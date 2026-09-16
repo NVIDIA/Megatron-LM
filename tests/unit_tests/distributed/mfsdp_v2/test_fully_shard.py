@@ -53,13 +53,12 @@ class _FusedWgradLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (x,) = ctx.saved_tensors
         weight = ctx.weight
-        weight.get_main_grad().add_(grad_output.t().matmul(x))
-        weight.grad_added_to_main_grad = True
-        return grad_output.matmul(weight), torch.zeros_like(weight), grad_output.sum(dim=0)
+        weight.main_grad.add_(grad_output.t().matmul(x))
+        return grad_output.matmul(weight), None, grad_output.sum(dim=0)
 
 
 class FusedWgradLinear(nn.Linear):
-    """Linear module that follows TE's fused-wgrad parameter protocol."""
+    """Linear module that follows TE's fused-wgrad parameter contract."""
 
     fuse_wgrad_accumulation = True
 
@@ -67,19 +66,6 @@ class FusedWgradLinear(nn.Linear):
         """Run the fused-wgrad autograd function."""
         assert self.bias is not None
         return _FusedWgradLinearFunction.apply(x, self.weight, self.bias)
-
-
-class SelectiveFusedWgradModel(nn.Module):
-    """Model with fused and ordinary parameters owned by the same FSDP root."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.fused = FusedWgradLinear(8, 8)
-        self.ordinary = nn.Linear(8, 8)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run both parameter groups."""
-        return self.fused(x) + self.ordinary(x)
 
 
 class CheckpointedTinyModel(TinyModel):
@@ -345,8 +331,8 @@ def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
 
-def test_fused_wgrad_matches_baseline(distributed_setup):
-    """Direct wgrads should match ordinary autograd across microbatches."""
+def test_mfsdp_fused_wgrad_buffer_matches_autograd(distributed_setup):
+    """MFSDP should reduce direct ``main_grad`` writes and ordinary bias gradients."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -359,7 +345,7 @@ def test_fused_wgrad_matches_baseline(distributed_setup):
     model.load_state_dict(baseline.state_dict())
 
     with fully_shard_context(device=device) as context:
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fuse_wgrad_accumulation=True)
 
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -385,45 +371,58 @@ def test_fused_wgrad_matches_baseline(distributed_setup):
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
     parameter_group = model.parameter_groups[0]
     assert parameter_group._fused_wgrad_buffer is None
-    assert not parameter_group._fused_wgrad_indices
     for fsdp_parameter in parameter_group.fsdp_parameters:
         parameter = fsdp_parameter.unsharded
-        assert parameter.main_grad is None
-        assert not parameter.grad_added_to_main_grad
+        assert not hasattr(parameter, "main_grad")
 
 
-def test_fused_wgrad_only_marks_supported_module_parameters(distributed_setup):
-    """Only parameters owned by fused modules should receive TE's destination protocol."""
+def test_fused_wgrad_requires_explicit_opt_in(distributed_setup):
+    """A TE-style module flag alone should not change MFSDP's gradient path."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = SelectiveFusedWgradModel().to(device)
+    model = FusedWgradLinear(8, 8).to(device)
 
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    groups = {group.fuse_wgrad_accumulation: group for group in model.parameter_groups}
-    assert groups.keys() == {False, True}
-    assert {fqn for parameter in groups[True].fsdp_parameters for fqn in parameter.fqns} == {
-        "fused.weight",
-        "fused.bias",
-    }
-    assert {fqn for parameter in groups[False].fsdp_parameters for fqn in parameter.fqns} == {
-        "ordinary.weight",
-        "ordinary.bias",
-    }
-
-    for parameter in groups[True].fsdp_parameters:
-        assert parameter.unsharded.__fsdp_param__
-        assert parameter.unsharded.get_main_grad is not None
-        assert not parameter.unsharded.overwrite_main_grad
-        assert not parameter.unsharded.grad_added_to_main_grad
-        assert parameter.unsharded.zero_out_wgrad
-    for parameter in groups[False].fsdp_parameters:
-        assert not hasattr(parameter.unsharded, "get_main_grad")
+    assert all(not group.fuse_wgrad_accumulation for group in model.parameter_groups)
+    for group in model.parameter_groups:
+        for parameter in group.fsdp_parameters:
+            assert not hasattr(parameter.unsharded, "main_grad")
 
 
-def test_te_linear_fused_wgrad_matches_baseline(distributed_setup):
-    """Real TE Linear kernels should train through MFSDP's direct destination."""
+def test_fused_wgrad_buffer_is_zeroed_in_grad_comm_dtype(distributed_setup):
+    """An unwritten wgrad slice must contribute zero in the communication dtype."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(8, 8, bias=False, device=device, dtype=torch.bfloat16)
+    model.weight.allreduce = False
+    policy = MixedPrecisionPolicy(
+        main_params_dtype=torch.bfloat16,
+        main_grads_dtype=torch.bfloat16,
+        grad_comm_dtype=torch.float32,
+    )
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=policy,
+            fuse_wgrad_accumulation=True,
+        )
+
+    group = model.parameter_groups[0]
+    group.prepare_fused_wgrad_buffer()
+    partial_grad = group.finalize_fused_wgrad_buffer()
+    assert partial_grad.dtype == torch.float32
+    torch.testing.assert_close(
+        partial_grad.local_buffer, torch.zeros_like(partial_grad.local_buffer)
+    )
+
+
+def test_te_linear_writes_wgrad_into_mfsdp_buffer(distributed_setup):
+    """TE Linear should train through MFSDP using only the public ``main_grad`` contract."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -454,7 +453,11 @@ def test_te_linear_fused_wgrad_matches_baseline(distributed_setup):
     mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.bfloat16)
     with fully_shard_context(device=device) as context:
         fully_shard(
-            model, mesh=mesh, placements=_flat_placements(), mixed_precision_policy=mp_policy
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=mp_policy,
+            fuse_wgrad_accumulation=True,
         )
 
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)

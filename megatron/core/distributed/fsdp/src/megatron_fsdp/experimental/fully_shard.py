@@ -110,6 +110,8 @@ def fully_shard(
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     grad_divisor: int = 1,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
+    *,
+    fuse_wgrad_accumulation: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -134,6 +136,11 @@ def fully_shard(
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
         schedule_policy: Communication scheduling policy for this FSDP module.
+        fuse_wgrad_accumulation: Let compatible fused linear kernels write weight
+            gradients directly into reduce-scatter input buffers. Use this only when
+            the module's fused backward follows TE's ``weight.main_grad`` contract;
+            the destination is zeroed before backward, so parameters without a
+            regular ``.grad`` contribute zero.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -164,6 +171,7 @@ def fully_shard(
             grad_divisor=grad_divisor,
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
     except Exception:
         module.__class__ = original_cls

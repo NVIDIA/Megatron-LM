@@ -183,6 +183,7 @@ class FsdpModule:
         grad_divisor: int = 1,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
+        fuse_wgrad_accumulation: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -191,13 +192,11 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
-        owned_parameters, fused_wgrad_parameters = _collect_owned_parameters(self)
+        owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = []
-        for group_parameters, group_fuses_wgrad in _group_parameters(
-            owned_parameters, fused_wgrad_parameters
-        ):
+        for group_parameters in _group_parameters(owned_parameters):
             group_dtype = next(iter(group_parameters.values())).dtype
             parameter_groups.append(
                 FsdpParameterGroup(
@@ -214,7 +213,7 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
-                    fuse_wgrad_accumulation=group_fuses_wgrad,
+                    fuse_wgrad_accumulation=fuse_wgrad_accumulation,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -458,6 +457,8 @@ class FsdpModule:
         self._unshard_parameter_groups()
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
+        for group in self._parameter_groups:
+            group.prepare_fused_wgrad_buffer()
 
         self._prefetch_parameter_groups(
             context.backward_order, self._schedule_policy.backward_prefetch_size
@@ -481,12 +482,12 @@ class FsdpModule:
                 continue
 
             if group.fuse_wgrad_accumulation:
-                partial_grad = group.take_fused_wgrad_buffer()
+                partial_grad = group.finalize_fused_wgrad_buffer()
             else:
                 with torch.cuda.stream(reduce_scatter_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
                 current_stream.wait_stream(reduce_scatter_stream)
-            group.copy_gradients_to_partial_buffer(partial_grad)
+                group.copy_gradients_to_partial_buffer(partial_grad)
 
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
@@ -529,17 +530,11 @@ def _collect_fsdp_children(module: nn.Module, children: set["FsdpModule"]) -> No
             _collect_fsdp_children(child, children)
 
 
-def _collect_owned_parameters(
-    root_module: nn.Module,
-) -> tuple[dict[str, nn.Parameter], set[nn.Parameter]]:
+def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
     parameters: dict[str, nn.Parameter] = {}
-    fused_wgrad_parameters: set[nn.Parameter] = set()
 
     def visit(submodule: nn.Module, submodule_fqn: str) -> None:
         direct_parameters = submodule.named_parameters(recurse=False, remove_duplicate=False)
-        module_fuses_wgrad = getattr(submodule, "fuse_wgrad_accumulation", False) or getattr(
-            submodule, "gradient_accumulation_fusion", False
-        )
 
         for local_parameter_name, parameter in direct_parameters:
             parameter_fqn = (
@@ -550,8 +545,6 @@ def _collect_owned_parameters(
                     f"Parameter {parameter_fqn!r} is already owned by another FsdpModule."
                 )
             parameters[parameter_fqn] = parameter
-            if module_fuses_wgrad and parameter.requires_grad:
-                fused_wgrad_parameters.add(parameter)
 
         for child_name, child_module in submodule.named_children():
             if isinstance(child_module, FsdpModule):
@@ -560,17 +553,15 @@ def _collect_owned_parameters(
             visit(child_module, child_fqn)
 
     visit(root_module, "")
-    return parameters, fused_wgrad_parameters
+    return parameters
 
 
-def _group_parameters(
-    parameters: dict[str, nn.Parameter], fused_wgrad_parameters: set[nn.Parameter]
-) -> list[tuple[dict[str, nn.Parameter], bool]]:
-    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
+def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
+    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad, parameter in fused_wgrad_parameters)
+        key = (parameter.dtype, parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
-    return [(grouped[key], key[2]) for key in grouped]
+    return [grouped[key] for key in grouped]
 
 
 def _specialize_placements(

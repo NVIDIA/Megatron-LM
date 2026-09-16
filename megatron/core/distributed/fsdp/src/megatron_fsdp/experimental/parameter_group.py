@@ -31,7 +31,6 @@ from .dbuffer import DBuffer
 from .module_utils import get_parameter_owner
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
-_PARAMETER_GROUP_INDEX_ATTR = "_mfsdp_parameter_group_index"
 
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
@@ -42,15 +41,6 @@ def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGro
     if parameter_group_ref is None:
         return None
     return parameter_group_ref()
-
-
-def _get_main_grad(parameter: nn.Parameter) -> torch.Tensor:
-    """Return this parameter's view into the active reduce-scatter input buffer."""
-    parameter_group = get_containing_parameter_group(parameter)
-    if parameter_group is None:
-        raise RuntimeError("FSDP parameter no longer has an owning parameter group.")
-    parameter_index = getattr(parameter, _PARAMETER_GROUP_INDEX_ATTR)
-    return parameter_group.get_fused_wgrad(parameter_index)
 
 
 def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
@@ -109,8 +99,8 @@ class FsdpParameterGroup:
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
     fuse_wgrad_accumulation: bool
+    _partial_grad_dtype: torch.dtype | None
     _fused_wgrad_buffer: DBuffer | None
-    _fused_wgrad_indices: set[int]
 
     def __init__(
         self,
@@ -140,7 +130,8 @@ class FsdpParameterGroup:
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
             fuse_wgrad_accumulation: Let fused linear kernels write weight gradients
-                directly into the reduce-scatter input buffer.
+                directly into the reduce-scatter input buffer using each parameter's
+                ``main_grad`` attribute.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -223,10 +214,11 @@ class FsdpParameterGroup:
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
+        self._partial_grad_dtype = None
         self._fused_wgrad_buffer = None
-        self._fused_wgrad_indices = set()
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+            self._partial_grad_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
             # Keep main_grad persistent for the initial implementation. For micro-batch
             # size 1, this allocation could be delayed until post_backward and then
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
@@ -262,20 +254,6 @@ class FsdpParameterGroup:
                 parameter.grad = None
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
-            if self.fuse_wgrad_accumulation and parameter.requires_grad:
-                # TE and MCore fused linear kernels discover this protocol during
-                # forward, then request the destination when their wgrad GEMM runs.
-                parameter.__fsdp_param__ = True
-                parameter.get_main_grad = _get_main_grad.__get__(parameter, type(parameter))
-                parameter.main_grad = None
-                # The destination is zeroed before backward, so fused kernels should
-                # accumulate into it.
-                parameter.overwrite_main_grad = False
-                # TE returns a shared zero dummy gradient so PyTorch runs the
-                # parameter-completion hook without materializing the real wgrad.
-                parameter.grad_added_to_main_grad = False
-                parameter.zero_out_wgrad = True
-                setattr(parameter, _PARAMETER_GROUP_INDEX_ATTR, index)
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
@@ -369,39 +347,32 @@ class FsdpParameterGroup:
             return
         if self._fused_wgrad_buffer is not None:
             return
+        assert self._partial_grad_dtype is not None
 
         self._fused_wgrad_buffer = DBuffer(
             mesh=self.mesh,
             placements=[Partial("avg")] * self.mesh.ndim,
             tensor_shapes=self.main_weight.layout.tensor_shapes,
-            dtype=self.dtype,
+            dtype=self._partial_grad_dtype,
             device=self.main_weight.device,
         )
         self._fused_wgrad_buffer.local_buffer.zero_()
-        for fsdp_parameter in self.fsdp_parameters:
-            parameter = fsdp_parameter.unsharded
-            parameter.main_grad = None
-            parameter.overwrite_main_grad = False
-            parameter.grad_added_to_main_grad = False
-        self._fused_wgrad_indices.clear()
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.unsharded.main_grad = self._fused_wgrad_buffer.get_local_tensor(index)
 
-    def get_fused_wgrad(self, index: int) -> torch.Tensor:
-        """Return a full parameter-shaped view for a fused wgrad GEMM."""
+    def finalize_fused_wgrad_buffer(self) -> DBuffer:
+        """Finish the fused destination and return it for reduce-scatter."""
         if self._fused_wgrad_buffer is None:
-            self.prepare_fused_wgrad_buffer()
-        assert self._fused_wgrad_buffer is not None
-        self._fused_wgrad_indices.add(index)
-        return self._fused_wgrad_buffer.get_local_tensor(index)
-
-    def take_fused_wgrad_buffer(self) -> DBuffer:
-        """Detach the completed fused-wgrad buffer for reduce-scatter."""
-        if self._fused_wgrad_buffer is None:
-            self.prepare_fused_wgrad_buffer()
+            raise RuntimeError("MFSDP fused-wgrad buffer is missing at gradient reduction.")
         assert self._fused_wgrad_buffer is not None
         partial_grad = self._fused_wgrad_buffer
         self._fused_wgrad_buffer = None
-        for fsdp_parameter in self.fsdp_parameters:
-            fsdp_parameter.unsharded.main_grad = None
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            parameter = fsdp_parameter.unsharded
+            del parameter.main_grad
+            if parameter.grad is not None:
+                partial_grad.get_local_tensor(index).add_(parameter.grad)
+            parameter.grad = None
         return partial_grad
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
@@ -423,22 +394,11 @@ class FsdpParameterGroup:
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack ordinary gradients while preserving directly written wgrads."""
+        """Pack full local gradients into an existing reduce-scatter input buffer."""
+        # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            parameter = fsdp_parameter.unsharded
-            destination = partial_grad.get_local_tensor(index)
-            if index in self._fused_wgrad_indices:
-                if parameter.grad is not None:
-                    destination.add_(parameter.grad)
-            elif parameter.grad is not None:
-                destination.copy_(parameter.grad)
-            else:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            parameter.grad = None
-            if self.fuse_wgrad_accumulation:
-                parameter.grad_added_to_main_grad = False
-
-        self._fused_wgrad_indices.clear()
+            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
+            fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
         has_any_grad = False
