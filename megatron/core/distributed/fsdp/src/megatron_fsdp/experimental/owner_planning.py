@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
-Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
+Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
 
 - `ParameterLayout` describes how a single parameter's flat element range is split across the DP
   group under MFSDP v2's all-`Flat` layout.

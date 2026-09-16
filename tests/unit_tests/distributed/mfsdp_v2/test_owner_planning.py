@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
-Pure CPU tests for the shard-planning and owner-compute packing logic.
+Pure CPU tests for the parameter layout and owner-compute packing logic.
 
 These tests exercise functions without a process group or any `torch.distributed` dependency. P2P
 communication is simulated in-process by `_simulate_p2p`.
@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.shard_plan import (
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
     GroupOwnerLayout,
     OwnerGatherPlan,
     OwnerScatterPlan,
