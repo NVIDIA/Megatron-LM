@@ -77,6 +77,71 @@ swap_model_weights(None, None, "nccl",
                    src_rank_offset=0, dst_rank_offset=src_world)
 ```
 
+### MIMO training with ordinary LLaVA inference
+
+The public prepare/swap API accepts the original models without caller-side
+adapters or new arguments:
+
+```python
+from megatron.core.resharding.refit import prepare_swap_model_weights, swap_model_weights
+
+# Each rank supplies its local model, or None on the opposite side.
+prepare_swap_model_weights(train_model, inference_model, group=refit_group)
+# After an optimizer step, collectively on all refit ranks:
+swap_model_weights(train_model, inference_model, "nccl", group=refit_group)
+```
+
+Regular refit reads tensor names and one root process-group collection. MIMO
+differs in two ways: its components have separate process groups, and their
+storage paths differ from LLaVA's. The transfer planner already accepts both
+owning groups and separate storage/matching names in `ParameterMetadata`.
+
+Models can declare their local components through an optional `refit_modules()`
+method returning `(matching_label, module, process_group_collection)` tuples.
+Each module must be the original model or one of its registered descendants;
+precision/DDP wrappers are allowed. An empty matching label preserves the
+component's tensor names, for example when removing an inference wrapper prefix.
+Refit uses its ordinary parameter extractor with each component's groups, then
+prefixes the matching name with its label and the storage name with its actual
+module path. Rank offsets and metadata serialization remain internal to refit.
+The declarations must cover every parameter and persistent buffer exactly once
+and produce unique matching names. Models without the method retain the ordinary
+extraction path. An empty list describes a rank with no state.
+
+MIMO matches its language model, image encoder, and input projector under
+`language_model`, `vision_model`, and `vision_projection`. These match standard
+LLaVA's registered names, so inference does not need MIMO. For example, TP2
+language training can use two GPUs, TP1 vision/projector training a third,
+and standard TP1 LLaVA inference a fourth.
+
+The executor uses original tensor paths, including wrapper levels; declarations
+do not rename modules or checkpoint keys. Buffer dtypes are matched by transfer
+ID. The existing rank-offset arguments still apply when the refit group joins
+independent worlds.
+
+The MIMO mapping covers a core CLIP image encoder and at most one input projector.
+Other encoder implementations may require their own matching declarations and
+explicit ownership. MIMO configurations enabling FP8, FP4, Kitchen, or per-module
+quantization recipes are rejected. Missing ownership, unmapped names, and
+ambiguous destination names raise errors. Callers must use equivalent component
+architectures and input preprocessing; matching tensor names and shapes alone
+do not establish equivalence.
+
+Plans are cached between optimizer steps; update tensor values in place.
+Initialize persistent buffers to their runtime dtypes before the first swap
+(for example, MoE routers promote their bias to FP32 on first forward).
+A buffer dtype change that preserves the tensor object requires
+`clear_plan_cache()` on all refit ranks and a new prepare call before swapping
+again.
+For a new layout, construct new model objects, call `clear_plan_cache()` on
+**all** refit ranks, and prepare again. Replacing tensors or submodules on an
+existing model is not automatically tracked by refit's tensor caches.
+
+TP2 affine projectors currently require bias to be disabled: the projector
+forward adds its local bias after gathering the output, which is incompatible
+with a sharded bias at TP2. This is a model-forward limitation, independent
+of refit.
+
 ## Copy Service Backends
 
 | Backend | Transport | Best for | Notes |

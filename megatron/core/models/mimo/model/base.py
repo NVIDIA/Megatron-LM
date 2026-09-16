@@ -3,7 +3,7 @@
 import logging
 import warnings
 from contextlib import ExitStack, contextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
@@ -19,6 +19,9 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import unwrap_model
+
+if TYPE_CHECKING:
+    from megatron.core.process_groups_config import ProcessGroupCollection
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +102,59 @@ class MimoModel(MegatronModule):
         self._initialize_submodules()
         self._finish_init_quantization()
         self._initialize_language_model()
+
+    def refit_modules(self) -> list[tuple[str, torch.nn.Module, "ProcessGroupCollection"]]:
+        """Declare local LLaVA matching labels, modules, and their owning groups.
+
+        Native module registration and checkpoint names remain unchanged.
+        """
+        components = []
+        if self.language_model is not None:
+            language = unwrap_model(self.language_model)
+            components.append(("language_model", language, language.pg_collection))
+        for modality, wrapped_tower in self.modality_submodules.items():
+            tower = unwrap_model(wrapped_tower)
+            if (
+                modality != "images"
+                or len(tower.encoders) != 1
+                or len(tower.input_projections) > 1
+                or tower.decoders
+                or tower.output_projections
+            ):
+                raise ValueError("Refit requires one image encoder and at most one input projector")
+            vision = unwrap_model(next(iter(tower.encoders.values())))
+            components.append(("vision_model", vision, vision.pg_collection))
+            for wrapped_projector in tower.input_projections:
+                projector = unwrap_model(wrapped_projector)
+                components.append(
+                    (
+                        "vision_projection",
+                        projector,
+                        getattr(projector, "pg_collection", None) or tower.pg_collection,
+                    )
+                )
+
+        for label, module, pg in components:
+            if pg is None or any(getattr(pg, axis, None) is None for axis in ("tp", "pp", "dp")):
+                raise ValueError(
+                    f"Refit component {label!r} requires explicit tp, pp and dp groups"
+                )
+            config = getattr(module, "config", None)
+            if (
+                getattr(config, "fp8", None)
+                or getattr(config, "fp4", None)
+                or getattr(config, "use_kitchen", False)
+                or getattr(config, "quant_recipe", None) is not None
+            ):
+                raise ValueError("Quantized component refit is not supported")
+            tp = getattr(module, "tp_group", None)
+            if tp is not None and torch.distributed.get_process_group_ranks(tp) != (
+                torch.distributed.get_process_group_ranks(pg.tp)
+            ):
+                raise ValueError(
+                    f"Refit component {label!r}: TP group disagrees with its declaration"
+                )
+        return components
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.

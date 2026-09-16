@@ -151,7 +151,7 @@ class ReshardPlan:
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
     transform: Optional["ReshardTransform"] = None
-    # Cache of canonical persistent-buffer dtypes keyed by raw module path.
+    # Cache of persistent-buffer dtypes keyed by local destination module path.
     # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
     # skip the all_gather_object + named_modules() walks on the hot path.
     buffer_dtypes: Optional[dict[str, torch.dtype]] = None
