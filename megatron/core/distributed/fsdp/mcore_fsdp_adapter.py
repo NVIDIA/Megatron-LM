@@ -798,14 +798,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
-        if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
-            config.expert_model_parallel_size <= 1
-            or ddp_config.num_distributed_optimizer_instances <= 1
+        if (
+            ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
+            and ddp_config.expert_num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
-                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires an outer expert-DP "
-                "axis, i.e. expert parallelism and num_distributed_optimizer_instances > 1."
+                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
+                "expert_num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
@@ -951,11 +951,9 @@ def _build_expert_mesh_and_placements(
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
 
-    if ddp_config.num_distributed_optimizer_instances > 1:
-        # Match v1 topology: dense and expert parameters share the outer DP axis,
-        # while experts use the existing expert-DP inner group. Only placements differ.
+    if ddp_config.expert_num_distributed_optimizer_instances > 1:
         dp_mesh = _build_hybrid_dp_mesh(
-            pg_collection.inter_dist_opt,
+            pg_collection.inter_expt_dp,
             pg_collection.intra_expt_dp,
             device_type,
             flattened_group=pg_collection.expt_dp,
@@ -981,6 +979,23 @@ def _build_expert_mesh_and_placements(
         optimizer=[axis.optimizer],
     )
     return dp_mesh, placements
+
+
+def expert_main_weight_is_sharded(ddp_config: DistributedDataParallelConfig) -> bool:
+    """Whether the expert optimizer buffer keeps a sharded axis.
+
+    MFSDP v2's owner-compute Muon derives its shard plans from each parameter group's
+    ``main_weight``, which takes the *optimizer* placement of every expert DP axis (see
+    ``_build_expert_mesh_and_placements``). When no expert axis shards it, ``main_weight``
+    is fully replicated and no shard plan can be derived. Adam and other non-Muon
+    optimizers do not need this property, so callers must gate on the optimizer.
+    """
+    strategies = [get_sharding_strategy(ddp_config, is_expert_param=True)]
+    if ddp_config.expert_num_distributed_optimizer_instances > 1:
+        strategies.append(ddp_config.expert_outer_dp_sharding_strategy)
+    return any(
+        isinstance(_DATA_PARALLEL_PLACEMENTS[strategy].optimizer, Shard) for strategy in strategies
+    )
 
 
 def _build_hybrid_dp_mesh(outer_group, inner_group, device_type, flattened_group=None):

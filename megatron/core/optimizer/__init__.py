@@ -56,7 +56,10 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
-from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from ..distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallelV2,
+    expert_main_weight_is_sharded,
+)
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
@@ -782,6 +785,34 @@ def _get_megatron_emerging_optimizer(
             raise ValueError(
                 "MFSDP v2 Muon routes excluded parameters through Adam and requires "
                 "muon_scalar_optimizer='adam'."
+            )
+        # Muon's owner-compute shard plans are derived from each parameter group's
+        # `main_weight`, so at least one data-parallel axis must shard the optimizer buffer.
+        # The adapter pins dense parameters to `optim_grads_params`, but expert parameters
+        # choose their own strategy, and `no_shard` (with a single expert axis, or with no
+        # sharded expert axis at all) leaves the expert optimizer buffer fully replicated.
+        # Reject that here, where both the optimizer and the placement policy are known,
+        # instead of failing deep inside Muon's shard planning.
+        ddp_config = getattr(model_chunks[0], 'ddp_config', None)
+        if (
+            ddp_config is not None
+            and get_model_config(model_chunks[0]).expert_model_parallel_size > 1
+            and not expert_main_weight_is_sharded(ddp_config)
+        ):
+            outer_axis = (
+                " with expert_outer_dp_sharding_strategy="
+                f"{ddp_config.expert_outer_dp_sharding_strategy!r}"
+                if ddp_config.expert_num_distributed_optimizer_instances > 1
+                else ""
+            )
+            raise ValueError(
+                "MFSDP v2 Muon requires the expert optimizer buffer to be sharded on at "
+                "least one expert data-parallel axis, but "
+                "expert_data_parallel_sharding_strategy="
+                f"{ddp_config.expert_data_parallel_sharding_strategy!r}{outer_axis} leaves it "
+                "fully replicated, so no owner-compute shard plan can be derived. Use "
+                "'optim', 'optim_grads' or 'optim_grads_params' instead (and shard the expert "
+                "outer axis when expert_num_distributed_optimizer_instances > 1)."
             )
 
     if not HAVE_EMERGING_OPTIMIZERS:

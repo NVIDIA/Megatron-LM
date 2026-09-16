@@ -58,6 +58,7 @@ except (ModuleNotFoundError, ImportError):
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
 
+from .dbuffer import DBuffer
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 from .shard_plan import (
@@ -149,6 +150,215 @@ def _require_emerging_optimizers() -> None:
             "Please install the necessary dependencies with "
             "`pip install 'megatron_fsdp[emerging-optimizers]'`."
         )
+
+
+def _placement_names(buffer: DBuffer) -> list[str]:
+    """Names of a buffer's placements, for actionable error messages."""
+    return [type(placement).__name__ for placement in buffer.placements]
+
+
+def _require_sharded_main_weight(parameter_group: FsdpParameterGroup) -> None:
+    """Require a sharded (Flat) axis on the buffer the shard plans are derived from.
+
+    The owner-compute algorithm reads `main_weight` alone: `_init_shard_plans` takes its
+    layout and `_get_parameter_dp_group` its placements. `model_weight` and `main_grad`
+    are deliberately *not* required to be sharded (see `_require_matching_local_shards`),
+    so only `main_weight` is checked here.
+    """
+    main_weight = parameter_group.main_weight
+    if any(isinstance(placement, Flat) for placement in main_weight.placements):
+        return
+    raise ValueError(
+        "FsdpOrthogonalizedOptimizer requires at least one Flat (sharded) axis on the "
+        f"parameter group's main_weight, but {parameter_group} has main_weight placements "
+        f"{_placement_names(main_weight)}. The owner-compute shard plans are derived from "
+        "main_weight, so the optimizer buffer must be sharded on at least one "
+        "data-parallel axis (data_parallel_sharding_strategy or "
+        "expert_data_parallel_sharding_strategy in "
+        "{'optim', 'optim_grads', 'optim_grads_params'})."
+    )
+
+
+def _compute_weight_local_views(parameter_group: FsdpParameterGroup) -> list[tuple[str, DBuffer]]:
+    """Name the compute-weight views whose local shapes must match `main_weight`.
+
+    The base parameter group publishes the optimizer's update through
+    `post_optimizer_model_weight`, its `main_weight`-shaped view of `model_weight`.
+    `Fp8ParameterGroup` mirrors that split: its row-wise and column-wise uint8
+    payload *storage* rests in the parameter layout, and `post_optimizer_rowwise` /
+    `post_optimizer_colwise` are the `main_weight`-shaped views into it. The views
+    are checked -- not the storage -- because the storage is coarser whenever the
+    parameter layout is (expert ZeRO-1, HFSDP). A group exposing neither
+    contributes no compute-weight comparison.
+    """
+    views: list[tuple[str, DBuffer]] = []
+    sync_target = getattr(parameter_group, "post_optimizer_model_weight", None)
+    if sync_target is not None:
+        views.append(("post_optimizer_model_weight", sync_target))
+    for name in ("post_optimizer_rowwise", "post_optimizer_colwise"):
+        buffer = getattr(parameter_group, name, None)
+        if buffer is not None:
+            views.append((name, buffer))
+    return views
+
+
+def _require_matching_local_shards(parameter_group: FsdpParameterGroup) -> None:
+    """Require the parameter, gradient and compute-weight views to cover one local shard.
+
+    `FsdpOrthogonalizedOptimizer` reads the parameter through `main_weight`, whose layout
+    also defines the shard plans, and reads its gradient through `pre_optimizer_main_grad`,
+    the optimizer-layout view of `main_grad`. `_compute_orthogonalization_inputs` and
+    `_step_non_matrix` assume those views (and the momentum buffer, which mirrors the
+    parameter) localize to the same flat slice; a mismatch means the buffers were wired to
+    different shard layouts. Checking it here turns that into an early, explicit failure
+    rather than a late `reshape`/kernel error inside the step.
+
+    `model_weight` itself may legitimately be Replicate (ZeRO-1 keeps compute weights in
+    the parameter layout while the optimizer layout is Flat): the update is published
+    through `post_optimizer_model_weight`, its `main_weight`-shaped view, which is what is
+    checked here. `Fp8ParameterGroup` mirrors that split -- its payload storage rests in
+    the parameter layout and `post_optimizer_rowwise` / `post_optimizer_colwise` are the
+    `main_weight`-shaped views -- and `_compute_weight_local_views` selects those views; a
+    group exposing neither skips this half of the check. The gradient half applies to
+    every group, since `pre_optimizer_main_grad` always comes from the shared
+    `_initialize_buffers`.
+    """
+    views = [("pre_optimizer_main_grad", getattr(parameter_group, "pre_optimizer_main_grad", None))]
+    views.extend(_compute_weight_local_views(parameter_group))
+    for index, fsdp_parameter in enumerate(parameter_group.fsdp_parameters):
+        expected_shape = fsdp_parameter.sharded.to_local().shape
+        for name, buffer in views:
+            if buffer is None:
+                continue
+            local_shape = buffer.get_local_tensor(index).shape
+            if local_shape == expected_shape:
+                continue
+            raise ValueError(
+                "FsdpOrthogonalizedOptimizer requires the parameter, gradient and "
+                f"compute-weight views of {parameter_group} to cover the same local shard, "
+                f"but parameter {fsdp_parameter.fqns!r} localizes to {tuple(expected_shape)} "
+                f"while {name} localizes to {tuple(local_shape)} with placements "
+                f"{_placement_names(buffer)}."
+            )
+
+
+def _describe_tensor(tensor: torch.Tensor | None) -> str:
+    """Shape, dtype, numel, strides and contiguity of a tensor, for diagnostics."""
+    if tensor is None:
+        return "<none>"
+    return (
+        f"shape={tuple(tensor.shape)} numel={tensor.numel()} dtype={tensor.dtype} "
+        f"stride={tuple(tensor.stride())} contiguous={tensor.is_contiguous()}"
+    )
+
+
+def _describe_placements(tensor: object) -> str:
+    """DTensor placements of ``tensor``, or ``<unavailable>`` when it is not a DTensor."""
+    placements = getattr(tensor, "placements", None)
+    if placements is None:
+        return "<unavailable>"
+    return "[" + ", ".join(type(placement).__name__ for placement in placements) + "]"
+
+
+def _local_shard_mismatch_report(
+    param: DTensor,
+    param_local: torch.Tensor,
+    grad: DTensor,
+    momentum: DTensor,
+    momentum_local: torch.Tensor,
+    local_grad: torch.Tensor,
+    path: str,
+) -> str:
+    """Collect the full picture of a local-shard mismatch into one diagnostic line.
+
+    The gradient, momentum and parameter views are supposed to localize to the same shard
+    by construction, so this is expected to be dead code. If it ever fires, the numbers
+    needed to explain it (and to confirm the branch can be deleted) belong in one place.
+    """
+    parameter_group = get_containing_parameter_group(param)
+    fqns: tuple[str, ...] | None = None
+    details: list[str] = []
+    if parameter_group is None:
+        details.append(f"parameter_group=<none> param={param!r}")
+    else:
+        for fsdp_parameter in parameter_group.fsdp_parameters:
+            if fsdp_parameter.sharded is param:
+                fqns = fsdp_parameter.fqns
+                break
+        for name in ("main_weight", "model_weight", "main_grad", "pre_optimizer_main_grad"):
+            buffer = getattr(parameter_group, name, None)
+            if buffer is not None:
+                details.append(f"{name}.placements={_describe_placements(buffer)}")
+        mesh = getattr(parameter_group, "mesh", None)
+        mesh_tensor = getattr(mesh, "mesh", None)
+        mesh_size = getattr(mesh, "size", None)
+        details.append(
+            f"mesh.shape={tuple(mesh_tensor.shape) if mesh_tensor is not None else None} "
+            f"mesh.size={mesh_size() if callable(mesh_size) else None}"
+        )
+        # `_main_grad_is_stale` is set exactly when the last microbatch redistributed
+        # main_grad into the optimizer layout, so it doubles as the step's last-microbatch
+        # marker on this rank.
+        details.append(
+            f"main_grad_is_stale={getattr(parameter_group, '_main_grad_is_stale', None)}"
+        )
+    return (
+        f"path={path} fqns={fqns} "
+        f"param_local[{_describe_tensor(param_local)}] "
+        f"grad_local[{_describe_tensor(local_grad)}] "
+        f"momentum_local[{_describe_tensor(momentum_local)}] "
+        f"param.placements={_describe_placements(param)} "
+        f"grad.placements={_describe_placements(grad)} "
+        f"momentum.placements={_describe_placements(momentum)} " + " ".join(details)
+    )
+
+
+def _local_gradient_like_param(
+    param: DTensor,
+    param_local: torch.Tensor,
+    grad: DTensor,
+    momentum: DTensor,
+    momentum_local: torch.Tensor,
+    *,
+    path: str,
+) -> torch.Tensor:
+    """Return the local gradient in the momentum dtype after checking its local shard shape.
+
+    `param` is a view of the owning group's `main_weight`, `param.grad` is bound to
+    `pre_optimizer_main_grad` (the optimizer-layout view of `main_grad`, which shares
+    `main_weight`'s layout), and the momentum buffer mirrors `param`. All three therefore
+    localize to the same shard, so a shape mismatch means the buffers were wired to
+    different shard layouts, never a mere reshuffle: with equal numels `reshape` would
+    silently reinterpret the wrong slice, and with different numels it would fail obscurely
+    deeper inside the step. Report both cases and refuse to reshape.
+
+    Args:
+        param: The optimizer's DTensor parameter (a `main_weight` view).
+        param_local: `param.to_local()`, the expected local shard.
+        grad: The parameter's DTensor gradient.
+        momentum: The momentum DTensor that `momentum_local` belongs to.
+        momentum_local: `momentum.to_local()`.
+        path: Name of the calling path, for the diagnostic line.
+    """
+    local_grad = grad.to_local()
+    if local_grad.dtype != momentum_local.dtype:
+        local_grad = local_grad.to(dtype=momentum_local.dtype)
+    if local_grad.shape != momentum_local.shape:
+        report = _local_shard_mismatch_report(
+            param, param_local, grad, momentum, momentum_local, local_grad, path
+        )
+        logger.error(
+            "FsdpOrthogonalizedOptimizer gradient/momentum local shard mismatch: %s", report
+        )
+        raise ValueError(
+            "FsdpOrthogonalizedOptimizer requires the gradient, momentum and parameter views "
+            f"of {param!r} to cover the same local shard, but the gradient localizes to "
+            f"{tuple(local_grad.shape)} while the momentum buffer localizes to "
+            f"{tuple(momentum_local.shape)} (the parameter localizes to "
+            f"{tuple(param_local.shape)}). Refusing to reshape a mismatched gradient. "
+            f"Diagnostics: {report}"
+        )
+    return local_grad
 
 
 @dataclasses.dataclass
@@ -257,23 +467,17 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             super().__init__(params, {})
         self._inner = inner_optimizer
 
-        # Muon requires every optimizer-managed buffer to retain at least one
-        # sharded axis; HSDP may replicate the outer axis.
+        # The owner-compute algorithm plans its shards off `main_weight` alone, so that is
+        # the buffer that has to keep a sharded axis; the gradient and compute-weight views
+        # must additionally agree with it (see the helpers).
         _seen_groups: set[FsdpParameterGroup] = set()
         for _param in self._all_params():
             _group = get_containing_parameter_group(_param)
             if _group is None or _group in _seen_groups:
                 continue
             _seen_groups.add(_group)
-            for _buf in (_group.main_weight, _group.model_weight, _group.main_grad):
-                if _buf is None:
-                    continue
-                if not any(isinstance(_p, Flat) for _p in _buf.placements):
-                    raise ValueError(
-                        "FsdpOrthogonalizedOptimizer requires at least one Flat axis, but "
-                        f"{_group} has placements "
-                        f"{[type(_p).__name__ for _p in _buf.placements]}."
-                    )
+            _require_sharded_main_weight(_group)
+            _require_matching_local_shards(_group)
 
     @property
     def param_groups(self) -> list[dict[str, Any]]:
@@ -440,11 +644,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         state = self.state[param]
         momentum = state["momentum_buffer"]
         mom_local = momentum.to_local()
-        local_grad = grad.to_local()
-        if local_grad.dtype != mom_local.dtype:
-            local_grad = local_grad.to(dtype=mom_local.dtype)
-        if local_grad.shape != mom_local.shape:
-            local_grad = local_grad.reshape(mom_local.shape)
+        local_grad = _local_gradient_like_param(
+            param, p_local, grad, momentum, mom_local, path="matrix"
+        )
 
         self._inner._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
         mom_local.lerp_(local_grad, 1 - group["momentum"])
@@ -803,7 +1005,19 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         for state in chunk_states:
             self._apply_boundary_update(state)
 
-        for parameter_group in fsdp_parameter_groups:
+        # Iterate in a deterministic, rank-independent order. ``fsdp_parameter_groups`` is a
+        # set of objects with identity-based hashing (FsdpParameterGroup defines no __eq__ or
+        # __hash__), so its iteration order depends on per-process object addresses and differs
+        # between ranks. Each iteration issues collectives (sync_model_weight_from_main_weight
+        # -> cast_master_weights_to_fp8 -> all_reduce over the group's amax reduce group), so an
+        # order that differs across ranks means the ranks enter different collectives in
+        # different sequences and deadlock. Sorting by the parameters' FQNs gives every rank
+        # that shares a group the same order. The Adam path avoids this because
+        # sync_model_weights_from_main_weights() iterates a list and uses a set only for
+        # membership, which is why only Muon hit it.
+        for parameter_group in sorted(
+            fsdp_parameter_groups, key=lambda group: group.fsdp_parameters[0].fqns
+        ):
             parameter_group.sync_model_weight_from_main_weight()
         return loss
 
@@ -958,11 +1172,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         momentum = state["momentum_buffer"]
         p_local = param.to_local()
         mom_local = momentum.to_local()
-        local_grad = grad.to_local()
-        if local_grad.dtype != mom_local.dtype:
-            local_grad = local_grad.to(dtype=mom_local.dtype)
-        if local_grad.shape != mom_local.shape:
-            local_grad = local_grad.reshape(mom_local.shape)
+        local_grad = _local_gradient_like_param(
+            param, p_local, grad, momentum, mom_local, path="non_matrix"
+        )
         self._inner._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
         mom_local.lerp_(local_grad, 1 - group["momentum"])
         if self._inner.nesterov:

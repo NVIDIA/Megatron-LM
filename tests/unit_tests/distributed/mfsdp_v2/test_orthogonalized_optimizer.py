@@ -100,9 +100,26 @@ def distributed_setup():
 # ---------------------------------------------------------------------------
 
 
+def _fully_local_plan(rows: int = 2, cols: int = 2) -> ShardPlan:
+    """A one-rank shard plan: the single rank owns the whole `(rows, cols)` parameter.
+
+    `_group_updates` only reads `plan.is_boundary()` from the plan, so these CPU
+    grouping tests use a plan that classifies as fully local.
+    """
+    return compute_shard_plan(
+        torch.Size((rows, cols)),
+        tensor_flat_offset=0,
+        rank_flat_shard_size=rows * cols,
+        world_size=1,
+    )
+
+
 def test_group_updates_separates_mixed_dtypes():
     """`_group_updates` groups shards by (device, dtype), separating mixed dtypes."""
     optimizer = object.__new__(FsdpMuon)
+    # `_group_updates` caps chunks with the optimizer's configured maximum; disable the
+    # cap so this test isolates key-based grouping.
+    optimizer._max_params_per_owner_chunk = None
     cpu = torch.device("cpu")
     params = [
         nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),  # 0: fp32
@@ -111,7 +128,8 @@ def test_group_updates_separates_mixed_dtypes():
         nn.Parameter(torch.zeros(2, 2, dtype=torch.bfloat16, device=cpu)),  # 3: bf16
     ]
     shards = [p.detach() for p in params]
-    chunks = optimizer._group_updates(params, shards)
+    plans = [_fully_local_plan() for _ in params]
+    chunks = optimizer._group_updates(params, shards, plans)
 
     # Two chunks: one for fp32, one for bf16.
     assert len(chunks) == 2
@@ -129,20 +147,28 @@ def test_group_updates_separates_mixed_dtypes():
 
 
 class _MockMesh:
-    """Mock `DeviceMesh` whose `get_group()` returns a fixed `ProcessGroup`."""
+    """Mock `DeviceMesh` whose `get_group(axis)` returns a fixed `ProcessGroup`."""
 
     def __init__(self, pg: object) -> None:
         self._pg = pg
 
-    def get_group(self) -> object:
+    def get_group(self, axis: int = 0) -> object:
         return self._pg
 
 
+class _MockMainWeight:
+    """Mock `main_weight` `DBuffer` exposing the placements `_get_parameter_dp_group` reads."""
+
+    def __init__(self) -> None:
+        self.placements = (Flat(),)
+
+
 class _MockParamGroup:
-    """Mock `FsdpParameterGroup` (supports `weakref`) with a `mesh` attribute."""
+    """Mock `FsdpParameterGroup` (supports `weakref`) with the mesh and layout it is queried for."""
 
     def __init__(self, mesh: _MockMesh) -> None:
         self.mesh = mesh
+        self.main_weight = _MockMainWeight()
 
 
 def test_group_updates_separates_collective_groups():
@@ -150,10 +176,13 @@ def test_group_updates_separates_collective_groups():
 
     Even when all params share the same dtype and device, params whose
     `FsdpParameterGroup` resolves to a different `ProcessGroup` (via
-    `group.mesh.get_group()`) must land in separate chunks so that each
+    `group.mesh.get_group(flat_axis)`) must land in separate chunks so that each
     chunk's P2P communication uses a single collective group.
     """
     optimizer = object.__new__(FsdpMuon)
+    # `_group_updates` caps chunks with the optimizer's configured maximum; disable the
+    # cap so this test isolates key-based grouping.
+    optimizer._max_params_per_owner_chunk = None
     cpu = torch.device("cpu")
     # Mock ProcessGroups (the actual collective groups) and FsdpParameterGroups
     # whose `mesh.get_group()` returns them.
@@ -171,7 +200,8 @@ def test_group_updates_separates_collective_groups():
     for p, g in zip(params, [group_a, group_a, group_b, group_b]):
         setattr(p, _CONTAINING_PARAMETER_GROUP_ATTR, weakref.ref(g))
     shards = [p.detach() for p in params]
-    chunks = optimizer._group_updates(params, shards)
+    plans = [_fully_local_plan() for _ in params]
+    chunks = optimizer._group_updates(params, shards, plans)
 
     # Two chunks: one per collective group.
     assert len(chunks) == 2
@@ -317,10 +347,7 @@ def test_compute_orthogonalization_inputs_matches_reference(distributed_setup):
         use_syrk=False,
     )
     optimizer = FsdpMuon(
-        model.parameters(),
-        inner_optimizer=inner_optimizer,
-        dp_mesh=mesh,
-        use_owner_comm_stream=False,
+        model.parameters(), inner_optimizer=inner_optimizer, use_owner_comm_stream=False
     )
     optimizer.zero_grad(set_to_none=True)
     model(x).sum().backward()
@@ -395,10 +422,7 @@ def test_step_bitwise_matches_single_rank_reference(distributed_setup):
         use_syrk=False,
     )
     sharded_opt = FsdpMuon(
-        sharded.parameters(),
-        inner_optimizer=inner_optimizer,
-        dp_mesh=mesh,
-        use_owner_comm_stream=False,
+        sharded.parameters(), inner_optimizer=inner_optimizer, use_owner_comm_stream=False
     )
     base_opt = Muon(
         baseline.parameters(),
@@ -485,9 +509,7 @@ def test_step_explicit_boundary_param_bitwise_matches_reference(distributed_setu
         fp32_matmul_prec="medium",
         use_syrk=False,
     )
-    sharded_opt = FsdpMuon(
-        model.parameters(), inner_optimizer=inner, dp_mesh=mesh, use_owner_comm_stream=False
-    )
+    sharded_opt = FsdpMuon(model.parameters(), inner_optimizer=inner, use_owner_comm_stream=False)
     base_opt = Muon(
         baseline.parameters(),
         lr=lr,
@@ -570,7 +592,6 @@ def test_step_reconstruct_full_param_bitwise_matches_reference(distributed_setup
     sharded_opt = FsdpMuon(
         model.parameters(),
         inner_optimizer=inner,
-        dp_mesh=mesh,
         use_owner_comm_stream=False,
         reconstruct_full_param=True,
     )
@@ -607,8 +628,9 @@ def test_step_non_matrix_param_matches_reference(distributed_setup):
     parameter). It is classified `non_matrix` and updated by
     `_step_non_matrix` (plain momentum-SGD, no orthogonalization, no
     owner-compute P2P). This also exercises the `if not matrix_indices:
-    continue` edge and the `_owner_comm_needed=False` path (no boundary
-    2D params -> no `new_group`). The wrapper's momentum-SGD uses the Muon
+    continue` edge and the `_group_updates` non-matrix omission (no boundary
+    2D params, so no chunk state is created and no P2P group is built). The
+    wrapper's momentum-SGD uses the Muon
     EMA (`mom.lerp_(grad, 1-momentum)`, matching the inner
     `OrthogonalizedOptimizer`), which differs from `torch.optim.SGD`, so the
     reference replicates `_step_non_matrix` by hand (nesterov disabled) and
@@ -646,9 +668,7 @@ def test_step_non_matrix_param_matches_reference(distributed_setup):
         fp32_matmul_prec="medium",
         use_syrk=False,
     )
-    sharded_opt = FsdpMuon(
-        model.parameters(), inner_optimizer=inner, dp_mesh=mesh, use_owner_comm_stream=False
-    )
+    sharded_opt = FsdpMuon(model.parameters(), inner_optimizer=inner, use_owner_comm_stream=False)
 
     # Hand-coded reference replicating `_step_non_matrix` (Muon EMA, no
     # orthogonalization, no scale, weight_decay=0, nesterov=False, no pre/post hooks).
@@ -728,9 +748,7 @@ def test_step_mixed_paths_matches_reference(distributed_setup):
         fp32_matmul_prec="medium",
         use_syrk=False,
     )
-    sharded_opt = FsdpMuon(
-        model.parameters(), inner_optimizer=inner, dp_mesh=mesh, use_owner_comm_stream=False
-    )
+    sharded_opt = FsdpMuon(model.parameters(), inner_optimizer=inner, use_owner_comm_stream=False)
     # Reference for the 2D `fc.weight`: a single-rank Muon (orthogonalize).
     base_opt = Muon(
         [baseline.fc.weight],
@@ -824,10 +842,7 @@ def test_step_losses_track_torch_muon(distributed_setup):
         use_syrk=False,
     )
     sharded_opt = FsdpMuon(
-        sharded.parameters(),
-        inner_optimizer=inner_optimizer,
-        dp_mesh=mesh,
-        use_owner_comm_stream=False,
+        sharded.parameters(), inner_optimizer=inner_optimizer, use_owner_comm_stream=False
     )
     base_opt = torch.optim.Muon(
         baseline.parameters(), lr=0.05, momentum=0.9, weight_decay=0.0, nesterov=True, ns_steps=5
@@ -869,8 +884,9 @@ def test_step_mixed_dtypes_bitwise_matches_reference(distributed_setup):
     """The FSDP Muon step must handle a param group with mixed dtypes (fp32 + bf16).
 
     Exercises the `_group_updates` chunking: boundary params of different dtypes
-    must be processed in separate boundary chunks (one `_finish_boundary_step`
-    call each) with matching P2P buffer metadata, and the result must match a
+    must be processed in separate boundary chunks (one
+    `_compute_and_issue_boundary_scatter` call each) with matching P2P buffer
+    metadata, and the result must match a
     single-rank Muon reference.
     """
     world_size = distributed_setup.world_size
@@ -911,10 +927,7 @@ def test_step_mixed_dtypes_bitwise_matches_reference(distributed_setup):
         use_syrk=False,
     )
     sharded_opt = FsdpMuon(
-        sharded.parameters(),
-        inner_optimizer=inner_optimizer,
-        dp_mesh=mesh,
-        use_owner_comm_stream=False,
+        sharded.parameters(), inner_optimizer=inner_optimizer, use_owner_comm_stream=False
     )
     base_opt = Muon(
         baseline.parameters(),
@@ -1006,15 +1019,16 @@ def test_owner_p2p_round_trip_multi_owner(distributed_setup):
         rs, rc = plan.rank_rows[this_rank]
         local_shards.append(full[rs : rs + rc].clone())
 
+    # `pack_owner_work` / `pack_update_shards` derive the world size and this rank's
+    # index from the per-parameter collective groups, so pass one real group per param.
+    comm_groups = [mesh.get_group()] * len(plans)
+
     optimizer = object.__new__(FsdpMuon)
-    optimizer.dp_mesh = mesh
     optimizer.use_owner_comm_stream = False
     optimizer._owner_comm_stream_cache = {}
 
-    gather_plan = pack_owner_work(
-        plans, owners, local_shards, world_size, this_rank, device=device, dtype=torch.float32
-    )
-    recv_buffers, works = optimizer._send_to_owner(gather_plan, device, dtype=torch.float32)
+    gather_plan = pack_owner_work(plans, owners, local_shards, comm_groups)
+    recv_buffers, works, _ = optimizer._send_to_owner(gather_plan, device, torch.float32)
     optimizer._wait_for_dist_buffer(works)
 
     # Identity orthogonalization: the full update equals the gathered input.
@@ -1025,16 +1039,12 @@ def test_owner_p2p_round_trip_multi_owner(distributed_setup):
         plan = plans[local_index]
         if plan.rank_row_count(this_rank) == 0:
             continue
-        full = reconstruct_full_tensor(
-            local_index, plan, gather_plan, recv_buffers, owner_rank=this_rank
-        )
+        full = reconstruct_full_tensor(local_index, plan, gather_plan, recv_buffers)
         full_updates[local_index] = full
 
-    scatter_plan = pack_update_shards(
-        full_updates, plans, owners, world_size, this_rank, device=device, dtype=torch.float32
-    )
-    scatter_recv, scatter_works = optimizer._send_to_destination(
-        scatter_plan, device, dtype=torch.float32
+    scatter_plan = pack_update_shards(full_updates, plans, owners, comm_groups)
+    scatter_recv, scatter_works, _ = optimizer._send_to_destination(
+        scatter_plan, device, torch.float32
     )
     optimizer._wait_for_dist_buffer(scatter_works)
     received = unpack_update_shards(scatter_plan, scatter_recv)
@@ -1121,6 +1131,6 @@ def test_import_guard_construction_error_without_emerging_optimizers():
     """Constructing the optimizers without emerging_optimizers raises a helpful ModuleNotFoundError."""
     with _simulate_no_emerging_optimizers() as mod:
         with pytest.raises(ModuleNotFoundError, match="emerging-optimizers"):
-            mod.FsdpOrthogonalizedOptimizer([], object(), dp_mesh=None)
+            mod.FsdpOrthogonalizedOptimizer([], object())
         with pytest.raises(ModuleNotFoundError, match="emerging-optimizers"):
-            mod.FsdpMuon([], object(), dp_mesh=None)
+            mod.FsdpMuon([], object())
