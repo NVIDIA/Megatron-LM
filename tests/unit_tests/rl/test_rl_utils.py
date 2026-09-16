@@ -456,6 +456,24 @@ class TestRLUtils:
         with pytest.raises(AssertionError, match=match):
             self.create_test_args(perform_rl_step=True, **overrides)
 
+    def test_rl_optimizer_offload_configures_grad_buffer_layout(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            nccl_ub=True,
+            rl_offload_optimizer_during_inference=True,
+            rl_training_cuda_graphs=False,
+        )
+        assert args.grad_buffer_offload
+
+    def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
+        with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
+            self.create_test_args(
+                perform_rl_step=True,
+                rl_offload_optimizer_during_inference=True,
+                rl_training_cuda_graphs=False,
+                reuse_grad_buf_for_mxfp8_param_ag=True,
+            )
+
     @pytest.mark.parametrize(
         "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]
     )
@@ -1306,15 +1324,26 @@ class TestRLUtils:
         torch.testing.assert_close(aligned, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "initialize_model_parallel",
+        "initialize_model_parallel,nccl_ub,grad_buffer_offload,initial_registration_fails",
         [
-            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
-            for tp, pp in itertools.product([1, 2], [1, 2])
-            if tp * pp <= Utils.world_size
+            *[
+                pytest.param((tp, pp), False, True, False, id=f"ordinary-tp{tp}-pp{pp}")
+                for tp, pp in itertools.product([1, 2], [1, 2])
+                if tp * pp <= Utils.world_size
+            ],
+            pytest.param((1, 1), True, True, False, id="nccl-ub-offload-layout"),
+            pytest.param((1, 1), True, True, True, id="nccl-ub-initial-registration-failure"),
+            pytest.param((1, 1), True, False, False, id="nccl-ub-shared-pool-rejected"),
         ],
         indirect=["initialize_model_parallel"],
     )
-    def test_grad_buffer_offload(self, initialize_model_parallel):
+    def test_grad_buffer_offload(
+        self,
+        initialize_model_parallel,
+        nccl_ub,
+        grad_buffer_offload,
+        initial_registration_fails,
+    ):
         """Test that grad buffer offload/restore correctly frees and restores GPU memory."""
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
@@ -1337,17 +1366,49 @@ class TestRLUtils:
             use_distributed_optimizer=True,
             overlap_grad_reduce=False,
             bucket_size=None,  # Single bucket for simplicity
+            nccl_ub=nccl_ub,
+            grad_buffer_offload=grad_buffer_offload,
         )
 
-        ddp_model = DistributedDataParallel(
-            transformer_config, ddp_config=ddp_config, module=gpt_model
+        registration_context = (
+            patch(
+                "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                side_effect=RuntimeError("initial registration failed"),
+            )
+            if initial_registration_fails
+            else nullcontext()
         )
+        with registration_context:
+            if initial_registration_fails:
+                with pytest.raises(RuntimeError, match="initial registration failed"):
+                    DistributedDataParallel(
+                        transformer_config, ddp_config=ddp_config, module=gpt_model
+                    )
+                return
+            ddp_model = DistributedDataParallel(
+                transformer_config, ddp_config=ddp_config, module=gpt_model
+            )
 
         all_buffers = ddp_model.buffers + ddp_model.expert_parallel_buffers
 
         # Verify initial storage is allocated
         initial_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
         assert all(size > 0 for size in initial_sizes), "Expected non-zero initial storage"
+        initial_grad_pool_ids = [
+            buf.nccl_mem_pool.id if buf.nccl_mem_pool is not None else None for buf in all_buffers
+        ]
+        initial_param_pool_ids = [
+            buf.param_nccl_mem_pool.id if buf.param_nccl_mem_pool is not None else None
+            for buf in all_buffers
+        ]
+
+        if nccl_ub and not grad_buffer_offload:
+            with pytest.raises(RuntimeError, match="requires a separate NCCL gradient pool"):
+                ddp_model.offload_grad_buffers()
+            assert [buf.grad_data.storage().size() for buf in all_buffers] == initial_sizes
+            for buf in all_buffers:
+                buf.deregister_nccl_mem_pools()
+            return
 
         # Offload grad buffers to CPU
         ddp_model.offload_grad_buffers()
@@ -1355,6 +1416,18 @@ class TestRLUtils:
         # Verify storage is released
         for buf in all_buffers:
             assert buf.grad_data.storage().size() == 0, "Expected zero storage after offload"
+        if nccl_ub:
+            assert all(buf.nccl_mem_pool is None for buf in all_buffers)
+            assert [buf.param_nccl_mem_pool.id for buf in all_buffers] == initial_param_pool_ids
+
+            with patch(
+                "megatron.core.distributed.param_and_grad_buffer.nccl_allocator.register_mem_pool",
+                side_effect=RuntimeError("registration failed"),
+            ):
+                with pytest.raises(RuntimeError, match="registration failed"):
+                    ddp_model.restore_grad_buffers()
+            assert all(buf.grad_data.storage().size() == 0 for buf in all_buffers)
+            assert all(buf.nccl_mem_pool is None for buf in all_buffers)
 
         # Restore grad buffers to GPU
         ddp_model.restore_grad_buffers()
@@ -1364,6 +1437,44 @@ class TestRLUtils:
         assert (
             initial_sizes == restored_sizes
         ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
+        if nccl_ub:
+            assert all(
+                buf.nccl_mem_pool.id != initial_id
+                for buf, initial_id in zip(all_buffers, initial_grad_pool_ids)
+            )
+            assert [buf.param_nccl_mem_pool.id for buf in all_buffers] == initial_param_pool_ids
+            for buf in all_buffers:
+                grad_ptr = buf.grad_data.data_ptr()
+                grad_bytes = buf.grad_data.untyped_storage().nbytes()
+                pool_ranges = [
+                    (
+                        (segment["address"], segment["total_size"])
+                        if isinstance(segment, dict)
+                        else (segment.address, segment.total_size)
+                    )
+                    for segment in buf.nccl_mem_pool.snapshot()
+                ]
+                assert any(
+                    begin <= grad_ptr and grad_ptr + grad_bytes <= begin + size
+                    for begin, size in pool_ranges
+                )
+
+        # Exercise the real DDP collective path after restore, not only allocator metadata.
+        for buf in all_buffers:
+            rank = torch.distributed.get_rank(group=buf.data_parallel_group)
+            buf.grad_data.fill_(rank + 1)
+        ddp_model.finish_grad_sync()
+        for buf in all_buffers:
+            rank = torch.distributed.get_rank(group=buf.data_parallel_group)
+            world_size = torch.distributed.get_world_size(group=buf.data_parallel_group)
+            shard_size = buf.grad_data.numel() // world_size
+            local_shard = buf.grad_data.narrow(0, rank * shard_size, shard_size)
+            expected = torch.full_like(local_shard, (world_size + 1) / 2)
+            torch.testing.assert_close(local_shard, expected, rtol=0, atol=0)
+
+        if nccl_ub:
+            for buf in all_buffers:
+                buf.deregister_nccl_mem_pools()
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

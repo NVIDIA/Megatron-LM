@@ -464,9 +464,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ddp_grad_buffer_reductions",
         sources=("megatron/core/distributed/param_and_grad_buffer.py",),
-        tests=(C + "test_gpt_model.py",),
+        tests=(C + "test_gpt_model.py", "tests/unit_tests/rl/test_rl_utils.py"),
         kind="external-lib",
-        notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite.",
+        notes="NCCL reduce-scatter / all-gather; model-level coverage is complemented by the "
+        "RL test's exact post-restore classic-DDP reduce-scatter check.",
     ),
     KernelEntry(
         name="nccl_allocator",
