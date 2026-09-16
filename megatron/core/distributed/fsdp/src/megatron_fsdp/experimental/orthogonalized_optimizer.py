@@ -1005,7 +1005,19 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         for state in chunk_states:
             self._apply_boundary_update(state)
 
-        for parameter_group in fsdp_parameter_groups:
+        # Iterate in a deterministic, rank-independent order. ``fsdp_parameter_groups`` is a
+        # set of objects with identity-based hashing (FsdpParameterGroup defines no __eq__ or
+        # __hash__), so its iteration order depends on per-process object addresses and differs
+        # between ranks. Each iteration issues collectives (sync_model_weight_from_main_weight
+        # -> cast_master_weights_to_fp8 -> all_reduce over the group's amax reduce group), so an
+        # order that differs across ranks means the ranks enter different collectives in
+        # different sequences and deadlock. Sorting by the parameters' FQNs gives every rank
+        # that shares a group the same order. The Adam path avoids this because
+        # sync_model_weights_from_main_weights() iterates a list and uses a set only for
+        # membership, which is why only Muon hit it.
+        for parameter_group in sorted(
+            fsdp_parameter_groups, key=lambda group: group.fsdp_parameters[0].fqns
+        ):
             parameter_group.sync_model_weight_from_main_weight()
         return loss
 
