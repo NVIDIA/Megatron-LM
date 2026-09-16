@@ -14,8 +14,8 @@ resolution-markers = [
 ]
 
 [manifest]
-constraints = [{ name = "apache-tvm-ffi", specifier = "==0.1.11" }]
 overrides = [
+    { name = "apache-tvm-ffi", specifier = "==0.1.11" },
     { name = "tilelang", specifier = "==0.1.12" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'" },
@@ -2164,7 +2164,7 @@ wheels = [
 [[package]]
 name = "mamba-ssm"
 version = "2.3.2.post1"
-source = { git = "https://github.com/state-spaces/mamba.git?rev=ed6ce09e4d802e274b1ecc7205757b892e180a93#ed6ce09e4d802e274b1ecc7205757b892e180a93" }
+source = { git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1#0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "einops" },
@@ -2437,7 +2437,7 @@ requires-dist = [
     { name = "gigatoken", marker = "extra == 'mlm'" },
     { name = "gigatoken", marker = "extra == 'training'" },
     { name = "hypercorn", marker = "extra == 'dev'" },
-    { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=ed6ce09e4d802e274b1ecc7205757b892e180a93" },
+    { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "nemo-lens", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b85578fc2b736a1804705e537001b5f45e9c715d" },
