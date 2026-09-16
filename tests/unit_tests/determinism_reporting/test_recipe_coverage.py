@@ -78,6 +78,24 @@ def test_matching_forward_evidence_preserves_recipe_replay_boundary():
     assert report["operations"][0]["evidence"][0]["case_id"] == "test_swiglu[bf16]"
 
 
+def test_model_output_gradient_report_is_not_operator_evidence():
+    proof = evidence()
+    proof["kind"] = "model_determinism_replay"
+    with pytest.raises(ValueError, match="Unsupported coverage report"):
+        build_report([inventory()], [proof])
+
+
+def test_module_configuration_requires_an_explicit_matching_adapter():
+    request, proof = inventory(), evidence()
+    configuration = {"normalization": "RMSNorm", "eps": 1e-5}
+    proof["cases"][0]["observations"][0]["signature"]["configuration"] = configuration
+    assert build_report([request], [proof])["counts"][UNVERIFIED] == 1
+    request["operations"][0]["signature"]["configuration"] = configuration
+    assert build_report([request], [proof])["counts"][DETERMINISTIC] == 1
+    request["operations"][0]["signature"]["configuration"] = {**configuration, "eps": 1e-6}
+    assert build_report([request], [proof])["counts"][UNVERIFIED] == 1
+
+
 @pytest.mark.parametrize(
     "dimension",
     ["revision", "gpu", "dtype", "shape", "stride", "mode", "runtime", "implementation", "op_id"],
