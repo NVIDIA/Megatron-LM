@@ -291,6 +291,8 @@ class LayerNormalizedEntropyMetric(LogicalReductionMetric):
 class _SampledMedianContinuation:
     remaining_axes: tuple[str, ...]
     label: str
+    sample: MetricTensor | None = None
+    sizes: tuple[int, ...] | None = None
 
 
 class LayerSampledMedianMetric(TensorMetric):
@@ -298,8 +300,9 @@ class LayerSampledMedianMetric(TensorMetric):
 
     Approximately `1 / sample_factor` of every nonempty local tensor is retained during
     `prepare`. Samples from repeated observations are concatenated locally, then explicitly
-    all-gathered across every `Shard` axis before their median is computed. The participating
-    ranks must have equally sized local samples, as required by `AllGather`.
+    all-gathered across every `Shard` axis before their median is computed. Each gather first
+    exchanges sample lengths, then pads to a common size and removes that padding afterward.
+    Unequal and empty shards are supported; an entirely empty population produces NaN.
 
     Args:
         sample_factor: Approximate reduction in retained elements. A value of 100 samples about
@@ -325,6 +328,17 @@ class LayerSampledMedianMetric(TensorMetric):
         sampled = []
         for value in LayerL2NormMetric._selected_values(values):
             tensor = value.tensor.reshape(-1)
+            # Sampling flattens every population dimension, including sources that compact
+            # padding on some microbatches but retain sequence/batch dimensions on others.
+            relations = tuple(
+                (
+                    RankRelation(relation.axis, Shard(0))
+                    if isinstance(relation.placement, Shard)
+                    else relation
+                )
+                for relation in value.rank_relations
+            )
+            value = value.with_tensor(tensor, relations)
             if not tensor.numel():
                 sampled.append(value.with_tensor(tensor))
                 continue
@@ -377,19 +391,52 @@ class LayerSampledMedianMetric(TensorMetric):
             raise ValueError("Invalid sampled-median continuation.")
         if len(values) != 1:
             raise ValueError("Sampled median requires exactly one collective completion.")
-        return self._gather_or_finish(values[0], continuation.remaining_axes, continuation.label)
+        value = values[0]
+        if continuation.sample is not None:
+            # Gather sizes reach the host only at metric completion, never in the forward hook.
+            # Dynamic all-gather allocation requires these lengths; sample values stay on device.
+            sizes = tuple(value.tensor.tolist())
+            width = max(1, max(sizes))
+            sample = continuation.sample
+            padded = torch.nn.functional.pad(sample.tensor, (0, width - sample.tensor.numel()))
+            return CollectiveStage(
+                (
+                    CollectiveRequest(
+                        sample.with_tensor(padded), continuation.remaining_axes[0], AllGather(0)
+                    ),
+                ),
+                _SampledMedianContinuation(
+                    continuation.remaining_axes[1:], continuation.label, sizes=sizes
+                ),
+            )
+        if continuation.sizes is not None:
+            width = max(1, max(continuation.sizes))
+            sample = torch.cat(
+                tuple(
+                    value.tensor.narrow(0, rank * width, size)
+                    for rank, size in enumerate(continuation.sizes)
+                )
+            )
+            value = value.with_tensor(sample)
+        return self._gather_or_finish(value, continuation.remaining_axes, continuation.label)
 
     @staticmethod
     def _gather_or_finish(
         value: MetricTensor, remaining_axes: tuple[str, ...], label: str
     ) -> MetricStep:
         if remaining_axes:
+            size = value.tensor.new_tensor([value.tensor.numel()], dtype=torch.int64)
             return CollectiveStage(
-                (CollectiveRequest(value, remaining_axes[0], AllGather(dim=0)),),
-                _SampledMedianContinuation(remaining_axes[1:], label),
+                (CollectiveRequest(value.with_tensor(size), remaining_axes[0], AllGather(dim=0)),),
+                _SampledMedianContinuation(remaining_axes, label, sample=value),
             )
         if not value.tensor.numel():
-            raise ValueError("Sampled median requires at least one sampled element.")
+            return MetricResult(
+                value.tensor.new_full(
+                    (), float("nan"), dtype=_accumulation_dtype(value.tensor.dtype)
+                ),
+                label,
+            )
         sample = value.tensor.to(dtype=_accumulation_dtype(value.tensor.dtype))
         return MetricResult(torch.quantile(sample, 0.5), label)
 
