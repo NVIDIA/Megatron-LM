@@ -239,7 +239,16 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
     ) -> GroupRolloutParams:
 
         prompt, golden = await self.get_prompt(validation=request.validation)
+        return self.group_rollout_params(request, prompt=prompt, golden=golden)
 
+    def group_rollout_params(
+        self,
+        request: RolloutRequest | GroupedRolloutRequest,
+        *,
+        prompt: str | list[LLMChatMessage],
+        golden: Any,
+    ) -> GroupRolloutParams:
+        """The params for one group's rollouts on an already sampled prompt."""
         # Every rollout runs as a (possibly multi-turn) episode over the group's shared prompt.
         return GroupRolloutParams(
             run_episode=functools.partial(self._run_episode, request, prompt=prompt, golden=golden),
