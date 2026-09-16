@@ -21,6 +21,10 @@ python -m tools.determinism.run_state_replay \
 # One node, one worker per GPU, TP=4. Requires the MCore GPU dependency stack.
 python -m tools.determinism.run_state_replay \
   --backend mcore_gpt --world-size 4 --output /tmp/state-replay-gpu
+
+# Actual pretrain_gpt loop: TP=2, DP=2, BF16 and distributed optimizer/checkpoints.
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 --output /tmp/state-replay-training
 ```
 
 The output directory must be new. By default the protocol runs four steps,
@@ -31,8 +35,10 @@ saves a checkpoint at step 2, and performs four separate process launches:
 3. A new process that loads the reference checkpoint and executes steps 3–4.
 4. A resume that omits RNG restore, which must produce an observed mismatch.
 
-`--control optimizer`, `--control scheduler` and `--control dataloader` select
-other deliberately omitted restores. No reference golden values are changed.
+For `cpu` and `mcore_gpt`, `--control optimizer`, `--control scheduler` and
+`--control dataloader` select other deliberately omitted restores. The real
+`megatron_gpt` training adapter currently supports the RNG control, using the
+existing checkpoint loader's `no_load_rng` flag. No goldens are changed.
 Fresh replay compares every step; resumed runs compare every post-checkpoint
 step. Every declared rank is required, including ranks without logged loss.
 
@@ -44,10 +50,53 @@ optimizer, mixed-precision master weights, FP8/FP4 and production data loaders
 need additional adapters and validation. This pilot does not certify those
 paths or the named Nemotron/DSV recipes.
 
-The H100 and GB200 `determinism-state.yaml` recipes run the GPU protocol with
-eight and four ranks respectively. They use the existing integration-test
+The H100 and GB200 `determinism-state.yaml` recipes each select two jobs: the
+`mcore_gpt` pilot and the `megatron_gpt` training adapter, with eight and four
+ranks respectively. They use the existing integration-test
 selection path; actual scheduling still depends on the CI scope and protected
 runner approval. A configured recipe is not GPU execution evidence.
+
+## Real Megatron training adapter
+
+`megatron_gpt` executes the repository's `pretrain_gpt.py`, including its real
+language-model loss, forward/backward schedule, distributed Adam optimizer,
+learning-rate scheduler, sampler, and synchronous `torch_dist` save/load path.
+It uses TP=2, PP=CP=1 and DP=2/4 on four/eight GPUs, BF16 model weights and FP32
+master parameters, dropout, and two 128-hidden-size transformer layers.
+MockGPT uses 512 documents with maximum document length 64; those explicit
+test-data dimensions are recorded alongside the full training arguments.
+
+The diagnostic worker temporarily observes the training module's loader,
+train, checkpoint and post-step callbacks. The callbacks retain their original
+behavior and return values. Capture runs after optimizer/scheduler updates and
+consumed-sample bookkeeping, before checkpoint save and the next zero-grad.
+Successful entrypoint completion and every required step remain mandatory.
+
+The optimizer adapter reads each chained optimizer's **inner** state dict and
+local master-parameter groups. The distributed optimizer's outer `state_dict`
+intentionally omits parameter-dependent moments and is insufficient. Both Adam
+moments, group/step state, local master parameters/gradients, loss scale and
+scaler state are captured without gathering shards. Every rank is required.
+
+The loader adapter supports the single-pass MockGPT sampler with zero workers.
+It records the actual index arrays, document lengths, cached masks/positions,
+dedicated loader RNG and sampler configuration. It derives the absolute next
+sample from the iterator's observed yields plus its initial sampler position,
+then checks that against training's consumed-sample counter. A resumed iterator
+has a different local yield count; its canonical next sample must match.
+Worker prefetch, cyclic/external loaders and real-data content identity require
+additional adapters. They are rejected, rather than represented as only a cursor.
+
+The reference records every file in the completed distributed checkpoint
+directory. Resume validates that same directory before and after Megatron's
+load and checks the returned iteration. Comparison rechecks the real files;
+changed, missing or additional shards invalidate the evidence. Checkpoint
+hashes identify the loaded files; state comparisons still use raw bytes.
+
+This is an additional GPU validation recipe, **not an executed GPU result**.
+FP8/FP4, precision-aware/offloaded optimizers, communication overlap,
+PP/VPP/CP/EP/FSDP, real datasets and production recipe stop-point validation
+remain separate work. Unsupported state formats fail visibly.
 
 ## Capture contract
 
@@ -85,8 +134,9 @@ The pilot saves each rank's checkpoint with `checkpoint_path` and
 `record_checkpoint`. Resume verifies the actual file identity and records the
 reference run, rank, step and checksum. Checkpoint checksums establish which
 file was loaded; state equality is checked using the complete captured bytes,
-not hashes. A distributed-checkpoint or production-loader adapter must extend
-the checkpoint producer/restore path rather than relabel this pilot's files.
+not hashes. `record_checkpoint_directory` and `read_checkpoint_record` provide
+the corresponding identity contract for the real distributed checkpoint;
+the adapter continues to use Megatron's existing producer/restore path.
 
 ## Inspect results
 

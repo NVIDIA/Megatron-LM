@@ -367,6 +367,65 @@ def record_checkpoint(directory: Path, *, step: int, rank: int, run_id: str) -> 
     return record
 
 
+def _checkpoint_files(directory: Path) -> dict:
+    """Enumerate a completed checkpoint directory without following symlinks."""
+    if not directory.is_dir() or directory.is_symlink():
+        raise UnverifiedState("Checkpoint must be a real directory")
+    files = {}
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise UnverifiedState("Checkpoint symlinks are unsupported")
+        if path.is_file():
+            files[path.relative_to(directory).as_posix()] = file_sha256(path)
+        elif not path.is_dir():
+            raise UnverifiedState("Checkpoint contains a non-regular file")
+    if not files:
+        raise UnverifiedState("Empty checkpoint directory")
+    return files
+
+
+def record_checkpoint_directory(
+    directory: Path, *, checkpoint_directory: Path, step: int, rank: int, run_id: str
+) -> dict:
+    """Record all files in an actual, synchronously completed Megatron checkpoint."""
+    relative = checkpoint_directory.resolve().relative_to(directory.resolve()).as_posix()
+    files = _checkpoint_files(checkpoint_directory)
+    record = {
+        "run_id": run_id,
+        "step": step,
+        "rank": rank,
+        "checkpoint_directory": relative,
+        "checkpoint_files": files,
+        "checkpoint_sha256": hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest(),
+    }
+    path = checkpoint_path(directory, step, rank).with_suffix(".json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x") as stream:
+        json.dump(record, stream, indent=2)
+    return record
+
+
+def read_checkpoint_record(directory: Path, *, step: int, rank: int) -> dict:
+    """Verify actual checkpoint contents before loading or comparing a resume."""
+    path = checkpoint_path(directory, step, rank)
+    record = json.loads(path.with_suffix(".json").read_text())
+    if record["step"] != step or record["rank"] != rank:
+        raise UnverifiedState("Checkpoint rank/step differs from its record")
+    if "checkpoint_directory" in record:
+        root = directory / record["checkpoint_directory"]
+        if root.is_symlink() or not root.resolve().is_relative_to(directory.resolve()):
+            raise UnverifiedState("Checkpoint directory escapes its run")
+        files = _checkpoint_files(root)
+        digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+        if files != record["checkpoint_files"]:
+            raise UnverifiedState("Reference checkpoint files changed after recording")
+    else:
+        digest = file_sha256(path)
+    if record["checkpoint_sha256"] != digest:
+        raise UnverifiedState("Reference checkpoint changed after recording")
+    return record
+
+
 def compare_runs(
     reference: Path, candidate: Path, *, steps: list[int], world_size: int, comparison: str
 ) -> dict:
@@ -466,10 +525,7 @@ def compare_runs(
                     resume_by_rank[rank] = resumed
                     checkpoint_key = (resumed["step"], rank)
                     if checkpoint_key not in checkpoint_records:
-                        checkpoint = checkpoint_path(reference, resumed["step"], rank)
-                        record = json.loads(checkpoint.with_suffix(".json").read_text())
-                        if record["checkpoint_sha256"] != file_sha256(checkpoint):
-                            raise UnverifiedState("Reference checkpoint changed after recording")
+                        record = read_checkpoint_record(reference, step=resumed["step"], rank=rank)
                         checkpoint_records[checkpoint_key] = record
                     if resumed != checkpoint_records[checkpoint_key] or resumed["rank"] != rank:
                         raise UnverifiedState("Resume checkpoint identity does not match reference")

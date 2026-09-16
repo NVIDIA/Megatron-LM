@@ -91,6 +91,23 @@ def test_equal_complete_state_across_declared_steps_and_ranks(pair):
     assert result["first_difference"] is None
 
 
+def test_resume_verifies_actual_distributed_checkpoint_files(tmp_path, pair):
+    root = tmp_path / "reference"
+    checkpoint = root / "megatron-checkpoints/iter_0000001"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "common.pt").write_bytes(b"common")
+    (checkpoint / "rank.distcp").write_bytes(b"shard")
+    record = states.record_checkpoint_directory(
+        root, checkpoint_directory=checkpoint, step=1, rank=0, run_id="run-0"
+    )
+    roots = pair(steps=(2,), resume_from=record)
+    assert compare(roots, steps=(2,), comparison="resume")["status"] == "equal"
+    (checkpoint / "rank.distcp").write_bytes(b"changed shard")
+    result = compare(roots, steps=(2,), comparison="resume")
+    assert result["status"] == "not_verified"
+    assert "checkpoint files changed" in result["reason"]
+
+
 @pytest.mark.parametrize("component", states.COMPONENTS)
 def test_each_state_component_can_break_equality(pair, state, component):
     changed = copy.deepcopy(state)

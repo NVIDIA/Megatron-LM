@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "determinism_state_{environment}_{platforms}"
+  name: "determinism_state_{state_backend}_{environment}_{platforms}"
   model: gpt
   nodes: 1
   build: mcore-pyt-{environment}
@@ -36,7 +36,7 @@ spec:
     STATE_RUN_PARENT=$(mktemp -d "{assets_dir}/logs/training-state.XXXXXX")
     # The protocol owns its four launches; repeat counts do not weaken its gates.
     python -m tools.determinism.run_state_replay \
-      --backend mcore_gpt --world-size {gpus} \
+      --backend {state_backend} --world-size {gpus} \
       --steps 4 --checkpoint-step 2 --control rng \
       --output "$STATE_RUN_PARENT/protocol"
 
@@ -44,6 +44,7 @@ products:
   - test_case: [determinism_state]
     products:
       - environment: [dev]
+        state_backend: [mcore_gpt, megatron_gpt]
         scope: [mr-github]
         cadence: [pr, nightly]
         platforms: [dgx_h100]

@@ -43,10 +43,12 @@ def run_protocol(
     The output must be new. Raw state, command lines, checkpoint identity and
     worker logs remain available when a comparison or child process fails.
     """
-    if backend not in ("cpu", "mcore_gpt") or world_size not in (1, 2, 4, 8):
+    if backend not in ("cpu", "mcore_gpt", "megatron_gpt") or world_size not in (1, 2, 4, 8):
         raise ValueError("Unsupported backend or world size")
     if backend == "cpu" and world_size != 1:
         raise ValueError("The CPU harness validation recipe uses one process")
+    if backend == "megatron_gpt" and (world_size not in (4, 8) or control != "rng"):
+        raise ValueError("Megatron training uses four/eight ranks and an omitted-RNG control")
     if not 0 < checkpoint_step < steps or control not in (
         "rng",
         "optimizer",
@@ -82,7 +84,7 @@ def run_protocol(
     try:
         for name in ("reference", "repeat", "resume", "control"):
             command = [sys.executable]
-            if backend == "mcore_gpt":
+            if backend != "cpu":
                 command += [
                     "-m",
                     "torch.distributed.run",
@@ -93,7 +95,11 @@ def run_protocol(
                 ]
             command += [
                 "-m",
-                "tools.determinism.state_replay_worker",
+                (
+                    "tools.determinism.megatron_state_worker"
+                    if backend == "megatron_gpt"
+                    else "tools.determinism.state_replay_worker"
+                ),
                 "--backend",
                 backend,
                 "--output",
@@ -154,7 +160,7 @@ def main() -> int:
     """Run the protocol and return a gate status; unverified evidence cannot pass."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--backend", choices=("cpu", "mcore_gpt"), required=True)
+    parser.add_argument("--backend", choices=("cpu", "mcore_gpt", "megatron_gpt"), required=True)
     parser.add_argument("--world-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
