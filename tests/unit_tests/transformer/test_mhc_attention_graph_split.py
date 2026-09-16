@@ -501,6 +501,7 @@ def test_gpu_mhc_split_replay_matches_eager(hybrid, mla_recompute, packed):
         attention_dropout=0.0,
         attention_backend=AttnBackend.fused if packed else AttnBackend.unfused,
         bf16=packed,
+        params_dtype=torch.bfloat16 if packed else torch.float32,
         create_attention_mask_in_dataloader=False,
         gradient_accumulation_fusion=False,
         use_cpu_initialization=True,
