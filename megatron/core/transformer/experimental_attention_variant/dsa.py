@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fp8_utils import get_fp8_disabled_context
@@ -29,6 +28,9 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_kernels,
     dsa_layout,
     dsa_masking,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
+    DSAIndexerLossLoggingHelper,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -287,179 +289,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size**-0.5)
-
-
-class DSAIndexerLossLoggingHelper:
-    """Helper class for logging sparse attention indexer losses."""
-
-    tracker = {}
-
-    @staticmethod
-    def save_loss_to_tracker(
-        loss: torch.Tensor,
-        layer_number: int,
-        num_layers: int,
-        reduce_group: torch.distributed.ProcessGroup = None,
-        avg_group: torch.distributed.ProcessGroup = None,
-    ):
-        """Save the indexer loss for logging.
-
-        Args:
-            loss: The loss tensor.
-            layer_number: Layer index of the loss, 1-indexed.
-            num_layers: The number of total layers.
-            reduce_group: The group for reducing the loss.
-            avg_group: The group for averaging the loss.
-        """
-        # Skip indexer loss logging if layer_number is None.
-        if layer_number is None:
-            return
-
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
-        # (whose layer_number can exceed config.num_layers + config.mtp_num_layers when
-        # each MTP depth contains multiple hybrid layers) don't index out of bounds.
-        # Grow lazily; with PP=1 every rank takes the same path, so sizes stay consistent.
-        needed = max(num_layers, layer_number)
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
-        elif tracker["values"].shape[0] < needed:
-            grown = torch.zeros(
-                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
-            )
-            grown[: tracker["values"].shape[0]] = tracker["values"]
-            tracker["values"] = grown
-        tracker["values"][layer_number - 1] += loss.detach()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
-
-    @staticmethod
-    def clean_loss_in_tracker(preserve_groups: bool = False):
-        """Clear the indexer losses."""
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        reduce_group = tracker.get("reduce_group") if preserve_groups else None
-        avg_group = tracker.get("avg_group") if preserve_groups else None
-        if "values" in tracker:
-            tracker["values"].zero_()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
-
-    @staticmethod
-    def reduce_loss_in_tracker(num_layers: Optional[int] = None):
-        """Collect and reduce the indexer losses across ranks.
-
-        Cross-PP `all_reduce` must be invoked on every rank in the pipeline-parallel group,
-        otherwise ranks without any indexer layer would skip the collective and cause a hang.
-        Pass `num_layers` to lazily initialize the tracker on such ranks so they participate
-        with a zero-filled tensor.
-
-        Args:
-            num_layers: Total number of decoder layers; required to lazily initialize the
-                tracker on ranks where no indexer layer ran.
-        """
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-
-        # Agree on a consistent tracker size across the PP group BEFORE the collective.
-        # Ranks owning indexer layers may have grown the tracker via save_loss_to_tracker
-        # (e.g. an MTP layer whose layer_number exceeds num_layers), while ranks without any
-        # indexer layer have only a num_layers-sized (or absent) tracker. all_reduce requires
-        # identical shapes on every rank, so reduce-MAX the local size first, then pad to it
-        # (otherwise PP>1 hangs / errors on mismatched sizes).
-        # The agreed size (max over the PP group) is constant across iterations (num_layers and
-        # the layer numbering don't change), so compute it once and cache it. This avoids a
-        # per-iteration CPU-GPU sync (.item()); the size-negotiation all_reduce + .item() runs
-        # only on the first call. Every PP rank caches on the same (first) call, so later steps
-        # all skip it consistently.
-        if tracker.get("agreed_size") is not None:
-            size = tracker["agreed_size"]
-        else:
-            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
-            size_t = torch.tensor(
-                [local_size], device=torch.cuda.current_device(), dtype=torch.long
-            )
-            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
-            size = int(size_t.item())
-            tracker["agreed_size"] = size
-        if size == 0:
-            return
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
-        elif tracker["values"].shape[0] < size:
-            grown = torch.zeros(
-                size, device=tracker["values"].device, dtype=tracker["values"].dtype
-            )
-            grown[: tracker["values"].shape[0]] = tracker["values"]
-            tracker["values"] = grown
-        values = tracker["values"]
-
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce indexer losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
-        )
-
-    @staticmethod
-    def track_indexer_metrics(
-        loss_scale: float,
-        iteration: int,
-        writer,
-        wandb_writer=None,
-        total_loss_dict=None,
-        per_layer_logging: bool = False,
-        num_layers: Optional[int] = None,
-        num_indexer_layers: Optional[int] = None,
-        preserve_groups: bool = False,
-    ):
-        """Track the sparse attention indexer metrics for logging.
-
-        Args:
-            loss_scale: Scale factor for the loss.
-            iteration: Current training iteration.
-            writer: TensorBoard writer.
-            wandb_writer: Weights & Biases writer.
-            total_loss_dict: Dictionary to accumulate total losses.
-            per_layer_logging: Whether to log per-layer losses.
-            num_layers: Total decoder layer count used to initialize empty PP ranks.
-            num_indexer_layers: Number of layers that own an indexer. Defaults to
-                the tracker size when every tracked layer owns one.
-            preserve_groups: Keep reduction groups after logging for CUDA Graph runs.
-        """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(num_layers=num_layers)
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
-            return
-
-        indexer_loss_values = tracker["values"] * loss_scale
-        if num_indexer_layers is None:
-            num_indexer_layers = indexer_loss_values.shape[0]
-
-        # Average across layers that actually own an indexer; layers without one
-        # contribute zero in `tracker["values"]` so they must not be in the divisor.
-        avg_indexer_loss = indexer_loss_values.sum() / max(num_indexer_layers, 1)
-
-        # Log average loss
-        if total_loss_dict is not None:
-            if "indexer loss" in total_loss_dict:
-                total_loss_dict["indexer loss"] += avg_indexer_loss
-            else:
-                total_loss_dict["indexer loss"] = avg_indexer_loss
-
-        if writer is not None:
-            writer.add_scalar("indexer loss", avg_indexer_loss, iteration)
-
-        if wandb_writer is not None:
-            wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
-
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
 
 def compute_dsa_indexer_loss(
@@ -1936,6 +1765,7 @@ class DSAttention(MegatronModule):
 
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True
+    logs_dsa_indexer_loss = True
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
     _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
 

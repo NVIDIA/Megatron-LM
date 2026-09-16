@@ -64,6 +64,7 @@ def _make_gpt_args(
     args.moe_latent_size = None
     args.moe_shared_expert_intermediate_size = None
     args.mtp_num_layers = None
+    args.mtp_use_repeated_layer = False
     # Linear attention disabled.
     args.experimental_attention_variant = None
     args.linear_attention_freq = None
@@ -1044,6 +1045,34 @@ class TestDSv4Hybrid:
         bshd_flops = num_floating_point_operations(args, batch_size)
         assert flops < bshd_flops
 
+    @pytest.mark.parametrize(
+        ("mtp_use_repeated_layer", "expected_ratio_counts"), [(False, (2, 3, 2)), (True, (1, 5, 1))]
+    )
+    def test_mtp_repeated_layer_reuses_first_mtp_ratio(
+        self, monkeypatch, mtp_use_repeated_layer, expected_ratio_counts
+    ):
+        """DSv4 FLOPs count the compression ratio the repeated layer executes."""
+        args = _make_dsv4_args()
+        args.mtp_num_layers = 3
+        args.mtp_use_repeated_layer = mtp_use_repeated_layer
+        args.csa_compress_ratios = [0, 4, 128, 4, 4, 128, 0]
+        observed_ratio_counts = []
+        original_dsv4_flops = training_module._dsv4_hybrid_self_attention_flops
+
+        def capture_ratio_counts(**kwargs):
+            observed_ratio_counts.append(
+                (kwargs["n_layers_r0"], kwargs["n_layers_r4"], kwargs["n_layers_r128"])
+            )
+            return original_dsv4_flops(**kwargs)
+
+        monkeypatch.setattr(
+            training_module, "_dsv4_hybrid_self_attention_flops", capture_ratio_counts
+        )
+
+        num_floating_point_operations(args, batch_size=2)
+
+        assert observed_ratio_counts == [expected_ratio_counts]
+
 
 # ``compress_ratio -> hybrid attention symbol``: Window (r0) / CSA (r4) / HCA (r128).
 _RATIO_TO_SYMBOL = {0: "W", 4: "C", 128: "H"}
@@ -1370,6 +1399,33 @@ class TestDSA:
         assert num_floating_point_operations(args, batch_size) < num_floating_point_operations(
             no_sharing, batch_size
         )
+
+    @pytest.mark.parametrize(
+        ("num_decoder_layers", "mtp_use_repeated_layer", "expected_indexer_executions"),
+        [(78, False, 23), (78, True, 28), (80, False, 24), (80, True, 22)],
+    )
+    def test_cross_layer_index_sharing_with_repeated_mtp(
+        self, monkeypatch, num_decoder_layers, mtp_use_repeated_layer, expected_indexer_executions
+    ):
+        """MTP indexer FLOPs follow runtime layer numbering in repeated mode."""
+        args = _make_dsa_args()
+        args.num_layers = num_decoder_layers
+        args.mtp_num_layers = 7
+        args.mtp_use_repeated_layer = mtp_use_repeated_layer
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 3
+        observed_indexer_executions = []
+        original_indexer_flops = training_module._dsa_indexer_flops
+
+        def capture_indexer_count(**kwargs):
+            observed_indexer_executions.append(kwargs["num_indexer_layers"])
+            return original_indexer_flops(**kwargs)
+
+        monkeypatch.setattr(training_module, "_dsa_indexer_flops", capture_indexer_count)
+
+        num_floating_point_operations(args, batch_size=2)
+
+        assert observed_indexer_executions == [expected_indexer_executions]
 
     def test_topk_caps_long_context_growth(self):
         """Pin the bug: a long sequence must not be charged dense ``L^2 / 2``.
