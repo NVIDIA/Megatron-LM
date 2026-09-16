@@ -396,15 +396,16 @@ class TestMultiTokenPredictionLayer:
 
     @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
     def test_mtp_hsm_requires_multiple_layers(self, mtp_num_layers):
-        """TransformerConfig rejects HSM when there is no history to mix."""
+        """The MTP block rejects HSM when there is no history to mix."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=4,
+            num_attention_heads=1,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
         with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
-            TransformerConfig(
-                num_layers=2,
-                hidden_size=4,
-                num_attention_heads=1,
-                mtp_num_layers=mtp_num_layers,
-                mtp_hsm=True,
-            )
+            MultiTokenPredictionBlock(config=config, spec=object(), mtp_num_depths=0)
 
     @pytest.mark.parametrize(
         ("training", "expected_second_input"), [(True, [1.0, 2.0]), (False, [2.0, 2.0])]
@@ -3255,7 +3256,7 @@ class TestMultiTokenPredictionHybrid:
         layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
         torch.nn.Module.__init__(layer)
         layer.config = types.SimpleNamespace(recompute_granularity='full')
-        layer.mtp_layer_pattern = "M"
+        layer.is_hybrid_mtp = True
         layer.training = True
 
         input_ids = torch.arange(4).reshape(1, 4)
@@ -3525,6 +3526,7 @@ class TestMultiTokenPredictionHybrid:
             ),
             pre_process=False,
             post_process=True,
+            hybrid_layer_config_list=None,
             position_embedding_type='none',
             decoder=decoder,
             share_embeddings_and_output_weights=False,
