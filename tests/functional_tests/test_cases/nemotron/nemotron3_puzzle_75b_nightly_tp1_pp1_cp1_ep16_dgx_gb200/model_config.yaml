@@ -5,7 +5,7 @@ ENV_VARS:
   TORCH_NCCL_AVOID_RECORD_STREAMS: 1
   TORCH_NCCL_HIGH_PRIORITY: 1
   CUDA_DEVICE_MAX_CONNECTIONS: 32
-  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 16
   NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: 128
   NVLINK_DOMAIN_SIZE: 72
   USE_MNNVL: 1
@@ -20,11 +20,11 @@ TEST_TYPE: ckpt-resume
 
 MODEL_ARGS:
   # Full Puzzle architecture and its MTP head are defined in this test case's puzzle.py.
-  # Distributed topology: 2 nodes x 4 GB200 GPUs.
+  # Distributed topology: 4 nodes x 4 GB200 GPUs in one NVLink domain.
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
   --context-parallel-size: 1
-  --expert-model-parallel-size: 8
+  --expert-model-parallel-size: 16
   --expert-tensor-parallel-size: 1
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
