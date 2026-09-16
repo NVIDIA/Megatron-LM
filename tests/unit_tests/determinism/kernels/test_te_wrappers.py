@@ -174,24 +174,32 @@ class TestTEWrappers:
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
     @pytest.mark.parametrize(
-        ("recipe_storage", "global_recipe", "middle_uses_mxfp8"),
+        ("recipe_storage", "global_recipe", "transformer_impl", "middle_uses_mxfp8"),
         [
-            ({}, Fp8Recipe.mxfp8, True),
-            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, True),
-            ({"fp8_param": False}, Fp8Recipe.mxfp8, False),
-            ({}, Fp8Recipe.tensorwise, False),
+            ({}, Fp8Recipe.mxfp8, "inference_optimized", True),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "inference_optimized", True),
+            ({"fp8_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({"inherit_model_init_context": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({"fp4_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({}, Fp8Recipe.tensorwise, "inference_optimized", False),
+            ({}, Fp8Recipe.mxfp8, "transformer_engine", False),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "transformer_engine", True),
         ],
         ids=[
             "automatic-inheritance",
             "explicit-inheritance",
             "explicit-bf16-override",
+            "explicit-no-inheritance",
+            "explicit-fp4-storage-option",
             "mismatched-global-recipe",
+            "training-default-unchanged",
+            "training-explicit-inheritance",
         ],
     )
     def test_per_module_mxfp8_recipe_model_init_policy(
-        self, recipe_storage, global_recipe, middle_uses_mxfp8
+        self, recipe_storage, global_recipe, transformer_impl, middle_uses_mxfp8
     ):
-        """A matching global MXFP8 policy is inherited unless storage is explicit."""
+        """Only inference inherits MXFP8 storage automatically; explicit choices win."""
         training_recipe = {"fp8_quantization_recipe": "mxfp8", "override_quantized_autocast": True}
         training_recipe.update(recipe_storage)
         recipe = RecipeConfig.from_config_dict(
@@ -236,6 +244,9 @@ class TestTEWrappers:
             fp8="hybrid",
             fp8_recipe=global_recipe,
             fp8_param=True,
+            transformer_impl=transformer_impl,
+            normalization="RMSNorm",
+            moe_router_dtype="fp32",
             quant_recipe=recipe,
             first_last_layers_bf16=True,
             num_layers_at_start_in_bf16=1,

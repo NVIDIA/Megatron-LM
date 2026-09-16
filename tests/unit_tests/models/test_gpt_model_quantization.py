@@ -576,8 +576,17 @@ class TestGPTModelTEQuantizationConfig:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "inference_optimized"])
-    def test_selective_mxfp8_parameter_storage_at_construction(self, transformer_impl):
+    @pytest.mark.parametrize(
+        ("transformer_impl", "recipe_storage"),
+        [
+            ("transformer_engine", {}),
+            ("transformer_engine", {"inherit_model_init_context": True}),
+            ("inference_optimized", {}),
+        ],
+    )
+    def test_selective_mxfp8_parameter_storage_at_construction(
+        self, transformer_impl, recipe_storage
+    ):
         """Recipe names must reach constructors, before checkpoint values are quantized."""
         if torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("MXFP8 parameter initialization requires Blackwell or newer")
@@ -617,6 +626,7 @@ class TestGPTModelTEQuantizationConfig:
                             "transformer_engine_config_type": "TEQuantizationParams",
                             "training_recipe": {
                                 "fp8_quantization_recipe": "mxfp8",
+                                **recipe_storage,
                                 "override_quantized_autocast": True,
                             },
                         },
@@ -647,15 +657,20 @@ class TestGPTModelTEQuantizationConfig:
             max_sequence_length=32,
         )
         quantized_names = []
+        use_mxfp8_storage = transformer_impl == "inference_optimized" or recipe_storage.get(
+            "inherit_model_init_context", False
+        )
         for name, parameter in model.named_parameters():
             expected_mxfp8 = (
-                name.startswith(("decoder.layers.2.", "decoder.layers.3."))
+                use_mxfp8_storage
+                and name.startswith(("decoder.layers.2.", "decoder.layers.3."))
                 and ".mlp.experts.linear_fc" in name
             )
             assert isinstance(parameter, MXFP8Tensor) == expected_mxfp8, name
             if expected_mxfp8:
                 quantized_names.append(name)
-        assert len(quantized_names) == 8  # two middle layers, two projections, two experts
+        # Two middle layers, two projections, two experts; training defaults remain BF16.
+        assert len(quantized_names) == (8 if use_mxfp8_storage else 0)
 
     def test_te_config_resolution_dense(self) -> None:
         from megatron.core.extensions.transformer_engine import (
