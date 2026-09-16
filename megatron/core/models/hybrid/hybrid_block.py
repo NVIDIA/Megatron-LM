@@ -512,13 +512,11 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         expert offload is intentionally outside the Hybrid CUDA Graph support in this
         change, so this wrapper must not enter or flush that queue around replay.
         """
-        if self._uses_mhc_recompute_attn_cuda_graph_split():
-            try:
-                return self._replay_mhc_attention_cuda_graph(args, kwargs)
-            finally:
-                self._te_cuda_graph_route_replay_state = None
-        self._decompose_packed_seq_params_to_kwargs(kwargs)
-        return self._te_cuda_graph_replay_impl(args, kwargs)
+        try:
+            self._decompose_packed_seq_params_to_kwargs(kwargs)
+            return self._te_cuda_graph_replay_impl(args, kwargs)
+        finally:
+            self._te_cuda_graph_route_replay_state = None
 
     def _forward_mhc_attention_cuda_graph_consumer(
         self,
@@ -555,17 +553,24 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
         graph_kwargs = {
             name: kwargs[name]
-            for name in (
-                "attention_mask",
-                "rotary_pos_emb",
-                "sequence_len_offset",
-                "padding_mask",
-                "packed_seq_params",
-            )
+            for name in ("attention_mask", "rotary_pos_emb", "sequence_len_offset", "padding_mask")
             if name in kwargs and (kwargs[name] is not None or name == "attention_mask")
         }
-        # Resolve packed route metadata before selecting the matching mHC input slot.
-        self._decompose_packed_seq_params_to_kwargs(graph_kwargs)
+        # The outer replay boundary already decomposed packed metadata and resolved its slot.
+        graph_kwargs.update(
+            {
+                name: kwargs[name]
+                for name in (
+                    "cu_seqlens_q",
+                    "cu_seqlens_kv",
+                    "cu_seqlens_q_padded",
+                    "cu_seqlens_kv_padded",
+                    "dsa_cp_graph_layout_buffer",
+                    "dsa_cp_graph_route_buffer",
+                )
+                if name in kwargs
+            }
+        )
 
         manager = getattr(self, '_mhc_recompute_manager', None)
         output_slot = None
@@ -599,6 +604,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def _te_cuda_graph_replay_impl(self, args, kwargs):
         """Replay the wrapper graph, then run any eager continuation."""
+        if self._uses_mhc_recompute_attn_cuda_graph_split():
+            return self._replay_mhc_attention_cuda_graph(args, kwargs)
 
         group_tail = self._get_te_cuda_graph_group_tail()
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))

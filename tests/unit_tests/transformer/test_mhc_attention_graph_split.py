@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import sys
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
@@ -11,8 +12,11 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRecomputeSlotMetadata
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -223,6 +227,64 @@ class TestHybridMHCAttentionGraphSplit:
         assert call["manager"] is (None if is_group_end else manager)
 
 
+@pytest.mark.parametrize("slot_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_mhc_aggregate_slot_dtype_preserves_recompute_and_gradients(
+    hybrid_split_wrapper, monkeypatch, slot_dtype
+):
+    """Cast after aggregation and restore the graph's fixed input before backward."""
+    import megatron.core.tensor_parallel.random as random_module
+
+    # The computation is deterministic; CUDA RNG bookkeeping is unnecessary on CPU.
+    monkeypatch.setattr(random_module, "_get_all_rng_states", lambda: ())
+    monkeypatch.setattr(random_module, "_set_all_rng_states", lambda: None)
+    monkeypatch.setattr(random_module, "_fork_rng", nullcontext)
+
+    module = HyperConnectionModule(hybrid_split_wrapper.config, layer_number=1)
+    # Exercise the native math without compiling CPU kernels in this transport test.
+    module._h_aggregate_op = module._h_aggregate_op.__wrapped__
+    module._fused_add_3_op = module._fused_add_3_op.__wrapped__
+    generator = torch.Generator().manual_seed(123)
+    hidden = torch.randn(3, 1, 8, generator=generator, dtype=torch.float32, requires_grad=True)
+    h_pre = torch.randn(3, 1, 2, generator=generator, dtype=torch.float32, requires_grad=True)
+    module.compute_mappings = Mock(return_value=(h_pre, None, None))
+
+    manager = MHCCheckpointManager()
+    static_input = torch.empty(3, 1, 4, dtype=slot_dtype)
+    # Arena construction requires CUDA; retain its real view/address validation on CPU.
+    slot = object.__new__(MHCRecomputeArenaSlot)
+    slot.key = ("attention", 1, "aggregate", 0)
+    slot.consumer = static_input
+    slot.metadata = MHCRecomputeSlotMetadata(
+        shape=static_input.shape,
+        dtype=static_input.dtype,
+        device=static_input.device,
+        layout=static_input.layout,
+        data_ptr=static_input.data_ptr(),
+    )
+    manager.mhc_arena._slots[slot.key] = slot
+
+    ref_hidden = hidden.detach().clone().requires_grad_()
+    ref_h_pre = h_pre.detach().clone().requires_grad_()
+    expected = (ref_hidden.view(3, 1, 2, 4) * ref_h_pre.unsqueeze(-1)).sum(dim=2).to(slot_dtype)
+    expected.float().square().sum().backward()
+
+    aggregate, _, _, residual = module(hidden, mhc_recompute_manager=manager, output_slot=slot)
+    assert residual.dtype == torch.float32
+    assert aggregate.dtype == slot_dtype
+    assert aggregate.data_ptr() == static_input.data_ptr()
+    torch.testing.assert_close(aggregate, expected, atol=0, rtol=0)
+    loss = aggregate.float().square().sum()
+
+    manager.discard_all_outputs()
+    static_input.fill_(float("nan"))
+    manager.recompute_now()
+    assert aggregate.data_ptr() == static_input.data_ptr()
+    torch.testing.assert_close(static_input, expected, atol=0, rtol=0)
+    loss.backward()
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad)
+    torch.testing.assert_close(h_pre.grad, ref_h_pre.grad)
+
+
 @pytest.fixture(params=["gpt", "hybrid"])
 def packed_split_layer(hybrid_split_wrapper, request, monkeypatch):
     """Real packed graph boundaries with CPU-only branch compute and transport."""
@@ -338,15 +400,18 @@ class TestMHCAttentionGraphSplitTHD:
             assert getattr(captured, name) is getattr(packed, name)
         producer.assert_not_called()
 
+    @pytest.mark.parametrize("with_padded_seqlens", [False, True])
     def test_replay_forwards_packed_kwargs_and_preserves_eager_metadata(
-        self, packed_split_layer, monkeypatch
+        self, packed_split_layer, monkeypatch, with_padded_seqlens
     ):
         layer, producer, _ = packed_split_layer
         graph_reads = []
 
         def replay(_self, aggregate, **kwargs):
             assert "packed_seq_params" not in kwargs
-            assert all(isinstance(value, torch.Tensor) for value in kwargs.values())
+            assert all(
+                value is None or isinstance(value, torch.Tensor) for value in kwargs.values()
+            )
             assert set(kwargs) == set(expected)
             for name, value in expected.items():
                 assert kwargs[name] is value
@@ -356,6 +421,9 @@ class TestMHCAttentionGraphSplitTHD:
         monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", replay)
         for boundary in (3, 5):
             packed = _cpu_packed_metadata(boundary)
+            if not with_padded_seqlens:
+                packed.cu_seqlens_q_padded = None
+                packed.cu_seqlens_kv_padded = None
             mask = torch.tensor([[False] * 7 + [True]])
             kwargs = {"packed_seq_params": packed, "padding_mask": mask}
             expected = {"padding_mask": mask}
@@ -396,9 +464,14 @@ class TestMHCAttentionGraphSplitTHD:
             mhc_arena=SimpleNamespace(bind_external_slot=Mock(return_value=arena_slot))
         )
         decompose = layer._decompose_packed_seq_params_to_kwargs
+        route_kwargs = {
+            "dsa_cp_graph_layout_buffer": torch.zeros(16, dtype=torch.int32),
+            "dsa_cp_graph_route_buffer": torch.zeros(16, dtype=torch.int64),
+        }
 
         def decompose_retained_invocation(kwargs):
             decompose(kwargs)
+            kwargs.update(route_kwargs)
             layer._te_cuda_graph_route_replay_state = (0, 0)
 
         def produce(hidden, *, mhc_recompute_manager, output_slot):
@@ -409,6 +482,8 @@ class TestMHCAttentionGraphSplitTHD:
         def replay(_self, aggregate, **kwargs):
             assert aggregate.data_ptr() == slots[0].data_ptr()
             assert layer._te_cuda_graph_route_replay_state == (0, 0)
+            for name, value in route_kwargs.items():
+                assert kwargs[name] is value
             return (aggregate * 2,)
 
         producer.side_effect = produce
