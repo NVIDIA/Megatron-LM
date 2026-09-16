@@ -48,6 +48,7 @@ class TestMambaLayer:
     def test_gpu_forward(self):
         layer = self.layer
         layer.cuda()
+        layer.eval()
         micro_batch_size = 2
         sequence_length = 32
         hidden_states = torch.ones((sequence_length, micro_batch_size, layer.config.hidden_size))
