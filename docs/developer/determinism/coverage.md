@@ -32,6 +32,11 @@ Parametrized tests declare separate cases. The harness records tensor shapes,
 strides, dtypes, gradient requirements, deterministic-algorithm mode, and the
 actual comparison protocol. Autocast, TF32, and cuDNN dispatch settings are
 recorded at each call, and the run context includes GPU driver versions.
+Triton cache policy, cache directory, and all `TRITON_AUTOTUNE_BLOCK_*` overrides
+are recorded both at collection and at the replay call. A different policy or
+block override cannot reuse passing evidence. A cache path alone does not prove
+identical cache contents or selected configurations; SSM onboarding must also
+validate those before making a cross-process claim.
 A test-file mapping or a marker alone cannot pass.
 Do not annotate artificial negative controls as production operations.
 

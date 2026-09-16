@@ -16,6 +16,7 @@ from tools.determinism.coverage import (
     collect_observations,
     main,
     observe_replay,
+    triton_signature,
 )
 
 pytest_plugins = ["pytester"]
@@ -89,6 +90,19 @@ def test_mixed_context_is_rejected(field, value):
 def test_duplicate_ranks_are_not_retries_or_additional_coverage():
     with pytest.raises(ValueError, match="Duplicate"):
         aggregate([shard(), shard()])
+
+
+def test_triton_configuration_changes_invalidate_shared_evidence(monkeypatch):
+    monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/shared/cache")
+    monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE_M", "64")
+    rows = [shard(0, 2), shard(1, 2)]
+    rows[0]["context"]["environment"] = triton_signature()
+    assert rows[0]["context"]["environment"]["TRITON_CACHE_DIR"] == "/shared/cache"
+    monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE_M", "128")
+    rows[1]["context"]["environment"] = triton_signature()
+    with pytest.raises(ValueError, match="Cannot combine"):
+        aggregate(rows)
 
 
 def test_empty_selection_has_no_percentage():

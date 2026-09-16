@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import contextvars
 import json
+import os
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -34,6 +35,13 @@ def is_recording() -> bool:
     return _OBSERVER.get() is not None
 
 
+def triton_signature() -> dict:
+    """Record cache policy and every explicit SSM autotuning block override."""
+    keys = {"TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR"}
+    keys.update(key for key in os.environ if key.startswith("TRITON_AUTOTUNE_BLOCK_"))
+    return {key: os.environ.get(key) for key in sorted(keys)}
+
+
 def runtime_signature(torch) -> dict:
     """Record dispatch-affecting settings at the call, after test setup."""
     return {
@@ -44,6 +52,7 @@ def runtime_signature(torch) -> dict:
         "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "triton": triton_signature(),
     }
 
 

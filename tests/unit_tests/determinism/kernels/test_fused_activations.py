@@ -124,6 +124,7 @@ GATED_OP_IDS = {
     "bias_gelu": "fused_bias_gelu",
     "weighted_squared_relu": "fused_weighted_squared_relu",
     "weighted_clamped_squared_relu": "fused_weighted_squared_relu",
+    "clamped_squared_relu": "fused_weighted_squared_relu",
 }
 
 

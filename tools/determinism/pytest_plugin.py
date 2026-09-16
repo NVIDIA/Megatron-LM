@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.determinism.coverage import SCHEMA_VERSION, collect_observations
+from tools.determinism.coverage import SCHEMA_VERSION, collect_observations, triton_signature
 
 ENVIRONMENT_KEYS = (
     "CUDA_DEVICE_MAX_CONNECTIONS",
@@ -80,7 +80,10 @@ def _context(root: Path) -> dict:
         "capability": (
             list(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
         ),
-        "environment": {key: os.environ.get(key) for key in ENVIRONMENT_KEYS},
+        "environment": {
+            **{key: os.environ.get(key) for key in ENVIRONMENT_KEYS},
+            **triton_signature(),
+        },
     }
 
 
