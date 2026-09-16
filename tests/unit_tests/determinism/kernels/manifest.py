@@ -436,6 +436,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="cuda-ext",
         exempt_reason="Pluggable allocator (ncclMemAlloc); allocation only, no compute kernel.",
     ),
+    KernelEntry(
+        name="vmm_symm_allocator",
+        sources=("megatron/core/allocator/vmm_symm_allocator.py",),
+        kind="cuda-ext",
+        exempt_reason="Pluggable allocator (CUDA VMM driver calls); allocation only, no "
+        "compute kernel.",
+    ),
     # ---------------------------------------------------------------- inference (single GPU)
     KernelEntry(
         name="inference_kv_cache_tensor_ops",
@@ -638,6 +645,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
+    ),
+    # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
+    KernelEntry(
+        name="csa_teacher_lse",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
+        ),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
