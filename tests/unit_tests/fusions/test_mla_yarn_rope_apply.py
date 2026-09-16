@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import warnings
 from unittest.mock import MagicMock, patch
 
@@ -37,6 +38,50 @@ def dtype_tols(dtype):
         return dict(rtol=2.0e-2, atol=5.0e-2)
     else:
         raise ValueError(f"Unsuppored dtype ({dtype})")
+
+
+def _benchmark_ms(function, warmup=20, iterations=100):
+    """Measure average GPU time, including work joined from side streams."""
+    for _ in range(warmup):
+        function()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        function()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / iterations
+
+
+def _capture_cuda_graph(function):
+    """Capture a callable whose side-stream work joins the capture stream."""
+    function()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        function()
+    torch.cuda.synchronize()
+    return graph
+
+
+def _localization_available():
+    try:
+        from torch.cuda.green_contexts import is_localization_supported
+        from torch.cuda.memory import get_num_locality_domains
+    except ImportError:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    device = torch.cuda.current_device()
+    try:
+        supported = is_localization_supported(device)
+    except TypeError:
+        supported = is_localization_supported()
+    return supported and get_num_locality_domains(device) == 2
 
 
 class FakeCPGroup:
@@ -460,6 +505,211 @@ class TestFusedMLARope:
         if input_format != "sbhd":
             pytest.skip("The focused VMM prototype covers the profiled SBHD path")
         _test_fused_mla_rope_kv_split(input_format, use_vmm_outputs=True)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not _localization_available(), reason="CUDA localization is unavailable")
+@pytest.mark.skipif(
+    os.getenv("RUN_BENCHMARK_TESTS") != "1",
+    reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
+)
+def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
+    """Compare the profiled rotary Q/K/V plus three MXFP8 quant pattern."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
+
+    seqlen = 4096
+    batch_size = 1
+    num_heads = 16
+    nope_dim = 128
+    emb_dim = 64
+    k_dim = 128
+    v_dim = 128
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    freqs, mscale = yarn_rope(seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    q_shape = (seqlen, batch_size, num_heads, nope_dim + emb_dim)
+    kv_shape = (seqlen, batch_size, num_heads, k_dim + v_dim)
+    key_shape = (seqlen, batch_size, num_heads, k_dim + emb_dim)
+    value_shape = (seqlen, batch_size, num_heads, v_dim)
+    q_seed = torch.randn(q_shape, dtype=dtype, device=device)
+    q_ordinary = q_seed.clone()
+    kv = torch.randn(kv_shape, dtype=dtype, device=device)
+    k_pos_emb = torch.randn(
+        (seqlen, batch_size, 1, emb_dim), dtype=dtype, device=device
+    )
+    key_ordinary = torch.empty(key_shape, dtype=dtype, device=device)
+    value_ordinary = torch.empty(value_shape, dtype=dtype, device=device)
+
+    allocators = [
+        VMMRowSplitAllocator(device),
+        VMMRowSplitAllocator(device),
+        VMMRowSplitAllocator(device),
+    ]
+    try:
+        q_localized = allocators[0].allocate(q_shape, dtype)
+        key_localized = allocators[1].allocate(key_shape, dtype)
+        value_localized = allocators[2].allocate(value_shape, dtype)
+    except (RuntimeError, ValueError) as exc:
+        for allocator in allocators:
+            allocator.close()
+        pytest.skip(f"VMM-localized rotary outputs are unavailable: {exc}")
+    q_localized.copy_(q_seed)
+
+    ordinary_inputs = [
+        q_ordinary.view(seqlen, -1),
+        key_ordinary.view(seqlen, -1),
+        value_ordinary.view(seqlen, -1),
+    ]
+    localized_inputs = [
+        q_localized.view(seqlen, -1),
+        key_localized.view(seqlen, -1),
+        value_localized.view(seqlen, -1),
+    ]
+    quantizers = []
+    ordinary_quantized = []
+    localized_workspaces = []
+    try:
+        for ordinary_input, localized_input in zip(ordinary_inputs, localized_inputs):
+            quantizer = te.MXFP8Quantizer(
+                fp8_dtype=te.DType.kFloat8E4M3,
+                rowwise=True,
+                columnwise=True,
+            )
+            quantizer.optimize_for_gemm = True
+            quantizers.append(quantizer)
+            ordinary_quantized.append(
+                quantizer.make_empty(
+                    tuple(ordinary_input.shape),
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+            localized_workspaces.append(
+                te.MXFP8VMMWorkspace.from_vmm_input(localized_input, quantizer)
+            )
+    except (ImportError, RuntimeError, ValueError) as exc:
+        for workspace in localized_workspaces:
+            workspace.close()
+        for allocator in allocators:
+            allocator.close()
+        pytest.skip(f"VMM MXFP8 localization is unavailable: {exc}")
+
+    @torch.no_grad()
+    def ordinary_rotary():
+        fused_mla_rope_inplace(q_ordinary, cos, sin, nope_dim, emb_dim)
+        fused_mla_rope_kv_split(
+            kv,
+            k_pos_emb,
+            cos,
+            sin,
+            emb_dim,
+            k_dim,
+            v_dim,
+            out_key=key_ordinary,
+            out_value=value_ordinary,
+        )
+
+    @torch.no_grad()
+    def localized_rotary():
+        # Q RoPE is in-place, so its upstream buffer must already be VMM-backed.
+        fused_mla_rope_inplace(q_localized, cos, sin, nope_dim, emb_dim)
+        fused_mla_rope_kv_split(
+            kv,
+            k_pos_emb,
+            cos,
+            sin,
+            emb_dim,
+            k_dim,
+            v_dim,
+            out_key=key_localized,
+            out_value=value_localized,
+        )
+
+    @torch.no_grad()
+    def ordinary_quant():
+        for quantizer, input_tensor, output in zip(
+            quantizers, ordinary_inputs, ordinary_quantized
+        ):
+            quantizer.update_quantized(input_tensor, output)
+
+    @torch.no_grad()
+    def localized_quant():
+        for workspace in localized_workspaces:
+            workspace.quantize()
+
+    def ordinary_pipeline():
+        ordinary_rotary()
+        ordinary_quant()
+
+    def localized_pipeline():
+        localized_rotary()
+        localized_quant()
+
+    use_cuda_graph = os.getenv("MXFP8_LOCALIZATION_USE_CUDA_GRAPH") == "1"
+
+    def maybe_capture(function):
+        return _capture_cuda_graph(function).replay if use_cuda_graph else function
+
+    ordinary_rotary_fn = maybe_capture(ordinary_rotary)
+    localized_rotary_fn = maybe_capture(localized_rotary)
+    ordinary_quant_fn = maybe_capture(ordinary_quant)
+    localized_quant_fn = maybe_capture(localized_quant)
+    ordinary_pipeline_fn = maybe_capture(ordinary_pipeline)
+    localized_pipeline_fn = maybe_capture(localized_pipeline)
+
+    ordinary_rotary_ms = _benchmark_ms(ordinary_rotary_fn)
+    localized_rotary_ms = _benchmark_ms(localized_rotary_fn)
+    ordinary_quant_ms = _benchmark_ms(ordinary_quant_fn)
+    localized_quant_ms = _benchmark_ms(localized_quant_fn)
+    ordinary_pipeline_ms = _benchmark_ms(ordinary_pipeline_fn)
+    localized_pipeline_ms = _benchmark_ms(localized_pipeline_fn)
+
+    q_ordinary.copy_(q_seed)
+    q_localized.copy_(q_seed)
+    ordinary_pipeline_fn()
+    localized_pipeline_fn()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(q_localized, q_ordinary, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(key_localized, key_ordinary, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(value_localized, value_ordinary, atol=0.0, rtol=0.0)
+    for ordinary_output, workspace in zip(ordinary_quantized, localized_workspaces):
+        for name in (
+            "_rowwise_data",
+            "_rowwise_scale_inv",
+            "_columnwise_data",
+            "_columnwise_scale_inv",
+        ):
+            torch.testing.assert_close(
+                getattr(workspace.output, name),
+                getattr(ordinary_output, name),
+                atol=0.0,
+                rtol=0.0,
+            )
+
+    execution = "CUDA Graph" if use_cuda_graph else "eager"
+    print(
+        f"\nMLA rotary Q/K/V + three MXFP8 quant ({execution}):"
+        f"\n  ordinary-memory rotary:       {ordinary_rotary_ms:.3f} ms"
+        f"\n  VMM-output rotary:            {localized_rotary_ms:.3f} ms"
+        f"\n  full-chip three quant:        {ordinary_quant_ms:.3f} ms"
+        f"\n  localized three quant:        {localized_quant_ms:.3f} ms"
+        f"\n  ordinary full pipeline:       {ordinary_pipeline_ms:.3f} ms"
+        f"\n  localized full pipeline:      {localized_pipeline_ms:.3f} ms"
+        f"\n  end-to-end speedup:           "
+        f"{ordinary_pipeline_ms / localized_pipeline_ms:.3f}x"
+    )
+
+    for workspace in localized_workspaces:
+        workspace.close()
+    for allocator in allocators:
+        allocator.close()
 
 
 @pytest.mark.experimental
