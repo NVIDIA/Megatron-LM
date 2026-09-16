@@ -21,7 +21,7 @@ from megatron.lite.primitive.modules.chunked_ep_experts import (
     _tensor_byte_ranges_overlap,
 )
 from megatron.lite.primitive.modules.moe_ep_chunk_overlap_policy import runtime_ep_chunk_ranges
-from megatron.lite.primitive.utils.moe import unpermute
+from megatron.lite.primitive.utils.moe import _te_general_gemm, unpermute
 
 # Physical workspace capacity, deliberately independent of logical chunk count.
 EP_CHUNK_COUNT = 2
@@ -174,6 +174,7 @@ _FORWARD_EXPERT_ACTIVATION_STORAGE_SLOTS = {
     **_NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS,
     "fc2_output": "fc1_input",
 }
+
 
 def _expert_activation_capacity_bytes(requested_bytes: int) -> int:
     """Round an observed activation request to its 8 MiB reuse class."""
@@ -1166,7 +1167,7 @@ class _EPChunkOperationBase:
         wgrad_stream = _shared_stream(grad_2d.device, "wgrad")
         input_ready = torch.cuda.current_stream(grad_2d.device).record_event()
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in ranges]
-        router_accum: list[torch.Tensor | None] = [None for _ in router_params]
+        router_accum: list[Any] = [None for _ in router_params]
         pending_dispatch_bwd: list[tuple[_BackwardChunk, dict[str, Any]]] = []
         last_deepep_event: Any | None = None
         last_wgrad_done: torch.cuda.Event | None = None
@@ -1383,7 +1384,7 @@ class _EPChunkOperationBase:
         grad_ready = caller_stream.record_event()
         wgrad_stream = _shared_stream(grad_2d.device, "wgrad")
         grad_x_chunks: list[torch.Tensor | None] = [None for _ in context.chunks]
-        router_accum: list[torch.Tensor | None] = [None for _ in router_params]
+        router_accum: list[Any] = [None for _ in router_params]
         last_deepep_event: Any | None = grad_ready
 
         def remember_deepep_event(state: dict[str, Any]):
@@ -1701,21 +1702,6 @@ def _backward_expert(chunk, grad_output, lease):
     return grad_dispatched, grad_probs, hidden_reuse_base
 
 
-def _accumulate(
-    accum: list[torch.Tensor | None],
-    params: tuple[torch.Tensor, ...],
-    grads: tuple[torch.Tensor | None, ...],
-) -> None:
-    for idx, (param, grad) in enumerate(zip(params, grads, strict=True)):
-        if grad is None:
-            continue
-        grad = grad.to(accum[idx].dtype if accum[idx] is not None else param.dtype)
-        if accum[idx] is None:
-            accum[idx] = grad
-        else:
-            accum[idx].add_(grad)
-
-
 def _backward_router(chunk, grad_hidden, grad_scores, router_params, router_accum):
     """Combine router and expert input gradients after dispatch backward finishes."""
     if grad_scores is None:
@@ -1727,15 +1713,14 @@ def _backward_router(chunk, grad_hidden, grad_scores, router_params, router_accu
     router_output = chunk.scores_edge if chunk.scores_edge is not None else chunk.scores
     if router_output is None:
         raise RuntimeError("EP chunk overlap router graph was released.")
-    if any(hasattr(param, "_wgrad_accumulator") for param in router_params):
+    if any(hasattr(param, "_capture_wgrad") for param in router_params):
         raise RuntimeError("Router weight-gradient accumulator is already leased")
+    captured = [[] for _ in router_params]
     try:
-        for idx, param in enumerate(router_params):
-            if param.dtype == torch.float64 or chunk.scores_dtype == torch.float64:
-                continue
-            if router_accum[idx] is None:
-                router_accum[idx] = torch.zeros_like(param, dtype=torch.float32)
-            param._wgrad_accumulator = router_accum[idx]
+        for param, parts in zip(router_params, captured, strict=True):
+            param._capture_wgrad = lambda x, dy, dtype, parts=parts: parts.append(
+                (chunk.start, x.detach(), dy.detach().clone(), dtype)
+            )
         router_grads = torch.autograd.grad(
             router_output,
             (chunk.x, *router_params),
@@ -1744,12 +1729,23 @@ def _backward_router(chunk, grad_hidden, grad_scores, router_params, router_accu
         )
     finally:
         for param in router_params:
-            if hasattr(param, "_wgrad_accumulator"):
-                del param._wgrad_accumulator
+            if hasattr(param, "_capture_wgrad"):
+                del param._capture_wgrad
     grad_score_x = router_grads[0]
     if grad_score_x is None:
         grad_score_x = torch.zeros_like(chunk.x)
-    _accumulate(router_accum, router_params, router_grads[1:])
+    for idx, (param, grad, parts) in enumerate(
+        zip(router_params, router_grads[1:], captured, strict=True)
+    ):
+        if parts:
+            if grad is not None:
+                raise RuntimeError("Router gradient was both captured and returned")
+            if router_accum[idx] is None:
+                router_accum[idx] = []
+            router_accum[idx].extend(parts)
+        elif grad is not None:
+            grad = grad.to(param.dtype)
+            router_accum[idx] = grad if router_accum[idx] is None else router_accum[idx].add_(grad)
     return grad_hidden.to(chunk.x.dtype) + grad_score_x
 
 
@@ -1768,11 +1764,22 @@ def _submit_dispatch_backward(chunk, grad_hidden, grad_probs, stream, ready, pre
     return state
 
 
-def _materialize(
-    params: tuple[torch.Tensor, ...], accum: list[torch.Tensor | None]
-) -> list[torch.Tensor]:
+def _materialize(params: tuple[torch.Tensor, ...], accum: list[Any]) -> list[torch.Tensor]:
+    # Match the unchunked router reduction; expert activations still retire per chunk.
+    for idx, (param, parts) in enumerate(zip(params, accum, strict=True)):
+        if isinstance(parts, list):
+            parts.sort(key=lambda part: part[0])
+            dtype = parts[0][3]
+            x = torch.cat([part[1] for part in parts]).to(dtype)
+            dy = torch.cat([part[2] for part in parts])
+            out = (
+                _te_general_gemm(x, dy, dtype, layout="NT", grad=True)
+                if dtype != torch.float64
+                else None
+            )
+            accum[idx] = (dy.t() @ x if out is None else out[0]).to(param.dtype)
     return [
-        torch.zeros_like(param) if grad is None else grad.to(param.dtype)
+        torch.zeros_like(param) if grad is None else grad
         for param, grad in zip(params, accum, strict=True)
     ]
 

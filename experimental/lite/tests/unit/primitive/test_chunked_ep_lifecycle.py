@@ -408,7 +408,9 @@ def test_mtp_composition_is_explicit(mtp):
 
 
 @pytest.mark.parametrize("te_base", [SimpleNamespace(), SimpleNamespace(get_workspace=object)])
-def test_production_router_wgrad_does_not_round_each_chunk(ep, monkeypatch, te_base):
+@pytest.mark.parametrize("chunks", [2, 3, 4])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_router_full_reduction(ep, monkeypatch, te_base, chunks, reverse):
     from megatron.lite.primitive.utils import moe
 
     calls = []
@@ -420,34 +422,37 @@ def test_production_router_wgrad_does_not_round_each_chunk(ep, monkeypatch, te_b
             "NN": lambda: b.float() @ a.float(),
             "NT": lambda: b.float().T @ a.float(),
         }[layout]()
-        value = value.to(out_dtype)
-        if out is not None:
-            calls.append((out_dtype, accumulate, out.data_ptr()))
-            out.add_(value) if accumulate else out.copy_(value)
-            value = out
-        return (value,)
+        if layout == "NT":
+            calls.append((a.shape[0], out_dtype))
+            assert out is None and not accumulate
+        return (value.to(out_dtype),)
 
     monkeypatch.setattr(moe, "general_gemm", gemm)
     monkeypatch.setattr(moe, "te_module_base", te_base)
     torch.manual_seed(31)
     weight = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
-    x = torch.randn(12, 8, dtype=torch.bfloat16)
-    grad = torch.randn(12, 3, dtype=torch.bfloat16)
+    x = torch.randn(13, 8, dtype=torch.bfloat16)
+    grad = torch.randn(13, 3, dtype=torch.bfloat16)
     accum = [None]
-    for xx, gg in zip(x.chunk(2), grad.chunk(2)):
+    parts, start = [], 0
+    for xx, gg in zip(x.tensor_split(chunks), grad.tensor_split(chunks)):
+        parts.append((start, xx, gg.clone()))
+        start += len(xx)
+    for start, xx, gg in reversed(parts) if reverse else parts:
         xx = xx.detach().requires_grad_(True)
         scores = moe.router_gating_linear(xx, weight, None, torch.bfloat16)
-        chunk = SimpleNamespace(x=xx, scores=scores, scores_edge=None, scores_dtype=scores.dtype)
+        chunk = SimpleNamespace(
+            start=start, x=xx, scores=scores, scores_edge=None, scores_dtype=scores.dtype
+        )
         dx = ep._backward_router(chunk, torch.zeros_like(xx), gg, (weight,), accum)
         assert torch.equal(dx, (gg.float() @ weight.detach().float()).bfloat16())
-        assert not hasattr(weight, "_wgrad_accumulator")
+        assert not hasattr(weight, "_capture_wgrad") and not calls
+        gg.fill_(float("nan"))  # Retired dispatch scratch must not corrupt deferred wgrad.
     expected = (grad.float().T @ x.float()).bfloat16()
     assert torch.equal(ep._materialize((weight,), accum)[0], expected)
-    assert len(calls) == 2 and all(c[0] == torch.float32 and c[1] for c in calls)
-    assert calls[0][2] == calls[1][2]
+    assert calls == [(13, torch.bfloat16)]
     native = moe.router_gating_linear(x, weight, None, torch.bfloat16)
     assert torch.equal(torch.autograd.grad(native, weight, grad)[0], expected)
-    assert weight.grad is None and len(calls) == 2
 
 
 def test_double_router_is_not_downcast(ep):
@@ -456,34 +461,28 @@ def test_double_router_is_not_downcast(ep):
     weight = torch.ones(1, 1, dtype=torch.float64, requires_grad=True)
     x = torch.tensor([[1.00000000001]], dtype=torch.float64, requires_grad=True)
     scores = router_gating_linear(x, weight, None, torch.float64)
-    chunk = SimpleNamespace(x=x, scores=scores, scores_edge=None, scores_dtype=scores.dtype)
+    chunk = SimpleNamespace(
+        start=0, x=x, scores=scores, scores_edge=None, scores_dtype=scores.dtype
+    )
     accum = [None]
     ep._backward_router(chunk, torch.zeros_like(x), torch.ones_like(scores), (weight,), accum)
     assert torch.equal(ep._materialize((weight,), accum)[0], x.detach())
 
 
-def test_router_accumulator_binding_cleans_up_on_error(ep, monkeypatch):
+@pytest.mark.parametrize("leased", [False, True])
+def test_router_capture_binding_cleans_up_without_stealing_owner(ep, monkeypatch, leased):
     weight = torch.ones(2, 2, requires_grad=True)
     x = torch.ones(2, 2, requires_grad=True)
     chunk = SimpleNamespace(x=x, scores=x, scores_edge=None, scores_dtype=x.dtype)
 
     def fail(*args, **kwargs):
-        assert weight._wgrad_accumulator.dtype == torch.float32
+        assert callable(weight._capture_wgrad)
         raise RuntimeError("injected backward failure")
 
+    owner = object()
+    if leased:
+        weight._capture_wgrad = owner
     monkeypatch.setattr(torch.autograd, "grad", fail)
-    with pytest.raises(RuntimeError, match="injected"):
+    with pytest.raises(RuntimeError, match="already leased" if leased else "injected"):
         ep._backward_router(chunk, x, x, (weight,), [None])
-    assert not hasattr(weight, "_wgrad_accumulator")
-
-
-def test_router_accumulator_rejects_overlapping_owner(ep):
-    weight = torch.ones(2, 2, requires_grad=True)
-    owner = torch.zeros_like(weight)
-    weight._wgrad_accumulator = owner
-    x = torch.ones(2, 2, requires_grad=True)
-    chunk = SimpleNamespace(x=x, scores=x, scores_edge=None, scores_dtype=x.dtype)
-    with pytest.raises(RuntimeError, match="already leased"):
-        ep._backward_router(chunk, x, x, (weight,), [None])
-    assert weight._wgrad_accumulator is owner
-    del weight._wgrad_accumulator
+    assert getattr(weight, "_capture_wgrad", None) is (owner if leased else None)
