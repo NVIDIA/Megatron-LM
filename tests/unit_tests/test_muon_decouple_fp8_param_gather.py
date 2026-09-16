@@ -152,6 +152,7 @@ class TestMuonDecoupleFP8ParamGather:
         num_experts=0,
         expert_model_parallel_size=1,
         chunked_optimizer_state_offload=False,
+        optimizer_state_offload_chunk_size_mb=1,
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -203,7 +204,8 @@ class TestMuonDecoupleFP8ParamGather:
         args.fp8_param_gather = fp8_param_gather
         args.chunked_optimizer_state_offload = chunked_optimizer_state_offload
         if chunked_optimizer_state_offload:
-            args.optimizer_state_offload_chunk_size_mb = 1
+            # 0 = one full state window; a positive size exercises multi-chunk stepping.
+            args.optimizer_state_offload_chunk_size_mb = optimizer_state_offload_chunk_size_mb
             args.optimizer_state_offload_fraction = 1.0
             args.ckpt_format = 'torch_dist'
         if fp8_param_gather and fp8_recipe == "mxfp8":
@@ -248,6 +250,7 @@ class TestMuonDecoupleFP8ParamGather:
         num_experts=0,
         expert_model_parallel_size=1,
         chunked_optimizer_state_offload=False,
+        optimizer_state_offload_chunk_size_mb=1,
     ):
         args = self._create_args(
             fp8_param_gather,
@@ -256,6 +259,7 @@ class TestMuonDecoupleFP8ParamGather:
             num_experts=num_experts,
             expert_model_parallel_size=expert_model_parallel_size,
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
+            optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
         )
         set_args(args)
         torch.manual_seed(_SEED)
@@ -269,9 +273,10 @@ class TestMuonDecoupleFP8ParamGather:
         )
         return args, model, optimizer
 
-    def _run_steps(self, args, model, optimizer, n):
+    def _run_steps(self, args, model, optimizer, n, include_quantized=False):
         """Run ``n`` deterministic steps; return per-step loss, forward output,
-        per-param ``main_grad`` (pre-step), fp32 master and (bf16) param (post-step)."""
+        per-param ``main_grad`` (pre-step), fp32 master and (bf16) param (post-step).
+        With ``include_quantized`` the fp8 model weights are snapshotted too (dequantized)."""
         ids, labels, pos, mask, loss_mask = self._batch()
         losses, outs, grads, masters, params = [], [], [], [], []
         for _ in range(n):
@@ -328,7 +333,7 @@ class TestMuonDecoupleFP8ParamGather:
                 optimizer.prefetch_optimizer_state_for_gradient_finalization()
             ok, _, _ = optimizer.step()
             assert ok
-            params.append(_snapshot_params(model[0]))
+            params.append(_snapshot_params(model[0], include_quantized=include_quantized))
             masters.append(_snapshot_masters(model[0]))
             grads.append(grad)
             losses.append(loss.detach().clone())
@@ -600,3 +605,136 @@ class TestMuonDecoupleFP8ParamGather:
         assert len(ref_grads) == len(got_grads) and ref_grads, "expected LayerWise grad buffers"
         for i, (gr, gg) in enumerate(zip(ref_grads, got_grads)):
             _assert_equal(gg, gr, f"grad_data buffer {i} after force_sync")
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("chunk_size_mb", [1, 0])
+    @pytest.mark.parametrize("expt_dp_gt_1", [False, True])
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_moe_chunked_optimizer_state_offload(self, expt_dp_gt_1, chunk_size_mb):
+        """MoE + compact Muon FP8 gather + chunked state/master offload must match the plain
+        step bitwise, *including the MXFP8 model weights*, in both expert-DP regimes.
+
+        Regression for the Kimi-K3 9L CP1/CP2 SBHD split: after the forced pre-forward
+        LayerWise param sync, the sibling ``DistributedOptimizer``'s MXFP8 param-buffer
+        staging reset every bucket group's ``param_gather_dispatched`` flag, so the forward
+        pre-hooks re-gathered the LayerWise fp8 weights from fp32 masters that the offload
+        lifecycle had just rebound to pinned CPU buffers with their D2H copies still in
+        flight. One stale fp8 weight per iteration was enough to change the trajectory.
+        """
+        world = torch.distributed.get_world_size()
+        if expt_dp_gt_1 and world < 2:
+            pytest.skip("expt_dp > 1 needs data-parallel size >= 2; run with --nproc_per_node>=2")
+        if get_device_arch_version() < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+
+        ep = 1 if expt_dp_gt_1 else world
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=ep,
+        )
+        n = 8
+        with deterministic_mode():
+            ref_args, ref_model, ref_opt = self._build(
+                True, "mxfp8", True, num_experts=8, expert_model_parallel_size=ep
+            )
+            params0 = _snapshot_params(ref_model[0])
+            masters0 = _snapshot_masters(ref_model[0])
+            off_args, off_model, off_opt = self._build(
+                True,
+                "mxfp8",
+                True,
+                num_experts=8,
+                expert_model_parallel_size=ep,
+                chunked_optimizer_state_offload=True,
+                optimizer_state_offload_chunk_size_mb=chunk_size_mb,
+            )
+            _restore_initial_state(off_model[0], off_opt, params0, masters0)
+            reference = self._run_steps(ref_args, ref_model, ref_opt, n, include_quantized=True)
+            offloaded = self._run_steps(off_args, off_model, off_opt, n, include_quantized=True)
+
+        # Compare every rank's result so a single-rank divergence cannot pass unnoticed.
+        mismatch = None
+        for kind, actual_steps, expected_steps in zip(
+            ("loss", "output", "grad", "master", "param"), offloaded, reference
+        ):
+            for step, (actual, expected) in enumerate(zip(actual_steps, expected_steps)):
+                if isinstance(actual, dict):
+                    for name in actual:
+                        if not torch.equal(actual[name], expected[name]):
+                            mismatch = mismatch or f"{kind} step {step} {name}"
+                elif not torch.equal(actual, expected):
+                    mismatch = mismatch or f"{kind} step {step}"
+        flag = torch.tensor([0 if mismatch is None else 1], device="cuda")
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        assert flag.item() == 0, (
+            f"chunked offload diverged from the plain step (rank-local first mismatch: "
+            f"{mismatch}; expt_dp_gt_1={expt_dp_gt_1}, chunk_size_mb={chunk_size_mb})"
+        )
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_distopt_param_buffer_staging_keeps_layerwise_dispatch_state(self):
+        """The DistOpt MXFP8 param-buffer staging must only re-arm its own bucket groups.
+
+        With chunked optimizer-state offload, train_step force-syncs the LayerWise bucket
+        groups before the DistOpt staging and offloads the LayerWise masters right after
+        it. Resetting the LayerWise ``param_gather_dispatched`` flags there would make the
+        forward pre-hooks dispatch a second gather that stages from CPU-bound masters.
+        """
+        if get_device_arch_version() < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+        with deterministic_mode():
+            args, model, optimizer = self._build(
+                True,
+                "mxfp8",
+                True,
+                num_experts=8,
+                expert_model_parallel_size=torch.distributed.get_world_size(),
+                chunked_optimizer_state_offload=True,
+            )
+            self._run_steps(args, model, optimizer, 1)
+            ddp = model[0]
+            distopt = next(
+                child
+                for child in optimizer.chained_optimizers
+                if isinstance(child, DistributedOptimizer)
+            )
+            assert optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+
+            # Start of the next train_step in the offload path.
+            ddp.zero_grad_buffer()
+            optimizer.zero_grad()
+            optimizer.ensure_master_weights_for_pre_forward_param_sync()
+            optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
+            groups = ddp.bucket_groups + ddp.expert_parallel_bucket_groups
+            layerwise_groups = [g for g in groups if ddp._bucket_group_is_layer_wise(g)]
+            distopt_groups = [g for g in groups if not ddp._bucket_group_is_layer_wise(g)]
+            assert layerwise_groups and distopt_groups, "test precondition: mixed bucket groups"
+            assert all(g.param_gather_dispatched for g in layerwise_groups)
+
+            distopt._copy_main_params_to_param_buffer()
+            assert all(
+                g.param_gather_dispatched for g in layerwise_groups
+            ), "DistOpt param-buffer staging re-armed force-synced LayerWise gathers"
+            assert all(not g.param_gather_dispatched for g in distopt_groups)
+
+            # Offload masters as train_step does next; the forward pre-hooks must not stage
+            # LayerWise fp8 weights from the CPU-bound masters. Run one forward to prove it.
+            optimizer.offload_optimizer_state_for_forward()
+            ids, labels, pos, mask, loss_mask = self._batch()
+            ddp.set_is_first_microbatch()
+            ddp.forward(
+                input_ids=ids,
+                position_ids=pos,
+                attention_mask=mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+            for g in groups:
+                if g.param_gather_handle is not None:
+                    g.param_gather_handle.wait()
+                    g.param_gather_handle = None
