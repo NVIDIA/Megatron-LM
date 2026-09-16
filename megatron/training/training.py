@@ -3872,6 +3872,18 @@ def training_log(
     return report_memory_flag
 
 
+def _should_compute_params_norm(args, iteration, is_first_iteration):
+    """Whether this iteration can emit the parameter norm."""
+    return args.log_params_norm and (
+        is_first_iteration
+        or iteration % args.log_interval == 0
+        or (
+            bool(args.tensorboard_dir)
+            and iteration % args.tensorboard_log_interval == 0
+        )
+    )
+
+
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
     if args.save is None:
@@ -5046,7 +5058,7 @@ def train(
                 loss_scale = 1.0
             params_norm = None
 
-            if args.log_params_norm:
+            if _should_compute_params_norm(args, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
                 # + all-reduce that BLOCKS the training loop -- exposed goodput cost
                 # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
