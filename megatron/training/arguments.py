@@ -4879,13 +4879,6 @@ def _add_moe_args(parser):
         '--num-experts', type=int, default=None, help='Number of Experts in MoE (None means no MoE)'
     )
     group.add_argument(
-        '--moe-cached-recompute-dispatch',
-        action='store_true',
-        help='Under activation recompute of the MoE layer, re-run the expert dispatch through the '
-        'forward\'s DeepEP handle (cached dispatch: no layout/notify kernels, no host wait) and '
-        'reuse the forward\'s dispatched routing and host counts. Flex dispatcher, deepep backend.',
-    )
-    group.add_argument(
         '--moe-layer-freq',
         type=moe_freq_type,
         default=1,
