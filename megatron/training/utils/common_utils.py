@@ -588,12 +588,13 @@ def get_batch_on_this_tp_rank(
             _broadcast(n_tensor)
 
             if n == 0:
-                buf = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                assert isinstance(cu_seqlens, torch.Tensor)
-                assert cu_seqlens.dtype == torch.int32
-                assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
-                buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
+                # Avoid a zero-count NCCL collective backed by a null data pointer.
+                return
+
+            assert isinstance(cu_seqlens, torch.Tensor)
+            assert cu_seqlens.dtype == torch.int32
+            assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
+            buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
             _broadcast(buf)
 
         if args.dynamic_context_parallel:
@@ -693,12 +694,13 @@ def get_batch_on_this_tp_rank(
             n = int(n.item())
 
             if n == 0:
-                cu_seqlens = torch.empty(0, dtype=torch.int32, device=dev)
-            else:
-                cu_seqlens = torch.empty((args.micro_batch_size, n), dtype=torch.int32, device=dev)
+                # The source rank skips the matching zero-count collective.
+                return None
+
+            cu_seqlens = torch.empty((args.micro_batch_size, n), dtype=torch.int32, device=dev)
             _broadcast(cu_seqlens)
 
-            return cu_seqlens if n > 0 else None
+            return cu_seqlens
 
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(tokens)
