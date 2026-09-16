@@ -620,6 +620,26 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     Utils.destroy_model_parallel()
 
 
+def test_hybrid_dp_cp_groups_include_non_power_of_two_domain_sizes(monkeypatch):
+    """Dynamic CP groups must include every usable power of two below an odd domain size."""
+
+    class FakeGroup:
+        def __init__(self, ranks):
+            self.ranks = ranks
+
+    monkeypatch.setattr(ps, "create_group", lambda ranks, **kwargs: FakeGroup(ranks))
+
+    groups = ps.create_hybrid_dp_cp_groups(rank=0, ranks=list(range(6)), pg_options=None)
+
+    assert sorted(groups) == [2, 4]
+    assert groups[2].ranks == [0, 1]
+    assert groups[4].ranks == [0, 1, 2, 3]
+
+    tail_groups = ps.create_hybrid_dp_cp_groups(rank=4, ranks=list(range(6)), pg_options=None)
+    assert sorted(tail_groups) == [2]
+    assert tail_groups[2].ranks == [4, 5]
+
+
 def test_separate_all_gather_group():
     """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
     Utils.initialize_model_parallel(context_parallel_size=world_size)
