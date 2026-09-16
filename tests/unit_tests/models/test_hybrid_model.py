@@ -280,8 +280,37 @@ class TestHybridModel:
                 hybrid_layer_pattern="-",
             )
 
+    @pytest.mark.parametrize("mtp_num_layers", [0, 1, 3])
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
+    def test_mtp_rejects_pattern_depth_mismatch(
+        self, mocker, mtp_num_layers, mtp_use_repeated_layer
+    ):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        )
+        build = mocker.patch("megatron.core.models.hybrid.hybrid_model.build_module")
+        with pytest.raises(
+            ValueError,
+            match=f"hybrid_layer_pattern defines 2 MTP depths, but mtp_num_layers is {mtp_num_layers}",
+        ):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-/-/-",
+            )
+
+        assert config.mtp_num_layers == mtp_num_layers
+        build.assert_not_called()
+
     @pytest.mark.parametrize(
-        ("pattern", "mtp_num_layers"), [("-", None), ("-/-", None), ("-/-", 2)]
+        ("pattern", "mtp_num_layers"), [("-", None), ("-/-", None), ("-/-", 1)]
     )
     def test_hsm_requires_two_architecture_heads(self, pattern, mtp_num_layers):
         config = TransformerConfig(
@@ -303,12 +332,14 @@ class TestHybridModel:
 
         assert config.mtp_hsm is True
 
-    def test_hsm_accepts_inferred_mtp_depth(self):
+    @pytest.mark.parametrize("mtp_num_layers", [None, 2])
+    def test_hsm_accepts_inferred_or_matching_mtp_depth(self, mtp_num_layers):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
             mtp_hsm=True,
         )
         model = HybridModel(
