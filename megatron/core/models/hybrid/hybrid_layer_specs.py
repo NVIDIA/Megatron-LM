@@ -15,7 +15,7 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixer,
     GatedDeltaProductMixerSubmodules,
@@ -129,6 +129,20 @@ hybrid_stack_spec = ModuleSpec(
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=GatedDeltaNet,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=TELayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=TERowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn2_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet2,
                     submodules=GatedDeltaNetSubmodules(
                         in_proj=TELayerNormColumnParallelLinear,
                         out_norm=TENorm,
@@ -272,6 +286,7 @@ gated_delta_product_stack_spec = ModuleSpec(
             TELayerNormColumnParallelLinear, TERowParallelLinear
         ),
         gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
+        gdn2_layer=hybrid_stack_spec.submodules.gdn2_layer,
         attention_layer=hybrid_stack_spec.submodules.attention_layer,
         dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
         mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
@@ -302,6 +317,20 @@ hybrid_inference_stack_spec = ModuleSpec(
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=GatedDeltaNet,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn2_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet2,
                     submodules=GatedDeltaNetSubmodules(
                         in_proj=InferenceLayerNormColumnParallelLinear,
                         out_norm=TENorm,
@@ -466,6 +495,7 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
             InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
         ),
         gdn_layer=hybrid_inference_stack_spec.submodules.gdn_layer,
+        gdn2_layer=hybrid_inference_stack_spec.submodules.gdn2_layer,
         attention_layer=hybrid_inference_stack_spec.submodules.attention_layer,
         dsa_layer=hybrid_inference_stack_spec.submodules.dsa_layer,
         mlp_layer=hybrid_inference_stack_spec.submodules.mlp_layer,
