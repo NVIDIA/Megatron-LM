@@ -69,13 +69,12 @@ with no compute kernel). Exemptions are visible coverage debt, not silence.
 3. **Review**: the PR template checkbox and the `/claude review` prompt ask
    for the test explicitly.
 
-The kernel bucket runs in the H100 unit-test recipe
-(`tests/test_utils/recipes/h100/unit-tests.yaml`). Hardware-specific
-scheduling is exactly what these tests are meant to catch, so running the
-bucket on GB200/GB300-class runners as well (GB200 unit tests are selected by
-the `launch_on_gb200` marker) is a tracked follow-up; until then, reproduce
-findings on Blackwell hardware manually as described in
-[`status.md`](./status.md).
+The full kernel bucket runs in the H100 unit-test recipe. Dedicated GB200
+kernel and model buckets select a four-GPU subset with `launch_on_gb200`;
+larger configurations stay in the H100 matrix. Replay reports require real
+comparisons on every rank, and the GB200 model gate requires MXFP8 and NVFP4
+evidence explicitly. See [measured coverage](./coverage.md) for the selection,
+scope, and artifacts. Scheduling a test does not establish a hardware pass.
 
 Run the gate locally against `main`:
 

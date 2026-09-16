@@ -151,9 +151,10 @@ PARALLELISM_CONFIGS = [
     pytest.param({"TP": 2, "EP": 2}, id="tp2-ep2"),
     pytest.param({"TP": 2, "EP": 4}, id="tp2-ep4"),
     # FSDP — pure and EP composite.
+    pytest.param({"FSDP": 4}, id="fsdp4"),
     pytest.param({"FSDP": 8}, id="fsdp8"),
     pytest.param({"FSDP": 8, "EP": 4}, id="fsdp8-ep4"),
-    # PP — verified via pipeline schedule + NaN-aware equality.
+    # PP — pipeline schedule with byte comparisons of loss and parameter gradients.
     pytest.param({"PP": 2}, id="pp2"),
     pytest.param({"PP": 4}, id="pp4"),
     pytest.param({"TP": 2, "PP": 2}, id="tp2-pp2"),
@@ -192,9 +193,8 @@ _SHORTNAME_TO_INIT_KWARG = {
 # Each cell that exercises a specific quantization recipe carries it as an
 # explicit field in its TransformerConfig overrides — there is no global
 # attention-backend toggle. The TE attention backend is whatever NVTE's
-# default selection picks at first attention call; the deterministic-mode
-# guard at megatron/training/determinism.py rejects ``--use-flash-attn``
-# outright, so flash-attn is never reached under the determinism contract.
+# default selection picks at first attention call, subject to
+# NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 and the installed backend's support.
 #
 # FP8 recipe (specified per-cell in TransformerConfig overrides):
 #   fp8='hybrid' / fp8='e4m3'  + fp8_recipe='tensorwise' | 'delayed' | 'mxfp8'
@@ -230,3 +230,15 @@ def required_world_size(parallelism: dict) -> int:
     cp = parallelism.get("CP", 1)
     dp = max(parallelism.get("FSDP", 1), parallelism.get("EP", 1), 1)
     return tp * pp * cp * dp
+
+
+def gb200_compatible_configs(configs: list) -> list:
+    """Mark only configurations that divide a four-GPU node; retain the H100 matrix."""
+    selected = []
+    for config in configs:
+        required = required_world_size(config.values[0])
+        marks = list(config.marks)
+        if required <= 4 and 4 % required == 0:
+            marks.append(pytest.mark.launch_on_gb200)
+        selected.append(pytest.param(*config.values, id=config.id, marks=marks))
+    return selected

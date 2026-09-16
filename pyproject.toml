@@ -287,6 +287,7 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
     "determinism_case(op_id, implementation): measured kernel replay case",
+    "determinism_model(model_id): model output/gradient replay evidence",
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import contextvars
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -122,6 +123,9 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
     if not shards:
         raise ValueError("No evidence shards supplied")
     first = shards[0]
+    scope = first.get("evidence_scope", "kernel")
+    if scope not in ("kernel", "model"):
+        raise ValueError("Unknown replay evidence scope")
     context = first["context"]
     world_size = context["world_size"]
     if not isinstance(world_size, int) or world_size < 1:
@@ -130,6 +134,8 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
     for shard in shards:
         if shard.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("Unsupported evidence schema")
+        if shard.get("evidence_scope", "kernel") != scope:
+            raise ValueError("Cannot combine kernel and model replay evidence")
         if shard["context"] != context or shard["run_id"] != first["run_id"]:
             raise ValueError("Cannot combine different runs, source revisions, or environments")
         rank = shard["rank"]
@@ -186,11 +192,14 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
         raise ValueError("Kernel inventories differ")
     return {
         "schema_version": SCHEMA_VERSION,
-        "kind": "determinism_coverage",
+        "kind": "determinism_coverage" if scope == "kernel" else "model_determinism_replay",
         "run_id": first["run_id"],
         "context": context,
         "ranks_present": sorted(by_rank),
-        "scope": "Declared selected replay cases; outputs and gradients, not full training state",
+        "scope": (
+            f"Declared selected {scope} replay cases; same-process outputs and gradients, "
+            "not full training state or independent-run reproducibility"
+        ),
         "counts": {"total": total, **counts},
         "deterministic_percent": 100 * counts[DETERMINISTIC] / total if total else None,
         "verified_percent": (
@@ -207,7 +216,11 @@ def markdown_report(report: dict) -> str:
     """Render a compact report, including visible unannotated inventory debt."""
     counts = report["counts"]
     lines = [
-        "# Determinism coverage",
+        (
+            "# Model replay evidence"
+            if report["kind"] == "model_determinism_replay"
+            else "# Determinism coverage"
+        ),
         "",
         report["scope"],
         "",
@@ -225,11 +238,14 @@ def markdown_report(report: dict) -> str:
         )
     else:
         lines.append("No declared cases: coverage percentages are unavailable.")
-    lines.extend(["", "| Case | Operation | Status |", "| --- | --- | --- |"])
+    lines.extend(["", "| Case | Operation/model | Status | Reason |", "| --- | --- | --- | --- |"])
     for case in report["cases"]:
         name = case["case_id"].replace("|", "\\|").replace("\n", " ")
-        lines.append(f"| `{name}` | `{case['op_id']}` | {case['status']} |")
+        reasons = "; ".join(case["reasons"]).replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| `{name}` | `{case['op_id']}` | {case['status']} | {reasons} |")
     gaps = report["inventory_without_declared_cases"]
+    if report["kind"] == "model_determinism_replay":
+        return "\n".join(lines) + "\n"
     lines.extend(
         [
             "",
@@ -250,6 +266,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("shards", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--revision", help="Revision whose evidence is requested")
+    parser.add_argument(
+        "--require-verified",
+        action="store_true",
+        help="Fail unless at least one case has passing comparisons on every rank",
+    )
+    parser.add_argument(
+        "--require-case",
+        action="append",
+        default=[],
+        help="Require all cases matching this node-ID glob to be verified deterministic; missing matches fail",
+    )
     args = parser.parse_args(argv)
     report = aggregate(
         [json.loads(path.read_text()) for path in sorted(args.shards.glob("rank-*.json"))],
@@ -259,6 +286,16 @@ def main(argv: list[str] | None = None) -> int:
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     args.output.with_suffix(".md").write_text(markdown_report(report))
     print(markdown_report(report))
+    if args.require_verified and not report["counts"][DETERMINISTIC]:
+        print("No case completed passing replay comparisons on every required rank")
+        return 1
+    for pattern in args.require_case:
+        matches = [
+            case for case in report["cases"] if fnmatch.fnmatchcase(case["case_id"], pattern)
+        ]
+        if not matches or any(case["status"] != DETERMINISTIC for case in matches):
+            print(f"Required replay cases are absent or unverified: {pattern}")
+            return 1
     return 0
 
 

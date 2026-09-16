@@ -3,8 +3,10 @@
 """Opt-in pytest producer for per-rank replay evidence.
 
 Load with ``-p tools.determinism.pytest_plugin --determinism-evidence-dir DIR``.
-Only tests marked ``determinism_case(op_id=..., implementation=...)`` contribute
-to the denominator. Numerical outcomes come from the replay harness, not xfail.
+Kernel reports include only ``determinism_case(op_id=..., implementation=...)``.
+``--determinism-evidence-scope model`` selects ``determinism_model(model_id=...)``
+instead and produces a separate report kind. Numerical outcomes come from replay
+comparisons, not pytest passes or xfails.
 """
 
 from __future__ import annotations
@@ -90,9 +92,10 @@ def _context(root: Path) -> dict:
 class EvidencePlugin:
     """Persist planned cases before execution so interruptions retain unknowns."""
 
-    def __init__(self, directory: Path, root: Path):
+    def __init__(self, directory: Path, root: Path, scope: str = "kernel"):
         self.directory = directory
         self.root = root
+        self.scope = scope
         self.data = None
         self.path = directory / f"rank-{os.environ.get('RANK', '0')}-{os.getpid()}.json"
 
@@ -105,18 +108,21 @@ class EvidencePlugin:
     def pytest_collection_finish(self, session):
         cases = {}
         for item in session.items:
-            marker = item.get_closest_marker("determinism_case")
+            marker_name = "determinism_model" if self.scope == "model" else "determinism_case"
+            marker = item.get_closest_marker(marker_name)
             if marker is None:
                 continue
             declaration = dict(marker.kwargs)
+            required = {"model_id"} if self.scope == "model" else {"op_id", "implementation"}
             if (
                 marker.args
-                or set(declaration) != {"op_id", "implementation"}
+                or set(declaration) != required
                 or not all(isinstance(value, str) and value for value in declaration.values())
             ):
-                raise pytest.UsageError(
-                    "determinism_case requires op_id and implementation strings"
-                )
+                raise pytest.UsageError(f"{marker_name} requires {sorted(required)} strings")
+            if self.scope == "model":
+                model_id = declaration["model_id"]
+                declaration = {"op_id": model_id, "implementation": "model:" + model_id}
             cases[item.nodeid] = {
                 "declaration": declaration,
                 "observations": [],
@@ -124,22 +130,13 @@ class EvidencePlugin:
             }
         if not cases:
             return
-        manifest_path = self.root / "tests/unit_tests/determinism/kernels/manifest.py"
-        spec = importlib.util.spec_from_file_location(
-            "_determinism_evidence_manifest", manifest_path
-        )
-        manifest = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = manifest
-        spec.loader.exec_module(manifest)
-        inventory = {
-            entry.name: {"sources": entry.sources, "exempt_reason": entry.exempt_reason}
-            for entry in manifest.KERNELS
-        }
+        inventory = self._inventory(cases)
         unknown = {case["declaration"]["op_id"] for case in cases.values()} - inventory.keys()
         if unknown:
             raise pytest.UsageError(f"Unregistered determinism operation IDs: {sorted(unknown)}")
         self.data = {
             "schema_version": SCHEMA_VERSION,
+            "evidence_scope": self.scope,
             "run_id": os.environ.get("DETERMINISM_EVIDENCE_RUN_ID", "local"),
             "rank": int(os.environ.get("RANK", "0")),
             "context": _context(self.root),
@@ -148,6 +145,21 @@ class EvidencePlugin:
             "cases": cases,
         }
         self._write()
+
+    def _inventory(self, cases):
+        if self.scope == "model":
+            return {case["declaration"]["op_id"]: {} for case in cases.values()}
+        manifest_path = self.root / "tests/unit_tests/determinism/kernels/manifest.py"
+        spec = importlib.util.spec_from_file_location(
+            "_determinism_evidence_manifest", manifest_path
+        )
+        manifest = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = manifest
+        spec.loader.exec_module(manifest)
+        return {
+            entry.name: {"sources": entry.sources, "exempt_reason": entry.exempt_reason}
+            for entry in manifest.KERNELS
+        }
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_call(self, item):
@@ -173,7 +185,7 @@ class EvidencePlugin:
             case["test_complete"] = report.passed
         if report.failed or report.skipped:
             case["test_complete"] = False
-            case["reason"] = f"{report.when}: {report.outcome}"
+            case["reason"] = f"{report.when}: {report.outcome}: {report.longrepr}"
         self._write()
         return report
 
@@ -187,6 +199,7 @@ class EvidencePlugin:
 def pytest_addoption(parser):
     """Register the opt-in output path."""
     parser.addoption("--determinism-evidence-dir", type=Path, default=None)
+    parser.addoption("--determinism-evidence-scope", choices=("kernel", "model"), default="kernel")
 
 
 def pytest_configure(config):
@@ -194,8 +207,12 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "determinism_case(op_id, implementation): measured kernel replay case"
     )
+    config.addinivalue_line("markers", "determinism_model(model_id): model output/gradient replay")
     directory = config.getoption("--determinism-evidence-dir")
     if directory is not None:
         config.pluginmanager.register(
-            EvidencePlugin(directory, Path(config.rootpath)), "determinism-evidence"
+            EvidencePlugin(
+                directory, Path(config.rootpath), config.getoption("--determinism-evidence-scope")
+            ),
+            "determinism-evidence",
         )

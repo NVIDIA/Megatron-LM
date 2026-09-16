@@ -114,6 +114,8 @@ class BitExactRunner:
         required = required_world_size(parallelism)
         if Utils.world_size < required:
             pytest.skip(f"Requires {required} GPUs for {parallelism}")
+        if parallelism.get("FSDP", 1) > 1 and Utils.world_size != required:
+            pytest.skip(f"FSDP geometry {parallelism} requires exactly {required} GPUs")
 
         pp = parallelism.get("PP", 1)
         if pp > 1 and not self.supports_pp:

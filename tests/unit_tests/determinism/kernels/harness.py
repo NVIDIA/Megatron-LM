@@ -21,10 +21,12 @@ from __future__ import annotations
 import contextlib
 import functools
 import inspect
+import json
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
+from tests.unit_tests.determinism.comparison import _as_bytes, bytes_equal
 from tests.unit_tests.determinism.utils import (
     RacingStreams,
     capture_rng_state,
@@ -77,6 +79,12 @@ def _recorded_replay(replay):
             "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
             "runtime": runtime_signature(torch),
         }
+        if options["configuration"] is not None:
+            # Require explicit JSON values, not a lossy type-only encoding of
+            # opaque objects (e.g. two different torch.dtype settings).
+            signature["configuration"] = json.loads(
+                json.dumps(options["configuration"], allow_nan=False)
+            )
         protocol = {key: options[key] for key in ("replays", "contention", "restore_rng")}
         protocol.update(
             scope="same_process_outputs_and_gradients",
@@ -85,7 +93,10 @@ def _recorded_replay(replay):
         )
         with observe_replay(signature, protocol) as observation:
             result = replay(*args, **kwargs)
-            observation.update(compared_outputs=len(result[0]), compared_gradients=len(result[1]))
+            observation.update(
+                compared_outputs=sum(t.numel() > 0 for t in result[0].values()),
+                compared_gradients=sum(t.numel() > 0 for t in result[1].values()),
+            )
             return result
 
     return wrapped
@@ -141,25 +152,6 @@ def flatten_tensors(obj: Any, prefix: str = "out") -> Dict[str, torch.Tensor]:
 
 def _leaf_inputs(inputs: Any, prefix: str = "in") -> Dict[str, torch.Tensor]:
     return {name: t for name, t in flatten_tensors(inputs, prefix).items() if t.requires_grad}
-
-
-def _as_bytes(t: torch.Tensor) -> torch.Tensor:
-    """The logical contents of ``t`` as a flat ``uint8`` tensor (layout-independent)."""
-    return t.detach().contiguous().reshape(-1).view(torch.uint8)
-
-
-def bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """True iff ``a`` and ``b`` have the same shape and dtype and identical bit patterns.
-
-    Stricter than ``torch.equal``: ``+0.0`` and ``-0.0`` differ, and NaNs only match when
-    their payloads match. Strides are not compared -- both operands are read in logical
-    order -- so a kernel may return a differently laid out tensor with the same contents.
-    """
-    if a.shape != b.shape or a.dtype != b.dtype:
-        return False
-    if a.numel() == 0:
-        return True
-    return bool(torch.equal(_as_bytes(a), _as_bytes(b)))
 
 
 def _describe_mismatch(name: str, a: torch.Tensor, b: torch.Tensor) -> str:
@@ -230,6 +222,7 @@ def assert_replays_bit_exact(
     contention: bool = False,
     restore_rng: bool = False,
     what: str = "kernel",
+    configuration: Optional[dict] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Assert that ``replays`` runs of ``fn`` on identical inputs are byte-identical.
 
@@ -248,6 +241,9 @@ def assert_replays_bit_exact(
         restore_rng: snapshot every RNG before the reference run and restore it before
             each replay -- for kernels that consume random numbers (dropout).
         what: label for error messages.
+        configuration: JSON dispatch options held outside the input arguments;
+            included in evidence signatures so a recipe without an adapter cannot
+            reuse a closure's or module's incomplete input signature.
 
     Returns:
         The reference outputs and gradients (for follow-up assertions).
@@ -376,6 +372,7 @@ def assert_module_replays_bit_exact(
     contention: bool = False,
     restore_rng: bool = True,
     what: str = "module",
+    configuration: Optional[dict] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Module-level twin of ``assert_replays_bit_exact``.
 

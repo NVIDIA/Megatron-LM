@@ -20,7 +20,12 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
-from tests.unit_tests.determinism.configs import GPT_CONFIGS, PARALLELISM_CONFIGS, gpt_base
+from tests.unit_tests.determinism.configs import (
+    GPT_CONFIGS,
+    PARALLELISM_CONFIGS,
+    gb200_compatible_configs,
+    gpt_base,
+)
 
 SEQ_LEN = 32
 MICRO_BATCH = 4
@@ -78,6 +83,7 @@ def make_gpt_runner(supports_pp: bool = True) -> BitExactRunner:
 RUNNER = make_gpt_runner(supports_pp=True)
 
 
+@pytest.mark.determinism_model(model_id="gpt")
 class TestGPTModelDeterminism:
 
     def setup_method(self, method):
@@ -87,7 +93,8 @@ class TestGPTModelDeterminism:
         RUNNER.teardown()
 
     @pytest.mark.internal
-    @pytest.mark.parametrize("parallelism", PARALLELISM_CONFIGS)
+    # launch_on_gb200 marks apply to four-GPU parameters only.
+    @pytest.mark.parametrize("parallelism", gb200_compatible_configs(PARALLELISM_CONFIGS))
     @pytest.mark.parametrize("cfg_overrides", GPT_CONFIGS)
     def test_bit_exact_under_parallelism(self, cfg_overrides, parallelism):
         RUNNER.run(cfg_overrides, parallelism)

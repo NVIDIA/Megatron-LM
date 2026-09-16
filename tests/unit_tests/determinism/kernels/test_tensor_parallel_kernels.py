@@ -72,12 +72,18 @@ class TestTensorParallelLayers:
     @pytest.mark.parametrize(
         "deterministic_branch", [True, False], ids=["weight_index", "F.embedding"]
     )
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.determinism_case(
+        op_id="tensor_parallel_layers", implementation="test:VocabParallelEmbedding-local"
+    )
     def test_vocab_parallel_embedding_backward_replays(self, deterministic_branch):
         """64 distinct ids over 32k positions: ~500 duplicate rows accumulate per embedding row."""
         seeded()
         config = _config(deterministic_mode=deterministic_branch)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        assert tp_group.size() == 1  # Local evidence does not certify TP collective reductions.
         module = VocabParallelEmbedding(
-            8192, 1024, init_method=init_method_normal(0.02), config=config
+            8192, 1024, init_method=init_method_normal(0.02), config=config, tp_group=tp_group
         ).cuda()
         ids = torch.randint(0, 64, (8, 4096), device="cuda") * 100
         with deterministic_algorithms(deterministic_branch):
@@ -86,6 +92,11 @@ class TestTensorParallelLayers:
                 (ids,),
                 replays=4,
                 what=f"VocabParallelEmbedding[det={deterministic_branch}]",
+                configuration={
+                    "deterministic_branch": deterministic_branch,
+                    "TP": tp_group.size(),
+                    "vocab_size": 8192,
+                },
             )
 
     @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])

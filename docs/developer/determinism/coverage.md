@@ -8,9 +8,11 @@ Kernel registration says where tests belong. Measured coverage says which
 declared cases actually completed a replay protocol on a particular revision,
 software stack, GPU, and rank count.
 
-The initial producer annotates local fused-activation tests. The distributed
-cross-entropy test is not annotated: its process-group contract needs a separate
-adapter before its evidence can be reused by a recipe. Other kernel families
+The producer annotates local fused activations, TE normalization and attention,
+single-rank embedding accumulation, the MoE router GEMM, and SSM decode. These
+selected cases cover eleven manifest families, not every variant within them.
+The distributed cross-entropy test is not annotated: its process-group contract
+needs a separate adapter before its evidence can be reused by a recipe. Other kernel families
 remain visible in `inventory_without_declared_cases`; they are not included in
 the case percentage. This is incremental onboarding, not whole-model coverage.
 
@@ -40,6 +42,14 @@ validate those before making a cross-process claim.
 A test-file mapping or a marker alone cannot pass.
 Do not annotate artificial negative controls as production operations.
 
+Module/closure tests pass explicit `configuration` to the harness for options
+outside the tensor arguments: normalization, attention backend, router dtype,
+embedding branch/group size, or the SSM policy override. These `test:`
+implementation IDs and configuration fields deliberately require an explicit
+recipe adapter; the current function-only inventory cannot reuse them from
+matching input shapes alone. Decode evidence is forward-only and includes
+the mutated state tensor; it makes no claim about an SSM training backward.
+
 The current protocol compares outputs and gradients within one process. It does
 not certify fresh-process dispatch, checkpoint restart, arbitrary shapes,
 unobserved internal kernels, or complete mutable training state. Correctness
@@ -47,7 +57,7 @@ against an independent reference is a separate check.
 
 ## Running and reporting
 
-The dedicated H100 kernel recipe enables collection and writes reports beside
+The dedicated H100 and GB200 kernel recipes enable collection and write reports beside
 the uploaded logs, including on test failure. For a local GPU run, use a fresh
 output directory for each launch:
 
@@ -68,6 +78,38 @@ The report also writes `coverage.md`. Collection persists each rank's declared
 cases before execution and updates observations as comparisons finish. Reusing
 a directory with duplicate rank shards is rejected rather than silently picking
 the best retry.
+
+CI passes `--require-verified`: at least one selected case must have passing,
+nonempty comparisons on every required rank. Empty selections, all-skipped runs,
+and incomplete rank sets fail this gate while retaining available diagnostics.
+`--require-case '*pattern*'` additionally requires a nonempty matching selection
+and verified-deterministic status for every match. These are execution gates;
+they do not require all inventory families to be verified.
+
+## GB200 model replay
+
+The GB200 recipe has separate four-GPU kernel and model buckets, excluded from
+the general bucket. `launch_on_gb200` selects only compatible GPT/hybrid
+TP/PP/VPP/EP/FSDP cells. Eight-GPU cells remain in the H100 matrix; FSDP cells
+require the exact world size so an `fsdp4` label cannot silently exercise eight
+shards. The model bucket also selects tensorwise/delayed FP8, MXFP8, and NVFP4.
+MXFP8 and NVFP4 each have a required-case gate: skipping either cannot pass.
+
+`determinism_model(model_id=...)` plus `--determinism-evidence-scope model`
+uses the same per-rank protocol with a distinct `model_determinism_replay`
+report kind. The recipe consumer rejects this kind as operator evidence.
+Models compare output and parameter-gradient bytes, including signed zeros
+and NaN payloads. Pipeline cells compare the final loss scalar broadcast to
+all ranks and each rank's parameter gradients, not every activation tensor.
+The report records actual comparison counts, skips, and Torch's warn-only
+setting. It does not certify full training state, fresh-process replay, or
+checkpoint restart.
+
+GB200 sets `CUDA_DEVICE_MAX_CONNECTIONS=32` before CUDA initialization to allow
+scheduling contention. The kernel bucket also runs the harness's injected
+signed-zero/NaN mismatch controls, which are excluded from production coverage.
+Collection and CPU contract checks do not establish GPU pass rates; the first
+protected-runner execution is required to validate this selection and runtime.
 
 | Status | Meaning |
 | --- | --- |

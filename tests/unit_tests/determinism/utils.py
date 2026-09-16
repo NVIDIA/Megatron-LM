@@ -13,6 +13,8 @@ import random
 import numpy as np
 import torch
 
+from tests.unit_tests.determinism.comparison import assert_bit_exact as assert_bit_exact
+
 try:
     # Public-by-import helper used by PyTorch's own test_cuda.py to convert
     # milliseconds to device-cycle counts for torch.cuda._sleep.
@@ -56,38 +58,6 @@ def restore_rng_state(state: dict) -> None:
     torch.cuda.set_rng_state(state["torch_cuda"])
     if "mpu_tracker" in state:
         get_cuda_rng_tracker().set_states(state["mpu_tracker"])
-
-
-def _strict_equal_with_nan(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Element-wise equality where NaN at the same position counts as equal.
-
-    Plain ``torch.equal`` returns False for any NaN-vs-NaN comparison, which
-    is the correct semantics for value equality but wrong for *determinism*
-    where we only care that two runs produced bit-identical outputs — same
-    NaN pattern included.
-    """
-    if a.shape != b.shape or a.dtype != b.dtype:
-        return False
-    eq = (a == b) | (a.isnan() & b.isnan())
-    return bool(eq.all().item())
-
-
-def assert_bit_exact(out_a, grads_a, out_b, grads_b) -> None:
-    """Assert two (output, grad-dict) pairs are bit-exact equal.
-
-    Uses explicit ``raise AssertionError`` rather than ``assert`` statements:
-    this helper lives outside ``test_*.py`` so pytest does NOT rewrite its
-    asserts, and bare ``assert`` would be stripped under ``python -O`` /
-    ``PYTHONOPTIMIZE=1`` — turning every determinism check into a silent
-    no-op.
-    """
-    if not _strict_equal_with_nan(out_a, out_b):
-        raise AssertionError("Outputs differ between deterministic runs")
-    if grads_a.keys() != grads_b.keys():
-        raise AssertionError("Grad keys differ between runs")
-    for name in grads_a:
-        if not _strict_equal_with_nan(grads_a[name], grads_b[name]):
-            raise AssertionError(f"Grad mismatch for {name}")
 
 
 def collect_grads(modules) -> dict:

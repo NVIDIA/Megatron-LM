@@ -157,6 +157,88 @@ def test_cli_writes_matching_json_and_markdown(tmp_path):
     assert "Verification coverage: 100.0%" in target.with_suffix(".md").read_text()
 
 
+@pytest.mark.parametrize("failure", ["empty", "skipped", "missing_rank", "unrelated_failure"])
+def test_ci_gate_requires_passing_comparisons_on_every_rank(tmp_path, failure):
+    row = shard(world_size=2 if failure == "missing_rank" else 1)
+    if failure == "empty":
+        row["cases"] = {}
+    elif failure == "skipped":
+        row["cases"]["test_op[bf16]"]["observations"] = []
+    elif failure == "unrelated_failure":
+        row["cases"]["test_op[bf16]"]["test_complete"] = False
+    (tmp_path / "rank-0.json").write_text(json.dumps(row))
+    target = tmp_path / "report.json"
+    assert main([str(tmp_path), "--output", str(target), "--require-verified"]) == 1
+    assert target.exists()  # Preserve the unknowns even when the CI gate fails.
+
+
+def test_required_blackwell_case_cannot_be_replaced_by_an_unrelated_pass(tmp_path):
+    row = shard()
+    row["evidence_scope"] = "model"
+    (tmp_path / "rank-0.json").write_text(json.dumps(row))
+    args = [str(tmp_path), "--output", str(tmp_path / "report.json"), "--require-verified"]
+    assert main(args + ["--require-case", "*bf16*"]) == 0
+    assert main(args + ["--require-case", "*mxfp8*"]) == 1
+    row["cases"]["test_op[mxfp8]"] = {
+        "declaration": {"op_id": "tested", "implementation": "test:quantized"},
+        "test_complete": False,
+        "observations": [],
+    }
+    (tmp_path / "rank-0.json").write_text(json.dumps(row))
+    assert main(args) == 0  # The ordinary BF16 case still passed.
+    assert main(args + ["--require-case", "*mxfp8*"]) == 1
+    assert json.loads((tmp_path / "report.json").read_text())["kind"] == "model_determinism_replay"
+
+
+def test_model_evidence_cannot_be_combined_with_kernel_coverage():
+    rows = [shard(0, 2), shard(1, 2)]
+    rows[1]["evidence_scope"] = "model"
+    with pytest.raises(ValueError, match="kernel and model"):
+        aggregate(rows)
+
+
+def test_model_pytest_lifecycle_records_actual_comparisons_and_skip_reasons(pytester, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[3]))
+    monkeypatch.setenv("RANK", "0")
+    pytester.makeini("[pytest]\n")
+    pytester.makeconftest("""
+from tools.determinism import pytest_plugin
+pytest_plugin._context = lambda root: {'revision': 'a' * 40, 'dirty': False, 'world_size': 1}
+""")
+    pytester.makepyfile("""
+import pytest
+import torch
+from tests.unit_tests.determinism.comparison import assert_bit_exact
+pytestmark = pytest.mark.determinism_model(model_id='gpt')
+
+def test_good():
+    t = torch.ones(1)
+    assert_bit_exact(t, {'w': t}, t.clone(), {'w': t.clone()})
+
+@pytest.mark.skip(reason='unsupported precision')
+def test_skipped():
+    pass
+
+def test_without_comparison():
+    pass
+""")
+    output = pytester.path / "evidence"
+    result = pytester.runpytest_subprocess(
+        "-p",
+        "tools.determinism.pytest_plugin",
+        "--determinism-evidence-dir",
+        str(output),
+        "--determinism-evidence-scope",
+        "model",
+    )
+    result.assert_outcomes(passed=2, skipped=1)
+    report = aggregate([json.loads(path.read_text()) for path in output.glob("rank-*.json")])
+    assert report["kind"] == "model_determinism_replay"
+    assert report["counts"] == {"total": 3, DETERMINISTIC: 1, NONDETERMINISTIC: 0, UNVERIFIED: 2}
+    skipped = next(case for case in report["cases"] if case["case_id"].endswith("test_skipped"))
+    assert "unsupported precision" in " ".join(skipped["reasons"])
+
+
 def test_real_pytest_lifecycle_uses_replay_evidence(pytester, monkeypatch):
     root = Path(__file__).resolve().parents[3]
     monkeypatch.setenv("PYTHONPATH", str(root))

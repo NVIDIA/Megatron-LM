@@ -40,6 +40,8 @@ _QUANT_RECIPES = [
 ]
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.determinism_model(model_id="gpt-quantized")
 class TestQuantizationDeterminism:
 
     def setup_method(self, method):

@@ -56,7 +56,7 @@ spec:
     if [[ "$TAG" == "latest" && "$BUCKET" == "tests/unit_tests/determinism/kernels/**/*.py" ]]; then
         export DETERMINISM_EVIDENCE_RUN_ID="{environment}-{platforms}-{tag}"
         export PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:-}} -p tools.determinism.pytest_plugin --determinism-evidence-dir={assets_dir}/logs/determinism-shards"
-        trap 'status=$?; cd "$TEST_PATH"; python -m tools.determinism.coverage "{assets_dir}/logs/determinism-shards" --output "{assets_dir}/logs/determinism-coverage.json" --revision "$(git rev-parse HEAD)" || status=1; exit "$status"' EXIT
+        trap 'status=$?; cd "$TEST_PATH"; python -m tools.determinism.coverage "{assets_dir}/logs/determinism-shards" --output "{assets_dir}/logs/determinism-coverage.json" --revision "$(git rev-parse HEAD)" --require-verified || status=1; exit "$status"' EXIT
     fi
 
     bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \

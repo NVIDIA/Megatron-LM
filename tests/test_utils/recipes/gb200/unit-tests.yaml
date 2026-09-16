@@ -53,6 +53,21 @@ spec:
     fi
 
 
+    if [[ "$BUCKET" == "tests/unit_tests/determinism/kernels/**/*.py" || "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ]]; then
+        # Set before importing Torch or creating CUDA handles; allow scheduling contention.
+        export CUDA_DEVICE_MAX_CONNECTIONS=32
+        export MAMBA_DETERMINISTIC=1 CAUSAL_CONV1D_DETERMINISTIC=1
+        export DETERMINISM_EVIDENCE_RUN_ID="{environment}-{platforms}-{tag}"
+        EVIDENCE_SCOPE=kernel
+        REQUIRED_CASES=()
+        if [[ "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ]]; then
+            EVIDENCE_SCOPE=model
+            REQUIRED_CASES=(--require-case '*fp8-mxfp8*' --require-case '*fp4-nvfp4*')
+        fi
+        export PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:-}} -p tools.determinism.pytest_plugin --determinism-evidence-scope=$EVIDENCE_SCOPE --determinism-evidence-dir={assets_dir}/logs/determinism-shards"
+        trap 'status=$?; cd "$TEST_PATH"; python -m tools.determinism.coverage "{assets_dir}/logs/determinism-shards" --output "{assets_dir}/logs/determinism-coverage.json" --revision "$(git rev-parse HEAD)" --require-verified "${{REQUIRED_CASES[@]}}" || status=1; exit "$status"' EXIT
+    fi
+
     bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
       --tag $TAG \
       --environment $ENVIRONMENT \
@@ -68,11 +83,23 @@ spec:
     cp .coverage {assets_dir}/coverage_report
     cp coverage.xml {assets_dir}
 
-# GB200 unit-test selection is marker-driven: a single catch-all bucket is
-# narrowed to files carrying @pytest.mark.launch_on_gb200 by find_test_cases.py
-# (see tests/unit_tests/run_ci_test.sh --platform gb200). Re-shard into smaller
-# buckets here if the marked set grows large enough to need parallelism.
+# GB200 selection remains marker-driven. Dedicated replay buckets are excluded
+# from the catch-all by find_test_cases.py and require real numerical evidence.
 products:
+  - test_case: [tests/unit_tests/determinism/kernels/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/determinism/correctness/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/**/*.py]
     products:
       - environment: [dev]

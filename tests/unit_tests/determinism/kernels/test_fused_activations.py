@@ -140,6 +140,7 @@ GATED_OP_IDS = {
         for case in sorted(GATED_CASES)
     ],
 )
+@pytest.mark.launch_on_gb200
 def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
@@ -172,6 +173,7 @@ ACTIVATION_CASES = {
         for case in sorted(ACTIVATION_CASES)
     ],
 )
+@pytest.mark.launch_on_gb200
 def test_compiled_activations_replay_bit_exactly(case):
     seeded()
     x = _act((TOKENS, FFN)) * 5.0
@@ -182,6 +184,7 @@ def test_compiled_activations_replay_bit_exactly(case):
 @pytest.mark.determinism_case(
     op_id="compiled_activations", implementation="torch.compile:attention_output_gate"
 )
+@pytest.mark.launch_on_gb200
 def test_attention_output_gate_replays_bit_exactly():
     """``Attention._apply_output_gate`` is a compiled method; ``self`` is unused."""
     seeded()
@@ -196,6 +199,7 @@ def test_attention_output_gate_replays_bit_exactly():
 
 
 @pytest.mark.determinism_case(op_id="compiled_activations", implementation="torch.compile:L2Norm")
+@pytest.mark.launch_on_gb200
 def test_l2norm_replays_bit_exactly():
     """QK L2 norm: compiled row reduction (``pow(2).mean(-1)``) over head_dim."""
     seeded()
@@ -211,6 +215,7 @@ def test_l2norm_replays_bit_exactly():
 @pytest.mark.determinism_case(
     op_id="fused_bias_dropout_add", implementation="torch.compile:bias_dropout_add_train"
 )
+@pytest.mark.launch_on_gb200
 def test_bias_dropout_add_fused_train_replays_under_restored_rng(residual_dtype):
     """Dropout consumes the CUDA RNG: identical mask, output and grads when the RNG is restored."""
     seeded()
@@ -229,6 +234,7 @@ def test_bias_dropout_add_fused_train_replays_under_restored_rng(residual_dtype)
 @pytest.mark.determinism_case(
     op_id="fused_bias_dropout_add", implementation="torch.compile:bias_dropout_add_inference"
 )
+@pytest.mark.launch_on_gb200
 def test_bias_dropout_add_fused_inference_replays_bit_exactly():
     seeded()
     x = _act((2048, 4, 4096), grad=False)
@@ -285,6 +291,7 @@ class TestFusedCrossEntropy:
 @pytest.mark.determinism_case(
     op_id="dsv4_q_rms_norm", implementation="torch.compile:dsv4_q_rms_norm"
 )
+@pytest.mark.launch_on_gb200
 def test_dsv4_q_rms_norm_replays(dtype, layout):
     """``_q_rms_norm`` (weightless RMS norm, ``torch.compile``) on a [s, b, heads, dim] query.
 
