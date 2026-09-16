@@ -105,24 +105,37 @@ class RouterReplay:
 
     @staticmethod
     def set_global_static_buffers(
-        static_buffer: torch.Tensor, *, is_mtp_layer: bool | None = None
+        static_buffer: torch.Tensor,
+        *,
+        is_mtp_layer: bool | None = None,
+        buffer_index: torch.Tensor | None = None,
+        layer_indices: list[torch.Tensor] | None = None,
     ) -> None:
         """Set static buffers, optionally filtered by layer type.
 
         Args:
-            static_buffer (torch.Tensor): Tensor shaped ``[max_tokens, num_layers, topk]``.
+            static_buffer (torch.Tensor): Tensor shaped ``[max_tokens, num_layers, topk]``,
+                with a leading buffer dimension when ``buffer_index`` is provided.
             is_mtp_layer (bool | None): Select MTP routers when true, base-model routers
                 when false, or all routers when unset.
+            buffer_index (torch.Tensor | None): GPU selector for double-buffered recording.
+            layer_indices (list[torch.Tensor] | None): Stable GPU layer indices for
+                double-buffered recording, one scalar per router.
         """
         instances = RouterReplay.get_instances(is_mtp_layer)
         num_layers = len(instances)
-        assert static_buffer.shape[1] == num_layers, (
-            f"Buffer has {static_buffer.shape[1]} layers but there are "
+        assert static_buffer.shape[-2] == num_layers, (
+            f"Buffer has {static_buffer.shape[-2]} layers but there are "
             f"{num_layers} RouterReplay instances."
         )
         for layer_idx, router_instance in enumerate(instances):
-            # Each layer gets a view of shape [max_tokens, topk]
-            router_instance.set_static_buffer(static_buffer[:, layer_idx, :])
+            if buffer_index is None:
+                router_instance.set_static_buffer(static_buffer[:, layer_idx, :])
+            else:
+                assert layer_indices is not None
+                router_instance.set_static_buffer(
+                    static_buffer, buffer_index=buffer_index, layer_index=layer_indices[layer_idx]
+                )
 
     @staticmethod
     def clear_global_static_buffers(*, is_mtp_layer: bool | None = None) -> None:
@@ -151,6 +164,8 @@ class RouterReplay:
             []
         )  # List of tensors for backward pass replay
         self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph
+        self.static_buffer_index: Optional[torch.Tensor] = None
+        self.static_layer_index: Optional[torch.Tensor] = None
         self.layer_number: Optional[int] = None
         RouterReplay.global_router_replay_instances.append(self)
 
@@ -224,25 +239,55 @@ class RouterReplay:
         else:
             return default_compute_topk(scores, topk, num_groups, group_topk)
 
-    def set_static_buffer(self, buffer: torch.Tensor):
+    def set_static_buffer(
+        self,
+        buffer: torch.Tensor,
+        *,
+        buffer_index: torch.Tensor | None = None,
+        layer_index: torch.Tensor | None = None,
+    ) -> None:
         """Sets a static buffer for CUDA graph compatible recording.
 
         Args:
-            buffer: Tensor of shape [max_tokens, topk] to copy routing indices into.
+            buffer (torch.Tensor): Per-layer destination shaped ``[max_tokens, topk]``
+                for legacy recording, or the full contiguous
+                ``[2, max_tokens, num_layers, topk]`` buffer for async recording.
+            buffer_index (torch.Tensor | None): GPU selector for double-buffered recording.
+            layer_index (torch.Tensor | None): GPU layer index within the shared buffer.
         """
         self.static_buffer = buffer
+        self.static_buffer_index = buffer_index
+        self.static_layer_index = layer_index
 
     def clear_static_buffer(self):
         """Clears the static buffer."""
         self.static_buffer = None
+        self.static_buffer_index = None
+        self.static_layer_index = None
 
-    def record_indices(self, topk_indices: torch.Tensor):
+    def record_indices(self, topk_indices: torch.Tensor) -> None:
         """Records the topk indices.
 
         If a static buffer is set (for CUDA graph compatibility), copies into it.
         Otherwise, just stores the tensor reference.
+
+        Args:
+            topk_indices (torch.Tensor): Selected expert indices for this layer's tokens.
         """
-        if self.static_buffer is not None:
+        if self.static_buffer_index is not None:
+            rows = torch.arange(topk_indices.shape[0], device=topk_indices.device)
+            # Keep the compiled input contiguous: per-layer views can trigger
+            # copies spanning both banks, racing the other bank's D2H.
+            self.static_buffer.index_put_(
+                (
+                    self.static_buffer_index[:, None],
+                    rows[None, :],
+                    self.static_layer_index[:, None],
+                ),
+                topk_indices.to(self.static_buffer.dtype).unsqueeze(0),
+            )
+            self.recorded_topk_idx = topk_indices
+        elif self.static_buffer is not None:
             # Copy into static buffer for CUDA graph compatibility.
             num_tokens = topk_indices.shape[0]
             self.static_buffer[:num_tokens].copy_(topk_indices)

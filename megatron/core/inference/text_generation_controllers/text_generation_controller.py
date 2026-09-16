@@ -74,9 +74,10 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
 
 @dataclass
 class _AsyncScheduleRoutingBufferSlot:
-    """Reusable pinned CPU storage for one routing transfer."""
+    """Pinned CPU storage and transfer fences paired with one GPU routing bank."""
 
     cpu_buffer: Optional[Tensor] = None
+    forward_ready_event: Optional[torch.cuda.Event] = None
     cpu_ready_event: Optional[torch.cuda.Event] = None
     in_use: bool = False
 
@@ -89,9 +90,8 @@ class _AsyncScheduleRoutingRecord:
     block_ids: Tensor
     positions: Tensor
     buffer_slot: Optional[_AsyncScheduleRoutingBufferSlot] = None
-    source_captured_event: Optional[torch.cuda.Event] = None
     cpu_ready_event: Optional[torch.cuda.Event] = None
-    gpu_snapshot: Optional[Tensor] = None
+    gpu_source: Optional[Tensor] = None
     row_indices: Optional[Tensor] = None
 
     def select_rows(self, row_indices: Tensor) -> None:
@@ -111,7 +111,7 @@ class _AsyncScheduleRoutingRecord:
         if self.buffer_slot is not None:
             self.buffer_slot.in_use = False
             self.buffer_slot = None
-        self.gpu_snapshot = None
+        self.gpu_source = None
 
 
 @dataclass
@@ -409,15 +409,14 @@ class TextGenerationController(MTPInferenceMixin):
         self._async_sched_copy_stream = torch.cuda.Stream(device=device)
         self._async_sched_routing_copy_stream = None
         self._async_sched_routing_buffer_slots = []
-        self._async_sched_routing_source_captured_event = None
+        self._async_sched_routing_buffer_index = -1
         if (
             self.model_config.moe_enable_routing_replay
             and context.config.async_sched_mode == AsyncScheduleMode.ASYNC
         ):
             self._async_sched_routing_copy_stream = torch.cuda.Stream(device=device)
             self._async_sched_routing_buffer_slots = [
-                _AsyncScheduleRoutingBufferSlot(cpu_ready_event=torch.cuda.Event())
-                for _ in range(2)
+                _AsyncScheduleRoutingBufferSlot() for _ in range(2)
             ]
 
         # Sampling backend: provides the sampling kernel.
@@ -827,6 +826,23 @@ class TextGenerationController(MTPInferenceMixin):
             input_ids, position_ids = context.current_input_and_position_ids()
         return input_ids, position_ids, bookkeeping_done_event
 
+    def _select_async_sched_routing_buffer(self) -> None:
+        """Select the next routing bank without blocking the host on its prior transfer."""
+        if not self._async_sched_routing_buffer_slots:
+            return
+
+        buffer_index = (self._async_sched_routing_buffer_index + 1) % 2
+        slot = self._async_sched_routing_buffer_slots[buffer_index]
+        assert not slot.in_use, "Cannot overwrite routing output that has not been consumed."
+        if slot.cpu_ready_event is not None:
+            torch.cuda.current_stream().wait_event(slot.cpu_ready_event)
+
+        context = self.inference_wrapped_model.inference_context
+        selector = context.moe_routing_metadata.buffer_index_cuda
+        if selector is not None:
+            selector.fill_(buffer_index)
+        self._async_sched_routing_buffer_index = buffer_index
+
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor):
         """Forward step the model to get logits for dynamic batching.
 
@@ -880,6 +896,8 @@ class TextGenerationController(MTPInferenceMixin):
             inference_input["image_embeddings"] = image_embeddings
 
         with torch.inference_mode():
+            # Real, dummy, and warmup base forwards share the same bank-reuse fence.
+            self._select_async_sched_routing_buffer()
             logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
             # logits shape: [1, seq_len, vocab_size]
 
@@ -1187,8 +1205,11 @@ class TextGenerationController(MTPInferenceMixin):
             ),
         )
 
-    def _collect_router_recording(self) -> Optional[Tensor]:
+    def _collect_router_recording(self, buffer_index: int | None = None) -> Optional[Tensor]:
         """Collect routing indices in the context's active-token order.
+
+        Args:
+            buffer_index (int | None): Async forward's GPU bank, or ``None`` for legacy.
 
         Returns:
             Optional[Tensor]: GPU routing indices shaped
@@ -1201,7 +1222,7 @@ class TextGenerationController(MTPInferenceMixin):
         if context.moe_routing_metadata is None:
             return None
 
-        stacked_routing = context.moe_routing_metadata.get_routing_indices()
+        stacked_routing = context.moe_routing_metadata.get_routing_indices(buffer_index)
         if stacked_routing is None:
             return None
 
@@ -1900,25 +1921,14 @@ class TextGenerationController(MTPInferenceMixin):
         """Acquire reusable pinned CPU storage for one routing transfer.
 
         Args:
-            shape (torch.Size): Shape of the routing snapshot.
+            shape (torch.Size): Shape of the routing output.
 
         Returns:
             Tuple[_AsyncScheduleRoutingBufferSlot, Tensor]: Acquired slot and shaped CPU view.
         """
         required_size = shape.numel()
-        free_slots = [slot for slot in self._async_sched_routing_buffer_slots if not slot.in_use]
-        if not free_slots:
-            raise RuntimeError("Async routing replay exhausted its two transfer slots.")
-
-        slot = next(
-            (
-                candidate
-                for candidate in free_slots
-                if candidate.cpu_buffer is not None
-                and candidate.cpu_buffer.numel() >= required_size
-            ),
-            free_slots[0],
-        )
+        slot = self._async_sched_routing_buffer_slots[self._async_sched_routing_buffer_index]
+        assert not slot.in_use, "Cannot reuse an unconsumed routing transfer slot."
         if slot.cpu_buffer is None or slot.cpu_buffer.numel() < required_size:
             slot.cpu_buffer = torch.empty(
                 required_size, dtype=torch.int32, device="cpu", pin_memory=True
@@ -1930,7 +1940,7 @@ class TextGenerationController(MTPInferenceMixin):
         return slot, slot.cpu_buffer[:required_size].view(shape)
 
     def _capture_async_sched_routing(self) -> Optional[_AsyncScheduleRoutingRecord]:
-        """Detach current routing output from reusable model buffers.
+        """Transfer the current GPU routing bank to its paired pinned CPU slot.
 
         Returns:
             Optional[_AsyncScheduleRoutingRecord]: Pending CPU transfer and its
@@ -1940,28 +1950,25 @@ class TextGenerationController(MTPInferenceMixin):
             return None
 
         block_ids, positions = self._snapshot_router_recording_layout()
-        forward_ready_event = torch.cuda.Event()
-        forward_ready_event.record(torch.cuda.current_stream())
+        buffer_index = self._async_sched_routing_buffer_index
+        slot = self._async_sched_routing_buffer_slots[buffer_index]
+        if slot.forward_ready_event is None:
+            slot.forward_ready_event = torch.cuda.Event()
+        slot.forward_ready_event.record(torch.cuda.current_stream())
         routing_stream = self._async_sched_routing_copy_stream
         assert routing_stream is not None
 
         with torch.cuda.stream(routing_stream):
-            routing_stream.wait_event(forward_ready_event)
-            stacked_routing = self._collect_router_recording()
+            routing_stream.wait_event(slot.forward_ready_event)
+            stacked_routing = self._collect_router_recording(buffer_index)
             if stacked_routing is None:
                 return None
 
-            gpu_snapshot = stacked_routing.to(dtype=torch.int32, copy=True)
-            assert gpu_snapshot.shape[0] == block_ids.numel()
-
-            source_captured_event = torch.cuda.Event()
-            source_captured_event.record(routing_stream)
-            self._async_sched_routing_source_captured_event = source_captured_event
-
+            assert stacked_routing.shape[0] == block_ids.numel()
             buffer_slot, cpu_view = self._acquire_async_sched_routing_buffer_slot(
-                gpu_snapshot.shape
+                stacked_routing.shape
             )
-            cpu_view.copy_(gpu_snapshot, non_blocking=True)
+            cpu_view.copy_(stacked_routing, non_blocking=True)
             buffer_slot.cpu_ready_event.record(routing_stream)
 
         return _AsyncScheduleRoutingRecord(
@@ -1969,18 +1976,9 @@ class TextGenerationController(MTPInferenceMixin):
             block_ids=block_ids,
             positions=positions,
             buffer_slot=buffer_slot,
-            source_captured_event=source_captured_event,
             cpu_ready_event=buffer_slot.cpu_ready_event,
-            gpu_snapshot=gpu_snapshot,
+            gpu_source=stacked_routing,
         )
-
-    def _wait_for_async_sched_routing_source_capture(self) -> None:
-        """Make the current stream wait before reusing RouterReplay source storage."""
-        source_captured_event = self._async_sched_routing_source_captured_event
-        if source_captured_event is None:
-            return
-        torch.cuda.current_stream().wait_event(source_captured_event)
-        self._async_sched_routing_source_captured_event = None
 
     def _publish_async_sched_routing(
         self, routing_record: Optional[_AsyncScheduleRoutingRecord]
@@ -2665,9 +2663,7 @@ class TextGenerationController(MTPInferenceMixin):
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
 
-        # Preserve the prior routing source before this forward can overwrite it.
         if self.model_config.moe_enable_routing_replay:
-            self._wait_for_async_sched_routing_source_capture()
             RouterReplay.set_global_router_replay_action(
                 RouterReplayAction.RECORD, is_mtp_layer=False
             )
@@ -2694,7 +2690,6 @@ class TextGenerationController(MTPInferenceMixin):
         context = self.inference_wrapped_model.inference_context
 
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._wait_for_async_sched_routing_source_capture()
         self._run_dummy_base_forward(input_ids, position_ids)
         context.reset(preserve_prefix_cache=True, preserve_counters=True)
 
@@ -3189,8 +3184,6 @@ class TextGenerationController(MTPInferenceMixin):
                 decode-only state.
         """
         context = self.inference_wrapped_model.inference_context
-        if self.model_config.moe_enable_routing_replay:
-            self._wait_for_async_sched_routing_source_capture()
         self._async_sched_forward.clear()
         active_request_count = context.total_request_count - context.paused_request_count
 

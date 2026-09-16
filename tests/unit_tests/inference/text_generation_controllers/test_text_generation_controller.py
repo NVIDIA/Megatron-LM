@@ -313,6 +313,15 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
 
 
 def _make_async_sched_controller(context=None, model_config=None):
+    """Build a controller with isolated async scheduling state.
+
+    Args:
+        context: Optional test context replacing the default mock.
+        model_config: Optional model configuration replacing the default mock.
+
+    Returns:
+        TextGenerationController: Controller configured for focused phase tests.
+    """
     context = context or _make_async_sched_context()
     model_config = model_config or SimpleNamespace(
         params_dtype=torch.float32,
@@ -357,7 +366,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._async_sched_top_n_capacity = 0
     controller._async_sched_routing_copy_stream = None
     controller._async_sched_routing_buffer_slots = []
-    controller._async_sched_routing_source_captured_event = None
+    controller._async_sched_routing_buffer_index = -1
     return controller
 
 
@@ -611,19 +620,26 @@ def test_publish_async_sched_routing_uses_saved_compacted_layout():
     assert not slot.in_use
 
 
-def test_wait_for_async_sched_routing_source_capture_is_device_side():
-    """The next writer waits on its CUDA stream without synchronizing the host."""
+def test_select_async_sched_routing_buffer_waits_only_for_selected_bank():
+    """Each writer waits on its own bank's transfer without synchronizing the host."""
     controller = _make_async_sched_controller()
-    source_captured_event = mock.Mock()
+    selector = mock.Mock()
+    controller.inference_wrapped_model.inference_context.moe_routing_metadata = SimpleNamespace(
+        buffer_index_cuda=selector
+    )
+    slots = [_AsyncScheduleRoutingBufferSlot(cpu_ready_event=mock.Mock()) for _ in range(2)]
+    controller._async_sched_routing_buffer_slots = slots
     stream = mock.Mock()
-    controller._async_sched_routing_source_captured_event = source_captured_event
-
     with mock.patch("torch.cuda.current_stream", return_value=stream):
-        controller._wait_for_async_sched_routing_source_capture()
-
-    stream.wait_event.assert_called_once_with(source_captured_event)
-    source_captured_event.synchronize.assert_not_called()
-    assert controller._async_sched_routing_source_captured_event is None
+        for bank in [0, 1, 0]:
+            stream.reset_mock()
+            controller._select_async_sched_routing_buffer()
+            stream.wait_event.assert_called_once_with(slots[bank].cpu_ready_event)
+            slots[bank].cpu_ready_event.synchronize.assert_not_called()
+            selector.fill_.assert_called_with(bank)
+        slots[1].in_use = True
+        with pytest.raises(AssertionError, match="not been consumed"):
+            controller._select_async_sched_routing_buffer()
 
 
 def test_collect_router_recording_gathers_sequence_parallel_rows():
@@ -787,7 +803,6 @@ def test_run_async_sched_forward_records_pending_routing():
     controller = _make_async_sched_controller(context, model_config)
     controller._async_sched_forward = AsyncScheduleForwardState()
     controller._dynamic_step_forward_logits = mock.Mock()
-    controller._wait_for_async_sched_routing_source_capture = mock.Mock()
     routing_record = mock.Mock()
     controller._capture_async_sched_routing = mock.Mock(return_value=routing_record)
     input_ids = torch.tensor([[10, 11]])
@@ -806,19 +821,24 @@ def test_run_async_sched_forward_records_pending_routing():
     ):
         controller._run_async_sched_forward(input_ids, position_ids)
 
-    controller._wait_for_async_sched_routing_source_capture.assert_called_once_with()
     set_action.assert_called_once_with(RouterReplayAction.RECORD, is_mtp_layer=False)
     controller._capture_async_sched_routing.assert_called_once_with()
     assert controller._async_sched_forward.routing_record is routing_record
 
 
 @pytest.mark.internal
-def test_capture_async_sched_routing_uses_right_sized_snapshot_and_reusable_slot():
-    """Routing capture detaches graph storage and starts a pinned D2H transfer."""
+@pytest.mark.parametrize("discard", [False, True])
+def test_capture_async_sched_routing_alternates_banks_with_delayed_copy(discard):
+    """A delayed transfer survives bank reuse, including discarded pending output.
+
+    Args:
+        discard: Whether pending output is dropped rather than published.
+    """
     context = _make_async_sched_context(total_request_count=3)
-    routing = torch.arange(12, dtype=torch.int32, device="cuda").reshape(3, 2, 2)
+    routing = torch.zeros(2, 3, 2, 2, dtype=torch.int32, device="cuda")
     context.moe_routing_metadata = SimpleNamespace(
-        get_routing_indices=mock.Mock(return_value=routing)
+        get_routing_indices=lambda bank: routing[bank],
+        buffer_index_cuda=torch.zeros(1, dtype=torch.int64, device="cuda"),
     )
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
@@ -831,19 +851,44 @@ def test_capture_async_sched_routing_uses_right_sized_snapshot_and_reusable_slot
     controller._all_logits_cuda = torch.empty(1, device="cuda")
     controller._async_sched_routing_copy_stream = torch.cuda.Stream()
     controller._async_sched_routing_buffer_slots = [
-        _AsyncScheduleRoutingBufferSlot(cpu_ready_event=torch.cuda.Event()) for _ in range(2)
+        _AsyncScheduleRoutingBufferSlot() for _ in range(2)
     ]
+    controller._publish_router_recording = mock.Mock()
+    controller._select_async_sched_routing_buffer()
+    routing[0].fill_(11)
+    with torch.cuda.stream(controller._async_sched_routing_copy_stream):
+        torch.cuda._sleep(50_000_000)
+    first = controller._capture_async_sched_routing()
+    first_slot = first.buffer_slot
+    first_view = first.cpu_view
+    first_event = first.cpu_ready_event
+    assert first.gpu_source.data_ptr() == routing[0].data_ptr()
 
-    routing_record = controller._capture_async_sched_routing()
-    routing_record.cpu_ready_event.synchronize()
+    controller._select_async_sched_routing_buffer()
+    routing[1].fill_(22)
+    second = controller._capture_async_sched_routing()
+    controller._async_sched_forward.set_pending(None, routing_record=first)
+    if discard:
+        controller._async_sched_forward.clear()
+    else:
+        controller._publish_async_sched_routing(
+            controller._async_sched_forward.take_routing_record()
+        )
+    assert not first_slot.in_use
+    assert first_slot.cpu_ready_event is first_event
 
-    assert routing_record.gpu_snapshot.shape == routing.shape
-    assert routing_record.gpu_snapshot.data_ptr() != routing.data_ptr()
-    assert torch.equal(routing_record.cpu_view, routing.cpu())
-    assert routing_record.buffer_slot.cpu_buffer.numel() == routing.numel()
-    buffer_slot = routing_record.buffer_slot
-    routing_record.release()
-    assert not buffer_slot.in_use
+    controller._select_async_sched_routing_buffer()
+    routing[0].fill_(33)
+    torch.cuda.synchronize()
+    assert torch.all(first_view == 11)
+    assert torch.all(second.cpu_view == 22)
+    third = controller._capture_async_sched_routing()
+    third.cpu_ready_event.synchronize()
+    assert third.buffer_slot is first_slot
+    assert third.cpu_view.data_ptr() == first_view.data_ptr()
+    assert torch.all(third.cpu_view == 33)
+    second.release()
+    third.release()
 
 
 def test_run_async_sched_forward_commits_mamba_prefix_states():
@@ -1256,7 +1301,7 @@ def test_async_bookkeeping_retains_finished_handoff_state():
     context = _make_async_sched_context(total_request_count=3, paused_request_count=1)
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
     context.kv_block_allocator = SimpleNamespace(
-        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock(), block_routing={}
     )
     context.request_to_kv_block_ids = torch.tensor(
         [[8, 9, -1], [10, 11, -1], [12, 13, -1]], dtype=torch.int32
@@ -1266,6 +1311,7 @@ def test_async_bookkeeping_retains_finished_handoff_state():
         sampled_tokens_cpu_view=torch.tensor([99, 7]),
         sampled_mtp_tokens_cpu_view=None,
         accepted_tokens_cpu_view=None,
+        routing_record=None,
     )
 
     result = controller._run_async_sched_update_requests(
@@ -2154,6 +2200,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 sampled_tokens_cpu_view=sampled_tokens,
                 sampled_mtp_tokens_cpu_view=None,
                 accepted_tokens_cpu_view=None,
+                routing_record=None,
             ),
             resolved_sequence_lengths=torch.tensor([4, 4, 4]),
         )
