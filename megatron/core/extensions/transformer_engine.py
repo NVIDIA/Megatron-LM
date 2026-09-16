@@ -2625,6 +2625,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
 
+            self._forward_op: Optional[Tuple[torch.nn.Module]] = None
+
             self._register_load_state_dict_pre_hook(
                 type(self)._normalize_grouped_parameter_keys, with_module=True
             )
@@ -2802,12 +2804,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 self.te_quant_params, self.training, is_context_quantized
             )
 
+        def bind_forward_op(self, op: torch.nn.Module) -> None:
+            """Bind a bias-free TE op to execute under this linear's precision policy."""
+            if self.use_bias:
+                raise ValueError("Binding a forward op requires a bias-free grouped linear.")
+            # Runtime parameters must stay outside the optimizer/checkpoint module tree.
+            self._forward_op = (op,)
+
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
+                if self._forward_op is not None:
+                    return self._forward_op[0](x, m_splits), None
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 

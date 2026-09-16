@@ -68,9 +68,9 @@ BASE_CONFIG = {
 
 
 def _set_main_grad(parameter, dtype=torch.float32):
+    """Initialize persistent accumulating gradients as Megatron DDP does."""
     parameter.main_grad = torch.zeros(parameter.shape, dtype=dtype, device=parameter.device)
     parameter.grad_added_to_main_grad = False
-    parameter.overwrite_main_grad = True
 
 
 def _dense_linears(layer):
@@ -180,7 +180,7 @@ def _assert_runtime_layout(manager, *, grad_dtype, mxfp8):
                     )
             assert _weight_storage_ptrs(runtime_weight) == _weight_storage_ptrs(expected_weight)
             assert runtime_weight.main_grad.data_ptr() == expected_grad.data_ptr()
-            assert runtime_weight.overwrite_main_grad
+            assert runtime_weight.overwrite_main_grad == (index >= manager.num_owned_experts)
             assert not hasattr(runtime_weight, "grad_added_to_main_grad")
 
 
@@ -322,7 +322,7 @@ def _run_full_layer_parity(
 
         def record_native_grad(fc_layer):
             # The actual GEMM partial before any peer's virtual-expert gradient is added.
-            native_only[fc_layer] = manager.virtual_experts.native_grads[fc_layer].clone()
+            native_only[fc_layer] = torch.stack(manager.virtual_experts.native_grads[fc_layer])
             start_grad_reduce(fc_layer)
 
         manager._start_grad_reduce = record_native_grad
@@ -528,11 +528,6 @@ def _run_repeated_mtp_parity(monkeypatch):
     def initialize_main_grads(model):
         for parameter in model.parameters():
             _set_main_grad(parameter)
-            # Ordinary Megatron DDP zeroes persistent main-grad buffers and TE
-            # accumulates every tied-layer use into them. ``overwrite`` suits
-            # only a single-use synthetic forward: with two outstanding autograd
-            # contexts both would otherwise overwrite the same buffer.
-            del parameter.overwrite_main_grad
 
     def snapshot(model):
         return {

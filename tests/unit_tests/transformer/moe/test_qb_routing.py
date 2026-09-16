@@ -22,9 +22,15 @@ pytestmark = pytest.mark.launch_on_gb200
 
 
 @pytest.mark.internal
-@pytest.mark.parametrize("quantile", [False, True], ids=["seq_aux_loss", "quantile"])
-def test_nt4_compact_router(monkeypatch, quantile):
+@pytest.mark.parametrize(
+    ("quantile", "expert_bias"),
+    [(False, False), (False, True), (True, False)],
+    ids=["seq_aux_loss", "expert_bias", "quantile"],
+)
+@pytest.mark.parametrize("compact_supported", [False, True])
+def test_nt4_compact_router(monkeypatch, quantile, expert_bias, compact_supported):
     """Recipe-sized expert IDs and scores agree with a dense unfused router and CPU math."""
+    monkeypatch.setattr(moe_utils, "hybrid_ep_dense_topk_routing", lambda *_: compact_supported)
     Utils.initialize_model_parallel(1, 1)
     _set_random_seed(seed_=123, data_parallel_random_init=False)
     config = _virtual_expert_hybridep_config(
@@ -36,13 +42,14 @@ def test_nt4_compact_router(monkeypatch, quantile):
         moe_router_topk_scaling_factor=2.5,
         moe_router_load_balancing_type="quantile_balancing" if quantile else "seq_aux_loss",
         moe_aux_loss_coeff=0 if quantile else 1e-4,
-        moe_router_enable_expert_bias=not quantile,
-        moe_router_fusion=not quantile,
+        moe_router_enable_expert_bias=expert_bias,
+        moe_router_fusion=not quantile and not expert_bias,
     )
     torch.manual_seed(321)
     logits_cpu = torch.randn(256, 512)
-    logits_cpu[0] = -100  # Selected zero-probability routes must retain their expert ids.
-    bias = torch.randn(512) * 0.3
+    if quantile or expert_bias:
+        logits_cpu[0] = -100  # Bias resolves ties between selected zero-probability routes.
+    bias = torch.randn(512) * 0.3 if quantile or expert_bias else torch.zeros(512)
     scores = logits_cpu.sigmoid()
     selection = logits_cpu - bias if quantile else scores + bias
     expected_ids = selection.argsort(dim=1, descending=True)[:, :10].sort(dim=1).values
@@ -67,7 +74,8 @@ def test_nt4_compact_router(monkeypatch, quantile):
             replace(config, moe_router_fusion=False, moe_token_dispatcher_type="alltoall"), pg
         ).cuda()
         reference.set_layer_number(1)
-        (reference.qb_beta if quantile else reference.expert_bias).copy_(bias)
+        if quantile or expert_bias:
+            (reference.qb_beta if quantile else reference.expert_bias).copy_(bias)
         ref_logits = logits_cpu.cuda().requires_grad_()
         ref_probs, ref_map = reference.routing(ref_logits.view(256, 1, 512))
         (ref_probs * dy).sum().backward()
@@ -75,14 +83,16 @@ def test_nt4_compact_router(monkeypatch, quantile):
             ref_map.cpu(),
             torch.zeros_like(logits_cpu, dtype=torch.bool).scatter(1, expected_ids, True),
         )
-        for virtual in (False, True):
+        for virtual in ((False, True) if compact_supported and not expert_bias else (False,)):
             router = TopKRouter(replace(config, moe_virtual_expert_load_balance=virtual), pg).cuda()
             router.set_layer_number(1)
-            (router.qb_beta if quantile else router.expert_bias).copy_(bias)
+            if quantile or expert_bias:
+                (router.qb_beta if quantile else router.expert_bias).copy_(bias)
             logits = logits_cpu.cuda().requires_grad_()
             probs, ids = router.routing(logits.view(256, 1, 512))
-            assert (ids.dtype != torch.bool) == virtual
-            if not virtual:
+            compact = virtual or (quantile and compact_supported)
+            assert (ids.dtype != torch.bool) == compact
+            if not compact:
                 assert ids.shape == probs.shape == (256, 512)
                 ids = ids.to(torch.int8).topk(10, dim=1).indices
                 probs = probs.gather(1, ids)
@@ -92,7 +102,9 @@ def test_nt4_compact_router(monkeypatch, quantile):
             torch.testing.assert_close(
                 probs.gather(1, order).cpu(), expected_probs, rtol=1e-5, atol=1e-7
             )
-            assert ids.max() > 64 and not probs[0].any()
+            assert ids.max() > 64
+            if quantile or expert_bias:
+                assert not probs[0].any()
             (probs * dy.gather(1, ids)).sum().backward()
             torch.testing.assert_close(logits.grad, ref_logits.grad, rtol=2e-4, atol=1e-6)
             assert logits.grad[1:].norm() > 0
@@ -113,7 +125,7 @@ def test_nt4_compact_router(monkeypatch, quantile):
                 router.config.moe_router_fusion = True
                 with pytest.raises(AssertionError, match="does not support moe_router_fusion"):
                     router.routing(logits.view(256, 1, 512))
-            else:
+            elif expert_bias:
                 torch.testing.assert_close(
                     router.local_tokens_per_expert, ref_map.sum(dim=0).float(), rtol=0, atol=0
                 )
@@ -122,7 +134,7 @@ def test_nt4_compact_router(monkeypatch, quantile):
                 assert shape == (256, 512) and index_buffer is None
             else:
                 assert shape == (256, 512) and index_buffer.shape == (256, 10)
-        assert bool(calls) == (not quantile), "only the seq_aux_loss router uses fused scoring"
+        assert bool(calls) == config.moe_router_fusion
     finally:
         from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 

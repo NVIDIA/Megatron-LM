@@ -963,7 +963,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "hybridep", and "ncclep"."""
+    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
+    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
+    transformer_engine.pytorch.ep API."""
 
     moe_virtual_expert_load_balance: bool = False
     """Balance MoE routes by materializing virtual experts over HybridEP."""
@@ -2063,90 +2065,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
 
-        if self.moe_virtual_expert_load_balance:
-            if self.moe_expert_rank_capacity_factor is None:
-                self.moe_expert_rank_capacity_factor = 1.0
-            virtual_expert_mxfp8 = (
-                self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
-            )
-            fused_activation = (
-                self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu)
-            ) or (
-                not self.gated_linear_unit
-                and self.activation_func == squared_relu
-                and self.use_fused_weighted_squared_relu
-            )
-            required_values = {
-                "add_bias_linear": False,
-                "moe_grouped_gemm": True,
-                "moe_single_grouped_weight": False,
-                "moe_single_grouped_bias": False,
-                "use_transformer_engine_op_fuser": True,
-                "gradient_accumulation_fusion": True,
-                "moe_router_dtype": "fp32",
-                "expert_tensor_parallel_size": 1,
-                "delay_wgrad_compute": False,
-                "overlap_dispatch_backward_with_experts_wgrad": False,
-                "overlap_moe_expert_parallel_comm": False,
-                "moe_shared_expert_overlap": False,
-                "moe_expert_capacity_factor": None,
-                "moe_hybridep_pad_uneven_dispatch_inputs": False,
-                "moe_pad_expert_input_to_capacity": False,
-                "moe_token_dropping": False,
-                "moe_apply_probs_on_input": False,
-            }
-            # (requirement satisfied, requirement description)
-            requirements = [
-                (getattr(self, name) == value, f"{name}={value!r}")
-                for name, value in required_values.items()
-            ] + [
-                (
-                    self.moe_token_dispatcher_type == "flex"
-                    and self.moe_flex_dispatcher_backend == "hybridep",
-                    "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
-                ),
-                (
-                    self.bf16 and self.params_dtype == torch.bfloat16,
-                    "BF16 execution and BF16 parameters",
-                ),
-                (
-                    (not self.fp8 or virtual_expert_mxfp8) and not self.fp4,
-                    "quantization disabled or MXFP8 E4M3 with native FP8 parameters",
-                ),
-                (self.moe_router_topk <= 32, "moe_router_topk<=32"),
-                (
-                    fused_activation,
-                    "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation",
-                ),
-                (
-                    (self.moe_latent_size or self.hidden_size) % 128 == 0,
-                    "moe_latent_size (or hidden_size) divisible by 128",
-                ),
-                (self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128"),
-                (
-                    self.moe_expert_rank_capacity_factor >= 1.0,
-                    "moe_expert_rank_capacity_factor>=1.0",
-                ),
-                (self.moe_expert_capacity_factor is None, "moe_expert_capacity_factor=None"),
-                (
-                    not self.moe_router_padding_for_quantization or virtual_expert_mxfp8,
-                    "moe_router_padding_for_quantization=False",
-                ),
-                (
-                    self.recompute_granularity != "selective"
-                    or "moe" not in (self.recompute_modules or ()),
-                    "no MoE layer recompute (the virtual-expert hooks assume one forward per "
-                    "backward)",
-                ),
-            ]
-            unmet = [message for satisfied, message in requirements if not satisfied]
-            if unmet:
-                raise ValueError(
-                    "Virtual-expert load balancing configuration is unsupported; require "
-                    + ", ".join(unmet)
-                    + "."
-                )
-
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
         # moe_flex_dispatcher_num_sms takes precedence) and warn.
@@ -2210,6 +2128,101 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.num_moe_experts is not None and self.num_moe_experts > 0
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
+
+        if self.moe_virtual_expert_load_balance:
+            MAX_VIRTUAL_EXPERT_EP_SIZE = 64
+
+            def require(condition: bool, message: str) -> None:
+                if not condition:
+                    raise ValueError(f"Virtual-expert load balancing requires {message}.")
+
+            if self.moe_expert_rank_capacity_factor is None:
+                self.moe_expert_rank_capacity_factor = 1.0
+            required_values = {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "bf16": True,
+                "params_dtype": torch.bfloat16,
+                "fp4": None,
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "use_transformer_engine_op_fuser": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "moe_router_enable_expert_bias": False,
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_hybridep_pad_uneven_dispatch_inputs": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            for name, value in required_values.items():
+                require(getattr(self, name) == value, f"{name}={value!r}")
+            require(
+                2 <= self.expert_model_parallel_size <= MAX_VIRTUAL_EXPERT_EP_SIZE,
+                f"2<=expert_model_parallel_size<={MAX_VIRTUAL_EXPERT_EP_SIZE}",
+            )
+            require(
+                self.num_moe_experts is not None and self.num_moe_experts <= 8192,
+                "1<=num_moe_experts<=8192",
+            )
+            require(
+                self.num_moe_experts % self.expert_model_parallel_size == 0,
+                "num_moe_experts divisible by expert_model_parallel_size",
+            )
+            require(
+                1 <= self.moe_router_topk <= min(32, self.num_moe_experts),
+                "1<=moe_router_topk<=min(32, num_moe_experts)",
+            )
+            routing = self.moe_router_load_balancing_type
+            require(
+                "sinkhorn" not in ((routing,) if isinstance(routing, str) else routing),
+                "no sinkhorn routing",
+            )
+            require(
+                (self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu))
+                or (
+                    not self.gated_linear_unit
+                    and self.activation_func == squared_relu
+                    and self.use_fused_weighted_squared_relu
+                ),
+                "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation",
+            )
+            require(
+                (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                "moe_latent_size (or hidden_size) divisible by 128",
+            )
+            require(self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128")
+            require(
+                self.moe_expert_rank_capacity_factor >= 1.0, "moe_expert_rank_capacity_factor>=1.0"
+            )
+            mxfp8 = self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            require(
+                not self.fp8 or mxfp8,
+                "quantization disabled or MXFP8 E4M3 with native FP8 parameters",
+            )
+            require(
+                not self.moe_router_padding_for_quantization or mxfp8,
+                "moe_router_padding_for_quantization=False unless using native MXFP8",
+            )
+            require(
+                self.moe_flex_dispatcher_num_sms is None or self.moe_flex_dispatcher_num_sms > 0,
+                "moe_flex_dispatcher_num_sms>0",
+            )
+            require(
+                not self.moe_layer_recompute
+                and self.recompute_granularity != "full"
+                and not (
+                    self.recompute_granularity == "selective"
+                    and "moe" in (self.recompute_modules or ())
+                ),
+                "no MoE layer recompute",
+            )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

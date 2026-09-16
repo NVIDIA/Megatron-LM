@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
 )
 from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
+from megatron.core.transformer.moe.fused_a2a import hybrid_ep_dense_topk_routing
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -978,11 +979,16 @@ def uses_compact_routes(config) -> bool:
     """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
     and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
 
-    Ordinary HybridEP keeps its dense format with fused or Sinkhorn/quantile routing, token
-    dropping, capacity/uneven padding and expert TP. Virtual-expert planning always requires
-    compact routes and uses TE's newer index-output API for fused top-k routing.
+    Ordinary HybridEP keeps its dense format when compact routing is unsupported, or with fused
+    or Sinkhorn routing, expert bias, token dropping, capacity/uneven padding and expert TP.
+    Virtual-expert planning requires compact support for both native and virtual slots, and uses TE's newer
+    index-output API for fused top-k routing.
     """
     if config.moe_virtual_expert_load_balance:
+        assert hybrid_ep_dense_topk_routing(
+            2 * config.num_moe_experts,
+            2 * config.num_moe_experts // config.expert_model_parallel_size,
+        ), "Virtual experts require HybridEP's compact top-k routing API for their runtime experts."
         return True
     routing_types = config.moe_router_load_balancing_type
     if isinstance(routing_types, str):
@@ -991,12 +997,14 @@ def uses_compact_routes(config) -> bool:
         config.moe_token_dispatcher_type == "flex"
         and config.moe_flex_dispatcher_backend == "hybridep"
         and not config.moe_router_fusion
-        and not any(t in ("sinkhorn", "quantile_balancing") for t in routing_types)
+        and not config.moe_router_enable_expert_bias
+        and "sinkhorn" not in routing_types
         and config.moe_expert_capacity_factor is None
-        and not config.moe_pad_expert_input_to_capacity
-        and not config.moe_token_dropping
         and config.expert_tensor_parallel_size == 1
         and not config.moe_hybridep_pad_uneven_dispatch_inputs
+        and hybrid_ep_dense_topk_routing(
+            config.num_moe_experts, config.num_moe_experts // config.expert_model_parallel_size
+        )
     )
 
 
