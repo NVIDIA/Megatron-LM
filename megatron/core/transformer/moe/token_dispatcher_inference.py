@@ -469,13 +469,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata update; invoked from the first instance's token_dispatch.
 
-        Fires the fused NVLS allgather+reduce to publish
-        [valid_tokens, rank_token_offset, ep_max_tokens] into _step_metadata, then
-        (for FlashInfer) pre-masks the routing buffer with -1 so rows beyond
-        valid_tokens are ignored by the GEMM; the AGV below overwrites
-        [0, valid_tokens) in-place.
+        For FlashInfer, first masks the routing buffer with -1 so rows beyond
+        valid_tokens are ignored by the GEMM. The fused NVLS metadata update then
+        provides the cross-rank fence which prevents a late local clear from erasing
+        an early peer AGV write. The AGV overwrites [0, valid_tokens) in-place.
         """
         cls = NVLSAllGatherVDispatcher
+        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+            cls._symm_agv_routing["tensor"].fill_(-1)
         fused_metadata_update(
             local_tokens=local_tokens,
             local_buf=cls._symm_metadata["tensor"],
@@ -483,8 +484,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             step_metadata=cls._step_metadata,
         )
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
-        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
-            cls._symm_agv_routing["tensor"].fill_(-1)
 
     def __init__(
         self,
