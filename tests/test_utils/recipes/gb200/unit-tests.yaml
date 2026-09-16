@@ -46,6 +46,15 @@ spec:
     UNIT_TEST_REPEAT={n_repeat}
     export GPUS_PER_NODE={gpus}
 
+    # Keep the M2N transport override in a separate process because NCCL caches
+    # its environment settings. Other GB200 tests retain their default backend.
+    if [[ "$BUCKET" == "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py" ]]; then
+        export NCCL_GIN_TYPE=2
+        export NCCL_NET_PLUGIN=none
+        export NCCL_GIN_PLUGIN=none
+        export NCCL_RMA_PLUGIN=none
+    fi
+
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
     else
@@ -68,12 +77,17 @@ spec:
     cp .coverage {assets_dir}/coverage_report
     cp coverage.xml {assets_dir}
 
-# GB200 unit-test selection is marker-driven: a single catch-all bucket is
-# narrowed to files carrying @pytest.mark.launch_on_gb200 by find_test_cases.py
-# (see tests/unit_tests/run_ci_test.sh --platform gb200). Re-shard into smaller
-# buckets here if the marked set grows large enough to need parallelism.
+# GB200 selection is marker-driven. find_test_cases.py excludes the dedicated
+# M2N bucket from the catch-all bucket, so each marked test runs only once.
 products:
   - test_case: [tests/unit_tests/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/resharding/test_nccl_m2n_copy_service.py]
     products:
       - environment: [dev]
         tag: [latest]
