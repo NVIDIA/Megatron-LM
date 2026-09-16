@@ -531,7 +531,7 @@ def torch_chunk_gated_delta_rule(
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        value.new_zeros((batch_size, num_heads, k_head_dim, v_head_dim))
         if initial_state is None
         else initial_state.to(value)
     )

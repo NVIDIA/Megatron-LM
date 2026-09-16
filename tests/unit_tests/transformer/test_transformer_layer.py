@@ -815,8 +815,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         "cuda_graph_module",
         [CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     )
-    def test_moe_layer_rejects_partial_cuda_graphs(self, cuda_graph_module):
-        """Partial MoE graphs must not drop the hyper-connection state."""
+    def test_moe_layer_rejects_non_te_partial_cuda_graphs(self, cuda_graph_module):
+        """Only the TE partial path transports the hyper-connection state."""
         config = _make_mhc_config(
             hidden_size=32,
             num_streams=4,
@@ -837,6 +837,40 @@ class TestTransformerLayerWithHyperConnectionRecompute:
                     num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
                 ).submodules,
             )
+
+    def test_te_partial_moe_graph_transports_mhc_state(self):
+        """The captured boundary keeps both mixing matrices attached to autograd."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="alltoall",
+        )
+        config.cuda_graph_impl = "transformer_engine"
+        config.cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+        assert layer.mlp_hyper_connection in layer._get_submodules_under_cudagraphs()
+        residual = torch.randn(8, 2, 128, requires_grad=True)
+        h_res = torch.randn(8, 2, 4, 4, requires_grad=True)
+        h_post = torch.randn(8, 2, 4, requires_grad=True)
+        router_output = [torch.randn(8, 2, 32), torch.randn(16, 4)]
+        captured = layer._pack_mlp_cuda_graph_state(router_output, residual, (h_res, h_post))
+        replay_residual, (replay_h_res, replay_h_post) = layer._unpack_mlp_cuda_graph_state(
+            captured
+        )
+        assert all(actual is expected for actual, expected in zip(captured, router_output))
+        (replay_residual.sum() + replay_h_res.sum() + replay_h_post.sum()).backward()
+        assert residual.grad is not None and h_res.grad is not None and h_post.grad is not None
 
     @pytest.mark.parametrize("norm_attr", ["input_layernorm", "pre_mlp_layernorm"])
     def test_residual_returning_layernorm_is_rejected(self, norm_attr):

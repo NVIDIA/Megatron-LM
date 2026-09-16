@@ -373,6 +373,14 @@ a path that explicitly supports it.
 
 ### Update custom providers and conversion mappings
 
+For mHC training, Hybrid layers and the nested layers of Hybrid MTP stacks can
+participate in Transformer Engine CUDA graphs. The wrapped layer determines the
+applicable capture scope, while the wrapper supplies the expanded residual-stream
+input and preserves mHC mixing across capture and replay. Full-iteration training
+graphs use the existing training runner. See the
+[mHC CUDA graph configuration](features/cuda_graph.md#mhc-training) for supported
+scopes, static MoE requirements, and feature restrictions.
+
 Custom providers and conversion mappings also need to account for these API and
 state-dict differences:
 

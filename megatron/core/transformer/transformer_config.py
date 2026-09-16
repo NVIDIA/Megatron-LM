@@ -3147,6 +3147,31 @@ class TransformerConfig(ModelParallelConfig):
             )
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes
+
+        if self.enable_mhc_connections and self.cuda_graph_impl in (
+            'transformer_engine',
+            'full_iteration',
+        ):
+            if self.recompute_granularity == 'selective' and 'mhc' in self.recompute_modules:
+                raise NotImplementedError(
+                    'mHC CUDA graphs do not yet support selective mHC recompute.'
+                )
+            if self.fine_grained_activation_offloading or self.cpu_offloading:
+                raise NotImplementedError(
+                    'mHC CUDA graphs do not yet support activation offloading.'
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise NotImplementedError('mHC CUDA graphs do not yet support EP A2A overlap.')
+            if self.cuda_graph_impl == 'transformer_engine' and self.mtp_use_repeated_layer:
+                raise NotImplementedError(
+                    'mHC TE graphs require independent MTP layers; disable mtp_use_repeated_layer.'
+                )
+            if self.cuda_graph_impl == 'transformer_engine' and self.num_moe_experts:
+                if not self.cuda_graph_modules or CudaGraphModule.moe in self.cuda_graph_modules:
+                    raise NotImplementedError(
+                        'mHC TE graphs support partial MoE capture only. Select attn and/or '
+                        'moe_router (optionally moe_preprocess), not whole-layer or moe capture.'
+                    )
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."

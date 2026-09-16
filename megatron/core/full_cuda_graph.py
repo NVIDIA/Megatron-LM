@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Full iteration CUDA graph for training."""
 
@@ -132,7 +132,10 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        # Pipeline batch preparation replaces fields that a stage does not consume
+        # with None. Keep that per-call mutation out of the cache: CUDA graph replay
+        # must continue updating the original tensor allocations on every iteration.
+        return StaticBufferLoader.static_buffers[stage][microbatch].copy()
 
 
 class FullCudaGraphWrapper:
