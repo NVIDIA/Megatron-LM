@@ -8,6 +8,7 @@ import torch
 
 import megatron.core.transformer.moe.router as router_mod
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
@@ -161,6 +162,43 @@ class TestTop2Router:
                 match=rf"complete local sequences.*{unsupported_axis} parallel ranks",
             ):
                 self.router(hidden_states)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("grad_enabled", [False, True])
+    def test_router_diagnostics_report_quantile_balancing_selection_bias(self, grad_enabled):
+        self.transformer_config.moe_router_load_balancing_type = "quantile_balancing"
+        self.router = type(self.router)(
+            self.transformer_config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        beta = torch.tensor([1.0, -2.0, 0.5, 3.0], device="cuda")
+        self.router.qb_beta.copy_(beta)
+        logits = torch.arange(64, dtype=torch.float32, device="cuda").reshape(8, 2, 4) / 32
+        expected_indices = (logits.reshape(-1, 4) - beta).topk(2, dim=-1).indices
+        expected_map = torch.zeros_like(logits.reshape(-1, 4), dtype=torch.bool)
+        expected_map.scatter_(1, expected_indices, True)
+        observed = []
+
+        with (
+            torch.set_grad_enabled(grad_enabled),
+            capture_tensor_observations(
+                lambda *args: observed.append(args), frozenset({"router_diagnostics"})
+            ),
+        ):
+            _, routing_map = self.router.routing(logits)
+
+        assert len(observed) == 1
+        torch.testing.assert_close(routing_map, expected_map)
+        diagnostics = observed[0][3]
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.EXPERT_BIAS], -beta.expand(2, -1)
+        )
+        expected_load = expected_map.reshape(8, 2, 4).float().sum(dim=0) / 16
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.ACTUAL_LOAD], expected_load
+        )
+        # The reported correction belongs to this batch, not the accumulated next-batch update.
+        torch.testing.assert_close(self.router.qb_beta, beta)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -204,6 +204,61 @@ def test_router_observes_raw_logits_before_forced_benchmark_routing(monkeypatch)
     torch.testing.assert_close(routed_logits[0], raw_logits + 100.0)
 
 
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("padding", ["none", "mixed", "all"])
+@pytest.mark.parametrize("padding_value", [1000.0, float("nan")])
+def test_router_observations_exclude_padding(
+    sequence_parallel, score_function, padding, padding_value
+):
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.config = SimpleNamespace(
+        sequence_parallel=sequence_parallel,
+        moe_router_force_load_balancing=False,
+        moe_router_force_biased=None,
+    )
+    router.score_function = score_function
+    router._maintain_float32_expert_bias = lambda: None
+    router.apply_input_jitter = lambda tensor: tensor
+    raw_logits = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3).requires_grad_()
+    router.gating = lambda tensor: raw_logits
+    padding_mask = torch.zeros((4, 2), dtype=torch.bool)
+    if padding == "mixed":
+        padding_mask[1:, 0] = True
+        padding_mask[0, 1] = True
+    elif padding == "all":
+        padding_mask.fill_(True)
+    with torch.no_grad():
+        raw_logits[padding_mask] = padding_value
+    routed = []
+
+    def routing(logits, padding_mask=None):
+        routed.append((logits, padding_mask))
+        return logits, torch.ones_like(logits, dtype=torch.bool)
+
+    router.routing = routing
+    observed = []
+    with capture_tensor_observations(
+        lambda *args: observed.append(args), frozenset({"router_logits", "router_scores"})
+    ):
+        router(torch.ones(4, 2, 1), padding_mask=padding_mask)
+
+    assert len(observed) == 2
+    expected_logits = raw_logits.detach()[~padding_mask]
+    expected_scores = router_mod.compute_normalized_router_scores(expected_logits, score_function)
+    for observation, kind, expected in zip(
+        observed, ("router_logits", "router_scores"), (expected_logits, expected_scores)
+    ):
+        assert observation[:3] == (router, kind, kind)
+        torch.testing.assert_close(observation[3], expected)
+        assert not observation[3].requires_grad
+        assert observation[4:] == (0 if sequence_parallel else None, 0, 0)
+    # Masking is strictly an observation operation, not a change to the training path.
+    assert routed[0][0] is raw_logits
+    assert routed[0][1] is padding_mask
+
+
 def test_router_observes_normalized_configured_decision_scores():
     raw_logits = torch.tensor([[0.0, torch.log(torch.tensor(3.0))]])
     expected_scores = {

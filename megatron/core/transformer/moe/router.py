@@ -750,9 +750,8 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask of shape `[seq_length, bsz]`.
+                `True` marks padding. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -833,11 +832,16 @@ class TopKRouter(Router):
                     padding_mask=padding_mask,
                 )
             if observe_router_diagnostics:
+                # Report the additive selection correction: QB subtracts beta from logits,
+                # whereas ordinary bias routing adds expert_bias to the routing scores.
+                selection_bias = (
+                    -self.qb_beta if self.routing_type == "quantile_balancing" else self.expert_bias
+                )
                 diagnostics = build_router_diagnostics(
                     scores_for_aux_loss,
                     routing_map_for_aux_loss,
                     routing_map,
-                    self.expert_bias,
+                    selection_bias,
                     seq_length,
                     bsz,
                     padding_mask=padding_mask,
@@ -888,40 +892,52 @@ class TopKRouter(Router):
         """
         Forward pass of the router.
 
+        Raw router observations exclude padding when a mask is supplied. Their shape is then
+        `[valid_tokens, num_experts]`, with sequence and batch populations both on dimension zero.
+        Without a mask, observations retain the original sequence and batch dimensions. Routing
+        itself always receives the full logits and the original mask.
+
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask of shape `[seq_length, bsz]`.
+                `True` marks padding. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
-        tp_shard_dim = 0 if self.config.sequence_parallel else None
-        observe_tensor(
-            self,
-            "router_logits",
-            "router_logits",
-            logits,
-            tp_shard_dim=tp_shard_dim,
-            sequence_dim=0,
-            batch_dim=1,
-        )
-        # Materialize the full decision distribution only when a due metric requests it.
-        if is_observing_tensor("router_scores"):
+        observe_logits = is_observing_tensor("router_logits")
+        observe_scores = is_observing_tensor("router_scores")
+        if observe_logits or observe_scores:
             with torch.no_grad():
-                scores = compute_normalized_router_scores(logits, self.score_function)
-            observe_tensor(
-                self,
-                "router_scores",
-                "router_scores",
-                scores,
-                tp_shard_dim=tp_shard_dim,
-                sequence_dim=0,
-                batch_dim=1,
-            )
+                observed_logits = logits.detach()
+                if padding_mask is not None:
+                    observed_logits = observed_logits[~padding_mask]
+                tp_shard_dim = 0 if self.config.sequence_parallel else None
+                batch_dim = 0 if padding_mask is not None else 1
+                if observe_logits:
+                    observe_tensor(
+                        self,
+                        "router_logits",
+                        "router_logits",
+                        observed_logits,
+                        tp_shard_dim=tp_shard_dim,
+                        sequence_dim=0,
+                        batch_dim=batch_dim,
+                    )
+                # Materialize the full decision distribution only for a due metric.
+                if observe_scores:
+                    scores = compute_normalized_router_scores(observed_logits, self.score_function)
+                    observe_tensor(
+                        self,
+                        "router_scores",
+                        "router_scores",
+                        scores,
+                        tp_shard_dim=tp_shard_dim,
+                        sequence_dim=0,
+                        batch_dim=batch_dim,
+                    )
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark

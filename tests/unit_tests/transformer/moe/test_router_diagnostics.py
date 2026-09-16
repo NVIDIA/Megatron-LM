@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import pytest
 import torch
 
 from megatron.core.transformer.moe.router_diagnostics import (
@@ -9,7 +10,8 @@ from megatron.core.transformer.moe.router_diagnostics import (
 )
 
 
-def test_build_router_diagnostics_compacts_per_sequence_scores_loads_and_bias():
+@pytest.mark.parametrize("padding_value", [0.0, float("nan"), float("inf")])
+def test_build_router_diagnostics_compacts_per_sequence_scores_loads_and_bias(padding_value):
     scores = torch.tensor(
         [
             [0.6, 0.3, 0.1],
@@ -27,6 +29,7 @@ def test_build_router_diagnostics_compacts_per_sequence_scores_loads_and_bias():
         [[0, 1, 0], [0, 1, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 1]], dtype=torch.bool
     )
     padding_mask = torch.tensor([False, False, False, True, True, False])
+    scores[padding_mask] = padding_value
 
     diagnostics = build_router_diagnostics(
         scores,
