@@ -677,6 +677,13 @@ class MegatronMultimodalTokenizer:
         if any(turn["content"] == "" for turn in rendered_turns):
             raise ValueError(f"empty turn in conversation: {rendered_turns}. Skipping.")
 
+        if not return_target:
+            # Turn boundaries are only needed for loss masking. Encode the same
+            # concatenated text once, even when offsets are unavailable.
+            text = "".join(turn["content"] for turn in rendered_turns)
+            replacements = [r for reps in replacements_per_turn for r in reps]
+            return np.asarray(self._encode_with_markers(text, replacements), dtype=np.int64)
+
         if any(turn_replacements for turn_replacements in replacements_per_turn):
             return self._tokenize_raw_conversation_slow(
                 rendered_turns, replacements_per_turn, return_target
@@ -697,9 +704,6 @@ class MegatronMultimodalTokenizer:
 
         token_ids, cumulative_lengths = tokenized
         tokens = np.asarray(token_ids, dtype=np.int64)
-
-        if not return_target:
-            return tokens
 
         target = np.full_like(tokens, IGNORE_INDEX)
         start = 0
