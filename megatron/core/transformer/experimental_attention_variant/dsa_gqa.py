@@ -620,7 +620,7 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             else int(inference_context.token_to_position_in_request[:active_tokens].max().item())
             + 1
         )
-        if self.config.rope_type == "rope":
+        if _dsa_rope_setting(self.config, "rope_type") == "rope":
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
         else:
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
@@ -647,28 +647,11 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             q[active_tokens:] = 0
         return q
 
-    def forward_q_dynamic(
-        self, hidden_states: torch.Tensor, use_rope: bool, inference_context
-    ) -> torch.Tensor:
-        """Project dynamic tokens to indexer Q and apply request-position RoPE."""
-        q = self.forward_q(hidden_states, use_rope=False)
-        return self._apply_rope_dynamic(q, inference_context) if use_rope else q
-
     def forward_qk_dynamic(
         self, hidden_states: torch.Tensor, use_rope: bool, inference_context
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project dynamic tokens to indexer Q/K with absolute-position RoPE."""
-        if not self.use_learned_k or self.linear_k is None:
-            raise RuntimeError("Simplified DSA learned-K projection is not enabled.")
-        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, group=self.pg_collection.tp
-            )
-        seqlen, batch_size, _ = hidden_states.shape
-        q, _ = self.linear_q(hidden_states)
-        k, _ = self.linear_k(hidden_states)
-        q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
-        k = k.reshape(seqlen, batch_size, 1, self.index_head_dim)
+        q, k = self.forward_qk(hidden_states, use_rope=False)
         if not use_rope:
             return q, k
         return self._apply_rope_dynamic(q, inference_context), self._apply_rope_dynamic(
@@ -1000,7 +983,7 @@ class DSGQACoreAttention(MegatronModule):
         )
 
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
-        if self.config.dsa_fwd_skip_dsa or self.config.dsa_fwd_use_dense_attn:
+        if self.config.dsa_fwd_use_dense_attn:
             raise NotImplementedError("Dynamic DSA-GQA requires sparse indexer routing.")
         if self.config.dsa_indexer_mode != "simplified":
             raise NotImplementedError("Dynamic DSA-GQA supports the simplified indexer only.")
@@ -1040,25 +1023,11 @@ class DSGQACoreAttention(MegatronModule):
                 indexer_hidden_states, indexer_input_norm
             )
 
-        learned_k = self.config.dsa_simplified_use_learned_k
-        if learned_k:
-            index_q, current_index_key = self.indexer.forward_qk_dynamic(
-                indexer_hidden_states,
-                use_rope=use_indexer_rope,
-                inference_context=inference_context,
-            )
-            inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
-            index_key_cache, index_block_table = inference_context.dsa_key_cache(
-                provider_layer_number
-            )
-        else:
-            index_q = self.indexer.forward_q_dynamic(
-                indexer_hidden_states,
-                use_rope=use_indexer_rope,
-                inference_context=inference_context,
-            )
-            index_key_cache = key_cache[:, :, 0, :]
-            index_block_table = block_table
+        index_q, current_index_key = self.indexer.forward_qk_dynamic(
+            indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+        )
+        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
+        index_key_cache, index_block_table = inference_context.dsa_key_cache(provider_layer_number)
 
         num_decode_requests = inference_context.num_decode_requests
         if num_decode_requests:
@@ -1273,6 +1242,8 @@ class DSGQACoreAttention(MegatronModule):
                 indexer=self.indexer,
                 softmax_scale=self.softmax_scale,
                 use_indexer_rope=use_indexer_rope,
+                query_chunk_size=None,
+                key_chunk_size=None,
                 simplified_input_norm=indexer_input_norm,
                 cache_indexer_k=_dsa_caches_indexer_k(self.config),
                 use_triton=dsa_kernel_backend == "min-memory-triton",

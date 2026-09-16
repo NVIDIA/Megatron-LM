@@ -377,9 +377,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
-        self.cache_dsa_indexer_keys = getattr(
-            model_config, "experimental_attention_variant", None
-        ) == "dsa" and getattr(model_config, "dsa_simplified_use_learned_k", False)
+        # The simplified indexer always projects its own K, independent of main attention K.
+        self.cache_dsa_indexer_keys = (
+            getattr(model_config, "experimental_attention_variant", None) == "dsa"
+            and getattr(model_config, "dsa_indexer_mode", "standard") == "simplified"
+        )
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
         )
