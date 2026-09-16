@@ -2062,7 +2062,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         engine.track_generated_token_events = False
         engine.num_speculative_tokens = 0
         engine.stop_word_being_finished_ids = set()
-        active_ids, finished_records = engine.post_process_requests(
+        active_ids, finished_requests = engine.post_process_requests(
             request_ids=torch.tensor([request.request_id]),
             finished_request_ids=torch.tensor([request.request_id]),
             evict_request_ids=torch.empty(0, dtype=torch.int64),
@@ -2075,10 +2075,10 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         )
 
         expected = routing[: 2 * bs + 3]
-        merged = record.merge()
+        merged = finished_requests[0]
         assert active_ids == []
-        assert finished_records == [record]
-        assert future.result() is record
+        assert len(finished_requests) == 1
+        assert future.result() is merged
         assert merged.generated_tokens == generated
         assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
         np.testing.assert_array_equal(current.routing_indices, expected)
@@ -3019,9 +3019,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     max_mamba_matched_blocks,
                     *(getattr(request, "_mamba_num_matched_blocks", 0) for request in requests),
                 )
-                for record in result["finished_request_records"]:
-                    merged = record.merge()
-                    finished[merged.request_id] = merged
+                for request in result["finished_requests"]:
+                    finished[request.request_id] = request
                 assert step_count < 256, f"{case['name']} did not converge"
 
             torch.cuda.synchronize()
@@ -3057,13 +3056,12 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert engine._prefix_cache_hits == 0
 
         if enable_prefix_caching and case["feature"] == "moe":
-            # EP routing evidence is recorded with the live request IDs inside
-            # token_dispatch. The engine drains hit accounting after the forward,
-            # so correlating the dispatcher batch to the cached follower is more
-            # precise than comparing counters on adjacent host steps.
+            # Correlate live dispatcher request IDs with the cached follower.
             assert cached_request_ids & evidence["moe_request_ids"]
             feature_seen_for_cached_request = True
 
+        for request in finished.values():
+            request.finalize_text(engine.controller.tokenizer)
         return finished, {
             "saw_chunk": saw_chunk,
             "mtp_tokens_proposed": int(engine._spec_tokens_proposed_per_pos.sum()),
@@ -3194,8 +3192,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         engine._add_request(request)
         for _ in range(32):
             result = engine.step_modern()
-            for record in result["finished_request_records"]:
-                output = record.merge()
+            for output in result["finished_requests"]:
                 if output.request_id == request_id:
                     assert getattr(request, "_pending_prompt_logprob_row", None) is None
                     cost = engine.context.lifetime_prefill_token_count - computed_before
@@ -3357,8 +3354,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 engine._add_request(request)
             outputs = {}
             for _ in range(32):
-                for record in engine.step_modern()["finished_request_records"]:
-                    output = record.merge()
+                for output in engine.step_modern()["finished_requests"]:
                     outputs[output.request_id] = output
                 if outputs.keys() >= {20, 21}:
                     break
