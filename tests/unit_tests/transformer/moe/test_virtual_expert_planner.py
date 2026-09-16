@@ -17,6 +17,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformer_engine.pytorch.distributed_weight import (
+    finalize_weight_grads,
+    materialize_weight_for_backward,
+    materialize_weight_for_forward,
+    weight_grad_buffers,
+)
 
 from megatron.core.transformer.moe.experts import _VirtualExpertFC2WgradStore
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
@@ -54,85 +60,48 @@ def _load_balancer(virtual_experts=None):
     ("ep_size", "num_experts", "num_local_experts", "topk"),
     [
         (1, 2, 2, 2),
-        (65, 130, 2, 2),
-        (2, 0, 0, 1),
-        (2, 8194, 4097, 2),
-        (4, 7, 1, 2),
-        (2, 4, 1, 2),
-        (2, 4, 2, 0),
-        (2, 4, 2, 5),
-        (2, 64, 32, 33),
+        (4, 4, 1, 2),  # A valid topology that differs from the configured EP size.
+        (2, 4, 2, 2),  # A different global expert count.
+        (2, 2, 2, 2),  # Incorrect local expert ownership.
+        (2, 2, 1, 1),  # A different top-k.
     ],
 )
 def test_virtual_expert_init_rejects_layout_before_cuda(
     monkeypatch, ep_size, num_experts, num_local_experts, topk
 ):
     """Validate actual process-group size and expert ownership before touching CUDA."""
+    config = _virtual_expert_hybridep_config()
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: ep_size)
     monkeypatch.setattr(
         torch.cuda, "current_device", lambda: pytest.fail("invalid layout reached CUDA")
     )
-    with pytest.raises(ValueError, match="requires 2..64 EP ranks"):
+    with pytest.raises(ValueError, match="runtime layout must match TransformerConfig"):
         VirtualExpertLoadBalancer().initialize_virtual_expert_load_balancer(
             group=object(),
             num_local_experts=num_local_experts,
             router_topk=topk,
             num_experts=num_experts,
-            config=None,
-        )
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"moe_flex_dispatcher_num_sms": 0}, "num_sms>0"),
-        ({"moe_flex_dispatcher_num_sms": -1}, "num_sms>0"),
-        ({"moe_hybridep_num_sms": 0}, "num_sms>0"),
-        ({"moe_deepep_num_sms": -1}, "num_sms>0"),
-        ({"moe_layer_recompute": True}, "no MoE layer recompute"),
-        (
-            {
-                "recompute_granularity": "full",
-                "recompute_method": "uniform",
-                "recompute_num_layers": 1,
-            },
-            "no MoE layer recompute",
-        ),
-        ({"moe_router_load_balancing_type": "sinkhorn"}, "no sinkhorn"),
-        (
-            {
-                "moe_router_load_balancing_type": ["aux_loss", "sinkhorn"],
-                "moe_aux_loss_coeff": [0.01, 0.0],
-            },
-            "no sinkhorn",
-        ),
-    ],
-)
-def test_virtual_expert_init_checks_normalized_settings(monkeypatch, overrides, message):
-    """Initialization sees canonical settings even when the caller uses deprecated aliases."""
-    config = _virtual_expert_hybridep_config(**overrides)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
-    with pytest.raises(ValueError, match=message):
-        VirtualExpertLoadBalancer().initialize_virtual_expert_load_balancer(
-            group=object(), num_local_experts=1, router_topk=2, num_experts=2, config=config
+            config=config,
         )
 
 
 @requires_cuda
 def test_virtual_expert_compact_api_requirement_preserves_plain_hybridep(monkeypatch):
     """Old HybridEP remains usable without virtual experts; virtual experts fail before launch."""
-    from megatron.core.transformer.moe import token_dispatcher
+    from megatron.core.transformer.moe import moe_utils, token_dispatcher
 
+    monkeypatch.setattr(moe_utils, "hybrid_ep_dense_topk_routing", lambda *_: False)
     monkeypatch.setattr(token_dispatcher, "hybrid_ep_dense_topk_routing", lambda *_: False)
     monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", object())
     for virtual in (False, True):
         config = _virtual_expert_hybridep_config(moe_virtual_expert_load_balance=virtual)
         if virtual:
-            with pytest.raises(ValueError, match="compact top-k routing API"):
+            with pytest.raises(AssertionError, match="compact top-k routing API"):
                 token_dispatcher._HybridEPManager(object(), 1, 2, config)
         else:
             manager = token_dispatcher._HybridEPManager(object(), 1, 2, config)
             assert not manager._dense_topk_routing
+            assert manager.dense_routing_metadata
 
 
 @requires_cuda
@@ -150,6 +119,10 @@ def test_virtual_expert_init_accepts_supported_limits(
 ):
     """Large positive HybridEP SM budgets are valid; transport caps its own budget later."""
     config = _virtual_expert_hybridep_config(
+        expert_model_parallel_size=ep_size,
+        num_moe_experts=num_experts,
+        moe_router_topk=topk,
+        moe_router_pre_softmax=True,
         moe_flex_dispatcher_num_sms=64,
         moe_router_load_balancing_type=routing,
         moe_router_fusion=routing != "quantile_balancing",
@@ -182,6 +155,19 @@ def test_virtual_expert_rank_capacity_includes_per_expert_padding():
     load_balancer.config.moe_expert_rank_capacity_factor = 1.0
     load_balancer._alignment = 0
     assert load_balancer._compute_rank_capacity(8192) == 180224
+
+
+@pytest.mark.parametrize("num_tokens", [0, 7, 9])
+def test_virtual_expert_runtime_rejects_changed_token_count(num_tokens):
+    """A rejected resize leaves the initialized layer usable at its original token count."""
+    manager = _load_balancer(virtual_experts=object())
+    manager.num_tokens, manager.rank_capacity = 8, 64
+    with pytest.raises(ValueError, match=f"fixed token count; expected 8, got {num_tokens}"):
+        manager._runtime_init(torch.empty((num_tokens, 128), device="meta"))
+    assert (manager.num_tokens, manager.rank_capacity) == (8, 64)
+    # The flattened token count is fixed; sequence/batch dimensions may be reshaped.
+    manager._runtime_init(torch.empty((2, 4, 128), device="meta"))
+    assert (manager.num_tokens, manager.rank_capacity) == (8, 64)
 
 
 def test_virtual_expert_hooks_do_not_keep_their_owner_alive():
@@ -327,7 +313,7 @@ def _mxfp8(tensor):
     return MXFP8Quantizer(DType.kFloat8E4M3)(tensor)
 
 
-def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
+def _fake_virtual_experts(mxfp8, device, num_local_experts, template, main_grads):
     """The slots object over plain tensors: no symmetric memory, no group."""
     numel = MEMBER_SHAPE[0] * MEMBER_SHAPE[1]
 
@@ -336,8 +322,8 @@ def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
     virtual_experts.config = SimpleNamespace(
         mxfp8=mxfp8,
         member_shapes=(MEMBER_SHAPE,),
-        direct_main_grad=(False,),
-        grad_dtype=staging.dtype if staging is not None else torch.float32,
+        gtp=(getattr(template, "is_gtp_weight_remat", False),),
+        grad_dtype=main_grads.dtype if main_grads is not None else torch.float32,
         device=device,
     )
     virtual_experts.num_local_experts = num_local_experts
@@ -355,15 +341,16 @@ def _fake_virtual_experts(mxfp8, device, num_local_experts, template, staging):
         sum(virtual_experts._grad_sections), dtype=virtual_experts.config.grad_dtype, device=device
     )
     virtual_experts.slot_weights = (virtual_experts._slot_parameters(0, template),)
-    virtual_experts.native_staging = (staging,)
     return virtual_experts
 
 
-def _build_fc_layer(parameters, template, staging, *, mxfp8=False):
-    """Build a FC layer over a slots object; ``staging`` is the plain natives' wgrad staging
-    (None under GTP)."""
+def _build_fc_layer(parameters, template, main_grads, *, mxfp8=False):
+    """Build a FC layer with DDP main gradients, or deferred GTP buffers when None."""
+    if main_grads is not None:
+        for parameter, grad in zip(parameters, main_grads):
+            parameter.main_grad = grad
     virtual_experts = _fake_virtual_experts(
-        mxfp8, parameters[0].device, len(parameters), template, staging
+        mxfp8, parameters[0].device, len(parameters), template, main_grads
     )
     return _VirtualExperts(virtual_experts, (parameters,))
 
@@ -421,8 +408,7 @@ def _weight_push(monkeypatch, fc_layer):
     balancer.device = fc_layer.config.device
     balancer._plan = VirtualExpertPlan(None, None)
     balancer.prefetch_done = torch.cuda.Event()
-    stream = torch.cuda.Stream()
-    balancer._weight_stream = lambda current: stream
+    balancer.weight_streams = (torch.cuda.Stream(),)
     monkeypatch.setattr(
         "megatron.core.transformer.moe.virtual_expert_load_balancer."
         "launch_virtual_expert_weight_prefetch",
@@ -448,34 +434,33 @@ def _data_ptrs(weights, weight_format, direction):
 @requires_cuda
 @pytest.mark.parametrize("weight_format", ["bf16", "mxfp8"])
 def test_virtual_expert_plain_fc_layer_binds_its_tables_once(weight_format):
-    """Plain parameters and their staging never move: the first weight table of a direction is
+    """Plain parameters and their main gradients never move: the first weight table of a direction is
     written once, every later call checks that the pointers it was built from still hold."""
     device = torch.device("cuda", torch.cuda.current_device())
     mxfp8 = weight_format == "mxfp8"
     weights = [torch.randn(MEMBER_SHAPE, dtype=torch.bfloat16, device=device) for _ in range(3)]
     parameters = tuple(torch.nn.Parameter(_mxfp8(w) if mxfp8 else w) for w in weights)
-    staging = torch.zeros(
+    main_grads = torch.zeros(
         (3, *MEMBER_SHAPE), dtype=torch.bfloat16 if mxfp8 else torch.float32, device=device
     )
-    fc_layer = _build_fc_layer(parameters, parameters[0], staging, mxfp8=mxfp8)
+    fc_layer = _build_fc_layer(parameters, parameters[0], main_grads, mxfp8=mxfp8)
     torch.cuda.synchronize(device)
-    assert fc_layer.gtp_leaders[0] is None and fc_layer.native_grads[0] is staging
+    assert fc_layer.gtp_leaders[0] is None
+    assert all(g is p.main_grad for g, p in zip(fc_layer.native_grads[0], parameters))
     assert not fc_layer._tables[0]
-    assert fc_layer.grad_tables()[0].tolist() == [grad.data_ptr() for grad in staging]
+    grad_table = fc_layer.grad_table(0)
+    assert grad_table.tolist() == [grad.data_ptr() for grad in main_grads]
+    assert fc_layer.grad_table(0) is grad_table
     assert [parameter.main_grad.data_ptr() for parameter in fc_layer.runtime_weights[0][:3]] == [
-        grad.data_ptr() for grad in staging
+        grad.data_ptr() for grad in main_grads
     ]
-    # Plain sources are the parameters themselves, in both directions; GTP has nothing to consume.
-    for direction in WeightDirection:
-        assert fc_layer._weight_sources(0, direction) is parameters
-    fc_layer.consume(WeightDirection.FORWARD)
+    assert materialize_weight_for_forward(fc_layer.runtime_weights[0]) == list(
+        fc_layer.runtime_weights[0]
+    )
 
     # The first call of each direction writes its table; every later call returns the same
     # device tensor after validating.
-    tables = {
-        direction: fc_layer.get_weight_table(0, direction, parameters)
-        for direction in WeightDirection
-    }
+    tables = {direction: fc_layer.weight_tables(direction)[0] for direction in WeightDirection}
     runtime_ptrs = {d: fc_layer._ptrs(d, fc_layer.runtime_weights[0]) for d in WeightDirection}
     grad_ptrs = [p.main_grad.data_ptr() for p in fc_layer.runtime_weights[0]]
     for _ in range(3):
@@ -497,24 +482,29 @@ def test_virtual_expert_plain_fc_layer_binds_its_tables_once(weight_format):
 
 @requires_cuda
 def test_virtual_expert_plain_fc_layer_hands_wgrads_to_the_source_parameters():
-    """Accumulate the FP32 staging into ``main_grad`` and return a BF16 dummy for autograd; a
-    parameter without a main_grad gets a copy of the staging, never an alias."""
+    """Preserve DDP accumulation and return BF16 dummies without adding direct gradients twice."""
     device = torch.device("cuda", torch.cuda.current_device())
     parameters = tuple(
         torch.nn.Parameter(torch.ones(MEMBER_SHAPE, dtype=torch.bfloat16, device=device))
         for _ in range(2)
     )
-    parameters[0].main_grad = torch.zeros(MEMBER_SHAPE, dtype=torch.float32, device=device)
-    parameters[0].grad_added_to_main_grad = False
-    staging = torch.full((2, *MEMBER_SHAPE), 1.0001, dtype=torch.float32, device=device)
-    fc_layer = _build_fc_layer(parameters, parameters[0], staging)
+    for parameter in parameters:
+        parameter.main_grad = torch.full(MEMBER_SHAPE, 2.0, dtype=torch.float32, device=device)
+        parameter.grad_added_to_main_grad = False
+    contributions = torch.full((2, *MEMBER_SHAPE), 1.0001, dtype=torch.float32, device=device)
+    storage = _fake_virtual_experts(False, device, len(parameters), parameters[0], contributions)
+    fc_layer = _VirtualExperts(storage, (parameters,))
 
-    grads = fc_layer.hand_off_wgrads(0)
-    torch.testing.assert_close(parameters[0].main_grad, staging[0], rtol=0, atol=0)
-    assert parameters[0].grad_added_to_main_grad
-    assert grads[0].dtype == torch.bfloat16 and tuple(grads[0].shape) == MEMBER_SHAPE
-    torch.testing.assert_close(grads[1], staging[1], rtol=0, atol=0)
-    assert grads[1].data_ptr() != staging[1].data_ptr()
+    expected = torch.full_like(contributions, 2.0)
+    for _ in range(2):
+        for target, contribution in zip(fc_layer.native_grads[0], contributions):
+            target.add_(contribution)
+        expected.add_(contributions)
+        grads = fc_layer.hand_off_wgrads(0)
+        for parameter, grad, accumulated in zip(parameters, grads, expected):
+            torch.testing.assert_close(parameter.main_grad, accumulated, rtol=0, atol=0)
+            assert parameter.grad_added_to_main_grad
+            assert grad.dtype == torch.bfloat16 and tuple(grad.shape) == MEMBER_SHAPE
 
 
 @requires_cuda
@@ -626,12 +616,21 @@ def test_virtual_expert_balancer_peeks_for_the_push_and_consumes_at_the_gemm(
         leader.calls.clear()
         table = push(direction)
         assert leader.calls == [("peek", direction)]
-        fc_layer.consume(direction)
+        materialize = (
+            materialize_weight_for_forward
+            if direction == WeightDirection.FORWARD
+            else materialize_weight_for_backward
+        )
+        materialized = materialize(fc_layer.runtime_weights[0])
         assert leader.calls == [("peek", direction), ("consume", direction)]
+        assert len(materialized) == 2 * len(gathers[direction])
+        assert _data_ptrs(materialized[:2], weight_format, direction) == _data_ptrs(
+            gathers[direction], weight_format, direction
+        )
         # The consume validates against the bound pointers and rebinds nothing.
         assert fc_layer.get_weight_table(0, direction, gathers[direction]) is table
         if direction == WeightDirection.BACKWARD:
-            fc_layer.bind_native_grads(0, None)
+            fc_layer._bind_gtp_grads(0, None)
 
     # A consume that hands out other buffers than the peeked ones is an error, not a rebind:
     # the push has already copied the peeked bytes to the peers.
@@ -639,43 +638,21 @@ def test_virtual_expert_balancer_peeks_for_the_push_and_consumes_at_the_gemm(
         WeightDirection.FORWARD
     ][0]
     with pytest.raises(RuntimeError, match="moved"):
-        fc_layer.consume(WeightDirection.FORWARD)
+        materialize_weight_for_forward(fc_layer.runtime_weights[0])
 
 
-def test_virtual_expert_backward_consumes_gtp_weights_in_gemm_order():
-    """Forward consumes FC1 then FC2 at the expert GEMMs; the layer-output hook takes the pass
-    back and starts its push, then the combine hook waits for it and consumes FC2 before FC1
-    (the expert backward's order), binding each FC layer's GTP wgrad scratch."""
+def test_virtual_expert_hooks_leave_gtp_materialization_to_te():
+    """VE hooks wait for transport but leave materialization and wgrad acquisition to TE."""
     events = []
 
     owner = _VirtualExperts.__new__(_VirtualExperts)
-    owner.parameters = [None, None]
-    owner.config = SimpleNamespace(direct_main_grad=(False, False))
-    owner.gtp_leaders = [
-        SimpleNamespace(
-            _weights=[
-                SimpleNamespace(get_wgrad_tensor=lambda *, persistent, name=name: f"{name} scratch")
-            ],
-            prefetch_initialized=True,
-        )
-        for name in ("FC1", "FC2")
-    ]
-    owner.get_weight_table = lambda i, key, sources: events.append(
-        ("consume", f"FC{i + 1}", key, sources)
-    )
-    owner.bind_native_grads = lambda i, grads: events.append(("bind", f"FC{i + 1}", grads))
-    owner._weight_sources = lambda i, direction, peek=True: "peeked" if peek else "consumed"
+    owner.config = SimpleNamespace(gtp=(True, True))
+    owner.materialize = lambda *args: pytest.fail("VE hook materialized GTP weights")
+    owner._bind_gtp_grads = lambda *args: pytest.fail("VE hook acquired GTP wgrad buffers")
     load_balancer = _load_balancer(owner)
     load_balancer._wait_weight_push = lambda: events.append("wait")
     load_balancer._start_weight_push = lambda direction: events.append(("push", direction))
     plan = load_balancer._plan = VirtualExpertPlan(None, None)
-
-    load_balancer.prepare_expert_forward()
-    assert events == [
-        "wait",
-        ("consume", "FC1", WeightDirection.FORWARD, "consumed"),
-        ("consume", "FC2", WeightDirection.FORWARD, "consumed"),
-    ]
 
     # The layer output closes the forward; its backward hook hands the pass back.
     events.clear()
@@ -687,19 +664,50 @@ def test_virtual_expert_backward_consumes_gtp_weights_in_gemm_order():
 
     events.clear()
     load_balancer._prepare_expert_backward()
-    assert events == [
-        "wait",
-        ("consume", "FC2", WeightDirection.BACKWARD, "consumed"),
-        ("bind", "FC2", ("FC2 scratch",)),
-        ("consume", "FC1", WeightDirection.BACKWARD, "consumed"),
-        ("bind", "FC1", ("FC1 scratch",)),
-    ]
+    assert events == ["wait"]
     assert plan.started == set()
 
     # One wait per push: waiting for a push that was never started, or twice, is an error.
     assert not plan.push_in_flight
     with pytest.raises(RuntimeError, match="unwaited"):
-        VirtualExpertLoadBalancer._wait_weight_push(load_balancer)
+        VirtualExpertLoadBalancer._wait_weight_push(load_balancer, None, None)
+
+
+@requires_cuda
+@pytest.mark.parametrize("weight_format", ["bf16", "mxfp8"])
+def test_virtual_expert_te_protocol_uses_persistent_buffers_and_defers_gtp(weight_format):
+    """TE gets the native ring and virtual arena buffers; GTP finalizes only after VE reduction."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    owner, _ = _gtp_fc_layer(weight_format, device)
+    weights = owner.runtime_weights[0]
+    finalized = []
+
+    def finalize(grads):
+        finalized.append(tuple(g.data_ptr() for g in grads))
+        return [None, None]
+
+    owner.gtp_leaders[0].finalize_group_grads = finalize
+    for _ in range(2):
+        assert owner.native_grads[0] is None
+        buffers = weight_grad_buffers(weights, MEMBER_SHAPE, torch.bfloat16, device)
+        assert all(buffer.dtype == torch.float32 for buffer in buffers)
+        assert all(buffer is weight.main_grad for buffer, weight in zip(buffers, weights))
+        assert all(
+            buffer is source.scratch
+            for buffer, source in zip(buffers, owner.gtp_leaders[0]._weights)
+        )
+        pointers = tuple(g.data_ptr() for g in buffers[:2])
+        completed = len(finalized)
+        assert finalize_weight_grads(weights, buffers) == [None] * len(weights)
+        assert len(finalized) == completed
+        assert owner.hand_off_wgrads(0) == (None, None)
+        assert finalized[-1] == pointers
+        assert owner.native_grads[0] is None
+
+    # TE may keep the runtime parameters alive, but their protocol must not retain the owner.
+    owner_ref = weakref.ref(owner)
+    del owner
+    assert owner_ref() is None
 
 
 @requires_cuda
@@ -720,7 +728,7 @@ def test_virtual_expert_gtp_fc_layer_writes_wgrads_into_gtp_scratch():
     fc_layer.gtp_leaders[0].finalize_group_grads = finalize_group_grads
 
     def bind_pool_scratch():
-        fc_layer.bind_native_grads(
+        fc_layer._bind_gtp_grads(
             0, tuple(weight.get_wgrad_tensor() for weight in fc_layer.gtp_leaders[0]._weights)
         )
         return fc_layer.native_grads[0]
@@ -731,7 +739,7 @@ def test_virtual_expert_gtp_fc_layer_writes_wgrads_into_gtp_scratch():
     pointers = [grad.data_ptr() for grad in scratch]
     assert [parameter.main_grad.data_ptr() for parameter in natives] == pointers
     assert "grad" not in fc_layer._tables[0]
-    table = fc_layer.grad_tables()[0]
+    table = fc_layer.grad_table(0)
     assert table.tolist() == pointers
     with pytest.raises(RuntimeError, match="twice"):
         bind_pool_scratch()
@@ -747,7 +755,7 @@ def test_virtual_expert_gtp_fc_layer_writes_wgrads_into_gtp_scratch():
 
     # Persistent GTP scratch keeps the table unchanged on the next backward.
     assert all(a is b for a, b in zip(bind_pool_scratch(), scratch))
-    assert fc_layer.grad_tables()[0].data_ptr() == table.data_ptr() and table.tolist() == pointers
+    assert fc_layer.grad_table(0).data_ptr() == table.data_ptr() and table.tolist() == pointers
     fc_layer.hand_off_wgrads(0)
 
     # Reject moved scratch before changing the pointer table or binding runtime destinations.
@@ -780,9 +788,14 @@ def test_virtual_expert_unchanged_pointer_table_requires_no_upload(monkeypatch, 
     for _ in range(3):
         for direction in WeightDirection:
             assert push(direction) is tables[direction]
-            fc_layer.consume(direction)
+            materialize = (
+                materialize_weight_for_forward
+                if direction == WeightDirection.FORWARD
+                else materialize_weight_for_backward
+            )
+            materialize(fc_layer.runtime_weights[0])
         assert fc_layer.get_weight_table(0, "grad", grads) is grad_table
-        fc_layer.bind_native_grads(0, None)
+        fc_layer._bind_gtp_grads(0, None)
 
 
 @requires_cuda
@@ -796,14 +809,17 @@ def test_virtual_expert_owners_share_slots_but_keep_native_bindings_separate(wei
         for i in range(2)
     ]
     parameters = [torch.nn.Parameter(_mxfp8(w) if mxfp8 else w) for w in weights]
-    staging = torch.zeros((1, *MEMBER_SHAPE), dtype=torch.float32, device=device)
-    first = _build_fc_layer((parameters[0],), parameters[0], staging, mxfp8=mxfp8)
+    main_grads = torch.zeros((1, *MEMBER_SHAPE), dtype=torch.float32, device=device)
+    first = _build_fc_layer((parameters[0],), parameters[0], main_grads, mxfp8=mxfp8)
     cls = first.storage
+    parameters[1].main_grad = torch.zeros_like(parameters[0].main_grad)
     second = _VirtualExperts(cls, ((parameters[1],),))
     assert first.storage is second.storage
     assert first.runtime_weights[0][0] is not second.runtime_weights[0][0]
     assert first.runtime_weights[0][1] is second.runtime_weights[0][1]
-    assert first.native_grads[0] is second.native_grads[0] is staging
+    assert first.native_grads[0][0] is parameters[0].main_grad
+    assert second.native_grads[0][0] is parameters[1].main_grad
+    assert first.native_grads[0][0].data_ptr() != second.native_grads[0][0].data_ptr()
     for direction in WeightDirection:
         tables = [owner.weight_tables(direction)[0] for owner in (first, second)]
         assert tables[0] is not tables[1]
@@ -816,7 +832,7 @@ def test_virtual_expert_owners_share_slots_but_keep_native_bindings_separate(wei
     cls.destroy()  # Idempotent, even while layers retain runtime parameters.
     assert all(ref() is None for ref in arenas), "slot views retained their arena base"
     assert cls.weight_arena is None and cls.grad_arena is None
-    assert cls.slot_weights == cls.native_staging == ()
+    assert cls.slot_weights == ()
     for owner in (first, second):
         slot = owner.runtime_weights[0][1]
         assert slot.main_grad is None
@@ -845,7 +861,7 @@ def test_virtual_expert_grad_table_is_created_before_reduction_stream_wait(monke
     balancer.grad_reduce_done = torch.cuda.Event()
     producer = torch.cuda.Stream()
     grads = tuple(w.scratch for w in owner.gtp_leaders[0]._weights)
-    owner.bind_native_grads(0, grads)
+    owner._bind_gtp_grads(0, grads)
     assert not owner._tables[0]
     seen = []
     get_table = owner.get_weight_table

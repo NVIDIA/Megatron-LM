@@ -94,7 +94,7 @@ def _prefix_maximum(a, b):
 
 # The route-count, exchange-timeout and slot asserts compile in only under ``TRITON_DEBUG=1``;
 # production runs without them.
-@triton.jit(do_not_specialize=["source_rank", "num_tokens"])
+@triton.jit(do_not_specialize=["source_rank"])
 def _plan_virtual_expert_routes_kernel(
     top_indices,
     virtual_experts,
@@ -102,9 +102,9 @@ def _plan_virtual_expert_routes_kernel(
     scratch,
     counts_sym_mem,
     source_rank,
-    num_tokens,
     peer_bases,
     signal_bases,
+    NUM_TOKENS: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     EP_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
@@ -138,14 +138,14 @@ def _plan_virtual_expert_routes_kernel(
     running_counts = histogram_rows + _PLANNER_PROGRAMS * NUM_EXPERTS
     totals = running_counts + _PLANNER_PROGRAMS * NUM_EXPERTS
     program = tl.program_id(0)
-    num_routes = num_tokens * ROUTER_TOPK
+    NUM_ROUTES: tl.constexpr = NUM_TOKENS * ROUTER_TOPK
     experts = tl.arange(0, BLOCK_NUM_EXPERTS)
     valid_experts = experts < NUM_EXPERTS
     ranks = tl.arange(0, BLOCK_EP_SIZE)
     valid_ranks = ranks < EP_SIZE
-    tokens_per_program = tl.cdiv(num_tokens, _PLANNER_PROGRAMS)
-    program_start = program * tokens_per_program * ROUTER_TOPK
-    program_end = tl.minimum((program + 1) * tokens_per_program, num_tokens) * ROUTER_TOPK
+    TOKENS_PER_PROGRAM: tl.constexpr = tl.cdiv(NUM_TOKENS, _PLANNER_PROGRAMS)
+    program_start = program * TOKENS_PER_PROGRAM * ROUTER_TOPK
+    program_end = tl.minimum((program + 1) * TOKENS_PER_PROGRAM, NUM_TOKENS) * ROUTER_TOPK
     # Contiguous route tiles preserve token-major order without padding top-k slots.
     flat = tl.arange(0, ROUTE_TILE)
 
@@ -219,13 +219,13 @@ def _plan_virtual_expert_routes_kernel(
             axis=1,
         )
         tl.device_assert(
-            (source_total == num_routes) | ~valid_owned_ranks,
+            (source_total == NUM_ROUTES) | ~valid_owned_ranks,
             "virtual-expert planner: a rank's route count differs from tokens * topk",
         )
         tl.store(
             balance + owned_ranks,
             tl.sum(tl.reshape(owned_totals, (RANKS_PER_PROGRAM, BLOCK_NUM_EXPERTS_PER_GPU)), axis=1)
-            - num_routes,
+            - NUM_ROUTES,
             mask=valid_owned_ranks,
         )
         _grid_sync(placement_sync, _GRID_SYNC_TAG, PLACEMENT_PROGRAMS)
@@ -379,9 +379,9 @@ def _scratch_layout(num_experts: int, ep_size: int) -> tuple[dict, int]:
     # Each flag word gets its own 128-byte line (the kernel's _FLAG_STRIDE).
     fields = (
         ("placement_grid_sync", (1,)),
-        ("_pad0", (31,)),
+        ("_pad0", (_FLAG_STRIDE.value - 1,)),
         ("grid_sync", (1,)),
-        ("_pad1", (31,)),
+        ("_pad1", (_FLAG_STRIDE.value - 1,)),
         ("balance", (ep_size,)),  # native load minus rank capacity
         ("allocation", (num_experts, ep_size)),  # routes of each expert per destination
         ("destination_boundaries", (num_experts, block_ep)),  # segment ends, local ordinals
@@ -465,9 +465,9 @@ def launch_virtual_expert_planner(
         workspace.scratch,
         workspace.gathered_counts,
         workspace.rank,
-        num_tokens,
         int(workspace.histogram_handle.buffer_ptrs_dev),
         int(workspace.histogram_handle.signal_pad_ptrs_dev),
+        NUM_TOKENS=num_tokens,
         ROUTER_TOPK=router_topk,
         EP_SIZE=ep_size,
         NUM_EXPERTS=num_experts,
