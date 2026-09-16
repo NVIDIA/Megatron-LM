@@ -34,7 +34,7 @@ workspace.
   `pull-request/<this PR number>`. Retarget every such dependent PR to `main`
   before merging; otherwise GitHub may close it and discard review discussion
   or approvals.
-- Read @docs/developer/contribute.md for the full contribution policy, including code style, commit message conventions, and issue guidelines.
+- Read [docs/developer/contribute.md](./docs/developer/contribute.md) for the full contribution policy, including code style, commit message conventions, and issue guidelines.
 
 ### Code Quality
 

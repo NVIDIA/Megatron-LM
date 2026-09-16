@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Optional
 
 import torch
@@ -20,8 +21,23 @@ class NCCLCopyService(CopyService):
 
     supports_multiple_runs_per_plan = True
 
+    # Safety net for plans that were not split into execution batches: a single
+    # ncclGroup holding a whole model's P2P ops is split by NCCL into several
+    # kernel plans at rank-dependent points, and matching sends/recvs that end up
+    # in different plans deadlock (https://github.com/pytorch/pytorch/issues/174288).
+    # When a one-batch plan has more than TASK_WINDOW transfers in its global
+    # schedule, run() issues the ops as consecutive batch_isend_irecv calls over
+    # windows of TASK_WINDOW global task ids. The decision uses only plan-global
+    # data (identical on every rank), and sender and receiver of a transfer share
+    # its task id, so every rank places each transfer in the same window and no
+    # window depends on another. A rank never has more than TASK_WINDOW ops in a
+    # window. Set to 0 to disable.
+    TASK_WINDOW = int(os.environ.get("MEGATRON_NCCL_COPY_TASK_WINDOW", "256"))
+
     def __init__(self, group=None):
         super().__init__(group=group)
+        self._plan_total_tasks: Optional[int] = None
+        self._plan_num_batches: int = 1
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[RecvOp] = []
         # Dedicated stream for local (same-rank) copies to avoid unnecessary
@@ -41,6 +57,46 @@ class NCCLCopyService(CopyService):
         device = torch.device("cuda", torch.cuda.current_device())
         group._get_backend(device).eager_connect_single_device(device)
         self._nccl_connected = True
+
+    def set_plan(self, plan, *, transform=None) -> None:
+        """Remember the plan-global sizes that decide whether run() windows its submission."""
+        self._plan_total_tasks = getattr(plan, "total_tasks", None)
+        self._plan_num_batches = getattr(plan, "num_batches", 1)
+
+    def _should_window(self, remote_sends: List[SendOp], remote_recvs: List[RecvOp]) -> bool:
+        if self.TASK_WINDOW <= 0 or self._plan_total_tasks is None or self._plan_num_batches != 1:
+            return False
+        if self._plan_total_tasks <= self.TASK_WINDOW:
+            return False
+        # Task ids are required to place ops in windows; plans built by the planner
+        # always carry them. Same-rank (local) ops were already copied out.
+        return all(op.task_id is not None for op in remote_sends) and all(
+            op.task_id is not None for op in remote_recvs
+        )
+
+    def _run_in_task_windows(self, remote_sends: List[SendOp], remote_recvs: List[RecvOp]) -> None:
+        """Issue the pending remote ops as one batch_isend_irecv per global task-id window."""
+        width = self.TASK_WINDOW
+        windows: dict[int, list] = {}
+        for op in remote_sends:
+            windows.setdefault(op.task_id // width, []).append(
+                dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group)
+            )
+        for op in remote_recvs:
+            windows.setdefault(op.task_id // width, []).append(
+                dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group)
+            )
+        if self.rank == 0:
+            logger.info(
+                "Executing batched communication in %d task-id windows of %d (max %d ops/window)",
+                len(windows),
+                width,
+                max((len(w) for w in windows.values()), default=0),
+            )
+        for key in sorted(windows):
+            reqs = dist.batch_isend_irecv(windows[key])
+            for req in reqs:
+                req.wait()
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
@@ -77,16 +133,21 @@ class NCCLCopyService(CopyService):
                 for send_op, recv_op in pairs:
                     recv_op.tensor.copy_(send_op.tensor)
 
-        p2p_ops = []
-        for op in remote_sends:
-            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group))
-        for op in remote_recvs:
-            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group))
+        if self._should_window(remote_sends, remote_recvs):
+            # See TASK_WINDOW: keep each ncclGroup small enough to stay in one kernel
+            # plan, deciding from plan-global data so every rank takes the same path.
+            self._run_in_task_windows(remote_sends, remote_recvs)
+        else:
+            p2p_ops = []
+            for op in remote_sends:
+                p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group))
+            for op in remote_recvs:
+                p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group))
 
-        if p2p_ops:
-            reqs = dist.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
+            if p2p_ops:
+                reqs = dist.batch_isend_irecv(p2p_ops)
+                for req in reqs:
+                    req.wait()
 
         # Make sure the copy stream is finished
         torch.cuda.current_stream().wait_stream(self._copy_stream)
