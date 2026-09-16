@@ -306,8 +306,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             parsed_pattern = parse_hybrid_pattern(self.hybrid_layer_pattern)
             self.mtp_pattern = parsed_pattern.mtp_pattern
             self.mtp_num_depths = parsed_pattern.mtp_num_depths
-            if self.config.mtp_num_layers is None and self.mtp_num_depths > 0:
-                self.config.mtp_num_layers = self.mtp_num_depths
+            if self.mtp_num_depths > 0:
+                if self.config.mtp_num_layers is None:
+                    self.config.mtp_num_layers = self.mtp_num_depths
+                elif self.config.mtp_num_layers != self.mtp_num_depths:
+                    raise ValueError(
+                        f"hybrid_layer_pattern defines {self.mtp_num_depths} MTP depths, "
+                        f"but mtp_num_layers is {self.config.mtp_num_layers}"
+                    )
             if (
                 self.config.mtp_num_layers
                 and self.mtp_num_depths == 0
