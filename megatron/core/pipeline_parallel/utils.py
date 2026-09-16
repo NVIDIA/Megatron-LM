@@ -17,6 +17,8 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+from .tensor_lifetime import ScheduleTensorLifetimeManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -158,6 +160,9 @@ class ScheduleNode:
         name: str = "schedule_node",
         forward_nvtx_name: Optional[str] = None,
         backward_nvtx_name: Optional[str] = None,
+        lifetime_manager: Optional[ScheduleTensorLifetimeManager] = None,
+        input_owner_stream: Optional[torch.cuda.Stream] = None,
+        backward_input_owner_stream: Optional[torch.cuda.Stream] = None,
     ):
         """Initialize a schedule node.
 
@@ -177,6 +182,15 @@ class ScheduleNode:
             name (str): Name of the node for debugging purposes.
             forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
             backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
+            lifetime_manager (ScheduleTensorLifetimeManager, optional): Schedule-aware
+                owner for cross-stream tensor retirement. ``None`` preserves the
+                allocator ``record_stream`` behavior.
+            input_owner_stream (torch.cuda.Stream, optional): Statically known stream
+                that produced this node's forward input. Only required for nodes with
+                ``free_input=True`` when schedule-aware retirement is enabled.
+            backward_input_owner_stream (torch.cuda.Stream, optional): Statically known
+                stream that produced this node's incoming backward gradient. ``None``
+                keeps the allocator ``record_stream`` fallback for external boundaries.
         """
         self.name = name
         self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
@@ -186,6 +200,9 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.lifetime_manager = lifetime_manager
+        self.input_owner_stream = input_owner_stream
+        self.backward_input_owner_stream = backward_input_owner_stream
         self.inputs = None
         self.outputs = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
@@ -215,7 +232,8 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.forward_nvtx_name):
+        node_name = self.forward_nvtx_name
+        with self.stream_acquire_context(node_name):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
@@ -236,13 +254,23 @@ class ScheduleNode:
 
             self.output = data
 
-        # Immediately frees input tensors after they are used for nodes
-        # where inputs are no longer needed after computation.
         if self.free_input:
-            for input in inputs:
-                if input is not None:
-                    input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+            if self.lifetime_manager is not None and self.input_owner_stream is not None:
+                if isinstance(self.input_owner_stream, Callable):
+                    self.input_owner_stream = self.input_owner_stream()
+                self.lifetime_manager.retire_forward_inputs(
+                    inputs,
+                    owner_stream=self.input_owner_stream,
+                    consumer_stream=self.stream,
+                    node=node_name,
+                )
+            else:
+                # Preserve the allocator fallback when the producer is external or
+                # otherwise not encoded by the layer-node topology.
+                for input in inputs:
+                    if input is not None:
+                        input.record_stream(self.stream)
+                        input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -260,7 +288,8 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.backward_nvtx_name):
+        node_name = self.backward_nvtx_name
+        with self.stream_acquire_context(node_name):
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)
@@ -268,15 +297,31 @@ class ScheduleNode:
                 f"{len(outputs)} of {type(outputs[0])} is not equal to "
                 f"{len(output_grad)} of {type(output_grad[0])}"
             )
-            output_grad = self.backward_func(outputs, output_grad)
+            consumed_grads = self.backward_func(outputs, output_grad)
 
-        # output_grad maybe from another stream
-        if output_grad:
-            for g in output_grad:
+        grads = self.get_grad()
+
+        if self.lifetime_manager is not None:
+            if isinstance(self.backward_input_owner_stream, Callable):
+                self.backward_input_owner_stream = self.backward_input_owner_stream()
+            fallback_grads = (
+                consumed_grads[len(output_grad) :]
+                if isinstance(consumed_grads, tuple)
+                else consumed_grads
+            )
+            self.lifetime_manager.retire_backward_inputs(
+                output_grad,
+                owner_stream=self.backward_input_owner_stream,
+                consumer_stream=self.stream,
+                node=node_name,
+                fallback_consumed=fallback_grads,
+            )
+        elif consumed_grads:
+            # Gradients may have been produced on another stream.
+            for g in consumed_grads:
                 if g is not None:
                     g.record_stream(self.stream)
 
-        grads = self.get_grad()
         self._release_state()
 
         return grads
@@ -307,6 +352,10 @@ class ScheduleNode:
             nvtx_range_push(name)
         try:
             with torch.cuda.stream(self.stream):
+                # The wait above transfers every previously consumed tensor owned by
+                # this plan back to its creation stream before storage becomes reusable.
+                if self.lifetime_manager is not None:
+                    self.lifetime_manager.drain(self.stream, name or self.name)
                 yield
         finally:
             if name:
