@@ -593,7 +593,16 @@ class MoELayer(BaseMoELayer):
         experts.
         """
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
-            hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
+            wgrad = _DelayedExpertWgrad(self)
+            hidden_states = _RegisterDelayedWgradForExperts.apply(wgrad, hidden_states)
+            # Flex creates the shared/routed fork inside token_dispatch for every backend.
+            # All-to-all forks in dispatch_preprocess, before the wgrad node above.
+            if self.shared_expert_overlap and isinstance(
+                self.token_dispatcher, MoEFlexTokenDispatcher
+            ):
+                return self.token_dispatcher.token_dispatch(
+                    hidden_states, probs, dispatch_backward_callback=wgrad.launch
+                )
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
@@ -941,8 +950,8 @@ class _RecordExpertDgradCompletion(torch.autograd.Function):
 
     Placed in the forward graph just before the expert computation so that during
     the backward pass, when the expert dgrad completes, we record an event. The
-    subsequent ``_RegisterDelayedWgradForExperts`` waits on this event before
-    launching the delayed wgrad computation on a separate CUDA stream.
+    deferred wgrad stream waits on this event before launching weight-gradient
+    computation, independently of dispatch backward completion.
     """
 
     @staticmethod
@@ -959,42 +968,56 @@ class _RecordExpertDgradCompletion(torch.autograd.Function):
         return (None,) + grad_outputs
 
 
-class _RegisterDelayedWgradForExperts(torch.autograd.Function):
-    """Autograd function that orchestrates delayed wgrad computation for MoE experts.
+class _DelayedExpertWgrad:
+    """Per-forward launch and completion state for deferred expert weight gradients."""
 
-    Placed in the forward graph at the dispatch boundary. During the backward pass,
-    this function:
-      1. Records an event on the current (backward) stream to signal the dgrad is done.
-      2. Executes the delayed wgrad computation on a dedicated CUDA stream.
-      3. Waits for the wgrad computation to complete.
-      4. Invokes the registered gradient processing callback (e.g., FSDP reduce-scatter).
-    """
+    def __init__(self, module: MoELayer):
+        self.module = module
+        self.completion = torch.cuda.Event()
+        self.launched = False
 
-    @staticmethod
-    def forward(ctx, module: MoELayer, *inputs):
-        """Forward pass that stores the MoE module and passes through inputs unchanged."""
-        ctx.module = module
-        return inputs[0] if len(inputs) == 1 else inputs
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        """Backward pass that executes delayed wgrad computation on a separate stream."""
-        module = ctx.module
-        event = module._delayed_wgrad_event
+    def launch(self):
+        """Submit wgrad after expert dgrad, without waiting for dispatch communication."""
+        if self.launched:
+            return
+        module = self.module
         wgrad_stream = module._delayed_wgrad_stream
-
-        wgrad_stream.wait_event(event)
+        wgrad_stream.wait_event(module._delayed_wgrad_event)
         with torch.cuda.stream(wgrad_stream):
             nvtx_range_push("delayed_expert_wgrad")
             module.backward_dw(routed_experts=True, shared_experts=False)
             nvtx_range_pop("delayed_expert_wgrad")
-            event.record(wgrad_stream)
+            self.completion.record(wgrad_stream)
+        self.launched = True
 
-        torch.cuda.current_stream().wait_event(event)
-
-        for param in module.parameters():
+    def finish(self):
+        """Join wgrad and run deferred gradient hooks at the original graph boundary."""
+        # Dispatchers without an earlier launch retain the original scheduling.
+        self.launch()
+        torch.cuda.current_stream().wait_event(self.completion)
+        for param in self.module.parameters():
             if getattr(param, "post_wgrad_grad_acc_hook", None) is not None:
                 param.post_wgrad_grad_acc_hook()
+        self.module = None
 
-        ctx.module = None
+
+class _RegisterDelayedWgradForExperts(torch.autograd.Function):
+    """Join expert wgrad at the original dispatch boundary.
+
+    Keep completion and deferred gradient hooks here even when the dispatcher
+    launches wgrad earlier on its routed branch. With Flex shared overlap, this
+    boundary follows the shared/routed input-gradient merge in backward.
+    """
+
+    @staticmethod
+    def forward(ctx, wgrad: _DelayedExpertWgrad, *inputs):
+        """Store the state for this forward and pass through inputs unchanged."""
+        ctx.wgrad = wgrad
+        return inputs[0] if len(inputs) == 1 else inputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Wait for this forward's wgrad before processing its gradients."""
+        ctx.wgrad.finish()
+        ctx.wgrad = None
         return (None,) + grad_outputs
