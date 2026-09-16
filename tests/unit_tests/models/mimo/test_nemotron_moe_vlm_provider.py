@@ -273,6 +273,51 @@ def test_configs_follow_stock_dtype_args():
         assert config.bf16 is False
 
 
+def test_make_dense_non_hybrid_drops_language_only_settings():
+    """Dense vision and projector configs must not inherit language-only settings."""
+    from types import SimpleNamespace
+
+    from examples.mimo.model_providers.radio_encoder import _make_dense_non_hybrid
+
+    config = SimpleNamespace(
+        activation_func_tanh_clamp_scale=2.0,
+        activation_func_tanh_clamp_scale_linear=1.0,
+        num_moe_experts=128,
+        moe_ffn_hidden_size=1856,
+        moe_shared_expert_intermediate_size=3712,
+        moe_grouped_gemm=True,
+        moe_router_fusion=True,
+        moe_permute_fusion=True,
+        moe_shared_expert_overlap=True,
+        moe_shortcut_connection=True,
+        moe_shortcut_parallel=True,
+        moe_shortcut_post_norm=True,
+        is_hybrid_model=True,
+        use_fused_weighted_squared_relu=True,
+        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm"],
+        offload_modules=["core_attn", "shortcut_post_norm"],
+    )
+
+    _make_dense_non_hybrid(config)
+
+    assert config.activation_func_tanh_clamp_scale is None
+    assert config.activation_func_tanh_clamp_scale_linear is None
+    assert config.num_moe_experts is None
+    assert config.moe_ffn_hidden_size is None
+    assert config.moe_shared_expert_intermediate_size is None
+    assert config.moe_grouped_gemm is False
+    assert config.moe_router_fusion is False
+    assert config.moe_permute_fusion is False
+    assert config.moe_shared_expert_overlap is False
+    assert config.moe_shortcut_connection is False
+    assert config.moe_shortcut_parallel is False
+    assert config.moe_shortcut_post_norm is False
+    assert config.is_hybrid_model is False
+    assert config.use_fused_weighted_squared_relu is False
+    assert config.recompute_modules == ["moe_act"]
+    assert config.offload_modules == ["core_attn"]
+
+
 def test_language_model_spec_builds_mamba():
     """language_model_spec returns a MambaModel spec carrying the preset config."""
     from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
