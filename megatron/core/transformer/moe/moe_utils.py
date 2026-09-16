@@ -38,6 +38,7 @@ if HAVE_TE:
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
         fused_topk_with_score_function_supports_qb,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -55,6 +56,7 @@ else:
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
     fused_topk_with_score_function_supports_qb = False
+    fused_topk_with_score_function_supports_topk_indices = False
 
 
 def switch_load_balancing_loss_func(
@@ -709,6 +711,7 @@ def topk_routing_with_score_function(
     dense_output: bool = False,
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -737,6 +740,8 @@ def topk_routing_with_score_function(
                                                with shape [num_experts, num_bins].
         qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
                                                 K3 Quantile Balancing histogram bounds.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -746,7 +751,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -812,6 +818,8 @@ def topk_routing_with_score_function(
                 qb_bin_bounds=qb_bin_bounds,
                 qb_histogram_mode="fused_atomic",
             )
+        if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
+            kwargs["topk_indices"] = topk_indices
         return fused_topk_with_score_function(**kwargs)
 
     def _compute_topk(

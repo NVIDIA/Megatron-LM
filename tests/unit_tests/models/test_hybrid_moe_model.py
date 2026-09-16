@@ -93,6 +93,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_bf16_reduced_precision_matmul": False,
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
+    "dsa_cp_balance_indexer": False,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
     "dsa_indexer_k_norm_fp32": False,
@@ -210,6 +211,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_hybridep_num_sms_preprocessing": 108,
     "moe_hybridep_num_blocks_permute": None,
     "moe_hybridep_num_blocks_unpermute": None,
+    "moe_hybridep_routing_map_mode": "indices",
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
     "moe_latent_up_projection_rmsnorm": False,
@@ -656,6 +658,7 @@ class TestHybridMoEModel:
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        padding_mask = torch.ones_like(input_ids, dtype=torch.bool)
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         ).cuda()
@@ -664,6 +667,7 @@ class TestHybridMoEModel:
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            padding_mask=padding_mask,
             runtime_gather_output=True,
         )
 

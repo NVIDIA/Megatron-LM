@@ -5,8 +5,8 @@
 Coverage:
 
 * Pure-Python helpers: :func:`local_to_global_flat`, :func:`build_flat_topk_idxs`,
-  :func:`_kl_loss_from_target_predict` — full correctness checks; no GPU
-  kernels required (CPU is fine).
+  :func:`_kl_loss_from_target_predict` — full correctness checks, plus CUDA
+  parity for the compiled sparse-KL path.
 * Lazy-import gates: :func:`_ensure_flash_mla`, :func:`_ensure_dsa_namespace`
   raise informative ``ImportError`` when the optional packages are missing.
 * GPU helpers: :func:`_get_topk_alignment` — runs only on CUDA.
@@ -21,6 +21,7 @@ Coverage:
 from __future__ import annotations
 
 import inspect
+import logging
 import math
 import sys
 import types
@@ -29,6 +30,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from megatron.core.transformer.experimental_attention_variant import dsa_fused_safety
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention as dk,
 )
@@ -73,11 +75,14 @@ def reset_lazy_kernel_state():
     """
     saved_flash = dk._flash_mla_sparse_fwd
     saved_dsa = dk._DSA
+    saved_row_limit_warned = dsa_fused_safety._ROW_LIMIT_WARNED
     dk._flash_mla_sparse_fwd = None
     dk._DSA = None
+    dsa_fused_safety._ROW_LIMIT_WARNED = False
     yield
     dk._flash_mla_sparse_fwd = saved_flash
     dk._DSA = saved_dsa
+    dsa_fused_safety._ROW_LIMIT_WARNED = saved_row_limit_warned
 
 
 def _make_local_idxs(b: int, sq: int, topk: int, *, with_invalid: bool = False) -> torch.Tensor:
@@ -665,6 +670,83 @@ class TestKLLossFromTargetPredict:
 
         assert torch.allclose(loss_sum, loss_mean * (b * sq), rtol=1e-5, atol=1e-5)
 
+    def test_explicit_loss_divisor(self):
+        torch.manual_seed(2)
+        rows, topk = 7, 5
+        target = torch.softmax(torch.randn(rows, topk), dim=-1)
+        predict = torch.softmax(torch.randn(rows, topk), dim=-1)
+        topk_indices = torch.zeros(rows, topk, dtype=torch.int32)
+        topk_indices[0] = -1
+
+        raw_loss = _kl_loss_from_target_predict(
+            target, predict, topk_indices, loss_coeff=0.75, calculate_per_token_loss=True
+        )
+        divided_by_number = _kl_loss_from_target_predict(
+            target,
+            predict,
+            topk_indices,
+            loss_coeff=0.75,
+            calculate_per_token_loss=True,
+            loss_divisor=4,
+        )
+        divided_by_tensor = _kl_loss_from_target_predict(
+            target,
+            predict,
+            topk_indices,
+            loss_coeff=0.75,
+            calculate_per_token_loss=True,
+            loss_divisor=torch.tensor(4.0),
+        )
+
+        torch.testing.assert_close(divided_by_number, raw_loss / 4)
+        torch.testing.assert_close(divided_by_tensor, raw_loss / 4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled sparse KL requires CUDA")
+    def test_cuda_compiled_matches_cpu_eager(self):
+        torch.manual_seed(3)
+        rows, topk = 9, 7
+        target = torch.softmax(torch.randn(rows, topk), dim=-1)
+        predict = torch.softmax(torch.randn(rows, topk), dim=-1)
+        topk_indices = torch.zeros(rows, topk, dtype=torch.int32)
+        target[0] = torch.nan
+        predict[0] = torch.nan
+        topk_indices[0] = -1
+        topk_indices[4, 2:] = -1
+
+        expected = _kl_loss_from_target_predict(
+            target,
+            predict,
+            topk_indices,
+            loss_coeff=0.625,
+            calculate_per_token_loss=True,
+            loss_divisor=3,
+        )
+        actual = _kl_loss_from_target_predict(
+            target.cuda(),
+            predict.cuda(),
+            topk_indices.cuda(),
+            loss_coeff=0.625,
+            calculate_per_token_loss=True,
+            loss_divisor=3,
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_scale_indexer_grads_matches_individual_mul():
+    torch.manual_seed(4)
+    grad_loss = torch.tensor(0.375)
+    grads = (torch.randn(7, 3), torch.randn(5, 2), torch.randn(9))
+    original = tuple(grad.clone() for grad in grads)
+
+    actual = dk._scale_indexer_grads(grad_loss, *grads)
+
+    assert len(actual) == len(grads)
+    for scaled, reference in zip(actual, original):
+        torch.testing.assert_close(scaled, reference * grad_loss)
+    for grad, reference in zip(grads, original):
+        assert torch.equal(grad, reference)
+
 
 class TestKLLossFromDenseScores:
     def test_per_token_loss_reports_raw_sum(self):
@@ -781,6 +863,70 @@ class TestGetTopkAlignment:
         sm = torch.cuda.get_device_capability()
         expected = 64 if sm[0] >= 10 else 128
         assert align == expected
+
+
+# ---------------------------------------------------------------------------
+# Sparse-loss preparation
+# ---------------------------------------------------------------------------
+
+
+def _sparse_loss_preparation_reference(scores, topk, padding_mask=None, physical=None):
+    if padding_mask is not None:
+        row_mask = padding_mask.unsqueeze(-1)
+        topk = topk.masked_fill(row_mask, -1)
+        if physical is not None:
+            physical = physical.masked_fill(row_mask, -1)
+    score_width = scores.shape[-1]
+    valid = (topk >= 0) & (topk < score_width)
+    safe_topk = topk.clamp(min=0, max=score_width - 1).long()
+    selected = torch.gather(scores, -1, safe_topk)
+    selected = torch.where(valid, selected, torch.finfo(torch.float32).min)
+    return torch.softmax(selected, -1), topk, physical
+
+
+def test_sparse_loss_preparation_cpu_fallback():
+    scores = torch.tensor([[0.5, -1.0, 2.0, 1.0], [3.0, 2.0, 1.0, 0.0]])
+    topk = torch.tensor([[2, 4, -1], [3, 1, 0]], dtype=torch.int32)
+    physical = torch.tensor([[12, 14, -1], [23, 21, 20]], dtype=torch.int32)
+    padding_mask = torch.tensor([False, True])
+
+    actual = dk.csa_indexer_loss_kernels.prepare_sparse_loss(scores, topk, padding_mask, physical)
+    expected = _sparse_loss_preparation_reference(scores, topk, padding_mask, physical)
+    torch.testing.assert_close(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+    assert torch.equal(actual[2], expected[2])
+    torch.testing.assert_close(actual[0][0], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(actual[0][1], torch.full((3,), 1.0 / 3.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sparse_loss_preparation_triton_matches_eager():
+    if not dk.csa_indexer_loss_kernels._TRITON_AVAILABLE:
+        pytest.skip("Triton is not available")
+    scores = torch.randn(7, 11, dtype=torch.float32, device="cuda")
+    topk = torch.tensor(
+        [
+            [2, 11, 1, -1, -1],
+            [8, 0, 3, 5, -1],
+            [-1, -1, -1, -1, -1],
+            [10, 9, 4, 2, 1],
+            [6, 5, 4, 3, 2],
+            [1, 0, -1, -1, -1],
+            [7, 3, 8, 6, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    physical = torch.where(topk >= 0, topk + 100, topk)
+    padding_mask = torch.tensor([False, True, False, False, True, False, False], device="cuda")
+
+    actual = dk.csa_indexer_loss_kernels.prepare_sparse_loss(scores, topk, padding_mask, physical)
+    expected = _sparse_loss_preparation_reference(scores, topk, padding_mask, physical)
+    torch.testing.assert_close(actual[0], expected[0], atol=2e-6, rtol=2e-6)
+    assert torch.equal(actual[1], expected[1])
+    assert torch.equal(actual[2], expected[2])
+    assert actual[0][0, 1].item() == 0.0
+    torch.testing.assert_close(actual[0][2], torch.full((5,), 0.2, device="cuda"))
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +1051,9 @@ class TestDsaFwdFlashMla:
         # (b) indexer_topk == 0
         _, _, lse_idx_b = _csa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=0)
         assert lse_idx_b is None, "(b) indexer_topk=0 must yield lse_indexer=None"
+        assert (
+            stub.call_args.args[2].data_ptr() == topk_idxs_aligned.data_ptr()
+        ), "(b) aligned indices should reach FlashMLA without a padding allocation"
 
         # (c) 0 < indexer_topk < TopK
         _, lse_c, lse_idx_c = _csa_fwd_flash_mla(
@@ -1116,13 +1265,14 @@ class TestCPCommunicationOverlap:
             local_compressed_kv_rows = 2
             softmax_scale = 0.5
             q_padding_mask = None
-            num_forward_inputs = 26
+            out_rope = None
+            num_forward_inputs = 29
 
         gradients = FusedCSAIndexerSparseAttnFromTopkFunc.backward(
             FakeContext(), torch.ones(2, 5), torch.ones(())
         )
 
-        assert len(gradients) == 26
+        assert len(gradients) == 29
         assert events == ["sparse_attention_backward", "launch_compressed_kv", "launch_indexer"]
         assert gradients[19] is handles["indexer"].tensor
         assert gradients[20] is handles["compressed_kv"].tensor
@@ -1340,6 +1490,149 @@ class TestIndexerTopk:
         assert compact_call.kwargs['topk_indices_global'] is False
 
 
+def _install_row_limit_dsa_stub():
+    """Install a CPU stub that preserves THD/BSHD score shapes."""
+    fake_dsa = MagicMock(name="_DSA_row_limit_stub")
+
+    def fake_indexer_forward(q, _k, _w, ratio, **_kwargs):
+        del ratio
+        shape = (q.shape[0], 1) if q.ndim == 3 else (q.shape[0], q.shape[1], 1)
+        return {"scores": torch.zeros(shape, dtype=torch.float32, device=q.device)}
+
+    def fake_topk(scores, _seq_lens, top_k, **_kwargs):
+        return {
+            "indices": torch.zeros(scores.shape[0], top_k, dtype=torch.int32, device=scores.device)
+        }
+
+    fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
+    fake_dsa.indexer_top_k_wrapper.side_effect = fake_topk
+    dk._DSA = fake_dsa
+    return fake_dsa
+
+
+@pytest.mark.parametrize("layout", ["thd", "sbhd"])
+def test_fused_row_limit_warning_is_shared_and_once(layout, caplog, reset_lazy_kernel_state):
+    """Every fused layout warns above the verified limit, at most once per process."""
+    rows = dk.FUSED_INDEXER_MAX_SAFE_ROWS + 1
+    fake_dsa = _install_row_limit_dsa_stub()
+
+    with caplog.at_level(logging.WARNING, logger=dk.__name__):
+        for _ in range(2):
+            if layout == "thd":
+                cu_q = torch.tensor([0, rows], dtype=torch.int32)
+                cu_k = torch.tensor([0, 1], dtype=torch.int32)
+                indexer_topk(
+                    torch.zeros(rows, 1, 1, dtype=torch.bfloat16),
+                    torch.zeros(1, 1, dtype=torch.bfloat16),
+                    torch.ones(rows, 1, dtype=torch.bfloat16),
+                    topk=1,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_kv=cu_k,
+                    max_seqlen_q=rows,
+                    max_seqlen_kv=1,
+                    use_compact=False,
+                )
+            else:
+                indexer_topk(
+                    torch.zeros(rows, 1, 1, 1, dtype=torch.bfloat16),
+                    torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+                    torch.ones(rows, 1, 1, dtype=torch.bfloat16),
+                    topk=1,
+                    use_compact=False,
+                )
+
+    warnings = [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
+    assert len(warnings) == 1
+    assert fake_dsa.indexer_forward_wrapper.call_count == 2
+
+
+@pytest.mark.parametrize("layout", ["thd", "sbhd"])
+def test_fused_row_limit_does_not_warn_at_boundary(layout, caplog, reset_lazy_kernel_state):
+    """The exact 32768-row boundary is verified safe and emits no warning."""
+    rows = dk.FUSED_INDEXER_MAX_SAFE_ROWS
+    _install_row_limit_dsa_stub()
+
+    with caplog.at_level(logging.WARNING, logger=dk.__name__):
+        if layout == "thd":
+            indexer_topk(
+                torch.zeros(rows, 1, 1, dtype=torch.bfloat16),
+                torch.zeros(1, 1, dtype=torch.bfloat16),
+                torch.ones(rows, 1, dtype=torch.bfloat16),
+                topk=1,
+                cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32),
+                cu_seqlens_kv=torch.tensor([0, 1], dtype=torch.int32),
+                max_seqlen_q=rows,
+                max_seqlen_kv=1,
+                use_compact=False,
+            )
+        else:
+            indexer_topk(
+                torch.zeros(rows, 1, 1, 1, dtype=torch.bfloat16),
+                torch.zeros(1, 1, 1, dtype=torch.bfloat16),
+                torch.ones(rows, 1, 1, dtype=torch.bfloat16),
+                topk=1,
+                use_compact=False,
+            )
+
+    assert not [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
+
+
+def test_fused_row_limit_warns_only_for_launched_calls(
+    monkeypatch, caplog, reset_lazy_kernel_state
+):
+    """Invalid inputs and backend-resolution failures must not consume the warning."""
+    rows = dk.FUSED_INDEXER_MAX_SAFE_ROWS + 1
+    q = torch.zeros(rows, 1, 1, dtype=torch.bfloat16)
+    w = torch.ones(rows, 1, dtype=torch.bfloat16)
+    cu_q = torch.tensor([0, rows], dtype=torch.int32)
+    cu_k = torch.tensor([0, 1], dtype=torch.int32)
+
+    with caplog.at_level(logging.WARNING, logger=dk.__name__):
+        _install_row_limit_dsa_stub()
+        with pytest.raises(ValueError, match="THD q must be"):
+            dk._indexer_topk_core(
+                q.unsqueeze(1),
+                torch.zeros(1, 1, dtype=torch.bfloat16),
+                w,
+                topk=1,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_k,
+                max_seqlen_q=rows,
+                max_seqlen_kv=1,
+            )
+
+        with pytest.raises(ValueError, match="at least one K row"):
+            dk._indexer_topk_core(
+                q,
+                torch.zeros(0, 1, dtype=torch.bfloat16),
+                w,
+                topk=1,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=torch.tensor([0, 0], dtype=torch.int32),
+                max_seqlen_q=rows,
+                max_seqlen_kv=0,
+            )
+
+        dk._DSA = None
+        monkeypatch.setattr(
+            dk, "_ensure_dsa_namespace", MagicMock(side_effect=ImportError("backend unavailable"))
+        )
+        with pytest.raises(ImportError, match="backend unavailable"):
+            dk._indexer_topk_core(
+                q,
+                torch.zeros(1, 1, dtype=torch.bfloat16),
+                w,
+                topk=1,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_k,
+                max_seqlen_q=rows,
+                max_seqlen_kv=1,
+            )
+
+    assert not [record for record in caplog.records if "CORRECTNESS WARNING" in record.message]
+    assert dsa_fused_safety._ROW_LIMIT_WARNED is False
+
+
 # ---------------------------------------------------------------------------
 # csa_sparse_attn / CSASparseAttnFunc forward (mocked)
 # ---------------------------------------------------------------------------
@@ -1406,6 +1699,67 @@ class TestDsaSparseAttn:
         assert torch.equal(kv.grad, dkv_kernel.reshape(skv, b, d)), "(b) kv.grad mis-reshaped"
         assert torch.equal(attn_sink.grad, d_sink_kernel), "(b) attn_sink.grad mismatch"
         fake_dsa.sparse_attention_backward_wrapper.assert_called_once()
+
+    def test_thd_backward_reconstructs_kv_without_saving_concatenation(self, monkeypatch):
+        """THD backward rebuilds KV while gradients still use the original cat edge."""
+        total_q, num_heads, head_dim = 4, 2, 3
+        boundary_kv = torch.randn(1, head_dim, requires_grad=True)
+        local_kv = torch.randn(4, head_dim, requires_grad=True)
+        compressed_kv = torch.randn(2, head_dim, requires_grad=True)
+        kv_full = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
+        kv_full.retain_grad()
+        query = torch.randn(total_q, num_heads, head_dim, requires_grad=True)
+        attn_sink = torch.randn(num_heads, requires_grad=True)
+        topk_idxs = torch.zeros(total_q, 2, dtype=torch.int32)
+        expected_kv = kv_full.detach().clone()
+        expected_dkv = torch.arange(kv_full.numel(), dtype=kv_full.dtype).reshape_as(kv_full)
+        seen = {}
+
+        def fake_flash(q, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(q), torch.zeros(total_q, num_heads), None
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_attention_backward_wrapper(q, kv, out, dO, lse, sink, topk, **kwargs):
+                del out, dO, lse, topk, kwargs
+                seen['backward_kv'] = kv.detach().clone()
+                return {
+                    'dq': torch.zeros_like(q),
+                    'dkv': expected_dkv,
+                    'd_sink': torch.zeros_like(sink),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        saved_storage_ids = []
+
+        def pack_hook(tensor):
+            saved_storage_ids.append(tensor.untyped_storage()._cdata)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+            output = csa_sparse_attn(
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=0.5,
+                is_thd=True,
+                kv_reconstruction_parts=(boundary_kv, local_kv, compressed_kv),
+            )
+            output.sum().backward()
+
+        assert kv_full.untyped_storage()._cdata not in saved_storage_ids
+        for part in (boundary_kv, local_kv, compressed_kv):
+            assert part.untyped_storage()._cdata in saved_storage_ids
+        torch.testing.assert_close(seen['backward_kv'], expected_kv)
+        torch.testing.assert_close(kv_full.grad, expected_dkv)
+        expected_parts = expected_dkv.split((1, 4, 2), dim=0)
+        for part, expected_grad in zip((boundary_kv, local_kv, compressed_kv), expected_parts):
+            torch.testing.assert_close(part.grad, expected_grad)
 
 
 # ---------------------------------------------------------------------------
@@ -2349,6 +2703,10 @@ class TestFusedIndexerSparseAttnFromTopk:
     def test_dense_loss_passes_recomputed_full_teacher_lse(self, monkeypatch):
         inputs = self._inputs()
         total_q, num_heads, _ = inputs['query'].shape
+        logical_window_width = inputs['topk_idxs'].shape[-1] - inputs['indexer_topk_idxs'].shape[-1]
+        inputs['topk_idxs'] = torch.cat(
+            (inputs['topk_idxs'], torch.full((total_q, 2), -1, dtype=torch.int32)), dim=-1
+        )
         max_seqlen_k = 2
         sentinel_lse = torch.full((total_q, num_heads), 37.0)
         seen = {}
@@ -2359,7 +2717,9 @@ class TestFusedIndexerSparseAttnFromTopk:
 
         def fake_non_compressed(query, kv_full, sink, window_indices, scale):
             del query, kv_full, sink, scale
-            torch.testing.assert_close(window_indices, inputs['topk_idxs'][:, 1:])
+            torch.testing.assert_close(
+                window_indices, inputs['topk_idxs'][:, 1 : 1 + logical_window_width]
+            )
             return torch.full((total_q, num_heads), 5.0)
 
         def fake_dense_teacher(query, compressed_kv, non_compressed_lse, *args, **kwargs):
@@ -2416,6 +2776,15 @@ class TestFusedIndexerSparseAttnFromTopk:
                 torch.tensor([0], dtype=torch.int32),
             ),
             None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            logical_window_width,
         )
 
         assert seen['dense_teacher_called']
@@ -2491,6 +2860,95 @@ class TestFusedIndexerSparseAttnFromTopk:
         )
         assert torch.count_nonzero(seen['dO'][1]) == 0
         assert torch.count_nonzero(seen['lse'][1]) == 0
+
+    def test_backward_reconstructs_kv_without_saving_concatenation(self, monkeypatch):
+        """The fused indexer path also saves KV producers instead of ``kv_full``."""
+        inputs = self._inputs()
+        total_q, num_heads, head_dim = inputs['query'].shape
+        boundary_kv = torch.randn(1, head_dim, requires_grad=True)
+        local_kv = torch.randn(3, head_dim, requires_grad=True)
+        compressed_kv = torch.randn(2, head_dim, requires_grad=True)
+        kv_reconstruction_parts = (boundary_kv, local_kv, compressed_kv)
+        inputs['kv_full'] = torch.cat(kv_reconstruction_parts, dim=0)
+        inputs['kv_full'].retain_grad()
+        expected_kv = inputs['kv_full'].detach().clone()
+        expected_dkv = torch.arange(
+            inputs['kv_full'].numel(), dtype=inputs['kv_full'].dtype
+        ).reshape_as(inputs['kv_full'])
+        seen = {}
+
+        def fake_flash(query, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(query), torch.zeros(total_q, num_heads), None
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_indexer_score_recompute_wrapper(q, k, w, topk, **kwargs):
+                del q, k, w, kwargs
+                return {'predict': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attn_score_recompute_wrapper(q, k, lse, topk, scale, **kwargs):
+                del q, k, lse, scale, kwargs
+                return {'target': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attention_backward_wrapper(q, kv, out, dO, lse, sink, topk, **kwargs):
+                del out, dO, lse, topk, kwargs
+                seen['backward_kv'] = kv.detach().clone()
+                return {
+                    'dq': torch.zeros_like(q),
+                    'dkv': expected_dkv,
+                    'd_sink': torch.zeros_like(sink),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        saved_storage_ids = []
+
+        def pack_hook(tensor):
+            saved_storage_ids.append(tensor.untyped_storage()._cdata)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+            output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+                *inputs.values(),
+                1.0,
+                1.0,
+                0.0,
+                float(total_q),
+                True,
+                2,
+                total_q,
+                (
+                    torch.tensor([0, total_q], dtype=torch.int32),
+                    torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                    torch.tensor([0], dtype=torch.int32),
+                ),
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                1,
+                kv_reconstruction_parts,
+            )
+            (output.sum() + loss).backward()
+
+        assert inputs['kv_full'].untyped_storage()._cdata not in saved_storage_ids
+        for part in kv_reconstruction_parts:
+            assert part.untyped_storage()._cdata in saved_storage_ids
+        torch.testing.assert_close(seen['backward_kv'], expected_kv)
+        torch.testing.assert_close(inputs['kv_full'].grad, expected_dkv)
+        expected_parts = expected_dkv.split((1, 3, 2), dim=0)
+        for part, expected_grad in zip(kv_reconstruction_parts, expected_parts):
+            torch.testing.assert_close(part.grad, expected_grad)
 
 
 # ---------------------------------------------------------------------------
@@ -4237,9 +4695,8 @@ class TestRealKernelFusedIndexerSparseAttnThd:
     pipeline produces a numerically equivalent loss to the SBHD pipeline
     with ``b=1`` on the same tensors — both go through the same
     underlying cuDNN kernels, differing only in the layout-glue around
-    them. The sparse-loss THD path additionally exercises
-    :func:`local_to_global_flat` (over ``cu_seqlens_compressed_idx``)
-    and the ``topk_indices_global=True`` flag wiring.
+    them. The THD path additionally exercises raw sequence-major KV
+    lowering and the ``topk_indices_global=True`` flag wiring.
     """
 
     SHAPES = dict(
@@ -4282,9 +4739,11 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         kv_full_sbhd = torch.randn(s['skv'], b, s['d'], dtype=torch.bfloat16, device=dev)
         attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev)
         torch.manual_seed(1)
-        win_idxs_sbhd = torch.randint(
-            0, s['sq'], (b, s['sq'], s['win_topk']), dtype=torch.int32, device=dev
-        )
+        query_rows = torch.arange(s['sq'], dtype=torch.int32, device=dev).unsqueeze(1)
+        window_offsets = torch.arange(s['win_topk'], dtype=torch.int32, device=dev)
+        win_idxs = (query_rows - s['win_topk'] + 1).clamp_min(0) + window_offsets
+        win_idxs = torch.where(win_idxs <= query_rows, win_idxs, -1)
+        win_idxs_sbhd = win_idxs.unsqueeze(0)
         q_indexer_sbhd = torch.randn(
             s['sq'], b, s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
         )
@@ -4313,11 +4772,10 @@ class TestRealKernelFusedIndexerSparseAttnThd:
 
         # ---- THD equivalent --------------------------------------------------
         # Reshape: SBHD (sq, 1, ...) -> THD flat (sq, ...).
-        # kv_full SBHD layout is [kv (sq), compressed (n_comp)] in dim 0;
-        # the THD analogue is [kv (sq), compressed (n_comp)] per-segment.
+        # kv_full SBHD and raw THD are both [kv (sq), compressed (n_comp)]
+        # for this single-segment case.
         query_thd = query_sbhd.squeeze(1)  # (sq, np, d)
         kv_full_thd = kv_full_sbhd.squeeze(1)  # (skv, d)
-        win_idxs_thd = win_idxs_sbhd.squeeze(0)  # (sq, win_topk)
         q_indexer_thd = q_indexer_sbhd.squeeze(1)  # (sq, idx_nh, idx_hd)
         k_indexer_thd = k_indexer_sbhd.squeeze(1)  # (n_comp, idx_hd)
         weights_thd = weights_sbhd.squeeze(1)  # (sq, idx_nh)
@@ -4325,7 +4783,6 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         # Single-segment cu_seqlens (B=1): total_q == sq.
         cu_q = _make_cu_seqlens([s['sq']], device=dev)
         cu_kv = _make_cu_seqlens([kv_offset], device=dev)
-        cu_kv_full = _make_cu_seqlens([s['skv']], device=dev)
         # Indexer K is per-segment compressed-only (n_comp positions).
         cu_comp_idx = _make_cu_seqlens([s['n_comp']], device=dev)
 
@@ -4336,7 +4793,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             query_thd,
             kv_full_thd,
             attn_sink,
-            win_idxs_thd,
+            None,
             q_indexer_thd,
             k_indexer_thd,
             weights_thd,
@@ -4349,12 +4806,13 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             kv_offset=0,  # ignored in THD
             cu_seqlens_q=cu_q,
             cu_seqlens_kv=cu_kv,
-            cu_seqlens_kv_full=cu_kv_full,
             cu_seqlens_compressed_idx=cu_comp_idx,
             max_seqlen_q=s['sq'],
             max_seqlen_compressed_idx=s['n_comp'],
             compressed_kv=compressed_kv_thd,
             indexer_precision=indexer_precision,
+            thd_window_size=s['win_topk'],
+            thd_compressed_is_sequence_major=True,
         )
 
         # SBHD and THD share the same underlying kernels; for B=1 the
@@ -4366,6 +4824,104 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             f"sbhd = {loss_sbhd.item():.6f}, "
             f"abs diff = {(loss_thd - loss_sbhd).abs().item():.3e}"
         )
+
+    def test_raw_thd_tail_padding_backward_uses_dummy_tile(self, reset_lazy_kernel_state):
+        """Raw THD tail padding supplies a harmless tile to DSA backward.
+
+        CUDA graphs keep Q-side tensors at a static capacity, which may leave
+        physical rows beyond the last packed-sequence endpoint. Raw THD
+        lowering emits all ``-1`` indices for those rows, so FlashMLA forward
+        sees ``topk_length == 0``. DSA backward instead requires at least one
+        tile; the fused wrapper must pass length 1 after sanitizing the index.
+        """
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        s = self.SHAPES
+        torch.manual_seed(2)
+        dev = 'cuda'
+        real_q = s['sq']
+        tail_q = 128
+        total_q = real_q + tail_q
+        n_comp = 128
+        indexer_topk = 128
+        kv_offset = real_q
+
+        query = torch.randn(
+            total_q, s['np_'], s['d'], dtype=torch.bfloat16, device=dev, requires_grad=True
+        )
+        kv_full = torch.randn(
+            kv_offset + n_comp, s['d'], dtype=torch.bfloat16, device=dev, requires_grad=True
+        )
+        attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev, requires_grad=True)
+        q_indexer = torch.randn(total_q, s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        k_indexer = torch.randn(n_comp, s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        weights = torch.randn(total_q, s['idx_nh'], dtype=torch.bfloat16, device=dev)
+
+        cu_q = _make_cu_seqlens([real_q], device=dev)
+        cu_q_unpadded = cu_q.clone()
+        cu_kv = _make_cu_seqlens([kv_offset], device=dev)
+        cu_comp_idx = _make_cu_seqlens([n_comp], device=dev)
+        compressed_kv = kv_full.detach()[kv_offset:]
+
+        _ensure_dsa_namespace()
+        _ensure_flash_mla()
+        real_sparse_attention_backward = dk._DSA.sparse_attention_backward_wrapper
+        real_flash_mla = dk._flash_mla_sparse_fwd
+        seen = {}
+
+        def capture_flash_mla(*args, **kwargs):
+            seen['forward_topk_length'] = kwargs['topk_length'].detach().clone()
+            return real_flash_mla(*args, **kwargs)
+
+        def capture_sparse_attention_backward(*args, **kwargs):
+            seen['backward_topk_length'] = kwargs['topk_length'].detach().clone()
+            seen['topk_idxs'] = args[6].detach().clone()
+            return real_sparse_attention_backward(*args, **kwargs)
+
+        with (
+            patch.object(dk, '_flash_mla_sparse_fwd', side_effect=capture_flash_mla),
+            patch.object(
+                dk._DSA,
+                'sparse_attention_backward_wrapper',
+                side_effect=capture_sparse_attention_backward,
+            ),
+        ):
+            output, _ = fused_csa_indexer_sparse_attn(
+                query,
+                kv_full,
+                attn_sink,
+                None,
+                q_indexer,
+                k_indexer,
+                weights,
+                indexer_topk=indexer_topk,
+                ratio=s['ratio'],
+                softmax_scale=s['softmax_scale'],
+                indexer_softmax_scale=s['indexer_softmax_scale'],
+                loss_coeff=0.0,
+                sparse_loss=True,
+                kv_offset=0,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_kv,
+                cu_seqlens_compressed_idx=cu_comp_idx,
+                max_seqlen_q=real_q,
+                max_seqlen_compressed_idx=n_comp,
+                compressed_kv=compressed_kv,
+                cu_seqlens_q_unpadded=cu_q_unpadded,
+                thd_window_size=s['win_topk'],
+                thd_compressed_is_sequence_major=True,
+            )
+            output.sum().backward()
+
+        expected_forward_tail_length = torch.zeros(tail_q, dtype=torch.int32, device=dev)
+        expected_tail_length = torch.ones(tail_q, dtype=torch.int32, device=dev)
+        assert torch.equal(seen['forward_topk_length'][real_q:], expected_forward_tail_length)
+        assert torch.equal(seen['backward_topk_length'][real_q:], expected_tail_length)
+        assert torch.all(seen['topk_idxs'] >= 0)
+        assert query.grad is not None
+        assert torch.all(query.grad[real_q:] == 0)
+        assert torch.isfinite(query.grad[:real_q]).all()
+        assert kv_full.grad is not None and torch.isfinite(kv_full.grad).all()
+        assert attn_sink.grad is not None and torch.isfinite(attn_sink.grad).all()
 
 
 # ---------------------------------------------------------------------------
@@ -4975,6 +5531,413 @@ class TestRealKernelDenseIndexerBackward:
         ]:
             cs = cosine(dk_grad, dr_grad)
             assert cs > 1 - eps, f"{name}: cosine_sim={cs:.10f}, eps={eps}"
+
+
+# ---------------------------------------------------------------------------
+# Output inverse RoPE fused into the sparse-attention Functions
+# ---------------------------------------------------------------------------
+
+
+def _make_rotation_cos_sin(max_seqlen, pos_dim, device, dtype=torch.bfloat16):
+    """Build cos/sin tables laid out the way ``RotaryEmbedding`` emits them.
+
+    Both halves of the ``pos_dim`` axis carry the same angle, which is what
+    makes the kernel's forward and backward an exact rotation / inverse pair
+    and therefore what lets the fused backward recover the pre-RoPE output.
+    """
+    torch.manual_seed(11)
+    theta = torch.rand(max_seqlen, pos_dim // 2, device=device) * (2 * math.pi)
+    cos = torch.cat([theta.cos(), theta.cos()], dim=-1).to(dtype)
+    sin = torch.cat([theta.sin(), theta.sin()], dim=-1).to(dtype)
+    return cos.view(max_seqlen, 1, 1, pos_dim), sin.view(max_seqlen, 1, 1, pos_dim)
+
+
+def _make_small_flash_mla_stub():
+    """FlashMLA stand-in whose output is O(1), so a bf16 rotate/un-rotate
+    round trip stays well inside a meaningful tolerance.
+    """
+
+    def _impl(q, kv, indices, softmax_scale, d_v, attn_sink, topk_length, indexer_topk):
+        total_s_q, h, _ = q.shape
+        gen = torch.Generator(device=q.device).manual_seed(23)
+        out = (
+            torch.randn(total_s_q, h, d_v, generator=gen, device=q.device, dtype=torch.float32)
+            .mul_(0.5)
+            .to(q.dtype)
+        )
+        max_logits = torch.zeros(total_s_q, h, dtype=torch.float32, device=q.device)
+        lse = torch.zeros(total_s_q, h, dtype=torch.float32, device=q.device)
+        if indexer_topk > 0:
+            return out, max_logits, lse, lse + 1.0
+        return out, max_logits, lse
+
+    stub = MagicMock(name='small_flash_mla_stub')
+    stub.side_effect = _impl
+    return stub
+
+
+class TestFusedOutputInverseRope:
+    """DSv4's output inverse RoPE, fused into the Path B Function, must be
+    indistinguishable from running the Function and rotating afterwards.
+
+    The cuDNN / FlashMLA kernels are mocked but the RoPE triton kernels are
+    real. The mocked sparse-attention backward records the ``(O, dO)`` pair it
+    is handed and derives its gradients from it, so an incorrect un-rotation
+    shows up both in the recorded tensors and in every returned gradient.
+    """
+
+    SHAPES = dict(sq=4, b=2, np_=2, d=512, skv=8, n_comp=4, idx_nh=4, idx_hd=64)
+    POS_DIM = 64
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_apply_matches_helper_and_undo_inverts(self, layout):
+        """``OutputRopeParams.apply_`` reproduces the shipped out-of-place
+        helper, and ``undo`` inverts it both in place and into a buffer.
+        """
+        from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
+
+        dev = 'cuda'
+        pos_dim = nope_dim = 64
+        head_dim = nope_dim + pos_dim
+        nheads = 4
+        sq = b = None
+        if layout == 'sbhd':
+            sq, b = 5, 3
+            rows, cu_seqlens, batch_size, max_seqlen = sq * b, None, b, sq
+        else:
+            seg_lens = [4, 6, 5]
+            rows = sum(seg_lens)
+            cu_seqlens = _make_cu_seqlens(seg_lens, device=dev)
+            batch_size, max_seqlen = None, max(seg_lens)
+
+        cos, sin = _make_rotation_cos_sin(max_seqlen, pos_dim, dev, dtype=torch.float32)
+        params = dk.OutputRopeParams(
+            cos=cos,
+            sin=sin,
+            nope_dim=nope_dim,
+            pos_dim=pos_dim,
+            cu_seqlens_q=cu_seqlens,
+            sbhd_batch_size=batch_size,
+        )
+
+        torch.manual_seed(5)
+        out_flat = torch.randn(rows, nheads, head_dim, dtype=torch.float32, device=dev)
+        original = out_flat.clone()
+
+        helper_input = original.view(sq, b, nheads, head_dim) if layout == 'sbhd' else original
+        expected = fused_mla_rope_out_of_place(
+            helper_input,
+            cos,
+            sin,
+            nope_dim,
+            pos_dim,
+            cu_seqlens_q=cu_seqlens,
+            inverse=True,
+            remove_interleaving=True,
+        ).reshape(rows, nheads, head_dim)
+
+        params.apply_(out_flat)
+        assert torch.equal(out_flat, expected), "fused in-place rope diverged from the helper"
+
+        recovered = torch.empty_like(out_flat)
+        params.undo(out_flat, out=recovered)
+        torch.testing.assert_close(recovered, original, rtol=1e-5, atol=1e-5)
+        # An out-of-place undo must leave the rotated buffer alone: in the real
+        # backward that buffer is still the module output another node saved.
+        assert torch.equal(out_flat, expected), "out-of-place undo mutated its input"
+
+        params.undo(out_flat)
+        torch.testing.assert_close(out_flat, original, rtol=1e-5, atol=1e-5)
+
+    def _make_inputs(self):
+        """Six differentiable leaves plus the non-differentiable window idxs."""
+        s = self.SHAPES
+        win_topk = _get_topk_alignment() - 2
+        torch.manual_seed(0)
+
+        def leaf(*shape, dtype=torch.bfloat16):
+            return torch.randn(*shape, dtype=dtype, device='cuda').requires_grad_(True)
+
+        return dict(
+            query=leaf(s['sq'], s['b'], s['np_'], s['d']),
+            kv_full=leaf(s['skv'], s['b'], s['d']),
+            attn_sink=torch.zeros(s['np_'], dtype=torch.float32, device='cuda').requires_grad_(
+                True
+            ),
+            window_idxs=torch.zeros(s['b'], s['sq'], win_topk, dtype=torch.int32, device='cuda'),
+            q_indexer=leaf(s['sq'], s['b'], s['idx_nh'], s['idx_hd']),
+            k_indexer=leaf(s['n_comp'], s['b'], s['idx_hd']),
+            weights=leaf(s['sq'], s['b'], s['idx_nh']),
+        )
+
+    def _install_recording_mock(self, captured):
+        """Full DSA mock whose sparse-attn backward records ``(O, dO)`` and
+        derives every gradient from them.
+        """
+        s = self.SHAPES
+        fake_dsa, _ = _install_full_dsa_mock(
+            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
+        )
+
+        def recording_backward(q, kv, out, dout, lse, attn_sink, topk_idxs, **kwargs):
+            captured['out'] = out.detach().clone()
+            captured['dout'] = dout.detach().clone()
+            scale = out.float().abs().mean() + dout.float().abs().mean()
+            return {
+                'dq': torch.full_like(q, 1.0) * scale.to(q.dtype),
+                'dkv': torch.full_like(kv, 1.0) * scale.to(kv.dtype),
+                'd_sink': torch.full_like(attn_sink, 1.0) * scale,
+            }
+
+        fake_dsa.sparse_attention_backward_wrapper.side_effect = recording_backward
+        dk._flash_mla_sparse_fwd = _make_small_flash_mla_stub()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_fused_rope_matches_external_rope(self, reset_lazy_kernel_state):
+        """Running Path B with ``out_rope`` equals running it without and
+        rotating the output afterwards, for the output, every gradient, and
+        the ``(O, dO)`` pair the sparse-attn backward is handed.
+        """
+        from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
+
+        s = self.SHAPES
+        dev = 'cuda'
+        pos_dim = self.POS_DIM
+        nope_dim = s['d'] - pos_dim
+        cos, sin = _make_rotation_cos_sin(s['sq'], pos_dim, dev)
+        params = dk.OutputRopeParams(
+            cos=cos, sin=sin, nope_dim=nope_dim, pos_dim=pos_dim, sbhd_batch_size=s['b']
+        )
+
+        torch.manual_seed(7)
+        grad_out = torch.randn(s['sq'], s['b'], s['np_'] * s['d'], dtype=torch.bfloat16, device=dev)
+        grad_loss = torch.tensor(1.0, device=dev)
+
+        runs = {}
+        for name, rope in (('fused', params), ('external', None)):
+            inputs = self._make_inputs()
+            captured = {}
+            self._install_recording_mock(captured)
+
+            output, indexer_loss = fused_csa_indexer_sparse_attn(
+                **inputs,
+                indexer_topk=2,
+                ratio=4,
+                softmax_scale=0.5,
+                loss_coeff=0.7,
+                sparse_loss=True,
+                kv_offset=s['skv'] - s['n_comp'],
+                out_rope=rope,
+            )
+            if rope is None:
+                output = fused_mla_rope_out_of_place(
+                    output.view(s['sq'], s['b'], s['np_'], s['d']),
+                    cos,
+                    sin,
+                    nope_dim,
+                    pos_dim,
+                    inverse=True,
+                    remove_interleaving=True,
+                ).reshape(s['sq'], s['b'], s['np_'] * s['d'])
+
+            leaves = [
+                inputs['query'],
+                inputs['kv_full'],
+                inputs['attn_sink'],
+                inputs['q_indexer'],
+                inputs['k_indexer'],
+                inputs['weights'],
+            ]
+            frozen_output = output.detach().clone()
+            # Fresh grad copies: the backward un-rotates dO in place, matching
+            # what _FusedMLARoPEInplace already does to its incoming gradient.
+            grads = torch.autograd.grad(
+                [output, indexer_loss],
+                leaves,
+                [grad_out.clone(), grad_loss.clone()],
+                retain_graph=True,
+            )
+            grads_again = torch.autograd.grad(
+                [output, indexer_loss],
+                leaves,
+                [grad_out.clone(), grad_loss.clone()],
+                retain_graph=True,
+            )
+
+            assert torch.equal(output, frozen_output), f"{name}: backward corrupted the output"
+            for i, (first, second) in enumerate(zip(grads, grads_again)):
+                assert torch.equal(first, second), f"{name}: leaf {i} differs on second backward"
+
+            runs[name] = dict(output=frozen_output, grads=grads, captured=captured)
+
+        assert torch.equal(
+            runs['fused']['output'], runs['external']['output']
+        ), "fused rope output differs from the externally rotated output"
+
+        # The un-rotated O survives a bf16 rotate/un-rotate round trip, so
+        # compare against the baseline's untouched O with a bf16 tolerance.
+        torch.testing.assert_close(
+            runs['fused']['captured']['out'],
+            runs['external']['captured']['out'],
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        torch.testing.assert_close(
+            runs['fused']['captured']['dout'],
+            runs['external']['captured']['dout'],
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        for i, (fused_grad, external_grad) in enumerate(
+            zip(runs['fused']['grads'], runs['external']['grads'])
+        ):
+            torch.testing.assert_close(
+                fused_grad, external_grad, rtol=2e-2, atol=2e-2, msg=f"leaf {i} gradient differs"
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    def test_sparse_attn_fused_rope_matches_external_rope(self, reset_lazy_kernel_state, layout):
+        """Path A carries the same guarantee as Path B: ``csa_sparse_attn`` with
+        ``out_rope`` equals the same call without it followed by an
+        out-of-place rotation, for the output, the leaf gradients and the
+        ``(O, dO)`` pair handed to the sparse-attn backward.
+
+        Path A covers the window-only and ratio-128 layers, which have no
+        indexer and so never reach Path B.
+        """
+        from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
+
+        s = self.SHAPES
+        dev = 'cuda'
+        pos_dim = self.POS_DIM
+        nope_dim = s['d'] - pos_dim
+        topk = _get_topk_alignment()
+
+        if layout == 'sbhd':
+            rows, cu_seqlens, batch_size, max_seqlen = s['sq'] * s['b'], None, s['b'], s['sq']
+        else:
+            seg_lens = [s['sq'], s['sq']]
+            rows = sum(seg_lens)
+            cu_seqlens = _make_cu_seqlens(seg_lens, device=dev)
+            batch_size, max_seqlen = None, max(seg_lens)
+
+        cos, sin = _make_rotation_cos_sin(max_seqlen, pos_dim, dev)
+        params = dk.OutputRopeParams(
+            cos=cos,
+            sin=sin,
+            nope_dim=nope_dim,
+            pos_dim=pos_dim,
+            cu_seqlens_q=cu_seqlens,
+            sbhd_batch_size=batch_size,
+        )
+
+        torch.manual_seed(11)
+        grad_out = torch.randn(rows, s['np_'] * s['d'], dtype=torch.bfloat16, device=dev)
+        if layout == 'sbhd':
+            grad_out = grad_out.reshape(s['sq'], s['b'], s['np_'] * s['d'])
+
+        runs = {}
+        for name, rope in (('fused', params), ('external', None)):
+            torch.manual_seed(3)
+            if layout == 'sbhd':
+                query = torch.randn(
+                    s['sq'], s['b'], s['np_'], s['d'], dtype=torch.bfloat16, device=dev
+                )
+                kv = torch.randn(s['skv'], s['b'], s['d'], dtype=torch.bfloat16, device=dev)
+            else:
+                query = torch.randn(rows, s['np_'], s['d'], dtype=torch.bfloat16, device=dev)
+                kv = torch.randn(s['skv'] * 2, s['d'], dtype=torch.bfloat16, device=dev)
+            query.requires_grad_(True)
+            kv.requires_grad_(True)
+            attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev).requires_grad_(True)
+            topk_idxs = torch.zeros(rows, topk, dtype=torch.int32, device=dev)
+
+            captured = {}
+            self._install_recording_mock(captured)
+
+            output = csa_sparse_attn(
+                query,
+                kv,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=0.5,
+                is_thd=layout == 'thd',
+                out_rope=rope,
+            )
+            if rope is None:
+                rope_in = output.reshape(rows, s['np_'], s['d'])
+                if layout == 'sbhd':
+                    rope_in = rope_in.view(s['sq'], s['b'], s['np_'], s['d'])
+                output = fused_mla_rope_out_of_place(
+                    rope_in,
+                    cos,
+                    sin,
+                    nope_dim,
+                    pos_dim,
+                    cu_seqlens_q=cu_seqlens,
+                    inverse=True,
+                    remove_interleaving=True,
+                ).reshape(output.shape)
+
+            leaves = [query, kv, attn_sink]
+            frozen_output = output.detach().clone()
+            grads = torch.autograd.grad(output, leaves, grad_out.clone(), retain_graph=True)
+            grads_again = torch.autograd.grad(output, leaves, grad_out.clone(), retain_graph=True)
+
+            assert torch.equal(output, frozen_output), f"{name}: backward corrupted the output"
+            for i, (first, second) in enumerate(zip(grads, grads_again)):
+                assert torch.equal(first, second), f"{name}: leaf {i} differs on second backward"
+
+            runs[name] = dict(output=frozen_output, grads=grads, captured=captured)
+
+        assert torch.equal(
+            runs['fused']['output'], runs['external']['output']
+        ), "fused rope output differs from the externally rotated output"
+
+        for key in ('out', 'dout'):
+            torch.testing.assert_close(
+                runs['fused']['captured'][key],
+                runs['external']['captured'][key],
+                rtol=2e-2,
+                atol=2e-2,
+                msg=f"{key} handed to the sparse-attn backward differs",
+            )
+        for i, (fused_grad, external_grad) in enumerate(
+            zip(runs['fused']['grads'], runs['external']['grads'])
+        ):
+            torch.testing.assert_close(
+                fused_grad, external_grad, rtol=2e-2, atol=2e-2, msg=f"leaf {i} gradient differs"
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_head_dim_mismatch_raises(self, reset_lazy_kernel_state):
+        """A rope whose ``nope_dim + pos_dim`` misses the head dim is rejected
+        rather than silently rotating the wrong slice.
+        """
+        s = self.SHAPES
+        cos, sin = _make_rotation_cos_sin(s['sq'], self.POS_DIM, 'cuda')
+        params = dk.OutputRopeParams(
+            cos=cos,
+            sin=sin,
+            nope_dim=s['d'] - self.POS_DIM - 8,
+            pos_dim=self.POS_DIM,
+            sbhd_batch_size=s['b'],
+        )
+        inputs = self._make_inputs()
+        self._install_recording_mock({})
+        with pytest.raises(ValueError, match="nope_dim \\+ pos_dim"):
+            fused_csa_indexer_sparse_attn(
+                **inputs,
+                indexer_topk=2,
+                ratio=4,
+                softmax_scale=0.5,
+                loss_coeff=0.0,
+                sparse_loss=True,
+                kv_offset=s['skv'] - s['n_comp'],
+                out_rope=params,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -123,6 +123,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/**/*.py]
     products:
       - environment: [lts, dev]

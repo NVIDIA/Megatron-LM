@@ -15,11 +15,12 @@ cover the Megatron-side wiring only:
     ``enabled`` switch, deterministic mode, unsupported
     configurations, and a missing/old cudnn-frontend (no ``cudnn.csa``);
   - ``Compressor._forward_thd`` integration: the fused dispatch engages and matches
-    eager, gradients flow, and the module falls back to the bitwise-identical eager
+    eager for regular and CP pre-grouped inputs, gradients flow, precomputed RoPE
+    positions are reused, and the module falls back to the bitwise-identical eager
     path when the frontend is unavailable.
 
-Without a cudnn-frontend that provides ``cudnn.csa`` (or without CUDA / off compute
-capability 10.0) every test skips.
+Without a cudnn-frontend that provides ``cudnn.csa`` (or without CUDA / below
+compute-capability major 10) every kernel test skips.
 """
 
 from types import SimpleNamespace
@@ -53,7 +54,7 @@ def _require_fused():
             f"is not available: {cfc._frontend_error!r}"
         )
     if not cfc.fused_compressor_available():
-        pytest.skip("fused CSA compressor requires compute capability 10.0")
+        pytest.skip("fused CSA compressor requires compute-capability major >= 10 (SM100+)")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +326,7 @@ class TestCompressorFusedIntegration:
 
     @pytest.fixture(scope='class', autouse=True)
     def class_environment(self, request):
-        # Skip (do not crash) on machines without CUDA / the frontend / CC 10.0 before
+        # Skip (do not crash) on machines without CUDA / the frontend / SM100+ before
         # touching model-parallel state.
         _require_fused()
 
@@ -465,3 +466,69 @@ class TestCompressorFusedIntegration:
         assert x.grad is not None
         assert compressor.ape.grad is not None
         assert compressor.ape.grad.abs().sum().item() > 0
+
+    def test_pre_grouped_cp_uses_local_prefixes_and_precomputed_positions(self):
+        """CP compact inputs dispatch through the fused pool on their canonical rows."""
+        _require_fused()
+        compressor = self._make_compressor()
+        capacity, ratio = 8, 4
+        x_base = torch.randn(
+            capacity * ratio, 1, self.config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        cu_global = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+        group_ids = torch.tensor([5, 6, 7, 0, 1, -1, -1, -1], dtype=torch.int32, device="cuda")
+        position_ids = torch.tensor([20, 24, 28, 0, 4, 0, 0, 0], dtype=torch.int32, device="cuda")
+        local_cu = torch.tensor([0, 12, 20], dtype=torch.int32, device="cuda")
+        local_cuc = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+        canonical_rows = torch.tensor([1, 2, 3, 4], device="cuda")
+        grad_out = torch.zeros(
+            capacity, 1, self.config.v_head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        grad_out[canonical_rows] = torch.randn_like(grad_out[canonical_rows])
+
+        def run(use_fused):
+            x = x_base.detach().clone().requires_grad_(True)
+            seen_positions = []
+
+            def fake_rope(tensor, *_args, **kwargs):
+                seen_positions.append(kwargs["position_ids"])
+                return tensor
+
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(compressor, "use_fused_compressor", use_fused)
+                mp.setattr(compressor.config, "apply_rope_fusion", True)
+                with patch.object(csa_module, "fused_mla_rope_inplace", side_effect=fake_rope):
+                    with patch.object(
+                        csa_module,
+                        "maybe_compress_thd_fused",
+                        wraps=csa_module.maybe_compress_thd_fused,
+                    ) as dispatch:
+                        out, returned_cuc = compressor._forward_thd(
+                            x,
+                            cu_global,
+                            max_seqlen_q=64,
+                            compressed_group_ids=group_ids,
+                            compressed_position_ids=position_ids,
+                            pre_grouped_cu_seqlens=local_cu,
+                            pre_grouped_cu_seqlens_compressed=local_cuc,
+                        )
+                    grad_x, grad_ape = torch.autograd.grad(
+                        out, (x, compressor.ape), grad_outputs=grad_out
+                    )
+            assert returned_cuc is None
+            assert dispatch.call_count == 1
+            assert dispatch.call_args.args[3] is local_cu
+            assert dispatch.call_args.args[4] is local_cuc
+            assert seen_positions[0].data_ptr() == position_ids.data_ptr()
+            return out.detach(), grad_x.detach(), grad_ape.detach()
+
+        fused = run(True)
+        eager = run(False)
+        assert torch.allclose(
+            fused[0].index_select(0, canonical_rows).float(),
+            eager[0].index_select(0, canonical_rows).float(),
+            rtol=0,
+            atol=0.1,
+        )
+        assert torch.allclose(fused[1].float(), eager[1].float(), rtol=0, atol=0.1)
+        assert torch.allclose(fused[2], eager[2], rtol=0, atol=0.1)
