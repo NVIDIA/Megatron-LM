@@ -15,8 +15,11 @@
 """DBuffer placement definitions.
 
 DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
-types directly. ``RowAtomic`` and ``BlockAtomic`` are DBuffer-specific dim-0
-``Shard`` placements whose local storage is part of one flattened buffer.
+types directly. ``RowAtomic``, ``BlockAtomic``, and ``TensorAtomic`` are
+DBuffer-specific dim-0 ``Shard`` placements whose local storage is part of one
+flattened buffer. ``RowAtomic`` and ``BlockAtomic`` split the flattened buffer into
+equal-size per-rank shards; ``TensorAtomic`` instead assigns every logical
+tensor as a whole to one owner rank, so per-rank shards may differ in size.
 
 =============  =============  ====================
 Source         Destination    DBuffer operation
@@ -29,11 +32,12 @@ sharded        ``Replicate``  ``allgather()``
 """
 
 from collections.abc import Iterable
+from typing import TypeAlias
 
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "RowAtomic", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "RowAtomic", "TensorAtomic", "PlacementReference", "changed_mesh_axis"]
 
 
 class RowAtomic(Shard):
@@ -43,8 +47,13 @@ class RowAtomic(Shard):
         super().__init__(0)
 
     def __eq__(self, other: object) -> bool:
-        # PyTorch Shard.__eq__ compares only dim, so distinguish RowAtomic from BlockAtomic.
-        return isinstance(other, Shard) and other.dim == 0 and not isinstance(other, BlockAtomic)
+        # PyTorch Shard.__eq__ compares only dim, so distinguish RowAtomic from BlockAtomic
+        # and TensorAtomic.
+        return (
+            isinstance(other, Shard)
+            and other.dim == 0
+            and not isinstance(other, (BlockAtomic, TensorAtomic))
+        )
 
 
 class BlockAtomic(Shard):
@@ -64,6 +73,19 @@ class BlockAtomic(Shard):
         return f"BlockAtomic(block_size={self.block_size})"
 
 
+class TensorAtomic(Shard):
+    """Dim-0 shard placement that assigns each logical tensor as a whole to one rank."""
+
+    def __init__(self) -> None:
+        super().__init__(0)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TensorAtomic)
+
+    def __repr__(self) -> str:
+        return "TensorAtomic()"
+
+
 def changed_mesh_axis(
     old_placements: Iterable[Placement], new_placements: Iterable[Placement]
 ) -> int | None:
@@ -81,3 +103,6 @@ def changed_mesh_axis(
             )
         changed_axis = axis
     return changed_axis
+
+
+PlacementReference: TypeAlias = RowAtomic | BlockAtomic | TensorAtomic

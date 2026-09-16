@@ -124,6 +124,7 @@ def fully_shard(
     grad_divisor: int = 1,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
+    param_to_owner: dict[nn.Parameter, int] | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -152,6 +153,10 @@ def fully_shard(
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
+        param_to_owner: Owner rank of every parameter this call manages, required when
+            ``placements`` uses ``TensorAtomic`` and must be omitted otherwise. Parameters
+            are reordered by owner rank when parameter groups are built, so each rank's
+            tensors form one contiguous segment.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -183,6 +188,7 @@ def fully_shard(
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
+            param_to_owner=param_to_owner,
         )
     except Exception:
         module.__class__ = original_cls
