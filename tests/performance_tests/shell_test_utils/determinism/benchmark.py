@@ -29,6 +29,7 @@ MODE_ENV = (
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
     "MAMBA_DETERMINISTIC",
     "CAUSAL_CONV1D_DETERMINISTIC",
+    "TRITON_CACHE_AUTOTUNING",
 )
 DET_ENV = {
     "NCCL_ALGO": "Ring",
@@ -81,7 +82,7 @@ def read_step_times(directory: Path, warmup: int, steps: int) -> tuple[list[floa
     return [samples[index] for index in range(warmup + 1, warmup + steps + 1)], str(path)
 
 
-def ratio_summary(ratios: list[float], limit: float) -> dict:
+def ratio_summary(ratios: list[float], limit: float | None) -> dict:
     """Bootstrap paired-run ratios; ambiguous or undersampled checks stay pending."""
     if not ratios or any(not math.isfinite(value) or value <= 0 for value in ratios):
         raise ValueError("Ratios must be finite and positive")
@@ -90,6 +91,8 @@ def ratio_summary(ratios: list[float], limit: float) -> dict:
     low, high = medians[49], medians[1949]
     if len(ratios) < 3:
         status = "inconclusive"
+    elif limit is None:
+        status = "not_gated"
     elif low > limit:
         status = "fail"
     elif high <= limit:
@@ -106,7 +109,11 @@ def ratio_summary(ratios: list[float], limit: float) -> dict:
 
 
 def summarize(
-    runs: list[dict], pairs: int, has_base: bool, overhead_limit: float, regression_limit: float
+    runs: list[dict],
+    pairs: int,
+    has_base: bool,
+    overhead_limit: float | None,
+    regression_limit: float | None,
 ) -> dict:
     """Report mode overhead and base-to-head changes as separate comparisons."""
     values = {}
@@ -208,7 +215,8 @@ def markdown_report(report: dict) -> str:
     lines = [
         "# Determinism performance",
         "",
-        f"Recipe: `{report['measurement']['recipe']}`. Status: **{report['status']}**.",
+        f"Workload: `{report['measurement'].get('kernel_case') or report['measurement']['recipe']}`. "
+        f"Status: **{report['status']}**.",
         "",
         "Timings are unprofiled; each pair uses independent fresh processes.",
         "",
@@ -217,8 +225,9 @@ def markdown_report(report: dict) -> str:
     ]
     for name, result in report.get("comparisons", {}).items():
         low, high = result["bootstrap_95_percent_interval"]
+        limit = f"{result['limit']:.4f}" if result["limit"] is not None else "report only"
         lines.append(
-            f"| {name} | {result['median_ratio']:.4f} | [{low:.4f}, {high:.4f}] | {result['limit']:.4f} | {result['status']} |"
+            f"| {name} | {result['median_ratio']:.4f} | [{low:.4f}, {high:.4f}] | {limit} | {result['status']} |"
         )
     lines.extend(
         [
@@ -249,21 +258,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--recipe", choices=("dense", "moe", "hybrid"), default="dense")
     parser.add_argument("--gpus", type=int, default=8)
-    parser.add_argument("--max-overhead-ratio", type=float, default=1.35)
-    parser.add_argument("--max-regression-ratio", type=float, default=1.05)
+    parser.add_argument(
+        "--kernel-case", choices=("bias_swiglu", "weighted_swiglu", "weighted_squared_relu")
+    )
+    parser.add_argument("--phase", choices=("forward", "backward"), default="forward")
+    parser.add_argument("--tokens", type=int, default=4096)
+    parser.add_argument("--hidden-size", type=int, default=8192)
+    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--max-overhead-ratio", type=float)
+    parser.add_argument("--max-regression-ratio", type=float)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
-    if min(args.pairs, args.steps, args.gpus) < 1 or args.warmup < 0:
+    if min(args.pairs, args.steps, args.gpus, args.tokens, args.hidden_size) < 1 or args.warmup < 0:
         parser.error("pairs, steps, and gpus must be positive; warmup must be nonnegative")
+    if not args.kernel_case:
+        if args.max_overhead_ratio is None:
+            args.max_overhead_ratio = 1.35
+        if args.max_regression_ratio is None:
+            args.max_regression_ratio = 1.05
+    elif args.gpus != 1 or args.command:
+        parser.error("Kernel measurements require --gpus 1 and the built-in kernel runner")
+    elif args.warmup < 1:
+        parser.error("Kernel measurements require at least one warmup to exclude compilation")
     for value in (args.max_overhead_ratio, args.max_regression_ratio):
-        if not math.isfinite(value) or value <= 0:
+        if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error("ratio limits must be finite and positive")
     output = args.output.resolve()
     if output.exists() and any(output.iterdir()):
         parser.error("Use an empty output directory; previous attempts must be preserved")
     output.mkdir(parents=True, exist_ok=True)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command:
+    if args.kernel_case:
+        command = [sys.executable, str(Path(__file__).with_name("run_kernel.py").resolve())]
+        for option in ("kernel_case", "phase", "tokens", "hidden_size", "dtype", "warmup", "steps"):
+            command.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
+    elif not command:
         command = [sys.executable, str(Path(__file__).with_name("run_training.py").resolve())]
     checkouts = {"head": Path.cwd()}
     if args.base_checkout:
@@ -271,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     sources = {label: _source(checkout) for label, checkout in checkouts.items()}
     report = {
         "schema_version": 1,
-        "kind": "determinism_performance",
+        "kind": "determinism_kernel_performance" if args.kernel_case else "determinism_performance",
         "status": "incomplete",
         "sources": sources,
         "machine": _machine(),
@@ -281,6 +310,15 @@ def main(argv: list[str] | None = None) -> int:
         "command": command,
         "runs": [],
     }
+    if args.kernel_case:
+        report["measurement"].pop("recipe")
+        report["measurement"].update(
+            {
+                key: getattr(args, key)
+                for key in ("kernel_case", "phase", "tokens", "hidden_size", "dtype")
+            }
+        )
+        report["measurement"]["timing"] = "cuda_event_ms"
     _write(report, output)
     try:
         for pair in range(args.pairs):
@@ -307,7 +345,15 @@ def main(argv: list[str] | None = None) -> int:
                     "log_directory": str(run_dir),
                     "environment": {
                         key: environment.get(key)
-                        for key in (*MODE_ENV, "CUDA_DEVICE_MAX_CONNECTIONS", "NCCL_PROTO")
+                        for key in sorted(
+                            set(MODE_ENV)
+                            | {"CUDA_DEVICE_MAX_CONNECTIONS", "NCCL_PROTO", "TRITON_CACHE_DIR"}
+                            | {
+                                key
+                                for key in environment
+                                if key.startswith("TRITON_AUTOTUNE_BLOCK_")
+                            }
+                        )
                     },
                 }
                 report["runs"].append(run)
@@ -322,15 +368,21 @@ def main(argv: list[str] | None = None) -> int:
                         stderr=subprocess.STDOUT,
                         check=True,
                     )
-                samples, log_path = read_step_times(run_dir, args.warmup, args.steps)
+                if args.kernel_case:
+                    from run_kernel import read_result
+
+                    result = read_result(run_dir / "kernel.json", report["measurement"], mode)
+                    samples = result["samples_ms"]
+                    log_path = str(run_dir / "kernel.json")
+                    run["kernel"] = result
+                else:
+                    samples, log_path = read_step_times(run_dir, args.warmup, args.steps)
                 if _source(checkouts[label]) != sources[label]:
                     raise ValueError(f"Source changed during benchmark: {label}")
                 run.update(
-                    status="complete",
-                    step_times_ms=samples,
-                    median_ms=statistics.median(samples),
-                    timing_log=log_path,
+                    status="complete", median_ms=statistics.median(samples), timing_log=log_path
                 )
+                run["samples_ms" if args.kernel_case else "step_times_ms"] = samples
                 _write(report, output)
         report["comparisons"] = summarize(
             report["runs"],
@@ -342,10 +394,12 @@ def main(argv: list[str] | None = None) -> int:
         gated = [
             result["status"]
             for name, result in report["comparisons"].items()
-            if name != "base_overhead"
+            if name != "base_overhead" and result["status"] != "not_gated"
         ]
         report["status"] = (
-            "fail" if "fail" in gated else "inconclusive" if "inconclusive" in gated else "pass"
+            "fail"
+            if "fail" in gated
+            else "inconclusive" if "inconclusive" in gated else "pass" if gated else "reported"
         )
         if any(source["dirty"] for source in sources.values()) or report["machine"]["gpus"] is None:
             report["status"] = "inconclusive"
@@ -355,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         _write(report, output)
     print(markdown_report(report))
-    return {"pass": 0, "fail": 1, "error": 1, "inconclusive": 2}[report["status"]]
+    return {"pass": 0, "reported": 0, "fail": 1, "error": 1, "inconclusive": 2}[report["status"]]
 
 
 if __name__ == "__main__":

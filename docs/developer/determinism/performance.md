@@ -16,6 +16,10 @@ The default is three deterministic/default pairs, each with 20 warmup steps and
 reduce order bias. Both arms use identical model dimensions, input seed,
 parallelism, and Python dependencies. Determinism-owned environment variables
 are explicitly reset before launch, including in the default arm.
+`TRITON_CACHE_AUTOTUNING` is unset in both arms: deterministic SSM uses its
+pinned-config fallback. An inherited cache directory or explicit
+`TRITON_AUTOTUNE_BLOCK_*` overrides are retained equally and recorded. Cached
+SSM autotuning is a separate policy that needs its own controlled benchmark.
 
 The report uses the median iteration time of each run, then ratios within each
 pair. A paired bootstrap interval describes run-to-run uncertainty. Fewer than
@@ -75,6 +79,54 @@ The H100 dense recipe remains in L1. Broader MoE/hybrid and GB200 rows are
 scheduled at nightly cadence within L1, which the current workflow selects.
 Labels that bypass cadence also select those rows. The GPU presets and initial
 budgets require runtime validation before treating their reports as baselines.
+
+## Kernel leaderboard pilot
+
+The operator pilot covers `bias_swiglu`, `weighted_swiglu`, and
+`weighted_squared_relu` from the production fusion modules. It produces six
+rows: separate forward and backward measurements for each case. The initial
+shape is 4096 tokens, hidden size 8192, BF16 activations and FP32 token weights.
+This small selection is not a leaderboard of every registered kernel.
+
+```bash
+uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/kernel_leaderboard.py \
+  --output /tmp/kernel-leaderboard
+```
+
+The H100 and GB200 `determinism-kernel-perf.yaml` recipes select this pilot at
+nightly cadence in L1 (and when labels bypass cadence). They use one GPU per
+measurement and upload `leaderboard.json`, `leaderboard.md`, full per-case
+reports, raw samples and logs through the existing assets directory. A cadence
+selects eligible jobs; a scheduled or explicit workflow trigger must still run.
+
+Each arm starts a fresh process with the requested policy before operator imports.
+CUDA events time all GPU work in the operator call. Compilation and warmup are
+excluded; backward also excludes forward/graph construction and upstream-gradient
+allocation. `autograd.grad` avoids accumulating leaf gradients. The interval can
+include launch gaps; it is operator latency, not a sum of individual device-kernel
+durations. The report records input shapes/strides/dtypes, CUDA/driver/GPU/package
+versions, source revisions and the uninitialized-memory-fill setting.
+
+Kernel comparisons default to **report only** (`reported`, exit 0), with no
+performance pass claim. Missing/invalid timings fail; insufficient pairs, dirty
+source or missing GPU provenance are inconclusive. A failing row stays visible
+while later rows still run. A new run needs a fresh output directory.
+
+After calibrating a specific case, phase, dtype, shape and GPU, an explicit budget
+can gate that row. Base/head runs use the same driver and allocation:
+
+```bash
+uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/benchmark.py \
+  --output /tmp/swiglu-backward --kernel-case weighted_swiglu --phase backward --gpus 1 \
+  --base-checkout /path/to/base-checkout \
+  --max-overhead-ratio <calibrated-ratio> --max-regression-ratio <calibrated-ratio>
+```
+
+`--tokens`, `--hidden-size`, and `--dtype` select another case configuration.
+Keep H100 and GB200 baselines separate. Pair timing results with scoped replay
+and independent-reference correctness evidence; a fast kernel can still be wrong.
+Publishing historical baselines and enforcing changed-kernel budgets remain
+follow-up work after GPU calibration.
 
 CPU tests:
 
