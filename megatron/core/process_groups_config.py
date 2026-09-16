@@ -57,6 +57,7 @@ class ProcessGroupCollection:
             identical to expt_dp when EGTP_remat_size=1
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
+        inter_expt_dp: Inter partial expert data parallel group
         inter_dist_opt: Inter distributed optimizer instance group
 
     Example:
@@ -162,6 +163,9 @@ class ProcessGroupCollection:
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    inter_expt_dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
@@ -283,6 +287,10 @@ class ProcessGroupCollection:
                 check_initialized=False,
                 with_gtp_remat=False,
                 partial_expert_data_parallel=True,
+            ),
+            'inter_expt_dp': partial(
+                parallel_state.get_expert_inter_distributed_optimizer_instance_group,
+                check_initialized=False,
             ),
             'inter_dist_opt': partial(
                 parallel_state.get_inter_distributed_optimizer_instance_group,
