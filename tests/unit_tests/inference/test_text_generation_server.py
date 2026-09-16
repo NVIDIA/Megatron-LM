@@ -1,6 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
+import multiprocessing as mp
+import os
+from multiprocessing.connection import Connection
 from types import SimpleNamespace
 
 import pytest
@@ -54,10 +57,14 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
         served.append((app, config))
 
     closed_sockets = []
+    listened = []
 
     class FakeListener:
         def fileno(self):
             return 19
+
+        def listen(self, backlog):
+            listened.append(backlog)
 
         def close(self):
             closed_sockets.append(self)
@@ -80,6 +87,7 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
         text_generation_server, "_bind_reuseport_socket", lambda _port, _host: FakeListener()
     )
 
+    ready_reader, ready_writer = mp.Pipe(duplex=False)
     await text_generation_server._run_text_gen_server(
         "coordinator:1234",
         tokenizer=object(),
@@ -87,8 +95,11 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
         server_port=8080,
         hostname="127.0.0.1",
         multimodal_prompt_config=supplied_config,
+        ready_conn=ready_writer,
     )
 
+    # Readiness is signalled only once the listener is bound and listening.
+    assert listened == [2**14] and ready_reader.poll() and ready_reader.recv() is True
     assert len(apps) == len(clients) == len(served) == 1
     app = apps[0]
     assert app.config["multimodal_prompt_config"] == (
@@ -123,10 +134,11 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
             self.args = args
             self.daemon = daemon
             self.pid = 123
+            self.sentinel = os.pipe()[0]  # never readable: the fake replica stays alive
             processes.append(self)
 
         def start(self):
-            pass
+            self.args[-1].send(True)  # the replica signals once it listens
 
     prompt_config = MultimodalPromptConfig(video_spec=MediaPromptSpec(model_token="<video>"))
     monkeypatch.setattr(text_generation_server, "_SERVER_PROCESSES", [])
@@ -152,7 +164,40 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
         *processes[0].args
     )
     assert worker_call.arguments["multimodal_prompt_config"] is prompt_config
+    ready_conn = worker_call.arguments["ready_conn"]
+    assert isinstance(ready_conn, Connection) and ready_conn.closed
     assert processes[0].daemon is True
+
+
+def test_start_server_fails_loudly_when_a_replica_exits_before_listening(monkeypatch):
+    """A replica that dies before binding must not leave a URL nobody answers on nor
+    the already-running guard set: the group is torn down and the caller gets an error."""
+
+    class FakeProcess:
+        def __init__(self, *, target, args, daemon):
+            self.pid = 321
+            read_end, write_end = os.pipe()
+            os.close(write_end)  # EOF on the sentinel reads as "process exited"
+            self.sentinel = read_end
+
+        def start(self):
+            pass  # exits without ever signalling
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(text_generation_server, "_SERVER_PROCESSES", [])
+    monkeypatch.setattr(text_generation_server.mp, "Process", FakeProcess)
+
+    with pytest.raises(RuntimeError, match="exited before listening"):
+        text_generation_server.start_text_gen_server(
+            "coordinator:1234", tokenizer=object(), rank=0, server_port=8080, num_replicas=2
+        )
+
+    assert text_generation_server._SERVER_PROCESSES == []
 
 
 def test_start_server_rejects_socket_without_real_port(monkeypatch):
