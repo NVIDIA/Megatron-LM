@@ -15,7 +15,6 @@ from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layo
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
@@ -279,28 +278,42 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
     prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
 
-    # Start send and recv ops
+    # Keep each boundary exchange on its CP communicator. Using the default WORLD
+    # communicator couples otherwise independent DP lanes and can deadlock when
+    # packed batches issue different P2P sequences.
     ops = []
     if local_rank != 0:
-        req_send_first_part = torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank)
-        ops.append(req_send_first_part)
-        req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
-        ops.append(req_recv_second_part)
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
+            )
+        )
     else:
         # Inserted elements are set to be 0.0.
         tensor_recv_list[1] = 0
     if local_rank != len(global_ranks) - 1:
-        req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
-        ops.append(req_recv_first_part)
-        req_send_second_part = torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank)
-        ops.append(req_send_second_part)
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
+            )
+        )
     else:
         # For the last CP rank, the removed elements of second part go into the first part
         tensor_recv_list[0] = tensor_send_list[1]
 
     # Wait for all communication operations to complete
-    for op in ops:
-        op.wait()
+    for request in torch.distributed.batch_isend_irecv(ops):
+        request.wait()
 
     # Splicing: Replace boundary elements with received elements from adjacent ranks
     # This ensures proper sequence continuity across CP boundaries
@@ -399,19 +412,35 @@ def _roll_tensor_packed_seq(
 
         ops = []
         if local_rank != 0:
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
+                )
+            )
         else:
             tensor_recv_list[1].zero_()
 
         if local_rank != cp_size - 1:
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
+                )
+            )
         else:
             tensor_recv_list[0].copy_(tensor_send_list[1])
 
-        for op in ops:
-            op.wait()
+        for request in torch.distributed.batch_isend_irecv(ops):
+            request.wait()
 
         index = [slice(None)] * rolled_chunks[0].dim()
         index[dims] = shifts
@@ -1431,8 +1460,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
             return get_fp8_context(self.config)
-        if self.config.fp4:
-            return get_fp4_context(self.config)
+
+        # FP4 in MTP layers still needs numerical validation.
         return nullcontext()
 
     def _get_embeddings(
@@ -1618,27 +1647,23 @@ class MultiTokenPredictionLayer(MegatronModule):
             rng_context = nullcontext()
 
         # Unlike transformer_block.py which needs to support mixed-precision in
-        # different layers, currently MTP only uses a global quantization context.
-        # FP8 and FP4 are mutually exclusive.
+        # different layers,currently MTP only use global fp8 context.
         if self.config.fp8:
-            quantization_context = get_fp8_context(self.config)
-            transformer_layer_quantization_context = get_fp8_context(self.config)
-        elif self.config.fp4:
-            quantization_context = get_fp4_context(self.config)
-            transformer_layer_quantization_context = get_fp4_context(self.config)
+            fp8_context = get_fp8_context(self.config)
+            transformer_layer_fp8_context = get_fp8_context(self.config)
         else:
-            quantization_context = nullcontext()
-            transformer_layer_quantization_context = nullcontext()
+            fp8_context = nullcontext()
+            transformer_layer_fp8_context = nullcontext()
 
+        # TODO: currently ignoring FP4 in MTP layers because we need more numerical validation
         with rng_context:
-            with quantization_context:
+            with fp8_context:
                 hidden_states = self._concat_embeddings(hidden_states, decoder_input)
 
-            # Use a separate quantization context for the transformer layer. This is to ensure
-            # that when the transformer layer is cudagraphed, the
-            # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
-            # can be triggered correctly.
-            with transformer_layer_quantization_context:
+            # Use a separate fp8 context for the transformer layer. This is to ensure that when the
+            # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is
+            # True so that the fp8 weight caching can be triggered correctly.
+            with transformer_layer_fp8_context:
                 if self.mtp_layer_pattern is not None:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
@@ -2283,13 +2308,8 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_legacy(layer_spec, layer_number):
             """Build layer using legacy spec-based approach."""
-            if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, is_init=True)
-            elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, is_init=True)
-            else:
-                quant_init_context = nullcontext()
-            with quant_init_context:
+            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            with fp8_init_context:
                 module = build_module(
                     layer_spec,
                     config=self.config,
@@ -2297,9 +2317,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
-                    name=(
-                        self.name + f".layers.{layer_number - 1}" if self.name is not None else None
-                    ),
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
@@ -2307,13 +2325,8 @@ class MultiTokenPredictionBlock(MegatronModule):
             layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
         ):
             """Build layer using pattern-based approach (new Mamba path)."""
-            if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, is_init=True)
-            elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, is_init=True)
-            else:
-                quant_init_context = nullcontext()
-            with quant_init_context:
+            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            with fp8_init_context:
                 module = build_module(
                     layer_spec,
                     config=self.config,
@@ -2322,9 +2335,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
-                    name=(
-                        self.name + f".layers.{layer_number - 1}" if self.name is not None else None
-                    ),
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 

@@ -33,6 +33,10 @@ permissions:
   contents: read
 
 jobs:
+  # The DCO App also runs against `gh-readonly-queue/**` commits, where it re-reports the
+  # pull-request verdict it already reported on the PR head. Mirroring that verdict here
+  # would overwrite the always-green gate published by `dco-gate-merge-group.yml` and evict
+  # the entry from the merge queue, so merge-queue refs are left to that workflow.
   mirror-dco:
     name: Mirror trusted DCO result
     if: |
@@ -42,6 +46,7 @@ jobs:
         || (
           github.event.check_run.name == 'DCO'
           && github.event.check_run.app.slug == 'dco'
+          && !startsWith(github.event.check_run.check_suite.head_branch, 'gh-readonly-queue/')
         )
       )
     runs-on: ubuntu-latest

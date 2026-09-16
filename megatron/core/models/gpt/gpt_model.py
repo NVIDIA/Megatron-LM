@@ -181,6 +181,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
@@ -240,7 +241,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
-            name="decoder",
         )
         if hasattr(self, 'cudagraph_manager') and hasattr(self.decoder, 'cudagraph_manager'):
             del self.decoder.cudagraph_manager
@@ -251,7 +251,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 spec=self.mtp_block_spec,
                 vp_stage=vp_stage,
                 pg_collection=self.pg_collection,
-                name="mtp",
             )
 
             self._setup_mtp_cuda_graphs()
@@ -296,6 +295,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
                 output_dtype=self.logit_dtype,
             )
 

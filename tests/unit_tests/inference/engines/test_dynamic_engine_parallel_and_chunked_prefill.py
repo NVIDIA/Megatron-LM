@@ -430,9 +430,8 @@ class TestChunkedPrefillCudaGraphs:
                     mamba_idx = engine.context.mamba_metadata.request_to_mamba_state_idx[0].item()
                     assert mamba_idx >= 0, "request 0 has no mamba slot after its first step"
                 conv_snapshots.append(engine.context.mamba_conv_states[:, mamba_idx].clone())
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
 
         return finished, step_count
 

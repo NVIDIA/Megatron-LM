@@ -59,6 +59,10 @@ class GatedDeltaNet2(_GDNBase):
 
     def _setup_variant_attrs(self):
         """Set the GDN2 in_proj sizing, split tables, gate parameter dims, and kernel."""
+        assert (
+            chunk_gdn2 is not None or self.config.deterministic_mode
+        ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
+
         # f (decay pre-activation), b (erase gate), w (write gate), on top of the
         # q/k/v/z sections the base class already accounts for.
         # TODO: for now, output gate is forced for GDN2.
@@ -91,23 +95,10 @@ class GatedDeltaNet2(_GDNBase):
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
 
-        backend = self.config.gdn_kernel_backend
-        if self.config.deterministic_mode and backend != "torch":
-            raise ValueError(
-                "deterministic_mode=True requires gdn_kernel_backend='torch' for GDN2."
-            )
-        if backend == "transformer_engine":
-            raise ValueError("GDN2 does not support gdn_kernel_backend='transformer_engine'.")
-        if backend == "torch":
-            self.gdn_backend = "torch"
+        if self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gdn2
-            return
-
-        assert (
-            chunk_gdn2 is not None
-        ), "GDN2 requires flash-linear-attention >= 0.5.1 with the fla.ops.gdn2 kernel."
-        self.gdn_backend = "fla"
-        self.gated_delta_rule = chunk_gdn2
+        else:
+            self.gated_delta_rule = chunk_gdn2
 
     def _reset_dt_bias(self):
         """Softplus-inverse init of dt_bias.
@@ -155,7 +146,7 @@ class GatedDeltaNet2(_GDNBase):
 
         return g, {"b": b.contiguous(), "w": w.contiguous()}
 
-    def forward(
+    def forward_pre_attn_and_core_attn(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -164,14 +155,18 @@ class GatedDeltaNet2(_GDNBase):
         sequence_len_offset: int | None = None,
         *,
         inference_params: BaseInferenceContext | None = None,
+        packed_sequence_cp_metadata=None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """
-        Perform a forward pass through the GDN2 module.
+        Run GDN2 through its normalized recurrence output, before output projection.
 
         Return:
-            (tuple[torch.Tensor, torch.Tensor]) GDN2 output and bias.
+            torch.Tensor: Normalized recurrence output.
         """
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "GDN2 does not support packed-sequence chunkwise CP metadata."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -331,15 +326,7 @@ class GatedDeltaNet2(_GDNBase):
                 core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
             )
 
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
+        return norm_out
 
 
 ####################
