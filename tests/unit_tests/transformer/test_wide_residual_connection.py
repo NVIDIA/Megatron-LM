@@ -12,12 +12,14 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.residual_connection import ResidualConnection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_layer import (
     LearnedWideResidualRetention,
+    StreamwiseSigmoidMap,
     StreamwiseSigmoidResidualReadout,
     StreamwiseSigmoidWideResidualConnection,
     WideResidualTransformerLayer,
@@ -27,7 +29,11 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def _wide_config(
-    *, init_scale: float = 0.0, learned_retention: bool = False, **config_overrides
+    *,
+    num_streams: int = 3,
+    init_scale: float = 0.0,
+    learned_retention: bool = False,
+    **config_overrides,
 ) -> TransformerConfig:
     values = dict(
         num_layers=1,
@@ -37,7 +43,7 @@ def _wide_config(
         bias_dropout_fusion=False,
         use_cpu_initialization=True,
         wide_residual=WideResidualConfig(
-            num_streams=3,
+            num_streams=num_streams,
             streamwise_sigmoid_init_scale=init_scale,
             learned_retention=learned_retention,
             retention_init=0.999,
@@ -121,6 +127,135 @@ class _ResidualReturningNorm(nn.Module):
         return hidden_states, hidden_states
 
 
+class _ProtocolResidualConnection(ResidualConnection):
+    """Minimal configurable connection for exercising the abstract runtime contract."""
+
+    def __init__(
+        self,
+        *,
+        residual_stream_hidden_size=12,
+        branch_hidden_size=4,
+        read_behavior="valid",
+        write_behavior="valid",
+    ):
+        super().__init__(residual_stream_hidden_size, branch_hidden_size)
+        self.read_behavior = read_behavior
+        self.write_behavior = write_behavior
+
+    def _read(self, hidden_states):
+        if self.read_behavior == "non_tensor":
+            return object(), ()
+        if self.read_behavior == "wrong_leading_shape":
+            return torch.empty(3, self.branch_hidden_size), ()
+        if self.read_behavior == "wrong_hidden_size":
+            return torch.empty(*hidden_states.shape[:-1], self.branch_hidden_size + 1), ()
+        if self.read_behavior == "non_tuple_state":
+            return hidden_states[..., : self.branch_hidden_size], []
+        if self.read_behavior == "non_tensor_state":
+            return hidden_states[..., : self.branch_hidden_size], (object(),)
+        return hidden_states[..., : self.branch_hidden_size], ()
+
+    def _write(self, branch_output, state, *, dropout_probability, training):
+        del branch_output, dropout_probability, training
+        if self.write_behavior == "non_tensor":
+            return object()
+        if self.write_behavior == "wrong_shape":
+            return state[0][..., :-1]
+        return state[0]
+
+
+class TestResidualConnectionContract:
+    @pytest.mark.parametrize(
+        ("residual_stream_hidden_size", "branch_hidden_size"), [(0, 4), (12, 0)]
+    )
+    def test_constructor_requires_positive_hidden_sizes(
+        self, residual_stream_hidden_size, branch_hidden_size
+    ):
+        with pytest.raises(ValueError, match="hidden size must be positive"):
+            _ProtocolResidualConnection(
+                residual_stream_hidden_size=residual_stream_hidden_size,
+                branch_hidden_size=branch_hidden_size,
+            )
+
+    def test_forward_rejects_operation_argument_mismatches(self):
+        connection = _ProtocolResidualConnection()
+        residual = torch.randn(2, 12)
+        branch = torch.randn(2, 4)
+
+        with pytest.raises(TypeError, match="read expects a tensor"):
+            connection((residual, None), operation="read")
+        with pytest.raises(TypeError, match="write-only arguments"):
+            connection(residual, operation="read", state=())
+        with pytest.raises(TypeError, match="read-only arguments"):
+            connection(
+                branch,
+                operation="write",
+                state=(residual,),
+                fp32_residual_connection=True,
+                dropout_probability=0.0,
+                training=False,
+            )
+        with pytest.raises(TypeError, match="requires connection state"):
+            connection(branch, operation="write", dropout_probability=0.0, training=False)
+        with pytest.raises(TypeError, match="requires dropout_probability and training"):
+            connection(branch, operation="write", state=(residual,))
+        with pytest.raises(ValueError, match="Unsupported residual connection operation"):
+            connection(residual, operation="invalid")
+
+    @pytest.mark.parametrize(
+        ("read_behavior", "expected_exception", "expected_error"),
+        [
+            ("non_tensor", TypeError, "expected a tensor"),
+            ("wrong_leading_shape", ValueError, "changed non-hidden dimensions"),
+            ("wrong_hidden_size", ValueError, "expected branch hidden size"),
+            ("non_tuple_state", TypeError, "possibly empty tuple of tensors"),
+            ("non_tensor_state", TypeError, "contain only tensors"),
+        ],
+    )
+    def test_read_validates_implementation_outputs(
+        self, read_behavior, expected_exception, expected_error
+    ):
+        connection = _ProtocolResidualConnection(read_behavior=read_behavior)
+
+        with pytest.raises(expected_exception, match=expected_error):
+            connection(torch.randn(2, 12), operation="read")
+
+    def test_read_validates_input_width(self):
+        with pytest.raises(ValueError, match="expected residual-stream hidden size"):
+            _ProtocolResidualConnection()(torch.randn(2, 11), operation="read")
+
+    def test_write_validates_state_branch_output_and_implementation_output(self):
+        connection = _ProtocolResidualConnection()
+        residual = torch.randn(2, 12)
+        branch = torch.randn(2, 4)
+        write_kwargs = dict(
+            operation="write", state=(residual,), dropout_probability=0.0, training=False
+        )
+
+        with pytest.raises(TypeError, match="non-empty tuple of tensors"):
+            connection(branch, **{**write_kwargs, "state": ()})
+        with pytest.raises(TypeError, match="contain only tensors"):
+            connection(branch, **{**write_kwargs, "state": (object(),)})
+        with pytest.raises(TypeError, match="tensor or an .* tensor tuple"):
+            connection((branch,), **write_kwargs)
+        with pytest.raises(TypeError, match="tensor and an optional tensor"):
+            connection((object(), None), **write_kwargs)
+        with pytest.raises(ValueError, match="incompatible non-hidden dimensions"):
+            connection(torch.randn(3, 4), **write_kwargs)
+        with pytest.raises(ValueError, match="expected branch output hidden size"):
+            connection(torch.randn(2, 5), **write_kwargs)
+
+        for write_behavior, expected_error in (
+            ("non_tensor", "expected a tensor"),
+            ("wrong_shape", "changed the residual-stream shape"),
+        ):
+            invalid_connection = _ProtocolResidualConnection(write_behavior=write_behavior)
+            with pytest.raises(
+                TypeError if write_behavior == "non_tensor" else ValueError, match=expected_error
+            ):
+                invalid_connection(branch, **write_kwargs)
+
+
 @pytest.mark.parametrize("num_streams", [True, 1, 0, -1])
 def test_wide_residual_config_rejects_invalid_num_streams(num_streams):
     error = TypeError if isinstance(num_streams, bool) else ValueError
@@ -139,6 +274,11 @@ def test_wide_residual_config_validates_bounded_retention(retention_init, max_fo
             retention_init=retention_init,
             retention_max_forget=max_forget,
         )
+
+
+def test_wide_residual_config_rejects_negative_map_init_scale():
+    with pytest.raises(ValueError, match="streamwise_sigmoid_init_scale"):
+        WideResidualConfig(num_streams=3, streamwise_sigmoid_init_scale=-0.01)
 
 
 @pytest.mark.parametrize(
@@ -162,6 +302,54 @@ def test_transformer_config_rejects_unsupported_wide_residual_modes(override, ex
 
 
 class TestStreamwiseSigmoidWideResidualConnection:
+    def test_maps_materialize_expected_initial_factors(self):
+        config = _wide_config(num_streams=3, init_scale=0.2)
+        read_map = StreamwiseSigmoidMap(config, map_kind="read")
+        write_map = StreamwiseSigmoidMap(config, map_kind="write")
+
+        assert read_map(return_logits=True) is read_map.logit
+        assert write_map(return_logits=True) is write_map.logit
+        assert torch.allclose(read_map(), torch.full((3,), 1.0 / 3.0))
+        assert torch.allclose(write_map().mean(), torch.tensor(1.0))
+
+    def test_controller_at_minimum_shard_size_is_not_padded_again(self):
+        read_map = StreamwiseSigmoidMap(_wide_config(num_streams=128), map_kind="read")
+
+        assert read_map.logit.numel() == 128
+
+    def test_component_constructors_validate_wide_configuration(self):
+        base_config = TransformerConfig(
+            num_layers=1, hidden_size=8, num_attention_heads=2, use_cpu_initialization=True
+        )
+
+        with pytest.raises(ValueError, match="StreamwiseSigmoidMap requires"):
+            StreamwiseSigmoidMap(base_config, map_kind="read")
+        with pytest.raises(ValueError, match="LearnedWideResidualRetention requires"):
+            LearnedWideResidualRetention(
+                base_config, layer_number=1, branch_name="test", num_streams=3
+            )
+        with pytest.raises(ValueError, match="StreamwiseSigmoidWideResidualConnection requires"):
+            StreamwiseSigmoidWideResidualConnection(
+                config=base_config,
+                layer_number=1,
+                branch_name="test",
+                pg_collection=_process_groups(),
+            )
+        with pytest.raises(ValueError, match="StreamwiseSigmoidResidualReadout requires"):
+            StreamwiseSigmoidResidualReadout(base_config)
+
+    def test_components_validate_controller_and_activation_shapes(self):
+        config = _wide_config()
+
+        with pytest.raises(ValueError, match="Unsupported streamwise sigmoid map kind"):
+            StreamwiseSigmoidMap(config, map_kind="unsupported")
+        with pytest.raises(ValueError, match="one controller per full-width stream"):
+            LearnedWideResidualRetention(config, layer_number=1, branch_name="test", num_streams=2)
+        with pytest.raises(ValueError, match="expected hidden size"):
+            StreamwiseSigmoidResidualReadout(config)(torch.randn(2, 8))
+        with pytest.raises(ValueError, match="greater than one"):
+            expand_wide_residual_stream(torch.randn(2, 8), 1)
+
     def test_initial_read_write_and_readout_preserve_base_stream(self):
         config = _wide_config(init_scale=0.0)
         connection = StreamwiseSigmoidWideResidualConnection(

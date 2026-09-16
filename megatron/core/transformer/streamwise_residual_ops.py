@@ -139,8 +139,11 @@ def _can_use_streamwise_triton(
 
 if HAVE_STREAMWISE_TRITON:
 
+    # Coverage.py cannot trace Triton device bodies after they are JIT-compiled. Their
+    # forward, backward, and determinism behavior is exercised by dedicated CUDA tests.
+
     @triton.jit
-    def _streamwise_read_fwd_kernel(
+    def _streamwise_read_fwd_kernel(  # pragma: no cover
         X,  # noqa: ANN001
         READ_LOGITS,  # noqa: ANN001
         OUT,  # noqa: ANN001
@@ -175,7 +178,7 @@ if HAVE_STREAMWISE_TRITON:
         )
 
     @triton.jit
-    def _streamwise_read_bwd_kernel(
+    def _streamwise_read_bwd_kernel(  # pragma: no cover
         X,  # noqa: ANN001
         GRAD_OUT,  # noqa: ANN001
         READ_LOGITS,  # noqa: ANN001
@@ -220,7 +223,7 @@ if HAVE_STREAMWISE_TRITON:
             tl.store(GRAD_LOGIT_PARTIALS + stream * NUM_PARTIALS + partial_index, partial)
 
     @triton.jit
-    def _streamwise_write_fwd_kernel(
+    def _streamwise_write_fwd_kernel(  # pragma: no cover
         RESIDUAL,  # noqa: ANN001
         UPDATE,  # noqa: ANN001
         WRITE_LOGITS,  # noqa: ANN001
@@ -267,7 +270,7 @@ if HAVE_STREAMWISE_TRITON:
             tl.store(OUT + offset, output, mask=mask)
 
     @triton.jit
-    def _streamwise_write_bwd_kernel(
+    def _streamwise_write_bwd_kernel(  # pragma: no cover
         RESIDUAL,  # noqa: ANN001
         UPDATE,  # noqa: ANN001
         GRAD_OUT,  # noqa: ANN001
@@ -340,7 +343,7 @@ if HAVE_STREAMWISE_TRITON:
         )
 
     @triton.jit
-    def _reduce_streamwise_partials_kernel(
+    def _reduce_streamwise_partials_kernel(  # pragma: no cover
         PARTIALS,  # noqa: ANN001
         SECOND_PARTIALS,  # noqa: ANN001
         GRAD_LOGITS,  # noqa: ANN001

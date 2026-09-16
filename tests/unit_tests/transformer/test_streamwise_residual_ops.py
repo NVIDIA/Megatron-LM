@@ -116,11 +116,24 @@ def test_native_streamwise_autograd_gradcheck():
 
 
 def test_native_streamwise_rejects_incompatible_shapes():
+    with pytest.raises(ValueError, match="non-empty one-dimensional"):
+        streamwise_read(torch.randn(2, 12), torch.empty(0))
+
     with pytest.raises(ValueError, match="not divisible"):
         streamwise_read(torch.randn(2, 10), torch.randn(3))
 
     with pytest.raises(ValueError, match="branch_update"):
         streamwise_writeback(torch.randn(2, 12), torch.randn(2, 5), torch.randn(3))
+
+    with pytest.raises(ValueError, match="same device"):
+        streamwise_writeback(torch.randn(2, 12), torch.empty(2, 4, device="meta"), torch.randn(3))
+
+    with pytest.raises(ValueError, match="same dtype"):
+        streamwise_writeback(
+            torch.randn(2, 12, dtype=torch.float32),
+            torch.randn(2, 4, dtype=torch.float64),
+            torch.randn(3),
+        )
 
     with pytest.raises(ValueError, match="same number of streams"):
         streamwise_writeback(
@@ -186,10 +199,35 @@ def test_raw_logit_api_validates_padded_controllers():
     residual = torch.randn(2, 12)
     update = torch.randn(2, 4)
 
+    with pytest.raises(ValueError, match="num_streams must be positive"):
+        streamwise_sigmoid_read(residual, torch.randn(128), 0)
     with pytest.raises(ValueError, match="at least 3"):
         streamwise_sigmoid_read(residual, torch.randn(2), 3)
+    with pytest.raises(TypeError, match="floating-point dtype"):
+        streamwise_sigmoid_read(residual, torch.ones(128, dtype=torch.int64), 3)
+    with pytest.raises(ValueError, match="non-empty hidden dimension"):
+        streamwise_sigmoid_read(torch.empty(2, 0), torch.randn(128), 3)
+    with pytest.raises(ValueError, match="not divisible"):
+        streamwise_sigmoid_read(torch.randn(2, 10), torch.randn(128), 3)
     with pytest.raises(ValueError, match="same device"):
         streamwise_sigmoid_read(residual, torch.empty(128, device="meta"), 3)
+    with pytest.raises(ValueError, match="branch_update"):
+        streamwise_sigmoid_writeback(residual, torch.randn(2, 5), torch.randn(128), 3)
+    with pytest.raises(ValueError, match="same device"):
+        streamwise_sigmoid_writeback(
+            residual, torch.empty(2, 4, device="meta"), torch.randn(128), 3
+        )
+    with pytest.raises(ValueError, match="same dtype"):
+        streamwise_sigmoid_writeback(residual, update.double(), torch.randn(128), 3)
+    with pytest.raises(ValueError, match="retention_logits and residual_stream"):
+        streamwise_sigmoid_writeback(
+            residual,
+            update,
+            torch.randn(128),
+            3,
+            retention_logits=torch.empty(128, device="meta"),
+            retention_max_forget=0.1,
+        )
     with pytest.raises(ValueError, match="retention_max_forget"):
         streamwise_sigmoid_writeback(
             residual,
