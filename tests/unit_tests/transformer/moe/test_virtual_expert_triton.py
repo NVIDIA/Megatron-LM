@@ -19,7 +19,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.transformer.moe.virtual_expert_load_balancer import plan_virtual_expert_routes
+from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+    VirtualExpertLoadBalancer,
+    plan_virtual_expert_routes,
+)
 from megatron.core.transformer.moe.virtual_expert_triton import (
     VirtualExpertPlannerWorkspace,
     _transport_tile,
@@ -403,6 +406,67 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
 # --------------------------------------------------------------------------------------
 
 
+@requires_four_ranks
+def test_virtual_expert_planner_overlap_graph_replay(monkeypatch):
+    """Capture the real planner stream handoff and replay it with changing route inputs."""
+    Utils.initialize_distributed()
+    group = dist.group.WORLD
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, tokens, topk = 32, 257, 3
+    workspace = VirtualExpertPlannerWorkspace(num_experts=experts, device=device, group=group)
+    manager = VirtualExpertLoadBalancer.__new__(VirtualExpertLoadBalancer)
+    manager.device = device
+    manager.planner = workspace
+    manager.planner_stream = torch.cuda.Stream(device=device)
+    manager.planner_done = torch.cuda.Event()
+    consumer = torch.cuda.Stream(device=device)
+    routes = torch.zeros((tokens, topk), device=device, dtype=torch.int32)
+    seen_routes = torch.empty_like(routes, dtype=torch.int16)
+    seen_table = torch.empty((world, experts // world), device=device, dtype=torch.int32)
+    hidden = torch.zeros(1, device=device)
+
+    def consume_table(direction):
+        # Stand in for weight transport while exercising its independent stream dependency.
+        consumer.wait_event(manager._plan.ready)
+        manager._plan.experts_to_copy.record_stream(consumer)
+        with torch.cuda.stream(consumer):
+            seen_table.copy_(manager._plan.experts_to_copy)
+
+    monkeypatch.setattr(manager, "_start_weight_push", consume_table)
+
+    def run():
+        manager.plan_dispatch(routes)
+        _, planned = manager.prepare_virtual_expert_dispatch(hidden)
+        seen_routes.copy_(planned)
+        torch.cuda.current_stream().wait_stream(consumer)
+
+    try:
+        run()
+        torch.cuda.synchronize(device)
+        dist.barrier(group=group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        torch.cuda.synchronize(device)
+        for iteration in range(3):
+            indices = torch.arange(tokens * topk, device=device).view(tokens, topk)
+            routes.copy_((indices + rank * 5 + iteration * 3) % (experts >> iteration))
+            gathered = [torch.empty_like(routes) for _ in range(world)]
+            dist.all_gather(gathered, routes, group=group)
+            _, _, expected_table, expected_routes = _reference_plan(
+                torch.stack(gathered).cpu(), experts
+            )
+            graph.replay()
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(seen_routes.cpu(), expected_routes[rank], rtol=0, atol=0)
+            torch.testing.assert_close(seen_table.cpu(), expected_table, rtol=0, atol=0)
+            dist.barrier(group=group)
+    finally:
+        workspace.destroy()
+        dist.barrier(group=group)
+
+
 def _reference_plan(routes, num_experts):
     """CPU greedy placement and stable route assignment, using only semantic input routes."""
     ep_size, num_tokens, topk = routes.shape
@@ -545,8 +609,10 @@ def test_virtual_expert_planner_reference_tie_breaks():
         (4, 8, 16, 1, "balanced local remote rank_ties hot_expert balanced"),
         (4, 8, 16, 3, "random hot_expert hot_rank concentrated balanced"),
         (2, 8, 257, 3, "random hot_expert concentrated"),
+        (3, 12, 263, 5, "random rank_ties concentrated hot_rank balanced"),
         (4, 12, 9, 1, "ties local remote ties"),
         (4, 512, 8192, 10, "random hot_rank balanced"),
+        (4, 768, 2057, 7, "random concentrated hot_expert"),
         (4, 32, 1025, 22, "random concentrated"),
         (2, 64, 513, 32, "random concentrated"),
     ],
@@ -554,8 +620,10 @@ def test_virtual_expert_planner_reference_tie_breaks():
         "ep4-k1",
         "ep4-k3",
         "ep2-strided",
+        "ep3-and-ep1",
         "non-power-of-two-ties",
         "production",
+        "large-histogram-route-tails",
         "k22",
         "ep2-k32",
     ],
@@ -564,13 +632,45 @@ def test_virtual_expert_planner_matches_independent_reference(
     ep_size, num_experts, num_tokens, topk, skews
 ):
     """Exact placement and routes across shapes and changing plans in the same workspace."""
+    _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 64 or not torch.cuda.is_available(),
+    reason="EP64 planner coverage requires a 64-rank torchrun launch on CUDA",
+)
+@pytest.mark.parametrize(
+    "ep_size,num_experts,num_tokens,topk,skews",
+    [
+        (64, 128, 257, 3, "random rank_ties concentrated hot_rank balanced"),
+        (64, 768, 65, 7, "random concentrated hot_rank"),
+        (63, 126, 97, 7, "random concentrated hot_rank balanced"),
+        (33, 2046, 9, 3, "random concentrated balanced"),
+    ],
+    ids=["ep64", "ep64-large-histogram", "ep63-and-ep1", "ep33-and-ep31"],
+)
+def test_virtual_expert_planner_ep64_matches_independent_reference(
+    ep_size, num_experts, num_tokens, topk, skews
+):
+    """Exercise two ranks per block, including partially populated second rank tiles."""
+    _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews)
+
+
+def _check_planner_reference(ep_size, num_experts, num_tokens, topk, skews):
     Utils.initialize_distributed()
+    world_size = dist.get_world_size()
     groups = (
-        [dist.new_group(list(range(start, start + ep_size))) for start in range(0, 4, ep_size)]
-        if ep_size == 2
+        [
+            dist.new_group(list(range(start, min(start + ep_size, world_size))))
+            for start in range(0, world_size, ep_size)
+        ]
+        if ep_size != world_size
         else []
     )
     group = groups[dist.get_rank() // ep_size] if groups else dist.group.WORLD
+    # A trailing subgroup also exercises fewer ranks, including the EP1 utility case.
+    ep_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
     device = torch.device("cuda", torch.cuda.current_device())
     local_experts = num_experts // ep_size
