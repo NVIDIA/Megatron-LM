@@ -121,10 +121,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" \
         -print -quit)
     test -n "${NCCL_EP_JIT_HEADERS}"
-    test -f "${NCCL_EP_JIT_HEADERS}/device/hybrid_ep.cuh"
+    test -f "${NCCL_EP_JIT_HEADERS}/device/ht_ep.cuh"
     mkdir -p /opt/nccl-ep/include
     cp -a "${NCCL_EP_JIT_HEADERS}" /opt/nccl-ep/include/
-    test -f /opt/nccl-ep/include/nccl_ep/device/hybrid_ep.cuh
+    cp -a "${NCCL_EP_JIT_HEADERS}/../nccl_ep.h" /opt/nccl-ep/include/
+    test -f /opt/nccl-ep/include/nccl_ep/device/ht_ep.cuh
+    test -f /opt/nccl-ep/include/nccl_ep.h
 EOF
 
 ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}

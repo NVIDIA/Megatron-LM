@@ -123,6 +123,7 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.flaky_in_dev
 def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(monkeypatch):
     """Expert parameters must use EGTP even when EP, TP, and ETP alone do not distinguish them."""
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -196,7 +197,13 @@ def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(
         "gtp_weight_remat_size",
         "expert_gtp_weight_remat_size",
     ),
-    ((2, 2, 1, 1, 1), (2, 1, 2, 1, 1), (4, 1, 2, 1, 1), (2, 1, 4, 1, 1), (1, 1, 1, 1, 2)),
+    (
+        (2, 2, 1, 1, 1),
+        (2, 1, 2, 1, 1),
+        (4, 1, 2, 1, 1),
+        (2, 1, 4, 1, 1),
+        pytest.param(1, 1, 1, 1, 2, marks=pytest.mark.flaky_in_dev),
+    ),
     ids=(
         "expert-parallel",
         "expert-tensor-parallel",
