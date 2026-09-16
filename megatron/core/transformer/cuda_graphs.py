@@ -16,6 +16,7 @@ from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
+from weakref import WeakSet
 
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
@@ -578,7 +579,6 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
-    cudagraph_val_record: list[tuple] = []
     _saved_tensors_observer = None
 
     @classmethod
@@ -643,6 +643,10 @@ class _CudagraphGlobalRecord:
         # No cudagraphs have been created or recorded, so do nothing
         if len(cls.cudagraph_record) == 0:
             return
+
+        # Validation runs between training steps. Capture its forward records after all
+        # training backwards have released their activations, so both can share the pool.
+        cls.cudagraph_record.sort(key=lambda record: not record[0].training)
 
         # Otherwise, create all the recorded cudagraphs.
         has_te_modules = False
@@ -709,15 +713,18 @@ class _CudagraphGlobalRecord:
             runner, graph_type = g[0:2]
             if graph_type == 'fwd':
                 args, kwargs, out = g[2:]
-                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
+                module = runner.base_module
+                was_training = module.training
+                try:
+                    module.train(runner.training)
+                    runner.create_fwd_graph(
+                        args, kwargs, out, clone_inputs=True, preserve_model_state=True
+                    )
+                finally:
+                    module.train(was_training)
             else:
                 assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
-
-        # Backwards have released the training activations, so validation can reuse their pool.
-        for runner in dict.fromkeys(g[0] for g in cls.cudagraph_record):
-            if runner.grad_enabled:
-                runner.create_val_graph()
 
         # Memory usage.
         time_end = time.time()
@@ -740,7 +747,7 @@ class _CudagraphGlobalRecord:
             "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
             "allocated %s, reserved %s."
             % (
-                len(cls.cudagraph_record) + len(cls.cudagraph_val_record),
+                len(cls.cudagraph_record),
                 capture_stats["time"],
                 format_mem_bytes(capture_stats["allocated_bytes"]),
                 format_mem_bytes(capture_stats["reserved_bytes"]),
@@ -748,7 +755,7 @@ class _CudagraphGlobalRecord:
         )
 
         # Mark cuda graphs as created.
-        for g in (*cls.cudagraph_record, *cls.cudagraph_val_record):
+        for g in cls.cudagraph_record:
             runner = g[0]
             runner.cudagraph_created = True
 
@@ -785,13 +792,19 @@ def delete_cuda_graphs():
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
-    # Reset runners.
-    for record in [
-        *_CudagraphGlobalRecord.cudagraph_record,
-        *_CudagraphGlobalRecord.cudagraph_inference_record,
-        *_CudagraphGlobalRecord.cudagraph_val_record,
-    ]:
-        runner = record[0]
+    # The capture record is cleared after capture; managers still own the captured runners.
+    runners = {
+        record[0]
+        for record in (
+            *_CudagraphGlobalRecord.cudagraph_record,
+            *_CudagraphGlobalRecord.cudagraph_inference_record,
+        )
+    }
+    for manager in list(CudaGraphManager._instances):
+        runners.update(manager.cudagraph_runners)
+        runners.update(manager.val_cudagraph_runners)
+        manager.val_cudagraph_runners.clear()
+    for runner in runners:
         assert isinstance(runner, _CudaGraphRunner)
 
         runner.cudagraph_created = False
@@ -806,7 +819,6 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
-    _CudagraphGlobalRecord.cudagraph_val_record = []
     _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
@@ -1004,6 +1016,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.base_module = base_module
         self.mempool = mempool
+        self.training = getattr(base_module, "training", True)
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
         self.fwd_graph_input_kwarg_metas = {
@@ -1012,7 +1025,6 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.fwd_graph = None
         self.bwd_graph = None
-        self.val_runner = None
         self.bwd_graph_replay_complete_event = torch.cuda.Event()
 
         self.fwd_graph_recorded = False
@@ -1221,67 +1233,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_outputs = tree_map(weakref_output, self.fwd_graph_outputs)
         self.fwd_graph_output_surface = tree_map(weakref_output, self.fwd_graph_output_surface)
 
-    @torch.no_grad()
-    def create_val_graph(self):
-        """Capture validation's forward-only graph using the training capture's inputs and pool."""
-        module = self.base_module
-        args, kwargs = self.fwd_graph_input_args, self.fwd_graph_input_kwargs
-        # Validation reuses the first matching graph across microbatches. Share it instead of
-        # capturing duplicates for PP training runners with the same method and input signature.
-        for runner, _ in _CudagraphGlobalRecord.cudagraph_val_record:
-            if (
-                runner.base_module is module
-                and runner.func == self.func
-                and not runner.get_mismatch_errors(args, kwargs)
-            ):
-                self.val_runner = runner
-                return
-
-        was_training = module.training
-        module.eval()
-        try:
-            runner = _CudaGraphRunner(module, self.mempool, args, kwargs, self.func, False)
-            runner.training = False
-            runner.num_warmup_steps = self.num_warmup_steps
-            runner.fp8_runtime_enabled = self.fp8_runtime_enabled
-            runner.fp4_runtime_enabled = self.fp4_runtime_enabled
-            if self.fp8_enabled:
-                runner.fp8_recipe = self.fp8_recipe
-            if self.is_first_layer:
-                runner.fp8_param_cache_updated = self.fp8_param_cache_updated
-
-            def capture_arg(value):
-                if torch.is_tensor(value):
-                    value = value.detach()
-                    return ArgMetadata(value) if value.is_cuda else value.clone()
-                return value
-
-            # Training's allocation path supplies stable buffers without its reuse metadata.
-            with (
-                preserve_gtp_prefetch_state(module.parameters())
-                if self.gtp_remat
-                else nullcontext()
-            ):
-                # Validation warmup can mutate buffers and quantization state even without autograd.
-                # Set `preserve_model_state=True` to preserve those just as in training, without
-                # backing up unused training gradients.
-                runner.create_fwd_graph(
-                    *tree_map(capture_arg, (args, kwargs)), preserve_model_state=True
-                )
-            # Keep output ownership, including aliases of inputs, while releasing input storage.
-            outputs = tree_map(
-                lambda value: value.detach() if torch.is_tensor(value) else value,
-                runner.fwd_graph_outputs,
-            )
-            runner._weakref_forward_buffers(preserve_forward_to_backward_lifetimes=False)
-            runner.fwd_graph_outputs = outputs
-            runner.fwd_graph_output_surface = runner.get_tensors(outputs)
-            runner.fwd_graph_recorded = True
-            self.val_runner = runner
-            _CudagraphGlobalRecord.cudagraph_val_record.append((runner, "fwd"))
-        finally:
-            module.train(was_training)
-
     def create_fwd_graph(
         self, args, kwargs, outputs=None, clone_inputs=True, *, preserve_model_state: bool = False
     ):
@@ -1455,7 +1406,14 @@ class _CudaGraphRunner(torch.nn.Module):
                         self._wait_side_streams(warmup_rs_streams)
             _set_warmup_end()
 
-        with grad_context:
+        # Validation's actual capture must also preserve GTP handoff flags; the context
+        # above only protects warmup. Inference leaves preserve_model_state disabled.
+        preserve_prefetch_context = (
+            preserve_gtp_prefetch_state(self.base_module.parameters())
+            if preserve_model_state and self.gtp_remat and not self.grad_enabled
+            else nullcontext()
+        )
+        with grad_context, preserve_prefetch_context:
             with self.get_quantization_context():
                 torch.cuda.synchronize()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
@@ -1559,6 +1517,16 @@ class _CudaGraphRunner(torch.nn.Module):
 
             # restore cached grads
             _restore_grads_after_capture(grad_backup)
+        elif not self.grad_enabled and preserve_model_state:
+            # Validation has no backward. Retain outputs, including input aliases, before
+            # releasing input storage for later captures. Inference keeps input ownership.
+            outputs = tree_map(
+                lambda value: value.detach() if torch.is_tensor(value) else value,
+                self.fwd_graph_outputs,
+            )
+            self._weakref_forward_buffers(preserve_forward_to_backward_lifetimes=False)
+            self.fwd_graph_outputs = outputs
+            self.fwd_graph_output_surface = self.get_tensors(outputs)
 
         if preserve_model_state:
             if self.fp8_enabled or self.fp4_enabled:
@@ -1957,6 +1925,8 @@ class CudaGraphManager(torch.nn.Module):
 
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
+    # Find validation owners for explicit cleanup without keeping their modules alive.
+    _instances: WeakSet["CudaGraphManager"] = WeakSet()
 
     def __init__(
         self,
@@ -2022,6 +1992,8 @@ class CudaGraphManager(torch.nn.Module):
 
         assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
         self.cudagraph_runners: list[_CudaGraphRunner] = []
+        # Keep validation out of training lookup and PP rotation; capture uses the same record.
+        self.val_cudagraph_runners: list[_CudaGraphRunner] = []
         self.custom_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
 
@@ -2059,14 +2031,53 @@ class CudaGraphManager(torch.nn.Module):
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
-    def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs, cache_key=None):
-        '''Returns a valid cudagraph runner for the current forward call.
-        The cudagraph corresponding to this call is the first element of 'self.cudagraph_runners'.
-        We iterate through the list by 1 for each call, and the number of calls is equal to the
-        length of 'self.cudagraph_runners'.
-        Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
-        over different microbatches by tracking their respective fwd and bwd passes.'''
+    def _record_validation_graph(self, training_runner, args, kwargs):
+        """Record one validation forward per input signature for this manager's callable."""
+        # PP may create several training runners for the same input signature, but they
+        # share one forward-only validation runner.
+        for runner in self.val_cudagraph_runners:
+            if not runner.get_mismatch_errors(args, kwargs):
+                return
+
+        runner = _CudaGraphRunner(
+            training_runner.base_module,
+            training_runner.mempool,
+            args,
+            kwargs,
+            training_runner.func,
+            need_backward=False,
+        )
+        runner.training = False
+        runner.num_warmup_steps = training_runner.num_warmup_steps
+        runner.fp8_runtime_enabled = training_runner.fp8_runtime_enabled
+        runner.fp4_runtime_enabled = training_runner.fp4_runtime_enabled
+        if training_runner.fp8_enabled:
+            runner.fp8_recipe = training_runner.fp8_recipe
+
+        def capture_arg(value):
+            if torch.is_tensor(value):
+                # Allocate from the same pool without training's buffer-reuse metadata.
+                value = value.detach()
+                return ArgMetadata(value) if value.is_cuda else value.clone()
+            return value
+
+        runner.fwd_graph_recorded = True
+        self.val_cudagraph_runners.append(runner)
+        CudaGraphManager._instances.add(self)
+        _CudagraphGlobalRecord.record_fwd_graph(
+            runner, *tree_map(capture_arg, (args, kwargs)), None
+        )
+
+    def get_cudagraph_runner(
+        self, megatron_module, args, kwargs, reuse_cudagraphs, cache_key=None, runners=None
+    ):
+        """Return a matching runner, rotating training runners in capture order with PP.
+
+        Validation supplies its own runner list for reuse without advancing training rotation.
+        """
         if reuse_cudagraphs:
+            if runners is None:
+                runners = self.cudagraph_runners
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
             else:
@@ -2082,15 +2093,15 @@ class CudaGraphManager(torch.nn.Module):
                         and (not require_grad or r.grad_enabled)
                     )
 
-                # We must choose the first available runner, as the order of
-                # self.cudagraph_runners corresponds to the capture order.
-                runner = next((r for r in self.cudagraph_runners if is_valid(r)), None)
+                # We must choose the first available runner, as the runner list
+                # corresponds to the capture order.
+                runner = next((r for r in runners if is_valid(r)), None)
 
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
                     assert False, (
                         f"`cudagraph_created` is set to True but no matching cudagraph "
-                        f"runners were found. This module has {len(self.cudagraph_runners)} "
+                        f"runners were found. This module has {len(runners)} "
                         f"existing runners. Use `get_mismatch_errors` to debug mismatches."
                     )
                 else:
@@ -2104,7 +2115,7 @@ class CudaGraphManager(torch.nn.Module):
                     )
                     if self._num_warmup_steps is not None:
                         runner.num_warmup_steps = self._num_warmup_steps
-                    self.cudagraph_runners.append(runner)
+                    runners.append(runner)
                     if cache_key is not None:
                         self.custom_cudagraphs_lookup_table[cache_key] = runner
         else:
@@ -2153,35 +2164,13 @@ class CudaGraphManager(torch.nn.Module):
         if HAVE_TE_GRAPHS:
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
 
-        # Standard validation uses val_runner
-        if (
+        is_validation = (
             not is_inference_mode
             and not self._inline_capture
             and not getattr(megatron_module, "training", self.training)
-        ):
-            # module.eval() does not disable autograd; validation graphs have no backward.
-            runner = None
-            if not torch.is_grad_enabled():
-                runner = next(
-                    (
-                        r.val_runner
-                        for r in self.cudagraph_runners
-                        if r.val_runner is not None
-                        and r.val_runner.cudagraph_created
-                        and not r.val_runner.get_mismatch_errors(args, kwargs)
-                    ),
-                    None,
-                )
-            if runner is None:
-                # Validation graphs cover training signatures only. Before capture, for other
-                # inputs, or with autograd enabled, run the original method or module eagerly.
-                if self.func is not None:
-                    return self.func(*args, **kwargs)
-                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
-            # Use the common replay epilogue to update status and the first-microbatch flag.
-            out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+        )
 
-        elif _CudagraphGlobalRecord.cudagraph_created:
+        if _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
                 # Trigger Mcore DDP pre-forward hooks
                 self.call_ddp_preforward_hook(megatron_module)
@@ -2189,7 +2178,12 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(
-                megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
+                megatron_module,
+                args,
+                kwargs,
+                self.reuse_cudagraphs or is_validation,
+                cache_key=None if is_validation else cache_key,
+                runners=self.val_cudagraph_runners if is_validation else None,
             )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
@@ -2245,7 +2239,10 @@ class CudaGraphManager(torch.nn.Module):
                 runner = self.get_cudagraph_runner(
                     megatron_module, args, kwargs, self.reuse_cudagraphs
                 )
+                record_validation = runner.grad_enabled and not runner.fwd_graph_recorded
                 out = runner.record_graph_capture(args, kwargs)
+                if record_validation:
+                    self._record_validation_graph(runner, args, kwargs)
             else:
                 # No cudagraphs were found in training mode with grad disabled, so fallback to
                 # eager since autograd is needed to correctly trace the backward graph.

@@ -372,18 +372,12 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
             apply_sgd_step(partial_cg, gtp_size)
             if step in (0, steps // 2, steps - 1):
                 partial_cg_eval_losses.append(evaluate(partial_cg, step, dp_rank))
-                for manager in managers:
-                    val_runner = manager.cudagraph_runners[0].val_runner
-                    assert val_runner is not None
-                    assert not val_runner.grad_enabled
-                    assert val_runner.bwd_graph is None
-                    assert val_runner.mempool == manager.cudagraph_runners[0].mempool
         del loss, x
     finally:
         torch.cuda.synchronize()
         managers = get_cudagraph_managers(partial_cg)
         for manager in managers:
-            for runner in manager.cudagraph_runners:
+            for runner in manager.cudagraph_runners + manager.val_cudagraph_runners:
                 if runner.fwd_graph is not None:
                     runner.fwd_graph.reset()
                 if runner.bwd_graph is not None:
