@@ -256,6 +256,51 @@ def _mla_rope_bwd_inplace_kernel(
     tl.store(DO + x_2_off, x_2, mask=mask)
 
 
+def fused_mla_rope_q_backward_inplace(
+    dq: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    nope_dim: int,
+    emb_dim: int,
+    *,
+    remove_interleaving: bool = False,
+) -> torch.Tensor:
+    """Run the SBHD Q RoPE backward kernel in-place."""
+    if dq.ndim != 4:
+        raise ValueError("fused_mla_rope_q_backward_inplace currently supports SBHD tensors")
+    seqlen, batch_size, nheads, headdim = dq.shape
+    if headdim != nope_dim + emb_dim:
+        raise ValueError(f"Expected Q head dimension {nope_dim + emb_dim}, got {headdim}")
+    if not dq.is_contiguous():
+        raise ValueError("dQ must be contiguous")
+    if not cos.is_contiguous() or not sin.is_contiguous():
+        raise ValueError("cos and sin must be contiguous")
+
+    dq_3d = dq.view(seqlen * batch_size, nheads, headdim)
+    grid = lambda META: (dq_3d.shape[0], triton.cdiv(nheads, META["BLOCK_H"]))
+    _mla_rope_bwd_inplace_kernel[grid](
+        dq_3d,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        nheads,
+        batch_size,
+        None,
+        None,
+        None,
+        dq_3d.stride(0),
+        dq_3d.stride(1),
+        cos.stride(0),
+        sin.stride(0),
+        0,
+        1,
+        INVERSE=False,
+        REMOVE_INTERLEAVING=remove_interleaving,
+    )
+    return dq
+
+
 class _FusedMLARoPEInplace(torch.autograd.Function):
     """
     Autograd function for applying RoPE inplace to the trailing emb_dim
@@ -723,6 +768,84 @@ def _mla_rope_bwd_kv_split_kernel(
         dEMB_ptr = dEMB + pid_m * stride_demb_seq
         tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2, x_1)
         tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2 + 1, x_2)
+
+
+def fused_mla_rope_kv_backward_out(
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    emb_dim: int,
+    k_dim: int,
+    v_dim: int,
+    *,
+    out_kv: torch.Tensor,
+    out_k_pos_emb: torch.Tensor,
+    remove_interleaving: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the SBHD KV RoPE backward kernel into caller-provided buffers."""
+    if dk.ndim != 4 or dv.ndim != 4:
+        raise ValueError("fused_mla_rope_kv_backward_out currently supports SBHD tensors")
+    seqlen, batch_size, nheads, key_dim = dk.shape
+    expected_dv_shape = (seqlen, batch_size, nheads, v_dim)
+    expected_kv_shape = (seqlen, batch_size, nheads, k_dim + v_dim)
+    expected_emb_shape = (seqlen, batch_size, 1, emb_dim)
+    if key_dim != k_dim + emb_dim or tuple(dv.shape) != expected_dv_shape:
+        raise ValueError(
+            f"Expected dK/dV shapes ending in {k_dim + emb_dim}/{v_dim}, "
+            f"got {tuple(dk.shape)}/{tuple(dv.shape)}"
+        )
+    for name, tensor, shape in (
+        ("out_kv", out_kv, expected_kv_shape),
+        ("out_k_pos_emb", out_k_pos_emb, expected_emb_shape),
+    ):
+        if (
+            tuple(tensor.shape) != shape
+            or tensor.dtype != dk.dtype
+            or tensor.device != dk.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must have shape {shape}, dtype {dk.dtype}, "
+                f"device {dk.device}, and contiguous layout"
+            )
+    if not dk.is_contiguous() or not dv.is_contiguous():
+        raise ValueError("dK and dV must be contiguous")
+    if not cos.is_contiguous() or not sin.is_contiguous():
+        raise ValueError("cos and sin must be contiguous")
+
+    total_seqlen = seqlen * batch_size
+    dk_3d = dk.view(total_seqlen, nheads, key_dim)
+    dv_3d = dv.view(total_seqlen, nheads, v_dim)
+    out_kv_3d = out_kv.view(total_seqlen, nheads, k_dim + v_dim)
+    out_emb_3d = out_k_pos_emb.view(total_seqlen, 1, emb_dim)
+    grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+    _mla_rope_bwd_kv_split_kernel[grid](
+        dk_3d,
+        dv_3d,
+        out_kv_3d,
+        out_emb_3d,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        nheads,
+        batch_size,
+        None,
+        None,
+        dk_3d.stride(0),
+        dk_3d.stride(1),
+        dv_3d.stride(0),
+        dv_3d.stride(1),
+        out_kv_3d.stride(0),
+        out_kv_3d.stride(1),
+        out_emb_3d.stride(0),
+        0,
+        1,
+        REMOVE_INTERLEAVING=remove_interleaving,
+    )
+    return out_kv, out_k_pos_emb
 
 
 class _FusedMLARoPEKVSplit(torch.autograd.Function):
