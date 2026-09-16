@@ -29,13 +29,52 @@ module only rebinds and detaches the raw uint8 payloads:
 Payloads are ``(rows, cols)`` row-major uint8 data (TE's ``_columnwise_data``
 shares the ``_rowwise_data`` shape); only the block direction and scale grid
 differ between the two orientations.
+
+Because the two orientations are independent buffers rather than views of one
+another, an unshard has to be told which of them the upcoming compute needs. The
+orientation vocabulary below is shared by the parameter groups (which gather) and
+``FsdpModule`` (which forwards the request).
 """
+
+from collections.abc import Iterable
+from typing import Literal
 
 import torch
 
 from ..mixed_precision import fp8_set_raw_data
 
 E4M3_BLOCK_SIZE = 32
+
+#: One payload orientation request for an unshard. Regular (non-FP8) parameter
+#: groups ignore the value; MXFP8 groups honour it.
+ROWWISE = "rowwise"
+COLWISE = "colwise"
+BOTH = "both"
+PayloadOrientation = Literal["rowwise", "colwise", "both"]
+
+
+def orientation_directions(orientation: str) -> frozenset[str]:
+    """Return the payload directions ``orientation`` materializes."""
+    if orientation == BOTH:
+        return frozenset((ROWWISE, COLWISE))
+    return frozenset((orientation,))
+
+
+def merge_orientations(directions: Iterable[str], default: str = ROWWISE) -> str:
+    """Return the narrowest orientation covering every direction in ``directions``.
+
+    Used to widen a materialization that has to serve more than one unshard of the
+    same module -- e.g. a recomputed forward and the backward that consumes it
+    with no reshard in between, which needs ``"both"``.
+    """
+    requested = frozenset(directions)
+    if not requested:
+        return default
+    if requested == frozenset((ROWWISE,)):
+        return ROWWISE
+    if requested == frozenset((COLWISE,)):
+        return COLWISE
+    return BOTH
 
 
 def set_rowwise_payload(tensor: torch.Tensor, data: torch.Tensor) -> None:
