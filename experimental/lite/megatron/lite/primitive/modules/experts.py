@@ -38,9 +38,30 @@ def _expert_nvtx_range(name: str):
 
 
 def swiglu_with_probs(
-    y: torch.Tensor, probs: torch.Tensor | None, swiglu_limit: float = 0.0
+    y: torch.Tensor,
+    probs: torch.Tensor | None,
+    swiglu_limit: float = 0.0,
+    swiglu_alpha: float = 1.0,
+    swiglu_up_offset: float = 0.0,
 ) -> torch.Tensor:
-    """SwiGLU with optional expert probability scaling."""
+    """SwiGLU with optional expert probability scaling.
+
+    ``alpha=1, up_offset=0`` (the default) uses the fused ``bias_swiglu_impl`` kernel with its
+    built-in clamp. MiniMax-M3 (``swigluoai``) needs ``alpha=1.702, up_offset=1.0``, which the fused
+    kernel doesn't support, so that case falls back to an explicit fp32 computation:
+    ``(clamp(up) + up_offset) * clamp(gate) * sigmoid(alpha * gate)``.
+    """
+    if swiglu_alpha != 1.0 or swiglu_up_offset != 0.0:
+        gate, up = y.chunk(2, dim=-1)
+        if swiglu_limit > 0:
+            up = torch.clamp(up.float(), min=-swiglu_limit, max=swiglu_limit)
+            gate = torch.clamp(gate.float(), max=swiglu_limit)
+        else:
+            up, gate = up.float(), gate.float()
+        out = gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_up_offset)
+        if probs is not None:
+            out = out * probs
+        return out.to(dtype=y.dtype)
     clamp_value = swiglu_limit if swiglu_limit > 0 else None
     if probs is not None:
         return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
@@ -81,6 +102,8 @@ class Experts(nn.Module):
             raise NotImplementedError(f"etp_size={ps.etp_size} unsupported; use 1.")
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+        self.swiglu_alpha = float(getattr(config, "swiglu_alpha", 1.0) or 1.0)
+        self.swiglu_up_offset = float(getattr(config, "swiglu_up_offset", 0.0) or 0.0)
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
             config.hidden_size,
@@ -180,7 +203,9 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
+                h = act_ckpt.checkpoint(
+                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit, self.swiglu_alpha, self.swiglu_up_offset
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -189,7 +214,9 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+                h = swiglu_with_probs(
+                    fc1_out, probs, self.swiglu_limit, self.swiglu_alpha, self.swiglu_up_offset
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)

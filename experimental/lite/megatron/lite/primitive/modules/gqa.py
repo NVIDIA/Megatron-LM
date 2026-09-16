@@ -10,12 +10,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.modules.gqa_utils import (
-    split_grouped_qkvg,
-    split_grouped_qkvg_for_tp,
-)
+from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
+from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg, split_grouped_qkvg_for_tp
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import (
@@ -212,9 +209,51 @@ class GQAttention(nn.Module):
         self.core_attn = self._build_core_attn(attention_backend)
         self.attention_backend = attention_backend
 
+    def _forward_msa(self, x: torch.Tensor, magi_ctx) -> torch.Tensor:
+        """Full causal attention on MSA's (MagiAttention MSA extension) dispatched CP layout.
+
+        Distinct from ``attention_backend="magi"`` above (upstream's generic MagiAttention
+        core-attention drop-in, selected via ``packed_seq_params.qkv_format == "magi"``): MSA
+        dispatch is a load-balanced token layout produced by the protocol, carried out-of-band
+        via ``magi_ctx`` rather than ``packed_seq_params``, and calls the native Magi
+        ``calc_attn`` directly instead of going through ``self.core_attn``.
+        ``x`` is ``[T_local, 1, hidden]``; RoPE uses the doc-local positions carried by ``magi_ctx``.
+        """
+        from megatron.lite.primitive.kernels import magi_msa
+
+        if self._mrope_section is not None or self._output_gate or self.qkv_lora is not None:
+            raise NotImplementedError("MSA dense attention path supports plain RoPE, no output gate, no LoRA")
+        qkv = self.qkv(x)
+        if self._replicate_kv:
+            qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)
+        q, _gate, k, v = self._split_qkv(qkv)  # [T, 1, H, D]
+        T, B = q.shape[:2]
+        if B != 1 or T != magi_ctx.local_tokens:
+            raise ValueError(f"MSA path expects [T_local={magi_ctx.local_tokens}, 1, hidden] input, got {tuple(x.shape)}")
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self._use_fp32_rope:
+            orig_dtype = q.dtype
+            q, k = q.float(), k.float()
+        freqs = magi_ctx.rope_freqs_for(self.rotary)  # [T, 1, 1, rot]
+        q = _apply_rotary_pos_emb_bshd(q, freqs, rotary_interleaved=False, mscale=1.0)
+        k = _apply_rotary_pos_emb_bshd(k, freqs, rotary_interleaved=False, mscale=1.0)
+        if self._use_fp32_rope:
+            q, k = q.to(orig_dtype), k.to(orig_dtype)
+        out = magi_msa.calc_dense_attn(
+            q.squeeze(1), k.squeeze(1), v.squeeze(1), magi_ctx, softmax_scale=self.head_dim**-0.5
+        )  # [T, H, D]
+        return self.proj(out.reshape(T, 1, self.num_heads_local * self.head_dim))
+
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        magi_ctx=None,
     ) -> torch.Tensor:
+        if magi_ctx is not None:
+            return self._forward_msa(x, magi_ctx)
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
@@ -390,6 +429,18 @@ class GQAttention(nn.Module):
             v = qkv[..., (q_per_group + 1) * hd : (q_per_group + 2) * hd]
             return q, None, k, v
 
+        if self._replicate_kv:
+            # Flat layout, tp > num_kv_heads: the column-parallel qkv is sharded 1/tp contiguously and
+            # all-gathered above, so ``qkv`` is the full canonical [Q | K | V]; pick this rank's q heads and
+            # the kv head serving its group (the same weight layout ``split_qkv`` produces at load time).
+            if self._output_gate:
+                raise NotImplementedError("flat qkv layout with output gate does not support tp > num_kv_heads")
+            heads = qkv.view(*lead, self.num_heads + 2 * self.num_kv_heads, hd)
+            g = self.ps.tp_rank // (self.ps.tp_size // self.num_kv_heads)
+            q = heads[..., self.ps.tp_rank * nq : (self.ps.tp_rank + 1) * nq, :]
+            k = heads[..., self.num_heads + g : self.num_heads + g + 1, :]
+            v = heads[..., self.num_heads + self.num_kv_heads + g : self.num_heads + self.num_kv_heads + g + 1, :]
+            return q, None, k, v
         if self._output_gate:
             q_block = qkv[..., : nq * 2 * hd].reshape(*lead, nq, 2 * hd)
             kv_block = qkv[..., nq * 2 * hd :].reshape(*lead, 2 * nkv, hd)

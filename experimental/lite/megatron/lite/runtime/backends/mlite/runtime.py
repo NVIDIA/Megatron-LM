@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
@@ -116,11 +117,23 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     os.environ["NVTE_UNFUSED_ATTN"] = unfused
 
 
-def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tuple[int, int, int]:
+def _infer_pipeline_tensor_shape(
+    batch: PackedBatch, model_cfg: Any, ps, magi_settings: Any = None
+) -> tuple[int, int, int]:
     if model_cfg is None or not hasattr(model_cfg, "hidden_size"):
         raise ValueError("Megatron Lite pipeline runtime requires model_cfg.hidden_size.")
     if not isinstance(batch, PackedBatch):
         raise TypeError("Megatron Lite pipeline runtime requires PackedBatch inputs.")
+    if magi_settings is not None:
+        # MiniMax-M3 msa_backend="magi": the protocol pads the packed batch to chunk_size * cp and
+        # dispatches it evenly over the CP ranks (Magi even-shard), then the model SP-scatters over TP.
+        cp_size = int(getattr(ps, "cp_size", 1) or 1)
+        tp_size = int(getattr(ps, "tp_size", 1) or 1)
+        total = int(batch.seq_lens.to(torch.int64).sum().item())
+        align = int(magi_settings.chunk_size) * cp_size
+        total_padded = total + (-total) % align
+        hc_mult = int(getattr(model_cfg, "hc_mult", 1) or 1)
+        return (total_padded // (cp_size * tp_size), 1, int(model_cfg.hidden_size) * hc_mult)
 
     input_ids = batch.input_ids
     if input_ids.dim() == 1:
@@ -538,7 +551,9 @@ class MegatronLiteRuntime(RuntimeBase):
             # forward-only schedules ignore this and use Megatron dynamic shape
             # exchange (the sender transmits its real per-micro-batch size), so THD
             # variable-length packing no longer needs a locally-derived shape.
-            tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
+            tensor_shape = _infer_pipeline_tensor_shape(
+                first_batch, model_cfg, ps, magi_settings=handle._extras.get("magi_settings")
+            )
 
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
