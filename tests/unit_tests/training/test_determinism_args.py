@@ -9,10 +9,12 @@ the guard must reject exactly the arg combinations whose config ends up with the
 """
 
 import argparse
+import os
 
 import pytest
 import torch
 
+from megatron.core import determinism as core_determinism
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.determinism import (
     ARG_VALUES_REQUIRED_FOR_DETERMINISM,
@@ -21,12 +23,23 @@ from megatron.training.determinism import (
 
 
 @pytest.fixture(autouse=True)
-def restore_torch_determinism():
-    """apply_determinism_to_args flips a torch global on the paths that don't raise."""
+def restore_torch_determinism(monkeypatch):
+    """Exercise option validation in a simulated cold process; restore global policy."""
     was_enabled = torch.are_deterministic_algorithms_enabled()
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    benchmark = torch.backends.cudnn.benchmark
+    fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+    cudnn_deterministic = torch.backends.cudnn.deterministic
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(core_determinism, "_configured_pid", None)
+    monkeypatch.setattr(core_determinism, "_configured_environment", None)
     yield
     torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
+    torch.backends.cudnn.benchmark = benchmark
+    torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized
+    torch.backends.cudnn.deterministic = cudnn_deterministic
 
 
 def make_args(**kwargs):

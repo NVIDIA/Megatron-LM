@@ -682,6 +682,13 @@ def validate_args(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
+    # Apply before hardware capability probes can initialize CUDA.
+    if args.deterministic_mode:
+        from megatron.training.determinism import apply_determinism_to_args
+
+        policy = apply_determinism_to_args(args)
+        print_rank_0(f"Determinism policy: {json.dumps(policy, sort_keys=True)}", args.rank)
+
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'
         warn_rank_0('Please specify --split when using --data-path. Using legacy default value '
@@ -1802,15 +1809,6 @@ def validate_args(args, defaults={}):
         "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
-
-    # Deterministic mode — env vars + config overrides + torch global state.
-    # Implementation lives in ``megatron/training/determinism.py`` so the
-    # same setup is reachable from tests / profiling scripts that don't go
-    # through argparse.
-    if args.deterministic_mode:
-        from megatron.training.determinism import apply_determinism_to_args
-
-        apply_determinism_to_args(args)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
