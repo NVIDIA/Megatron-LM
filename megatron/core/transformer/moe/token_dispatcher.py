@@ -1076,8 +1076,6 @@ class _HybridEPManager(_DispatchManager):
         self.topk_idx: Optional[torch.Tensor] = None
         self.dense_routing_metadata = not uses_compact_routes(config)
         self._dense_topk_routing = hybrid_ep_dense_topk_routing(num_experts, num_local_experts)
-        if config.moe_virtual_expert_load_balance and not self._dense_topk_routing:
-            raise ValueError("Virtual experts require HybridEP's compact top-k routing API.")
         # Handle used for combine operation
         self.handle = None
         # Used for padding the output for each expert
@@ -1106,7 +1104,7 @@ class _HybridEPManager(_DispatchManager):
         routing map, or with HybridEP's dense top-k routing the ``[num_tokens, topk]`` expert
         ids (``topk_idx``) in its place, and the dense probabilities. With compact routes the
         dispatcher passes the ``[num_tokens, topk]`` ids as ``routing_map`` and their
-        probabilities as ``probs``; both are expanded here."""
+        probabilities as ``probs``; only the probabilities are expanded here."""
         if not self.dense_routing_metadata:
             routing_map, topk_idx, probs = self._expand_compact_routes(routing_map, probs)
         num_tokens = probs.shape[0]
@@ -1179,15 +1177,14 @@ class _HybridEPManager(_DispatchManager):
     def _expand_compact_routes(self, top_indices: torch.Tensor, probs: torch.Tensor):
         """HybridEP's inputs from compact routes: the dense ``[num_tokens, num_experts]``
         probabilities (the scatter carries the router's gradient) and int16 top-k ids.
-        Ordinary HybridEP retains the boolean-map fallback for older builds.
         Shared by the plain path (the router's ids) and the
         virtual-expert path (the planner's runtime ids)."""
+        assert (
+            self._dense_topk_routing
+        ), "HybridEP received compact routes without compact top-k routing support."
         index = top_indices.long()
         probs = probs.new_zeros((probs.shape[0], self.num_experts)).scatter(1, index, probs)
-        if self._dense_topk_routing:
-            return None, top_indices.to(torch.int16), probs
-        routing_map = torch.zeros_like(probs, dtype=torch.bool).scatter(1, index, True)
-        return routing_map, None, probs
+        return None, top_indices.to(torch.int16), probs
 
     def dispatch(
         self,
@@ -1981,17 +1978,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
-            # Virtual-expert load balancing supports only the whole-layer moe CUDA-graph scope,
-            # so no intermediate dispatcher attributes cross a graph boundary there.
-            self.cudagraph_attrs = (
-                []
-                if virtual_experts
-                else [
-                    '_comm_manager.token_probs',
-                    '_comm_manager.routing_map',
-                    '_comm_manager.topk_idx',
-                ]
-            )
+            self.cudagraph_attrs = [
+                '_comm_manager.token_probs',
+                '_comm_manager.routing_map',
+                '_comm_manager.topk_idx',
+            ]
         elif self.config.moe_flex_dispatcher_backend == "ncclep":
             assert self.tp_size * self.ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
             self._comm_manager = _NCCLEPManager(

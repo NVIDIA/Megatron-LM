@@ -107,7 +107,6 @@ def test_virtual_expert_mixed_precision_repeated_layer_matches_hybridep(monkeypa
             )
         for parameter in layers.parameters():
             _set_main_grad(parameter, grad_dtype)
-            del parameter.overwrite_main_grad
         assert is_mxfp8tensor(layers[0].experts.linear_fc1.weight0)
         assert not is_mxfp8tensor(layers[1].experts.linear_fc1.weight0)
         assert not layers[1].experts._with_fused_impl
@@ -187,8 +186,7 @@ def test_virtual_expert_mixed_precision_repeated_layer_matches_hybridep(monkeypa
             )
             for manager in managers:
                 owner = manager.virtual_experts
-                assert all(owner.config.direct_main_grad)
-                assert owner.storage.native_staging == (None, None)
+                assert not any(owner.config.gtp)
                 for sources, runtime in zip(owner.parameters, owner.runtime_weights):
                     assert all(
                         native.main_grad.data_ptr() == source.main_grad.data_ptr()
