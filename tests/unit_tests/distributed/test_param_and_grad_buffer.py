@@ -845,6 +845,32 @@ class TestNVFP4IndexMaps:
         assert buffer.param_index_map[params[0]] == (10000, 20000, 0)
         assert buffer.numel == 20000
 
+    def test_grad_offload_preserves_contents_when_requested(self):
+        buffer, _ = self._make_buffer([('layer.weight', (10, 10))])
+        expected = torch.arange(buffer.grad_data.numel(), dtype=buffer.grad_data.dtype)
+        buffer.grad_data.copy_(expected)
+
+        buffer.offload_to_cpu(move_params=False, move_grads=True, preserve_grad_data=True)
+        assert buffer.grad_data.storage().size() == 0
+        with pytest.raises(RuntimeError, match="before reloading"):
+            buffer.release_grad_data_cpu()
+
+        buffer.reload_from_cpu(move_params=False, move_grads=True)
+
+        torch.testing.assert_close(buffer.grad_data, expected)
+        assert buffer.grad_data_cpu is not None
+        buffer.release_grad_data_cpu()
+        assert buffer.grad_data_cpu is None
+
+    def test_grad_offload_discards_contents_by_default(self):
+        buffer, _ = self._make_buffer([('layer.weight', (10, 10))])
+        buffer.grad_data.fill_(1)
+
+        buffer.offload_to_cpu(move_params=False, move_grads=True)
+        buffer.reload_from_cpu(move_params=False, move_grads=True)
+
+        assert torch.count_nonzero(buffer.grad_data) == 0
+
     def test_nvfp4_multi_bucket_param_to_index(self):
         """param_to_index in each bucket should be relative to that bucket's full-numel offset."""
         param_shapes = [
