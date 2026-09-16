@@ -2,9 +2,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import ast
+"""Qwen3-Coder XML tool-call parser.
+
+The model emits tool calls as::
+
+    <tool_call>
+    <function=NAME>
+    <parameter=KEY>VALUE</parameter>
+    </function>
+    </tool_call>
+
+Parsing here mirrors vLLM's parser engine so that a model served through the
+Megatron dynamic text-generation server yields the same parsed tool calls as
+the same model served through vLLM (vLLM 0.25 routes ``qwen3_coder`` to
+``Qwen3EngineToolParser``). RL pipelines that mix the two engines rely on this
+parity because tool-use rewards are computed from the parsed arguments.
+
+Three behaviours are taken from vLLM:
+
+- Parameter values are ``str.strip()``-ed (``vllm/parser/qwen3.py``,
+  ``_qwen3_arg_converter``). The previous implementation removed at most one
+  leading and one trailing newline, so multi-line code arguments kept their
+  indentation while vLLM dropped it, and ``<parameter=x>  v  </parameter>``
+  parsed differently in the two servers.
+- Content preceding the tool calls is ``str.strip()``-ed and an empty result
+  becomes ``None`` (``ParserEngine._strip_content_whitespace`` with
+  ``strip_content_whitespace_with_tools=True``).
+- Schema-based type coercion follows ``vllm/tool_parsers/utils.py``
+  (``extract_types_from_schema`` + ``coerce_to_schema_type``): candidate types
+  are tried in the order null > integer > number > boolean > object > array >
+  string, ``"1"``/``"0"`` are accepted as booleans, a value that matches none of
+  the schema types falls back to ``json.loads`` and otherwise stays a string.
+  The previous implementation degraded unparseable booleans to ``False``,
+  accepted Python literals for objects via ``ast.literal_eval`` and returned
+  ``None`` for ``"null"`` regardless of the schema.
+"""
+
 import json
 import logging
+import math
 import re
 import uuid
 from typing import Any
@@ -19,6 +55,157 @@ FunctionCall = dict[str, Any]
 ChatCompletionToolsParam = dict[str, Any]
 ChatCompletionRequest = dict[str, Any]
 ExtractedToolCallInformation = dict
+
+# Mirrors vllm/tool_parsers/utils.py::_TYPE_ALIASES.
+_TYPE_ALIASES: dict[str, str] = {
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "int": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "uint": "integer",
+    "uint32": "integer",
+    "uint64": "integer",
+    "long": "integer",
+    "short": "integer",
+    "unsigned": "integer",
+    "float": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "bool": "boolean",
+    "dict": "object",
+    "arr": "array",
+    "list": "array",
+    "sequence": "array",
+}
+
+# Priority in which candidate schema types are tried during coercion.
+_TYPE_PRIORITY = ("null", "integer", "number", "boolean", "object", "array", "string")
+
+
+def _extract_types_from_schema(schema: Any) -> list[str]:
+    """Extract all possible type strings from a JSON Schema definition.
+
+    Handles ``type`` (string or list), ``enum`` value inference, and recursive
+    ``anyOf``/``oneOf``/``allOf``. Returns ``["string"]`` when no type
+    information can be determined. Mirrors
+    ``vllm/tool_parsers/utils.py::extract_types_from_schema``.
+    """
+    if schema is None or not isinstance(schema, dict):
+        return ["string"]
+
+    types: set[str] = set()
+
+    if "type" in schema:
+        type_value = schema["type"]
+        if isinstance(type_value, str):
+            types.add(type_value)
+        elif isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str):
+                    types.add(t)
+
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        for value in schema["enum"]:
+            if value is None:
+                types.add("null")
+            elif isinstance(value, bool):
+                types.add("boolean")
+            elif isinstance(value, int):
+                types.add("integer")
+            elif isinstance(value, float):
+                types.add("number")
+            elif isinstance(value, str):
+                types.add("string")
+            elif isinstance(value, list):
+                types.add("array")
+            elif isinstance(value, dict):
+                types.add("object")
+
+    for choice_field in ("anyOf", "oneOf", "allOf"):
+        if choice_field in schema and isinstance(schema[choice_field], list):
+            for choice in schema[choice_field]:
+                types.update(_extract_types_from_schema(choice))
+
+    return list(types) if types else ["string"]
+
+
+def _is_json_finite(obj: Any) -> bool:
+    """Whether ``obj`` serializes to valid JSON (no ``inf``/``nan`` anywhere inside)."""
+    try:
+        json.dumps(obj, allow_nan=False)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
+    """Best-effort coercion of a raw string value to a JSON Schema type.
+
+    Tries each type in priority order (null > integer > number > boolean >
+    object > array > string) and returns the first successful coercion. When
+    no schema type matches, the value is parsed with ``json.loads`` and falls
+    back to the original string. Mirrors
+    ``vllm/tool_parsers/utils.py::coerce_to_schema_type``.
+    """
+    if isinstance(schema_type, str):
+        schema_type = [schema_type]
+
+    normalized_types = {
+        _TYPE_ALIASES.get(key, key) for t in schema_type for key in [t.strip().lower()]
+    }
+
+    for candidate_type in _TYPE_PRIORITY:
+        if candidate_type not in normalized_types:
+            continue
+
+        if candidate_type == "null":
+            if value.lower() == "null":
+                return None
+            continue
+        if candidate_type == "string":
+            return value
+        if candidate_type == "integer":
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                continue
+        if candidate_type == "number":
+            try:
+                val = float(value)
+            except (ValueError, TypeError):
+                continue
+            if not math.isfinite(val):
+                # inf/-inf/nan are not valid JSON numbers; keep the raw string.
+                continue
+            return val if val != int(val) else int(val)
+        if candidate_type == "boolean":
+            lower_val = value.lower().strip()
+            if lower_val in ("true", "1"):
+                return True
+            if lower_val in ("false", "0"):
+                return False
+            continue
+        if candidate_type in ("object", "array"):
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            if _is_json_finite(parsed):
+                return parsed
+            continue
+
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+    if not _is_json_finite(parsed):
+        return value
+    return parsed
 
 
 class _Qwen3CoderToolParser:
@@ -43,8 +230,13 @@ class _Qwen3CoderToolParser:
     def _get_arguments_config(
         self, func_name: str, tools: list[ChatCompletionToolsParam] | None
     ) -> dict:
-        """Extract argument configuration for a function."""
-        if tools is None:
+        """Return the ``properties`` schema of ``func_name``, or ``{}``.
+
+        Mirrors ``vllm/tool_parsers/utils.py::find_tool_properties``: only the
+        ``parameters.properties`` mapping drives coercion; a tool without it, or a
+        function that is not in ``tools``, leaves every argument a string.
+        """
+        if not tools:
             return {}
         for config in tools:
             if not isinstance(config, dict):
@@ -54,26 +246,26 @@ class _Qwen3CoderToolParser:
                 continue
             if config.get("type") != "function" or fn.get("name") != func_name:
                 continue
-            params = fn.get("parameters", {})
-            if isinstance(params, dict) and "properties" in params:
-                return params["properties"]
-            elif isinstance(params, dict):
-                return params
-            else:
+            params = fn.get("parameters") or {}
+            if not isinstance(params, dict):
                 return {}
+            properties = params.get("properties", {})
+            return properties if isinstance(properties, dict) else {}
         logger.debug("Tool '%s' is not defined in the tools list.", func_name)
         return {}
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
     ) -> Any:
-        """Convert parameter value based on its type in the schema."""
-        # Handle null value for any type
-        if param_value.lower() == "null":
-            return None
+        """Convert a parameter value according to its JSON Schema, like vLLM does.
 
-        if param_name not in param_config:
-            if param_config != {}:
+        Parameters absent from the schema (or whose schema is not a mapping) are
+        returned unchanged as strings; everything else goes through
+        ``_coerce_to_schema_type``.
+        """
+        schema = param_config.get(param_name) if param_config else None
+        if not isinstance(schema, dict):
+            if param_config:
                 logger.debug(
                     "Parsed parameter '%s' is not defined in the tool "
                     "parameters for tool '%s', directly returning the "
@@ -82,93 +274,7 @@ class _Qwen3CoderToolParser:
                     func_name,
                 )
             return param_value
-
-        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
-            param_type = str(param_config[param_name]["type"]).strip().lower()
-        elif isinstance(param_config[param_name], dict) and "anyOf" in param_config[param_name]:
-            # anyOf has no top-level "type"; treat as object to trigger json.loads.
-            param_type = "object"
-        else:
-            param_type = "string"
-        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
-            return param_value
-        elif (
-            param_type.startswith("int")
-            or param_type.startswith("uint")
-            or param_type.startswith("long")
-            or param_type.startswith("short")
-            or param_type.startswith("unsigned")
-        ):
-            try:
-                return int(param_value)
-            except (ValueError, TypeError):
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' is not an "
-                    "integer in tool '%s', degenerating to string.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-                return param_value
-        elif param_type.startswith("num") or param_type.startswith("float"):
-            try:
-                float_param_value = float(param_value)
-                return (
-                    float_param_value
-                    if float_param_value - int(float_param_value) != 0
-                    else int(float_param_value)
-                )
-            except (ValueError, TypeError):
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' is not a float "
-                    "in tool '%s', degenerating to string.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-                return param_value
-        elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
-            if param_value not in ["true", "false"]:
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' is not a boolean "
-                    "(`true` or `false`) in tool '%s', degenerating to "
-                    "false.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-            return param_value == "true"
-        else:
-            if (
-                param_type in ["object", "array", "arr"]
-                or param_type.startswith("dict")
-                or param_type.startswith("list")
-            ):
-                try:
-                    param_value = json.loads(param_value)
-                    return param_value
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    logger.debug(
-                        "Parsed value '%s' of parameter '%s' cannot be "
-                        "parsed with json.loads in tool '%s', will try "
-                        "other methods to parse it.",
-                        param_value,
-                        param_name,
-                        func_name,
-                    )
-            try:
-                param_value = ast.literal_eval(param_value)  # safer
-            except (ValueError, SyntaxError, TypeError):
-                logger.debug(
-                    "Parsed value '%s' of parameter '%s' cannot be "
-                    "converted via Python `ast.literal_eval()` in tool "
-                    "'%s', degenerating to string.",
-                    param_value,
-                    param_name,
-                    func_name,
-                )
-            return param_value
+        return _coerce_to_schema_type(param_value, _extract_types_from_schema(schema))
 
     def _parse_xml_function_call(
         self, function_call_str: str, tools: list[ChatCompletionToolsParam] | None
@@ -187,12 +293,9 @@ class _Qwen3CoderToolParser:
             if idx == -1:
                 continue
             param_name = match_text[:idx]
-            param_value = str(match_text[idx + 1 :])
-            # Remove prefix and trailing \n
-            if param_value.startswith("\n"):
-                param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
+            # vLLM strips all surrounding whitespace from the value (the model wraps
+            # values in newlines), not just a single leading/trailing newline.
+            param_value = str(match_text[idx + 1 :]).strip()
 
             param_dict[param_name] = self._convert_param_value(
                 param_value, param_name, param_config, function_name
@@ -248,7 +351,9 @@ class _Qwen3CoderToolParser:
             content_index = model_output.find(self.tool_call_start_token)
             idx = model_output.find(self.tool_call_prefix)
             content_index = content_index if content_index >= 0 else idx
-            content = model_output[:content_index]  # .rstrip()
+            # vLLM strips the content around tool calls
+            # (ParserEngineConfig.strip_content_whitespace_with_tools=True).
+            content = model_output[:content_index].strip()
 
             return ExtractedToolCallInformation(
                 tools_called=(len(tool_calls) > 0),
@@ -273,7 +378,8 @@ class Qwen3CoderToolParser(BaseParser):
     def parse(text: str, **kwargs) -> tuple[str, dict[str, list[dict]]]:
         """
         Extracts the tool calls from the text using <tool_call>...</tool_call> tags.
-        Uses the _Qwen3CoderToolParser class (copied from vLLM) to extract the tool calls.
+        Uses the _Qwen3CoderToolParser class (behaviourally aligned with vLLM's
+        Qwen3 parser engine) to extract the tool calls.
 
         Args:
             text (str): The text to parse.
