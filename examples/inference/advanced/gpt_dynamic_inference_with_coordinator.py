@@ -217,7 +217,7 @@ if __name__ == "__main__":
     with torch.inference_mode():
         args = parse_and_validate_args(
             extra_args_provider=add_inference_args,
-            args_defaults={'no_load_rng': True, 'no_load_optim': True},
+            args_defaults={'no_load_rng': True, 'no_load_optim': True, 'stream_ckpt_dequant': True},
         )
         initialize_megatron()
         configure_nvtx_profiling(True)

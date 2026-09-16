@@ -127,6 +127,7 @@ def main():
         args_defaults={
             'no_load_rng': True,
             'no_load_optim': True,
+            'stream_ckpt_dequant': True,
             'micro_batch_size': 1,
             'exit_on_missing_checkpoint': True,
         },

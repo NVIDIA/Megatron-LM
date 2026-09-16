@@ -223,6 +223,15 @@ class FullyParallelLoadStrategyWrapper:
         self.cached_distribution: Optional[ShardDistribution] = None
         self.cached_global_metadata: Optional[Metadata] = None
 
+    @property
+    def stream_ckpt_dequant(self) -> bool:
+        """Forwards the streaming dequantize flag of the wrapped strategy (see
+        `TorchDistLoadShardedStrategy`), so that `serialization.load` keeps the quantized
+        destinations in the state dict. Only the `broadcast` exchange supports it: it replicates
+        the raw quantized storage of the loading rank into the receivers' destinations (see
+        `exchange_loaded_tensors_broadcast_quantized`)."""
+        return getattr(self.base_strategy, "stream_ckpt_dequant", False)
+
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
     def load(
         self,
@@ -264,6 +273,12 @@ class FullyParallelLoadStrategyWrapper:
 
         if get_pg_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+
+        if self.stream_ckpt_dequant and self.exchange_algo != 'broadcast':
+            raise CheckpointingException(
+                'The streaming dequantize load (stream_ckpt_dequant) supports only the'
+                f' `broadcast` exchange algorithm, got `{self.exchange_algo}`.'
+            )
 
         # Step 1 and 2: exchange load metadata and distribute the load
         with debug_time("self.apply_loading_parallelization", logger):
@@ -340,6 +355,7 @@ class FullyParallelLoadStrategyWrapper:
                 precomputed_distribution,
                 self.parallelization_group,
                 self.exchange_algo,
+                exchange_quantized_storage=self.stream_ckpt_dequant,
             )
             if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
                 missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
