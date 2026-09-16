@@ -98,8 +98,8 @@ class TransformerConfig(ModelParallelConfig):
     At every MTP depth, each token independently draws its input from the main model
     hidden state and the outputs of the earlier depths, all aligned on the same target
     token. Only takes effect during training and requires at least two MTP layers,
-    since a single depth has nothing to mix. Model constructors disable it with a
-    warning when the resolved architecture has fewer than two MTP layers."""
+    since a single depth has nothing to mix. Model constructors validate this
+    against the resolved architecture."""
 
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
