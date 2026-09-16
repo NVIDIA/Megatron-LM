@@ -1,6 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import subprocess
+import sys
+import warnings
 from argparse import ArgumentParser
 from types import SimpleNamespace
 
@@ -21,14 +24,48 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize(
+        "imports",
+        [
+            (
+                "from megatron.core.inference.config import MambaInferenceStateConfig; "
+                "from megatron.core.ssm.mamba_layer import MambaLayer; "
+                "from megatron.core.ssm.gated_delta_net import GatedDeltaNet; "
+                "from megatron.core.transformer.attention import Attention"
+            ),
+            (
+                "from megatron.core.ssm.mamba_layer import MambaLayer; "
+                "from megatron.core.inference.config import MambaInferenceStateConfig"
+            ),
+            (
+                "from megatron.core.ssm.gated_delta_net import GatedDeltaNet; "
+                "from megatron.core.inference.config import MambaInferenceStateConfig"
+            ),
+            (
+                "from megatron.core.transformer.attention import Attention; "
+                "from megatron.core.inference.config import MambaInferenceStateConfig"
+            ),
+        ],
+    )
+    def test_layer_config_modules_do_not_create_inference_import_cycles(self, imports):
+        """Inference config and layer implementations import cleanly in either order."""
+        if Utils.rank != 0:
+            return
+        subprocess.run([sys.executable, "-c", imports], check=True)
+
     @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),
         [
@@ -47,29 +84,139 @@ class TestInferenceConfig:
             resolve_mxfp8_backend(grouped_gemm_backend)
 
     @staticmethod
-    def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):
+    def _hybrid_model(
+        layer_config_types,
+        model_experimental_attention_variant="gdn",
+        gdn_layer_experimental_attention_variant="gdn",
+    ):
+        layer_config_list = [
+            object.__new__(layer_config_type) for layer_config_type in layer_config_types
+        ]
+        for layer_config in layer_config_list:
+            if type(layer_config) is GDNLayerConfig:
+                layer_config.experimental_attention_variant = (
+                    gdn_layer_experimental_attention_variant
+                )
         return SimpleNamespace(
             config=SimpleNamespace(
                 params_dtype=torch.bfloat16,
                 batch_invariant_mode=False,
-                experimental_attention_variant=experimental_attention_variant,
+                experimental_attention_variant=model_experimental_attention_variant,
             ),
-            decoder=SimpleNamespace(layer_type_list=layer_type_list, layers=[]),
+            decoder=SimpleNamespace(
+                layer_config_list=layer_config_list,
+                layers=[SimpleNamespace() for _ in layer_config_list],
+                mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
+            ),
         )
 
     def test_mamba_inference_state_config_rejects_mixed_recurrent_layers(self):
         """Mamba and GDN cannot share one state shape and prefill chunk size."""
-        model = self._hybrid_model([Symbols.MAMBA, Symbols.GDN])
+        model = self._hybrid_model([MambaLayerConfig, GDNLayerConfig])
 
         with pytest.raises(ValueError, match="mixing Mamba and GDN"):
             MambaInferenceStateConfig.from_model(model)
 
     def test_mamba_inference_state_config_rejects_gdn2(self):
         """GDN2 should fail explicitly instead of missing the GDN inference hooks."""
-        model = self._hybrid_model([Symbols.GDN], experimental_attention_variant="gdn2")
+        model = self._hybrid_model(
+            [GDNLayerConfig],
+            model_experimental_attention_variant="gdn",
+            gdn_layer_experimental_attention_variant="gdn2",
+        )
 
         with pytest.raises(NotImplementedError, match="GDN2"):
             MambaInferenceStateConfig.from_model(model)
+
+    def test_mamba_inference_state_config_uses_gdn_layer_variant(self):
+        """A stale root GDN2 setting must not override the dispatched layer config."""
+        model = self._hybrid_model(
+            [GDNLayerConfig],
+            model_experimental_attention_variant="gdn2",
+            gdn_layer_experimental_attention_variant="gdn",
+        )
+
+        assert MambaInferenceStateConfig.from_model(model) is not None
+
+    def test_deprecated_layer_type_list_is_converted_to_layer_configs(self):
+        """Legacy positional construction produces complete, independent layer configs."""
+        root_config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
+
+        with pytest.warns(
+            DeprecationWarning,
+            match=r"DEPRECATED\(layer_type_list\): please use `layer_config_list` instead",
+        ):
+            state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA, Symbols.ATTENTION],
+                (16, 4),
+                (2, 8, 16),
+                torch.bfloat16,
+                torch.bfloat16,
+            )
+
+        layer_config_list = state_config.convert_layer_type_list(root_config)
+
+        assert [type(layer_config) for layer_config in layer_config_list] == [
+            MambaLayerConfig,
+            AttentionLayerConfig,
+        ]
+        assert all(
+            layer_config.hidden_size == root_config.hidden_size
+            for layer_config in layer_config_list
+        )
+        assert all(layer_config is not root_config for layer_config in layer_config_list)
+        assert len({id(layer_config) for layer_config in layer_config_list}) == 2
+        assert state_config.layer_config_list is layer_config_list
+        assert state_config.layer_type_list is None
+        assert dataclasses.replace(state_config).layer_config_list is layer_config_list
+
+    def test_layer_config_list_is_preserved_without_deprecation_warning(self):
+        """The config-list path preserves the supplied config objects."""
+        root_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+        layer_config_list = [MambaLayerConfig.from_config(root_config)]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            state_config = MambaInferenceStateConfig(
+                layer_type_list=None,
+                conv_states_shape=(16, 4),
+                ssm_states_shape=(2, 8, 16),
+                conv_states_dtype=torch.bfloat16,
+                ssm_states_dtype=torch.bfloat16,
+                layer_config_list=layer_config_list,
+            )
+
+        assert state_config.layer_config_list is layer_config_list
+
+    @pytest.mark.parametrize(
+        ("layer_type_list", "layer_config_list"),
+        [(None, None), ([Symbols.MAMBA], [object.__new__(MambaLayerConfig)])],
+    )
+    def test_layer_inputs_are_mutually_exclusive(self, layer_type_list, layer_config_list):
+        """Exactly one layer representation must be supplied."""
+        with pytest.raises(
+            ValueError, match="Exactly one of layer_type_list or layer_config_list must be provided"
+        ):
+            MambaInferenceStateConfig(
+                layer_type_list=layer_type_list,
+                conv_states_shape=(16, 4),
+                ssm_states_shape=(2, 8, 16),
+                conv_states_dtype=torch.bfloat16,
+                ssm_states_dtype=torch.bfloat16,
+                layer_config_list=layer_config_list,
+            )
+
+    @pytest.mark.parametrize("layer_type_list", [[Symbols.MAMBA * 2], [1]])
+    def test_deprecated_layer_type_list_requires_single_character_symbols(self, layer_type_list):
+        """Malformed legacy entries fail before normalization."""
+        with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
+            MambaInferenceStateConfig(
+                layer_type_list=layer_type_list,
+                conv_states_shape=(16, 4),
+                ssm_states_shape=(2, 8, 16),
+                conv_states_dtype=torch.bfloat16,
+                ssm_states_dtype=torch.bfloat16,
+            )
 
     def test_mutual_exclusivity_with_transformer_config(self):
         """
@@ -207,7 +354,7 @@ class TestInferenceConfig:
             position_embedding_type="rope",
             max_sequence_length=4096,
             pg_collection="pg",
-            decoder=SimpleNamespace(layer_type_list=None),
+            decoder=SimpleNamespace(layer_config_list=None),
         )
         kwargs = (
             {}
@@ -232,7 +379,7 @@ class TestInferenceConfig:
             position_embedding_type="rope",
             max_sequence_length=4096,
             pg_collection="pg",
-            decoder=SimpleNamespace(layer_type_list=None),
+            decoder=SimpleNamespace(layer_config_list=None),
         )
         setup_config = InferenceSetupConfig(
             inference_dynamic_batching_async_sched_mode="async",
@@ -274,7 +421,7 @@ class TestInferenceConfig:
             position_embedding_type="rope",
             max_sequence_length=4096,
             pg_collection="pg",
-            decoder=SimpleNamespace(layer_type_list=None),
+            decoder=SimpleNamespace(layer_config_list=None),
         )
         setup_config = InferenceSetupConfig(offset_sampling_seed_by_dp_rank=False)
 
@@ -288,13 +435,47 @@ class TestInferenceConfig:
 
         assert inference_config.offset_sampling_seed_by_dp_rank is False
 
+    def test_mamba_state_config_uses_exact_layer_config_types(self, monkeypatch):
+        """Model-derived Mamba metadata comes from exact layer config types."""
+
+        attention_config = object.__new__(AttentionLayerConfig)
+        mamba_layer_config = object.__new__(MambaLayerConfig)
+        decoder = SimpleNamespace(
+            layer_config_list=[attention_config, mamba_layer_config],
+            layers=[
+                SimpleNamespace(mixer=SimpleNamespace(chunk_size=16)),
+                SimpleNamespace(mixer=SimpleNamespace(chunk_size=64)),
+            ],
+            mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(batch_invariant_mode=False, params_dtype=torch.bfloat16)
+        )
+        monkeypatch.setattr(
+            "megatron.core.inference.config.get_attr_wrapped_model",
+            lambda *_args, **_kwargs: decoder,
+        )
+
+        mamba_state_config = MambaInferenceStateConfig.from_model(model)
+
+        assert mamba_state_config is not None
+        assert mamba_state_config.layer_config_list[0] is attention_config
+        assert mamba_state_config.layer_config_list[1] is mamba_layer_config
+        assert mamba_state_config.conv_states_shape == (4, 8)
+        assert mamba_state_config.ssm_states_shape == (8, 32, 16)
+        assert mamba_state_config.conv_states_dtype is torch.bfloat16
+        assert mamba_state_config.ssm_states_dtype is torch.bfloat16
+        assert mamba_state_config.mamba_chunk_size == 64
+
+        decoder.layer_config_list = [attention_config]
+        decoder.layers = decoder.layers[:1]
+        assert MambaInferenceStateConfig.from_model(model) is None
+
 
 def _ssm_model(mixers):
     """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
-    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-
     decoder = SimpleNamespace(
-        layer_type_list=[Symbols.MAMBA] * len(mixers),
+        layer_config_list=[object.__new__(MambaLayerConfig) for _ in mixers],
         layers=[SimpleNamespace(mixer=mixer) for mixer in mixers],
         mamba_state_shapes_per_request=lambda: ((16, 4), (2, 8, 16)),
     )
@@ -355,11 +536,10 @@ class TestSSMChunkAlignment:
     @pytest.mark.internal
     def test_stack_without_a_recurrent_layer_reports_no_chunking(self):
         """A pipeline stage of pure attention/MLP layers has nothing to report."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
         from megatron.core.ssm.ssm_inference import ssm_chunking
 
-        layer_types = [Symbols.ATTENTION, Symbols.MLP]
-        assert ssm_chunking(layer_types, [SimpleNamespace(), SimpleNamespace()]) is None
+        layer_configs = [object.__new__(AttentionLayerConfig), object.__new__(MLPLayerConfig)]
+        assert ssm_chunking(layer_configs, [SimpleNamespace(), SimpleNamespace()]) is None
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -395,7 +575,8 @@ class TestSSMChunkAlignment:
     def test_alignment_defaults_to_the_mamba_chunk_size(self):
         """Hand-built configs that predate the field keep their old behaviour."""
         config = MambaInferenceStateConfig(
-            layer_type_list=["M"],
+            layer_type_list=None,
+            layer_config_list=[object.__new__(MambaLayerConfig)],
             conv_states_shape=(16, 4),
             ssm_states_shape=(2, 8, 16),
             conv_states_dtype=torch.bfloat16,

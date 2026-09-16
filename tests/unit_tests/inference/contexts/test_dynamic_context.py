@@ -20,10 +20,21 @@ from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampl
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def make_layer_configs(*config_types):
+    """Create marker configs without initializing their inherited TransformerConfig fields."""
+    return [object.__new__(config_type) for config_type in config_types]
 
 
 @contextlib.contextmanager
@@ -90,6 +101,7 @@ class TestDynamicContext:
         block_size_tokens,
         max_tokens,
         is_hybrid_model=False,
+        layer_config_list=None,
         layer_type_list=None,
         paused_buffer_size_gb=None,
         num_cuda_graphs=None,
@@ -98,16 +110,19 @@ class TestDynamicContext:
         max_requests: int = None,
     ):
         if is_hybrid_model:
-            if layer_type_list is None:
-                layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+            if layer_config_list is None and layer_type_list is None:
+                layer_config_list = make_layer_configs(
+                    MambaLayerConfig, MLPLayerConfig, AttentionLayerConfig, MLPLayerConfig
+                )
             mamba_conv_states_shape = (544, 4)
             mamba_ssm_states_shape = (8, 64, 16)
             mamba_inference_state_config = MambaInferenceStateConfig(
-                layer_type_list,
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
+                layer_type_list=layer_type_list,
+                conv_states_shape=mamba_conv_states_shape,
+                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_dtype=params_dtype,
+                ssm_states_dtype=params_dtype,
+                layer_config_list=layer_config_list,
             )
         else:
             mamba_inference_state_config = None
@@ -179,6 +194,73 @@ class TestDynamicContext:
 
         # Check initializations to -1
         assert torch.all(dynamic_context.request_ids == -1)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_cache_maps_use_exact_layer_config_types(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=3,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_config_list=make_layer_configs(MambaLayerConfig, DSALayerConfig, MoELayerConfig),
+        )
+
+        assert dynamic_context.num_attention_layers == 1
+        assert dynamic_context.num_mamba_layers == 1
+        assert dynamic_context.layer_map == {0: 0, 1: 0}
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_cache_maps_normalize_deprecated_layer_type_list(self):
+        """Dynamic inference converts legacy symbols before deriving cache maps."""
+        with pytest.warns(
+            DeprecationWarning,
+            match=r"DEPRECATED\(layer_type_list\): please use `layer_config_list` instead",
+        ):
+            dynamic_context = self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=3,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=128,
+                max_tokens=None,
+                is_hybrid_model=True,
+                layer_type_list=[Symbols.MAMBA, Symbols.DS_ATTENTION, Symbols.MOE],
+            )
+
+        assert dynamic_context.num_attention_layers == 1
+        assert dynamic_context.num_mamba_layers == 1
+        assert dynamic_context.layer_map == {0: 0, 1: 0}
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_cache_maps_share_recurrent_indices_for_mamba_and_gdn(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=3,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_config_list=make_layer_configs(
+                MambaLayerConfig, AttentionLayerConfig, GDNLayerConfig
+            ),
+        )
+
+        assert dynamic_context.num_attention_layers == 1
+        assert dynamic_context.num_mamba_layers == 2
+        assert dynamic_context.layer_map == {0: 0, 1: 0, 2: 1}
 
     @pytest.mark.internal
     def test_is_static_batching(self):
@@ -775,7 +857,9 @@ class TestDynamicContext:
             block_size_tokens=8,
             max_tokens=None,
             is_hybrid_model=True,
-            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+            layer_config_list=make_layer_configs(
+                MambaLayerConfig, AttentionLayerConfig, MLPLayerConfig, AttentionLayerConfig
+            ),
         )
 
         request = DynamicInferenceRequest(
@@ -1032,7 +1116,7 @@ class TestDynamicContext:
             max_requests=8,
             num_speculative_tokens=num_speculative_tokens,
             is_hybrid_model=is_hybrid_model,
-            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
+            layer_config_list=make_layer_configs(MambaLayerConfig, AttentionLayerConfig),
         )
 
     @staticmethod
@@ -1609,7 +1693,9 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
-            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MAMBA, Symbols.ATTENTION],
+            layer_config_list=make_layer_configs(
+                MambaLayerConfig, AttentionLayerConfig, MambaLayerConfig, AttentionLayerConfig
+            ),
         )
 
         # Add a request to populate states
@@ -1628,7 +1714,7 @@ class TestDynamicContext:
         # Manually set some dummy values in mamba_conv_states and mamba_ssm_states
         # Mamba layers are at global indices 0 and 2 (mapped to local 0 and 1 via layer_map)
         # `layer_map` will map global layer index to the corresponding Mamba/Attention index.
-        # For layer_type_list ["MAMBA", "ATTENTION", "MAMBA", "ATTENTION"],
+        # For alternating Mamba and attention layer configs,
         # global layer 1 (index 0) is MAMBA -> local mamba layer 0
         # global layer 3 (index 2) is MAMBA -> local mamba layer 1
 
@@ -1989,19 +2075,25 @@ class TestDynamicContext:
 
         if rank == 0:
             mamba_inference_state_config = MambaInferenceStateConfig(
-                [Symbols.MAMBA] + [Symbols.ATTENTION] * 4,
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
+                layer_type_list=None,
+                conv_states_shape=mamba_conv_states_shape,
+                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_dtype=params_dtype,
+                ssm_states_dtype=params_dtype,
+                layer_config_list=make_layer_configs(
+                    *([MambaLayerConfig] + [AttentionLayerConfig] * 4)
+                ),
             )
         else:
             mamba_inference_state_config = MambaInferenceStateConfig(
-                [Symbols.MAMBA] * 4 + [Symbols.ATTENTION],
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
+                layer_type_list=None,
+                conv_states_shape=mamba_conv_states_shape,
+                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_dtype=params_dtype,
+                ssm_states_dtype=params_dtype,
+                layer_config_list=make_layer_configs(
+                    *([MambaLayerConfig] * 4 + [AttentionLayerConfig])
+                ),
             )
 
         context = DynamicInferenceContext(
@@ -2145,15 +2237,16 @@ class TestDynamicContext:
         kv_channels = 64
         params_dtype = torch.float32
 
-        layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        layer_config_list = make_layer_configs(MambaLayerConfig, AttentionLayerConfig)
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            layer_type_list,
-            mamba_conv_states_shape,
-            mamba_ssm_states_shape,
-            params_dtype,
-            params_dtype,
+            layer_type_list=None,
+            conv_states_shape=mamba_conv_states_shape,
+            ssm_states_shape=mamba_ssm_states_shape,
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
+            layer_config_list=layer_config_list,
         )
 
         context = DynamicInferenceContext(
@@ -2227,15 +2320,16 @@ class TestDynamicContext:
         kv_channels = 64
         params_dtype = torch.float32
 
-        layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        layer_config_list = make_layer_configs(MambaLayerConfig, AttentionLayerConfig)
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            layer_type_list,
-            mamba_conv_states_shape,
-            mamba_ssm_states_shape,
-            params_dtype,
-            params_dtype,
+            layer_type_list=None,
+            conv_states_shape=mamba_conv_states_shape,
+            ssm_states_shape=mamba_ssm_states_shape,
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
+            layer_config_list=layer_config_list,
         )
 
         context = DynamicInferenceContext(
@@ -2348,8 +2442,10 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
-            layer_type_list=(
-                [Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION]
+            layer_config_list=(
+                make_layer_configs(
+                    MambaLayerConfig, AttentionLayerConfig, MLPLayerConfig, AttentionLayerConfig
+                )
                 if is_hybrid_model
                 else None
             ),
@@ -2461,7 +2557,7 @@ class TestDynamicContext:
             block_size_tokens=4,
             max_tokens=None,
             is_hybrid_model=True,
-            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
+            layer_config_list=make_layer_configs(MambaLayerConfig, AttentionLayerConfig),
             enable_chunked_prefill=True,
         )
 

@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Sequence
+
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -88,6 +90,32 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
         if type(layer_config) is config_type:
             return symbol
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
+
+
+def contains_layer_config(
+    layer_config_type: type[TransformerConfig], layer_config_list: Sequence[TransformerConfig]
+) -> bool:
+    """Return whether a layer config list contains an exact config type.
+
+    Args:
+        layer_config_type: Layer config type to find.
+        layer_config_list: Per-layer configs to search.
+
+    Returns:
+        Whether a config whose exact type is ``layer_config_type`` is present.
+
+    Raises:
+        ValueError: If the requested or supplied config type is unsupported.
+    """
+    valid_config_types = set(Symbols.LAYER_CONFIG_MAP.values())
+    if layer_config_type not in valid_config_types:
+        raise ValueError(f"Unexpected hybrid layer config type: {layer_config_type.__name__}")
+
+    for layer_config in layer_config_list:
+        if type(layer_config) not in valid_config_types:
+            raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
+
+    return any(type(layer_config) is layer_config_type for layer_config in layer_config_list)
 
 
 def validate_tp_comm_overlap(
