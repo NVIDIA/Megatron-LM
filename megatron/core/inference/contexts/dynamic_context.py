@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -264,6 +264,13 @@ class PrefixMatch:
     prefix_skip_tokens: int
     effective_prefill_chunk_length: int
     backed_off_blocks: int = 0
+    backed_off_block_ids: list = field(default_factory=list)
+    """Blocks matched by hash but declined for draft-KV reasons. They stay the producer's, but
+    must be pinned across this request's allocation: they are still this chain's parents, and
+    evicting one leaves a registered block above a missing hash -- a hole that breaks both the
+    backward scan in `_find_kv_match_count` and the leaf-inward ordering in `evict_lru_blocks`."""
+    speculative_reserve_blocks: int = 0
+    """Extra block held for the draft loop's writes past the prompt; see `_compute_prefix_match`."""
 
 
 class DynamoHelper:
@@ -3224,16 +3231,35 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         overall_required_blocks = (
             finished + prefill_chunk_length + self.block_size_tokens - 1
         ) // self.block_size_tokens
+        # Extra block the draft loop needs beyond the prompt. It runs in the SAME step as this
+        # prefill, writing `num_speculative_tokens` positions past the prompt's last, so it can
+        # cross into the next block. Decode keeps that headroom by pausing a request whose last
+        # block is within D+1 of full (`update_requests` step 5) before it ever enters such a
+        # step; a prefill has nothing to pause into, so it reserves the block up front.
+        #
+        # Deliberately NOT folded into `overall_required_blocks`: that value means "blocks this
+        # prompt occupies" and also bounds the hash-match range, names the last token-bearing
+        # block, and drives the Mamba boundary store. Only the pool draw and the block count
+        # may grow.
+        speculative_reserve_blocks = 0
+        if self.num_speculative_tokens > 0:
+            last_block_offset = (finished + prefill_chunk_length - 1) % self.block_size_tokens
+            if last_block_offset >= self.block_size_tokens - 1 - self.num_speculative_tokens:
+                speculative_reserve_blocks = 1
 
         # Fast path: skip all prefix matching when disabled.
         if not self.enable_prefix_caching:
             return PrefixMatch(
                 matched_block_ids=[],
-                num_blocks_from_pool=max(0, overall_required_blocks - already_allocated_blocks),
+                num_blocks_from_pool=max(
+                    0,
+                    overall_required_blocks + speculative_reserve_blocks - already_allocated_blocks,
+                ),
                 already_allocated_blocks=already_allocated_blocks,
                 overall_required_blocks=overall_required_blocks,
                 prefix_skip_tokens=0,
                 effective_prefill_chunk_length=prefill_chunk_length,
+                speculative_reserve_blocks=speculative_reserve_blocks,
             )
 
         matched_block_ids, _ = self._find_kv_match_count(
@@ -3254,9 +3280,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # everything downstream depends on. Named `mtp_backed_off_blocks` because the Mamba
         # branch below binds `backed_off_blocks` for an unrelated purpose.
         mtp_backed_off_blocks = 0
+        mtp_backed_off_block_ids: list = []
         if self.enable_mtp_kv_cache and matched_block_ids:
             if self.mtp_metadata.chunk_boundary_req_id == req.request_id:
                 mtp_backed_off_blocks = len(matched_block_ids)
+                mtp_backed_off_block_ids = matched_block_ids
                 matched_block_ids = []
             else:
                 keep = len(matched_block_ids)
@@ -3279,6 +3307,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                         keep = k
                         break
                 mtp_backed_off_blocks = len(matched_block_ids) - keep
+                mtp_backed_off_block_ids = matched_block_ids[keep:]
                 matched_block_ids = matched_block_ids[:keep]
 
         num_matched = len(matched_block_ids)
@@ -3356,7 +3385,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
-            0, overall_required_blocks - already_allocated_blocks - num_matched
+            0,
+            overall_required_blocks
+            + speculative_reserve_blocks
+            - already_allocated_blocks
+            - num_matched,
         )
 
         return PrefixMatch(
@@ -3367,6 +3400,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             prefix_skip_tokens=prefix_skip_tokens,
             effective_prefill_chunk_length=effective_prefill_chunk_length,
             backed_off_blocks=mtp_backed_off_blocks,
+            backed_off_block_ids=mtp_backed_off_block_ids,
+            speculative_reserve_blocks=speculative_reserve_blocks,
         )
 
     def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
@@ -3514,6 +3549,19 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
 
+        # Blocks the draft-KV back-off declined are still this chain's parents. They are not
+        # ours to keep, but the allocation below could evict them -- they are unpinned and the
+        # producer may have finished -- and the blocks we register afterwards hang off them.
+        # Losing one leaves a registered hash above a missing one, which breaks the "if hash N
+        # exists, all hashes 0..N exist" assumption that `_find_kv_match_count` subscripts on
+        # and that `evict_lru_blocks` orders by. Hold them until registration is done.
+        backed_off_tensor = None
+        if match.backed_off_block_ids:
+            backed_off_tensor = torch.tensor(
+                match.backed_off_block_ids, dtype=torch.int32, device='cpu'
+            )
+            self.kv_block_allocator.block_ref_counts[backed_off_tensor] += 1
+
         new_block_ids = None
         if num_blocks_from_pool > 0:
             new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
@@ -3522,6 +3570,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 # the matched blocks (which would make them permanently unevictable).
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
+                if backed_off_tensor is not None:
+                    self.kv_block_allocator.block_ref_counts[backed_off_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
 
         # Track prefix cache hits only after allocation succeeds. Matched blocks
@@ -3585,7 +3635,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             ] = new_block_ids
 
         self.request_kv_length_offsets[current_id] = effective_kv_offset
-        self.request_kv_block_counts[current_id] = overall_required_blocks
+        self.request_kv_block_counts[current_id] = (
+            overall_required_blocks + match.speculative_reserve_blocks
+        )
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
             overall_required_blocks - 1
         ]
@@ -3798,6 +3850,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             req.num_matched_prefix_blocks = already_allocated_blocks + num_matched_blocks
         # Mirror onto the context for the MTP commit pass, which cannot reach `req`.
         self.request_matched_prefix_blocks[current_id] = req.num_matched_prefix_blocks
+
+        # Allocation and registration are both done, so the declined parents no longer need
+        # protecting from this request. Release them to whatever the producer left them at.
+        if backed_off_tensor is not None:
+            self.kv_block_allocator.block_ref_counts[backed_off_tensor] -= 1
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length

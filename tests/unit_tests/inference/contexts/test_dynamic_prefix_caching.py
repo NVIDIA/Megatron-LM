@@ -3401,7 +3401,15 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
-    def test_back_off_costs_exactly_one_extra_block_from_the_pool(self):
+    def test_mtp_draws_two_extra_blocks_from_the_pool(self):
+        """One block for the back-off, one for the draft loop's speculative headroom.
+
+        The back-off gives up the last matched block and recomputes it privately. Separately,
+        a prefill reserves a block when its last one is within D+1 of full, because the draft
+        loop runs in the same step and writes past the prompt's final position -- decode keeps
+        that headroom by pausing, which a prefill cannot do. The sibling's prompt is a whole
+        number of blocks here, so the reservation always fires.
+        """
         bs = None
         drawn = {}
         for mtp_on in (False, True):
@@ -3414,7 +3422,7 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
             ctx.add_request(self._req(ctx, s_prompt, request_id=2))
             drawn[mtp_on] = avail - alloc.pool_avail
 
-        assert drawn[True] == drawn[False] + 1
+        assert drawn[True] == drawn[False] + 2
 
     @pytest.mark.internal
     def test_a_single_matched_block_is_given_up_entirely(self):
@@ -3465,6 +3473,66 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert s_blocks[:2] == p_blocks[:2]
         assert s_blocks[2] != p_blocks[2]
         self._assert_hash_registry_is_injective(alloc)
+
+    @pytest.mark.internal
+    def test_backed_off_blocks_survive_the_allocation_that_follows_them(self):
+        """A declined block is still this chain's parent, so our allocation must not evict it.
+
+        The back-off drops a matched block without inheriting it, and the sibling then
+        allocates its own. Those declined blocks are unpinned and sit at ref_count 0 once the
+        producer finishes, so the allocation can evict them -- while the blocks the sibling
+        registers afterwards hang off their hashes. Losing one leaves a registered hash above a
+        missing one, and that hole breaks two things at once: `_find_kv_match_count` scans
+        backwards for the last present hash and then subscripts every hash below it, and
+        `evict_lru_blocks` only treats a block as evictable once its child count reaches zero.
+        """
+        ctx = self._mtp_ctx()
+        alloc = ctx.kv_block_allocator
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3, tail_blocks=2)
+
+        producer = self._req(ctx, p_prompt)
+        ctx.add_request(producer)
+        p_blocks = self._block_ids(ctx, 0, 5)
+        # Release the producer so its blocks are cached at ref_count 0 -- i.e. evictable, which
+        # is the state that makes the declined blocks vulnerable.
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.int32))
+
+        # Drain the free pool so the sibling's allocation can only be satisfied by evicting,
+        # and the producer's released blocks are the only eviction candidates. Not
+        # `_fill_pool_with_one_evictable_block`: that helper asserts exactly one evictable
+        # block, which is incompatible with having just released a whole chain.
+        held = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert alloc.pool_avail == 0, "pool was not drained, so no eviction will be forced"
+        assert int(alloc.get_evictable_block_count()) > 0, "producer's blocks are not evictable"
+        del held
+
+        sibling = self._req(ctx, s_prompt, request_id=2)
+        match = ctx._compute_prefix_match(sibling, len(s_prompt))
+        assert match.backed_off_blocks > 0, "fixture produced no back-off, so nothing is at risk"
+        declined = list(match.backed_off_block_ids)
+        assert declined, "back-off reported a count but no block ids to pin"
+
+        declined_hashes = [alloc.block_hashes[b].item() for b in declined]
+        assert all(h != -1 for h in declined_hashes), "declined blocks were not registered"
+
+        try:
+            ctx.add_request(sibling, prefill_chunk_length=len(s_prompt))
+        except Exception:  # pool exhaustion is a valid outcome; the pin must still be released
+            pass
+
+        for block_id, block_hash in zip(declined, declined_hashes):
+            assert alloc.block_hashes[block_id].item() == block_hash, (
+                f"declined block {block_id} was evicted during the sibling's allocation, "
+                f"leaving a hole in the hash chain it parents"
+            )
+
+        self._assert_hash_registry_is_injective(alloc)
+        # The pin is transient: holding it past `add_request` would make the producer's blocks
+        # permanently unevictable.
+        for block_id in declined:
+            assert (
+                alloc.block_ref_counts[block_id].item() == 0
+            ), f"declined block {block_id} kept a reference after add_request returned"
 
     @pytest.mark.internal
     def test_a_recycled_block_carries_no_stale_lookahead_token(self):

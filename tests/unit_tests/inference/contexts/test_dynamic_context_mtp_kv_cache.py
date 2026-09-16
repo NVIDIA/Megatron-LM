@@ -21,7 +21,7 @@ The invariants asserted are the ones the draft attention depends on: write posit
 padding rows that never index real KV.
 """
 
-import math
+import types
 
 import pytest
 import torch
@@ -542,17 +542,24 @@ class TestMtpDraftBlockCoverage:
 
     @staticmethod
     def _blocks_for(context, num_positions):
-        """Block ids the main path would own after writing `num_positions`, incl. speculative."""
-        # `request_last_kv_block_offset` is the LAST WRITTEN token's index within its block
-        # (`(length - 1) % block_size`), not a token count, so an exactly-full block reports
-        # `block_size - 1` and trips the pre-allocation below.
-        offset_in_last = (num_positions - 1) % context.block_size_tokens
-        num_blocks = math.ceil(num_positions / context.block_size_tokens)
-        # Main pre-allocates one more once the last block is within D+1 of full.
-        if offset_in_last >= context.block_size_tokens - 1 - context.num_speculative_tokens:
-            num_blocks += 1
+        """Block ids a request owns after prefilling `num_positions`, per the REAL allocator.
+
+        Asks `_compute_prefix_match` for the block count rather than reimplementing the rule.
+        An earlier version of this helper modelled the allocation itself, agreed with the very
+        assumption that was wrong, and so passed while the draft loop was writing to block -1.
+        """
+        req = types.SimpleNamespace(
+            request_id=1,
+            finished_chunk_token_count=0,
+            prompt_tokens=torch.arange(num_positions, dtype=torch.int64),
+            precomputed_block_hashes=[],
+        )
+        match = context._compute_prefix_match(req, num_positions)
+        # `overall_required_blocks` is what the PROMPT occupies; the draft loop's extra block is
+        # carried separately, and the request owns both.
+        owned = match.overall_required_blocks + match.speculative_reserve_blocks
         # Block 0 is the dummy block, so start real ids at 1.
-        return list(range(1, num_blocks + 1))
+        return list(range(1, owned + 1))
 
     @pytest.mark.parametrize("prompt_length", list(range(1, 2 * BLOCK_SIZE_TOKENS + 1)))
     def test_every_draft_depth_lands_on_an_allocated_block(self, prompt_length):

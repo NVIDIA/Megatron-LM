@@ -550,8 +550,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         add_request(1)
         while env.engine.has_unfinished_requests():
             result = env.engine.step_modern()
-            for record in result["finished_request_records"]:
-                request = record.merge()
+            # `DynamicInferenceEngineStepResult` hands back already-merged requests; there is
+            # no record to merge.
+            for request in result["finished_requests"]:
                 outputs[request.request_id] = list(request.generated_tokens)
         return env, outputs
 
@@ -808,6 +809,18 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         if enable_chunked_prefill:
             assert saw_chunking, "no request was ever chunked, so the seam path never ran"
 
+        # No MTP write -- commit pass or draft loop -- may target an unallocated block table
+        # column. `-1` is the table's empty fill, so it means the request reached past what the
+        # main path allocated for it. The draft loop writes D+1 speculative positions past the
+        # committed range, which the coverage check above does not reach, so this is the only
+        # guard on that tail.
+        unallocated = sorted({(b, sl) for b, sl in written if b < 0})
+        assert not unallocated, (
+            f"MTP draft KV written to unallocated block column(s) {unallocated[:8]}; the draft "
+            f"loop outran the main path's block pre-allocation. "
+            f"chunked_prefill={enable_chunked_prefill}, prefix_caching={enable_prefix_caching}"
+        )
+
         # No MTP draft-KV write may land in a block another request is reading. The main KV
         # path redirects such writes to the dummy block; if this fires, the MTP path needs the
         # same redirect in `_mtp_setup_prefill_step`.
@@ -912,12 +925,17 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             _orig_match = context._compute_prefix_match
 
             def _traced_match(req, *args, **kwargs):
+                # Force the Mamba count to be recorded: on a hybrid model it, not the KV match,
+                # decides the skip, so a trace without it cannot tell "matched nothing" from
+                # "matched but the Mamba state was not cached".
+                kwargs["record_mamba_match"] = True
                 m = _orig_match(req, *args, **kwargs)
                 trace.append(
                     f"req={req.request_id} finished={req.finished_chunk_token_count} "
                     f"chunk={args[0] if args else kwargs.get('prefill_chunk_length')} "
                     f"matched={len(m.matched_block_ids)} backed_off={m.backed_off_blocks} "
                     f"skip={m.prefix_skip_tokens} "
+                    f"mamba={getattr(req, '_mamba_num_matched_blocks', 'n/a')} "
                     # The hash map exists only when prefix caching is on; the oracle run has
                     # no registry at all.
                     f"registry={len(getattr(alloc, 'kv_hash_to_block_id', ()))}"
