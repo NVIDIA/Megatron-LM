@@ -228,6 +228,35 @@ class MegatronOptimizer(ABC):
         """Stage optimizer-owned model params before an explicit DDP param sync."""
         return
 
+    def _stage_model_params_from_main_params(self) -> None:
+        """Re-derive this optimizer's model params from its FP32 main params.
+
+        Does not zero any shared buffer and does not all-gather; both are the caller's
+        responsibility so that optimizers sharing a DDP model chunk can be staged together.
+        See :meth:`quantize_and_sync_model_params_from_main_params`.
+        """
+        return
+
+    @torch.no_grad()
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive the model params from the main params, then all-gather them.
+
+        Runs the same main-to-model copy an optimizer step performs, quantizing where the
+        model params are quantized, and follows it with a *synchronous* param all-gather.
+        Exposed so it can be run after the main params are restored from a checkpoint.
+
+        Not for use inside the training loop: the all-gather is forced synchronous and would
+        defeat the overlapped param gather. The training loop reaches the same copy through
+        :meth:`step_with_ready_grads`.
+
+        Quantized model params (MXFP8, NVFP4) are stored dequantized and carry no block
+        scales, so loading them re-quantizes a value that has already been through one
+        quantization round trip, which need not land on the same block scales the saving job
+        chose from its main params. Re-deriving the model params from those main params
+        reproduces the saved weights exactly.
+        """
+        self._stage_model_params_from_main_params()
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -371,6 +400,20 @@ class MegatronOptimizer(ABC):
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
 
+    def _uses_decoupled_grad(self, param_list) -> bool:
+        """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`."""
+        if hasattr(param_list[0], "_mfsdp_parameter_group"):
+            # MFSDP v2 always reduces directly into `.grad`.
+            return False
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return True
+        if self.config.use_precision_aware_optimizer and getattr(
+            param_list[0], "__fsdp_param__", False
+        ):
+            # MFSDP v1 always uses decoupled_grad with FusedAdam.
+            return True
+        return False
+
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads.
 
@@ -385,13 +428,6 @@ class MegatronOptimizer(ABC):
             # Only reduce group grad norms when clipping can use them.
             self._compute_grad_norms_by_group()
 
-            def use_decoupled_grad(param_list):
-                return self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
-                    # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                    self.config.use_precision_aware_optimizer
-                    and getattr(param_list[0], "__fsdp_param__", False)
-                )
-
             main_params = []
             params_by_grad_norm_group = {}
             for p in params:
@@ -405,7 +441,7 @@ class MegatronOptimizer(ABC):
                     main_params,
                     clip_grad,
                     grad_norm,
-                    use_decoupled_grad=use_decoupled_grad(main_params),
+                    use_decoupled_grad=self._uses_decoupled_grad(main_params),
                 )
             for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
                 group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
@@ -415,7 +451,7 @@ class MegatronOptimizer(ABC):
                     grouped_params,
                     clip_grad,
                     group_grad_norm,
-                    use_decoupled_grad=use_decoupled_grad(grouped_params),
+                    use_decoupled_grad=self._uses_decoupled_grad(grouped_params),
                 )
         return grad_norm
 
@@ -425,12 +461,7 @@ class MegatronOptimizer(ABC):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-            or (
-                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                self.config.use_precision_aware_optimizer
-                and getattr(params[0], "__fsdp_param__", False)
-            ),
+            use_decoupled_grad=self._uses_decoupled_grad(params),
             tp_group=getattr(self, 'tp_group', None),
             expert_tp_group=getattr(self, 'expert_tp_group', None),
         )
@@ -703,6 +734,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def reload_model_params(self, state_dict=None):
         if self.param_groups:
             self._copy_model_params_to_main_params(state_dict=state_dict)
+
+    @override
+    def _stage_model_params_from_main_params(self) -> None:
+        if getattr(self, 'is_stub_optimizer', False):
+            return
+        self._copy_main_params_to_model_params()
 
     def _unscale_main_grads_and_check_for_nan(self):
 
@@ -1575,6 +1612,34 @@ class ChainedOptimizer(MegatronOptimizer):
         state_dicts = self._split_state_dict(state_dict)
         for idx, optimizer in enumerate(self.chained_optimizers):
             optimizer.reload_model_params(state_dict=state_dicts[idx])
+
+    @override
+    def _stage_model_params_from_main_params(self) -> None:
+        # A ChainedOptimizer can itself be a member of another chain -- a
+        # LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one.
+        # Without this the nested chain inherits the base no-op and its params, which are
+        # the quantized weights under Muon, are never re-derived.
+        if self.is_stub_optimizer:
+            return
+        for optimizer in self.chained_optimizers:
+            optimizer._stage_model_params_from_main_params()
+
+    @override
+    @torch.no_grad()
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive and all-gather the model params (see MegatronOptimizer)."""
+        # A rank with no trainable parameters gets an empty chain, and __init__ leaves
+        # self.config unset in that case, so nothing here may read it.
+        if self.is_stub_optimizer:
+            return
+        for optimizer in self.chained_optimizers:
+            optimizer._stage_model_params_from_main_params()
+        # self.model_chunks, not a walk over the members: __init__ collects chunks only from
+        # members that expose a model_chunks attribute, which Float16OptimizerWithFloat16Params
+        # does not. LayerWiseDistributedOptimizer therefore reassigns self.model_chunks after
+        # super().__init__(), and recomputing here would discard that and gather nothing.
+        for model_chunk in self.model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
 
     def state_dict(self):
         if len(self.chained_optimizers) == 1:

@@ -11,6 +11,7 @@ from packaging import version
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text import MegatronTokenizerText
 from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
+from megatron.core.tokenizers.text.libraries.sft_tokenizer import IGNORE_INDEX
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
@@ -490,6 +491,123 @@ def test_multimodal_tokenizer():
     ]
 
 
+def test_multimodal_gigatoken_tokenizer():
+    """Test gigatoken MegatronMultimodalTokenizer."""
+    prompt_format = "qwen2p0"
+    special_tokens = ["<image>"]
+    image_tag_type = "nvlm"
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "multimodal"},
+        prompt_format=prompt_format,
+        special_tokens=special_tokens,
+        image_tag_type=image_tag_type,
+        use_gigatoken=True,
+    )
+
+    assert tokenizer._tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
+
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"
+
+    # Try converting tokens to ids.
+    assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
+
+    assert tokenizer._tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
+    assert tokenizer._tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
+        {"role": "user", "content": "<Image><image></Image>hello"}
+    ]
+
+
+def test_multimodal_matches_gigatoken_tokenizer():
+    """Test default MegatronMultimodalTokenizer matches gigatoken."""
+    prompt_format = "qwen2p0"
+    special_tokens = ["<image>"]
+    image_tag_type = "nvlm"
+    tokenizer_default = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "multimodal"},
+        prompt_format=prompt_format,
+        special_tokens=special_tokens,
+        image_tag_type=image_tag_type,
+        use_gigatoken=False,
+    )
+    tokenizer_gigatoken = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "multimodal"},
+        prompt_format=prompt_format,
+        special_tokens=special_tokens,
+        image_tag_type=image_tag_type,
+        use_gigatoken=True,
+    )
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    # Test tokenization with return_target=False
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with add_generation_prompt=True
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with return_target=True
+    conv_tokens_default, target_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    conv_tokens_gigatoken, target_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+    assert (
+        target_tokens_default.tolist() == target_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+
 def test_null_multimodal_tokenizer():
     """Test MegatronNullMultimodalTokenizer."""
     vocab_size = 10000
@@ -537,6 +655,163 @@ def test_sft_tokenizer():
     assert len(conv_tokens) > 0 and len(conv_tokens) == len(
         target_tokens
     ), "failed to tokenize conversation and return target tokens"
+
+
+@pytest.mark.parametrize(
+    ("prompt_format", "expect_masked_tokens"),
+    [
+        pytest.param("default", False, id="default"),
+        pytest.param("nemotron-nano-v2", True, id="nemotron-nano-v2"),
+        pytest.param("nemotron-h-aligned", True, id="nemotron-h-aligned"),
+        pytest.param("identity", True, id="identity"),
+    ],
+)
+def test_sft_tokenizer_target_masking(prompt_format, expect_masked_tokens):
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+    )
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant.\n"},
+        {"role": "user", "content": "What is self-attention?\n"},
+        {
+            "role": "assistant",
+            "content": "Self-attention relates each token to other tokens in the sequence.\n",
+        },
+    ]
+
+    tokens, targets = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    sft_tokenizer = tokenizer._tokenizer
+    expected_targets = np.asarray(tokens).copy()
+
+    if expect_masked_tokens:
+        turn_start = 0
+        for turn_idx, turn in enumerate(conversation):
+            turn_tokens = sft_tokenizer._extract_token_ids(
+                sft_tokenizer._tokenizer.apply_chat_template(
+                    [turn],
+                    tokenize=True,
+                    chat_template=sft_tokenizer._prompt_config.custom_chat_template,
+                )
+            )
+            if sft_tokenizer._prompt_config.has_bos and turn_idx > 0:
+                turn_tokens = turn_tokens[1:]
+
+            turn_end = turn_start + len(turn_tokens)
+            if turn["role"] in ("system", "user", "tool"):
+                expected_targets[turn_start:turn_end] = IGNORE_INDEX
+            else:
+                assistant_content_start = (
+                    turn_start + sft_tokenizer._prompt_config.assistant_prefix_len
+                )
+                expected_targets[turn_start:assistant_content_start] = IGNORE_INDEX
+            turn_start = turn_end
+
+        assert turn_start == len(tokens)
+
+    np.testing.assert_array_equal(targets, expected_targets)
+
+
+def test_sft_gigatoken_tokenizer():
+    """Test gigatoken SFTTokenizer."""
+    prompt_format = "nemotron-nano-v2"
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+        use_gigatoken=True,
+    )
+
+    assert tokenizer._tokenizer.use_gigatoken == True, "use_gigatoken is not set to True."
+
+    # Simple encode - decode roundtrip.
+    assert (
+        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
+    ), "encode-decode roundtrip failed"
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    conv_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0, "failed to tokenize conversation"
+
+    conv_tokens, target_tokens = tokenizer.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
+        target_tokens
+    ), "failed to tokenize conversation and return target tokens"
+
+
+def test_sft_matches_gigatoken_tokenizer():
+    """Test default SFTTokenizer matches gigatoken."""
+    prompt_format = "nemotron-nano-v2"
+    tokenizer_default = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+        use_gigatoken=False,
+    )
+    tokenizer_gigatoken = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+        use_gigatoken=True,
+    )
+
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello! Can you summarize this image for me?"},
+        {"role": "user", "content": "<image>"},
+        {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
+        {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
+    ]
+
+    # Test tokenization with return_target=False
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=False
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with add_generation_prompt=True
+    conv_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=False, add_generation_prompt=True
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+
+    # Test tokenization with return_target=True
+    conv_tokens_default, target_tokens_default = tokenizer_default.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    conv_tokens_gigatoken, target_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
+        conversation, return_target=True, add_generation_prompt=False
+    )
+    assert (
+        conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
+    ), "default and gigatoken tokenization do not match."
+    assert (
+        target_tokens_default.tolist() == target_tokens_gigatoken.tolist()
+    ), "default and gigatoken target tokenization do not match."
 
 
 # ------------------------------------------------------------------------
