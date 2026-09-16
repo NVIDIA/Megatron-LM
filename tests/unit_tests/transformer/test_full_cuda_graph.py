@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from unittest.mock import Mock, patch
@@ -9,17 +9,79 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+    get_shared_capture_stream,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import get_batch_on_this_tp_rank, is_te_min_version
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("stage", ["training", "validation"])
+@pytest.mark.parametrize("first_stage", [False, True])
+def test_static_loader_preserves_tensors_after_pipeline_batch_preparation(stage, first_stage):
+    """Stage-local get_batch mutations must not replace the captured input allocations."""
+    from megatron.core import parallel_state
+
+    Utils.initialize_model_parallel()
+    loader = StaticBufferLoader()
+    previous_buffers = StaticBufferLoader.static_buffers
+    StaticBufferLoader.static_buffers = {"training": [], "validation": []}
+    try:
+        pointers = None
+        for iteration in range(3):
+            inputs = {
+                "tokens": torch.full((1, 8), iteration, dtype=torch.long, device="cuda"),
+                "labels": torch.full((1, 8), iteration + 1, dtype=torch.long, device="cuda"),
+                "loss_mask": torch.ones(1, 8, device="cuda"),
+                "position_ids": torch.arange(8, device="cuda").unsqueeze(0),
+                "attention_mask": None,
+            }
+            batch = loader(inputs, stage, 0)
+            cached = StaticBufferLoader.static_buffers[stage][0]
+            assert batch is not cached
+            current_pointers = {
+                key: value.data_ptr() for key, value in cached.items() if value is not None
+            }
+            if pointers is not None:
+                assert current_pointers == pointers
+            pointers = current_pointers
+            get_batch_on_this_tp_rank(
+                batch=batch,
+                has_cu_seqlens=False,
+                is_hybrid_cp=False,
+                create_attention_mask_in_dataloader=False,
+                broadcast_src_rank=parallel_state.get_tensor_model_parallel_src_rank(),
+                broadcast_group=parallel_state.get_tensor_model_parallel_group(),
+                cp_size=1,
+                tp_rank=0,
+                micro_batch_size=1,
+                seq_length=8,
+                mtp_on_this_rank=False,
+                pipeline_model_parallel_size=2,
+                is_pipeline_first_stage=first_stage,
+                is_pipeline_last_stage=not first_stage,
+            )
+            discarded_fields = (
+                ("labels", "loss_mask") if first_stage else ("tokens", "position_ids")
+            )
+            for key in discarded_fields:
+                assert batch[key] is None
+                torch.testing.assert_close(cached[key], inputs[key])
+    finally:
+        torch.cuda.synchronize()
+        StaticBufferLoader.static_buffers = previous_buffers
+        Utils.destroy_model_parallel()
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():

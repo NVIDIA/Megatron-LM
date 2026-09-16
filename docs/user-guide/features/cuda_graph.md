@@ -138,6 +138,82 @@ This implementation does not create inference CUDA graphs. For inference, use
 
 ## Common Configuration Examples
 
+### mHC training
+
+`--enable-mhc-connections` supports Transformer Engine training graphs and
+full-iteration graphs with fixed sequence lengths and microbatch shapes. The
+existing mHC parameter names, checkpoint keys, fused-kernel selection, and
+residual-stream contraction are shared with eager training.
+
+For `HybridModel`, the graph boundary is the mHC wrapper. Capture includes its
+stream aggregation and mixing, and static inputs have width
+`hidden_size * mhc_num_residual_streams`. Hybrid MTP stacks participate in TE
+capture through their individual wrapped layers. A custom GPT layer specification
+using `HyperConnectionTransformerLayer` follows the same TE protocol.
+
+| Training path | mHC capture coverage |
+|---|---|
+| TE, dense Hybrid layers | Attention, dense MLP, GDN, and Mamba, selected by the applicable module scopes |
+| TE, MoE | Router and optional preprocessing; expert dispatch and computation continue eagerly |
+| Full iteration | Forward, backward, and gradient synchronization; optimizer steps remain outside the graph |
+
+For a Hybrid attention/MoE model, including a Hybrid MTP pattern, use:
+
+```bash
+--enable-mhc-connections \
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn moe_router moe_preprocess
+```
+
+The partial MoE graph returns the mHC residual and mixing tensors alongside the
+router tensors. This preserves the backward path from the eager expert output
+through the captured mHC prefix. Whole-layer and whole-MoE TE capture are not
+supported for mHC MoE models. Hybrid partial MoE capture requires separate attention and
+MoE layers, as provided by the standard Hybrid layer specs. TE graphs require independent
+MTP depths (`mtp_use_repeated_layer=False`); this restriction is specific to TE graphs.
+TE mHC capture/replay also requires `padding_mask=None`, since the per-layer static
+samples do not transport the MoE token padding mask.
+
+Full-iteration MoE capture requires fixed-capacity, padded expert inputs. The
+eager reference must use the same capacity and padding settings, since capacity
+changes can change token routing:
+
+```bash
+--enable-mhc-connections \
+--cuda-graph-impl full_iteration \
+--no-check-for-nan-in-loss-and-grad \
+--moe-token-dispatcher-type alltoall \
+--moe-expert-capacity-factor 1.0 \
+--moe-pad-expert-input-to-capacity
+```
+
+Selective mHC recomputation, activation offloading, and expert-parallel
+communication overlap are rejected for these mHC graph modes. Packed THD input,
+dynamic context parallelism, and inference capture are outside this training
+support. The existing pipeline-parallel and MTP placement requirements still
+apply. Nonzero dropout requires the graph-safe RNG implementation used by the
+selected backend; it is not subject to a blanket mHC dropout restriction.
+
+When combined with PP/VPP support, full-iteration dropout can expose a native
+allocator capture error in NGC PyTorch 26.08 (`4fdf77b940`). Lazy RNG state
+initialization can query device-wide allocator events while another stream is
+capturing. This configuration requires a PyTorch allocator capture-safety fix;
+the MCore graph support does not repair that dependency error.
+
+The full-iteration loader returns a fresh batch dictionary for each consumer
+while retaining the captured tensor storage. This allows pipeline stages to
+discard unused batch fields without corrupting subsequent refills. Batched P2P
+communication retains its eager synchronization fence and omits that device-wide
+fence only while the CUDA stream is being captured.
+
+The mHC functional regression recipes enable `--deterministic-mode` and set
+`NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` to request exact golden verification, including
+the number of zero gradients. A passing repeat is still required to establish
+reproducibility. GDN uses its existing deterministic implementation under this
+setting and allocates its initial recurrent state directly on the input device
+so capture does not perform a CPU-to-CUDA copy. Fused mHC remains enabled in the
+recipes.
+
 ### Dense Model Training
 
 All three implementations work for dense models:

@@ -48,6 +48,13 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html)).
 
+GDN and GDN2 use a torch-native query/key L2 normalization in deterministic mode,
+in addition to their native convolution and recurrence paths. FLA's normalization
+autotuner can select reduction layouts with different rounding between processes.
+The native path preserves additive epsilon, FP32 intermediate computation, and
+FLA's backward formula using the normalized output rounded to the input dtype.
+Training without deterministic mode continues to use the optimized FLA path.
+
 ## Verifying determinism
 
 The bit-exact correctness suite lives at `tests/unit_tests/determinism/correctness/`. It parametrizes over model presets (GPT-like, Llama-like, Hybrid/Mamba) × parallelism cells (TP, PP, VPP, EP, FSDP, and composites) and asserts that two runs of the same configuration produce bit-identical outputs and gradients. FP8 / FP4 recipes (`tensorwise`, `delayed`, `mxfp8`, `nvfp4`) are covered by `tests/unit_tests/determinism/correctness/test_fp8_determinism.py`; the Blackwell-only recipes are capability-skipped on Hopper.
