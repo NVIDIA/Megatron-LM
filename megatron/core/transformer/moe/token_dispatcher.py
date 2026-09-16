@@ -34,6 +34,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     new_nccl_ep_buffer,
     set_deepep_num_sms,
 )
+from megatron.core.transformer.moe.dead_recompute import skipping_dead_recompute
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1493,13 +1494,18 @@ class _DeepepManager(_DispatchManager):
         hidden_states: torch.Tensor,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        skip_compute: bool = False,
     ) -> torch.Tensor:
+        # skip_compute: an activation-recompute re-run whose combined values nobody reads
+        # (dead_recompute.py) -- the backward is the cached dispatch through the handle
         hidden_states, _ = fused_combine(
             hidden_states,
             self.group,
             self.handle,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
+            skip_compute=skip_compute,
+            num_tokens=self.token_indices.shape[0] if skip_compute else None,
         )
         # Release the handle after combine operation
         self.handle = None
@@ -2157,6 +2163,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+        if skipping_dead_recompute(self.config):
+            # the recompute re-run: no combine communication, a tensor of the combined shape
+            # (only the deepep backend's manager takes the argument; the config check pins it)
+            return self._comm_manager.combine(
+                hidden_states, async_finish, allocate_on_comm_stream, skip_compute=True
+            )
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
