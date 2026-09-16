@@ -24,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantizat
 
 try:
     from megatron.core.transformer.moe.virtual_expert_triton import (
+        MAX_VIRTUAL_EXPERT_EP_SIZE,
         MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
         VirtualExpertPlannerWorkspace,
         launch_virtual_expert_grad_reduce,
@@ -34,6 +35,7 @@ try:
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
+    MAX_VIRTUAL_EXPERT_EP_SIZE = None
     MAX_VIRTUAL_EXPERT_WEIGHT_SMS = VirtualExpertPlannerWorkspace = None
     launch_virtual_expert_planner = launch_virtual_expert_weight_prefetch = None
     launch_virtual_expert_grad_reduce = None
@@ -74,8 +76,8 @@ class VirtualExpertPlan:
     the transport dispatches; ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic
     ids per virtual-expert slot, ``-1`` if unused. The manager owns the plan during its forward and
     again during its backward, taking it back at the layer-output hook (a repeated MTP layer has
-    several forwards outstanding, so that hook carries the plan). Plain data and scalars only: the
-    backward hooks capture the plan inside autograd contexts.
+    several forwards outstanding, so that hook carries the plan). The optional ready event joins
+    side-stream planning before forward consumers read the output tensors.
     """
 
     virtual_experts: torch.Tensor
@@ -84,6 +86,7 @@ class VirtualExpertPlan:
     push_in_flight: bool = False
     # The FC layers whose reduction was launched in the backward.
     started: set = field(default_factory=set)
+    ready: torch.cuda.Event | None = None
 
 
 def plan_virtual_expert_routes(top_indices: torch.Tensor, workspace) -> VirtualExpertPlan:
@@ -234,7 +237,8 @@ class _VirtualExpertStorage:
 
     def _slot_parameters(self, fc_layer: int, template) -> tuple[torch.nn.Parameter, ...]:
         """One runtime parameter per slot of ``fc_layer`` over its arena sections (MXFP8-wrapped
-        with ``template``'s quantization metadata), its ``main_grad`` the matching gradient slot."""
+        with ``template``'s quantization metadata), its ``main_grad`` the matching gradient slot.
+        """
         count, shape = self.num_local_experts, self.config.member_shapes[fc_layer]
         weights = self.weight_arena.split(self._weight_sections)
         data = weights[2 * fc_layer].view(count, *shape)
@@ -382,7 +386,8 @@ class _VirtualExperts:
         published them (the push runs ahead of the expert module's pre-forward hook, where DDP would
         otherwise finish; a backward re-reads what the forward waited for), or GTP's gathered
         buffers, peeked at for the push and consumed right before the expert GEMMs, where TE would
-        consume them, so virtual experts leave GTP's gather and prefetch schedule alone."""
+        consume them, so virtual experts leave GTP's gather and prefetch schedule alone.
+        """
         if self.gtp_leaders[fc_layer] is None:
             if direction == WeightDirection.FORWARD:
                 ensure_params_ready(self.parameters[fc_layer])
@@ -531,6 +536,7 @@ class VirtualExpertLoadBalancer:
     # Shared by every layer of the process, allocated by the first layer to bind. Two candidate
     # weight streams: a CUDA-graph capture stream comes from the same pool and may alias one.
     planner: VirtualExpertPlannerWorkspace | None = None
+    planner_stream: torch.cuda.Stream | None = None
     storages: dict[_VirtualExpertConfig, _VirtualExpertStorage] = {}
     weight_streams: tuple[torch.cuda.Stream, torch.cuda.Stream] | None = None
     grad_stream: torch.cuda.Stream | None = None
@@ -550,13 +556,13 @@ class VirtualExpertLoadBalancer:
         self.ep_size = torch.distributed.get_world_size(group=group)
         # Check the immutable layout once, before creating streams, arenas or transport.
         if not (
-            2 <= self.ep_size <= 64
+            2 <= self.ep_size <= MAX_VIRTUAL_EXPERT_EP_SIZE
             and 0 < num_experts <= 8192
             and num_experts == self.ep_size * num_local_experts
             and 1 <= router_topk <= min(32, num_experts)
         ):
             raise ValueError(
-                "Virtual-expert load balancing requires 2..64 EP ranks, 1..8192 evenly "
+                f"Virtual-expert load balancing requires 2..{MAX_VIRTUAL_EXPERT_EP_SIZE} EP ranks, 1..8192 evenly "
                 "distributed experts and 1<=topk<=min(32, experts); got "
                 f"EP={self.ep_size}, experts={num_experts}, local={num_local_experts}, "
                 f"topk={router_topk}."
@@ -595,7 +601,8 @@ class VirtualExpertLoadBalancer:
         # graph capture.
         self.prefetch_done = torch.cuda.Event()
         self.grad_reduce_done = torch.cuda.Event()
-        for event in (self.prefetch_done, self.grad_reduce_done):
+        self.planner_done = torch.cuda.Event()
+        for event in (self.prefetch_done, self.grad_reduce_done, self.planner_done):
             event.record(torch.cuda.current_stream(self.device))
         # Bound at the first forward, once DDP has built the main gradients whose dtype the arenas
         # take.
@@ -634,7 +641,7 @@ class VirtualExpertLoadBalancer:
             for linear in linears
         )
         grad_dtypes = {
-            None if (grad := getattr(parameter, "main_grad", None)) is None else grad.dtype
+            (None if (grad := getattr(parameter, "main_grad", None)) is None else grad.dtype)
             for group in parameters
             for parameter in group
         }
@@ -689,6 +696,7 @@ class VirtualExpertLoadBalancer:
                 device=self.device,
                 group=self.group,
             )
+            cls.planner_stream = torch.cuda.Stream(device=self.device)
             cls.weight_streams = (
                 torch.cuda.Stream(device=self.device),
                 torch.cuda.Stream(device=self.device),
@@ -712,7 +720,7 @@ class VirtualExpertLoadBalancer:
         cls.storages.clear()
         if cls.planner is not None:
             cls.planner.destroy()
-        cls.planner = cls.weight_streams = cls.grad_stream = None
+        cls.planner = cls.planner_stream = cls.weight_streams = cls.grad_stream = None
         # TE's op contexts and autograd graphs hold the runtime parameters in reference cycles;
         # collect now so anything still viewing the arenas is freed while the group is alive.
         gc.collect()
@@ -737,7 +745,8 @@ class VirtualExpertLoadBalancer:
 
     def _compute_rank_capacity(self, num_tokens: int) -> int:
         """A static, dropless route capacity for one transport rank: every rank receives
-        exactly its own route count, plus HybridEP's per-runtime-expert segment padding."""
+        exactly its own route count, plus HybridEP's per-runtime-expert segment padding.
+        """
         num_routes = num_tokens * self.router_topk
         alignment = self._alignment
         padding = self.num_runtime_experts * max(alignment - 1, 0)
@@ -764,9 +773,14 @@ class VirtualExpertLoadBalancer:
     @torch.compiler.disable
     @nvtx_decorator(message="virtual_expert_plan")
     def plan_dispatch(self, top_indices: torch.Tensor) -> None:
-        """Plan the router's ``[num_tokens, topk]`` routes and begin the weight push, before
-        shared-expert compute."""
-        self._plan = plan_virtual_expert_routes(top_indices, self.planner)
+        """Overlap planning with independent shared-expert or paired-attention compute."""
+        current = torch.cuda.current_stream(self.device)
+        self.planner_stream.wait_stream(current)
+        top_indices.record_stream(self.planner_stream)
+        with torch.cuda.stream(self.planner_stream):
+            self._plan = plan_virtual_expert_routes(top_indices, self.planner)
+            self.planner_done.record(self.planner_stream)
+        self._plan.ready = self.planner_done
         self._start_weight_push(WeightDirection.FORWARD)
 
     def prepare_virtual_expert_dispatch(
@@ -778,6 +792,11 @@ class VirtualExpertLoadBalancer:
         hidden_states = _VirtualExpertHook.apply(
             hidden_states, self._start_pending_grad_reduces, ()
         )
+        if self._plan.ready is not None:
+            current = torch.cuda.current_stream(self.device)
+            current.wait_event(self._plan.ready)
+            self._plan.virtual_experts.record_stream(current)
+            self._plan.experts_to_copy.record_stream(current)
         return hidden_states, self._plan.virtual_experts
 
     def prepare_virtual_expert_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -796,7 +815,8 @@ class VirtualExpertLoadBalancer:
     @nvtx_decorator(message="virtual_expert_weight_push_start")
     def _start_weight_push(self, direction: WeightDirection) -> None:
         """Enqueue the owner push of the pass's FC1/FC2 weights on the weight stream. Only reads
-        the weights: GTP consumes them, and issues its next prefetch, at the expert GEMMs."""
+        the weights: GTP consumes them, and issues its next prefetch, at the expert GEMMs.
+        """
         if self._plan.push_in_flight:
             raise RuntimeError("Virtual-expert weight prefetch is already outstanding.")
         virtual_experts = self.virtual_experts
@@ -804,6 +824,9 @@ class VirtualExpertLoadBalancer:
         current_stream = torch.cuda.current_stream(self.device)
         weight_stream = self._weight_stream(current_stream)
         weight_stream.wait_stream(current_stream)
+        if direction == WeightDirection.FORWARD and self._plan.ready is not None:
+            weight_stream.wait_event(self._plan.ready)
+            self._plan.experts_to_copy.record_stream(weight_stream)
         with torch.cuda.stream(weight_stream):
             launch_virtual_expert_weight_prefetch(
                 virtual_experts.storage,

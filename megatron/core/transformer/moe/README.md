@@ -372,6 +372,19 @@ layout's shared slots and registrations before the EP process group is destroyed
 Runtime parameters receive fused wgrad writes through `main_grad` without allocating dummy leaf
 gradients; the semantic parameters retain their normal DDP gradient hooks.
 
+The planner uses one fused cooperative launch with a fixed 32-block grid. Contiguous 512-route tiles
+avoid padding top-k to a power of two. It sorts tiles by expert and original position and scans the
+sorted runs to recover stable route ordinals, preserving placement tie breaks and token order.
+Binary search over cumulative allocations selects the destination rank for each route.
+Up to 32 blocks exchange histograms and place experts, handling two ranks each at EP64.
+EP sizes up to 64 are supported independently of the fixed planner grid. There are no separate
+planner configuration arguments.
+
+Planning always runs on its side stream, after waiting for the router's indices. Weight prefetch
+and dispatch wait for the completed plan, allowing independent shared-expert or paired-attention
+computation to overlap it. Stream recording protects tensors across these handoffs. CUDA graph
+capture records the same stream fork and consumer joins.
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
