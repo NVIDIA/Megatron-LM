@@ -1242,6 +1242,8 @@ class _ParamAndGradBuffer:
 
         self.grad_data_size = 0
         self.param_data_size = 0
+        self.grad_data_cpu = None
+        self.grad_data_preserved = False
         self.param_data_cpu = None
 
         # Finally, map param.data and param.main_grad fields to buffers.
@@ -1668,12 +1670,32 @@ class _ParamAndGradBuffer:
         for grad in self.extra_main_grads:
             grad.zero_()
 
-    def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
+    def offload_to_cpu(
+        self, move_params: bool = True, move_grads: bool = True, preserve_grad_data: bool = False
+    ) -> None:
         """
         Offload the buffers to CPU.
+
+        By default, gradient storage is released without retaining its contents,
+        matching :meth:`DistributedDataParallel.offload_grad_buffers`. Set
+        ``preserve_grad_data`` when gradients must survive an inference/offload
+        phase inside an open gradient-accumulation step.
         """
         if move_grads and self.grad_data is not None and self.grad_data.storage().size() > 0:
             self.grad_data_size = self.grad_data.storage().size()
+            self.grad_data_preserved = preserve_grad_data
+            if preserve_grad_data:
+                if (
+                    self.grad_data_cpu is None
+                    or self.grad_data_cpu.shape != self.grad_data.shape
+                    or self.grad_data_cpu.dtype != self.grad_data.dtype
+                ):
+                    self.grad_data_cpu = torch.empty_like(
+                        self.grad_data, device='cpu', pin_memory=self.grad_data.is_cuda
+                    )
+                # The CUDA storage is released immediately below, so this copy
+                # must complete before resize_(0).
+                self.grad_data_cpu.copy_(self.grad_data, non_blocking=False)
             self.grad_data.storage().resize_(0)
         if move_params and self.param_data is not None and self.param_data.storage().size() > 0:
             self.param_data_size = self.param_data.storage().size()
@@ -1697,8 +1719,19 @@ class _ParamAndGradBuffer:
             self.param_data.copy_(self.param_data_cpu, non_blocking=True)
         if move_grads and self.grad_data is not None and self.grad_data_size > 0:
             self.grad_data.storage().resize_(self.grad_data_size)
-            self.grad_data.zero_()
+            if self.grad_data_preserved:
+                assert self.grad_data_cpu is not None
+                self.grad_data.copy_(self.grad_data_cpu, non_blocking=False)
+            else:
+                self.grad_data.zero_()
             self.grad_data_size = 0
+            self.grad_data_preserved = False
+
+    def release_grad_data_cpu(self) -> None:
+        """Release a preserved host gradient copy after accumulation finishes."""
+        if self.grad_data_preserved:
+            raise RuntimeError("cannot release preserved host gradients before reloading them")
+        self.grad_data_cpu = None
 
 
 def partition_buckets(
