@@ -29,6 +29,11 @@ from .layout import non_leading_numel
 from .parameter_group import FsdpParameterGroup
 
 
+def select_ge_2d_params(param: torch.Tensor) -> bool:
+    """Whether the given tensor has dimensionality ≥2."""
+    return param.ndim >= 2
+
+
 @dataclasses.dataclass(frozen=True)
 class ParameterLayout:
     """How a single parameter's flat element range splits across the DP group.
@@ -71,9 +76,7 @@ class ParameterLayout:
                 (`param.ndim >= 2`).
         """
         if eligible_fn is None:
-
-            def eligible_fn(param):
-                return param.ndim >= 2
+            eligible_fn = select_ge_2d_params
 
         mesh = group.mesh
         layout = group.main_weight.layout
