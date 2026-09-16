@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
-from testmon.db import DB
+testmon_db = pytest.importorskip("testmon.db", reason="requires the testmon dependency group")
+DB = testmon_db.DB
 
 ROOT = Path(__file__).parents[2]
 HELPER = ROOT / "tests/unit_tests/testmon_cache.py"
