@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -690,7 +690,8 @@ class ProcessGroupCollection:
 
 
 def resolve_gtp_remat_group(
-    pg_collection: Optional["ProcessGroupCollection"], is_expert: bool
+    pg_collection: Optional[Union["ProcessGroupCollection", "MultiModuleProcessGroupCollection"]],
+    is_expert: bool,
 ) -> Optional[torch.distributed.ProcessGroup]:
     """Resolve the gtp_remat / expt_gtp_remat group for a weight-owning module.
 
@@ -699,11 +700,22 @@ def resolve_gtp_remat_group(
     pre-pg_collection callers working — a collection that does carry the field is always
     honored, including when it holds a custom (non-MPU) group.
 
+    A ``MultiModuleProcessGroupCollection`` is unwrapped to the language model's collection
+    first: only the per-module collections carry the GTP axes, so the wrapper would
+    otherwise miss the ``vars()`` check below and fall through to MPU globals that a MIMO
+    run never creates.
+
     Args:
         pg_collection: Collection supplied by the caller, or None.
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
     """
     attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        # Ranks outside the language module (a MIMO vision encoder) own no GTP axis, and
+        # get_language_model_collection() raises for them, so answer None directly.
+        if pg_collection.language_model_module_name is None:
+            return None
+        pg_collection = pg_collection.get_language_model_collection()
     # `vars()`, not hasattr: __getattr__ makes hasattr always True, so the fallback below
     # would be unreachable.
     if pg_collection is not None and attr in vars(pg_collection):
