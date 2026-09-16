@@ -42,7 +42,9 @@ def build_router_diagnostics(
         scores_for_aux_loss: Normalized all-expert scores with shape `[tokens, num_experts]`.
         routing_map_for_aux_loss: Unbiased top-k assignments with the same shape.
         actual_routing_map: Assignments used for token dispatch with the same shape.
-        expert_bias: Current expert-selection bias, or `None` when bias routing is disabled.
+        expert_bias: Additive expert-selection correction, or `None` when disabled. Positive
+            values favor an expert. Ordinary bias routing uses score units; quantile balancing
+            uses `-qb_beta` in logit units.
         seq_length: Local sequence length before the token dimension was flattened.
         batch_size: Local micro-batch size.
         padding_mask: Flattened mask where `True` marks padding.
@@ -82,7 +84,7 @@ def build_router_diagnostics(
             raise ValueError("padding_mask must contain seq_length * batch_size elements.")
         valid_mask = ~padding_mask.bool().reshape(seq_length, batch_size)
         expanded_valid_mask = valid_mask.unsqueeze(-1)
-        scores = scores * expanded_valid_mask
+        scores = scores.masked_fill(~expanded_valid_mask, 0.0)
         aux_map = aux_map & expanded_valid_mask
         actual_map = actual_map & expanded_valid_mask
 
