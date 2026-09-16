@@ -900,7 +900,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx.request_kv_length_offsets[1].item() == 0
 
     @pytest.mark.parametrize(
-        ("saved_state_block_indices", "expected_restore_blocks"), [([0, 3], 1), ([0, 2, 3], 3)]
+        ("saved_state_block_indices", "expected_restore_blocks"),
+        [([0, 3], 1), ([0, 2, 3], 3), ([3], 0), ([], 0)],
     )
     @pytest.mark.internal
     def test_mamba_prompt_logprobs_restore_highest_valid_state(
@@ -2686,6 +2687,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=(test_config.materialize_only_last_token_logits),
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
+                async_sched_mode=test_config.async_sched_mode,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 prefix_caching_mamba_gb=(
@@ -3216,10 +3218,19 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 cls._assert_top_n_logprobs_close(actual_row, expected_row)
 
     @pytest.mark.internal
-    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @pytest.mark.parametrize(
+        ("model_provider", "chunked_donor", "expected_skipped"),
+        [
+            pytest.param("gpt", True, 511, id="gpt-chunked"),
+            pytest.param("hybrid", True, 256, id="hybrid-chunked"),
+            pytest.param("hybrid", False, 0, id="hybrid-unchunked"),
+        ],
+    )
     @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
     @torch.inference_mode()
-    def test_prompt_logprob_sidecar_reuse(self, model_provider, async_sched_mode):
+    def test_prompt_logprob_sidecar_reuse(
+        self, monkeypatch, model_provider, chunked_donor, expected_skipped, async_sched_mode
+    ):
         if model_provider == "hybrid":
             skip_if_sequence_packing_not_available("mamba")
         Utils.initialize_model_parallel()
@@ -3236,7 +3247,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             oracle_config = self._case_config(case, enable_prefix_caching=False)
             oracle_config.materialize_only_last_token_logits = False
+            oracle_config.async_sched_mode = AsyncScheduleMode.LEGACY
             oracle_env = self._build_test_env(oracle_config)
+            assert oracle_env.engine.context.config.async_sched_mode == AsyncScheduleMode.LEGACY
             oracle_env.engine.controller.tokenizer.detokenize = (
                 lambda tokens, **_: f"tok_{tokens[0]}"
             )
@@ -3251,14 +3264,15 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             cache_config.materialize_only_last_token_logits = False
             cache_config.enable_chunked_prefill = True
             cache_config.async_sched_mode = async_sched_mode
-            if model_provider == "gpt":
+            if chunked_donor:
                 cache_config.context_max_tokens = cache_config.context_block_size_tokens + 8
             cache_env = self._build_test_env(cache_config)
             engine = cache_env.engine
+            assert engine.context.config.async_sched_mode == async_sched_mode
             engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
             donor, donor_cost, donor_chunked = run(engine, 10, prompt, 5)
             assert donor_cost == prompt_length
-            assert donor_chunked == (model_provider == "gpt")
+            assert donor_chunked == chunked_donor
             self._assert_prompt_logprob_parity(donor, oracle_top5)
             allocator = engine.context.kv_block_allocator
             sidecars = sorted(
@@ -3269,10 +3283,43 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             np.testing.assert_array_equal(np.flatnonzero(sidecars[0].valid), np.arange(1, 256))
             np.testing.assert_array_equal(np.flatnonzero(sidecars[1].valid), np.arange(256))
             assert [sidecar.top_n_logprobs.shape for sidecar in sidecars] == [(256, 5), (256, 5)]
-            exact, exact_cost, _ = run(engine, 11, prompt, 5)
+            # Witness the scheduler and real state copies during the cache-hit request.
+            scheduler_steps = dict.fromkeys(AsyncScheduleMode, 0)
+            restore_attempts = []
+            with monkeypatch.context() as witness:
+                for mode, step_name in (
+                    (AsyncScheduleMode.LEGACY, "_run_legacy_step"),
+                    (AsyncScheduleMode.ASYNC, "_run_async_sched_step_no_overlap"),
+                ):
+                    step = getattr(engine.controller, step_name)
+
+                    async def traced_step(*args, _step=step, _mode=mode, **kwargs):
+                        scheduler_steps[_mode] += 1
+                        return await _step(*args, **kwargs)
+
+                    witness.setattr(engine.controller, step_name, traced_step)
+                if model_provider == "hybrid":
+                    mamba_allocator = engine.context.mamba_slot_allocator
+                    assert mamba_allocator.has_state(sidecars[0].block_id) == chunked_donor
+                    assert mamba_allocator.has_state(sidecars[1].block_id)
+                    restore = mamba_allocator.restore_to_live
+
+                    def traced_restore(request_idx, block_id):
+                        restored = restore(request_idx, block_id)
+                        restore_attempts.append((block_id, restored))
+                        return restored
+
+                    witness.setattr(mamba_allocator, "restore_to_live", traced_restore)
+                exact, exact_cost, _ = run(engine, 11, prompt, 5)
+            for mode, count in scheduler_steps.items():
+                assert (count > 0) == (mode == async_sched_mode)
+            assert restore_attempts == (
+                [(sidecars[0].block_id, True)]
+                if model_provider == "hybrid" and chunked_donor
+                else []
+            )
             self._assert_prompt_logprob_parity(exact, oracle_top5)
-            expected_skipped = 511 if model_provider == "gpt" else 0
-            expected_cost = 2 if model_provider == "gpt" else prompt_length
+            expected_cost = prompt_length - expected_skipped
             assert (exact.num_cached_tokens, exact_cost) == (expected_skipped, expected_cost)
 
             mismatch, mismatch_cost, _ = run(engine, 12, prompt, 4)
