@@ -759,12 +759,35 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() before freeing.
             empty_cache: Whether to call torch.cuda.empty_cache() after freeing.
+
+        Registered gradient storage is deregistered and its private pool is
+        destroyed after the storage is released. Parameter pools remain live.
+
+        Raises:
+            RuntimeError: If registered gradient storage was not constructed
+                with an offload-capable separate pool.
         """
         if synchronize:
             torch.cuda.synchronize()
 
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        buffers = self.buffers + self.expert_parallel_buffers
+        registered_buffers = [buffer for buffer in buffers if buffer.nccl_mem_pool is not None]
+        if any(not buffer.nccl_grad_pool_is_separate for buffer in registered_buffers):
+            raise RuntimeError(
+                "Gradient-buffer offload requires a separate NCCL gradient pool; construct "
+                "DistributedDataParallel with grad_buffer_offload=True."
+            )
+
+        # Complete all collective deregistrations before mutating storage so a failure cannot
+        # leave only part of the model offloaded.
+        for buffer in registered_buffers:
+            buffer.deregister_grad_pool_for_offload()
+
+        for buffer in buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
+
+        for buffer in registered_buffers:
+            buffer.release_offloaded_grad_pool()
 
         if empty_cache:
             torch.cuda.empty_cache()
@@ -781,7 +804,10 @@ class DistributedDataParallel(_BaseDataParallel):
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
         for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.reload_from_cpu(move_params=False, move_grads=True)
+            if buffer.nccl_grad_pool_is_separate and buffer.nccl_mem_pool is None:
+                buffer.reload_grad_buffer_into_nccl_pool()
+            else:
+                buffer.reload_from_cpu(move_params=False, move_grads=True)
 
         if synchronize:
             torch.cuda.synchronize()
