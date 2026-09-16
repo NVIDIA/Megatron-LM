@@ -19,7 +19,7 @@ repos:
   hooks:
   - id: check-dco
     name: Check Signed-off-by trailer
-    entry: bash -c 'if ! grep -q "Signed-off-by:" "$1"; then echo "❌ Commit message must be signed off. Use git commit -s to add it automatically."; exit 1; fi' --
+    entry: bash -c 'if ! git interpret-trailers --parse "$1" | grep -Eiq "^Signed-off-by:[[:space:]]+.+[[:space:]]+<[^<>[:space:]]+@[^<>[:space:]]+>$"; then echo "❌ Commit message must be signed off. Use git commit -s to add it automatically."; exit 1; fi' --
     language: system
     always_run: true
     stages: [commit-msg]
