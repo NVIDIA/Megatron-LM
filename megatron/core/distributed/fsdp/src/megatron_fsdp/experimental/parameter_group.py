@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from weakref import ReferenceType, ref
 
 import torch
+import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
@@ -34,7 +35,7 @@ from .module_utils import (
     restore_parameter_attributes,
     save_parameter_attributes,
 )
-from .placement import BlockAtomic, changed_mesh_axis
+from .placement import BlockAtomic, changed_mesh_axis, sharded_reduce_group
 from .quantization import (
     E4M3_BLOCK_SIZE,
     allocate_quantize_temp,
@@ -587,18 +588,34 @@ class Fp8ParameterGroup(FsdpParameterGroup):
     """FSDP parameter group whose parameters are TE MXFP8Tensor primary weights.
 
     The sharded compute weights rest as row-wise (forward GEMM) and column-wise
-    (backward GEMM) MXFP8 E4M3 payloads in two uint8 DBuffers with the same
-    layout as ``main_weight``. Quantization is done by TE's verified
-    ``cast_master_weights_to_fp8`` into full-size temporary tensors whose shard
-    slices are copied back into the DBuffers; the tensors' scale-inverse grids
-    are filled in place by TE and never gathered. Unshard gathers only the
-    orientation needed by the pass (row-wise on forward, column-wise on
-    backward) and rebinds the module's own MXFP8Tensor payloads from the
-    gathered buffers; reshard detaches them.
+    (backward GEMM) MXFP8 E4M3 payloads in two uint8 DBuffers whose storage uses
+    the *parameter* layout, exactly like the bf16 ``model_weight``. Each buffer
+    exposes the optimizer layout as a view (``post_optimizer_rowwise`` /
+    ``post_optimizer_colwise``), the analogue of
+    ``post_optimizer_model_weight``: quantization fills the view and unshard
+    redistributes the view back into the storage. Both moves change at most one
+    mesh axis, so a coarser parameter layout such as HFSDP's
+    ``[Replicate, Shard]`` over ``[Shard, Shard]`` masters never needs multi-axis
+    support.
+
+    Quantization is done by TE's verified ``cast_master_weights_to_fp8`` into
+    full-size temporary tensors whose shard slices are copied back into the
+    optimizer-layout views; the tensors' scale-inverse grids are filled in place
+    by TE and never gathered. Unshard gathers only the orientation needed by the
+    pass (row-wise on forward, column-wise on backward) and rebinds the module's
+    own MXFP8Tensor payloads from the gathered buffers; reshard detaches them.
     """
 
+    # Payload storage in the parameter layout, and its optimizer-layout views.
     _rowwise_buffer: DBuffer
     _colwise_buffer: DBuffer
+    post_optimizer_rowwise: DBuffer
+    post_optimizer_colwise: DBuffer
+    # sync_model_weight_from_main_weight() refreshes only this rank's optimizer-layout
+    # views; the remaining payload-storage slices must be redistributed before the
+    # unsharded gather, exactly like ``_model_weight_is_stale``.
+    _rowwise_is_stale: bool
+    _colwise_is_stale: bool
     _unsharded_rowwise: DBuffer
     _unsharded_colwise: DBuffer
 
@@ -654,20 +671,20 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         self.model_weight = None
         self._unsharded_model_weight = None
         device = self.main_weight.device
+        # Mirror the bf16 path: the payload *storage* rests in the parameter
+        # layout and exposes the optimizer layout as a view. Quantization then
+        # fills the view (see _quantize_model_weight_from_main_weight) and unshard
+        # redistributes the view back into the storage. Every move changes at most
+        # one mesh axis, because the parameter layout is only ever coarser than
+        # the optimizer layout -- expert ZeRO-1 (parameter Replicate, optimizer
+        # Flat) and HFSDP dense (parameter [Replicate, Shard], optimizer
+        # [Shard, Shard]) -- so a single-axis Replicate-to-Flat view slice covers
+        # the two, and the later gather to everything-Replicate widens the
+        # remaining axis. Storing at the optimizer layout instead forced the
+        # unshard to widen two axes at once to reach the gathered buffer.
         self._rowwise_buffer = DBuffer.empty(
             mesh=self.mesh,
-            # The fp8 payloads are quantized FROM the main weights, so they must be
-            # sharded exactly like them. That is NOT the parameter placement in
-            # general: _DATA_PARALLEL_PLACEMENTS maps ZeRO-1 to
-            # (parameter=Replicate, gradient=Partial, optimizer=Shard) and ZeRO-2 to
-            # (Replicate, Shard, Shard), while fully_shard.py derives
-            # model_weight_placements from placements.parameter but
-            # main_weight_placements from placements.optimizer. Using the parameter
-            # placement here leaves the payload replicated (full size) while the main
-            # weight is a shard, so the local shard->payload copy fails with a 2x size
-            # mismatch. Under ZeRO-3 the two placements coincide, which is why that
-            # configuration never exposed this.
-            placements=main_weight_placements,
+            placements=model_weight_placements,
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
@@ -676,13 +693,20 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         )
         self._colwise_buffer = DBuffer.empty(
             mesh=self.mesh,
-            placements=main_weight_placements,
+            placements=model_weight_placements,
             tensor_shapes=tensor_shapes,
             dtype=torch.uint8,
             device=device,
             block_size=block_size,
             subgroup_size=self.subgroup_size,
         )
+        # Optimizer-layout views into the payload storage, avoiding a second
+        # allocation. view() returns the storage itself when the placements match,
+        # so under ZeRO-3 (parameter == optimizer placement) both views alias their
+        # storage and every read/write below is the pre-change buffer.
+        self.post_optimizer_rowwise = self._rowwise_buffer.view(main_weight_placements)
+        self.post_optimizer_colwise = self._colwise_buffer.view(main_weight_placements)
+        self._update_payload_staleness()
         self._unsharded_rowwise = DBuffer.empty(
             mesh=self.mesh,
             placements=[Replicate()] * self.mesh.ndim,
@@ -723,8 +747,42 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         parameter.grad = None
 
     def sync_model_weight_from_main_weight(self) -> None:
-        """Quantize the sharded main weights into the fp8 payload DBuffers."""
+        """Quantize the sharded main weights into the fp8 payload views."""
         self._quantize_model_weight_from_main_weight()
+        self._update_payload_staleness()
+
+    def _update_payload_staleness(self) -> None:
+        """Record whether the refreshed optimizer-layout views need a pre-gather move.
+
+        The fp8 analogue of ``FsdpParameterGroup._model_weight_is_stale``. A view
+        whose placements differ from its storage's has been written only on this
+        rank's optimizer-layout shard, so the storage still needs the other ranks'
+        slices before it can be gathered for compute.
+        """
+        self._rowwise_is_stale = (
+            self.post_optimizer_rowwise.placements != self._rowwise_buffer.placements
+        )
+        self._colwise_is_stale = (
+            self.post_optimizer_colwise.placements != self._colwise_buffer.placements
+        )
+
+    def _amax_reduce_group(self) -> dist.ProcessGroup:
+        """Return the process group TE must MAX-reduce the quantization amax over.
+
+        The group spans every axis the **quantization source**, ``main_weight``,
+        is sharded over: the masters are sharded on every optimizer axis, so each
+        rank holds a disjoint sub-block and only the union of those axes sees the
+        whole tensor's amax.
+
+        This must NOT be derived from the payload buffer's placements. After the
+        bf16-style alignment the payload *storage* rests in the coarser parameter
+        layout, so under HFSDP (payload ``[Replicate, Shard]``, masters
+        ``[Shard, Shard]``) a payload-derived group would select only the inner
+        axis, omit the outer axis's disjoint blocks, and produce an amax that is
+        too small -- hence fp8 scales that are too large, a silent numerical
+        regression with no error and no crash.
+        """
+        return sharded_reduce_group(self.mesh, self.main_weight.placements)
 
     def _quantize_model_weight_from_main_weight(self) -> None:
         """Quantize via TE's ``cast_master_weights_to_fp8``.
@@ -732,7 +790,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         A full-size temporary MXFP8Tensor per fp8 tensor receives the
         quantized shard in its row-wise and column-wise raw data (filled at
         the shard's flat offset); the shard slices are then copied into the
-        group's payload DBuffers and the temporaries are released.
+        optimizer-layout payload views and the temporaries are released.
         """
         main = self.main_weight.local_buffer
         cast_master_weights_to_fp8 = te_cast_master_weights_to_fp8()
@@ -775,29 +833,30 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 )
             )
 
-        # The reduce group is the axis the main weights are sharded over, which is the
-        # axis the amax must be reduced across (each rank owns a disjoint shard, so no
-        # rank sees the whole tensor's amax on its own). It is read from the payload
-        # buffers, which now follow the main-weight placement. When nothing is sharded
-        # (fully replicated main weights) fall back to this FSDP mesh's own axis: every
-        # rank then holds an identical copy, so the MAX is idempotent. The default
-        # process group must NOT be used -- it spans unrelated PP/TP ranks holding
-        # different parameters and would silently corrupt the scales.
-        gather_axis = changed_mesh_axis(
-            tuple(self._rowwise_buffer.placements),
-            tuple(Replicate() for _ in range(self.mesh.ndim)),
-        )
-        reduce_axis = 0 if gather_axis is None else gather_axis
+        # The reduce group must span every axis the main weights are sharded over
+        # (see _amax_reduce_group): each rank owns a disjoint shard, so no rank
+        # sees the whole tensor's amax on its own, and under HFSDP the optimizer
+        # placement shards both axes, so only their flattened union does. It is
+        # deliberately derived from main_weight, not from the payload storage,
+        # whose parameter-layout placements are coarser. When nothing is sharded
+        # (fully replicated main weights) sharded_reduce_group falls back to this
+        # mesh's own axis: every rank then holds an identical copy, so the MAX is
+        # idempotent. The default process group must NOT be used -- it spans
+        # unrelated PP/TP ranks holding different parameters and would silently
+        # corrupt the scales.
         cast_master_weights_to_fp8(
             model_weights=model_weights,
             master_weights=master_weights,
             start_offsets=start_offsets,
-            group=self.mesh.get_group(reduce_axis),
+            group=self._amax_reduce_group(),
             fsdp_shard_model_weights=fsdp_shard_model_weights,
         )
 
-        # Copy the shard slices out of the temporaries into the payload
-        # DBuffers; the temporaries are released when this scope ends.
+        # Copy the shard slices out of the temporaries into the optimizer-layout
+        # payload views -- the fp8 analogue of the bf16 cast into
+        # post_optimizer_model_weight. The views are main_weight-shaped, so the
+        # copy targets match the master shard the temporaries were filled from.
+        # The temporaries are released when this scope ends.
         for temp, index, owned_range in temps:
             if owned_range is None:
                 continue
@@ -805,14 +864,36 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             rows_local = numel // temp.shape[-1]
             start_offset = owned_range.tensor_relative_offset
             end_offset = start_offset + numel
-            ro_chunk = self._rowwise_buffer.get_local_tensor(index)
-            co_chunk = self._colwise_buffer.get_local_tensor(index)
+            ro_chunk = self.post_optimizer_rowwise.get_local_tensor(index)
+            co_chunk = self.post_optimizer_colwise.get_local_tensor(index)
             ro_chunk.copy_(
                 temp._rowwise_data.reshape(-1)[start_offset:end_offset].view(rows_local, -1)
             )
             co_chunk.copy_(
                 temp._columnwise_data.reshape(-1)[start_offset:end_offset].view(rows_local, -1)
             )
+
+    def _redistribute_payloads_into_storage(self) -> None:
+        """Move refreshed optimizer-layout views back into the parameter-layout storage.
+
+        The fp8 analogue of the bf16 unshard's
+        ``post_optimizer_model_weight.redistribute(model_weight.placements,
+        out=model_weight)``. The view only ever narrowed Replicate axes to Flat, so
+        this widens at most one axis -- HFSDP's ``[Shard, Shard]`` view over
+        ``[Replicate, Shard]`` storage gathers only the outer axis here. The
+        storage keeps its gathered contents between passes, so only the first
+        unshard after an optimizer step pays this move.
+        """
+        if self._rowwise_is_stale:
+            self.post_optimizer_rowwise.redistribute(
+                self._rowwise_buffer.placements, out=self._rowwise_buffer
+            )
+            self._rowwise_is_stale = False
+        if self._colwise_is_stale:
+            self.post_optimizer_colwise.redistribute(
+                self._colwise_buffer.placements, out=self._colwise_buffer
+            )
+            self._colwise_is_stale = False
 
     def unshard_parameters(self, orientation: str = "rowwise") -> None:
         """Gather both payload orientations and bind them on the fp8 tensors.
@@ -825,16 +906,21 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         the tensors (global after quantize) and are never gathered.
         """
         del orientation
+        self._redistribute_payloads_into_storage()
         for source, target in (
             (self._rowwise_buffer, self._unsharded_rowwise),
             (self._colwise_buffer, self._unsharded_colwise),
         ):
             with self._symmetric_memory_context():
                 target.reallocate_storage()
-            # With all-Replicate placements (expert parameters at ZeRO-1) the source buffer
-            # already holds the whole tensor on this rank, so there is nothing to gather:
-            # copy locally into the unsharded buffer that was just reallocated. Both buffers
-            # share this mesh and the same tensor_shapes, so their local buffers match.
+            # With all-Replicate placements (expert parameters at ZeRO-1, whose
+            # parameter layout is Replicate while the optimizer layout is Flat) the
+            # pre-gather redistribution above already filled the whole source buffer
+            # on this rank, so there is nothing left to gather: copy locally into the
+            # unsharded buffer that was just reallocated. Both buffers share this mesh
+            # and the same tensor_shapes, so their local buffers match. Any other
+            # difference is a single-axis redistribution, because the storage is the
+            # parameter layout and only its Replicate axes remain.
             gather_axis = changed_mesh_axis(source.placements, target.placements)
             if gather_axis is None:
                 target.local_buffer.copy_(source.local_buffer)
