@@ -90,9 +90,7 @@ def _virtual_expert_hybridep_config(**overrides):
 
 def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
     """The backend is dropless by construction and allows the whole-layer moe graph."""
-    config = _virtual_expert_hybridep_config(
-        cuda_graph_impl="local", cuda_graph_modules=["moe"]
-    )
+    config = _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
 
     assert config.moe_expert_rank_capacity_factor == 1.0
     assert config.moe_single_grouped_weight is False
@@ -102,14 +100,8 @@ def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
     ("overrides", "message"),
     [
         # The feature augments HybridEP rather than introducing another dispatcher backend.
-        (
-            {"moe_flex_dispatcher_backend": "deepep"},
-            "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
-        ),
-        (
-            {"moe_token_dispatcher_type": "alltoall"},
-            "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
-        ),
+        ({"moe_flex_dispatcher_backend": "deepep"}, "moe_flex_dispatcher_backend='hybridep'"),
+        ({"moe_token_dispatcher_type": "alltoall"}, "moe_token_dispatcher_type='flex'"),
         # Every runtime expert needs its own weight address for the owner push.
         ({"moe_single_grouped_weight": True}, "moe_single_grouped_weight=False"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
@@ -117,24 +109,101 @@ def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
         # The bridge reads wgrads out of main_grad buffers.
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
         ({"add_bias_linear": True}, "add_bias_linear=False"),
+        # These restrictions are already enforced by the general MoE validation.
+        (
+            {"moe_single_grouped_bias": True},
+            "moe_single_grouped_bias requires add_bias_linear=True",
+        ),
+        ({"moe_pad_expert_input_to_capacity": True}, "moe_expert_capacity_factor must be set"),
         ({"moe_router_dtype": "fp64"}, "moe_router_dtype='fp32'"),
+        (
+            {"moe_router_enable_expert_bias": True, "moe_router_score_function": "sigmoid"},
+            "moe_router_enable_expert_bias=False",
+        ),
         # The planner owns dispatch scheduling, so these overlap paths conflict.
         ({"delay_wgrad_compute": True}, "delay_wgrad_compute=False"),
         ({"moe_shared_expert_overlap": True}, "moe_shared_expert_overlap=False"),
         ({"moe_expert_capacity_factor": 1.0}, "moe_expert_capacity_factor=None"),
         # Route ids are packed against these limits.
-        ({"moe_router_topk": 33}, "moe_router_topk<=32"),
+        ({"expert_model_parallel_size": 1}, "2<=expert_model_parallel_size<=64"),
+        (
+            {"expert_model_parallel_size": 65, "num_moe_experts": 130},
+            "2<=expert_model_parallel_size<=64",
+        ),
+        ({"num_moe_experts": 8194}, "1<=num_moe_experts<=8192"),
+        ({"num_moe_experts": 3}, "num_moe_experts divisible by expert_model_parallel_size"),
+        ({"moe_router_topk": 0}, "1<=moe_router_topk<=min(32, num_moe_experts)"),
+        ({"moe_router_topk": 3}, "1<=moe_router_topk<=min(32, num_moe_experts)"),
+        (
+            {"num_moe_experts": 64, "moe_router_topk": 33},
+            "1<=moe_router_topk<=min(32, num_moe_experts)",
+        ),
         # The transport tile assumes 128-aligned projections.
         ({"moe_ffn_hidden_size": 129}, "moe_ffn_hidden_size divisible by 128"),
         ({"hidden_size": 129, "kv_channels": 32}, "moe_latent_size (or hidden_size)"),
         # Only fused SwiGLU, quick-GeGLU and weighted squared-ReLU are supported.
         ({"activation_func": F.gelu}, "fused SwiGLU"),
-        ({"params_dtype": torch.float32}, "BF16 execution and BF16 parameters"),
+        ({"params_dtype": torch.float32}, "params_dtype=torch.bfloat16"),
     ],
 )
 def test_virtual_expert_hybridep_rejects_unsupported_configurations(overrides, message):
     with pytest.raises(ValueError, match=re.escape(message)):
         _virtual_expert_hybridep_config(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"moe_flex_dispatcher_num_sms": 0}, "num_sms>0"),
+        ({"moe_flex_dispatcher_num_sms": -1}, "num_sms>0"),
+        ({"moe_hybridep_num_sms": 0}, "num_sms>0"),
+        ({"moe_deepep_num_sms": -1}, "num_sms>0"),
+        ({"moe_layer_recompute": True}, "no MoE layer recompute"),
+        (
+            {"recompute_granularity": "selective", "recompute_modules": ["moe"]},
+            "no MoE layer recompute",
+        ),
+        (
+            {
+                "recompute_granularity": "full",
+                "recompute_method": "uniform",
+                "recompute_num_layers": 1,
+            },
+            "no MoE layer recompute",
+        ),
+        ({"moe_router_load_balancing_type": "sinkhorn"}, "no sinkhorn"),
+        (
+            {
+                "moe_router_load_balancing_type": ["aux_loss", "sinkhorn"],
+                "moe_aux_loss_coeff": [0.01, 0.0],
+            },
+            "no sinkhorn",
+        ),
+    ],
+)
+def test_virtual_expert_config_checks_normalized_settings(overrides, message):
+    """Deprecated aliases must be rejected at config construction, before any runtime exists."""
+    with pytest.raises(ValueError, match=message):
+        _virtual_expert_hybridep_config(**overrides)
+
+
+@pytest.mark.parametrize("num_experts", [None, 0, -1])
+def test_virtual_expert_config_requires_experts(num_experts):
+    with pytest.raises(ValueError, match="num_moe_experts"):
+        _virtual_expert_hybridep_config(num_moe_experts=num_experts)
+
+
+@pytest.mark.parametrize("alias", ["moe_deepep_num_sms", "moe_hybridep_num_sms"])
+def test_virtual_expert_config_explicit_sms_overrides_deprecated_alias(alias):
+    config = _virtual_expert_hybridep_config(**{alias: 0, "moe_flex_dispatcher_num_sms": 64})
+    assert config.moe_flex_dispatcher_num_sms == 64
+
+
+def test_virtual_expert_config_accepts_selective_recompute_outside_moe():
+    config = _virtual_expert_hybridep_config(
+        recompute_granularity="selective", recompute_modules=["core_attn"]
+    )
+    assert config.recompute_modules == ["core_attn"]
 
 
 def test_virtual_expert_hybridep_accepts_native_mxfp8_with_router_padding():

@@ -13,6 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.moe import moe_utils
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity, uses_compact_routes
@@ -571,59 +572,84 @@ def test_hybridep_compact_routes_metadata(dense_topk_routing):
     manager._dense_topk_routing = dense_topk_routing
     top_indices = torch.tensor([[0, 65], [511, 2], [127, 256]])
     probs = torch.tensor([[0.6, 0.4], [0.0, 0.5], [0.9, 0.1]], requires_grad=True)
+    if not dense_topk_routing:
+        with pytest.raises(AssertionError, match="without compact top-k routing support"):
+            manager.setup_metadata(top_indices, probs)
+        return
     manager.setup_metadata(top_indices, probs)
     expected = torch.zeros(3, 512).scatter(1, top_indices, probs.detach())
     torch.testing.assert_close(manager.token_probs, expected, rtol=0, atol=0)
     (manager.token_probs * torch.arange(512.0)).sum().backward()
     torch.testing.assert_close(probs.grad, top_indices.float(), rtol=0, atol=0)
-    if dense_topk_routing:
-        assert manager.routing_map is None and manager.topk_idx.dtype == torch.int16
-        assert torch.equal(manager.topk_idx.long(), top_indices)
-    else:
-        expected_map = torch.zeros_like(expected, dtype=torch.bool).scatter(1, top_indices, True)
-        assert manager.topk_idx is None and torch.equal(manager.routing_map, expected_map)
+    assert manager.routing_map is None and manager.topk_idx.dtype == torch.int16
+    assert torch.equal(manager.topk_idx.long(), top_indices)
 
 
 @pytest.mark.launch_on_gb200
-def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers():
+@pytest.mark.parametrize("compact_supported", [False, True])
+def test_uses_compact_routes_covers_hybridep_without_dense_map_consumers(
+    monkeypatch, compact_supported
+):
     """Plain HybridEP takes compact routes unless something downstream needs the dense map;
-    virtual experts always do."""
+    virtual experts require compact support for their expanded expert layout."""
+    layouts = []
+
+    def supports_compact(num_experts, num_local_experts):
+        layouts.append((num_experts, num_local_experts))
+        return compact_supported
+
+    monkeypatch.setattr(moe_utils, "hybrid_ep_dense_topk_routing", supports_compact)
     plain = dict(
+        num_moe_experts=512,
+        expert_model_parallel_size=64,
         moe_virtual_expert_load_balance=False,
         moe_token_dispatcher_type="flex",
         moe_flex_dispatcher_backend="hybridep",
         moe_router_fusion=False,
         moe_router_load_balancing_type="seq_aux_loss",
+        moe_router_enable_expert_bias=False,
         moe_expert_capacity_factor=None,
         moe_pad_expert_input_to_capacity=False,
         moe_token_dropping=False,
         expert_tensor_parallel_size=1,
         moe_hybridep_pad_uneven_dispatch_inputs=False,
     )
-    assert uses_compact_routes(SimpleNamespace(**plain))
-    assert not uses_compact_routes(
-        SimpleNamespace(**{**plain, "moe_router_load_balancing_type": "quantile_balancing"})
+    assert uses_compact_routes(SimpleNamespace(**plain)) == compact_supported
+    assert layouts[-1] == (512, 8)
+    assert (
+        uses_compact_routes(
+            SimpleNamespace(**{**plain, "moe_router_load_balancing_type": "quantile_balancing"})
+        )
+        == compact_supported
     )
-    assert uses_compact_routes(
-        SimpleNamespace(**{**plain, "moe_router_load_balancing_type": ["aux_loss", "seq_aux_loss"]})
+    assert (
+        uses_compact_routes(
+            SimpleNamespace(
+                **{**plain, "moe_router_load_balancing_type": ["aux_loss", "seq_aux_loss"]}
+            )
+        )
+        == compact_supported
     )
     for name, value in (
         ("moe_flex_dispatcher_backend", "deepep"),
         ("moe_token_dispatcher_type", "alltoall"),
         ("moe_router_fusion", True),
+        ("moe_router_enable_expert_bias", True),
         ("moe_router_load_balancing_type", "sinkhorn"),
         ("moe_expert_capacity_factor", 1.0),
-        ("moe_pad_expert_input_to_capacity", True),
-        ("moe_token_dropping", True),
         ("expert_tensor_parallel_size", 2),
         ("moe_hybridep_pad_uneven_dispatch_inputs", True),
     ):
         assert not uses_compact_routes(SimpleNamespace(**{**plain, name: value})), name
-    assert uses_compact_routes(
-        SimpleNamespace(
-            **{**plain, "moe_virtual_expert_load_balance": True, "moe_router_fusion": True}
-        )
+    virtual = SimpleNamespace(
+        **{**plain, "moe_virtual_expert_load_balance": True, "moe_router_fusion": True}
     )
+    if compact_supported:
+        assert uses_compact_routes(virtual)
+    else:
+        with pytest.raises(AssertionError, match="compact top-k routing API"):
+            uses_compact_routes(virtual)
+    assert layouts[-1] == (1024, 16)
 
 
 def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):

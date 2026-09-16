@@ -39,7 +39,7 @@ from packaging.version import Version
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     allocate_graph_wgrad_rings,
     bind_wgrad_ring_slot,
-    clear_wgrad_rings,
+    clear_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
     register_capture_params_to_ensure_ready,
@@ -1858,7 +1858,7 @@ class GTPShardedParam(torch.nn.Parameter):
         Persistent buffers share the gather cache's bounded scheduling domains and wait for
         their previous reduce-scatter reader before reuse. Ordinary callers retain pooled scratch.
         """
-        ring_slot = getattr(self, "_gtp_wgrad_ring_slot", None)
+        ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)
         if ring_slot is None and persistent:
             # Grouped cache domains keep FC1/FC2 separate and alternate layers between two
             # slots. Include the logical shape so another parameter cannot dirty our padding.
@@ -1868,7 +1868,7 @@ class GTPShardedParam(torch.nn.Parameter):
             if not _chain_is_graphed(self.chain_id):
                 # The graph runner fences replay; eager writers acquire before their GEMM.
                 ring_slot.wait_for_reader()
-            return self._gtp_wgrad_ring_view
+            return self._gtp_graph_wgrad_ring_view
 
         # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
         if is_gtp_symm_pool_registered(self.group):
@@ -1948,7 +1948,7 @@ class GTPShardedParam(torch.nn.Parameter):
             if self._wgrad_rs_handle is not None:
                 waited = True
                 self._wgrad_rs_handle.wait()
-                self._record_wgrad_ring_slots_ready()
+                self._record_graph_wgrad_ring_slots_ready()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
                 if finalize_grad:
@@ -1988,11 +1988,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 symmetric_wgrad_pool.free(buf)
             setattr(self, attr, None)
 
-    def _record_wgrad_ring_slots_ready(self) -> None:
+    def _record_graph_wgrad_ring_slots_ready(self) -> None:
         """Publish that this RS has finished reading its persistent input slots."""
         seen = set()
         for weight in self._weights:
-            slot = getattr(weight, "_gtp_wgrad_ring_slot", None)
+            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
             if slot is None or id(slot) in seen:
                 continue
             seen.add(id(slot))
@@ -2175,8 +2175,10 @@ class GTPShardedParam(torch.nn.Parameter):
         send_bufs = []
         release_bufs = []
         for weight, wgrad in zip(self._weights, wgrads):
-            slot = getattr(weight, "_gtp_wgrad_ring_slot", None)
+            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
+
             if slot is None:
+
                 # With symmetric memory registration, send the padded parent tensor of the
                 # logical view that get_wgrad_tensor handed the GEMM.
                 if is_gtp_symm_pool_registered(weight.group):
@@ -2204,7 +2206,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 continue
 
             register_capture_wgrad_ring_slot(slot, weight)
-            logical_view = weight._gtp_wgrad_ring_view
+            logical_view = weight._gtp_graph_wgrad_ring_view
             if tuple(wgrad.shape) != tuple(logical_view.shape):
                 raise RuntimeError(
                     f"GTP wgrad shape {tuple(wgrad.shape)} does not match ring view "
@@ -2258,7 +2260,7 @@ class GTPShardedParam(torch.nn.Parameter):
             wgrads, _, release_bufs = self._reduce_scatter(
                 wgrads, async_op=False, nvtx_label=nvtx_label
             )
-            self._record_wgrad_ring_slots_ready()
+            self._record_graph_wgrad_ring_slots_ready()
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
                 weights[0].main_grad.add_(wgrads[0])
@@ -2732,7 +2734,7 @@ def reset_gtp_state():
     GTPShardedParam._link_tables_flushed = False
     GTPShardedParam._recompute_link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
-    clear_wgrad_rings(_GTP_PARAMS)
+    clear_graph_wgrad_rings(_GTP_PARAMS)
 
 
 # ------------------------------------------------------------------------

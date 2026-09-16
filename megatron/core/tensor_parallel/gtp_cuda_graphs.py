@@ -69,7 +69,7 @@ def preserve_gtp_prefetch_state(params: Iterable[torch.nn.Parameter]):
 
 
 @dataclass
-class WgradRingSlot:
+class GraphWgradRingSlot:
     """One persistent wgrad slot guarded by its reduce-scatter completion event."""
 
     tensor: torch.Tensor
@@ -146,7 +146,7 @@ class GTPCaptureCommState:
 
         return params, ag_streams, rs_streams
 
-    def register_wgrad_ring_slot(self, slot: WgradRingSlot, param) -> None:
+    def register_wgrad_ring_slot(self, slot: GraphWgradRingSlot, param) -> None:
         """Track slots used by this graph and reject unsafe intra-graph aliasing."""
         slot_id = id(slot)
         param_id = id(param)
@@ -176,7 +176,7 @@ def register_capture_params_to_ensure_ready(params: Iterable) -> None:
         _ACTIVE_CAPTURE_COMM_STATE.register_params_to_ensure_ready(params)
 
 
-def register_capture_wgrad_ring_slot(slot: WgradRingSlot, param) -> None:
+def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
     """Register a ring slot with the active capture, if one exists."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
         _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_ring_slot(slot, param)
@@ -205,12 +205,12 @@ def track_gtp_capture_comms():
 
 # Slots live outside the shared graph pool so independently replayed graphs cannot reuse an
 # in-flight reduce-scatter input as temporary workspace.
-_WGRAD_RINGS: dict[tuple, WgradRingSlot] = {}
+_GRAPH_WGRAD_RINGS: dict[tuple, GraphWgradRingSlot] = {}
 
 
-def bind_wgrad_ring_slot(param, key: tuple) -> WgradRingSlot:
+def bind_wgrad_ring_slot(param, key: tuple) -> GraphWgradRingSlot:
     """Bind a parameter to fixed padded storage in its caller-selected scheduling domain."""
-    slot = _WGRAD_RINGS.get(key)
+    slot = _GRAPH_WGRAD_RINGS.get(key)
     if slot is None:
         symm = is_gtp_symm_pool_registered(param.group)
         with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
@@ -219,12 +219,12 @@ def bind_wgrad_ring_slot(param, key: tuple) -> WgradRingSlot:
             )
         if param.pad_length > 0:
             tensor[param._unsharded_shape[0] :].zero_()
-        slot = _WGRAD_RINGS[key] = WgradRingSlot(
+        slot = _GRAPH_WGRAD_RINGS[key] = GraphWgradRingSlot(
             tensor=tensor, ready_event=torch.cuda.Event(external=True)
         )
         slot.ready_event.record()
-    param._gtp_wgrad_ring_slot = slot
-    param._gtp_wgrad_ring_view = slot.tensor[: param._unsharded_shape[0]]
+    param._gtp_graph_wgrad_ring_slot = slot
+    param._gtp_graph_wgrad_ring_view = slot.tensor[: param._unsharded_shape[0]]
     return slot
 
 
@@ -255,7 +255,7 @@ def allocate_graph_wgrad_rings(
         if chain_param.chain_id != graphed_chain_id or chain_param.prev_w is None:
             continue
         for param in chain_param._weights:
-            if id(param) in seen_params or hasattr(param, "_gtp_wgrad_ring_slot"):
+            if id(param) in seen_params or hasattr(param, "_gtp_graph_wgrad_ring_slot"):
                 continue
             seen_params.add(id(param))
             if not hasattr(param, "main_grad"):
@@ -303,13 +303,13 @@ def allocate_graph_wgrad_rings(
     )
 
 
-def clear_wgrad_rings(params: Iterable) -> None:
+def clear_graph_wgrad_rings(params: Iterable) -> None:
     """Drop persistent storage and parameter bindings after callers have synchronized GPU work."""
     for param in params:
-        for attr in ("_gtp_wgrad_ring_slot", "_gtp_wgrad_ring_view"):
+        for attr in ("_gtp_graph_wgrad_ring_slot", "_gtp_graph_wgrad_ring_view"):
             if hasattr(param, attr):
                 delattr(param, attr)
-    _WGRAD_RINGS.clear()
+    _GRAPH_WGRAD_RINGS.clear()
 
 
 _CG_MEMPOOL_DEVICE = None

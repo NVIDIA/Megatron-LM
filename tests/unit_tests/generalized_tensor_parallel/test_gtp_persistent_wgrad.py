@@ -23,7 +23,7 @@ def test_persistent_wgrad_reuse_preserves_every_reduction(monkeypatch, async_red
     """Full gradients, padding and exactly-once completion survive shared/repeated writers."""
     Utils.initialize_distributed()
     group = torch.distributed.group.WORLD
-    monkeypatch.setattr(gtp_cuda_graphs, "_WGRAD_RINGS", {})
+    monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
     monkeypatch.setattr(gtp, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
     monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", async_reduction)
     monkeypatch.setattr(gtp.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", True)
@@ -96,12 +96,14 @@ def test_persistent_wgrad_reuse_preserves_every_reduction(monkeypatch, async_red
                         torch.testing.assert_close(
                             weight.main_grad, expected[id(weight)], rtol=0, atol=0
                         )
-                        assert not torch.count_nonzero(weight._gtp_wgrad_ring_slot.tensor[130:])
+                        assert not torch.count_nonzero(
+                            weight._gtp_graph_wgrad_ring_slot.tensor[130:]
+                        )
                         calls_per_step = 2 if layer is layers[-1] else 1
                         assert completions[id(weight)] == (step + 1) * calls_per_step
             # Two buffers per role/expert, independent of the three-layer model depth.
             assert len(set(pointers.values())) == 8
-            assert len(gtp_cuda_graphs._WGRAD_RINGS) == 8
+            assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 8
     finally:
         torch.cuda.synchronize()
         for layer in layers:

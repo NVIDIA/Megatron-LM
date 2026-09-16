@@ -215,7 +215,7 @@ def test_virtual_expert_gtp_persistent_wgrads_match_recycled_scratch(monkeypatch
                     lambda p, method=get_wgrad_tensor, **kwargs: method(p),
                 )
             refs = [run(seed) for seed in (21, 22)]
-            assert not any(hasattr(p, "_gtp_wgrad_ring_slot") for p in experts)
+            assert not any(hasattr(p, "_gtp_graph_wgrad_ring_slot") for p in experts)
         while reference_layers:
             for tables in reference_layers.pop()._tables:
                 tables.pop("grad", None)
@@ -238,7 +238,7 @@ def test_virtual_expert_gtp_persistent_wgrads_match_recycled_scratch(monkeypatch
                 torch.testing.assert_close(
                     actual, expected, atol=0.01, rtol=0.02, msg=lambda msg: f"{name}: {msg}"
                 )
-            pointers = [p._gtp_wgrad_ring_slot.tensor.data_ptr() for p in experts]
+            pointers = [p._gtp_graph_wgrad_ring_slot.tensor.data_ptr() for p in experts]
             if slots is None:
                 slots = pointers
                 # Three layers share two slots per FC role/expert/shape domain.
@@ -247,7 +247,7 @@ def test_virtual_expert_gtp_persistent_wgrads_match_recycled_scratch(monkeypatch
                 def check_static_table(owner, fc_layer, key, sources):
                     tables = tuple(owner._tables[fc_layer].values())
                     result = get_weight_table(owner, fc_layer, key, sources)
-                    assert any(result is tensor for tensor, _ in tables)
+                    assert any(result is table.tensor for table in tables)
                     return result
 
                 monkeypatch.setattr(_VirtualExperts, "get_weight_table", check_static_table)
@@ -334,10 +334,10 @@ def test_virtual_expert_training_lifetime(monkeypatch, mxfp8):
             assert all(manager._plan is None for manager in managers)
             # Ignore chain discovery, then compare identities and every recorded source address.
             current = tuple(
-                (id(table), table.data_ptr(), tuple(map(tuple, rows)))
+                (id(table.tensor), table.tensor.data_ptr(), tuple(map(tuple, table.pointers)))
                 for manager in managers
                 for tables in manager.virtual_experts._tables
-                for table, rows in tables.values()
+                for table in tables.values()
             )
             current += (
                 managers[0].virtual_experts.storage.weight_arena.data_ptr(),
@@ -466,7 +466,6 @@ def test_virtual_expert_gtp_training_matches_hybridep(
             moe_router_score_function="sigmoid",
             moe_router_load_balancing_type="quantile_balancing" if quantile else "seq_aux_loss",
             moe_aux_loss_coeff=0 if quantile else 1e-4,
-            moe_router_enable_expert_bias=not quantile,
             moe_router_quantile_balancing_ema=0.9,
             moe_router_bias_update_rate=1e-3,
             moe_router_topk_scaling_factor=2.5,
@@ -708,7 +707,6 @@ def test_virtual_expert_gtp_training_matches_hybridep(
                             .metrics["seq_load_balancing_loss"]
                             .values.cpu()
                         )
-                        values["router bias"] = torch.stack([r.expert_bias for r in routers]).cpu()
                     assert all(r.weight.main_grad.float().norm() > 0 for r in routers)
                     for name, parameter in module.named_parameters():
                         values[f"model weight {name}"] = parameter.detach().float().cpu()
@@ -731,7 +729,7 @@ def test_virtual_expert_gtp_training_matches_hybridep(
                     if virtual:
                         assert tables
                         if expert_gtp == 2:
-                            assert all(p._gtp_wgrad_ring_slot is not None for p in experts)
+                            assert all(p._gtp_graph_wgrad_ring_slot is not None for p in experts)
                         else:
                             for layer in module.layers:
                                 owner = layer.mlp.token_dispatcher._comm_manager.virtual_experts

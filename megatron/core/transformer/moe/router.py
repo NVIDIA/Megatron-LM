@@ -745,15 +745,6 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
-                if routing_map.dtype != torch.bool:
-                    # Compact [num_tokens, topk] expert ids (virtual-expert load balancing):
-                    # expand them into the map with a scatter. bincount would read the ids'
-                    # range back to the host, two stream syncs per layer.
-                    routing_map = torch.zeros(
-                        (routing_map.shape[0], self.config.num_moe_experts),
-                        dtype=torch.bool,
-                        device=routing_map.device,
-                    ).scatter_(1, routing_map, True)
                 if padding_mask is not None:
                     routing_map = routing_map & (~padding_mask).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
@@ -789,10 +780,6 @@ class TopKRouter(Router):
         # HybridEP and virtual-expert planning consume the compact [num_tokens, topk] ids and
         # probabilities directly (see uses_compact_routes); the dispatcher expects the same format.
         compact_routes = uses_compact_routes(self.config)
-        if compact_routes and self.routing_type == "sinkhorn":
-            raise NotImplementedError(
-                f"Virtual-expert load balancing does not support {self.routing_type} routing."
-            )
 
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
