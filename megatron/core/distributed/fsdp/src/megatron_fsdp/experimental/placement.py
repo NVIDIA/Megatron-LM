@@ -30,10 +30,12 @@ sharded        ``Replicate``  ``allgather()``
 
 from collections.abc import Iterable
 
-from torch.distributed.tensor import Shard
+import torch.distributed as dist
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "Flat", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "Flat", "changed_mesh_axis", "sharded_reduce_group"]
 
 
 class Flat(Shard):
@@ -81,3 +83,46 @@ def changed_mesh_axis(
             )
         changed_axis = axis
     return changed_axis
+
+
+def sharded_reduce_group(mesh: DeviceMesh, placements: Iterable[Placement]) -> dist.ProcessGroup:
+    """Return a process group spanning every mesh axis ``placements`` shards over.
+
+    A reduction whose result must see the whole buffer -- such as the amax that
+    Transformer Engine MAX-reduces while quantizing MXFP8 master weights -- has to
+    include every ``Shard`` axis, because each rank of such an axis owns a
+    rank-disjoint block. One sharded axis uses that axis's group; several use the
+    flattened group over all of them, because no single mesh axis spans disjoint
+    shards on more than one axis. With no sharded axis every rank holds an
+    identical copy, so this mesh's axis 0 is the documented, idempotent fallback.
+    The default process group must NOT be used: it spans unrelated PP/TP ranks
+    holding different parameters and would silently corrupt the result.
+
+    A ``Partial`` axis holds a full-size unreduced contribution rather than a
+    rank-disjoint block, so no group can span "its shards"; it is rejected rather
+    than silently treated as either replicated or sharded.
+    """
+    sharded_axes = [
+        axis for axis, placement in enumerate(placements) if isinstance(placement, Shard)
+    ]
+    for axis, placement in enumerate(placements):
+        if not isinstance(placement, (Shard, Replicate)):
+            raise NotImplementedError(
+                f"Unsupported placement {placement!r} on mesh axis {axis}: expected Shard or "
+                "Replicate. A Partial axis is a full-size unreduced contribution, not a "
+                "rank-disjoint block, so no process group spans its shards."
+            )
+    if not sharded_axes:
+        return mesh.get_group(0)
+    if len(sharded_axes) == 1:
+        return mesh.get_group(sharded_axes[0])
+    if len(sharded_axes) == mesh.ndim:
+        flattened_group = getattr(mesh, "_mfsdp_flattened_group", None)
+        if flattened_group is not None:
+            return flattened_group
+        return mesh._flatten().get_group()
+    raise NotImplementedError(
+        f"Cannot reduce over sharded mesh axes {sharded_axes} of a {mesh.ndim}-dimensional "
+        "mesh: they are neither empty, a single axis, nor every axis, so no existing process "
+        "group spans exactly their shards."
+    )

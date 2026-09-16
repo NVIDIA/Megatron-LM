@@ -167,6 +167,71 @@ state precision.
   convention.
 - Main gradients and optimizer states stay fp32/bf16.
 
+### Revision 7 (payload storage aligned with the bf16 path)
+
+Revision 6 stored the two uint8 payload DBuffers at the *optimizer* placements,
+so the payload had the same layout as `main_weight` and the unshard widened
+directly to the all-`Replicate` gathered buffer. That is not how the bf16 path
+works, and for a two-axis-sharded dense parameter (HFSDP:
+`outer_dp_sharding_strategy=optim`, `data_parallel_sharding_strategy=
+optim_grads_params`, `num_distributed_optimizer_instances=2`) the quantization
+reduce group was derived from the payload's `[Shard, Shard]` placements as a
+single-axis gather, which raised `NotImplementedError: Expected at most one
+changed placement axis` during FSDP wrapping.
+
+Revision 7 mirrors the already-validated bf16 structure instead:
+
+- `_rowwise_buffer` / `_colwise_buffer` (the payload **storage**) are allocated
+  at `model_weight_placements` (the parameter layout), and
+  `post_optimizer_rowwise` / `post_optimizer_colwise` are
+  `buffer.view(main_weight_placements)` — the direct analogue of
+  `post_optimizer_model_weight`.
+- Quantization copies the temp shard slices into the **views**
+  (`_quantize_model_weight_from_main_weight`), the analogue of bf16's
+  `main_weight.cast(..., out=post_optimizer_model_weight)`.
+- `_rowwise_is_stale` / `_colwise_is_stale` mirror `_model_weight_is_stale`, and
+  `unshard_parameters` first runs
+  `post_optimizer_<orientation>.redistribute(buffer.placements, out=buffer)` when
+  stale, then gathers `buffer` into `_unsharded_<orientation>` as before.
+- The TE amax reduce group is derived from the quantization **source**
+  (`main_weight.placements`) through `placement.sharded_reduce_group()`, never
+  from the payload storage. Under HFSDP the payload is `[Replicate, Shard]` while
+  the masters are `[Shard, Shard]`; a payload-derived group would select only the
+  inner axis and produce an amax that is too small — fp8 scales that are too
+  large, a silent numerical regression. `test_mxfp8_parameter_group.py` pins the
+  flattened group for exactly that payload/master combination.
+- `_compute_weight_local_views` (the Muon shard-shape check) now compares the
+  **views**, matching the bf16 path; the storage is no longer `main_weight`-shaped
+  whenever the parameter layout is coarser.
+
+Every view/redistribute move then changes at most one mesh axis, so the existing
+single-axis `DBuffer.view` / `DBuffer.redistribute` / `changed_mesh_axis`
+machinery handles both configurations — no multi-axis redistribution support is
+needed:
+
+- **HFSDP dense**: payload `[Replicate, Shard]`; view `[Shard, Shard]`
+  (`Replicate` -> `Shard`, one axis); unshard `[Replicate, Shard]` ->
+  `[Replicate, Replicate]` (one axis).
+- **Expert ZeRO-1** (`main_weight=[Shard]`, parameter `[Replicate]`): view
+  `[Shard]` (one axis); unshard `[Replicate]` -> `[Replicate]` (zero axes, a
+  local copy).
+- **ZeRO-3** (`model_weight_placements == main_weight_placements`): `view()`
+  returns the storage itself, both staleness flags are `False`, and the storage
+  size, quantize target, and collective sequence are byte-for-byte the pre-change
+  path (verified against the base commit with a CPU simulation).
+
+Configuration behaviour and memory:
+
+- **Expert ZeRO-1**: the payload storage is now fully replicated. This is
+  intentional and the view makes the quantize copy correctly shard-shaped (the
+  pre-existing 2x local-size mismatch cannot recur). Persistent payload storage
+  per rank grows from the optimizer shard to the full tensor (× the sharded DP
+  size); the unshard peak grows from `2N + 2N/d` to `4N`.
+- **HFSDP dense** (outer 2 × inner 8): persistent payload storage per rank grows
+  ×2 (the outer axis) for both orientations, because the payload rests at
+  `[Replicate, Shard]` instead of `[Shard, Shard]`. The unshard peak is
+  unchanged.
+
 ### Validation status
 
 The end-to-end parity test `tests/unit_tests/distributed/mfsdp_v2/test_mxfp8_v1_parity.py`
