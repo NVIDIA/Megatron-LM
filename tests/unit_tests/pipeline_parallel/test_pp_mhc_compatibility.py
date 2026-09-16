@@ -290,6 +290,9 @@ class TestGetTensorShapesWithFixedPackedP2P:
     def _shapes(config, *, pp_rank=0, is_recv=True, tp_size=1, cp_size=32):
         tp, cp = _make_tp_cp_groups(tp_size=tp_size, cp_size=cp_size)
         return get_tensor_shapes(
+            # Deliberately unrelated to max_seqlen_per_dp_cp_rank: on the fixed packed path
+            # seq_length must be ignored in favor of the padded local length, so a value that
+            # would yield a different shape makes a regression visible.
             seq_length=65536,
             micro_batch_size=1,
             decoder_seq_length=None,
@@ -317,6 +320,52 @@ class TestGetTensorShapesWithFixedPackedP2P:
     def test_fixed_shape_honors_sequence_parallel(self):
         config = self._config(pipeline_p2p_fixed_shape=True, sequence_parallel=True)
         assert self._shapes(config, tp_size=2) == [(1024, 1, 64)]
+
+    def test_validated_config_derives_matching_shape(self):
+        """End-to-end: a config that passes __post_init__ must yield the padded local shape.
+
+        The other cases here use SimpleNamespace, so validation and shape derivation are
+        exercised on disjoint objects. This one runs the real __post_init__ and feeds the same
+        object to get_tensor_shapes(), pinning the validated-config -> derived-shape contract
+        (and catching a validation rule that permits a shape the derivation cannot build).
+
+        sequence_packing_scheduler is deliberately left unset: it would drag in the TE >= 2.9
+        gate in TransformerConfig.__post_init__ and make a pure shape-derivation test fail on
+        environments with an older or absent TransformerEngine. The packing-scheduler
+        requirement itself is covered in tests/unit_tests/test_model_parallel_config.py.
+        """
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=1,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            variable_seq_lengths=True,
+            max_seqlen_per_dp_cp_rank=2048,
+        )
+        config.pipeline_p2p_fixed_shape = True
+        assert self._shapes(config, tp_size=2) == [(1024, 1, 64)]
+
+    def test_fixed_shape_ignores_micro_batch_size(self):
+        """Packed batches are flattened to one sequence, so the pipeline batch dim stays 1.
+
+        get_tensor_shapes() receives args.micro_batch_size, which under sequence packing is the
+        sequences-per-sample-group and is routinely > 1. Sending (T, micro_batch_size, H) while
+        the real activation is (T, 1, H) mismatches the receiver's buffer.
+        """
+        config = self._config(pipeline_p2p_fixed_shape=True)
+        tp, cp = _make_tp_cp_groups(tp_size=1, cp_size=32)
+        shapes = get_tensor_shapes(
+            seq_length=65536,
+            micro_batch_size=8,
+            decoder_seq_length=None,
+            config=config,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=_make_pp_group(0, 4),
+            is_recv=True,
+        )
+        assert shapes == [(2048, 1, 64)]
 
 
 # ===========================================================================

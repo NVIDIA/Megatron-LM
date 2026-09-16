@@ -384,6 +384,16 @@ class ModelParallelConfig:
     ``max_seqlen_per_dp_cp_rank`` to determine the pipeline receive-buffer shape. It requires a
     sequence-packing scheduler, maximum-size packed-sequence padding, and static context
     parallelism.
+
+    Supported only by ``forward_backward_pipelining_without_interleaving``, the sole caller of
+    ``get_tensor_shapes()`` where the fixed packed shape is derived. The interleaved (VPP)
+    schedule computes its own ``seq_length // cp_size`` buffer, so
+    ``virtual_pipeline_model_parallel_size > 1`` is rejected in ``__post_init__`` rather than
+    silently posting mismatched receive buffers.
+
+    ``mtp_standalone=True`` keeps the dynamic shape protocol unconditionally, making this flag a
+    no-op; ``__post_init__`` warns in that case so the absent speedup is not mistaken for a
+    regression.
     """
 
     overlap_p2p_comm: bool = False
@@ -565,6 +575,46 @@ class ModelParallelConfig:
             if self.dynamic_context_parallel:
                 raise ValueError(
                     "pipeline_p2p_fixed_shape is not supported with dynamic_context_parallel."
+                )
+            # Must precede the alignment comparison below: when both fields are unset that
+            # comparison is `None not in ("max", None)` -> False, so validation would pass and
+            # get_tensor_shapes() would then derive the pipeline buffer from a None sequence
+            # length. Checking here turns that into a clear configuration error rather than a
+            # fixed-size buffer receiving genuinely variable-length sends.
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires max_seqlen_per_dp_cp_rank to be set; it "
+                    "defines the fixed pipeline receive-buffer sequence length."
+                )
+            # `is not None`, not `> 1`: get_forward_backward_func() selects the interleaved
+            # schedule on `vp_size is not None`, so a size of 1 already routes there even
+            # though it looks degenerate. arguments.py normalizes 1 -> None for the training
+            # entrypoints, but a config built directly against mcore does not get that.
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape is not supported with virtual pipeline "
+                    "parallelism. The interleaved schedule derives its own "
+                    "seq_length // cp_size pipeline buffer rather than calling "
+                    "get_tensor_shapes(), so skipping the shape exchange would post "
+                    "mismatched irecv buffers."
+                )
+            if (
+                self.sequence_parallel
+                and self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size != 0
+            ):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape with sequence_parallel requires "
+                    "max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}) to be divisible by "
+                    f"tensor_model_parallel_size ({self.tensor_model_parallel_size}); the "
+                    "pipeline buffer is scattered along the sequence dimension and floor "
+                    "division would under-allocate it."
+                )
+            if self.mtp_standalone:
+                warnings.warn(
+                    "pipeline_p2p_fixed_shape has no effect when mtp_standalone=True: the "
+                    "dynamic pipeline shape protocol stays enabled, so the shape-exchange "
+                    "synchronization is not removed."
                 )
             if self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank):
                 raise ValueError(

@@ -320,7 +320,7 @@ class P2PCommunicator:
         tensor_recv_next_func = None
 
         use_dynamic_shapes = config.mtp_standalone or (
-            config.variable_seq_lengths and not getattr(config, 'pipeline_p2p_fixed_shape', False)
+            config.variable_seq_lengths and not config.pipeline_p2p_fixed_shape
         )
         if use_dynamic_shapes:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(

@@ -3,6 +3,7 @@
 import sys
 
 import pytest
+import torch
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -66,6 +67,83 @@ def test_pipeline_p2p_fixed_shape_accepts_static_max_padding():
         pad_packed_seq_alignment="max",
     )
     assert config.pipeline_p2p_fixed_shape
+
+
+def test_pipeline_p2p_fixed_shape_requires_max_seqlen_when_alignment_unset():
+    """Both fields unset must not slip through the alignment membership test.
+
+    ``None not in ("max", None)`` is False, so without an explicit guard this configuration would
+    validate and then derive the pipeline buffer from a None sequence length.
+    """
+    with pytest.raises(ValueError, match="requires max_seqlen_per_dp_cp_rank to be set"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True, sequence_packing_scheduler="dp_balanced"
+        )
+
+
+def test_pipeline_p2p_fixed_shape_requires_max_seqlen_with_max_alignment():
+    """Same hole reached via a set alignment; here the pre-existing padding guard fires first.
+
+    Matched on the field name rather than one guard's wording so the test pins the outcome (no
+    fixed-shape config without a concrete padded length) instead of which check happens to run.
+    """
+    with pytest.raises(ValueError, match="max_seqlen_per_dp_cp_rank"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            pad_packed_seq_alignment="max",
+        )
+
+
+@pytest.mark.parametrize("vpp_size", [1, 2])
+def test_pipeline_p2p_fixed_shape_rejects_virtual_pipeline_parallelism(vpp_size):
+    """vpp_size=1 must be rejected too: get_forward_backward_func() picks the interleaved
+    schedule on `is not None`, so even a size of 1 bypasses get_tensor_shapes()."""
+    with pytest.raises(ValueError, match="not supported with virtual pipeline"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment="max",
+            pipeline_model_parallel_size=4,
+            virtual_pipeline_model_parallel_size=vpp_size,
+            pipeline_dtype=torch.bfloat16,
+        )
+
+
+def test_pipeline_p2p_fixed_shape_requires_tp_divisible_max_seqlen():
+    with pytest.raises(ValueError, match="to be divisible by"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=2049,
+            pad_packed_seq_alignment="max",
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+        )
+
+
+def test_pipeline_p2p_fixed_shape_allows_indivisible_max_seqlen_without_sequence_parallel():
+    """Without sequence parallelism the pipeline buffer is not scattered along TP."""
+    config = ModelParallelConfig(
+        pipeline_p2p_fixed_shape=True,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=2049,
+        pad_packed_seq_alignment="max",
+        tensor_model_parallel_size=2,
+    )
+    assert config.pipeline_p2p_fixed_shape
+
+
+def test_pipeline_p2p_fixed_shape_warns_when_mtp_standalone():
+    with pytest.warns(UserWarning, match="no effect when mtp_standalone"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment="max",
+            mtp_standalone=True,
+        )
 
 
 def test_contiguous_context_parallel_rejects_bshd_inputs():

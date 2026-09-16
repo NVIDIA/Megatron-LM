@@ -2241,9 +2241,7 @@ def get_tensor_shapes(
     """
     tensor_shapes = []
 
-    use_fixed_packed_shape = config.variable_seq_lengths and getattr(
-        config, 'pipeline_p2p_fixed_shape', False
-    )
+    use_fixed_packed_shape = config.variable_seq_lengths and config.pipeline_p2p_fixed_shape
     if config.variable_seq_lengths and not use_fixed_packed_shape:
         # Shapes exchanged dynamically during P2P communication
         tensor_shapes.append(())
@@ -2251,10 +2249,17 @@ def get_tensor_shapes(
 
     # Fixed sequence lengths - compute shape
     if use_fixed_packed_shape:
+        # Packed THD batches are flattened to a single sequence before the pipeline
+        # (data_schedule.py builds `tokens.view(1, total_tokens)`), so the inter-stage
+        # activation is (local_padded_T, 1, H) regardless of micro_batch_size. Mirrors the
+        # static-input derivation in transformer/module.py, which hardcodes batch = 1 on the
+        # THD path for the same reason.
         effective_seq_length = config.max_seqlen_per_dp_cp_rank
+        effective_micro_batch_size = 1
     else:
         effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
         effective_seq_length = effective_seq_length // cp_group.size()
+        effective_micro_batch_size = micro_batch_size
 
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
@@ -2279,7 +2284,7 @@ def get_tensor_shapes(
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
+    tensor_shapes.append((effective_seq_length, effective_micro_batch_size, hidden_size))
     return tensor_shapes
 
 
@@ -2363,6 +2368,17 @@ def forward_backward_pipelining_without_interleaving(
             if not config.variable_seq_lengths:
                 raise ValueError(
                     "config.variable_seq_lengths=True required for multi-module pipelines"
+                )
+            # Same reason the line above demands the dynamic protocol: modules exchange
+            # differently-shaped activations across a boundary (e.g. vision encoder -> language
+            # model), which only the per-boundary handshake resolves. pipeline_p2p_fixed_shape
+            # keeps variable_seq_lengths True while skipping that handshake, so it would derive
+            # one config.hidden_size-based shape for every boundary.
+            if config.pipeline_p2p_fixed_shape:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape is not supported for multi-module pipelines; "
+                    "their inter-module activation shapes differ per boundary and require the "
+                    "dynamic shape exchange."
                 )
             if pg_collection.has_language_model():
                 cp_size = pg_collection.get_language_model_cp_size()
