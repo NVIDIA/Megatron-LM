@@ -193,6 +193,7 @@ class ViTModel(MegatronModule):
         spatial_merge_size: int = 2,
         pg_collection=None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ):
         super().__init__(config=transformer_config)
         assert HAVE_TE, (
@@ -247,6 +248,7 @@ class ViTModel(MegatronModule):
             post_process=False,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name=(name + ".decoder") if name is not None else None,
         )
 
         # Optional Pixtral-Large-style 2×2 patch merger after the transformer stack.

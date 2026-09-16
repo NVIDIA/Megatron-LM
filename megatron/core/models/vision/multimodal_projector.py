@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
@@ -24,6 +24,9 @@ class MultimodalProjector(MegatronModule):
         projector_type (str): Projector type
         input_size (int): Input size from feature encoder
         tp_group (torch.distributed.ProcessGroup): Tensor parallel group
+        name (str | None): Qualified module path of this projector within the model.
+            A quant_recipe needs it to select the projector while its parameters are
+            being created; without it the recipe only takes effect in the forward pass.
     """
 
     def __init__(
@@ -34,6 +37,7 @@ class MultimodalProjector(MegatronModule):
         input_size: int,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
         self.projector_type = projector_type
@@ -46,7 +50,12 @@ class MultimodalProjector(MegatronModule):
         with fp8_init_context:
             if self.projector_type == "mlp":
                 self.encoder = MLP(
-                    config=config, submodules=submodules, input_size=input_size, tp_group=tp_group
+                    config=config,
+                    submodules=submodules,
+                    input_size=input_size,
+                    tp_group=tp_group,
+                    pg_collection=pg_collection,
+                    name=(name + ".encoder") if name is not None else None,
                 )
             elif self.projector_type == "affine":
                 self.encoder = submodules.linear_fc1(
@@ -56,10 +65,12 @@ class MultimodalProjector(MegatronModule):
                     init_method=not_none(config.init_method),
                     gather_output=True,
                     bias=config.add_bias_linear,
-                    skip_bias_add=True,
+                    skip_bias_add=False,
                     is_expert=False,
                     tp_comm_buffer_name=None,
                     tp_group=tp_group,
+                    pg_collection=pg_collection,
+                    name=(name + ".encoder") if name is not None else None,
                 )
             else:
                 raise Exception(f"Unsupported multimodal projection type {self.projector_type}")
@@ -73,6 +84,23 @@ class MultimodalProjector(MegatronModule):
         Returns:
             torch.Tensor: The projected output.
         """
+        original_shape = hidden_states.shape
+        padding = 0
+        if self.config.fp8:
+            alignment = get_fp8_align_size(self.config.fp8_recipe)
+            num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+            padding = (
+                alignment
+                if num_tokens == 0 and self.config.gtp_weight_remat_size > 1
+                else (-num_tokens) % alignment
+            )
+            if padding:
+                hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+                hidden_states = torch.cat(
+                    [hidden_states, hidden_states.new_zeros(padding, hidden_states.shape[-1])],
+                    dim=0,
+                )
+
         fp8_context = get_fp8_context(self.config)
         with fp8_context:
             # Run encoder.
@@ -80,6 +108,12 @@ class MultimodalProjector(MegatronModule):
 
             if encoder_output_bias is not None:
                 encoder_output = encoder_output + encoder_output_bias
+
+            if padding:
+                encoder_output = encoder_output[:-padding]
+                encoder_output = encoder_output.reshape(
+                    *original_shape[:-1], encoder_output.shape[-1]
+                )
 
             # the encoder produces "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
