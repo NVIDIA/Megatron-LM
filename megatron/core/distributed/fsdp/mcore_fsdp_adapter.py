@@ -58,6 +58,9 @@ try:
         fully_shard_context,
         microbatch,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
+        copy_parameter_attributes,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
         any_sharding_strategy_in,
@@ -94,8 +97,19 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
             "reset_parameters method."
         )
 
+    # Both _apply() and TE reset_parameters() may replace Parameter objects.
+    parameter_states = [
+        (name, parameter, parameter.requires_grad)
+        for name, parameter in module.named_parameters(recurse=False)
+    ]
+
     module._apply(materialize_tensor, recurse=False)
     reset_parameters()
+
+    for name, original_parameter, requires_grad in parameter_states:
+        parameter = module.get_parameter(name)
+        parameter.requires_grad_(requires_grad)
+        copy_parameter_attributes(original_parameter, parameter)
 
 
 def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:
@@ -768,14 +782,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
-        if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
-            config.expert_model_parallel_size <= 1
-            or ddp_config.num_distributed_optimizer_instances <= 1
+        if (
+            ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
+            and ddp_config.num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
-                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires an outer expert-DP "
-                "axis, i.e. expert parallelism and num_distributed_optimizer_instances > 1."
+                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
+                "num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")

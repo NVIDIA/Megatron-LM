@@ -318,7 +318,7 @@ one contiguous local buffer.
   `scatter` convenience operations. Redistributing between sharded placements preserves
   the global layout; [the optimizer subdesign](optimizer.md) converts between `Flat` and
   `TensorAtomic` this way.
-- `get_local_tensor(index)`: the local view for one logical tensor.
+- `get_tensor_view(index)`: the local view for one logical tensor.
 - `get_dtensor(index)`: the corresponding DTensor, used by the optimizer and distributed
   checkpointing.
 
