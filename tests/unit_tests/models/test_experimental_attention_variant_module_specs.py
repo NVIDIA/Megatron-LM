@@ -307,6 +307,7 @@ class TestGetGatedDeltaNetModuleSpec:
         hybrid_submodules = (
             hybrid_stack_spec.submodules.kda_layer.submodules.self_attention.submodules
         )
+        assert hybrid_submodules.beta_proj is TELinear
         assert hybrid_submodules.f_proj is TEColumnParallelLinear
         assert hybrid_submodules.f_a_proj is TELinear
         assert hybrid_submodules.f_b_proj is TEColumnParallelLinear
