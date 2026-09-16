@@ -165,9 +165,17 @@ class TEQuantizationRecipe:
     If an amax reduction is applicable, such as in per-tensor quantization recipe,
     whether to reduce only along TP groups.
     """
-    fp8_param: bool = False
+    inherit_model_init_context: bool = False
     """
-    If cast the initialized parameters to fp8 precision and all-gather weights in FP8.
+    Whether parameter storage should always inherit the enclosing model-init context.
+    Matching global and per-module MXFP8 policies also inherit automatically when
+    ``fp8_param`` is omitted.
+    """
+    fp8_param: bool | None = None
+    """
+    Whether to cast initialized parameters to FP8. If omitted, parameter storage
+    remains BF16 except when a matching global MXFP8 parameter policy is active;
+    that targeted case inherits the enclosing model-init context automatically.
     """
     fp4_param: bool = False
     """
@@ -179,6 +187,12 @@ class TEQuantizationRecipe:
         """
         Parse config from quantization dictionary.
         """
+        if quant_config.get("inherit_model_init_context", False) and any(
+            field in quant_config for field in ("fp8_param", "fp4_param")
+        ):
+            raise ValueError(
+                "inherit_model_init_context cannot be combined with fp8_param or fp4_param."
+            )
         kwargs = {}
         class_keys = cls.get_config_keys()
         for field in class_keys:
@@ -255,12 +269,19 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
-def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+def _get_fp8_model_init_for_quant_recipe(
+    qrecipe: TEQuantizationRecipe, *, auto_inherit_model_init_context: bool = False
+):
+    if qrecipe.inherit_model_init_context or auto_inherit_model_init_context:
+        # Preserve both the enclosing recipe and whether storage is enabled. In
+        # particular, this lets the global first/last-layer BF16 policy remain in
+        # control while a per-module recipe changes execution precision.
+        return nullcontext()
     if qrecipe.fp8_quantization_recipe is None and qrecipe.fp4_quantization_recipe is None:
         enabled = False
         quant_recipe = None
     elif qrecipe.fp8_quantization_recipe is not None:
-        enabled = qrecipe.fp8_param
+        enabled = bool(qrecipe.fp8_param)
         if qrecipe.fp8_format == "e4m3":
             fp8_format = te.common.recipe.Format.E4M3
         elif qrecipe.fp8_format == "hybrid":
@@ -301,13 +322,30 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     )
 
 
-def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_model_init_for_quant_params(
+    qparams: TEQuantizationParams | None, training: bool, config: TransformerConfig
+):
     if qparams is None:
         return nullcontext()
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_model_init_for_quant_recipe(qparams.evaluation_recipe)
+        qrecipe = qparams.evaluation_recipe
     else:
-        return _get_fp8_model_init_for_quant_recipe(qparams.training_recipe)
+        qrecipe = qparams.training_recipe
+
+    # A matching MXFP8 execution recipe should follow a global MXFP8 parameter
+    # policy when it does not make an explicit storage choice. This is narrow to
+    # MXFP8 and fp8_param=True: omitted recipe storage retains the legacy BF16
+    # behavior everywhere else, while explicit fp8_param=False remains an opt-out.
+    auto_inherit_model_init_context = (
+        qrecipe.fp8_param is None
+        and not qrecipe.fp4_param
+        and qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8
+        and getattr(config, "fp8_recipe", None) == Fp8Recipe.mxfp8
+        and bool(getattr(config, "fp8_param", False))
+    )
+    return _get_fp8_model_init_for_quant_recipe(
+        qrecipe, auto_inherit_model_init_context=auto_inherit_model_init_context
+    )
 
 
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
@@ -1328,7 +1366,7 @@ class TELinear(te.pytorch.Linear):
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
-            self.te_quant_params, torch.is_grad_enabled()
+            self.te_quant_params, torch.is_grad_enabled(), config
         )
         init_gtp_remat_context = _init_gtp_remat_context(
             self,
@@ -1553,7 +1591,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
-            self.te_quant_params, torch.is_grad_enabled()
+            self.te_quant_params, torch.is_grad_enabled(), config
         )
         # Yield a separate gtp_output_size: the logical output_size is reused below for cpu-init
         # (divide(output_size, tp_size)), so it must stay unsharded.
@@ -2591,7 +2629,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
             self.finish_init(quant_config)
             init_quant_context = _get_fp8_model_init_for_quant_params(
-                self.te_quant_params, torch.is_grad_enabled()
+                self.te_quant_params, torch.is_grad_enabled(), config
             )
             init_gtp_remat_context = _init_gtp_remat_context(
                 self,
