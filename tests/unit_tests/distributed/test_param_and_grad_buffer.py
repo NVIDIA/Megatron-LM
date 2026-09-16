@@ -105,6 +105,36 @@ def get_model_and_buffers(
     return model, param_and_grad_buffer, bucket_groups
 
 
+def test_param_offload_allocates_pinned_destination_directly():
+    Utils.initialize_model_parallel()
+    try:
+        _, param_and_grad_buffer, _ = get_model_and_buffers(
+            input_dim=4,
+            output_dim=4,
+            num_layers=1,
+            bias=False,
+            shared_embedding=False,
+            bucket_size=None,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            average_in_collective=False,
+        )
+        expected = param_and_grad_buffer.param_data.cpu()
+
+        original_empty_like = torch.empty_like
+        with mock.patch.object(torch, "empty_like", wraps=original_empty_like) as empty_like:
+            param_and_grad_buffer.offload_to_cpu(move_params=True, move_grads=False)
+
+        empty_like.assert_called_once_with(
+            param_and_grad_buffer.param_data, device="cpu", pin_memory=True
+        )
+        assert param_and_grad_buffer.param_data_cpu.is_pinned()
+        torch.testing.assert_close(param_and_grad_buffer.param_data_cpu, expected)
+        assert param_and_grad_buffer.param_data.storage().size() == 0
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
