@@ -1932,7 +1932,7 @@ def pretrain(
             # Determine which context manager to use for model allocation
             # Use torch_memory_saver if offloading is requested but UVM is not enabled
             use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights_when_idle
+                args.rl_offload_inference_model_weights
                 and uvm_level == 0
                 and HAVE_TORCH_MEMORY_SAVER
             )
@@ -1957,9 +1957,9 @@ def pretrain(
             inference_model[0].eval()
 
         # Validate: offloading flag requires a separate inference model
-        if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
+        if args.rl_offload_inference_model_weights and inference_model is None:
             raise ValueError(
-                "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
+                "--rl-offload-inference-model-weights requires a separate inference model. "
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
