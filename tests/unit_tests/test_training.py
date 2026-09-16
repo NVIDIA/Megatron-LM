@@ -14,6 +14,7 @@ from megatron.training.training import (
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
     _pop_samples_seen,
+    _should_compute_params_norm,
     build_train_valid_test_data_iterators,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -112,6 +113,22 @@ class TestTraining:
         valid_data = next(valid_iter)
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
+
+    def test_params_norm_is_computed_only_when_it_can_be_logged(self):
+        args = SimpleNamespace(
+            log_params_norm=True, log_interval=20, tensorboard_dir=None, tensorboard_log_interval=1
+        )
+
+        assert _should_compute_params_norm(args, iteration=1, is_first_iteration=True)
+        assert _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
+        assert not _should_compute_params_norm(args, iteration=19, is_first_iteration=False)
+
+        args.tensorboard_dir = "/tmp/tensorboard"
+        args.tensorboard_log_interval = 5
+        assert _should_compute_params_norm(args, iteration=5, is_first_iteration=False)
+
+        args.log_params_norm = False
+        assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self):
         """multiple_validation_sets + full_validation builds a list of iterators
