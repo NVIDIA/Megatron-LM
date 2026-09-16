@@ -124,6 +124,7 @@ def main(model_type: str = "gpt"):
         args_defaults={
             'no_load_rng': True,
             'no_load_optim': True,
+            'stream_ckpt_dequant': True,
             'exit_on_missing_checkpoint': True,
         },
     )

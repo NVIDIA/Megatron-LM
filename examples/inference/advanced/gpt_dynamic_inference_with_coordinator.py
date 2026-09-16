@@ -217,7 +217,7 @@ if __name__ == "__main__":
     with torch.inference_mode():
         args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
-            args_defaults={'no_load_rng': True, 'no_load_optim': True},
+            args_defaults={'no_load_rng': True, 'no_load_optim': True, 'stream_ckpt_dequant': True},
         )
         configure_nvtx_profiling(True)
 

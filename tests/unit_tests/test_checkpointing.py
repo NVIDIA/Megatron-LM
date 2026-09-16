@@ -494,6 +494,22 @@ def test_load_checkpoint(
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
 
 
+def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_args):
+    """The streaming dequantize load is weights-only (inference): the loaded state dict holds
+    the re-quantized params, so `load_checkpoint` must refuse any optimizer up front, before
+    anything is read."""
+    args = create_ckpt_load_args
+    args.load = "/nonexistent"
+    args.no_load_optim = True
+    args.stream_ckpt_dequant = True
+    set_args(args)
+
+    with pytest.raises(ValueError, match="inference-only"):
+        load_checkpoint(
+            [MockModel(TransformerConfig(num_layers=1, kv_channels=1))], MockState({}), None
+        )
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
     init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format

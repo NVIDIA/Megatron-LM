@@ -265,7 +265,7 @@ async def _run_async(
 def main():
     args = parse_and_validate_args(
         extra_args_provider=add_offline_inference_args,
-        args_defaults={'no_load_rng': True, 'no_load_optim': True},
+        args_defaults={'no_load_rng': True, 'no_load_optim': True, 'stream_ckpt_dequant': True},
     )
     initialize_megatron()
     _validate_high_level_api_args(args)
