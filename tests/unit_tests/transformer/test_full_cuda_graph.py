@@ -7,19 +7,30 @@ import pytest
 import torch
 from pytest_mock import mocker
 
+import megatron.core.full_cuda_graph as full_cuda_graph_module
 import megatron.core.pipeline_parallel.schedules as schedule
-from megatron.core import ModelParallelConfig
+from megatron.core import ModelParallelConfig, parallel_state
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
+    DSAIndexerLossLoggingHelper,
+)
 from megatron.core.utils import is_te_min_version
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def _reset_full_cuda_graph_state():
+    """Drop process-global full-iteration graph state between focused tests."""
+    FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
+    FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
+    FullCudaGraphWrapper.result = {'training': None, 'validation': None}
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
@@ -162,3 +173,111 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
         print(losses_reduced)
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph test requires a GPU")
+def test_full_cuda_graph_capture_counts_dsa_metric_once(monkeypatch):
+    """Capture records the DSA write; the immediate replay contributes it exactly once."""
+    _reset_full_cuda_graph_state()
+    initialize_rng_tracker(force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    values = torch.full((1,), 7.0, device="cuda")
+    tracker = {"values": values, "agreed_size": 1, "reduce_group": None, "avg_group": None}
+    tracker["agreed_size_pp_group"] = parallel_state.get_pipeline_model_parallel_group()
+    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+    reduce_group = object()
+    avg_group = object()
+
+    def forward_backward_func(**kwargs):
+        del kwargs
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
+        tracker["values"].add_(1.0)
+        return [tracker["values"]]
+
+    model = torch.nn.Module()
+    model.logs_dsa_indexer_loss = True
+    model.layer_number = 1
+    wrapped = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=0)
+    wrapped.data_read = lambda *_args: []
+
+    try:
+        result = wrapped(
+            data_iterator=[], model=[model], num_microbatches=1, seq_length=1, forward_only=True
+        )
+        torch.cuda.synchronize()
+
+        assert tracker["values"] is values
+        torch.testing.assert_close(values, torch.full_like(values, 8.0))
+        torch.testing.assert_close(result[0], torch.full_like(result[0], 8.0))
+        assert tracker["reduce_group"] is reduce_group
+        assert tracker["avg_group"] is avg_group
+    finally:
+        wrapped.reset_cuda_graph()
+        Utils.destroy_model_parallel()
+
+
+def test_full_cuda_graph_initializes_dsa_tracker_before_eager_warmup(monkeypatch):
+    """Custom full-iteration callers fix tracker storage before eager warmup writes."""
+    _reset_full_cuda_graph_state()
+    calls = []
+    events = []
+    storage = torch.zeros(1)
+
+    def initialize_tracker(model, pg_collection):
+        calls.append((model, pg_collection))
+        events.append("initialize")
+
+    def forward_backward_func(**_kwargs):
+        events.append("forward")
+        storage.add_(1)
+        return [storage]
+
+    monkeypatch.setattr(
+        full_cuda_graph_module.dsa_logging, "initialize_dsa_metric_tracker", initialize_tracker
+    )
+    monkeypatch.setattr(
+        full_cuda_graph_module.torch.autograd.graph,
+        "set_override_stale_capture_stream",
+        lambda _enabled: None,
+        raising=False,
+    )
+
+    model = torch.nn.Module()
+    pg_collection = object()
+    wrapped = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=1)
+    wrapped.data_read = lambda *_args: []
+
+    result = wrapped(
+        data_iterator=[],
+        model=[model],
+        num_microbatches=1,
+        seq_length=1,
+        forward_only=True,
+        pg_collection=pg_collection,
+    )
+
+    assert events == ["initialize", "forward"]
+    assert calls == [([model], pg_collection)]
+    assert result[0] is storage
+
+    def stop_before_capture():
+        raise RuntimeError("stop before capture")
+
+    monkeypatch.setattr(full_cuda_graph_module.torch.distributed, "barrier", stop_before_capture)
+    with pytest.raises(RuntimeError, match="stop before capture"):
+        wrapped(
+            data_iterator=[],
+            model=[model],
+            num_microbatches=1,
+            seq_length=1,
+            forward_only=True,
+            pg_collection=pg_collection,
+        )
+
+    assert calls == [([model], pg_collection)]
+    assert storage.item() == 1
+
+    wrapped.reset_cuda_graph()
+    assert not wrapped._dsa_tracker_initialized_stages

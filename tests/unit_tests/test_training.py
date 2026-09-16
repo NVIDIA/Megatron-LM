@@ -76,7 +76,7 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
 
 
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
-    """Hybrid MTP repeats each inner-pattern indexer once per unshared prediction depth."""
+    """Every hybrid MTP depth contributes one execution, including repeated-layer mode."""
     args = SimpleNamespace(
         num_layers=2,
         mtp_num_layers=2,
@@ -89,10 +89,49 @@ def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
     assert _get_indexer_logging_layer_counts(args) == (5, 5)
 
     args.mtp_use_repeated_layer = True
-    assert _get_indexer_logging_layer_counts(args) == (5, 3)
+    assert _get_indexer_logging_layer_counts(args) == (5, 5)
 
     args.csa_dense_mode = True
     assert _get_indexer_logging_layer_counts(args) == (5, 0)
+
+
+def test_indexer_logging_counts_repeated_standard_dsa_executions():
+    """Standard DSA MTP uses block-local numbers; repeated MTP reuses layer 1."""
+    args = SimpleNamespace(
+        num_layers=78,
+        mtp_num_layers=7,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern=None,
+        csa_compress_ratios=None,
+        dsa_indexer_skip_topk_offset=3,
+        dsa_indexer_topk_freq=4,
+    )
+
+    assert _get_indexer_logging_layer_counts(args) == (85, 25)
+
+    args.mtp_use_repeated_layer = True
+    assert _get_indexer_logging_layer_counts(args) == (85, 28)
+
+    args.num_layers = 80
+    assert _get_indexer_logging_layer_counts(args) == (87, 29)
+
+    args.mtp_use_repeated_layer = False
+    assert _get_indexer_logging_layer_counts(args) == (87, 26)
+
+
+def test_indexer_logging_counts_hybrid_dsa_executions():
+    """Hybrid DSA counts block-local indexers once for every MTP depth."""
+    args = SimpleNamespace(
+        num_layers=4,
+        mtp_num_layers=3,
+        mtp_use_repeated_layer=True,
+        hybrid_layer_pattern="D---/DD/DD/DD",
+        csa_compress_ratios=None,
+        dsa_indexer_skip_topk_offset=1,
+        dsa_indexer_topk_freq=4,
+    )
+
+    assert _get_indexer_logging_layer_counts(args) == (6, 4)
 
 
 class TestTraining:

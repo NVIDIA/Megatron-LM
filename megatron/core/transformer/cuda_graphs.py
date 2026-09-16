@@ -29,6 +29,7 @@ from megatron.core.tensor_parallel.random import (
     is_checkpointing,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.experimental_attention_variant import dsa_logging
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -2212,6 +2213,8 @@ class TECudaGraphHelper:
     parameters that are covered by cudagraphs.
     """
 
+    _manages_dsa_metric_tracker = True
+
     def __init__(
         self, model, config, seq_length, micro_batch_size, optimizers=[], pg_collection=None
     ):
@@ -2246,6 +2249,14 @@ class TECudaGraphHelper:
         self.num_microbatches = None
 
         self._discover_layers()
+        attention_in_graph_scope = (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+        if self._manages_dsa_metric_tracker and attention_in_graph_scope:
+            # Custom TE entrypoints may bypass training setup. Initialize collectively here,
+            # before any eager warmup or capture can write or rebind tracker storage.
+            dsa_logging.initialize_dsa_metric_tracker(self.model, self.pg_collection)
 
         # Flags to track CUDA Graph state:
         # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
@@ -2804,6 +2815,9 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        # TE executes real eager warmups before recording its graphs. Discard any metric writes
+        # while retaining the fixed storage and process-group metadata used by graph replay.
+        dsa_logging.DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -3188,6 +3202,8 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
             since the vision encoder always uses batch-dim = 1).
         num_microbatches: Number of microbatches per step.
     """
+
+    _manages_dsa_metric_tracker = False
 
     def __init__(
         self,
