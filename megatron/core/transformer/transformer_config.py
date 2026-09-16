@@ -421,6 +421,73 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    linear_attention_output_gate_activation: Optional[Literal["silu", "sigmoid"]] = None
+    """Activation applied to the gated delta net output gate (``z`` branch) before it
+    multiplies the normalized state output. ``None`` keeps the historical behaviour of
+    reusing ``activation_func`` (SiLU for Qwen3-Next / Qwen3.5). Qwen4-Exp
+    (Qwen3.8-Flash-Next) uses ``sigmoid``."""
+
+    ####################
+    # QSA (Qwen Sparse Attention)
+    ####################
+    qsa_indexer_n_heads: Optional[int] = None
+    """Number of QSA indexer query heads. Setting this turns every standard (softmax)
+    attention layer of the hybrid pattern into a Qwen Sparse Attention layer: a lightweight
+    MQA indexer scores mean-pooled key blocks and each query attends only to the tokens of its
+    top-k blocks plus the (incomplete) block it belongs to."""
+
+    qsa_indexer_kv_heads: int = 1
+    """Number of QSA indexer key heads. Qwen4-Exp requires 1."""
+
+    qsa_indexer_head_dim: Optional[int] = None
+    """Head dimension of the QSA indexer query and key heads."""
+
+    qsa_indexer_budget: Optional[int] = None
+    """Maximum number of tokens (from complete compressed blocks) each query attends to.
+    Must be a multiple of ``qsa_indexer_compress_ratio``."""
+
+    qsa_indexer_compress_ratio: Optional[int] = None
+    """Number of consecutive key tokens mean-pooled into one QSA index block."""
+
+    qsa_force_sparse: bool = False
+    """Always run the block-sparse (FlexAttention) kernel, even for sequences short enough
+    that every block is selected and dense causal attention would be exact. Testing knob."""
+
+    ####################
+    # PLE (per-layer n-gram embedding)
+    ####################
+    ple_layer_ids: Optional[List[int]] = None
+    """One-indexed decoder layer numbers that inject a Per-Layer (hashed n-gram) Embedding into
+    the residual streams before their attention sub-layer (Qwen4-Exp). ``None`` disables PLE."""
+
+    ple_embed_dim: Optional[int] = None
+    """Concatenated width of all n-gram heads of one PLE module. Defaults to ``hidden_size``."""
+
+    ple_conv_kernel_size: int = 4
+    """Kernel size of the dilated depthwise causal convolution inside each PLE module."""
+
+    ple_ngram_size: int = 3
+    """Largest token n-gram represented by PLE (bigrams and trigrams for 3)."""
+
+    ple_heads_per_ngram: int = 8
+    """Number of independently hashed embedding heads per n-gram order."""
+
+    ple_ngram_vocab_size_base: int = 20_000_000
+    """Lower bound used to derive a distinct prime vocabulary size for every hashed head."""
+
+    ple_ngram_vocab_divisible_by: int = 128
+    """Pad the combined n-gram vocabulary of a PLE module to a multiple of this value."""
+
+    ple_seed: int = 1234
+    """Seed used to derive the per-layer n-gram hash multipliers."""
+
+    ple_eos_token_id: Optional[int] = None
+    """Token id that resets the n-gram context (document separator). Required with PLE."""
+
+    ple_unigram_vocab_size: Optional[int] = None
+    """Token vocabulary size the n-gram hash multipliers are derived from (the HF
+    ``vocab_size``, 248320 for Qwen3.8-Flash-Next). Required with PLE."""
+
     ####################
     # initialization
     ####################
@@ -1228,6 +1295,18 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
+
+    mhc_variant: Literal["mhc", "gated_residual"] = "mhc"
+    """Hyper-connection formulation used by the layer specs when ``enable_mhc_connections`` is
+    set. ``mhc`` is the Manifold-Constrained Hyper-Connection of DeepSeek-V4
+    (``HyperConnectionModule``). ``gated_residual`` is the Qwen4-Exp (Qwen3.8-Flash-Next) Gated
+    Residual (``GatedResidualHyperConnection``): each sub-layer reads a sigmoid-gated mean of the
+    per-stream RMS-normalized streams and writes its output back to every stream with a per-stream
+    scalar gate; the block output is a learned gated mix of the streams instead of their mean."""
+
+    mhc_gated_residual_rank: Optional[int] = None
+    """Bottleneck rank of the gated-residual input mixer (``hc_lowrank`` in the Qwen4-Exp HF
+    config). Required when ``mhc_variant == "gated_residual"``."""
 
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
@@ -2372,8 +2451,10 @@ class TransformerConfig(ModelParallelConfig):
                     "on a None chunk. Disable one of them."
                 )
 
-        if self.enable_mhc_connections and not (
-            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        if (
+            self.enable_mhc_connections
+            and self.mhc_variant == "mhc"
+            and not (self.recompute_granularity == "selective" and "mhc" in self.recompute_modules)
         ):
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
@@ -2394,11 +2475,86 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
 
         if self.enable_mhc_connections and self.recompute_granularity == "full":
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet compatible with full activation recompute. "
-                "Use selective recompute with 'mhc' in recompute_modules, or disable "
-                "activation recompute."
-            )
+            # Full recompute checkpoints whole layers on the n-stream tensor, which is
+            # shape-agnostic; only the fine-grained mHC recompute managers are not threaded
+            # through that path. The gated-residual variant has no such managers.
+            if self.mhc_variant != "gated_residual":
+                raise NotImplementedError(
+                    "enable_mhc_connections is not yet compatible with full activation "
+                    "recompute for mhc_variant='mhc'. Use selective recompute with 'mhc' in "
+                    "recompute_modules, or disable activation recompute."
+                )
+
+        if self.mhc_variant == "gated_residual":
+            if not self.enable_mhc_connections:
+                raise ValueError(
+                    "mhc_variant='gated_residual' requires enable_mhc_connections=True."
+                )
+            if self.mhc_gated_residual_rank is None or self.mhc_gated_residual_rank < 1:
+                raise ValueError(
+                    "mhc_variant='gated_residual' requires a positive mhc_gated_residual_rank, "
+                    f"got {self.mhc_gated_residual_rank}."
+                )
+            if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+                raise NotImplementedError(
+                    "'mhc' in recompute_modules is only implemented for mhc_variant='mhc'."
+                )
+            if self.use_fused_mhc:
+                raise NotImplementedError(
+                    "use_fused_mhc is only implemented for mhc_variant='mhc'."
+                )
+
+        if self.qsa_indexer_n_heads is not None:
+            for name in (
+                "qsa_indexer_head_dim",
+                "qsa_indexer_budget",
+                "qsa_indexer_compress_ratio",
+            ):
+                if getattr(self, name) is None or getattr(self, name) <= 0:
+                    raise ValueError(f"QSA requires a positive {name}, got {getattr(self, name)}.")
+            if self.qsa_indexer_kv_heads != 1:
+                raise ValueError("QSA requires qsa_indexer_kv_heads=1.")
+            if self.qsa_indexer_budget % self.qsa_indexer_compress_ratio != 0:
+                raise ValueError(
+                    "qsa_indexer_budget must be a multiple of qsa_indexer_compress_ratio."
+                )
+            # `rotary_percent` is a model-level (GPTModel / provider) setting; validate when
+            # present.
+            rotary_percent = getattr(self, "rotary_percent", None)
+            if self.kv_channels is not None and rotary_percent is not None:
+                rotary_dim = int(self.kv_channels * rotary_percent)
+                if rotary_dim > self.qsa_indexer_head_dim:
+                    raise ValueError(
+                        "The attention RoPE width must fit in the QSA indexer head: "
+                        f"rotary_dim={rotary_dim} > "
+                        f"qsa_indexer_head_dim={self.qsa_indexer_head_dim}."
+                    )
+            if self.multi_latent_attention:
+                raise NotImplementedError("QSA is only implemented for standard (GQA) attention.")
+
+        if self.ple_layer_ids:
+            self.ple_layer_ids = sorted(set(self.ple_layer_ids))
+            if self.ple_eos_token_id is None:
+                raise ValueError("ple_eos_token_id must be set when ple_layer_ids is set.")
+            if self.ple_unigram_vocab_size is None or self.ple_unigram_vocab_size < 1:
+                raise ValueError("ple_unigram_vocab_size must be set when ple_layer_ids is set.")
+            if not self.enable_mhc_connections:
+                raise NotImplementedError(
+                    "PLE is only implemented on top of hyper-connection streams."
+                )
+            ngram_heads = (self.ple_ngram_size - 1) * self.ple_heads_per_ngram
+            ple_embed_dim = self.ple_embed_dim or self.hidden_size
+            if ngram_heads <= 0 or ple_embed_dim % ngram_heads != 0:
+                raise ValueError(
+                    f"ple_embed_dim ({ple_embed_dim}) must be divisible by the number of n-gram "
+                    f"heads ({ngram_heads})."
+                )
+            bad = [i for i in self.ple_layer_ids if i < 1 or i > self.num_layers]
+            if bad:
+                raise ValueError(
+                    f"ple_layer_ids must be one-indexed layer numbers in [1, {self.num_layers}], "
+                    f"got {bad}."
+                )
 
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(

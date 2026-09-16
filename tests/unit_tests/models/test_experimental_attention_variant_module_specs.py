@@ -87,6 +87,9 @@ def _make_config(**overrides):
         kitchen_attention_backend="sdpa",
         fallback_to_eager_attn=False,
         enable_mhc_connections=False,
+        mhc_variant="mhc",
+        qsa_indexer_n_heads=None,
+        ple_layer_ids=None,
     )
     defaults.update(overrides)
     cfg = MagicMock()

@@ -630,6 +630,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        # Per-layer (hashed n-gram) embeddings need the raw token ids, which the decoder
+        # layers never see: hand them to every PLE module of this stage before the decoder runs.
+        if self.config.ple_layer_ids:
+            self._prepare_per_layer_embeddings(input_ids, packed_seq_params, inference_context)
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -674,6 +679,42 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )
+
+    def _prepare_per_layer_embeddings(
+        self,
+        input_ids: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        inference_context: Optional[BaseInferenceContext],
+    ) -> None:
+        """Compute the hashed n-gram ids for every PLE module of this pipeline stage.
+
+        The ids are derived from the raw token ids (with the n-gram context reset at
+        ``config.ple_eos_token_id`` and at packed-sequence boundaries) and stashed on the PLE
+        modules, which consume them in their forward pass.
+        """
+        ple_modules = [
+            layer.per_layer_embedding
+            for layer in getattr(self.decoder, "layers", [])
+            if getattr(layer, "per_layer_embedding", None) is not None
+        ]
+        if not ple_modules:
+            return
+        if input_ids is None:
+            raise ValueError(
+                "Per-layer embeddings require `input_ids`; passing only `decoder_input` is not "
+                "supported for models with ple_layer_ids."
+            )
+        if inference_context is not None:
+            raise NotImplementedError(
+                "Per-layer embeddings do not support the Megatron inference path yet."
+            )
+        cu_seqlens = None
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+            if packed_seq_params.cu_seqlens_q_padded is not None:
+                cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        for module in ple_modules:
+            module.prepare(input_ids, cu_seqlens=cu_seqlens)
 
     def _postprocess(
         self,

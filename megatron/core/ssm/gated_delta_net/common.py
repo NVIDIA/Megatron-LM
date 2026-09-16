@@ -177,6 +177,19 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
+        # Output-gate activation: defaults to the conv/MLP activation (SiLU for Qwen3-Next),
+        # Qwen4-Exp gates the normalized state output with a sigmoid instead.
+        gate_activation = config.linear_attention_output_gate_activation
+        if gate_activation is None:
+            self.gate_act_fn = self.act_fn
+        elif gate_activation == "sigmoid":
+            self.gate_act_fn = torch.sigmoid
+        elif gate_activation == "silu":
+            self.gate_act_fn = F.silu
+        else:
+            raise ValueError(
+                f"Unsupported linear_attention_output_gate_activation: {gate_activation}"
+            )
         self.conv_kernel_dim = config.linear_conv_kernel_dim
         self.key_head_dim = config.linear_key_head_dim
         self.value_head_dim = config.linear_value_head_dim
@@ -404,7 +417,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         y = self.out_norm(x)
         # Output gate
         gate = gate.reshape(-1, gate.shape[-1])
-        y = y * self.act_fn(gate.float())
+        y = y * self.gate_act_fn(gate.float())
         y = y.to(x_dtype)
         return y
 
