@@ -25,6 +25,7 @@ from typing import Self
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 
+from .layout import non_leading_numel
 from .parameter_group import FsdpParameterGroup
 
 
@@ -127,8 +128,24 @@ class ParameterLayout:
         return len(self.owner_candidates()) > 1
 
 
+def ns_cost_fn(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
+    """Cost function matching the Newton-Schulz orthogonalization compute estimate for the given
+    number of Newton-Schulz iterations/steps.
+
+    `numel * (min(rows, cols) * num_steps + 1)` under the DBuffer's leading-dim view (`(shape[0],
+    shape[1:].numel())`).
+    """
+
+    def cost_fn(layout: ParameterLayout) -> int:
+        shape = layout.full_shape
+        short_dim = min(shape[0], non_leading_numel(shape))
+        return layout.full_numel() * (short_dim * num_ns_steps + 1)
+
+    return cost_fn
+
+
 def assign_owner_work(
-    layouts: dict[int, ParameterLayout], cost_fn: Callable[[ParameterLayout], float]
+    layouts: dict[int, ParameterLayout], cost_fn: Callable[[ParameterLayout], float] | None = None
 ) -> dict[int, int]:
     """Assign one owner rank to each parameter, keyed by tensor index.
 
@@ -143,11 +160,15 @@ def assign_owner_work(
         cost_fn: Callable that returns a positive cost estimate for a given parameter layout. The
             greedy balancer minimizes the maximum running cost total across ranks, so the cost
             should reflect the relative compute weight of owning each parameter (e.g., an
-            orthogonalization cost estimate).
+            orthogonalization cost estimate). When `None`, defaults to a compute estimate for
+            orthogonalization via Newton-Schulz with 5 iterations/steps.
 
     Returns:
         Mapping from tensor index to owner rank.
     """
+    if cost_fn is None:
+        cost_fn = ns_cost_fn(num_ns_steps=5)
+
     assignments: dict[int, int] = {}
     if not layouts:
         return assignments
@@ -210,7 +231,7 @@ class GroupOwnerLayout:
         cls,
         group: FsdpParameterGroup,
         *,
-        cost_fn: Callable[[ParameterLayout], float],
+        cost_fn: Callable[[ParameterLayout], float] | None = None,
         eligible_fn: Callable[[torch.Tensor], bool] | None = None,
     ) -> Self:
         """Build the owner layout for one group.
@@ -218,7 +239,8 @@ class GroupOwnerLayout:
         Args:
             group: The FSDP parameter group whose DBuffer layout describes the parameter placements.
             cost_fn: Cost estimate per parameter layout used to balance owner assignments across
-                ranks. See also `assign_owner_work`.
+                ranks. When `None`, defaults to a compute estimate for orthogonalization via
+                Newton-Schulz with 5 iterations/steps. See also `assign_owner_work`.
             eligible_fn: Predicate selecting which parameters participate in owner-compute
                 orthogonalization. When `None`, defaults to matching ≥2D tensors. See also
                 `ParameterLayout.from_group`.
