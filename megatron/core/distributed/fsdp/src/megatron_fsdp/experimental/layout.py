@@ -15,29 +15,71 @@
 """Global tensor layout metadata for DBuffer."""
 
 import dataclasses
+import itertools
 import math
 from collections.abc import Iterable
 from typing import TypeAlias
 
 import torch
-from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Shard
-from torch.distributed.tensor.placement_types import Placement
+
+from .placement import BlockAtomic, Flat, PlacementReference, TensorAtomic
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 
 
 @dataclasses.dataclass(frozen=True)
 class GlobalLayout:
-    """Global tensor layout in element coordinates."""
+    """Global tensor layout in element coordinates.
+
+    Attributes:
+        tensor_shapes: Logical tensor shapes in tensor-id order.
+        tensor_to_offset: Global element offset of each logical tensor's first element.
+        size: Total number of global elements, including any padding or gaps.
+        reference: The Shard placement this layout was planned against. ``Flat`` and
+            ``BlockAtomic`` produce a row-/block-aligned layout padded to equal-size
+            per-rank shards; ``TensorAtomic`` produces a gap-free layout in which each
+            rank's contiguous segment holds exactly the tensors it owns.
+    """
 
     tensor_shapes: tuple[torch.Size, ...]
     tensor_to_offset: tuple[int, ...]
     size: int
-    block_size: int = 1
+    reference: PlacementReference = Flat()
 
     @classmethod
-    def build(cls, shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1) -> "GlobalLayout":
+    def build(
+        cls, shapes: Iterable[Shape], dp_size: int, *, reference: PlacementReference = Flat()
+    ) -> "GlobalLayout":
+        """Plan a global layout for ``shapes`` under the given reference placement.
+
+        Dispatches to ``_build_for_tensor_atomic`` for ``TensorAtomic`` and to
+        ``_build_for_row_aligned`` for ``Flat`` / ``BlockAtomic``.
+
+        Args:
+            shapes: Logical tensor shapes in tensor-id order.
+            dp_size: Data-parallel shard count for this global layout.
+            reference: Shard placement the layout must be compatible with.
+
+        Returns:
+            A validated ``GlobalLayout``.
+        """
+        if dp_size <= 0:
+            raise ValueError(f"DP size must be positive, got {dp_size}.")
+        if not isinstance(reference, (Flat, BlockAtomic, TensorAtomic)):
+            raise ValueError(
+                "'reference' type should be chosen from (Flat, BlockAtomic, TensorAtomic), "
+                f"but got {type(reference)}."
+            )
+
+        tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
+        if isinstance(reference, TensorAtomic):
+            return cls._build_for_tensor_atomic(tensor_shapes, dp_size=dp_size, reference=reference)
+        return cls._build_for_row_aligned(tensor_shapes, dp_size=dp_size, reference=reference)
+
+    @classmethod
+    def _build_for_row_aligned(
+        cls, tensor_shapes: Iterable[Shape], dp_size: int, *, reference: PlacementReference = Flat()
+    ) -> "GlobalLayout":
         """Compute global tensor element offsets and padded size.
 
         This is a DBuffer-specific reimplementation of
@@ -46,11 +88,10 @@ class GlobalLayout:
         size is a multiple of ``chunk_size``; DBuffer derives rank-local slices
         later through DTensor placements.
 
-        The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
-        even though the latter two are not implemented.
 
         ``chunk_size`` is the least common multiple of each tensor's row size
-        (``shape[1:].numel()``). For example, with shapes P0=(2, 6), P1=(4, 4),
+        (``shape[1:].numel()``), additionally multiplied by ``block_size`` for
+        ``BlockAtomic``. For example, with shapes P0=(2, 6), P1=(4, 4),
         P2=(4, 4), P3=(1, 2), P4=(1, 6), ``chunk_size = LCM(6, 4, 4, 2, 6) = 12``
         and a 5-rank DP layout has equal-size rank shards:
 
@@ -68,20 +109,21 @@ class GlobalLayout:
         padding gaps.
 
         Args:
-            shapes: Logical tensor shapes in tensor-id order.
+            tensor_shapes: Logical tensor shapes in tensor-id order.
             dp_size: Data-parallel shard count for this global layout.
+            reference: ``Flat`` or ``BlockAtomic``. For ``BlockAtomic`` its
+                ``block_size`` rows are kept together on one rank.
 
         Returns:
             Global layout with row-aligned tensor offsets and a total size padded
             to a multiple of ``chunk_size * dp_size``, so every rank-local shard
             length is a multiple of ``chunk_size``.
         """
-        if dp_size <= 0:
-            raise ValueError(f"DP size must be positive, got {dp_size}.")
+
+        block_size = reference.block_size if isinstance(reference, BlockAtomic) else 1
         if block_size <= 0:
             raise ValueError(f"Block size must be positive, got {block_size}.")
 
-        tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
         chunk_size = 1
         for shape in tensor_shapes:
             row_size = non_leading_numel(shape)
@@ -175,11 +217,100 @@ class GlobalLayout:
             tensor_shapes=tensor_shapes,
             tensor_to_offset=tuple(tensor_to_offset),
             size=_pad_to_multiple(next_offset, chunk_size * dp_size),
-            block_size=block_size,
+            reference=reference,
+        )
+
+    @classmethod
+    def _build_for_tensor_atomic(
+        cls, tensor_shapes: Iterable[Shape], dp_size: int, *, reference: TensorAtomic
+    ) -> "GlobalLayout":
+        """Compute global tensor element offsets from a tensor-to-owner-rank assignment.
+
+        The global buffer is the concatenation of one contiguous segment per rank,
+        ordered by rank id. Rank ``r``'s segment holds exactly the tensors that
+        ``reference.tensor_to_owner_rank`` assigns to ``r``, packed back to back in
+        ascending tensor-id order. Because tensors are never split across ranks
+        there is no row- or block-alignment constraint, and because segments are
+        packed tightly there is no padding: ``size`` equals the sum of all tensor
+        numels. Segment lengths are in general different per rank.
+
+        For example, with shapes P0=(2, 6), P1=(4, 4), P2=(1, 2) and the assignment
+        ``{0: 1, 1: 0, 2: 1}`` on 2 ranks:
+
+        ```
+        rank 0 [ 0, 16): | P1                      |
+        rank 1 [16, 30): | P0             | P2     |
+        ```
+
+        Args:
+            tensor_shapes: Logical tensor shapes in tensor-id order.
+            dp_size: Data-parallel shard count for this global layout.
+            reference: ``TensorAtomic`` placement whose ``tensor_to_owner_rank``
+                maps every tensor id in ``range(len(tensor_shapes))`` to an owner
+                rank in ``[0, dp_size)``.
+
+        Returns:
+            Global layout whose per-rank segments are gap-free and whose ``size`` is
+            the total number of logical elements.
+        """
+
+        tensor_to_owner_rank = reference.tensor_to_owner_rank
+        if len(tensor_shapes) != len(tensor_to_owner_rank):
+            raise ValueError(
+                "In planning a layout for TensorAtomic placement, the number of tensors must "
+                "equal to the number of assignment entries, "
+                f"but got {len(tensor_shapes)} and {len(tensor_to_owner_rank)}."
+            )
+
+        if set(tensor_to_owner_rank.keys()) != set(range(len(tensor_shapes))):
+            raise ValueError(
+                "In planning a layout for TensorAtomic placement, the keys of "
+                "'tensor_to_owner_rank' must exactly match the indices of tensors of range "
+                f"({len(tensor_shapes)}), "
+                f"but got {tensor_to_owner_rank.keys()}"
+            )
+
+        candidate_rank_set = set(tensor_to_owner_rank.values())
+        if min(candidate_rank_set) < 0 or max(candidate_rank_set) >= dp_size:
+            raise ValueError(
+                "In planning a layout for TensorAtomic placement, the owner of each tensor must be "
+                f"within the range of data parallel size: [0, {dp_size}), "
+                f"but got {min(candidate_rank_set)} for minimum, "
+                f"and {max(candidate_rank_set)} for maximum."
+            )
+
+        # Group tensor ids by owner rank. Iterating the dict in insertion order and
+        # appending keeps each rank's tensor list in a deterministic order.
+        rank_to_tensors: dict[int, list[int]] = {rank: [] for rank in range(dp_size)}
+        totalel = 0
+        for tensor_index, owner_rank in tensor_to_owner_rank.items():
+            rank_to_tensors[owner_rank].append(tensor_index)
+            totalel += tensor_shapes[tensor_index].numel()
+
+        # Lay out rank segments back to back in ascending rank order, packing each
+        # rank's tensors contiguously inside its segment.
+        offset = 0
+        tensor_to_offset = [-1] * len(tensor_shapes)
+        per_rank_numels = [0] * len(rank_to_tensors)
+        for rank_id in sorted(rank_to_tensors.keys()):
+            tensor_list = rank_to_tensors[rank_id]
+            local_offset = 0
+            for tensor_index in tensor_list:
+                numel = tensor_shapes[tensor_index].numel()
+                tensor_to_offset[tensor_index] = offset + local_offset
+                local_offset += numel
+                per_rank_numels[rank_id] += numel
+            offset += local_offset
+
+        return cls(
+            tensor_shapes=tensor_shapes,
+            tensor_to_offset=tuple(tensor_to_offset),
+            size=totalel,
+            reference=reference,
         )
 
     def __post_init__(self) -> None:
-        """Validate tensor offsets are row-aligned, in bounds, and non-overlapping."""
+        """Validate tensor offsets are in bounds, non-overlapping, and reference-compatible."""
 
         @dataclasses.dataclass(frozen=True)
         class TensorRange:
@@ -197,6 +328,31 @@ class GlobalLayout:
                 f"{len(self.tensor_shapes)} shapes and {len(self.tensor_to_offset)} offsets."
             )
 
+        if isinstance(self.reference, TensorAtomic):
+            # Recompute each rank's segment from the owner assignment and check that
+            # every tensor sits inside its owner's segment.
+            owner = self.reference.tensor_to_owner_rank
+            dp_size = max(owner.values()) + 1
+            per_rank = [0] * dp_size
+            for tensor_id, rank in owner.items():
+                per_rank[rank] += self.tensor_shapes[tensor_id].numel()
+            if sum(per_rank) != self.size:
+                raise AssertionError(
+                    "For TensorAtomic reference placement, the sum of all ranks' local elements "
+                    f"({sum(per_rank)}) should equal to total size ({self.size})."
+                )
+            segment_start = list(itertools.accumulate([0, *per_rank[:-1]]))
+            for tensor_id, (shape, start) in enumerate(
+                zip(self.tensor_shapes, self.tensor_to_offset)
+            ):
+                rank = owner[tensor_id]
+                lo, hi = segment_start[rank], segment_start[rank] + per_rank[rank]
+                if not (lo <= start and start + shape.numel() <= hi):
+                    raise AssertionError(
+                        f"Tensor {tensor_id} [{start}, {start + shape.numel()}) is out of "
+                        f"owner rank {rank} segment [{lo}, {hi})."
+                    )
+
         tensor_ranges: list[TensorRange] = []
         for tensor_id, (shape, start) in enumerate(
             zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
@@ -204,14 +360,18 @@ class GlobalLayout:
             if start < 0:
                 raise AssertionError(f"Tensor {tensor_id} offset {start} is negative.")
 
-            row_size = non_leading_numel(shape)
-            if row_size <= 0:
-                raise AssertionError(f"Tensor {tensor_id} has invalid row size {row_size}.")
-            if start % (self.block_size * row_size) != 0:
-                raise AssertionError(
-                    f"Tensor {tensor_id} offset {start} is not aligned to block size "
-                    f"{self.block_size * row_size}."
-                )
+            if not isinstance(self.reference, TensorAtomic):
+                # Flat / BlockAtomic shards may cut through a tensor, so every tensor must
+                # start on a row (and block) boundary to keep dim-0 rows intact per rank.
+                # TensorAtomic never splits a tensor, so no alignment is required.
+                row_size = non_leading_numel(shape)
+                if row_size <= 0:
+                    raise AssertionError(f"Tensor {tensor_id} has invalid row size {row_size}.")
+                if start % (self.block_size * row_size) != 0:
+                    raise AssertionError(
+                        f"Tensor {tensor_id} offset {start} is not aligned to block size "
+                        f"{self.block_size * row_size}."
+                    )
 
             end = start + shape.numel()
             if end > self.size:
@@ -233,22 +393,10 @@ class GlobalLayout:
                 )
             previous_range = current_range
 
-    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
-        """Return this rank's local element offset and length for ``placements``."""
-        offset = 0
-        numel = self.size
-        for axis, placement in reversed(tuple(enumerate(placements))):
-            if not isinstance(placement, Shard):
-                continue
-            axis_size = mesh.size(axis)
-            if numel % axis_size != 0:
-                raise ValueError(
-                    f"Local range size {numel} is not divisible by Flat axis size {axis_size}."
-                )
-            shard_size = numel // axis_size
-            offset += mesh.get_local_rank(axis) * shard_size
-            numel = shard_size
-        return offset, numel
+    @property
+    def block_size(self) -> int:
+        """Number of dim-0 rows kept together per rank; 1 unless the reference is BlockAtomic."""
+        return self.reference.block_size if isinstance(self.reference, BlockAtomic) else 1
 
 
 def non_leading_numel(shape: torch.Size) -> int:

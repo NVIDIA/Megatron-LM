@@ -35,7 +35,12 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
     shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
     grouped = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
     main_weight = DBuffer.empty(
-        mesh, [BlockAtomic(32)], shapes, torch.float32, distributed_setup.device, block_size=32
+        mesh,
+        [BlockAtomic(32)],
+        shapes,
+        torch.float32,
+        distributed_setup.device,
+        reference=BlockAtomic(32),
     )
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
@@ -82,7 +87,12 @@ def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
     shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
     grouped = QuantizedDBuffer(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
     main_weight = DBuffer.empty(
-        mesh, [BlockAtomic(32)], shapes, torch.float32, distributed_setup.device, block_size=32
+        mesh,
+        [BlockAtomic(32)],
+        shapes,
+        torch.float32,
+        distributed_setup.device,
+        reference=BlockAtomic(32),
     )
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
