@@ -31,9 +31,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd $SCRIPT_DIR/..
 
-UV_CMD="uv lock"
+UV_ARGS=(lock)
 if [ "$UPGRADE" = true ]; then
-    UV_CMD="uv lock --upgrade"
+    UV_ARGS+=(--upgrade)
 fi
 
 docker run \
@@ -41,4 +41,8 @@ docker run \
     -v $(pwd):/workdir/ \
     -w /workdir/ \
     $GITLAB_ENDPOINT/adlr/megatron-lm/mcore_ci_dev:main \
-    $UV_CMD
+    bash -ec '
+        export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n "s/.*release \([0-9][0-9]*\).*/\1/p" | head -1)"
+        test -n "$TMS_CUDA_MAJOR"
+        exec uv "$@"
+    ' bash "${UV_ARGS[@]}"
