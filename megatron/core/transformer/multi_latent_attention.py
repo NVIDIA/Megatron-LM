@@ -1010,33 +1010,55 @@ class MLASelfAttention(MultiLatentAttention):
                 self.num_attention_heads_per_partition,
             ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
                 but {self.core_attention.current_max_attn_logits.shape}"
+            # Floor the denominator: a head with max logit <=0 would give a
+            # negative eta and eta**alpha = NaN. With the floor such heads (and any
+            # with max_logit <= threshold) get eta = 1.0 (no clip).
+            _max_logit = self.core_attention.current_max_attn_logits.clamp(min=1e-6)
             self.qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_threshold / self.core_attention.current_max_attn_logits, max=1.0
+                self.config.qk_clip_threshold / _max_logit, max=1.0
             ).view(self.num_attention_heads_per_partition, 1, 1)
             assert torch.all(self.qk_clip_balancing_eta <= 1.0)
+            assert torch.all(self.qk_clip_balancing_eta > 0.0)
 
-            # Update q side weight, keep qk_pos_emb_head_dim side weight unchanged
+            # Rescale both the DP-replicated bf16 weight and the fp32 master. With
+            # the distributed optimizer the master is a flat shard, so build the
+            # full per-element factor (matching weight.view(-1)) and slice this
+            # rank's shard by its offset; view_as also covers the non-distributed
+            # full 2-D master (start=0).
+            eta = self.qk_clip_balancing_eta  # [n, 1, 1], <= 1.0
+            n = self.num_attention_heads_per_partition
+            a = self.config.qk_head_dim
+            alpha = self.config.qk_clip_alpha
+
+            def _rescale(model_weight, rows_per_head, head_factor):
+                # head_factor: [n, rows_per_head, 1] fp32 multiplicative factor
+                w = model_weight.data
+                cols = w.numel() // (n * rows_per_head)
+                # (1) replicated bf16 model weight (full)
+                w.view(n, rows_per_head, cols).mul_(head_factor.to(w.dtype))
+                # (2) fp32 master: flat shard (distributed) or full 2-D (regular)
+                mp = getattr(model_weight, 'main_param', None)
+                if mp is not None:
+                    start = int(getattr(model_weight, 'main_param_shard_start', 0))
+                    numel = mp.numel()
+                    flat = head_factor.expand(n, rows_per_head, cols).reshape(-1)
+                    mp.data.mul_(flat[start : start + numel].to(mp.dtype).view_as(mp.data))
+
+            # q side: content (nope) part *= eta^alpha, rotary (pe) part *= eta
+            b_pe = self.config.qk_pos_emb_head_dim
+            q_factor = torch.ones(n, a + b_pe, 1, device=eta.device, dtype=torch.float32)
+            q_factor[:, :a, :] = torch.pow(eta, alpha)
+            q_factor[:, a:, :] = eta
             if self.config.q_lora_rank is None:
-                q_proj_weight = self.linear_q_proj.weight
+                _rescale(self.linear_q_proj.weight, a + b_pe, q_factor)
             else:
-                q_proj_weight = self.linear_q_up_proj.weight
+                _rescale(self.linear_q_up_proj.weight, a + b_pe, q_factor)
 
-            # Handle different weight access patterns (main_param vs direct access)
-            if hasattr(q_proj_weight, 'main_param'):
-                q_proj_weight.main_param.data.copy_(
-                    self._clip_q_proj_weight(q_proj_weight.main_param.data)
-                )
-            q_proj_weight.data.copy_(self._clip_q_proj_weight(q_proj_weight.data))
-
-            # Update k side weight, keep v side weight unchanged
-            kv_proj_weight = self.linear_kv_up_proj.weight
-
-            # Handle different weight access patterns
-            if hasattr(kv_proj_weight, 'main_param'):
-                kv_proj_weight.main_param.data.copy_(
-                    self._clip_kv_proj_weight(kv_proj_weight.main_param.data)
-                )
-            kv_proj_weight.data.copy_(self._clip_kv_proj_weight(kv_proj_weight.data))
+            # k side: k part *= eta^(1-alpha), v part unchanged
+            v = self.config.v_head_dim
+            kv_factor = torch.ones(n, a + v, 1, device=eta.device, dtype=torch.float32)
+            kv_factor[:, :a, :] = torch.pow(eta, 1.0 - alpha)
+            _rescale(self.linear_kv_up_proj.weight, a + v, kv_factor)
 
         # reset current_max_attn_logits
         self.core_attention.current_max_attn_logits = None

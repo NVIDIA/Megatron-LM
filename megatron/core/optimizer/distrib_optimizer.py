@@ -410,6 +410,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # Store handle to main_param.
                     model_param.main_param = shard_main_param
                     model_param.main_param_sharded = True
+                    # Flat offset of this rank's shard in the flattened param
+                    # (main_param == model_param.view(-1)[start:start+numel]);
+                    # used by qk_clip to rescale the sharded fp32 master.
+                    model_param.main_param_shard_start = param_range.start
 
                     # Add to group.
                     model_float16_params_this_group.append(model_param)
