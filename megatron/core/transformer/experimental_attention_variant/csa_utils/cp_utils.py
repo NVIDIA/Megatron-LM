@@ -31,7 +31,7 @@ CPIndexerLayout = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 # =============================================================================
 
 
-def _thd_cp_position_ids(
+def thd_cp_position_ids(
     cu_seqlens_padded: torch.Tensor, global_start: int, local_rows: int
 ) -> torch.Tensor:
     """Map a consecutive CP row interval to positions within packed sequences."""
@@ -48,6 +48,10 @@ def _thd_cp_position_ids(
     sequence_ends = cu_seqlens_padded[sequence_ids + 1]
     valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
     return torch.where(valid_rows, global_rows - sequence_starts, 0)
+
+
+# Retained for callers outside megatron.core that already use the private name.
+_thd_cp_position_ids = thd_cp_position_ids
 
 
 def apply_thd_cp_local_rope_fused(
@@ -97,7 +101,7 @@ def apply_thd_cp_local_rope_unfused(
     inverse: bool = False,
 ) -> torch.Tensor:
     """Apply unfused RoPE to a consecutive interval of packed CP rows."""
-    position_ids = _thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
+    position_ids = thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
     freqs = torch.index_select(rotary_pos_emb, 0, position_ids.long())
 
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
