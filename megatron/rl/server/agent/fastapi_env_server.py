@@ -2,20 +2,17 @@
 
 import asyncio
 import socket
-from typing import AsyncGenerator
 
 import httpx
 import yaml
 from fastapi import FastAPI
-from pydantic import Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 from typing_extensions import Self
 from uvicorn import Config, Server
 from uvicorn.config import LOGGING_CONFIG
 
 LOGGING_CONFIG['root'] = {"handlers": ["default"], "level": "INFO"}
 
-from ... import inference
-from ...agent.registry import get_agent_class
 from ...agent.api import (
     Agent,
     ContrastiveRollout,
@@ -23,22 +20,21 @@ from ...agent.api import (
     EvaluationAgent,
     EvaluationRequest,
     EvaluationResponse,
-    GroupedRolloutGenerator,
     GroupedRolloutRequest,
     GroupRolloutParams,
     RolloutGenerator,
     RolloutRequest,
     TokenRollout,
 )
-from ...server.api import (
-    EnvironmentServer,
-    InferenceServer,
-    RemoteEvaluationRequest,
-    RemoteGroupedRolloutRequest,
-    RemoteRolloutRequest,
-)
-from .. import agent
-from ..api import EnvironmentServer, InferenceServer, RemoteEvaluationRequest, RemoteRolloutRequest
+from ...agent.registry import get_agent_class
+from ...inference import InferenceInterface
+from ...inference.chat_interface import MegatronChatInterface
+from ..api import EnvironmentServer, RemoteEvaluationRequest, RemoteRolloutRequest
+
+
+def _bind(wire: BaseModel, request_cls: type, interface: InferenceInterface):
+    """Rebuild an agent request from its wire form, generating through `interface`."""
+    return request_cls.model_validate({**wire.model_dump(), "inference_interface": interface})
 
 
 @EnvironmentServer.register_subclass
@@ -48,19 +44,9 @@ class FastAPIEnvServer(EnvironmentServer):
     _server_task: asyncio.Task = PrivateAttr(None)
 
     @classmethod
-    async def launch(cls, env_cls: type[Agent], cls_args: dict, port: int, **kwargs) -> Self:
-
+    def build_app(cls, env_cls: type[Agent], cls_args: dict, policy: InferenceInterface) -> FastAPI:
+        """Env server app; every route generates through `policy`."""
         app = FastAPI()
-
-        if issubclass(env_cls, GroupedRolloutGenerator):
-
-            @app.post("/grouped_rollouts/")
-            async def grouped_rollouts(
-                request: RemoteGroupedRolloutRequest,
-            ) -> list[list[TokenRollout]]:
-                env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
-                return await env.get_grouped_rollouts(request)
 
         if issubclass(env_cls, ContrastiveRolloutGenerator):
 
@@ -69,24 +55,29 @@ class FastAPIEnvServer(EnvironmentServer):
                 request: RemoteRolloutRequest,
             ) -> list[ContrastiveRollout]:
                 env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
-                return await env.get_contrastive_rollouts(request)
+                return await env.get_contrastive_rollouts(_bind(request, RolloutRequest, policy))
 
         if issubclass(env_cls, RolloutGenerator):
 
             @app.post("/rollouts/")
             async def rollouts(request: RemoteRolloutRequest) -> list[TokenRollout]:
                 env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
-                return await env.get_reward_rollouts(request)
+                return await env.get_reward_rollouts(_bind(request, RolloutRequest, policy))
 
         if issubclass(env_cls, EvaluationAgent):
 
             @app.post("/evaluation/")
             async def run_evaluation(request: RemoteEvaluationRequest):
                 env = env_cls(**cls_args)
-                request.inference_interface = request.inference_interface.unwrap()
-                return await env.run_evaluation(request)
+                return await env.run_evaluation(_bind(request, EvaluationRequest, policy))
+
+        return app
+
+    @classmethod
+    async def launch(
+        cls, env_cls: type[Agent], cls_args: dict, port: int, policy: InferenceInterface, **kwargs
+    ) -> Self:
+        app = cls.build_app(env_cls, cls_args, policy)
 
         loop = asyncio.get_event_loop()
         config = Config(app=app, loop=loop, host='0.0.0.0', port=port)
@@ -103,87 +94,58 @@ class FastAPIEnvServer(EnvironmentServer):
     def kill(self):
         return self._server_task.cancel()
 
-    async def get_contrastive_rollouts(self, request: RolloutRequest) -> list[ContrastiveRollout]:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Rollout requests to remote server must contain an InferenceServer object"
-        payload = request.model_dump()
-        payload["inference_interface"] = request.inference_interface.model_dump()
-        async with httpx.AsyncClient() as client:
+    async def _post(self, path: str, body: BaseModel):
+        """POST a wire request; a failure on the env server is raised with its detail."""
+        async with httpx.AsyncClient(timeout=None) as client:
             response = await client.post(
-                f"http://{self.env_server_host_port}/contrastive_rollouts/",
-                json=payload,
-                timeout=None,
+                f"http://{self.env_server_host_port}{path}",
+                content=body.model_dump_json(),
+                headers={"content-type": "application/json"},
             )
-        rollouts = [ContrastiveRollout.model_validate(r) for r in response.json()]
-        return rollouts
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Env server {path} returned HTTP {response.status_code}: {response.text}"
+            )
+        return response.json()
 
-    async def prepare_group_rollout(
-        self,
-        request: GroupedRolloutRequest,
-    ) -> GroupRolloutParams:
+    async def get_contrastive_rollouts(self, request: RolloutRequest) -> list[ContrastiveRollout]:
+        wire = RemoteRolloutRequest.model_validate(
+            request.model_dump(exclude={"inference_interface"})
+        )
+        result = await self._post("/contrastive_rollouts/", wire)
+        return [ContrastiveRollout.model_validate(r) for r in result]
+
+    async def prepare_group_rollout(self, request: GroupedRolloutRequest) -> GroupRolloutParams:
         raise NotImplementedError(
-            "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."
+            "FastAPIEnvServer overrides get_reward_rollouts; prepare_group_rollout is not used."
         )
 
     async def get_rollout_response(self, request, inference_request):
         raise NotImplementedError(
-            "FastAPIEnvServer overrides get_grouped_rollouts/get_reward_rollouts/run_evaluation; "
+            "FastAPIEnvServer overrides get_reward_rollouts/run_evaluation; "
             "get_rollout_response is not used."
         )
 
-    async def get_grouped_rollouts(
-        self, request: GroupedRolloutRequest
-    ) -> AsyncGenerator[list[TokenRollout], None]:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Rollout requests to remote server must contain an InferenceServer object"
-        assert (
-            request.submission_granularity != "R"
-        ), "FastAPIEnvServer does not support rollout submission granularity"
-        payload = request.model_dump()
-        payload["inference_interface"] = request.inference_interface.model_dump()
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"http://{self.env_server_host_port}/grouped_rollouts/", json=payload, timeout=None
-            )
-        rollouts = [[TokenRollout.model_validate(r) for r in group] for group in response.json()]
-        for rollout in rollouts:
-            yield rollout
-
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Rollout requests to remote server must contain an InferenceServer object"
-        payload = request.model_dump()
-        payload["inference_interface"] = request.inference_interface.model_dump()
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"http://{self.env_server_host_port}/rollouts/", json=payload, timeout=None
-            )
-        rollouts = [TokenRollout.model_validate(r) for r in response.json()]
-        return rollouts
+        wire = RemoteRolloutRequest.model_validate(
+            request.model_dump(exclude={"inference_interface"})
+        )
+        result = await self._post("/rollouts/", wire)
+        return [TokenRollout.model_validate(r) for r in result]
 
     async def run_evaluation(self, request: EvaluationRequest) -> EvaluationResponse:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Evaluation requests to remote server must contain an InferenceServer object"
-        payload = request.model_dump()
-        payload["inference_interface"] = request.inference_interface.model_dump()
-        async with httpx.AsyncClient(timeout=None) as client:
-            response = await client.post(
-                f"http://{self.env_server_host_port}/evaluation/", json=payload, timeout=None
-            )
-        response = EvaluationResponse.model_validate(response.json()).unwrap()
-        return response
+        wire = RemoteEvaluationRequest.model_validate(
+            request.model_dump(exclude={"inference_interface"})
+        )
+        return EvaluationResponse.validate_registered(await self._post("/evaluation/", wire))
 
 
-def run(agent_cls: type[Agent], cls_args: dict, port: int):
+def run(agent_cls: type[Agent], cls_args: dict, port: int, policy: InferenceInterface):
     loop = asyncio.new_event_loop()
 
     async def run_server():
         server: FastAPIEnvServer = await FastAPIEnvServer.launch(
-            env_cls=agent_cls, cls_args=cls_args, port=port
+            env_cls=agent_cls, cls_args=cls_args, port=port, policy=policy
         )
         print(server.model_dump(exclude={'_server_task'}))
         await server._server_task
@@ -197,9 +159,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-config", type=str, required=True)
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--policy-url",
+        type=str,
+        required=True,
+        help="Megatron text-generation server to generate through, e.g. http://<rank 0>:8294.",
+    )
+    parser.add_argument(
+        "--add-bos",
+        action="store_true",
+        help="Prepend BOS to prompts; set it when the trainer runs without --rl-skip-bos-token.",
+    )
     args = parser.parse_args()
     with open(args.env_config, 'r') as f:
         config = yaml.safe_load(f)[0]
     agent_cls = get_agent_class(config['agent_type'])
     cls_args = config['agent_args']
-    run(agent_cls, cls_args, port=args.port)
+    run(
+        agent_cls,
+        cls_args,
+        port=args.port,
+        policy=MegatronChatInterface(base_url=args.policy_url, add_bos=args.add_bos),
+    )

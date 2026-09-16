@@ -20,6 +20,11 @@ class TypeLookupable(BaseModel, extra='allow'):
         return type(self).Library.type_names[self.type_name](**self.model_dump())
 
     @classmethod
+    def validate_registered(cls, payload: dict) -> Self:
+        """Validate a serialized instance as the registered subclass named by its type_name."""
+        return cls.Library.type_names[payload['type_name']].model_validate(payload)
+
+    @classmethod
     def register_subclass(cls, register_type: Type[Self]) -> Type[Self]:
         """Register subclass for unwrapping."""
         if 'Library' not in cls.__dict__:

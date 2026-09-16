@@ -31,6 +31,7 @@ from .api import (
 from .pass_at_evaluation_agent import PassAtEvaluationAgent
 
 
+@EvaluationResponse.register_subclass
 class RewardOnlyEvaluationResponse(EvaluationResponse[RewardEvaluationResult]):
     type_name: str = 'RewardOnlyEvaluationResponse'
 
