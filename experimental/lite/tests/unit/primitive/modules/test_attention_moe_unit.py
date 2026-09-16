@@ -56,6 +56,8 @@ def test_attention_public_api_is_narrow():
     assert attention.__all__ == [
         "DSAIndexShareState",
         "DynamicSparseAttention",
+        "MSAIndexer",
+        "MSAttention",
         # MagiAttention is an optional core-attention backend added upstream in
         # NVIDIA/Megatron-LM#6478; both names are part of the primitive's public
         # surface, unlike the internal helpers asserted against below.
@@ -158,9 +160,7 @@ def test_gqa_kv_replication_selects_distinct_queries_and_reuses_kv():
 
 def test_gqa_kv_replication_backward_reduce_scatters_duplicate_gradients(monkeypatch):
     from megatron.lite.primitive.parallel import linear
-    from megatron.lite.primitive.parallel.linear import (
-        all_gather_last_dim_with_grad_reduce,
-    )
+    from megatron.lite.primitive.parallel.linear import all_gather_last_dim_with_grad_reduce
 
     tp_size = 4
     tp_rank = 1
@@ -287,10 +287,7 @@ def test_topk_router_aux_loss_contributes_gate_gradient(monkeypatch):
 @pytest.mark.parametrize("router_kind", ["topk", "sigmoid"])
 def test_router_replay_rejects_nonzero_aux_loss(router_kind):
     from megatron.lite.primitive.modules.router import SigmoidTopKRouter, TopKRouter
-    from megatron.lite.primitive.modules.router_replay import (
-        RouterReplay,
-        RouterReplayAction,
-    )
+    from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
     from megatron.lite.primitive.parallel import ParallelState
 
     config = SimpleNamespace(
