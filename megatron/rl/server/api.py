@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import Self, Type
 
 from .. import TypeLookupable
-from ..agent.api import EvaluationRequest, GroupedRolloutRequest, RolloutRequest
+from ..agent.api import EvaluationRequest, RolloutRequest
 from ..inference import InferenceInterface
 
 
@@ -37,13 +37,11 @@ class EnvironmentServer(Server):
     ...
 
 
+### Intentionally force `inference_interface` to be `None` in these subclasses.
+
 class RemoteRolloutRequest(RolloutRequest):
-    inference_interface: InferenceServer
-
-
-class RemoteGroupedRolloutRequest(GroupedRolloutRequest):
-    inference_interface: InferenceServer
+    inference_interface: None = None
 
 
 class RemoteEvaluationRequest(EvaluationRequest):
-    inference_interface: InferenceServer
+    inference_interface: None = None
