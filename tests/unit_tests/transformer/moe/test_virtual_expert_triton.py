@@ -407,13 +407,14 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
 
 
 @requires_four_ranks
-def test_virtual_expert_planner_overlap_graph_replay(monkeypatch):
+@pytest.mark.parametrize("tokens", [16, 257, 1025])
+def test_virtual_expert_planner_overlap_graph_replay(monkeypatch, tokens):
     """Capture the real planner stream handoff and replay it with changing route inputs."""
     Utils.initialize_distributed()
     group = dist.group.WORLD
     rank, world = dist.get_rank(group), dist.get_world_size(group)
     device = torch.device("cuda", torch.cuda.current_device())
-    experts, tokens, topk = 32, 257, 3
+    experts, topk = 32, 3
     workspace = VirtualExpertPlannerWorkspace(num_experts=experts, device=device, group=group)
     manager = VirtualExpertLoadBalancer.__new__(VirtualExpertLoadBalancer)
     manager.device = device

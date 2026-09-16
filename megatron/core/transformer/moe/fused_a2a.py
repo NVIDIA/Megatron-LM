@@ -375,8 +375,8 @@ def hybrid_ep_dense_topk_routing(num_experts: int, num_local_experts: int) -> bo
         return False
     if _hybrid_ep_buffer is not None:
         return _hybrid_ep_buffer._use_dense_topk_routing(num_experts, num_local_experts)
-    # Before the buffer exists, apply the static limits; the ranks-per-domain limit is checked by
-    # HybridEP at dispatch, which falls back to the dense map when it does not hold.
+    # Before the buffer exists, apply the static limits; dispatch checks the full capability
+    # after buffer initialization, including the ranks-per-domain limit.
     from deep_ep import hybrid_ep_buffer as _hybrid_ep_buffer_module
 
     return num_experts <= getattr(
@@ -445,6 +445,10 @@ class HybridEPDispatch(torch.autograd.Function):
                 fp8_dispatch,
                 num_sms_preprocessing_api,
             )
+        if topk_idx is not None:
+            assert hybrid_ep_dense_topk_routing(
+                num_experts, num_local_experts
+            ), "HybridEP received compact routes unsupported by the initialized buffer."
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None

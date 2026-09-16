@@ -325,16 +325,20 @@ accumulation in subsequent reductions, also enable
 `--ddp-reduce-scatter-with-fp32-accumulation` and, when expert GTP is enabled,
 `--gtp-remat-reduce-scatter-with-fp32-accumulation`.
 
+Each layer fixes its local token count on its first forward and rejects later changes.
+The planner specializes on that count, and the layer sizes its transport capacity once.
+
 Virtual-expert load balancing supports EP sizes 2–64, up to 8,192 experts evenly divided
 across EP ranks, and top-k from 1 to min(32, number of experts). It does not support
-Sinkhorn routing or full/whole-MoE recomputation. The load-balancer initializer checks
-the EP/expert layout, dispatcher SM budget and normalized routing/recompute settings before
-allocating resources.
+Sinkhorn routing, DeepSeek-style expert bias (`--moe-router-enable-expert-bias`), or
+full/whole-MoE recomputation. `TransformerConfig` validates these restrictions, the expert
+layout, and the dispatcher SM budget at construction; the load-balancer initializer checks
+the actual process-group layout before allocating resources.
 
 Virtual experts require HybridEP's compact `topk_idx` API alongside dense probabilities;
 the fused TE router must expose its `topk_indices` output buffer. Ordinary HybridEP retains
 its older-build compatibility. Supported routing includes FP32 sigmoid scores, fusion,
-`seq_aux_loss` and expert bias. To use `micro_batch` quantile balancing instead,
+`seq_aux_loss` and quantile balancing with its own bias update. To use `micro_batch` quantile balancing,
 set `--moe-router-load-balancing-type quantile_balancing --moe-aux-loss-coeff 0`, omit
 `--moe-router-enable-expert-bias` and `--moe-router-fusion`, and disable
 `--moe-router-force-load-balancing` for real routing. QB uses its existing unfused scorer and dual
