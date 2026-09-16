@@ -23,13 +23,21 @@ from megatron.core.ssm.gated_delta_net.gdn2 import (
     chunk_gdn2,
     torch_chunk_gdn2,
 )
+from megatron.core.ssm.gated_delta_net.kda import (
+    HAVE_FLA_KDA,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 
 __all__ = [
     "HAVE_FLA",
     "HAVE_FLA_GDN2",
+    "HAVE_FLA_KDA",
     "GatedDeltaNet",
     "GatedDeltaNet2",
     "GatedDeltaNetSubmodules",
+    "KimiDeltaAttention",
+    "KimiDeltaAttentionSubmodules",
     "causal_conv1d",
     "chunk_gated_delta_rule",
     "chunk_gdn2",
