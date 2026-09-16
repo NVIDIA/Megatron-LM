@@ -370,3 +370,17 @@ def test_explicit_assistant_loss_rejects_missing_end_boundary(monkeypatch) -> No
             add_generation_prompt=False,
             assistant_turn_loss=[False, False, True],
         )
+
+
+@pytest.mark.parametrize("prompt_format", ["moe", "nemotron6", "6-m", ""])
+def test_last_assistant_mode_rejects_partial_prompt_names(prompt_format):
+    tokenizer = MegatronMultimodalTokenizer.__new__(MegatronMultimodalTokenizer)
+    tokenizer._prompt_format = prompt_format
+    with pytest.raises(AssertionError, match="only supported for nemotron6-moe"):
+        tokenizer.tokenize_conversation([], True, False, train_only_on_last_assistant_turn=True)
+
+
+def test_inverse_vocab_raises_not_implemented():
+    tokenizer = MegatronMultimodalTokenizer.__new__(MegatronMultimodalTokenizer)
+    with pytest.raises(NotImplementedError):
+        _ = tokenizer.inv_vocab

@@ -2,13 +2,16 @@
 
 """Multimodal tokenizer."""
 
-import json
-import os
-import time
-import uuid
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
+
+from megatron.core.models.multimodal.llava_model import (
+    DEFAULT_IMAGE_TOKEN_INDEX,
+    IGNORE_INDEX,
+    IMAGE_TOKEN,
+)
+from megatron.core.tokenizers.text.libraries.sft_tokenizer import PromptConfig
 
 try:
     import transformers
@@ -17,14 +20,6 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAVE_TRANSFORMERS = False
 
-# Mark tokens that will be ignored in the loss function with this value.
-# Same ignore_index in https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html
-from megatron.core.models.multimodal.llava_model import (
-    DEFAULT_IMAGE_TOKEN_INDEX,
-    IGNORE_INDEX,
-    IMAGE_TOKEN,
-)
-from megatron.core.tokenizers.text.libraries.sft_tokenizer import PromptConfig
 
 IMAGE_TAGS = {
     "nvlm": ("<Image>", "</Image>"),
@@ -545,49 +540,6 @@ class MegatronMultimodalTokenizer:
             [rendered] = rendered
         return rendered
 
-    def _write_debug_snapshot(
-        self,
-        conversation: List[Dict],
-        tokens: np.ndarray,
-        target: np.ndarray,
-        train_only_on_last_assistant_turn: bool,
-        has_nonempty_thinking_trace: bool,
-    ) -> None:
-        """Write debug artifacts to disk when DEBUG=1."""
-        if os.environ.get("DEBUG") != "1":
-            return
-
-        log_dir = os.environ.get("MM_TOKENIZER_DEBUG_DIR", "multimodal_tokenizer_logs")
-        os.makedirs(log_dir, exist_ok=True)
-
-        unique_key = f"{int(time.time())}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-        base_path = os.path.join(log_dir, unique_key)
-
-        # Prepare target for easier reading by collapsing consecutive IGNORE_INDEX.
-        target_to_print = target.copy()
-        is_ignore = target_to_print == IGNORE_INDEX
-        prev_is_ignore = np.roll(is_ignore, 1)
-        prev_is_ignore[0] = False  # First element has no previous.
-        keep_mask = ~is_ignore | (is_ignore & ~prev_is_ignore)
-        target_to_print = target_to_print[keep_mask]
-        target_to_print[target_to_print == IGNORE_INDEX] = 0
-
-        with open(f"{base_path}_conversation.json", "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "train_only_on_last_assistant_turn": train_only_on_last_assistant_turn,
-                    "conversation": conversation,
-                    "has_nonempty_thinking_trace": has_nonempty_thinking_trace,
-                },
-                handle,
-                ensure_ascii=True,
-                indent=2,
-            )
-        with open(f"{base_path}_input.txt", "w", encoding="utf-8") as handle:
-            handle.write(self.detokenize(tokens))
-        with open(f"{base_path}_target.txt", "w", encoding="utf-8") as handle:
-            handle.write(self.detokenize(target_to_print))
-
     def offsets(self, ids: list[int], text: str) -> list[int]:
         """
         Assume that the tokenizer is a HuggingFaceTokenizer.
@@ -792,8 +744,8 @@ class MegatronMultimodalTokenizer:
             )
 
         if train_only_on_last_assistant_turn:
-            assert self._prompt_format in (
-                "nemotron6-moe"
+            assert (
+                self._prompt_format == "nemotron6-moe"
             ), "train_only_on_last_assistant_turn is only supported for nemotron6-moe"
 
         if assistant_turn_loss is not None:
@@ -865,7 +817,7 @@ class MegatronMultimodalTokenizer:
         target = tokens.copy()
 
         # Temp hack for nemotron hybrid reasoning model.
-        if self._prompt_format in ("nemotron-h-reasoning"):
+        if self._prompt_format == "nemotron-h-reasoning":
             idx = np.where(tokens == 11)[0]
             assert tokens[-1] == 11, "last token should be <SPECIAL_11>"
             idx = idx[:-1]
@@ -882,7 +834,7 @@ class MegatronMultimodalTokenizer:
                     )
 
             return tokens, target
-        elif self._prompt_format in ("nemotron6-moe"):
+        elif self._prompt_format == "nemotron6-moe":
             # Mask everything.
 
             target = np.full_like(tokens, IGNORE_INDEX)
@@ -925,16 +877,6 @@ class MegatronMultimodalTokenizer:
                     raise ValueError("invalid nemotron6 assistant end boundary")
 
                 target[lb + 3 : ub + 1] = tokens[lb + 3 : ub + 1]
-
-            # import os
-            # if os.environ.get("DEBUG") == "1":
-            #     self._write_debug_snapshot(
-            #         conversation=conversation,
-            #         tokens=tokens,
-            #         target=target,
-            #         train_only_on_last_assistant_turn=train_only_on_last_assistant_turn,
-            #         has_nonempty_thinking_trace=has_nonempty_thinking_trace,
-            #     )
 
             return tokens, target
 
@@ -1045,7 +987,7 @@ class MegatronMultimodalTokenizer:
     @property
     def inv_vocab(self):
         """Inverse vocab."""
-        return NotImplementedError("not used")
+        raise NotImplementedError("not used")
 
     @property
     def vocab_size(self):
