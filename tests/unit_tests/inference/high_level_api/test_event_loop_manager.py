@@ -40,8 +40,9 @@ class TestEventLoopManager:
 
     def test_stop_terminates_thread_and_loop(self):
         """``stop()`` must shut down the loop and join the daemon thread so
-        no background work outlives the manager. Second ``stop()`` is a
-        no-op (idempotent)."""
+        no background work outlives the manager; the thread closes the loop on
+        its way out so no selector fds leak. Second ``stop()`` is a no-op
+        (idempotent)."""
         mgr = _EventLoopManager()
         mgr.start()
         thread = mgr._thread
@@ -52,6 +53,7 @@ class TestEventLoopManager:
         mgr.stop()
         assert not thread.is_alive()
         assert not loop.is_running()
+        assert loop.is_closed()
 
         mgr.stop()  # idempotent
 
@@ -97,3 +99,40 @@ class TestEventLoopManager:
             assert asyncio.run(foreign_caller()) == 42
         finally:
             mgr.stop()
+
+    def test_loop_factory_builds_the_runtime_loop(self):
+        """``loop_factory`` replaces the process-wide policy for this runtime only:
+        an embedder that installed uvloop (Ray does) can still pin the stdlib loop."""
+        built = []
+
+        def factory():
+            loop = asyncio.SelectorEventLoop()
+            built.append(loop)
+            return loop
+
+        async def running_loop():
+            return asyncio.get_running_loop()
+
+        mgr = _EventLoopManager(loop_factory=factory)
+        mgr.start()
+        try:
+            assert built and mgr.loop is built[0]
+            assert mgr.run_sync(running_loop()) is built[0]
+        finally:
+            mgr.stop()
+
+    def test_start_raises_when_loop_factory_fails(self):
+        """A factory that raises must surface in the caller's thread. Otherwise the
+        daemon thread dies before signalling readiness and ``start()`` waits forever
+        -- e.g. ``loop_factory=asyncio.new_event_loop()``, the loop instance instead
+        of the callable."""
+        not_a_factory = asyncio.new_event_loop()
+        try:
+            mgr = _EventLoopManager(loop_factory=not_a_factory)
+            with pytest.raises(TypeError, match="not callable"):
+                mgr.start()
+        finally:
+            not_a_factory.close()
+        assert mgr._started is False
+        assert mgr._thread is None
+        mgr.stop()  # no-op: never started

@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
@@ -65,4 +67,12 @@ class ServeConfig:
     In evaluation mode, chat requests default `prevent_retokenization` to false,
     avoiding transmission of prompt token IDs. Individual requests can still
     opt in by setting `prevent_retokenization` or `return_tokenized_data`.
+    """
+
+    loop_factory: Callable[[], asyncio.AbstractEventLoop] | None = None
+    """Builds each frontend replica's event loop.
+
+    `None` uses `asyncio.new_event_loop()` under the process-wide policy the replica inherits.
+    Pass an importable callable such as `asyncio.SelectorEventLoop` to pin the stdlib loop;
+    needed for Ray compatibility.
     """
