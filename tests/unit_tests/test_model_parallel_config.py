@@ -5,6 +5,7 @@ import sys
 import pytest
 import torch
 
+import megatron.core.transformer.transformer_config as transformer_config_module
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args, validate_args
@@ -76,9 +77,7 @@ def test_pipeline_p2p_fixed_shape_requires_max_seqlen_when_alignment_unset():
     validate and then derive the pipeline buffer from a None sequence length.
     """
     with pytest.raises(ValueError, match="requires max_seqlen_per_dp_cp_rank to be set"):
-        ModelParallelConfig(
-            pipeline_p2p_fixed_shape=True, sequence_packing_scheduler="dp_balanced"
-        )
+        ModelParallelConfig(pipeline_p2p_fixed_shape=True, sequence_packing_scheduler="dp_balanced")
 
 
 def test_pipeline_p2p_fixed_shape_requires_max_seqlen_with_max_alignment():
@@ -144,6 +143,53 @@ def test_pipeline_p2p_fixed_shape_warns_when_mtp_standalone():
             pad_packed_seq_alignment="max",
             mtp_standalone=True,
         )
+
+
+def test_pipeline_p2p_fixed_shape_rejects_layout_derived_vpp():
+    """Flexible layouts derive VPP after ModelParallelConfig.__post_init__ has returned."""
+    with pytest.raises(ValueError, match="not supported with virtual pipeline"):
+        TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            pipeline_model_parallel_size=2,
+            pipeline_model_parallel_layout=[
+                ["embedding"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["loss"],
+            ],
+            pipeline_dtype=torch.bfloat16,
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment="max",
+        )
+
+
+def test_pipeline_p2p_fixed_shape_warns_for_layout_derived_standalone_mtp(monkeypatch):
+    """Flexible layouts also derive mtp_standalone after base-config validation."""
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _: True)
+    with pytest.warns(UserWarning, match="no effect when mtp_standalone"):
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            pipeline_model_parallel_size=4,
+            pipeline_model_parallel_layout=[
+                ["embedding", "decoder"],
+                ["decoder"],
+                ["decoder", "decoder", "mtp"],
+                ["loss"],
+            ],
+            pipeline_dtype=torch.bfloat16,
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment="max",
+            mtp_num_layers=1,
+        )
+    assert config.mtp_standalone
 
 
 def test_contiguous_context_parallel_rejects_bshd_inputs():

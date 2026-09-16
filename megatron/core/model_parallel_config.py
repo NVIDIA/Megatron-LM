@@ -387,9 +387,10 @@ class ModelParallelConfig:
 
     Supported only by ``forward_backward_pipelining_without_interleaving``, the sole caller of
     ``get_tensor_shapes()`` where the fixed packed shape is derived. The interleaved (VPP)
-    schedule computes its own ``seq_length // cp_size`` buffer, so
-    ``virtual_pipeline_model_parallel_size > 1`` is rejected in ``__post_init__`` rather than
-    silently posting mismatched receive buffers.
+    schedule computes its own ``seq_length // cp_size`` buffer, so any non-``None``
+    ``virtual_pipeline_model_parallel_size`` is rejected rather than silently posting mismatched
+    receive buffers. ``TransformerConfig`` repeats this check after resolving a flexible pipeline
+    layout, which can derive VPP after this base class has initialized.
 
     ``mtp_standalone=True`` keeps the dynamic shape protocol unconditionally, making this flag a
     no-op; ``__post_init__`` warns in that case so the absent speedup is not mistaken for a
@@ -508,6 +509,27 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
+    def _validate_pipeline_p2p_fixed_shape_schedule(self) -> None:
+        """Reject schedules that do not derive the configured fixed packed shape."""
+        if self.pipeline_p2p_fixed_shape and self.virtual_pipeline_model_parallel_size is not None:
+            raise ValueError(
+                "pipeline_p2p_fixed_shape is not supported with virtual pipeline "
+                "parallelism. The interleaved schedule derives its own "
+                "seq_length // cp_size pipeline buffer rather than calling "
+                "get_tensor_shapes(), so skipping the shape exchange would post "
+                "mismatched irecv buffers."
+            )
+
+    def _warn_if_pipeline_p2p_fixed_shape_has_no_effect(self) -> None:
+        """Warn when standalone MTP keeps the dynamic shape protocol enabled."""
+        if self.pipeline_p2p_fixed_shape and self.mtp_standalone:
+            warnings.warn(
+                "pipeline_p2p_fixed_shape has no effect when mtp_standalone=True: the "
+                "dynamic pipeline shape protocol stays enabled, so the shape-exchange "
+                "synchronization is not removed.",
+                stacklevel=2,
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -590,14 +612,7 @@ class ModelParallelConfig:
             # schedule on `vp_size is not None`, so a size of 1 already routes there even
             # though it looks degenerate. arguments.py normalizes 1 -> None for the training
             # entrypoints, but a config built directly against mcore does not get that.
-            if self.virtual_pipeline_model_parallel_size is not None:
-                raise ValueError(
-                    "pipeline_p2p_fixed_shape is not supported with virtual pipeline "
-                    "parallelism. The interleaved schedule derives its own "
-                    "seq_length // cp_size pipeline buffer rather than calling "
-                    "get_tensor_shapes(), so skipping the shape exchange would post "
-                    "mismatched irecv buffers."
-                )
+            self._validate_pipeline_p2p_fixed_shape_schedule()
             if (
                 self.sequence_parallel
                 and self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size != 0
@@ -610,12 +625,7 @@ class ModelParallelConfig:
                     "pipeline buffer is scattered along the sequence dimension and floor "
                     "division would under-allocate it."
                 )
-            if self.mtp_standalone:
-                warnings.warn(
-                    "pipeline_p2p_fixed_shape has no effect when mtp_standalone=True: the "
-                    "dynamic pipeline shape protocol stays enabled, so the shape-exchange "
-                    "synchronization is not removed."
-                )
+            self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
             if self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank):
                 raise ValueError(
                     "pipeline_p2p_fixed_shape requires pad_packed_seq_alignment='max' or "

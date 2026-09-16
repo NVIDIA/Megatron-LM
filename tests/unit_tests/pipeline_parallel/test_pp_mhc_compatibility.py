@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+import megatron.core.transformer.transformer_config as transformer_config_module
 from megatron.core import parallel_state
 from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
@@ -321,7 +322,7 @@ class TestGetTensorShapesWithFixedPackedP2P:
         config = self._config(pipeline_p2p_fixed_shape=True, sequence_parallel=True)
         assert self._shapes(config, tp_size=2) == [(1024, 1, 64)]
 
-    def test_validated_config_derives_matching_shape(self):
+    def test_validated_config_derives_matching_shape(self, monkeypatch):
         """End-to-end: a config that passes __post_init__ must yield the padded local shape.
 
         The other cases here use SimpleNamespace, so validation and shape derivation are
@@ -329,21 +330,22 @@ class TestGetTensorShapesWithFixedPackedP2P:
         object to get_tensor_shapes(), pinning the validated-config -> derived-shape contract
         (and catching a validation rule that permits a shape the derivation cannot build).
 
-        sequence_packing_scheduler is deliberately left unset: it would drag in the TE >= 2.9
-        gate in TransformerConfig.__post_init__ and make a pure shape-derivation test fail on
-        environments with an older or absent TransformerEngine. The packing-scheduler
-        requirement itself is covered in tests/unit_tests/test_model_parallel_config.py.
+        Patch only the external TE version probe so the complete fixed-shape configuration is
+        validated regardless of which CI image runs this unit test.
         """
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _: True)
         config = TransformerConfig(
             num_layers=1,
             hidden_size=64,
-            num_attention_heads=1,
+            num_attention_heads=2,
             tensor_model_parallel_size=2,
             sequence_parallel=True,
-            variable_seq_lengths=True,
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
             max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment="max",
         )
-        config.pipeline_p2p_fixed_shape = True
+        assert config.variable_seq_lengths
         assert self._shapes(config, tp_size=2) == [(1024, 1, 64)]
 
     def test_fixed_shape_ignores_micro_batch_size(self):
