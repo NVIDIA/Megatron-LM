@@ -63,7 +63,12 @@ python -m tools.determinism.recipe_coverage /tmp/recipe-inventory \
 Source revision and the entire recorded environment must match. Shape, stride,
 dtype, mode, implementation, and phase matches are exact; no shape-range or
 backend equivalence is inferred. Driver versions and call-time autocast, TF32,
-and cuDNN settings are part of that match. A passing signature must have matching
+and cuDNN settings are part of that match. Triton cache policy/directory and all
+`TRITON_AUTOTUNE_BLOCK_*` overrides are matched at startup and at each call,
+including changes made after capture starts. Older evidence without these fields
+does not match a new capture. A cache directory is provenance, not proof that
+cache contents or selected configurations are unchanged.
+A passing signature must have matching
 protocol evidence from every required rank. A passing forward+backward replay can supply
 forward evidence. A backward mismatch is not projected into a forward failure.
 Matching negative evidence takes precedence over intermittent passing evidence.

@@ -105,6 +105,31 @@ def test_passing_evidence_does_not_erase_a_matching_mismatch():
     assert report["recipe_status"] == "known_nondeterministic_operation"
 
 
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("TRITON_CACHE_AUTOTUNING", "1"),
+        ("TRITON_CACHE_DIR", "/other/cache"),
+        ("TRITON_AUTOTUNE_BLOCK_SIZE_M", "128"),
+    ],
+)
+def test_triton_changes_require_new_evidence(monkeypatch, key, value):
+    monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", "0")
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/shared/cache")
+    monkeypatch.setenv("TRITON_AUTOTUNE_BLOCK_SIZE_M", "64")
+    request, proof = inventory(), evidence()
+    original = capture_recipe.triton_signature()
+    request["context"]["environment"] = original
+    proof["context"]["environment"] = original
+    request["operations"][0]["signature"]["runtime"]["triton"] = original
+    proof["cases"][0]["observations"][0]["signature"]["runtime"]["triton"] = original
+    assert build_report([request], [proof])["counts"][DETERMINISTIC] == 1
+    monkeypatch.setenv(key, value)
+    # Even a call-time override after capture startup must stop evidence reuse.
+    request["operations"][0]["signature"]["runtime"]["triton"] = capture_recipe.triton_signature()
+    assert build_report([request], [proof])["counts"][UNVERIFIED] == 1
+
+
 def test_backward_failure_does_not_claim_forward_failure():
     report = build_report([inventory()], [evidence(NONDETERMINISTIC)])
     assert report["counts"][UNVERIFIED] == 1

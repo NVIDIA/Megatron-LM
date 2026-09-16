@@ -36,6 +36,13 @@ ENVIRONMENT_KEYS = (
 )
 
 
+def triton_signature() -> dict:
+    """Match the replay producer's cache policy and SSM block override fields."""
+    keys = {"TRITON_CACHE_AUTOTUNING", "TRITON_CACHE_DIR"}
+    keys.update(key for key in os.environ if key.startswith("TRITON_AUTOTUNE_BLOCK_"))
+    return {key: os.environ.get(key) for key in sorted(keys)}
+
+
 def runtime_signature(torch) -> dict:
     """Match the replay producer's schema-1 runtime settings."""
     return {
@@ -46,6 +53,7 @@ def runtime_signature(torch) -> dict:
         "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "triton": triton_signature(),
     }
 
 
@@ -109,7 +117,10 @@ def source_context(torch) -> dict:
         "capability": (
             list(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
         ),
-        "environment": {key: os.environ.get(key) for key in ENVIRONMENT_KEYS},
+        "environment": {
+            **{key: os.environ.get(key) for key in ENVIRONMENT_KEYS},
+            **triton_signature(),
+        },
     }
 
 
