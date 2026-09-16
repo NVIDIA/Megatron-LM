@@ -1533,6 +1533,7 @@ def csa_sparse_attn(
 # Upper bound on the transient buffers one ``_stable_topk_indices`` sort may
 # hold at once: the masked score copy, the sorted scores and the int64 order.
 _STABLE_TOPK_SORT_BYTES = 256 << 20
+_NEG_INF = float("-inf")
 
 
 def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tensor:
@@ -1564,7 +1565,7 @@ def _stable_topk_indices(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Tenso
     for start in range(0, rows, slab):
         stop = min(start + slab, rows)
         candidates = scores[start:stop].masked_fill(
-            columns.unsqueeze(0) >= seq_lens[start:stop].unsqueeze(1), float("-inf")
+            columns.unsqueeze(0) >= seq_lens[start:stop].unsqueeze(1), _NEG_INF
         )
         sorted_scores, order = torch.sort(candidates, dim=-1, descending=True, stable=True)
         selected[start:stop] = (
