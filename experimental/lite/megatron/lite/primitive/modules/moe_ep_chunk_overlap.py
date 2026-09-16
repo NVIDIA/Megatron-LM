@@ -164,7 +164,7 @@ _EXPERT_ACTIVATION_LOGICAL_NAMES = frozenset(
     {"fc1_input", "fc1_output", "fc2_output", "fc1_dgrad", "fc2_dgrad"}
 )
 
-# Normal mode retains FC2 output for delayed wgrad; only the dgrads can alias,
+# Grad-enabled OPs retain FC2 output for delayed wgrad; only the dgrads can alias,
 # since SwiGLU consumes FC2 dgrad before FC1 dgrad is written.
 _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS = {"fc1_dgrad": "fc2_dgrad"}
 
@@ -174,11 +174,6 @@ _FORWARD_EXPERT_ACTIVATION_STORAGE_SLOTS = {
     **_NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS,
     "fc2_output": "fc1_input",
 }
-
-# Fused: same-stream FC2 wgrad precedes FC2 dgrad, then SwiGLU precedes FC1 dgrad.
-# All three can alias FC2-output storage without CUDA synchronize, in this OP only.
-_FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS = {"fc1_dgrad": "fc2_output", "fc2_dgrad": "fc2_output"}
-
 
 def _expert_activation_capacity_bytes(requested_bytes: int) -> int:
     """Round an observed activation request to its 8 MiB reuse class."""
@@ -426,8 +421,6 @@ class _EPChunkExpertActivationLease:
         op = self.workspace.key.op
         if op == "forward":
             storage_slots = _FORWARD_EXPERT_ACTIVATION_STORAGE_SLOTS
-        elif op == "fused_forward_backward":
-            storage_slots = _FUSED_EXPERT_ACTIVATION_STORAGE_SLOTS
         else:
             storage_slots = _NORMAL_EXPERT_ACTIVATION_STORAGE_SLOTS
         return self.workspace._activation_arena.tensor(
