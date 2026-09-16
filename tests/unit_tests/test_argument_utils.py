@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer import WideResidualConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
@@ -50,6 +51,7 @@ class CapturingTransformerConfig:
     """Minimal config that records kwargs produced by core_transformer_config_from_args."""
 
     moe_use_norm_before_up_proj: bool = False
+    wide_residual: object = None
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -87,6 +89,74 @@ def test_moe_norm_flag_reaches_transformer_config():
     )
 
     assert config.moe_use_norm_before_up_proj is True
+
+
+def test_wide_residual_cli_builds_typed_config():
+    """Flat training arguments should build the nested core configuration."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    disabled_args = parser.parse_args([])
+    disabled_args.params_dtype = torch.float32
+    disabled_config = core_transformer_config_from_args(
+        disabled_args, config_class=CapturingTransformerConfig
+    )
+    assert disabled_config.wide_residual is None
+
+    enabled_args = parser.parse_args(
+        [
+            '--wide-residual',
+            '3',
+            '--wide-residual-streamwise-sigmoid-init-scale',
+            '0.02',
+            '--wide-residual-learned-retention',
+            '--wide-residual-retention-init',
+            '0.998',
+            '--wide-residual-retention-max-forget',
+            '0.2',
+        ]
+    )
+    enabled_args.params_dtype = torch.float32
+    enabled_config = core_transformer_config_from_args(
+        enabled_args, config_class=CapturingTransformerConfig
+    )
+
+    assert isinstance(enabled_config.wide_residual, WideResidualConfig)
+    assert enabled_config.wide_residual.num_streams == 3
+    assert enabled_config.wide_residual.streamwise_sigmoid_init_scale == 0.02
+    assert enabled_config.wide_residual.learned_retention
+    assert enabled_config.wide_residual.retention_init == 0.998
+    assert enabled_config.wide_residual.retention_max_forget == 0.2
+
+
+@pytest.mark.parametrize(
+    'option',
+    [
+        ['--wide-residual-streamwise-sigmoid-init-scale', '0.02'],
+        ['--wide-residual-learned-retention'],
+        ['--wide-residual-retention-init', '0.998'],
+        ['--wide-residual-retention-max-forget', '0.2'],
+    ],
+)
+def test_wide_residual_controls_require_wide_residual(option):
+    """Dependent controls must not be silently ignored when wide residuals are disabled."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args(option)
+    args.params_dtype = torch.float32
+
+    with pytest.raises(ValueError, match='require --wide-residual'):
+        core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+
+def test_wide_residual_cli_rejects_yaml_config(monkeypatch):
+    """The experimental YAML path must not silently discard wide-residual CLI controls."""
+    monkeypatch.setattr(
+        sys, 'argv', ['test_argument_utils.py', '--yaml-cfg', 'unused.yaml', '--wide-residual', '3']
+    )
+
+    with pytest.raises(ValueError, match='cannot be combined with --yaml-cfg'):
+        parse_args()
 
 
 def test_moe_norm_flag_requires_latent_size(monkeypatch):
