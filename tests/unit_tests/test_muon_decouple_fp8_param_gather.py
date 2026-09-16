@@ -722,9 +722,13 @@ class TestMuonDecoupleFP8ParamGather:
             ), "DistOpt param-buffer staging re-armed force-synced LayerWise gathers"
             assert all(not g.param_gather_dispatched for g in distopt_groups)
 
-            # Offload masters as train_step does next; the forward pre-hooks must not stage
-            # LayerWise fp8 weights from the CPU-bound masters. Run one forward to prove it.
+            # Offload masters as train_step does next. The aligned VPP schedule calls
+            # start_param_sync directly before the forward pre-hooks: neither entry may
+            # re-stage completed LayerWise gathers from CPU-bound masters.
             optimizer.offload_optimizer_state_for_forward()
+            ddp.start_param_sync()
+            assert all(g.param_gather_dispatched for g in distopt_groups)
+            assert all(g.param_gather_handle is None for g in layerwise_groups)
             ids, labels, pos, mask, loss_mask = self._batch()
             ddp.set_is_first_microbatch()
             ddp.forward(

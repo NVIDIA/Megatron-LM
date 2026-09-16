@@ -77,6 +77,11 @@ MCore's model-to-main, main-to-model, and MXFP8 param-buffer copy entry points r
 CPU-bound selected master asynchronously, order the current compute stream after that H2D, and then
 validate residency. This makes external reload and param-staging entry points self-healing.
 
+The aligned virtual-pipeline parameter-gather schedule preserves LayerWise bucket gathers already
+completed before master offload. Ordinary DDP dispatch skips these buckets until the next reset;
+explicit `force_sync` and `force_dispatch` retain their synchronization semantics. Evaluation and
+checkpoint synchronization restore offloaded masters before forcing a new gather.
+
 Setting `optimizer_state_offload_fraction` to zero is a full disable even when the feature flag is
 present: no manager, transfer stream, training hook, or checkpoint-format restriction is installed.
 Checkpoint format and async-save restrictions are also skipped when optimizer state is explicitly

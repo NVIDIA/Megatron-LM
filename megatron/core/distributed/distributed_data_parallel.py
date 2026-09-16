@@ -579,6 +579,16 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            # Aligned VPP scheduling can revisit LayerWise buckets force-synced before
+            # master offload. Their model weights are already ready for this iteration.
+            if (
+                not force_sync
+                and not force_dispatch
+                and self._bucket_group_is_layer_wise(bucket_group)
+                and bucket_group.param_gather_dispatched
+                and bucket_group.param_gather_handle is None
+            ):
+                continue
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     def reset_param_sync_dispatch_state(self, *, skip_layer_wise: bool = False):
