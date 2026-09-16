@@ -155,8 +155,6 @@ class _MoKAutograd(torch.autograd.Function):
         gate_kwargs = {}
         if shared_output_gate_weight is not None:
             gate_main_grad = _main_grad_buffer(ctx.module.shared_output_gate_weight)
-            if gate_main_grad.dtype != torch.float32:
-                raise RuntimeError("MOK shared output gate requires FP32 main_grad")
             gate_kwargs = {
                 "shared_output_gate_weight": shared_output_gate_weight,
                 "shared_output_gate_main_grad": gate_main_grad,

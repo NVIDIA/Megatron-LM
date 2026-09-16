@@ -676,14 +676,18 @@ def test_apply_rebinds_restored_methods_to_replacement_parameter(monkeypatch):
     assert old_param._high_precision_init_val is high_precision_init_val
 
 
-def test_output_gate_alias_participates_in_ddp_hooks_without_double_accumulation(monkeypatch):
+@pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
+def test_output_gate_alias_participates_in_ddp_hooks_without_double_accumulation(
+    monkeypatch, main_grad_dtype
+):
     from megatron.core.distributed import distributed_data_parallel as ddp_module
 
     module, shared, _ = _mock_backend(monkeypatch)
     gate = shared.gate_weight
     with torch.no_grad():
         gate.fill_(3.0)  # A nonzero sentinel would expose accidental duplicate accumulation.
-    gate.main_grad = torch.full_like(gate, 0.75, dtype=torch.float32)
+    gate.main_grad = torch.full_like(gate, 0.75, dtype=main_grad_dtype)
+    main_grad = gate.main_grad
     waited, ready = [], []
     bucket = SimpleNamespace(register_grad_ready=lambda param, force: ready.append((param, force)))
     ddp = SimpleNamespace(
@@ -696,11 +700,18 @@ def test_output_gate_alias_participates_in_ddp_hooks_without_double_accumulation
     monkeypatch.setattr(ddp_module, "is_graph_capturing", lambda: False)
     ddp_module.DistributedDataParallel._make_forward_pre_hook(ddp)(module)
     assert waited == [bucket]
-    gate.grad = parameter_bridge.finish_weight_gradient(gate)
-    ddp_module.DistributedDataParallel._make_backward_post_hook(ddp, gate)()
-    assert gate.grad is None
-    assert len(ready) == 1 and ready[0][0] is gate and ready[0][1] is False
-    torch.testing.assert_close(gate.main_grad, torch.full_like(gate.main_grad, 0.75))
+    for iteration in range(2):
+        gate.grad_added_to_main_grad = False
+        gate.main_grad.add_(0.5)
+        gate.grad = parameter_bridge.finish_weight_gradient(gate)
+        ddp_module.DistributedDataParallel._make_backward_post_hook(ddp, gate)()
+        assert gate.grad is None
+        assert gate.grad_added_to_main_grad
+        assert gate.main_grad is main_grad
+        torch.testing.assert_close(
+            gate.main_grad, torch.full_like(gate.main_grad, 0.75 + 0.5 * (iteration + 1))
+        )
+    assert len(ready) == 2 and all(param is gate and force is False for param, force in ready)
     torch.testing.assert_close(gate, torch.full_like(gate, 3.0))
 
 
@@ -770,8 +781,9 @@ class _RuntimeContext:
 @pytest.mark.parametrize("single_grouped", [False, True])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("mxfp8", [False, True])
+@pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
 def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
-    monkeypatch, mxfp8_runtime_available, single_grouped, gated, mxfp8
+    monkeypatch, mxfp8_runtime_available, single_grouped, gated, mxfp8, main_grad_dtype
 ):
     module, shared, functional = _mock_backend(
         monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
@@ -781,11 +793,14 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
         shared.linear_fc2.weight,
     )
     for parameter in parameters:
-        parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+        parameter.main_grad = torch.zeros_like(parameter, dtype=main_grad_dtype)
     if gated:
         shared.gate_weight.main_grad = torch.full_like(
-            shared.gate_weight, 0.25, dtype=torch.float32
+            shared.gate_weight, 0.25, dtype=main_grad_dtype
         )
+        gate_main_grad = shared.gate_weight.main_grad
+        expected_gate_main_grad = gate_main_grad.clone()
+    gate_contribution = torch.full((1, 8), 0.1234, dtype=torch.float32)
     # Opaque payloads exercise the bridge's view selection without pretending
     # that BF16 mock Parameters contain real MXFP8 storage. Numerical/native TE
     # storage validation belongs to the kernel and weight-adaptation tests.
@@ -817,8 +832,8 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
             assert args[12] is fc2_view
         gate_grad = kwargs.get("shared_output_gate_main_grad")
         if gated:
-            assert gate_grad is shared.gate_weight.main_grad and gate_grad.dtype == torch.float32
-            gate_grad.add_(0.5)
+            assert gate_grad is gate_main_grad and gate_grad.dtype == main_grad_dtype
+            gate_grad.add_(gate_contribution)
         else:
             assert gate_grad is None
         return torch.ones_like(args[5]), torch.ones_like(args[6]), *kwargs["main_grads"], gate_grad
@@ -864,9 +879,12 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
         if gated:
             assert gradients[4].data_ptr() == shared.gate_weight.data_ptr()
             assert shared.gate_weight.grad_added_to_main_grad
+            assert shared.gate_weight.main_grad is gate_main_grad
+            expected_gate_main_grad = (expected_gate_main_grad.float() + gate_contribution).to(
+                main_grad_dtype
+            )
             torch.testing.assert_close(
-                shared.gate_weight.main_grad,
-                torch.full_like(shared.gate_weight.main_grad, 0.25 + 0.5 * (iteration + 1)),
+                shared.gate_weight.main_grad, expected_gate_main_grad, rtol=0, atol=0
             )
         else:
             assert gradients[4] is None
@@ -874,14 +892,34 @@ def test_runtime_gate_main_grad_accumulates_and_finishes_ddp_slot(
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("main_grad", [None, "bf16"])
+@pytest.mark.parametrize(
+    "invalid, error",
+    [
+        ("missing", "DDP to assign param.main_grad"),
+        ("fp16", "FP32 or BF16"),
+        ("fp64", "FP32 or BF16"),
+        ("shape", "shape mismatch"),
+        ("noncontiguous", "contiguous main_grad"),
+        ("device", "parameter device"),
+        ("zero_out_wgrad", "zero_out_wgrad"),
+    ],
+)
 @pytest.mark.parametrize("mxfp8", [False, True])
-def test_runtime_rejects_missing_or_bf16_output_gate_main_grad(
-    monkeypatch, mxfp8_runtime_available, main_grad, mxfp8
+def test_runtime_rejects_invalid_output_gate_main_grad(
+    monkeypatch, mxfp8_runtime_available, invalid, error, mxfp8
 ):
     module, shared, functional = _mock_backend(monkeypatch, mxfp8=mxfp8)
-    if main_grad == "bf16":
-        shared.gate_weight.main_grad = torch.zeros_like(shared.gate_weight)
+    if invalid != "missing":
+        gate = shared.gate_weight
+        gate.main_grad = {
+            "fp16": torch.zeros_like(gate, dtype=torch.float16),
+            "fp64": torch.zeros_like(gate, dtype=torch.float64),
+            "shape": torch.zeros((8,), dtype=torch.bfloat16),
+            "noncontiguous": torch.zeros((1, 16), dtype=torch.bfloat16)[:, ::2],
+            "device": torch.zeros_like(gate, device="meta", dtype=torch.bfloat16),
+            "zero_out_wgrad": torch.zeros_like(gate, dtype=torch.bfloat16),
+        }[invalid]
+        gate.zero_out_wgrad = invalid == "zero_out_wgrad"
     parameters = module.autograd_routed_parameters + (
         shared.linear_fc1.weight,
         shared.linear_fc2.weight,
@@ -895,10 +933,5 @@ def test_runtime_rejects_missing_or_bf16_output_gate_main_grad(
     ctx.routed_weight_views = (module.routed_fc1_parameters[0], module.routed_fc2_parameters[0])
     ctx.save_for_backward(x, probs, shared.gate_weight, *parameters)
     functional.backward = lambda *args, **kwargs: pytest.fail("invalid main_grad reached MOK")
-    error = (
-        "DDP to assign param.main_grad"
-        if main_grad is None
-        else "output gate requires FP32 main_grad"
-    )
     with pytest.raises(RuntimeError, match=error):
         mok_runtime._MoKAutograd.backward(ctx, torch.ones_like(x))
