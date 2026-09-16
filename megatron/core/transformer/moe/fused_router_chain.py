@@ -11,6 +11,13 @@ TransformerEngine's ``moe_router_fusion`` replaces them by THREE Functions
 (``fused_topk_with_score_function``, ``fused_compute_score_for_moe_aux_loss``,
 ``fused_moe_aux_loss``) that still meet at the logits through autograd's fanout accumulation.
 
+Numerics: the kernels compute the sigmoid with libdevice's ``expf`` and divide with IEEE ``div.rn``
+(Triton's own ``tl.exp`` / ``/`` are the approximate ``ex2.approx`` / ``div.full`` paths, 1-2 ulp off
+torch's), so the scores and the biased scores the top-k ranks are bitwise the eager path's (no
+selection flips but exact ties); what remains different is the order of the fp32 sums -- over the
+``topk`` picked scores, over the experts of a row, over the tokens -- i.e. last-ulp differences
+of the weights and the aux loss (the witness numbers are in the line's report).
+
 This module owns the WHOLE chain in one ``torch.autograd.Function``: the forward is one Triton
 kernel per token row (sigmoid, bias, group scores, group and expert ranks, normalization, the
 dense probs and map or the dense top-k indices) plus the balance-loss statistics (a row-block
@@ -36,9 +43,15 @@ import torch
 try:
     import triton
     import triton.language as tl
+
+    try:
+        from triton.language.extra import libdevice
+    except ImportError:  # older Triton: the CUDA backend's module
+        from triton.language.extra.cuda import libdevice
 except ImportError:  # pragma: no cover - the Triton kernels are the CUDA path only
     triton = None
     tl = None
+    libdevice = None
 
 _AUX_BLOCK_R = 16
 _AUX_BLOCK_P = 32
@@ -178,7 +191,9 @@ if triton is not None:
         row = tl.program_id(0)
         cols = tl.arange(0, E)
         x = tl.load(X + row * stride_x + cols).to(tl.float32)
-        s = tl.sigmoid(x)
+        # torch.sigmoid(x.float()): 1 / (1 + expf(-x)) with libdevice's expf and an IEEE division,
+        # so the scores (and the biased scores the top-k ranks) are bitwise the eager path's
+        s = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-x))
         tl.store(S + row * stride_s + cols, s)
         if HAS_BIAS:
             biased = s + tl.load(B + cols).to(tl.float32)
@@ -211,7 +226,7 @@ if triton is not None:
         sel = erank < K
         w = tl.where(sel, s, 0.0)
         denom = tl.sum(w, axis=0) + 1e-20
-        weights = s / denom * route_scale
+        weights = libdevice.div_rn(s, denom) * route_scale
         tl.store(P + row * stride_p + cols, tl.where(sel, weights, 0.0))
         tl.store(M + row * stride_m + cols, sel.to(M.dtype.element_ty))
         tl.store(IDX + row * stride_i + erank, cols.to(tl.int64), mask=sel)
@@ -233,7 +248,7 @@ if triton is not None:
             valid = row < rows
             row_c = tl.minimum(row, rows - 1)
             s = tl.load(S + row_c * stride_s + cols)
-            a = s / (tl.sum(s, axis=0) + 1e-20)
+            a = libdevice.div_rn(s, tl.sum(s, axis=0) + 1e-20)
             ai = a[:, None]
             aj = a[None, :]
             before = (aj > ai) | ((aj == ai) & (cj < ci))
@@ -290,14 +305,16 @@ if triton is not None:
         denom = tl.sum(w, axis=0) + 1e-20
         g_norm = gw * route_scale
         dot = tl.sum(g_norm * w, axis=0)
-        g_wsel = g_norm / denom - dot / (denom * denom)
+        g_wsel = libdevice.div_rn(g_norm, denom) - libdevice.div_rn(dot, denom * denom)
         g_scores = tl.sum(tl.where(hit, g_wsel[:, None], 0.0), axis=0)  # (E,)
         if HAS_AUX:
             counts = tl.load(COUNTS + cols)
             denom_s = tl.sum(s, axis=0) + 1e-20
-            a = s / denom_s
+            a = libdevice.div_rn(s, denom_s)
             factor = tl.load(GAUX).to(tl.float32) * aux_scale
-            g_scores = g_scores + factor / denom_s * (counts - tl.sum(a * counts, axis=0))
+            g_scores = g_scores + libdevice.div_rn(factor, denom_s) * (
+                counts - tl.sum(a * counts, axis=0)
+            )
         gx = g_scores * s * (1.0 - s)
         tl.store(GX + row * stride_gx + cols, gx.to(GX.dtype.element_ty))
 
