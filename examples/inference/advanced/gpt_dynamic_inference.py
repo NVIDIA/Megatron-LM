@@ -15,6 +15,7 @@ import torch
 from tqdm import tqdm
 
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -293,6 +294,7 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     # Start Nsight profiler.

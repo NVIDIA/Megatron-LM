@@ -5,31 +5,33 @@ import os
 import sys
 from functools import partial
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 import yaml
+
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from dataloader_provider import train_valid_test_dataloaders_provider, is_first_or_last_stage
+from dataloader_provider import is_first_or_last_stage, train_valid_test_dataloaders_provider
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_tensor_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
+from megatron.core.utils import get_batch_on_this_cp_rank, nvtx_range_pop, nvtx_range_push
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.training.utils import is_last_rank
 
 
@@ -335,6 +337,7 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
+
     # Import the common evaluation functions
     from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
@@ -389,6 +392,8 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     full_config = pretrain_cfg_container_from_args(args)
+    initialize_runtime_services(args)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         train_valid_test_dataloaders_provider,
         ModelType.encoder_or_decoder,

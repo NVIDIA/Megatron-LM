@@ -5,7 +5,6 @@ import sys
 import time
 from argparse import Namespace
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -20,6 +19,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
+from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -131,6 +132,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     model = get_model_for_inference()

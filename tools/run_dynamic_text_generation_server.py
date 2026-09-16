@@ -57,6 +57,7 @@ from megatron.inference.utils import (  # noqa: E402
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -388,10 +389,11 @@ if __name__ == "__main__":
             _defaults.append("--return-log-probs")
         sys.argv[1:1] = _defaults
 
-        parse_and_validate_args(
+        args = parse_and_validate_args(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
+        initialize_runtime_services(args)
         initialize_megatron()
 
         args = get_args()

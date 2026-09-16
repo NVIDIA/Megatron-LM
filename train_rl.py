@@ -11,6 +11,7 @@ from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
@@ -20,14 +21,18 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
-from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.utils import is_hybrid_model
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
-from model_provider import model_provider
-
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.utils import is_hybrid_model
+from model_provider import model_provider
 
 stimer = StragglerDetector()
 
@@ -418,10 +423,12 @@ if __name__ == "__main__":
         "the forward pass masks via PackedSeqParams and never consumes a dense attention mask."
     )
     if is_hybrid_model(args):
-        model_cfg = hybrid_config_from_args(args)
+        model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     else:
-        model_cfg = gpt_config_from_args(args)
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    initialize_runtime_services(args)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training

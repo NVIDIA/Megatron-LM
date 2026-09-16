@@ -27,6 +27,7 @@ from megatron.inference.utils import (
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 
 # pylint: disable=line-too-long
 
@@ -219,6 +220,7 @@ if __name__ == "__main__":
             extra_args_provider=add_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
+        initialize_runtime_services(args)
         initialize_megatron()
         configure_nvtx_profiling(True)
 
