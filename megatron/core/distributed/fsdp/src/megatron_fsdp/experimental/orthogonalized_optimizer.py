@@ -179,6 +179,30 @@ def _require_sharded_main_weight(parameter_group: FsdpParameterGroup) -> None:
     )
 
 
+def _compute_weight_local_views(parameter_group: FsdpParameterGroup) -> list[tuple[str, DBuffer]]:
+    """Name the compute-weight buffers whose local views must match `main_weight`.
+
+    The base parameter group publishes the optimizer's update through
+    `post_optimizer_model_weight`, its `main_weight`-shaped view of `model_weight`.
+    `Fp8ParameterGroup` never creates that view: it overrides
+    `_init_compute_weight_storage` to replace `model_weight` with two uint8 quantized
+    payload buffers and re-quantizes straight from `main_weight`. Those payload buffers are
+    the fp8 equivalent -- they are allocated from `main_weight`'s placements and logical
+    tensor shapes through the same `DBuffer.empty`/`GlobalLayout.build` path that
+    `DBuffer.distribute_tensors` uses for `main_weight` -- so they are checked in its
+    place. A group exposing neither contributes no compute-weight comparison.
+    """
+    views: list[tuple[str, DBuffer]] = []
+    sync_target = getattr(parameter_group, "post_optimizer_model_weight", None)
+    if sync_target is not None:
+        views.append(("post_optimizer_model_weight", sync_target))
+    for name in ("_rowwise_buffer", "_colwise_buffer"):
+        buffer = getattr(parameter_group, name, None)
+        if buffer is not None:
+            views.append((name, buffer))
+    return views
+
+
 def _require_matching_local_shards(parameter_group: FsdpParameterGroup) -> None:
     """Require the parameter, gradient and compute-weight views to cover one local shard.
 
@@ -193,23 +217,17 @@ def _require_matching_local_shards(parameter_group: FsdpParameterGroup) -> None:
     `model_weight` itself may legitimately be Replicate (ZeRO-1 keeps compute weights in
     the parameter layout while the optimizer layout is Flat): the update is published
     through `post_optimizer_model_weight`, its `main_weight`-shaped view, which is what is
-    checked here.
-
-    `Fp8ParameterGroup` overrides `_init_compute_weight_storage` and therefore never
-    creates `post_optimizer_model_weight`; its compute weights are the rowwise/colwise
-    quantized payload DBuffers rather than a `main_weight`-shaped view, so there is no
-    equivalent buffer to compare and that half of the check is skipped for it. The
-    gradient half still applies, because `pre_optimizer_main_grad` comes from the shared
+    checked here. `Fp8ParameterGroup` has no such view and instead quantizes `main_weight`
+    into its rowwise/colwise payload buffers, which `_compute_weight_local_views` selects
+    in its place; a group exposing neither skips this half of the check. The gradient half
+    applies to every group, since `pre_optimizer_main_grad` always comes from the shared
     `_initialize_buffers`.
     """
-    sync_target = getattr(parameter_group, "post_optimizer_model_weight", None)
-    gradient = getattr(parameter_group, "pre_optimizer_main_grad", None)
+    views = [("pre_optimizer_main_grad", getattr(parameter_group, "pre_optimizer_main_grad", None))]
+    views.extend(_compute_weight_local_views(parameter_group))
     for index, fsdp_parameter in enumerate(parameter_group.fsdp_parameters):
         expected_shape = fsdp_parameter.sharded.to_local().shape
-        for name, buffer in (
-            ("pre_optimizer_main_grad", gradient),
-            ("post_optimizer_model_weight", sync_target),
-        ):
+        for name, buffer in views:
             if buffer is None:
                 continue
             local_shape = buffer.get_local_tensor(index).shape
