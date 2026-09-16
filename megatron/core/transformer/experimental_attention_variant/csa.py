@@ -1007,6 +1007,31 @@ class CompressorSubmodules:
     norm: Union[ModuleSpec, type] = None
 
 
+def _weight_requires_single_cp_projection(weight: nn.Parameter) -> bool:
+    """True when fused wgrad will overwrite ``main_grad`` for this weight.
+
+    ``overwrite_main_grad`` is the runtime contract, but Megatron FSDP only sets
+    it inside the linear pre-forward unshard hook. ``optim_grads`` and
+    fine-grained param-gather wrapping therefore look unset on the first
+    compressor forward, even though both backward GEMMs will copy into the same
+    buffer. Fall back using FSDP state that exists as soon as the wrapper is
+    constructed. ``is_first_microbatch=None`` cannot override that copy.
+    """
+    if getattr(weight, "overwrite_main_grad", False):
+        return True
+    fsdp = getattr(weight, "_megatron_fsdp_model", None)
+    if fsdp is None:
+        return False
+    strategy = getattr(fsdp, "data_parallel_sharding_strategy", "no_shard")
+    if strategy == "no_shard":
+        return False
+    if getattr(fsdp, "enable_fine_grained_param_gather_hook", False):
+        return True
+    # These strategies do not install TransformerLayer FSDP units, so the
+    # unshard hook (and overwrite_main_grad) runs on the linear itself.
+    return strategy in ("optim", "optim_grads")
+
+
 class Compressor(MegatronModule):
     """Gated pooling compressor for CSA and HCA sparse attention.
 
@@ -1202,9 +1227,16 @@ class Compressor(MegatronModule):
         return kv
 
     def _cp_requires_single_projection(self) -> bool:
-        """Whether wgrad's per-call contract requires the original CP projection."""
-        return self.config.delay_wgrad_compute or any(
-            getattr(linear.weight, "overwrite_main_grad", False)
+        """Whether wgrad's per-call contract requires the original CP projection.
+
+        FSDP sets ``overwrite_main_grad`` in the linear pre-forward unshard hook.
+        ``_forward_thd_cp`` inspects the flag before that hook runs, so also use
+        wrapping state that exists as soon as FSDP is constructed.
+        """
+        if self.config.delay_wgrad_compute:
+            return True
+        return any(
+            _weight_requires_single_cp_projection(linear.weight)
             for linear in (self.linear_wkv, self.linear_wgate)
         )
 
@@ -1253,6 +1285,8 @@ class Compressor(MegatronModule):
                     # is_first_microbatch=None via TELinear also makes both GEMMs
                     # accumulate into the zeroed main_grad: otherwise backward's
                     # last GEMM can overwrite the other half on microbatch one.
+                    # FSDP's overwrite_main_grad still forces a copy, so this
+                    # path must not run when FSDP wrapping will set that flag.
                     cache_setting = getattr(linear, "disable_parameter_transpose_cache", None)
                     if cache_setting is not None:
                         linear.disable_parameter_transpose_cache = True
