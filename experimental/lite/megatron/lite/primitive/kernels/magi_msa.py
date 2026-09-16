@@ -185,8 +185,11 @@ class MagiMsaContext:
     """Per-micro-batch state shared by every layer of a ``magi`` forward.
 
     ``position_ids`` are the doc-local positions of this rank's dispatched tokens (RoPE input).
-    ``dense_key`` is the native flexible-attention key for the full-attention layers, built on
-    the same dispatch layout; ``None`` when this PP stage has no dense layer.
+    ``dense_key`` is the native flexible-attention runtime key for the full-attention (non-MSA)
+    layers, built on the same dispatch layout as ``key``; ``None`` when this PP stage has no dense
+    layer. It is consumed by GQAttention's existing ``attention_backend="magi"`` core (see
+    ``primitive.modules.attention.magi.MagiDotProductAttention``) via ``dense_packed_seq_params()``
+    -- dense layers reuse that generic backend rather than a MiniMax-M3-specific one.
     """
 
     key: Any
@@ -196,6 +199,7 @@ class MagiMsaContext:
     cu_seqlens_host: tuple[int, ...]
     num_real_docs: int
     pad: int
+    max_seqlen: int
     position_ids: torch.Tensor  # int64 [T_local]
 
     @property
@@ -205,6 +209,19 @@ class MagiMsaContext:
     def rope_freqs_for(self, rotary) -> torch.Tensor:
         """``[T_local, 1, 1, rot]`` rotary table for the dispatched tokens."""
         return rotary.get_emb_for_positions(self.position_ids)
+
+    def dense_packed_seq_params(self) -> Any:
+        """``packed_seq_params`` for ``GQAttention``'s generic ``attention_backend="magi"`` path."""
+        from types import SimpleNamespace
+
+        if self.dense_key is None:
+            raise RuntimeError("MagiMsaContext has no dense_key; plan_magi_batch(need_dense_key=True) is required")
+        return SimpleNamespace(
+            qkv_format="magi",
+            magi_runtime_key=self.dense_key,
+            max_seqlen_q=self.max_seqlen,
+            max_seqlen_kv=self.max_seqlen,
+        )
 
 
 def dispatch_config(settings: MagiMsaSettings) -> Any:
@@ -276,6 +293,7 @@ def plan_magi_batch(
         cu_seqlens_host=cu_seqlens,
         num_real_docs=len(seq_lens_host),
         pad=pad,
+        max_seqlen=max(seq_lens),
         position_ids=position_ids,
     )
 
@@ -323,23 +341,10 @@ def calc_msa_v1(
     return m.msa.calc_msa(inputs, ctx.key).output
 
 
-def calc_dense_attn(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, ctx: MagiMsaContext, *, softmax_scale: float
-) -> torch.Tensor:
-    """Full causal (per-document) attention on the dispatched layout via native ``calc_attn``."""
-    if ctx.dense_key is None:
-        raise RuntimeError("MagiMsaContext has no dense key; plan_magi_batch(need_dense_key=True) is required")
-    out, _meta = _ensure_magi().calc_attn(
-        q.contiguous(), k.contiguous(), v.contiguous(), ctx.dense_key, softmax_scale=softmax_scale
-    )
-    return out
-
-
 __all__ = [
     "MagiMsaContext",
     "MagiMsaSettings",
     "build_msa_config",
-    "calc_dense_attn",
     "calc_msa_v1",
     "dispatch_tokens",
     "ensure_single_process_group",

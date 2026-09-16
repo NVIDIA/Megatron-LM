@@ -197,6 +197,10 @@ class MiniMaxM3Layer(nn.Module):
                 ps,
                 use_thd=False,
                 output_gate=False,
+                # Dense (non-sparse) layers reuse the generic MagiAttention core-attention backend
+                # (primitive.modules.attention.magi.MagiDotProductAttention) rather than a bespoke
+                # MiniMax-M3 path; only the sparse MSA layers need msa_backend-specific machinery.
+                attention_backend="magi" if msa_backend == "magi" else "te",
                 **attn_kwargs,
             )
         if self.is_moe:
@@ -220,7 +224,15 @@ class MiniMaxM3Layer(nn.Module):
         if packed_seq_params is not None:
             raise NotImplementedError("MiniMax-M3 lite does not support THD/packed sequences (MSA contract)")
         if magi_ctx is not None:
-            x = x + self.attn(x, magi_ctx=magi_ctx)
+            if self.is_sparse_attention:
+                # MSAttention owns the sparse indexer + block-sparse attention on Magi's dispatch layout.
+                x = x + self.attn(x, magi_ctx=magi_ctx)
+            else:
+                # Dense layers go through GQAttention's generic attention_backend="magi" path on the
+                # same dispatch layout (magi_ctx.dense_packed_seq_params()), not a MiniMax-M3-specific one.
+                x = x + self.attn(
+                    x, position_ids=magi_ctx.position_ids, packed_seq_params=magi_ctx.dense_packed_seq_params()
+                )
         else:
             x = x + self.attn(x, position_ids=position_ids)
         if self.moe is not None:
