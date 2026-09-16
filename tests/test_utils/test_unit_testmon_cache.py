@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+
 testmon_db = pytest.importorskip("testmon.db", reason="requires the testmon dependency group")
 DB = testmon_db.DB
 
