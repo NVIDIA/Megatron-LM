@@ -138,7 +138,12 @@ def test_virtual_expert_compact_api_requirement_preserves_plain_hybridep(monkeyp
 @requires_cuda
 @pytest.mark.parametrize(
     ("ep_size", "num_experts", "topk", "routing"),
-    [(2, 2, 1, "none"), (64, 8192, 32, "seq_aux_loss"), (64, 512, 10, "quantile_balancing")],
+    [
+        (2, 2, 1, "none"),
+        (33, 66, 2, "none"),
+        (64, 8192, 32, "seq_aux_loss"),
+        (64, 512, 10, "quantile_balancing"),
+    ],
 )
 def test_virtual_expert_init_accepts_supported_limits(
     monkeypatch, ep_size, num_experts, topk, routing
