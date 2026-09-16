@@ -521,7 +521,7 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
 
     seqlen = 4096
     batch_size = 1
-    num_heads = 16
+    num_heads = 128
     nope_dim = 128
     emb_dim = 64
     k_dim = 128
