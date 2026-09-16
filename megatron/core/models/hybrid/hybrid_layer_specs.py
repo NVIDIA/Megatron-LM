@@ -9,6 +9,7 @@ from megatron.core.extensions.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
@@ -33,6 +34,18 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
+    CompressedSparseAttentionSubmodules,
+    Compressor,
+    CompressorSubmodules,
+    CSAIndexer,
+    CSAIndexerSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -69,6 +82,18 @@ moe = get_moe_module_spec(
 
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
+
+_csa_compressor = partial(
+    Compressor,
+    submodules=CompressorSubmodules(linear_wkv=TELinear, linear_wgate=TELinear, norm=TENorm),
+)
+_csa_indexer = partial(
+    CSAIndexer,
+    submodules=CSAIndexerSubmodules(
+        linear_wq_b=TELinear, linear_weights_proj=TELinear, compressor=_csa_compressor
+    ),
+)
+_csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
 
 
 # MTP block spec - provides norms and projection only.
@@ -187,6 +212,58 @@ hybrid_stack_spec = ModuleSpec(
                         q_layernorm=IdentityOp,
                         kv_layernorm=IdentityOp,
                     ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        csa_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=DSv4HybridSelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=DSv4HybridSelfAttentionSubmodules(
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_proj=TEColumnParallelLinear,
+                        core_attention=partial(
+                            CompressedSparseAttention,
+                            submodules=CompressedSparseAttentionSubmodules(
+                                compressor=_csa_compressor, indexer=_csa_indexer
+                            ),
+                        ),
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                    metainfo={"fuse_input_layernorm": False},
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        csa_qk_layernorm_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=DSv4HybridSelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=DSv4HybridSelfAttentionSubmodules(
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_proj=TEColumnParallelLinear,
+                        core_attention=partial(
+                            CompressedSparseAttention,
+                            submodules=CompressedSparseAttentionSubmodules(
+                                compressor=_csa_compressor, indexer=_csa_indexer
+                            ),
+                        ),
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=_csa_qk_norm,
+                        kv_layernorm=_csa_qk_norm,
+                    ),
+                    metainfo={"fuse_input_layernorm": False},
                 ),
                 self_attn_bda=get_bias_dropout_add,
             ),
@@ -480,3 +557,7 @@ mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
 gdp_stack_spec = gated_delta_product_stack_spec
 gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
+
+
+# Preserve the existing --spec import path; C/H/W use the standard static stack spec.
+hybrid_dsv4_stack_spec = hybrid_stack_spec
