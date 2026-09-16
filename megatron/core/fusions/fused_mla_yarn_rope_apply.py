@@ -809,7 +809,11 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
                     )
                 if out.requires_grad:
                     raise ValueError(f"{name} must not require gradients")
-            ctx.mark_dirty(out_key, out_value)
+            # Forward-only callers may provide partition views into persistent
+            # VMM outputs. PyTorch only permits multiple modified view inputs
+            # when no autograd graph is being constructed.
+            if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+                ctx.mark_dirty(out_key, out_value)
         o_key = out_key.view(total_seqlen, nheads, emb_dim + k_dim)
         o_value = out_value.view(total_seqlen, nheads, v_dim)
 

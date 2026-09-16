@@ -601,6 +601,19 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
             allocator.close()
         pytest.skip(f"VMM MXFP8 localization is unavailable: {exc}")
 
+    rotary_streams = localized_workspaces[0].streams
+    rotary_fork_event = torch.cuda.Event(enable_timing=False)
+    rotary_join_events = tuple(torch.cuda.Event(enable_timing=False) for _ in range(2))
+    rotary_capture_events = []
+
+    def rotary_events():
+        if torch.cuda.is_current_stream_capturing():
+            fork_event = torch.cuda.Event(enable_timing=False)
+            join_events = tuple(torch.cuda.Event(enable_timing=False) for _ in range(2))
+            rotary_capture_events.extend((fork_event, *join_events))
+            return fork_event, join_events
+        return rotary_fork_event, rotary_join_events
+
     @torch.no_grad()
     def ordinary_rotary():
         fused_mla_rope_inplace(q_ordinary, cos, sin, nope_dim, emb_dim)
@@ -618,19 +631,38 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
 
     @torch.no_grad()
     def localized_rotary():
-        # Q RoPE is in-place, so its upstream buffer must already be VMM-backed.
-        fused_mla_rope_inplace(q_localized, cos, sin, nope_dim, emb_dim)
-        fused_mla_rope_kv_split(
-            kv,
-            k_pos_emb,
-            cos,
-            sin,
-            emb_dim,
-            k_dim,
-            v_dim,
-            out_key=key_localized,
-            out_value=value_localized,
-        )
+        parent_stream = torch.cuda.current_stream(device)
+        fork_event, join_events = rotary_events()
+        fork_event.record(parent_stream)
+        rows_per_domain = seqlen // 2
+        for domain, stream in enumerate(rotary_streams):
+            row_start = domain * rows_per_domain
+            row_end = row_start + rows_per_domain
+            stream.wait_event(fork_event)
+            with torch.cuda.stream(stream):
+                # Q RoPE is in-place, so its upstream buffer must already be
+                # VMM-backed. KV reads ordinary memory and writes each VMM half.
+                fused_mla_rope_inplace(
+                    q_localized[row_start:row_end],
+                    cos[row_start:row_end],
+                    sin[row_start:row_end],
+                    nope_dim,
+                    emb_dim,
+                )
+                fused_mla_rope_kv_split(
+                    kv[row_start:row_end],
+                    k_pos_emb[row_start:row_end],
+                    cos[row_start:row_end],
+                    sin[row_start:row_end],
+                    emb_dim,
+                    k_dim,
+                    v_dim,
+                    out_key=key_localized[row_start:row_end],
+                    out_value=value_localized[row_start:row_end],
+                )
+            join_events[domain].record(stream)
+        for event in join_events:
+            parent_stream.wait_event(event)
 
     @torch.no_grad()
     def ordinary_quant():
@@ -697,7 +729,7 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
     print(
         f"\nMLA rotary Q/K/V + three MXFP8 quant ({execution}):"
         f"\n  ordinary-memory rotary:       {ordinary_rotary_ms:.3f} ms"
-        f"\n  VMM-output rotary:            {localized_rotary_ms:.3f} ms"
+        f"\n  green VMM-output rotary:      {localized_rotary_ms:.3f} ms"
         f"\n  full-chip three quant:        {ordinary_quant_ms:.3f} ms"
         f"\n  localized three quant:        {localized_quant_ms:.3f} ms"
         f"\n  ordinary full pipeline:       {ordinary_pipeline_ms:.3f} ms"
