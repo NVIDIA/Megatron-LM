@@ -113,6 +113,8 @@ class _GDNBase(MegatronModule):
     Kimi Delta Attention.
     """
 
+    supports_strict_runtime_validation = True
+
     dt_bias_dim: int
     a_log_dim: int
     in_proj_extra_dim: int
@@ -486,7 +488,13 @@ class _GDNBase(MegatronModule):
         raise NotImplementedError
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        strict_runtime_validation: bool = True,
     ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
@@ -494,20 +502,21 @@ class _GDNBase(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
-        if total_cu != total_seq_len:
-            raise ValueError(
-                f"GDN: {name}[-1]={total_cu} does not match "
-                f"total_sequence_length={total_seq_len}. "
-                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
-            )
+        if strict_runtime_validation:
+            total_cu = cu_seqlens[-1].cpu().item()
+            if total_cu != total_seq_len:
+                raise ValueError(
+                    f"GDN: {name}[-1]={total_cu} does not match "
+                    f"total_sequence_length={total_seq_len}. "
+                    f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+                )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        if (seq_lengths % cp_size != 0).any():
-            raise ValueError(
-                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
-                f"but got lengths: {seq_lengths.tolist()}"
-            )
+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            if (seq_lengths % cp_size != 0).any():
+                raise ValueError(
+                    "All per-sequence lengths in cu_seqlens must be divisible by "
+                    f"cp_size={cp_size}, but got lengths: {seq_lengths.tolist()}"
+                )
 
         return cu_seqlens
 
