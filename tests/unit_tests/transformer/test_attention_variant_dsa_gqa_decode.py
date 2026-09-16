@@ -179,6 +179,7 @@ class TestDSGQADynamicInference:
             dsa_indexer_n_heads=1,
             dsa_indexer_head_dim=192,
             dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=0.1,
         )
         context = DynamicInferenceContext(
             model_config=config,
@@ -265,12 +266,12 @@ class TestDSGQADynamicInference:
             actual, expected.squeeze(1) if packed else expected, atol=2e-2, rtol=2e-2
         )
 
-    @pytest.mark.parametrize("learned_k", [False, True])
+    @pytest.mark.parametrize("prefill_backend", ["reference", "min-memory-triton"])
     @pytest.mark.parametrize("use_rope", [False, True])
     @pytest.mark.parametrize("provide_packed_metadata", [False, True])
     @pytest.mark.parametrize("index_topk", [8, 32])
     def test_mixed_prefill_reuses_training_and_decode_uses_cute(
-        self, monkeypatch, learned_k, use_rope, provide_packed_metadata, index_topk
+        self, monkeypatch, prefill_backend, use_rope, provide_packed_metadata, index_topk
     ):
         dtype = torch.bfloat16
         hidden_size = 4096
@@ -288,10 +289,11 @@ class TestDSGQADynamicInference:
             attention_dropout=0.0,
             experimental_attention_variant="dsa",
             dsa_indexer_mode="simplified",
-            dsa_simplified_use_learned_k=learned_k,
+            dsa_kernel_backend=prefill_backend,
             dsa_indexer_n_heads=1,
-            dsa_indexer_head_dim=128 if learned_k else 256,
+            dsa_indexer_head_dim=128,
             dsa_indexer_topk=index_topk,
+            dsa_indexer_loss_coeff=0.1,
             tensor_model_parallel_size=1,
             sequence_parallel=False,
         )
@@ -308,6 +310,8 @@ class TestDSGQADynamicInference:
                 use_flashinfer_fused_rope=False,
             ),
         )
+        assert inference_context.cache_dsa_indexer_keys
+        assert inference_context.dsa_indexer_head_dim == 128
         token_offset = 0
         for request_id, prompt_length in enumerate((13, 9)):
             inference_context.add_request(
@@ -334,9 +338,7 @@ class TestDSGQADynamicInference:
         )
         attention.eval()
         rope = RotaryEmbedding(
-            config.kv_channels,
-            rotary_percent=config.rotary_percent,
-            cp_group=attention.pg_collection.cp,
+            config.kv_channels, rotary_percent=1.0, cp_group=attention.pg_collection.cp
         )
 
         def rotary(seq_len):
@@ -413,7 +415,7 @@ class TestDSGQADynamicInference:
         monkeypatch.setattr(core_attention, "forward", capture_prefill)
         mixed_output, mixed_hidden_states = run_step()
 
-        assert indexer_calls == [(2, 128 if learned_k else 256)]
+        assert indexer_calls == [(2, 128)]
         assert attention_calls == [((2, 16, 256), (2, index_topk))]
         assert prefill_calls == [5]
         assert mixed_output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
@@ -452,7 +454,7 @@ class TestDSGQADynamicInference:
         prefill_calls.clear()
         decode_output, decode_hidden_states = run_step()
         assert prefill_calls == []
-        assert indexer_calls[-1] == (3, 128 if learned_k else 256)
+        assert indexer_calls[-1] == (3, 128)
         assert attention_calls[-1] == ((3, 16, 256), (3, index_topk))
         monkeypatch.setattr(core_attention, "forward", training_forward)
         histories = [
