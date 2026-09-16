@@ -4550,6 +4550,22 @@ def train(
     if isinstance(model[0], FullyShardedDataParallelV2) or (
         isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
     ):
+        # MFSDP v2 finalizes the DP-outer gradient in the FSDP backward hooks, gated on
+        # FsdpContext.is_last_microbatch, so grad sync must be enabled at the true last microbatch.
+        # FullyShardedDataParallelV2.start_grad_sync is a no-op, so installing it as
+        # config.grad_sync_func buys nothing and merely makes the schedule defer the enable (by
+        # pipeline_parallel_rank, plus a post-loop flush) until after those hooks have run with
+        # is_last_microbatch False -- leaving the DP-outer gradient Partial and the optimizer
+        # raising "MFSDP v2 gradient is still Partial when gradient statistics are taken".
+        # Do not "fix" this by dropping the check: --align-grad-reduce is meaningless for MFSDP v2.
+        if isinstance(model[0], FullyShardedDataParallelV2) and args.align_grad_reduce:
+            raise ValueError(
+                'MFSDP v2 does not support --align-grad-reduce: '
+                'FullyShardedDataParallelV2.start_grad_sync is a no-op, and installing it as '
+                'config.grad_sync_func defers the last-microbatch grad-sync enable until after '
+                'the FSDP backward hooks, so the DP-outer gradient is never finalized. '
+                'Pass --no-align-grad-reduce.'
+            )
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
