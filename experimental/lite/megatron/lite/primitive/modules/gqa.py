@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
 from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg, split_grouped_qkvg_for_tp
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
@@ -173,6 +172,12 @@ class GQAttention(nn.Module):
 
     def _build_core_attn(self, attention_backend: str) -> nn.Module:
         if attention_backend == "magi":
+            # Deferred: a module-level import here would make attention.magi's package
+            # (attention/__init__.py) run before this class finishes defining, and
+            # attention/__init__.py imports msa.py, which imports GQAttention back
+            # from this module -- a circular import.
+            from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
+
             return MagiDotProductAttention(head_dim=self.head_dim)
         cp_kwargs = {}
         if self.ps.cp_size > 1:
