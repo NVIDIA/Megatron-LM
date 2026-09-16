@@ -10,6 +10,7 @@ from typing import Callable, List, Literal, Optional, Self, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.activations import squared_relu
 from megatron.core.context_parallel import CPLayout
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -2070,7 +2071,7 @@ class TransformerConfig(ModelParallelConfig):
             if getattr(self, name) is not None
         }
         if _deprecated_num_sms:
-            warnings.warn(
+            warn_single_rank(
                 f"{', '.join(_deprecated_num_sms)} is deprecated. "
                 "Use moe_flex_dispatcher_num_sms instead."
             )

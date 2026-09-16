@@ -91,3 +91,33 @@ def log_single_rank(
 
     if safe_get_rank() == rank:
         logger.log(level, msg, *args, **kwargs)
+
+
+def warn_single_rank(
+    message: str, category: type[Warning] = UserWarning, stacklevel: int = 2, rank: int = 0
+) -> None:
+    """Issue a warning only on a single rank.
+
+    Use for warnings that describe a property of the job rather than of the calling rank,
+    such as deprecated settings and experimental-API notices. Every rank raises those
+    identically, so a large job repeats one message thousands of times in a shared log.
+
+    ``safe_get_rank`` reads the RANK or SLURM_PROCID environment variable when torch
+    distributed is not initialized, so this also works at import time.
+
+    Args:
+        message: The warning message.
+        category: Warning category. Defaults to ``UserWarning``.
+        stacklevel: Frames to skip when attributing the warning. Defaults to 2, which
+            reports the caller of the function that warns.
+        rank: The rank to warn on. Defaults to 0.
+    """
+    with warnings.catch_warnings():
+        # safe_get_rank warns when it can find no rank at all, which happens on a plain
+        # import outside a launcher. Defaulting to rank 0 is the right answer here, and
+        # letting that warning through would just swap it for the one being deduplicated.
+        warnings.simplefilter("ignore")
+        current_rank = safe_get_rank()
+
+    if current_rank == rank:
+        warnings.warn(message, category=category, stacklevel=stacklevel + 1)
