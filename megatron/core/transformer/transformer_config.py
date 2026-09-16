@@ -82,6 +82,13 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    disable_mtp_loss: bool = False
+    """Disable the MTP training forward and loss while retaining the MTP module.
+
+    The retained module preserves checkpoint topology and remains available for
+    inference, but its parameters are frozen and omitted from the optimizer.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1571,6 +1578,11 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        if self.disable_mtp_loss and self.freeze_base_model_for_mtp:
+            raise ValueError(
+                "disable_mtp_loss and freeze_base_model_for_mtp cannot both be enabled"
+            )
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0

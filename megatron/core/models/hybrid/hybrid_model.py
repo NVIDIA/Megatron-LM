@@ -323,6 +323,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
             )
+            if self.config.disable_mtp_loss:
+                self.mtp.requires_grad_(False)
             self._setup_mtp_cuda_graphs()
 
         # Output
@@ -587,7 +589,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
 
         mtp_forward_ran = (
-            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
+            self.mtp_process
+            and not (in_inference_mode or is_spec_decode)
+            and compute_mtp_loss
+            and not self.config.disable_mtp_loss
         )
         mtp_hidden_states = hidden_states
         mtp_inputs = None
