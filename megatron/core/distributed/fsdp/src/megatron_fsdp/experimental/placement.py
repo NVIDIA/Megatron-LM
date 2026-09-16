@@ -15,8 +15,8 @@
 """DBuffer placement definitions.
 
 DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
-types directly. ``Flat`` is the only DBuffer-specific placement: a dim-0
-``Shard`` whose local storage is part of one flattened buffer.
+types directly. ``Flat`` and ``BlockAtomic`` are DBuffer-specific dim-0
+``Shard`` placements whose local storage is part of one flattened buffer.
 
 =============  =============  ====================
 Source         Destination    DBuffer operation
@@ -33,7 +33,7 @@ from collections.abc import Iterable
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["Flat", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "Flat", "changed_mesh_axis"]
 
 
 class Flat(Shard):
@@ -41,6 +41,27 @@ class Flat(Shard):
 
     def __init__(self) -> None:
         super().__init__(0)
+
+    def __eq__(self, other: object) -> bool:
+        # PyTorch Shard.__eq__ compares only dim, so distinguish Flat from BlockAtomic.
+        return isinstance(other, Shard) and other.dim == 0 and not isinstance(other, BlockAtomic)
+
+
+class BlockAtomic(Shard):
+    """Flattened dim-0 shard placement that keeps ``block_size`` rows together."""
+
+    def __init__(self, block_size: int) -> None:
+        if block_size <= 0:
+            raise ValueError(f"BlockAtomic block_size must be positive, got {block_size}.")
+        super().__init__(0)
+        self.block_size = block_size
+
+    def __eq__(self, other: object) -> bool:
+        # PyTorch Shard.__eq__ compares only dim, so preserve the block size as well.
+        return isinstance(other, BlockAtomic) and self.block_size == other.block_size
+
+    def __repr__(self) -> str:
+        return f"BlockAtomic(block_size={self.block_size})"
 
 
 def changed_mesh_axis(
