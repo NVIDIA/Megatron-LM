@@ -2,6 +2,7 @@
 
 import atexit
 import math
+import os
 from collections import Counter
 from typing import Any, Dict, List, Optional, Union
 
@@ -109,6 +110,18 @@ class SFTDataset(MegatronDataset):
             )
         tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
         divisor = cp_pad * tp_pad
+        # [REMOVE BEFORE MERGE] Temporary internal GDR experiment workaround: force
+        # SFT packed sample lengths to a caller-provided multiple until the internal
+        # kernels support arbitrary tails.
+        min_pad_granularity = os.environ.get("MCORE_GDN_MIN_PAD_GRANULARITY")
+        if min_pad_granularity:
+            min_pad = int(min_pad_granularity)
+            if min_pad <= 0:
+                raise ValueError(
+                    "MCORE_GDN_MIN_PAD_GRANULARITY must be a positive integer, "
+                    f"got {min_pad}."
+                )
+            divisor = math.lcm(divisor, min_pad)
         # TODO(tailaim): do we need to pad for FP8 execution?
         # divisor = ((divisor + 15) // 16) * 16
         return divisor

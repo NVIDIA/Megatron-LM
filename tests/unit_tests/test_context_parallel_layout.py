@@ -403,6 +403,19 @@ def test_prebuild_thd_cp_partition_routes_populates_direct_fields():
     assert packed_seq_params.cp_partition_route is route
 
 
+def test_thd_cp_route_does_not_own_cpu_metadata():
+    source = torch.tensor([0, 16, 40], dtype=torch.int32)
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd", cu_seqlens_q=source, cu_seqlens_q_padded=None, cp_partition_route=None
+    )
+    prebuild_thd_cp_partition_routes(packed_seq_params, _FakeGroup(size=2, rank=0))
+
+    route = packed_seq_params.cp_partition_route
+
+    assert not hasattr(route, "_cu_seqlens_cpu")
+    assert not hasattr(route, "_cu_seqlens_owner")
+
+
 def test_prebuild_thd_cp_partition_routes_raises_route_errors():
     packed_seq_params = SimpleNamespace(
         qkv_format="thd",
