@@ -1,10 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections.abc import Sequence
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.tensor_observation import capture_tensor_observations
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.router_diagnostics import (
     ROUTER_DIAGNOSTIC_CHANNEL_COUNT,
     RouterDiagnosticChannel,
@@ -37,11 +40,16 @@ from megatron.training.tensor_metrics.definitions import (
     _accumulation_dtype,
 )
 from megatron.training.tensor_metrics.router_metrics import (
+    LayerRouterDecisionEntropyMetric,
     LayerRouterExpertBiasMetric,
     LayerRouterHealthMetric,
+    LayerRouterLogitsL2NormMetric,
+    LayerRouterLogitsMaxMetric,
+    LayerRouterLogitsSampledMedianMetric,
     LayerRouterRoutingBalanceMetric,
     LayerRouterSeqAuxDecompositionMetric,
 )
+from tests.unit_tests.test_utilities import Utils
 
 SITE = MetricSite("decoder.layers.0.linear.weight", "parameter")
 
@@ -1036,19 +1044,144 @@ def _fake_all_gather(monkeypatch, remote_value):
     monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
 
 
-def test_layer_sampled_median_gathers_the_sharded_population(monkeypatch):
-    _fake_all_gather(monkeypatch, torch.tensor([[3.0, 4.0]]))
+@pytest.mark.parametrize(
+    ("local", "remote"),
+    [([1.0, 2.0], [3.0, 4.0]), ([1.0], [2.0, 3.0, 4.0]), ([], [3.0, 4.0]), ([], [])],
+)
+def test_layer_sampled_median_gathers_the_sharded_population(monkeypatch, local, remote):
+    _fake_all_gather(monkeypatch, torch.empty(0))
+    calls = []
+
+    def all_gather(outputs, tensor, group):
+        calls.append(tensor.shape)
+        outputs[0].copy_(tensor)
+        if tensor.dtype == torch.int64:
+            outputs[1].fill_(len(remote))
+        else:
+            outputs[1].fill_(1000.0)  # Transport padding must not influence the median.
+            outputs[1][0, : len(remote)].copy_(torch.tensor(remote))
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
     item = _item(
-        "decoder.layers.2.router_logits",
-        torch.tensor([1.0, 2.0]),
-        (RankRelation("dp", Shard(None)),),
+        "decoder.layers.2.router_logits", torch.tensor(local), (RankRelation("dp", Shard(None)),)
     )
 
     results = TensorMetricExecutor({"dp": object()}).run(
         LayerSampledMedianMetric(sample_factor=1), [item]
     )
 
-    torch.testing.assert_close(_result_tensor(results), torch.tensor(2.5))
+    expected = (
+        torch.quantile(torch.tensor(local + remote), 0.5)
+        if local or remote
+        else torch.tensor(float("nan"))
+    )
+    torch.testing.assert_close(_result_tensor(results), expected, equal_nan=True)
+    assert calls == [torch.Size([1, 1]), torch.Size([1, max(1, len(local), len(remote))])]
+
+
+def test_layer_sampled_median_combines_compacted_and_uncompacted_population_axes():
+    metric = LayerSampledMedianMetric(sample_factor=1)
+    values = [
+        _item(
+            "decoder.layers.2.router_logits", torch.ones(3, 2, 4), (RankRelation("dp", Shard(1)),)
+        ),
+        _item("decoder.layers.2.router_logits", torch.ones(2, 4), (RankRelation("dp", Shard(0)),)),
+    ]
+    prepared = metric.prepare(values)
+
+    assert (
+        prepared[0].rank_relations == prepared[1].rank_relations == (RankRelation("dp", Shard(0)),)
+    )
+    assert len(metric.start(prepared)) == 1
+
+
+@pytest.mark.parametrize("all_padding", [False, True])
+def test_router_padding_metrics_reduce_uneven_populations_end_to_end(all_padding):
+    """Exercise real collectives with empty ranks, multiple layers, and mixed microbatches."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        values = []
+        expected_by_layer = {}
+        for layer in (2, 3):
+            expected_parts = []
+            for peer in range(world_size):
+                for microbatch in (0, 1):
+                    logits = torch.arange(24, device=device, dtype=torch.float32).reshape(4, 2, 3)
+                    logits = logits / (layer + 1) - 20 + peer / 16
+                    mask = torch.arange(8, device=device).reshape(4, 2) >= peer + layer - 2
+                    if all_padding:
+                        mask = torch.ones_like(mask)
+                    elif microbatch == 1:
+                        mask = None
+                    if mask is not None:
+                        expected_parts.append(logits[~mask])
+                        logits = logits.masked_fill(mask.unsqueeze(-1), 1000.0)
+                    else:
+                        expected_parts.append(logits.reshape(-1, 3))
+                    if peer != rank:
+                        continue
+
+                    router = TopKRouter.__new__(TopKRouter)
+                    torch.nn.Module.__init__(router)
+                    router.config = SimpleNamespace(
+                        sequence_parallel=False,
+                        moe_router_force_load_balancing=False,
+                        moe_router_force_biased=None,
+                    )
+                    router.score_function = "softmax"
+                    router._maintain_float32_expert_bias = lambda: None
+                    router.apply_input_jitter = lambda tensor: tensor
+                    router.gating = lambda tensor: logits
+                    router.routing = lambda tensor, padding_mask=None: (tensor, None)
+
+                    def observe(owner, name, kind, tensor, tp_dim, sequence_dim, batch_dim):
+                        values.append(
+                            _item(
+                                f"decoder.layers.{layer}.{name}",
+                                tensor,
+                                (RankRelation("dp", Shard(batch_dim)),),
+                                kind=kind,
+                            )
+                        )
+
+                    with capture_tensor_observations(
+                        observe, frozenset({"router_logits", "router_scores"})
+                    ):
+                        router(logits, padding_mask=mask)
+            expected_by_layer[f"decoder.layers.{layer}"] = torch.cat(expected_parts)
+        expected_by_layer["global"] = torch.cat(tuple(expected_by_layer.values()))
+        executor = TensorMetricExecutor({"dp": torch.distributed.group.WORLD})
+        for metric in (
+            LayerRouterLogitsL2NormMetric(),
+            LayerRouterLogitsMaxMetric(),
+            LayerRouterLogitsSampledMedianMetric(sample_factor=1),
+            LayerRouterDecisionEntropyMetric(),
+        ):
+            results = executor.run(metric, values)
+            assert {result.label for result in results} == set(expected_by_layer)
+            for result in results:
+                logits = expected_by_layer[result.label]
+                if isinstance(metric, LayerRouterLogitsL2NormMetric):
+                    expected = logits.norm()
+                elif isinstance(metric, LayerRouterLogitsMaxMetric):
+                    expected = logits.amax() if logits.numel() else logits.new_tensor(-float("inf"))
+                elif isinstance(metric, LayerRouterLogitsSampledMedianMetric):
+                    expected = (
+                        torch.quantile(logits.flatten(), 0.5)
+                        if logits.numel()
+                        else logits.new_tensor(float("nan"))
+                    )
+                else:
+                    scores = logits.softmax(dim=-1)
+                    expected = (
+                        torch.special.entr(scores).sum(dim=-1).mean() / logits.new_tensor(3).log()
+                    )
+                torch.testing.assert_close(result.tensor, expected, equal_nan=True)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_executor_all_gathers_an_explicit_shard(monkeypatch):
