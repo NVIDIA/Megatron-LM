@@ -192,6 +192,12 @@ def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
             gated_linear_unit=True,
         )
         kda = _build_kda(config)
+        assert kda.beta_proj.weight.shape == (
+            config.linear_num_key_heads,
+            config.hidden_size,
+        )
+        assert not getattr(kda.beta_proj.weight, "tensor_model_parallel", False)
+        assert not getattr(kda.beta_proj.weight, "sequence_parallel", False)
         assert kda.act_fn is F.silu
         assert kda.activation == "silu"
         legacy_fused = f_lora_rank is None and gate_lora_rank is None

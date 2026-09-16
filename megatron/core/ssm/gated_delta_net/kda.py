@@ -161,22 +161,29 @@ class KimiDeltaAttention(_GDNBase):
                     name=(name + ".f_b_proj") if name is not None else None,
                 )
 
-        # KDA keeps beta in a separate projection so its checkpoint layout remains
-        # independent from the Q/K/V, F-decay, and output-gate projections.
+        # Beta has only one scalar per key head. Keep this small projection replicated
+        # across TP ranks so MXFP8 quantizes the globally aligned output dimension rather
+        # than a potentially unaligned local shard (for example, 96 / TP2 = 48).
         self.beta_proj = build_module(
             submodules.beta_proj,
             self.hidden_size,
             self.num_key_heads,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
+            parallel_mode="duplicated",
             bias=bias,
             skip_bias_add=False,
+            skip_weight_param_allocation=False,
             is_expert=False,
-            tp_comm_buffer_name="beta_proj",
-            tp_group=self.pg_collection.tp,
             name=(name + ".beta_proj") if name is not None else None,
         )
+        # _forward_compute explicitly handles both the SP input gather and TP output
+        # scatter. Their paired autograd mappings produce the complete, identical
+        # replicated-weight gradient on every TP rank, so beta_proj must not participate
+        # in the later sequence-parallel parameter-gradient all-reduce.
+        self.beta_proj.sequence_parallel = False
+        for parameter in self.beta_proj.parameters():
+            setattr(parameter, "sequence_parallel", False)
 
         if not self.use_legacy_fused_projections:
             if self.config.kda_gate_lora_rank is None:
@@ -571,7 +578,20 @@ class KimiDeltaAttention(_GDNBase):
                 seq_len_post_headwise,
                 packed_seq_params,
             )
-        beta, _ = self.beta_proj(hidden_states)
+        beta_input = hidden_states
+        if self.config.sequence_parallel:
+            # The duplicated projection needs the full sequence. Its output is TP-scattered
+            # below, whose backward all-gathers the complete beta gradient; therefore this
+            # gather's backward only splits instead of reduce-scattering duplicate gradients.
+            beta_input = tensor_parallel.gather_from_sequence_parallel_region(
+                beta_input,
+                tensor_parallel_output_grad=False,
+                group=self.pg_collection.tp,
+            )
+        beta, _ = self.beta_proj(beta_input)
+        beta = tensor_parallel.scatter_to_tensor_model_parallel_region(
+            beta, group=self.pg_collection.tp
+        )
         beta, _ = a2a_cp_to_hp(
             beta,
             (self.num_k_heads_local_tp,),

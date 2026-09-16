@@ -295,7 +295,7 @@ class TestGetGatedDeltaNetModuleSpec:
         assert spec.module is KimiDeltaAttention
         assert isinstance(spec.submodules, KimiDeltaAttentionSubmodules)
         assert spec.submodules.in_proj == _FakeColumnParallelLinear
-        assert spec.submodules.beta_proj == _FakeColumnParallelLinear
+        assert spec.submodules.beta_proj == _FakeLinear
         assert spec.submodules.f_proj == _FakeColumnParallelLinear
         assert spec.submodules.f_a_proj == _FakeLinear
         assert spec.submodules.f_b_proj == _FakeColumnParallelLinear
