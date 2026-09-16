@@ -431,8 +431,9 @@ def test_hybrid_stack_rejects_same_named_config_type():
         )
 
 
-def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch):
-    """C/H/W share one spec while forwarding their per-layer ratios and mHC context."""
+@pytest.mark.parametrize("qk_layernorm", [False, True])
+def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch, qk_layernorm):
+    """C/H/W select a static spec and preserve per-layer ratios and mHC context."""
 
     class DummyLayer(torch.nn.Module):
 
@@ -441,7 +442,10 @@ def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch):
             self.layer_number = layer_number
 
     csa_layer_spec = object()
-    submodules = HybridStackSubmodules(csa_layer=csa_layer_spec)
+    csa_qk_layernorm_spec = object()
+    submodules = HybridStackSubmodules(
+        csa_layer=csa_layer_spec, csa_qk_layernorm_layer=csa_qk_layernorm_spec
+    )
     build_calls = []
     built_layers = []
     wrapped_layers = []
@@ -467,6 +471,7 @@ def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch):
         num_attention_heads=4,
         use_cpu_initialization=True,
         enable_mhc_connections=True,
+        qk_layernorm=qk_layernorm,
     )
     pg_collection = _make_pg_collection()
     block = HybridStack(
@@ -481,7 +486,8 @@ def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch):
         name="decoder",
     )
 
-    assert [spec for spec, _ in build_calls] == [csa_layer_spec] * 3
+    expected_spec = csa_qk_layernorm_spec if qk_layernorm else csa_layer_spec
+    assert [spec for spec, _ in build_calls] == [expected_spec] * 3
     built_configs = []
     for index, (_, kwargs) in enumerate(build_calls):
         layer_symbol = (Symbols.CSA, Symbols.HCA, Symbols.WINDOW)[index]
@@ -505,6 +511,16 @@ def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch):
     )
     assert [layer for _, layer in wrapped_layers] == built_layers
     assert list(block.layers) == built_layers
+
+    with pytest.raises(ValueError, match="C/H/W layers require.*csa_layer"):
+        HybridStack(
+            transformer_config,
+            HybridStackSubmodules(),
+            layer_type_list=[Symbols.CSA, Symbols.HCA, Symbols.WINDOW],
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=pg_collection,
+        )
 
 
 _BF16 = {"bf16": True, "params_dtype": torch.bfloat16}

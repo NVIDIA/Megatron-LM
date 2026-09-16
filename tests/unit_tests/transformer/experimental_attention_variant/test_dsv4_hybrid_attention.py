@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from argparse import ArgumentParser
 from dataclasses import replace
 from functools import partial
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -75,6 +77,9 @@ def _make_config(
     """Create an MLATransformerConfig for DSv4 hybrid attention tests."""
     if csa_compress_ratios is None:
         csa_compress_ratios = [0, 4, 128, 4]
+    extra_config_kwargs.setdefault('experimental_attention_variant', 'dsv4_hybrid')
+    # Native attention fixtures opt out of the DSv4 fused backend default.
+    extra_config_kwargs.setdefault('dsa_kernel_backend', 'none')
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -96,7 +101,6 @@ def _make_config(
         rotary_base=10000,
         rotary_percent=1.0,
         multi_latent_attention=True,
-        experimental_attention_variant='dsv4_hybrid',
         csa_compress_ratios=csa_compress_ratios,
         csa_window_size=csa_window_size,
         dsa_indexer_n_heads=dsa_indexer_n_heads,
@@ -257,10 +261,59 @@ def test_config_rejects_context_parallelism():
         _make_config(context_parallel_size=2)
 
 
-def test_config_rejects_fused_backend_in_native_slice():
-    """Fused DSv4 backends belong to the follow-up kernel-integration slice."""
-    with pytest.raises(ValueError, match="requires dsa_kernel_backend='none'"):
-        _make_config(dsa_kernel_backend="cudnn")
+def test_config_accepts_cudnn_backend_for_fused_sbhd():
+    """DSv4 may select the CSA cuDNN adapter while ordinary DSA keeps its own router."""
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
+    ):
+        config = _make_config(dsa_kernel_backend="cudnn")
+
+    assert config.dsa_kernel_backend == "cudnn"
+
+
+def test_config_rejects_sm90_ratio4_dense_indexer_loss():
+    """SM90 must use sparse indexer loss for the fused ratio-4 CSA path."""
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(9, 0)),
+        pytest.raises(ValueError, match="dense indexer loss is not supported on SM90"),
+    ):
+        _make_config(dsa_kernel_backend="cudnn", dsa_indexer_loss_coeff=0.1)
+
+
+def test_config_rejects_tilelang_backend_for_dsv4():
+    """The main-owned TileLang ordinary-DSA backend is not a CSA implementation."""
+    with pytest.raises(ValueError, match="does not support.*tilelang"):
+        _make_config(dsa_kernel_backend="tilelang")
+
+
+@pytest.mark.parametrize(
+    ("variant", "requested", "expected"),
+    [("dsv4_hybrid", None, "cudnn"), ("dsv4_hybrid", "none", "none"), ("dsa", None, "none")],
+)
+def test_cli_backend_default_preserves_explicit_none(variant, requested, expected):
+    """The generated CLI preserves omission for variant-aware config defaults."""
+    from megatron.training.arguments import _add_network_size_args
+
+    parser = _add_network_size_args(ArgumentParser())
+    argv = [] if requested is None else ['--dsa-kernel-backend', requested]
+    args = parser.parse_args(argv)
+    assert args.dsa_kernel_backend == requested
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
+    ):
+        config = _make_config(
+            experimental_attention_variant=variant, dsa_kernel_backend=args.dsa_kernel_backend
+        )
+    assert config.dsa_kernel_backend == expected
 
 
 def test_config_accepts_hybrid_model_ratio_tail():
@@ -269,8 +322,8 @@ def test_config_accepts_hybrid_model_ratio_tail():
     assert config.csa_compress_ratios == [0, 4, 128, 4]
 
 
-def test_hybrid_stack_spec_uses_one_static_ratio_agnostic_spec():
-    """C/H/W share one static attention spec; layer configs provide their ratios."""
+def test_hybrid_stack_spec_uses_static_ratio_agnostic_specs():
+    """C/H/W use static norm/no-norm specs; layer configs provide their ratios."""
     from megatron.core.models.hybrid.hybrid_layer_specs import (
         hybrid_dsv4_stack_spec,
         hybrid_stack_spec,
@@ -285,6 +338,13 @@ def test_hybrid_stack_spec_uses_one_static_ratio_agnostic_spec():
     attention = hybrid_stack_spec.submodules.csa_layer.submodules.self_attention
     assert attention.module is DSv4HybridSelfAttention
     assert "compress_ratio" not in attention.params
+    assert attention.submodules.q_layernorm is IdentityOp
+    assert attention.submodules.kv_layernorm is IdentityOp
+    normalized = hybrid_stack_spec.submodules.csa_qk_layernorm_layer.submodules.self_attention
+    assert normalized.module is DSv4HybridSelfAttention
+    assert "compress_ratio" not in normalized.params
+    assert normalized.submodules.q_layernorm is not IdentityOp
+    assert normalized.submodules.kv_layernorm is not IdentityOp
 
 
 @pytest.mark.parametrize("variant", [None, "dsa"])
@@ -403,7 +463,12 @@ def _build_attention(config, layer_number, pg_collection, **kwargs):
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.spec_utils import build_module
 
-    spec = hybrid_stack_spec.submodules.csa_layer.submodules.self_attention
+    layer_spec = (
+        hybrid_stack_spec.submodules.csa_qk_layernorm_layer
+        if config.qk_layernorm
+        else hybrid_stack_spec.submodules.csa_layer
+    )
+    spec = layer_spec.submodules.self_attention
     return build_module(
         spec, config=config, layer_number=layer_number, pg_collection=pg_collection, **kwargs
     )

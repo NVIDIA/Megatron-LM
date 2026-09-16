@@ -650,6 +650,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
     ),
+    # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
+    KernelEntry(
+        name="csa_teacher_lse",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
+        ),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_kernels",

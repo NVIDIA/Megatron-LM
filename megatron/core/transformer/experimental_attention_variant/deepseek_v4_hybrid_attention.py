@@ -22,7 +22,6 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
-from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -504,20 +503,16 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_kv_proj") if name is not None else None,
         )
-        if self.config.qk_layernorm:
-            self.kv_layernorm = submodules.kv_layernorm(
-                hidden_size=self.config.v_head_dim,
-                config=self.config,
-                eps=self.config.attention_latent_norm_epsilon,
-            )
-            self.q_layernorm = submodules.q_layernorm(
-                hidden_size=self.config.q_lora_rank,
-                config=self.config,
-                eps=self.config.attention_latent_norm_epsilon,
-            )
-        else:
-            self.kv_layernorm = IdentityOp()
-            self.q_layernorm = IdentityOp()
+        self.kv_layernorm = submodules.kv_layernorm(
+            hidden_size=self.config.v_head_dim,
+            config=self.config,
+            eps=self.config.attention_latent_norm_epsilon,
+        )
+        self.q_layernorm = submodules.q_layernorm(
+            hidden_size=self.config.q_lora_rank,
+            config=self.config,
+            eps=self.config.attention_latent_norm_epsilon,
+        )
 
     def get_query_key_value_tensors(
         self,
