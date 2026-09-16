@@ -15,3 +15,12 @@ repos:
   hooks:
   - id: isort
     files: ^megatron/core/.*
+- repo: local
+  hooks:
+  - id: check-dco
+    name: Check Signed-off-by trailer
+    entry: bash -c 'if ! grep -q "Signed-off-by:" "$1"; then echo "❌ Commit message must be signed off. Use git commit -s to add it automatically."; exit 1; fi' --
+    language: system
+    always_run: true
+    stages: [commit-msg]
+    types: [text]
