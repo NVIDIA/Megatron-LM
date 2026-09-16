@@ -288,6 +288,7 @@ class DSAIndexerLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        raw_loss: Optional[torch.Tensor] = None,
     ):
         """Save the indexer loss for logging.
 
@@ -297,6 +298,9 @@ class DSAIndexerLossLoggingHelper:
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
+            raw_loss: The unscaled loss, before the indexer loss coefficient is applied.
+                Optional so call sites that do not track it (the fused-kernel path) keep
+                working; it is appended last to preserve the positional order above.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
@@ -315,6 +319,14 @@ class DSAIndexerLossLoggingHelper:
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
+        if raw_loss is not None:
+            if "raw_values" not in tracker or tracker["raw_values"].shape[0] < needed:
+                grown = torch.zeros(needed, device=tracker["values"].device,
+                                    dtype=tracker["values"].dtype)
+                if "raw_values" in tracker:
+                    grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
+                tracker["raw_values"] = grown
+            tracker["raw_values"][layer_number - 1] += raw_loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -326,6 +338,8 @@ class DSAIndexerLossLoggingHelper:
         avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
+        if "raw_values" in tracker:
+            tracker["raw_values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -366,19 +380,26 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        values = tracker["values"]
-
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce indexer losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
+        # raw_values must exist on every pipeline rank before the collectives below,
+        # since ranks that own no indexer still have to contribute zeros.
+        if "raw_values" not in tracker or tracker["raw_values"].shape[0] < size:
+            grown = torch.zeros(size, device=tracker["values"].device,
+                                dtype=tracker["values"].dtype)
+            if "raw_values" in tracker:
+                grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
+            tracker["raw_values"] = grown
+        for values in (tracker["values"], tracker["raw_values"]):
+            torch.distributed.all_reduce(values, group=pp_group)
+            # Reduce indexer losses across ranks.
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
             torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                values, group=pg_collection.dp, op=torch.distributed.ReduceOp.AVG
             )
-        torch.distributed.all_reduce(
-            values, group=pg_collection.dp, op=torch.distributed.ReduceOp.AVG
-        )
 
     @staticmethod
     def track_indexer_metrics(
@@ -427,6 +448,19 @@ class DSAIndexerLossLoggingHelper:
                 total_loss_dict["indexer loss"] += avg_indexer_loss
             else:
                 total_loss_dict["indexer loss"] = avg_indexer_loss
+
+        if "raw_values" in tracker:
+            raw_values = tracker["raw_values"] * loss_scale
+            avg_raw_indexer_loss = raw_values.sum() / max(num_indexer_layers, 1)
+            if total_loss_dict is not None:
+                if "indexer raw loss" in total_loss_dict:
+                    total_loss_dict["indexer raw loss"] += avg_raw_indexer_loss
+                else:
+                    total_loss_dict["indexer raw loss"] = avg_raw_indexer_loss
+            if writer is not None:
+                writer.add_scalar("indexer raw loss", avg_raw_indexer_loss, iteration)
+            if wandb_writer is not None:
+                wandb_writer.log({"indexer raw loss": avg_raw_indexer_loss}, iteration)
 
         if writer is not None:
             writer.add_scalar("indexer loss", avg_indexer_loss, iteration)
