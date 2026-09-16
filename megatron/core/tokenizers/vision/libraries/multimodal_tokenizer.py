@@ -521,10 +521,21 @@ class MegatronMultimodalTokenizer:
         rendered_turns: List[Dict[str, Any]] = []
         replacements_per_turn: List[List[List[int]]] = []
         for turn in conversation:
-            text, replacements = self._render_parts(self._as_parts(turn["content"]))
+            content = turn["content"]
+            # Legacy task encoders locate images by their added-vocabulary ID.
+            # Only explicitly structured image parts use the dedicated sentinel.
+            if isinstance(content, str):
+                content = self._apply_image_tag(content)
+            text, replacements = self._render_parts(self._as_parts(content))
             rendered_turns.append({**turn, "content": text})
             replacements_per_turn.append(replacements)
         return rendered_turns, replacements_per_turn
+
+    def _apply_image_tag(self, text: str) -> str:
+        """Preserve tag wrapping for legacy string image markers."""
+        if self._image_tag is None:
+            return text
+        return text.replace(IMAGE_TOKEN, f"{self._image_tag[0]}{IMAGE_TOKEN}{self._image_tag[1]}")
 
     def _apply_chat_template_to_text(
         self, conversation: List[Dict[str, Any]], add_generation_prompt: bool, **kwargs
@@ -709,7 +720,11 @@ class MegatronMultimodalTokenizer:
                 text, return_target=False, add_generation_prompt=True, **kwargs
             ).tolist()
 
-        return list(self.tokenizer.encode(text, add_special_tokens=add_special_tokens))
+        return list(
+            self.tokenizer.encode(
+                self._apply_image_tag(text), add_special_tokens=add_special_tokens
+            )
+        )
 
     def tokenize_conversation(
         self,
@@ -724,11 +739,12 @@ class MegatronMultimodalTokenizer:
     ):
         """Convert a conversation to tokens.
 
-        Each turn's ``content`` may be either a plain string (treated as a single
-        text part) or a list of structured parts of the form
+        Each turn's ``content`` may be either a legacy string or a list of structured parts
+        of the form
         ``[{"type": "text", "text": str}, {"type": "image"}]``.
-        Multimodal parts are lowered to dedicated sentinel ids during encoding;
-        the literal string ``"<image>"`` in text content has no special meaning.
+        Legacy string ``"<image>"`` markers retain tag wrapping and their added-vocabulary
+        IDs, as expected by existing task encoders. Structured image parts use dedicated
+        sentinel IDs; ``"<image>"`` within a structured text part remains literal text.
         """
         if assistant_turn_loss is not None and tool_response_as_turn_boundary:
             raise ValueError(
@@ -913,6 +929,8 @@ class MegatronMultimodalTokenizer:
             if role in ("system", "user"):
                 target[idx : idx + turn_len] = IGNORE_INDEX
             elif role == "assistant":
+                if isinstance(raw_turn["content"], str) and IMAGE_TOKEN in raw_turn["content"]:
+                    raise RuntimeError(f"{IMAGE_TOKEN} not allowed in assistant content!")
                 if any(part["type"] != "text" for part in self._as_parts(raw_turn["content"])):
                     raise RuntimeError("multimodal parts are not allowed in assistant content!")
 
