@@ -10,6 +10,7 @@ import torch
 
 import megatron
 from megatron.core import mpu, tensor_parallel
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
@@ -24,13 +25,10 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.argument_utils import (
-    pretrain_cfg_container_from_args,
-    resolve_tokenizer_vocab_size,
-)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import initialize_runtime_services
 from pretrain_gpt import loss_func
 
@@ -274,9 +272,7 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    args = parse_and_validate_args(
-        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'}
-    )
+    args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     full_config = pretrain_cfg_container_from_args(args)
     initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)

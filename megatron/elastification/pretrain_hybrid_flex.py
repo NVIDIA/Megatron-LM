@@ -48,14 +48,12 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import (
-    pretrain_cfg_container_from_args,
-    resolve_tokenizer_vocab_size,
-)
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.global_vars import initialize_runtime_services
 
 # modelopt distillation
 try:

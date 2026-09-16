@@ -37,10 +37,8 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (
-    pretrain_cfg_container_from_args,
-    resolve_tokenizer_vocab_size,
-)
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import initialize_runtime_services
 from pretrain_gpt import loss_func
@@ -499,8 +497,7 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     args = parse_and_validate_args(
-        extra_args_provider=add_vlm_extra_args,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
     full_config = pretrain_cfg_container_from_args(args)
     initialize_runtime_services(args)
