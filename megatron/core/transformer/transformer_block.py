@@ -288,7 +288,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ):
+        """Build layers, optionally resolving per-module quantization at initialization."""
         super().__init__(config=config)
 
         if pg_collection is None:
@@ -304,6 +306,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.name = name
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -375,6 +378,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    **(
+                        {"name": f"{self.name}.layers.{layer_number - 1}"}
+                        if self.name is not None
+                        else {}
+                    ),
                 )
             return module
 
