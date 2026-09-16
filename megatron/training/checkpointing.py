@@ -1112,7 +1112,8 @@ def save_checkpoint(
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
                     run_config = get_full_config()
-                    run_config.to_yaml(run_config_filename)
+                    if run_config is not None:
+                        run_config.to_yaml(run_config_filename)
 
                 # Save tokenizer files for torch_dist checkpoints (if enabled)
                 if (
