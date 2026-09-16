@@ -414,13 +414,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Fixed launch configurations and ordered parameter-gradient reductions; first-order replay.",
     ),
     KernelEntry(
-        name="gdn_fixed_launch_convolution",
-        sources=("megatron/core/ssm/gdn_common_optimizations.py",),
-        tests=(K + "test_gdn_fusion.py",),
-        kind="external-lib",
-        notes="FLA causal convolution with fixed backward tiles and ordered parameter-gradient reductions.",
-    ),
-    KernelEntry(
         name="ssm_triton_cache_manager",
         sources=("megatron/core/ssm/triton_cache_manager.py",),
         kind="triton",

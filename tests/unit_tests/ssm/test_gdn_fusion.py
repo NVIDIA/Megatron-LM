@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core.ssm import gdn_common_optimizations, gdn_fusion, gdn_gated_norm
+from megatron.core.ssm import gdn_fusion, gdn_gated_norm
 
 
 def test_disabled_preparation_does_not_require_fla(monkeypatch):
@@ -18,20 +18,7 @@ def test_disabled_preparation_does_not_require_fla(monkeypatch):
         assert not gdn_fusion.enabled(SimpleNamespace(), torch.empty(0))
 
 
-@pytest.mark.parametrize(
-    "dependency", ["_LINEAR_BWD", "causal_conv1d_fwd", "prepare_chunk_indices"]
-)
-def test_disabled_control_does_not_require_fla(monkeypatch, dependency):
-    monkeypatch.setenv("MCORE_GDN_COMMON_OPT", "1")
-    with patch.object(gdn_common_optimizations, dependency, None):
-        assert not gdn_common_optimizations.enabled(SimpleNamespace(), torch.empty(0))
-
-
-def test_control_is_independent_of_fusion_selector(monkeypatch):
-    monkeypatch.setenv("MCORE_GDN_COMMON_OPT", "0")
-    monkeypatch.setenv("MCORE_GDN_FUSION", "1")
-    assert not gdn_common_optimizations.enabled(SimpleNamespace(), torch.empty(0))
-    monkeypatch.setenv("MCORE_GDN_COMMON_OPT", "1")
+def test_disabled_preparation_does_not_inspect_inputs(monkeypatch):
     monkeypatch.setenv("MCORE_GDN_FUSION", "0")
     assert not gdn_fusion.enabled(SimpleNamespace(), torch.empty(0))
 
@@ -95,16 +82,13 @@ def test_preparation_forward_backward(length, scale, boundaries, has_bias, param
     gradients = tuple(torch.randn_like(out) for out in expected)
     inputs = tuple(t for t in (projection, weight, bias, alog, dtbias) if t is not None)
     reference_gradients = torch.autograd.grad(expected, inputs, gradients)
-    for actual in (
-        unfused(gdn_common_optimizations.tuned_causal_conv1d),
-        gdn_fusion.fused_prepare(projection, weight, bias, alog, dtbias, cu),
-    ):
-        for index, (got, ref) in enumerate(zip(actual, expected)):
-            if index in (3, 5):
-                torch.testing.assert_close(got, ref, atol=0, rtol=0)
-            else:
-                torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-2)
-        _assert_gradients_close(torch.autograd.grad(actual, inputs, gradients), reference_gradients)
+    actual = gdn_fusion.fused_prepare(projection, weight, bias, alog, dtbias, cu)
+    for index, (got, ref) in enumerate(zip(actual, expected)):
+        if index in (3, 5):
+            torch.testing.assert_close(got, ref, atol=0, rtol=0)
+        else:
+            torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-2)
+    _assert_gradients_close(torch.autograd.grad(actual, inputs, gradients), reference_gradients)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

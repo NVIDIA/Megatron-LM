@@ -75,7 +75,6 @@ def test_gdn_fused_module(monkeypatch, model_parallel, packed, recompute):
 
     def run(fused):
         monkeypatch.setenv("MCORE_GDN_FUSION", str(int(fused)))
-        monkeypatch.setenv("MCORE_GDN_COMMON_OPT", "1")
         model.zero_grad(set_to_none=True)
         x = hidden.detach().clone().requires_grad_()
         out, _ = model(x, None, packed_seq_params=metadata)

@@ -27,8 +27,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
-from megatron.core.ssm.gdn_common_optimizations import enabled as gdn_common_enabled
-from megatron.core.ssm.gdn_common_optimizations import tuned_causal_conv1d
 from megatron.core.ssm.gdn_fusion import enabled as gdn_fusion_enabled
 from megatron.core.ssm.gdn_fusion import fused_prepare
 from megatron.core.ssm.gdn_gated_norm import enabled as gdn_output_fusion_enabled
@@ -226,8 +224,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         elif not use_fusion:
             assert self.activation in ["silu", "swish"]
-            conv_fn = tuned_causal_conv1d if gdn_common_enabled(self, qkvzba) else causal_conv1d
-            qkv, _ = conv_fn(
+            qkv, _ = causal_conv1d(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
