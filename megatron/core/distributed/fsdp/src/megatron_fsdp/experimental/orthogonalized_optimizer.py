@@ -194,9 +194,16 @@ def _require_matching_local_shards(parameter_group: FsdpParameterGroup) -> None:
     the parameter layout while the optimizer layout is Flat): the update is published
     through `post_optimizer_model_weight`, its `main_weight`-shaped view, which is what is
     checked here.
+
+    `Fp8ParameterGroup` overrides `_init_compute_weight_storage` and therefore never
+    creates `post_optimizer_model_weight`; its compute weights are the rowwise/colwise
+    quantized payload DBuffers rather than a `main_weight`-shaped view, so there is no
+    equivalent buffer to compare and that half of the check is skipped for it. The
+    gradient half still applies, because `pre_optimizer_main_grad` comes from the shared
+    `_initialize_buffers`.
     """
-    sync_target = parameter_group.post_optimizer_model_weight
-    gradient = parameter_group.pre_optimizer_main_grad
+    sync_target = getattr(parameter_group, "post_optimizer_model_weight", None)
+    gradient = getattr(parameter_group, "pre_optimizer_main_grad", None)
     for index, fsdp_parameter in enumerate(parameter_group.fsdp_parameters):
         expected_shape = fsdp_parameter.sharded.to_local().shape
         for name, buffer in (
