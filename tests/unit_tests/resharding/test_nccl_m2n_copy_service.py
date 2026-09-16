@@ -302,9 +302,14 @@ def _has_nccl_m2n_python_package() -> bool:
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
-def test_nccl_m2n_reshards_parameter_between_tensor_dimensions():
-    """Exercise direct TP shard-to-shard M2N transfer on GPUs."""
+@pytest.mark.launch_on_gb200
+def test_nccl_m2n_reshards_parameter_between_tensor_dimensions(monkeypatch: pytest.MonkeyPatch):
+    """Exercise packed TP shard-to-shard M2N transfer on GPUs."""
     Utils.initialize_distributed()
+    if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
+        pytest.skip("Native NCCL M2N coverage runs on the GIN-enabled Blackwell CI lane")
+
+    monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "PACK")
     world_size = dist.get_world_size()
     if world_size < 2 or world_size % 2:
         pytest.skip("NCCL M2N integration test requires an even distributed world size >= 2")

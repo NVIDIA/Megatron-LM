@@ -90,6 +90,14 @@ class DotProductAttention(MegatronModule):
             coeff = self.layer_number
             self.softmax_scale /= coeff
 
+        # Resolve the attention logit softcap alongside coeff so the two stay in step. Query-key
+        # layer scaling divides softmax_scale by layer_number and defers the matching multiply to
+        # scale_mask_softmax, so the cap has to be divided too; otherwise the softmax would see an
+        # effective cap of attn_logit_softcapping * layer_number.
+        self.softcap = self.config.attn_logit_softcapping
+        if self.softcap is not None and coeff is not None:
+            self.softcap = self.softcap / coeff
+
         if is_layer_window_attention(
             self.config.window_size, self.config.window_attn_skip_freq, layer_number
         ):
@@ -201,6 +209,12 @@ class DotProductAttention(MegatronModule):
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
+
+        # Apply attention logit softcapping (cap * tanh(logits / cap)) before the mask + softmax
+        # for parity with the fused TE softcap path. self.softcap already accounts for query-key
+        # layer scaling; see __init__.
+        if self.softcap is not None:
+            attention_scores = self.softcap * torch.tanh(attention_scores / self.softcap)
 
         # ===========================
         # Attention probs and dropout

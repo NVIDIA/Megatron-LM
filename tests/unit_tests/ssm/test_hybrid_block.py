@@ -4,24 +4,31 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import transformer_engine as te
 
 import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
+from megatron.core.ssm.gated_delta_product import HAVE_FLA as HAVE_GDP
+from megatron.core.ssm.gated_delta_product import HAVE_MAMBA_SSM as HAVE_GDP_MAMBA
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import ModuleSpec, TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
@@ -424,6 +431,42 @@ def test_hybrid_stack_rejects_same_named_config_type():
         )
 
 
+_BF16 = {"bf16": True, "params_dtype": torch.bfloat16}
+# Current scaling, not delayed: delayed scaling opens one outer fp8 context for the whole stack
+# and the per-layer factory degenerates to nullcontext, so the block's interleaving of the two
+# physical layers' contexts would not actually run.
+_FP8 = {**_BF16, "fp8": "e4m3", "fp8_recipe": "tensorwise"}
+
+TWO_STAGE_ATTENTION_CASES = [
+    pytest.param(Symbols.MAMBA, hybrid_stack_spec, _BF16, id="mamba"),
+    pytest.param(
+        Symbols.GDN,
+        hybrid_stack_spec,
+        {"bf16": True, "params_dtype": torch.bfloat16, "activation_func": torch.nn.functional.silu},
+        marks=pytest.mark.skipif(not HAVE_GDN, reason="FLA is not installed"),
+        id="gdn",
+    ),
+    pytest.param(Symbols.ATTENTION, hybrid_stack_spec, _BF16, id="attention"),
+    pytest.param(Symbols.ATTENTION, hybrid_stack_spec, _FP8, id="attention-fp8"),
+    pytest.param(
+        Symbols.MAMBA,
+        gated_delta_product_stack_spec,
+        {
+            "bf16": True,
+            "params_dtype": torch.bfloat16,
+            "mamba_num_heads": 4,
+            "mamba_head_dim": 64,
+            "mamba_num_groups": 4,
+            "mamba_state_dim": 16,
+        },
+        marks=pytest.mark.skipif(
+            not (HAVE_GDP and HAVE_GDP_MAMBA), reason="GDP dependencies are not installed"
+        ),
+        id="gdp",
+    ),
+]
+
+
 @pytest.mark.internal
 class TestHybridBlock:
 
@@ -434,7 +477,30 @@ class TestHybridBlock:
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-    def get_hybrid_block(self, layer_pattern, **config_kwargs):
+    def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
+        """Reject overlap before constructing any HybridModel submodule."""
+        config = TransformerConfig(
+            hidden_size=256, num_layers=1, num_attention_heads=4, use_cpu_initialization=True
+        )
+        # Mutate after generic config validation to exercise the pattern-specific guard.
+        config.overlap_moe_expert_parallel_comm = True
+
+        def fail_build(*args, **kwargs):
+            pytest.fail("HybridModel submodule construction must not begin")
+
+        monkeypatch.setattr("megatron.core.models.hybrid.hybrid_model.build_module", fail_build)
+
+        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
+                pg_collection=self.get_pg_collection(),
+            )
+
+    def get_hybrid_block(self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs):
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
@@ -445,7 +511,7 @@ class TestHybridBlock:
             **config_kwargs,
         )
         layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
-        modules = hybrid_stack_spec.submodules
+        modules = stack_spec.submodules
         return HybridStack(
             transformer_config,
             modules,
@@ -514,6 +580,22 @@ class TestHybridBlock:
             layer_config_list=layer_config_list,
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
+        )
+
+    def get_gdn2_hybrid_block(
+        self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs
+    ):
+        """Build a HybridStack with the "gdn2" experimental attention variant selected."""
+        return self.get_hybrid_block(
+            layer_pattern,
+            stack_spec=stack_spec,
+            experimental_attention_variant="gdn2",
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            **config_kwargs,
         )
 
     def teardown_method(self, method):
@@ -648,6 +730,178 @@ class TestHybridBlock:
             for layer, layer_config in zip(block.layers, block.layer_config_list)
         )
 
+    @pytest.mark.parametrize(
+        ("compute_symbol", "stack_spec", "compute_config"), TWO_STAGE_ATTENTION_CASES
+    )
+    def test_two_stage_attention_matches_atomic_forward_bitwise(
+        self, compute_symbol, stack_spec, compute_config
+    ):
+        block = self.get_hybrid_block(
+            compute_symbol,
+            stack_spec=stack_spec,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            **compute_config,
+        ).cuda()
+        layer = block.layers[0]
+        layer.train()
+        assert layer.supports_two_stage_attention()
+
+        hidden_states = torch.randn(16, 2, block.config.hidden_size, device="cuda")
+        attention_mask = None
+        if compute_symbol == Symbols.ATTENTION:
+            attention_mask = torch.triu(
+                torch.ones(1, 1, 16, 16, dtype=torch.bool, device="cuda"), diagonal=1
+            )
+
+        with torch.no_grad():
+            model_parallel_cuda_manual_seed(123)
+            atomic_output = layer(hidden_states, attention_mask=attention_mask)
+
+            model_parallel_cuda_manual_seed(123)
+            stage_one_state = layer.forward_pre_attn_and_core_attn(
+                hidden_states, attention_mask=attention_mask, packed_sequence_cp_metadata=None
+            )
+            two_stage_output = layer.forward_post_core_attn(*stage_one_state)
+
+        def assert_bitwise_equal(actual, expected):
+            assert type(actual) is type(expected)
+            if isinstance(actual, tuple):
+                assert len(actual) == len(expected)
+                for actual_item, expected_item in zip(actual, expected):
+                    assert_bitwise_equal(actual_item, expected_item)
+            elif actual is None:
+                assert expected is None
+            else:
+                assert torch.equal(actual, expected)
+
+        assert_bitwise_equal(two_stage_output, atomic_output)
+
+    @pytest.mark.parametrize(
+        ("compute_symbol", "stack_spec", "compute_config"), TWO_STAGE_ATTENTION_CASES
+    )
+    @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "overlap"])
+    def test_shortcut_pair_eager_forward_backward(
+        self, monkeypatch, compute_symbol, stack_spec, compute_config, parallel
+    ):
+        block = self.get_hybrid_block(
+            compute_symbol + Symbols.MOE,
+            stack_spec=stack_spec,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_post_norm=True,
+            moe_shortcut_parallel=parallel,
+            moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            **compute_config,
+        )
+
+        assert len(block.layers) == 1
+        assert block.num_layers_per_pipeline_rank == 2
+        shortcut = block.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+        assert shortcut.overlap_mode is parallel
+        assert isinstance(shortcut.moe_layer, TransformerLayer)
+        state_keys = set(block.state_dict())
+        assert any(key.startswith("layers.0.attn_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
+        assert "layers.0.shortcut_post_norm.weight" in state_keys
+
+        block = block.cuda()
+        block.train()
+
+        hidden_states = torch.randn(
+            16, 2, block.config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+        )
+        attention_mask = None
+        if compute_symbol == Symbols.ATTENTION:
+            attention_mask = torch.triu(
+                torch.ones(1, 1, 16, 16, dtype=torch.bool, device=hidden_states.device), diagonal=1
+            )
+            attn_layer = shortcut.attn_layer
+
+            def fail_if_mlp_runs(*args, **kwargs):
+                pytest.fail("attention shortcut output projection must not execute an MLP")
+
+            monkeypatch.setattr(attn_layer, "_forward_mlp", fail_if_mlp_runs)
+
+        output = block(hidden_states, attention_mask=attention_mask)
+        output.float().square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        logical_norms = (
+            shortcut.shortcut_pre_mlp_layernorm,
+            shortcut.moe_layer.pre_mlp_layernorm,
+            shortcut.shortcut_post_norm,
+        )
+        assert len({id(norm.weight) for norm in logical_norms}) == len(logical_norms)
+        # This config leaves --normalization at its LayerNorm default.
+        assert all(isinstance(norm, te.pytorch.LayerNorm) for norm in logical_norms)
+        for norm in logical_norms:
+            assert norm.weight.grad is not None
+            assert torch.isfinite(norm.weight.grad).all()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+
+    def test_shortcut_pair_supports_a_residual_returning_pre_mlp_norm(self):
+        """A fused residual pre-MLP norm spec is honoured, not rejected."""
+        import copy
+
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+        stack_spec = copy.deepcopy(hybrid_stack_spec)
+        stack_spec.submodules.moe_layer.submodules.pre_mlp_layernorm = TESpecProvider().layer_norm(
+            has_residual=True
+        )
+        block = self.get_hybrid_block(
+            Symbols.MAMBA + Symbols.MOE,
+            stack_spec=stack_spec,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_post_norm=True,
+            moe_shared_expert_intermediate_size=256,
+            normalization="RMSNorm",
+            fused_residual_rmsnorm=True,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            **_BF16,
+        )
+        shortcut = block.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+
+        # The MoE layer keeps the residual norm the spec asked for; the shortcut-owned norms,
+        # which have no residual partner, drop that intent.
+        assert shortcut.moe_layer.pre_mlp_layernorm.returns_residual
+        assert not shortcut.shortcut_pre_mlp_layernorm.returns_residual
+        assert not shortcut.shortcut_post_norm.returns_residual
+        # Dropping residual intent must not drop --normalization RMSNorm.
+        assert isinstance(shortcut.shortcut_pre_mlp_layernorm, te.pytorch.RMSNorm)
+        assert isinstance(shortcut.shortcut_post_norm, te.pytorch.RMSNorm)
+
+        block = block.cuda()
+        block.train()
+        hidden_states = torch.randn(
+            16, 2, block.config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+        )
+
+        output = block(hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+
     def test_invalid_layer_types_cause_failure(self):
         invalid_pattern_char = 'X'
         assert not layer_utils.is_valid_symbol(invalid_pattern_char)  # sanity check.
@@ -709,6 +963,31 @@ class TestHybridBlock:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
+
+    def test_gdn2_layer_types(self, monkeypatch):
+        """With the "gdn2" variant, 'G' builds GatedDeltaNet2 while '*' still wraps
+        SelfAttention.
+
+        `deterministic_mode` selects GDN2's pure-torch kernel fallback so this test
+        also runs without flash-linear-attention; the env var is Transformer Engine's
+        requirement for deterministic mode.
+        """
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        block = self.get_gdn2_hybrid_block(Symbols.GDN + Symbols.ATTENTION, deterministic_mode=True)
+        layers = block.layers
+        assert isinstance(layers[0], TransformerLayer)
+        assert isinstance(layers[0].self_attention, GatedDeltaNet2)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
+
+    def test_gdn2_without_spec_raises(self):
+        """Requesting the gdn2 variant without the pre-built GDN2 layer spec errors out."""
+        stack_spec = ModuleSpec(
+            module=HybridStack,
+            submodules=HybridStackSubmodules(gdn_layer=hybrid_stack_spec.submodules.gdn_layer),
+        )
+        with pytest.raises(ValueError, match="gdn2_layer"):
+            self.get_gdn2_hybrid_block(Symbols.GDN, stack_spec=stack_spec)
 
     def test_dsa_layer_types(self):
         """D symbol creates a TransformerLayer with absorbed MLA and DSA core attention."""

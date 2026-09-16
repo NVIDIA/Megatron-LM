@@ -1386,6 +1386,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._decode_logit_idxs = torch.arange(
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        # A partial prefill chunk's last logit predicts a known prompt token, not
+        # the provisional sample that is discarded after the step. The scheduler
+        # permits only one partial chunk, so one stable scalar is sufficient.
+        self.chunked_prefill_next_prompt_token = torch.empty(
+            (), dtype=torch.int64, device=torch.cuda.current_device()
+        )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
         # GPU via the matching region of ContextGPUView._buf). Populated per
@@ -3343,6 +3349,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefill_chunk_length <= req.remaining_prompt_length
         ), "Prefill chunk length is greater than remaining prompt length"
 
+        if prefill_chunk_length < req.remaining_prompt_length:
+            self.chunked_prefill_next_prompt_token.copy_(
+                req.remaining_prompt_tokens[prefill_chunk_length]
+            )
+
         # =========================================================================
         # Block allocation + prefix matching + prefill skipping
         # =========================================================================
@@ -3860,9 +3871,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count += resume_request_count
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
+        resumed_request_ids = None
         if resume_request_count > 0:
             resume_start = self.paused_request_count
             resume_end = self.paused_request_count + resume_request_count
+            resumed_request_ids = self.request_ids[resume_start:resume_end]
 
             # Check which resumed requests actually need a new block
             offsets = self.request_last_kv_block_offset[resume_start:resume_end]
@@ -3884,13 +3897,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_kv_block_counts[row_idx] += 1
                 self.request_last_kv_block_id[row_idx] = block_ids
 
-        # Remove resumed requests from newly_paused_request_ids. We do this by
-        # truncating the end of newly_paused_request_ids, which works because we
-        # resume requests in LIFO order. If resume_request_count >
-        # len(newly_paused_request_ids), this means that none of the paused
-        # requests are newly paused during this update.
+        # Eviction may change which paused suffix resumes, so filter by identity
+        # rather than assuming every resumed request is at the end of this list.
         if newly_paused_request_ids is not None and resume_request_count > 0:
-            newly_paused_request_ids = newly_paused_request_ids[:-resume_request_count]
+            newly_paused_request_ids = newly_paused_request_ids[
+                ~torch.isin(newly_paused_request_ids, resumed_request_ids)
+            ]
 
         return active_request_count, newly_paused_request_ids
 
@@ -4446,11 +4458,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (active_requests_requiring_new_block == 1).sum().item()
             )
 
-            if active_requests_requiring_new_block_count > 0:
-                newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
-                ]
-
             # Swap unfinished active requests on the left side with paused requests on the right side
             # NOTE : We add paused request count because we concatenate
             # paused tokens to the left at the beginning of update requests
@@ -4486,6 +4493,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
+
+            if active_requests_requiring_new_block_count > 0:
+                # Clone required: request_ids is mutated later in update_requests,
+                # while this snapshot is returned to the caller.
+                newly_paused_request_ids = self.request_ids[
+                    self.paused_request_count : self.paused_request_count
+                    + active_requests_requiring_new_block_count
+                ].clone()
 
             self.paused_request_count += active_requests_requiring_new_block_count
             active_request_count -= active_requests_requiring_new_block_count
