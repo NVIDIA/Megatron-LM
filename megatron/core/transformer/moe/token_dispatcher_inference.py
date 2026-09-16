@@ -40,6 +40,9 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_collective,
+)
 from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
@@ -466,13 +469,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata update; invoked from the first instance's token_dispatch.
 
-        Fires the fused NVLS allgather+reduce to publish
-        [valid_tokens, rank_token_offset, ep_max_tokens] into _step_metadata, then
-        (for FlashInfer) pre-masks the routing buffer with -1 so rows beyond
-        valid_tokens are ignored by the GEMM; the AGV below overwrites
-        [0, valid_tokens) in-place.
+        For FlashInfer, first masks the routing buffer with -1 so rows beyond
+        valid_tokens are ignored by the GEMM. The fused NVLS metadata update then
+        provides the cross-rank fence which prevents a late local clear from erasing
+        an early peer AGV write. The AGV overwrites [0, valid_tokens) in-place.
         """
         cls = NVLSAllGatherVDispatcher
+        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+            cls._symm_agv_routing["tensor"].fill_(-1)
         fused_metadata_update(
             local_tokens=local_tokens,
             local_buf=cls._symm_metadata["tensor"],
@@ -480,8 +484,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             step_metadata=cls._step_metadata,
         )
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
-        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
-            cls._symm_agv_routing["tensor"].fill_(-1)
 
     def __init__(
         self,
@@ -641,10 +643,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
+        use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        # Under batch-invariant mode the "multimem" option keeps the native
+        # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
+        # bitwise-equal to an fp64 reference), deterministic and
+        # batch-invariant; "ordered" (default) uses the explicit fixed
+        # rank-order fp32 kernel, deterministic by construction anywhere.
         reduce_scatter_v = (
-            batch_invariant.ordered_reduce_scatter_v
-            if batch_invariant.enabled()
-            else multimem_reduce_scatter_v
+            batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
         )
         reduce_scatter_v(
             output,

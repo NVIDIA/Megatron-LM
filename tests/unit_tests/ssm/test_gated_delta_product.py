@@ -8,8 +8,9 @@ subgraph from the same saved input. So enabling it must not move the numerics at
 Any drift would mean the replay observed a different weight, a different RNG state, or
 a stale storage after the output-discarding checkpoint shared the recomputed one back.
 
-The one exception is `conv1d.weight`, see NONDETERMINISTIC_PARAMS below: its gradient is
-not reproducible run to run, for reasons that have nothing to do with recompute.
+`conv1d.weight` used to be exempt, because the conv backward reduced it with atomicAdd. The
+fixture below turns on the kernel's deterministic reduction instead, so it is held to the same
+bitwise bar as everything else.
 """
 
 import pytest
@@ -99,35 +100,20 @@ def _run(mixer, hidden_states, grads):
     return out.detach().clone(), x.grad.clone(), param_grads
 
 
-# `causal_conv1d_fn` accumulates its weight gradient across blocks with atomicAdd on the
-# channels-last layout the mixer feeds it, so the reduction order -- and with it the
-# last-place rounding -- varies from launch to launch. Two runs of the *same* mixer can
-# therefore disagree on this tensor. It is unrelated to recompute and to FP8: it
-# reproduces with recompute disabled, in plain BF16, and the conv sees the identical
-# layout and dtypes either way. Everything else here must still match bitwise, so scope
-# the tolerance to this one tensor rather than loosening the whole comparison.
-NONDETERMINISTIC_PARAMS = ("conv1d.weight",)
+@pytest.fixture(autouse=True)
+def deterministic_conv1d(monkeypatch):
+    """Hold the conv backward to its deterministic reduction for every test in this module.
 
-
-def _assert_grad_matches(name, recomputed_grad, base_grad):
-    """Compare one gradient: bitwise, unless the kernel that produced it is unstable."""
-    if name in NONDETERMINISTIC_PARAMS:
-        # Reordering shifts an element by a few ulps of its own value, so the budget is
-        # relative: BF16 carries 8 mantissa bits, so 2**-6 is four ulps. atol only has to
-        # cover elements too close to zero for rtol to mean anything, and is derived from
-        # the tensor's magnitude so it cannot go stale if these tests change shape.
-        atol = float(base_grad.abs().max()) * 2**-11
-        torch.testing.assert_close(
-            recomputed_grad, base_grad, rtol=2**-6, atol=atol, msg=f"{name} gradient drifted"
-        )
-    else:
-        torch.testing.assert_close(
-            recomputed_grad, base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
-        )
+    Without it, `causal_conv1d_fn` accumulates its weight gradient across blocks with atomicAdd
+    on the channel-last layout the mixer feeds it, so two runs of the *same* mixer disagree on
+    `conv1d.weight` and a parity test has to tolerate a drifting gradient. Set per-test rather
+    than process-wide because the env var is read on each backward call.
+    """
+    monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
 
 
 def _assert_replay_matches(baseline, recomputed):
-    """Compare a (output, input grad, param grads) triple; exact but for the conv weight."""
+    """Compare a (output, input grad, param grads) triple; every tensor bitwise."""
     base_out, base_input_grad, base_param_grads = baseline
     recomp_out, recomp_input_grad, recomp_param_grads = recomputed
 
@@ -137,7 +123,9 @@ def _assert_replay_matches(baseline, recomputed):
     )
     assert set(recomp_param_grads) == set(base_param_grads)
     for name, base_grad in base_param_grads.items():
-        _assert_grad_matches(name, recomp_param_grads[name], base_grad)
+        torch.testing.assert_close(
+            recomp_param_grads[name], base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
+        )
 
 
 @pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")

@@ -26,6 +26,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_backend,
     is_batch_invariant_mode_enabled,
     rmsnorm_batch_invariant,
 )
@@ -47,7 +48,10 @@ except ImportError:
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     # Use the same RMSNorm kernel as the training recompute.
-    if is_batch_invariant_mode_enabled():
+    if is_batch_invariant_mode_enabled() and get_batch_invariant_backend() != "te_native":
+        # te_native keeps the native TE RMSNorm: the 64-multiple alignment
+        # discipline holds its M%32 reduction bit-class constant, so kernel
+        # substitution is unnecessary (and native is faster).
         return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
     x = x.view(-1, x.size(-1))

@@ -5,19 +5,56 @@
 import asyncio
 import json
 import logging
+import math
 import time
 import uuid
+from collections.abc import Iterable
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 
 logger = logging.getLogger(__name__)
+
+# JSON cannot represent non-finite floats: `orjson.dumps` encodes them as null and the
+# std-json fallback emits `-Infinity` literals that strict parsers reject.
+# Use the standard floor of -9999.0, which other inference backends also use, e.g. vLLM:
+# https://github.com/vllm-project/vllm/blob/85c1365bd971/vllm/entrypoints/openai/completion/serving.py#L703
+# https://github.com/vllm-project/vllm/blob/85c1365bd971/vllm/entrypoints/generate/base/serving.py#L376-L388
+JSON_SAFE_LOGPROB_FLOOR = -9999.0
+
+
+def json_safe_logprob(logprob: float) -> float:
+    """Clamp one logprob to a finite, JSON-representable value."""
+    return logprob if math.isfinite(logprob) else JSON_SAFE_LOGPROB_FLOOR
+
+
+def json_safe_logprobs(logprobs: Iterable[float]) -> list[float]:
+    """Clamp a sequence of logprobs elementwise."""
+    return [json_safe_logprob(logprob) for logprob in logprobs]
+
+
+def json_safe_top_n_logprobs(
+    top_n_logprobs: Iterable[dict[str, float] | None],
+) -> list[dict[str, float] | None]:
+    """Clamp the values of per-position `{token: logprob}` dicts."""
+    return [
+        (
+            {token: json_safe_logprob(logprob) for token, logprob in entry.items()}
+            if isinstance(entry, dict)
+            else entry
+        )
+        for entry in top_n_logprobs
+    ]
 
 
 def _top_logprob_entries(top_logprobs):
     if not isinstance(top_logprobs, dict):
         return []
     return [
-        {"token": str(token), "logprob": logprob, "bytes": list(str(token).encode("utf-8"))}
+        {
+            "token": str(token),
+            "logprob": json_safe_logprob(logprob),
+            "bytes": list(str(token).encode("utf-8")),
+        }
         for token, logprob in top_logprobs.items()
     ]
 
@@ -34,7 +71,7 @@ def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_
         entries.append(
             {
                 "token": token,
-                "logprob": log_probs[i] if i < len(log_probs) else None,
+                "logprob": json_safe_logprob(log_probs[i]) if i < len(log_probs) else None,
                 "bytes": list(token.encode("utf-8")),
                 "top_logprobs": _top_logprob_entries(token_top_logprobs),
             }
@@ -46,10 +83,10 @@ def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_
     return {
         "tokens": [entry["token"] for entry in entries],
         "token_logprobs": [entry["logprob"] for entry in entries],
-        "top_logprobs": [
+        "top_logprobs": json_safe_top_n_logprobs(
             top_log_probs[i] if top_log_probs is not None and i < len(top_log_probs) else None
             for i in range(len(entries))
-        ],
+        ),
         "text_offset": offsets,
     }
 
@@ -57,10 +94,10 @@ def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_
 def _prompt_logprobs(tokenizer, token_ids, log_probs, top_log_probs):
     token_ids = list(token_ids or [])
     tokens = [tokenizer.detokenize([token_id]) for token_id in token_ids]
-    token_logprobs = [None] + list(log_probs or [])
+    token_logprobs = [None] + json_safe_logprobs(log_probs or [])
     token_logprobs = token_logprobs[: len(tokens)]
     token_logprobs.extend([None] * (len(tokens) - len(token_logprobs)))
-    prompt_top_logprobs = [None] + list(top_log_probs or [])
+    prompt_top_logprobs = [None] + json_safe_top_n_logprobs(top_log_probs or [])
     prompt_top_logprobs = prompt_top_logprobs[: len(tokens)]
     prompt_top_logprobs.extend([None] * (len(tokens) - len(prompt_top_logprobs)))
 
@@ -417,7 +454,7 @@ async def openai_stream(
                     parser.finish_reason(result) if parser is not None else _finish_reason(result)
                 ),
                 "generation_token_ids": list(state["tokens"]),
-                "generation_log_probs": list(state["log_probs"]),
+                "generation_log_probs": json_safe_logprobs(state["log_probs"]),
                 "generated_text": state["detokenizer"].text,
                 "generated_length": len(state["tokens"]),
             }

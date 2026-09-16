@@ -3,13 +3,14 @@
 """Tests for MIMO per-rank runtime setup (RNG seeding, DDP wrapping)."""
 
 import argparse
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from examples.mimo.training.runtime import (
-    _ddp_config_from_args,
+    _ddp_config_for_role,
     configure_module_rng,
     wrap_active_modules_with_ddp,
 )
@@ -32,8 +33,27 @@ ENCODER = "images"
 
 
 def _args(**overrides):
+    ddp_defaults = vars(DistributedDataParallelConfig())
     base = dict(
-        seed=1234, image_token_id=100, fp32=True, ddp_num_buckets=None, ddp_bucket_size=None
+        ddp_defaults,
+        seed=1234,
+        image_token_id=100,
+        fp32=True,
+        accumulate_allreduce_grads_in_fp32=ddp_defaults["grad_reduce_in_fp32"],
+        check_for_nan_in_loss_and_grad=ddp_defaults["check_for_nan_in_grad"],
+        check_for_large_grads=ddp_defaults["check_for_large_grads"],
+        ddp_num_buckets=ddp_defaults["num_buckets"],
+        ddp_bucket_size=ddp_defaults["bucket_size"],
+        ddp_pad_buckets_for_high_nccl_busbw=ddp_defaults["pad_buckets_for_high_nccl_busbw"],
+        ddp_reduce_scatter_with_fp32_accumulation=ddp_defaults[
+            "reduce_scatter_with_fp32_accumulation"
+        ],
+        ddp_param_name_patterns_for_fp32_local_accumulation=list(
+            ddp_defaults["param_name_patterns_for_fp32_local_accumulation"]
+        ),
+        ddp_average_in_collective=ddp_defaults["average_in_collective"],
+        use_precision_aware_optimizer=ddp_defaults["megatron_fsdp_use_decoupled_grad"],
+        cuda_graph_impl="none",
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -69,19 +89,40 @@ def _build_unwrapped_mimo_model(topo, bf16=False):
     return mimo_model
 
 
-def test_ddp_overlap_config_is_selected_per_module_role():
-    args = _args(overlap_grad_reduce=True, overlap_param_gather=True)
+@pytest.mark.parametrize(
+    ("overlap_grad_reduce", "overlap_param_gather", "enable_overlap", "expected"),
+    [
+        (True, True, True, (True, True)),
+        (True, False, True, (True, False)),
+        (False, True, True, (False, True)),
+        (True, True, False, (False, False)),
+    ],
+)
+def test_ddp_config_for_role_preserves_fields_and_masks_overlap(
+    overlap_grad_reduce, overlap_param_gather, enable_overlap, expected
+):
+    ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=overlap_grad_reduce,
+        overlap_param_gather=overlap_param_gather,
+        check_for_nan_in_grad=True,
+        average_in_collective=True,
+        use_distributed_optimizer=True,
+        fp8_param_gather=True,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+    )
+    original_values = {field.name: getattr(ddp_config, field.name) for field in fields(ddp_config)}
 
-    enabled = _ddp_config_from_args(args, enable_overlap=True)
-    disabled = _ddp_config_from_args(args, enable_overlap=False)
+    role_config = _ddp_config_for_role(ddp_config, enable_overlap)
 
-    assert enabled.overlap_grad_reduce
-    assert enabled.overlap_param_gather
-    assert not disabled.overlap_grad_reduce
-    assert not disabled.overlap_param_gather
+    assert role_config is not ddp_config
+    assert (role_config.overlap_grad_reduce, role_config.overlap_param_gather) == expected
+    for field in fields(ddp_config):
+        assert getattr(ddp_config, field.name) == original_values[field.name]
+        if field.name not in {"overlap_grad_reduce", "overlap_param_gather"}:
+            assert getattr(role_config, field.name) == original_values[field.name]
 
 
-def test_encoder_overlap_opt_in_reaches_encoder_ddp_config(mocker):
+def test_supplied_ddp_config_wins_over_global_args(mocker):
     encoder = mocker.MagicMock()
     wrapped_encoder = mocker.MagicMock()
     mimo_model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: encoder})
@@ -94,15 +135,20 @@ def test_encoder_overlap_opt_in_reaches_encoder_ddp_config(mocker):
     mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.MagicMock())
     mocker.patch("examples.mimo.training.runtime.print_rank_0")
 
-    wrap_active_modules_with_ddp(
-        _args(encoder_ddp_overlap=True, overlap_grad_reduce=True, overlap_param_gather=True),
-        mimo_model,
-        topology,
+    args = _args(
+        mimo_encoder_ddp_overlap=True, overlap_grad_reduce=False, overlap_param_gather=False
+    )
+    supplied_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True, overlap_param_gather=True, bucket_size=1234
     )
 
-    ddp_config = prepare.call_args.kwargs["ddp_config"]
-    assert ddp_config.overlap_grad_reduce
-    assert ddp_config.overlap_param_gather
+    wrap_active_modules_with_ddp(args, mimo_model, topology, ddp_config=supplied_ddp_config)
+
+    role_ddp_config = prepare.call_args.kwargs["ddp_config"]
+    assert role_ddp_config is not supplied_ddp_config
+    assert role_ddp_config.overlap_grad_reduce
+    assert role_ddp_config.overlap_param_gather
+    assert role_ddp_config.bucket_size == 1234
     assert mimo_model.modality_submodules[ENCODER] is wrapped_encoder
 
 
@@ -142,13 +188,26 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     )
     seed = mocker.patch("examples.mimo.training.builder.configure_module_rng")
 
+    ddp_config = DistributedDataParallelConfig()
     assert builder.build_distributed_models(
-        mocker.Mock(), ddp_config=DistributedDataParallelConfig(), data_parallel_random_init=True
+        mocker.Mock(),
+        ddp_config=ddp_config,
+        data_parallel_random_init=True,
+        use_layer_wise_distributed_optimizer=True,
+        use_layer_wise_param_layout=False,
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
     seed.assert_called_once_with(args, groups, _LANGUAGE_SEED_OFFSET, True)
-    wrap.assert_called_once_with(args, model, topology, True)
+    wrap.assert_called_once_with(
+        args,
+        model,
+        topology,
+        ddp_config=ddp_config,
+        data_parallel_random_init=True,
+        use_layer_wise_distributed_optimizer=True,
+        use_layer_wise_param_layout=False,
+    )
     grad_sync.assert_called_once_with(args, model, topology)
     # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.
     assert model.pg_collection is groups
@@ -181,6 +240,18 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     seed.assert_called_once_with(args, encoder_pg, _ENCODER_SEED_OFFSET, False)
     assert model.pg_collection is encoder_pg
     assert model.rng_state_key_prefix == "encoder."
+
+
+@pytest.mark.parametrize("fsdp_kwarg", ["use_megatron_fsdp", "use_torch_fsdp2"])
+def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+
+    with pytest.raises(NotImplementedError, match="has not been tested yet"):
+        builder.build_distributed_models(
+            mocker.Mock(), ddp_config=DistributedDataParallelConfig(), **{fsdp_kwarg: True}
+        )
 
 
 def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):
@@ -238,7 +309,7 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
     mocker.patch.object(builder, "build_model", return_value=original_model)
     mocker.patch(
         "examples.mimo.training.builder.wrap_active_modules_with_ddp",
-        side_effect=lambda *_: events.append("wrap"),
+        side_effect=lambda *_, **__: events.append("wrap"),
     )
     mocker.patch(
         "examples.mimo.training.builder.configure_grad_sync",
@@ -321,7 +392,9 @@ class TestRuntimeDistributed:
         try:
             # bf16 = production precision; a bare fp32 modality container has no config for get_model_config.
             mimo_model = _build_unwrapped_mimo_model(topo, bf16=True)
-            wrap_active_modules_with_ddp(_args(fp32=False), mimo_model, topo)
+            wrap_active_modules_with_ddp(
+                _args(fp32=False), mimo_model, topo, ddp_config=DistributedDataParallelConfig()
+            )
             # Non-colocated: each rank owns exactly one active module (language XOR encoder).
             if torch.distributed.get_rank() < 4:
                 active = mimo_model.modality_submodules[ENCODER]
@@ -338,7 +411,12 @@ class TestRuntimeDistributed:
         try:
             # bf16 -> Float16Module wrap; --freeze-vit freezes the encoder backbone only.
             mimo_model = _build_unwrapped_mimo_model(topo, bf16=True)
-            wrap_active_modules_with_ddp(_args(fp32=False, freeze_vit=True), mimo_model, topo)
+            wrap_active_modules_with_ddp(
+                _args(fp32=False, freeze_vit=True),
+                mimo_model,
+                topo,
+                ddp_config=DistributedDataParallelConfig(),
+            )
 
             if torch.distributed.get_rank() < 4:
                 active = mimo_model.modality_submodules[ENCODER]

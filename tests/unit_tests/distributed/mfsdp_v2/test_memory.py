@@ -6,16 +6,18 @@ import logging
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
@@ -50,7 +52,19 @@ class ElementwiseModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def _zero1_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
+    )
+
+
+def _zero2_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
 
 
 def _mb(num_bytes: int) -> str:
@@ -83,11 +97,16 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     if main_params_dtype == dtype:
         # Model and main weights alias, leaving only one BF16 weight buffer and one
         # BF16 main-gradient buffer per child.
-        assert all(
-            group.model_weight is group.main_weight
-            for layer in model.layers
-            for group in layer.parameter_groups
-        )
+        for layer_index, layer in enumerate(model.layers):
+            for group_index, group in enumerate(layer.parameter_groups):
+                assert group.model_weight is group.main_weight, (
+                    f"Layer {layer_index}, parameter group {group_index} should alias "
+                    "model and main weights."
+                )
+                assert group.post_optimizer_model_weight is group.model_weight, (
+                    f"ZeRO-3 layer {layer_index}, parameter group {group_index} should use "
+                    "model_weight itself as its post-optimizer model weight."
+                )
         expected_per_child_nbytes = 2 * child_weight_nbytes
     else:
         # FP32 main weights require a distinct buffer in addition to the BF16 model
@@ -107,8 +126,13 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     )
 
 
-def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
-    """A training step should stay below five full-size child buffers."""
+@pytest.mark.parametrize(
+    "unify_communication_stream", [False, True], ids=["separate_streams", "unified_stream"]
+)
+def test_training_step_peak_memory_bounds_full_size_buffers(
+    distributed_setup, unify_communication_stream
+):
+    """A training step should stay within its full-size-buffer bound."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -121,7 +145,7 @@ def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, unify_communication_stream=unify_communication_stream):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -135,23 +159,87 @@ def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
         model(x).float().sum().backward()
         optimizer.step()
 
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    # Warm up so cuBLAS's workspaces land in resting_allocated rather than in peak_delta,
+    # which would otherwise depend on whether an earlier test already allocated them.
+    train_step()
+
     resting_allocated = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
     train_step()
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
 
     # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input,
-    # for a four-full-child-buffer peak. Allow one additional buffer for cuBLAS
-    # workspace, allocator granularity, and small temporaries.
-    bound_nbytes = (4 + 1) * child_weight_nbytes
+    # child also has a full wgrad until it is copied into a full reduce-scatter input.
+    # With separate streams, their allocation cannot reuse the released full-weight
+    # storage, for a four-buffer peak. With a unified stream, the release precedes the
+    # allocation on that stream, reducing the peak to three. The slack on top covers
+    # allocator granularity and small temporaries, measured at ~169 KiB.
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    full_buffer_bound = 3 if unify_communication_stream else 4
+    bound_nbytes = full_buffer_bound * child_weight_nbytes + 1024**2
 
     assert peak_delta < bound_nbytes, (
         "FSDP training-step peak memory exceeded the full-size-buffer bound: "
         f"rank={rank}, peak_delta={_mb(peak_delta)}, "
-        f"five_full_child_buffers={_mb(bound_nbytes)}"
+        f"bound={_mb(bound_nbytes)} ({full_buffer_bound} full child buffers + 1.00 MB)"
     )
+
+
+def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_setup):
+    """ZeRO-1 keeps optimizer state sharded while model weights are replicated."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    dim = 4096
+    num_tokens = 256
+    dtype = torch.bfloat16
+    x = torch.ones(num_tokens, dim, device=device, dtype=dtype)
+    allocated_before_setup = torch.cuda.memory_allocated(device)
+    model = ElementwiseModel(dim).to(device=device, dtype=dtype)
+    mesh = init_device_mesh(device.type, (world_size,))
+    placements = _zero1_placements()
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=placements)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
+    fully_shard_optimizer(optimizer)
+    (parameter_group,) = model.parameter_groups
+
+    full_bf16_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    sharded_bf16_weight_nbytes = full_bf16_weight_nbytes // world_size
+    sharded_fp32_weight_nbytes = (
+        dim * dim // world_size * torch.empty((), dtype=torch.float32).element_size()
+    )
+    torch._C._cuda_clearCublasWorkspaces()
+    torch.cuda.reset_peak_memory_stats(device)
+
+    def train_step() -> None:
+        loss = model(x).sum()
+        loss.backward()
+        optimizer.step()
+
+    train_step()
+    peak_nbytes = torch.cuda.max_memory_allocated(device) - allocated_before_setup
+    resting_nbytes = torch.cuda.memory_allocated(device) - allocated_before_setup
+    assert parameter_group.model_weight.placements == (Replicate(),)
+    assert parameter_group.post_optimizer_model_weight.placements == (Flat(),)
+
+    optimizer_state_nbytes = sum(
+        state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
+        for state in optimizer.state.values()
+    )
+    # Resting memory holds one replicated BF16 model weight, one sharded BF16
+    # main gradient, and three sharded FP32 buffers: main weight and two Adam states.
+    expected_resting_nbytes = (
+        full_bf16_weight_nbytes + sharded_bf16_weight_nbytes + 3 * sharded_fp32_weight_nbytes
+    )
+    # Peak memory additionally holds the casted gradient and the sqrt and division
+    # intermediates in ``denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)``.
+    expected_peak_nbytes = expected_resting_nbytes + 3 * sharded_fp32_weight_nbytes
+    assert optimizer_state_nbytes == 2 * sharded_fp32_weight_nbytes
+    assert resting_nbytes < expected_resting_nbytes + 1024**2
+    assert peak_nbytes < expected_peak_nbytes + 1024**2
 
 
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
@@ -223,8 +311,16 @@ def test_fully_shard_returns_to_resting_memory(distributed_setup):
     assert_returns_to_resting_memory("backward")
 
 
-def test_fully_shard_reduces_peak_training_memory(distributed_setup):
-    """Per-layer FSDP should reduce peak CUDA memory during training."""
+@pytest.mark.parametrize(
+    "placements_factory",
+    [
+        pytest.param(_zero1_placements, id="zero1"),
+        pytest.param(_zero2_placements, id="zero2"),
+        pytest.param(_flat_placements, id="zero3"),
+    ],
+)
+def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_factory):
+    """Per-layer FSDP should reduce peak CUDA memory for each sharding strategy."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -262,7 +358,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
             fully_shard(
                 layer,
                 mesh=mesh,
-                placements=_flat_placements(),
+                placements=placements_factory(),
                 mixed_precision_policy=MixedPrecisionPolicy(
                     main_params_dtype=dtype, main_grads_dtype=dtype
                 ),
@@ -280,4 +376,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
         _mb(sharded_peak),
     )
 
-    assert sharded_peak < baseline_peak
+    assert sharded_peak < baseline_peak, (
+        f"Expected FSDP to reduce peak training memory on rank {rank}: "
+        f"baseline={_mb(baseline_peak)}, sharded={_mb(sharded_peak)}"
+    )

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -124,10 +124,23 @@ class MimoOptimizer(MegatronOptimizer):
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
+    @property
+    def chained_optimizers(self) -> List[MegatronOptimizer]:
+        """Expose leaf optimizers to stock training, checkpoint, and rerun lifecycle hooks."""
+        optimizers = []
+        for opt in self._active_optimizers:
+            optimizers.extend(getattr(opt, 'chained_optimizers', [opt]))
+        return optimizers
+
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage parameters for explicit synchronization in all active module optimizers."""
         for opt in self._active_optimizers:
             opt.prepare_model_params_for_param_sync()
+
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive model params from main params in all active module optimizers."""
+        for opt in self._active_optimizers:
+            opt.quantize_and_sync_model_params_from_main_params()
 
     def get_loss_scale(self) -> torch.Tensor:
         """Return the loss scale tensor from the first active optimizer."""
@@ -216,19 +229,31 @@ class MimoOptimizer(MegatronOptimizer):
 
 
 def _iter_optimizer_sub_dicts(module_sd, optimizer):
-    """Yield (sub_state_dict, inner_optimizer) pairs.
+    """Yield (sub_state_dict, inner_optimizer) pairs, one per leaf optimizer.
 
-    For a single optimizer, yields (module_sd, optimizer) once.
-    For ChainedOptimizer with N>1 inner optimizers, yields
-    (module_sd[i], chained_optimizers[i]) for each.
+    ChainedOptimizer nests: its state dict is keyed by integer index when the chain
+    holds more than one optimizer, and delegates straight to the single child when it
+    holds exactly one. A child can itself be a ChainedOptimizer, so this recurses.
+
+    Descending only one level hands the caller an integer-keyed dict where a leaf
+    state dict is expected. That is silent on save -- _extract_param_groups looks for
+    an 'optimizer' key, finds none, and writes no param_groups -- and raises
+    AttributeError on load when the restore helpers call str.startswith on an int key.
     """
     from megatron.core.optimizer.optimizer import ChainedOptimizer
 
-    if isinstance(optimizer, ChainedOptimizer) and len(optimizer.chained_optimizers) > 1:
-        for idx, inner_opt in enumerate(optimizer.chained_optimizers):
-            yield module_sd[idx], inner_opt
-    else:
-        yield module_sd, optimizer
+    if isinstance(optimizer, ChainedOptimizer):
+        inner_optimizers = optimizer.chained_optimizers
+        if len(inner_optimizers) > 1:
+            for idx, inner_opt in enumerate(inner_optimizers):
+                yield from _iter_optimizer_sub_dicts(module_sd[idx], inner_opt)
+            return
+        if len(inner_optimizers) == 1:
+            # Both state_dict() and sharded_state_dict() return the single child's
+            # state dict directly, so module_sd already belongs to that child.
+            yield from _iter_optimizer_sub_dicts(module_sd, inner_optimizers[0])
+            return
+    yield module_sd, optimizer
 
 
 def _extract_param_groups(sub_sd, module_name, suffix, replica_id):
@@ -279,7 +304,7 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
     # Find the _mimo_param_groups key (may have a suffix for chained optimizers)
     pg_key = None
     for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_param_groups'):
+        if isinstance(k, str) and k.startswith('_mimo_param_groups'):
             pg_key = k
             break
     if pg_key is None:
@@ -307,7 +332,7 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
 def _restore_param_state_sharding_type(sub_sd):
     """Load: restore param_state_sharding_type from ShardedObject key."""
     for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_param_state_sharding_type'):
+        if isinstance(k, str) and k.startswith('_mimo_param_state_sharding_type'):
             sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
             break
 
@@ -315,7 +340,7 @@ def _restore_param_state_sharding_type(sub_sd):
 def _restore_grad_scaler(sub_sd):
     """Load: restore grad_scaler from ShardedObject key."""
     for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_grad_scaler'):
+        if isinstance(k, str) and k.startswith('_mimo_grad_scaler'):
             sub_sd['grad_scaler'] = sub_sd.pop(k)
             break
 
@@ -323,7 +348,7 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    Returns (tp_gtp_rank, pp_rank, dp_cp_rank) so only (0, 0, 0) within each
     module's parallelism group is the main replica; all other ranks
     in the same module are non-main replicas of the same object.
     """
@@ -335,9 +360,30 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
-        hasattr(pg_collection, 'dp') and pg_collection.dp is not None
-    ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
+        hasattr(pg_collection, 'dp_cp') and pg_collection.dp_cp is not None
+    ), "pg_collection.dp_cp must be set for checkpoint deduplication"
+    gtp_group = getattr(pg_collection, 'gtp_remat', None)
+    gtp_rank = gtp_group.rank() if gtp_group is not None else 0
+    gtp_size = gtp_group.size() if gtp_group is not None else 1
+    tp_gtp_rank = pg_collection.tp.rank() * gtp_size + gtp_rank
+    return (tp_gtp_rank, pg_collection.pp.rank(), pg_collection.dp_cp.rank())
+
+
+def _optimizer_config_for_module(
+    config: OptimizerConfig, module: torch.nn.Module
+) -> OptimizerConfig:
+    """Derive an optimizer config whose param-gather overlap matches the module's DDP config."""
+    ddp_config = getattr(module, 'ddp_config', None)
+    if ddp_config is None:
+        raise ValueError("Active MIMO modules must be DDP-wrapped before optimizer construction.")
+    overlap_param_gather = ddp_config.overlap_param_gather
+    return replace(
+        config,
+        overlap_param_gather=overlap_param_gather,
+        overlap_param_gather_with_optimizer_step=(
+            config.overlap_param_gather_with_optimizer_step and overlap_param_gather
+        ),
+    )
 
 
 def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
@@ -368,21 +414,19 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 assert (
                     pg_collection is not None
                 ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
-                assert (
-                    not hasattr(module, 'ddp_config')
-                    or module.ddp_config is None
-                    or module.ddp_config.num_distributed_optimizer_instances == 1
-                ), (
+                module_config = _optimizer_config_for_module(config, module)
+                assert module.ddp_config.num_distributed_optimizer_instances == 1, (
                     "MIMO optimizer does not yet support "
                     "num_distributed_optimizer_instances > 1. "
                     f"Module '{module_name}' has "
                     f"{module.ddp_config.num_distributed_optimizer_instances} instances."
                 )
                 optimizer = get_megatron_optimizer(
-                    config=config,
+                    config=module_config,
                     model_chunks=[module],
                     pg_collection=pg_collection,
                     use_gloo_process_groups=False,
+                    param_group_process_group=pg_collection.intra_dist_opt,
                 )
 
         module_infos[module_name] = ModuleOptimizerInfo(

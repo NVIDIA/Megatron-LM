@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
+import sys
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -12,6 +13,8 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.argument_utils import gpt_config_from_args
+from megatron.training.arguments import parse_args, validate_args
 from megatron.training.models.gpt import (
     GPTModelBuilder,
     GPTModelConfig,
@@ -662,11 +665,11 @@ class TestGPTModelBuilderBuildModel:
         mock_mtp = patches[-1]
         mtp_spec = ModuleSpec(module=object)
         mock_mtp.return_value = mtp_spec
+        self.pg.pp.rank.return_value = 1
 
         self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=1)
 
-        # mtp_block_spec is called with (config, transformer_layer_spec, vp_stage=vp_stage)
-        mock_mtp.assert_called_once_with(self.config, self._default_spec, vp_stage=1)
+        mock_mtp.assert_called_once_with(self.config, self._default_spec, vp_stage=1, pp_rank=1)
         assert mock_model.call_args.kwargs["mtp_block_spec"] is mtp_spec
 
     @patch("megatron.training.models.gpt.mtp_block_spec", return_value=None)
@@ -884,11 +887,12 @@ class TestMtpBlockSpec:
             "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
         ) as mock_decoder_specs:
             mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec, vp_stage=3)
+            mtp_block_spec(config, spec, vp_stage=3, pp_rank=7)
 
         call_kwargs = mock_get_mtp.call_args.kwargs
         assert call_kwargs["use_transformer_engine"] is True
         assert call_kwargs["vp_stage"] == 3
+        assert call_kwargs["pp_rank"] == 7
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_use_transformer_engine_false_when_impl_not_te(self, mock_get_mtp):
@@ -903,3 +907,38 @@ class TestMtpBlockSpec:
             mtp_block_spec(config, spec)
 
         assert mock_get_mtp.call_args.kwargs["use_transformer_engine"] is False
+
+
+# =============================================================================
+# Section 5 — gpt_config_from_args
+# =============================================================================
+
+
+class TestGPTConfigFromArgs:
+    """Tests for argument propagation through ``gpt_config_from_args``."""
+
+    def _make_args(self, **overrides):
+        sys.argv = ['test_gpt_builder.py']
+        args = parse_args()
+        args.num_layers = 2
+        args.hidden_size = 128
+        args.num_attention_heads = 8
+        args.micro_batch_size = 1
+        args.seq_length = 128
+        args.max_position_embeddings = 131072
+        args.padded_vocab_size = 32000
+        args.position_embedding_type = 'rope'
+        args.apply_rope_fusion = False
+        for name, value in overrides.items():
+            setattr(args, name, value)
+        validate_args(args)
+        return args
+
+    def test_forwards_rope_scaling_factor_from_args(self):
+        """--rope-scaling-factor must reach the model config instead of the default."""
+        args = self._make_args(use_rope_scaling=True, rope_scaling_factor=32.0)
+
+        config = gpt_config_from_args(args)
+
+        assert config.rope_scaling is True
+        assert config.rope_scaling_factor == 32.0

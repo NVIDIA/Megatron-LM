@@ -62,6 +62,7 @@ class MegatronMultimodalTokenizer:
         special_tokens: List[str],
         image_tag_type: str,
         force_system_message: bool = False,
+        use_gigatoken: bool = False,
         **kwargs,
     ):
         """Tokenizer with a support for non-text inputs.
@@ -88,9 +89,13 @@ class MegatronMultimodalTokenizer:
         self._vocab_size = len(tokenizer)
 
         num_added_tokens = tokenizer.add_tokens(special_tokens, special_tokens=True)
-        assert num_added_tokens == len(
-            special_tokens
-        ), f"failed to add {len(special_tokens)} special tokens; only added {num_added_tokens}"
+        # When loading a pre-trained tokenizer for inference, the special tokens
+        # may already be in the vocabulary (num_added_tokens == 0 is OK).
+        if num_added_tokens not in (0, len(special_tokens)):
+            raise ValueError(
+                f"Expected to add 0 or {len(special_tokens)} special tokens, "
+                f"but added {num_added_tokens}"
+            )
 
         self.tokenizer = tokenizer
 
@@ -181,11 +186,27 @@ class MegatronMultimodalTokenizer:
                 has_bos=True,
                 has_system_role=True,
             )
+        elif prompt_format == "nemotron6-moe":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=None,  # Not used for pre-training.
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=None,
+                has_bos=False,
+                has_system_role=True,
+            )
         else:
             raise NotImplementedError("unknown multimodal tokenizer type", prompt_format)
 
         self._prompt_format = prompt_format
         self._image_tag = IMAGE_TAGS[image_tag_type]
+
+        self.use_gigatoken = use_gigatoken
+        self._hf_tokenizer = self.tokenizer
+        if self.use_gigatoken:
+            # restore tokenizer with gigatoken
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            self.tokenizer = init_gigatoken_from_hf(self.tokenizer, path)
 
     def _apply_image_tag(self, text: Union[str, List[Dict]]):
         """Surround <image> with image tags such as <img> and </img>."""
@@ -195,30 +216,35 @@ class MegatronMultimodalTokenizer:
         replacement = f"{self._image_tag[0]}{IMAGE_TOKEN}{self._image_tag[1]}"
 
         if isinstance(text, list):
-            for turn in text:
-                turn["content"] = turn["content"].replace(IMAGE_TOKEN, replacement)
+            # Build new dicts instead of mutating the caller's conversation in place. Since
+            # `replacement` itself contains IMAGE_TOKEN, mutating and re-tagging an
+            # already-tagged turn on a later call would wrap it again.
+            text = [
+                {**turn, "content": turn["content"].replace(IMAGE_TOKEN, replacement)}
+                for turn in text
+            ]
         else:
             text = text.replace(IMAGE_TOKEN, replacement)
 
         return text
 
-    def tokenize(self, text: Union[str, List[Dict]]):
+    def tokenize(self, text: Union[str, List[Dict]], add_special_tokens: bool = True):
         """Tokenize conversation or string input."""
         if isinstance(text, list):
             # This code path is used by the inference code currently.
             return self.tokenize_conversation(text, False, True).tolist()
 
-        return self._encode(text)
+        return self._encode(text, add_special_tokens=add_special_tokens)
 
-    def _encode(self, text: str):
+    def _encode(self, text: str, add_special_tokens: bool = True):
         """Tokenize text input."""
         text = self._apply_image_tag(text)
-        return self.tokenizer.encode(text)
+        return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def tokenize_conversation(
         self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
     ):
-        """Convert a conversation to tokens.
+        """Convert a conversation to tokens, or to a rendered string.
 
         Args:
             conversation (List[Dict]): Sequence of system/user/assistant messages.
@@ -251,15 +277,21 @@ class MegatronMultimodalTokenizer:
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
-        tokens = self.tokenizer.apply_chat_template(
+        tokenize = not self.use_gigatoken
+        tokens = self._hf_tokenizer.apply_chat_template(
             conversation,
-            tokenize=True,
+            tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
             return_assistant_token_mask=False,
-            return_tensors="np",
+            return_tensors="np" if tokenize else None,
             return_dict=False,
             chat_template=self._prompt_config.custom_chat_template,
-        )[0]
+        )
+
+        if not self.use_gigatoken:
+            tokens = tokens[0]
+        else:
+            tokens = np.array(self.tokenizer.encode(tokens, add_special_tokens=False))
 
         if not return_target:
             return tokens
@@ -272,7 +304,7 @@ class MegatronMultimodalTokenizer:
             if len(turn["content"]) == 0:
                 raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
-            turn_tokens = self.tokenizer.apply_chat_template(
+            turn_tokens = self._hf_tokenizer.apply_chat_template(
                 [turn],
                 tokenize=True,
                 return_dict=False,
@@ -312,6 +344,10 @@ class MegatronMultimodalTokenizer:
 
     def detokenize(self, tokens: List[int]):
         """Detokenize tokens."""
+        # Filter out invalid token IDs (e.g. -1 pad values from image token expansion).
+        # Use self._vocab_size (== len(tokenizer)) rather than tokenizer.vocab_size
+        # so multimodal special tokens added via add_tokens() survive detokenization.
+        tokens = [t for t in tokens if 0 <= t < self._vocab_size]
         return self.tokenizer.decode(tokens)
 
     def add_special_tokens(self, special_tokens: List[str]):
@@ -326,6 +362,11 @@ class MegatronMultimodalTokenizer:
     def pad(self):
         """Pad token ID."""
         return self._prompt_config.pad_token_id
+
+    @property
+    def bos(self):
+        """Beginning of sentence token ID."""
+        return self.tokenizer.bos_token_id
 
     @property
     def eod(self):

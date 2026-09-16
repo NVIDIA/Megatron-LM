@@ -15,7 +15,7 @@ metadata:
 
 For PR-label or trigger questions, lead with the exact values:
 
-- No label: `scope=mr-github-slim`, `n_repeat=5`, `lightweight=false`.
+- No label: `scope=mr-github-slim`, `n_repeat=2`, `lightweight=false`.
 - `Run tests`: `scope=mr-github`, `n_repeat=1`, `lightweight=true`.
 - `Run functional tests`: `scope=mr-github`, `n_repeat=5`, `lightweight=false`.
 - `container::lts` only switches the container image path to LTS and combines
@@ -71,7 +71,7 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | Merge group | `mr-github` | 1 | false | Automatic, no label needed |
 | Label: **`Run tests`** | `mr-github` | 1 | **true** | Trains 4 steps, no golden-value compare |
 | Label: **`Run functional tests`** | `mr-github` | 5 | **false** | Trains 100 steps, golden-value compare |
-| _(no label)_ | `mr-github-slim` | 5 | false | Slim subset only |
+| _(no label)_ | `mr-github-slim` | 2 | false | Slim subset only |
 
 **Orthogonal image label:**
 
