@@ -57,8 +57,8 @@ Training graph setup also captures separate forward-only graphs for `model.eval(
 `torch.no_grad()`, excluding training-only operations such as dropout and MoE router token-count
 accumulation. Validation reuses the training graph pool's inactive activation storage and leaves
 training replay order intact. Run validation between completed training steps, after all training
-backwards have finished. Evaluation before graph setup, with unmatched input shapes or arguments,
-or with autograd enabled runs eagerly.
+backwards have finished. Validation requires completed graph setup and a compatible input
+signature recorded during training. Incompatible inputs or enabled autograd raise an error.
 
 ### Usage
 
