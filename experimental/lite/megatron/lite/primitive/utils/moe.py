@@ -35,10 +35,7 @@ def _te_general_gemm(
     grad: bool = False,
     accumulate: bool = False,
 ):
-    if (get_workspace := getattr(te_module_base, "get_workspace", None)) is None:
-        return None
     kwargs = dict(
-        workspace=get_workspace(),
         out_dtype=out_dtype,
         quantization_params=None,
         gelu=None,
@@ -54,6 +51,8 @@ def _te_general_gemm(
         extra_output=None,
         bulk_overlap=False,
     )
+    if (get_workspace := getattr(te_module_base, "get_workspace", None)) is not None:
+        kwargs["workspace"] = get_workspace()
     return general_gemm(a, b, **kwargs)
 
 

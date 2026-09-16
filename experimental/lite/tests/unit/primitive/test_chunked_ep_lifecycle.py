@@ -407,13 +407,15 @@ def test_mtp_composition_is_explicit(mtp):
         validate_chunked_ep_mtp(enable_ep_chunk_overlap=True, mtp_enable=False)
 
 
-def test_production_router_wgrad_does_not_round_each_chunk(ep, monkeypatch):
+@pytest.mark.parametrize("workspace", [None, object()])
+def test_production_router_wgrad_does_not_round_each_chunk(ep, monkeypatch, workspace):
     from megatron.lite.primitive.utils import moe
 
-    # Real backward with a CPU GEMM reference, including its output dtype.
     calls = []
 
     def gemm(a, b, out_dtype, *, layout, out=None, accumulate=False, **kwargs):
+        assert kwargs.get("workspace") is workspace
+        assert ("workspace" in kwargs) == (workspace is not None)
         value = {
             "TN": lambda: b.float() @ a.float().T,
             "NN": lambda: b.float() @ a.float(),
@@ -426,7 +428,9 @@ def test_production_router_wgrad_does_not_round_each_chunk(ep, monkeypatch):
             value = out
         return (value,)
 
-    monkeypatch.setattr(moe, "_te_general_gemm", gemm)
+    monkeypatch.setattr(moe, "general_gemm", gemm)
+    te_base = SimpleNamespace(**({} if workspace is None else {"get_workspace": lambda: workspace}))
+    monkeypatch.setattr(moe, "te_module_base", te_base)
     torch.manual_seed(31)
     weight = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
     x = torch.randn(12, 8, dtype=torch.bfloat16)
@@ -444,7 +448,6 @@ def test_production_router_wgrad_does_not_round_each_chunk(ep, monkeypatch):
     assert len(calls) == 2 and all(c[0] == torch.float32 and c[1] for c in calls)
     assert calls[0][2] == calls[1][2]
     assert weight.grad is None
-    # Without a bound workspace the ordinary router still returns its gradient.
     native = moe.router_gating_linear(x, weight, None, torch.bfloat16)
     assert torch.equal(torch.autograd.grad(native, weight, grad)[0], expected)
     assert len(calls) == 2
