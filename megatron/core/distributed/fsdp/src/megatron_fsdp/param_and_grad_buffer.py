@@ -3373,6 +3373,7 @@ class ParamAndGradBuffer:
                         for attr_name in [
                             "requires_grad",
                             "sequence_parallel",
+                            "average_gradients_across_tp_domain",
                             "shared",
                             "tensor_model_parallel",
                             "partition_dim",
@@ -4967,7 +4968,8 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
         # No scaling - use SUM reduction.
         reduce_op = torch.distributed.ReduceOp.SUM
     elif ddp_config.average_in_collective:
-        # Scaling overridden by AVG reduction.
+        if scaling_factor != 1.0:
+            grad_data.mul_(scaling_factor)
         reduce_op = torch.distributed.ReduceOp.AVG
     elif ddp_config.gradient_reduce_div_fusion and grad_data.dtype != torch.bfloat16:
         # Fused SUM reduction.
