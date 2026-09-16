@@ -42,6 +42,7 @@ set -x
 MANDATORY_VARS=(
     "TRAINING_SCRIPT_PATH"
     "TRAINING_PARAMS_PATH"
+    "GOLDEN_VALUES_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
     "CHECKPOINT_SAVE_PATH"
@@ -76,15 +77,6 @@ N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
 MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.MODE // "pretraining"')
 
-# Checkpoint-resume tests can validate functionality against their own first run.
-# Other test types still require an external baseline.
-if [[ -z "$GOLDEN_VALUES_PATH" && ("$MODE" != "pretraining" || "$TEST_TYPE" != "ckpt-resume") ]]; then
-    echo 'Providing $GOLDEN_VALUES_PATH is mandatory except for pretraining ckpt-resume tests.'
-    exit 1
-fi
-ACTUAL_VALUES_FILENAME=$(basename "${GOLDEN_VALUES_PATH:-actual_values.json}")
-RESUMED_VALUES_FILENAME="${ACTUAL_VALUES_FILENAME%.json}_2nd.json"
-
 MODES=("pretraining" "inference")
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "checkpoint-consistency" "release")
 TEST_EVALUATION_TYPES=("pass" "xpass")
@@ -104,8 +96,7 @@ _TENSORBOARD_PATH=$TENSORBOARD_PATH
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
 
-# Match the NeMo CLI, not Python scripts in directories such as nemotron/.
-IS_NEMO_TEST=$([[ "${TRAINING_SCRIPT_PATH%% *}" == "nemo" ]] && echo "true" || echo "false")
+IS_NEMO_TEST=$([[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]] && echo "true" || echo "false")
 export IS_NEMO_TEST
 
 # Adjust model_config for lightweight mode
@@ -415,7 +406,7 @@ for i in $(seq 1 $N_REPEAT); do
             uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                 --logs-dir $FIRST_RUN_TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
-                --output-path "${OUTPUT_PATH}/${ACTUAL_VALUES_FILENAME}" \
+                --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                 "${EXTRACT_ARGS[@]}"
         fi
     fi
@@ -448,7 +439,7 @@ for i in $(seq 1 $N_REPEAT); do
     fi
 
     if [[ "$NODE_RANK" -eq 0 ]]; then
-        echo "Running pytest checks"
+        echo "Running pytest checks against golden values"
 
         # For pretraining jobs
         if [[ "$MODE" == "pretraining" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
@@ -456,26 +447,24 @@ for i in $(seq 1 $N_REPEAT); do
                 echo "Running checkpoint consistency check"
                 uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/test_optimizer_grads_match.py "${ITER_CHECKPOINT_DIRS[@]}"
             else
-                if [[ -n "$GOLDEN_VALUES_PATH" ]]; then
-                    uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
-                        --golden-values-path "$GOLDEN_VALUES_PATH" \
-                        --actual-values-path "${OUTPUT_PATH}/${ACTUAL_VALUES_FILENAME}" \
-                        --train-iters $TRAIN_ITERS \
-                        --model-config-path ${TRAINING_PARAMS_PATH} \
-                        $ALLOW_NONDETERMINISTIC_ALGO_ARG
-                fi
+                uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
+                    --golden-values-path $GOLDEN_VALUES_PATH \
+                    --actual-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                    --train-iters $TRAIN_ITERS \
+                    --model-config-path ${TRAINING_PARAMS_PATH} \
+                    $ALLOW_NONDETERMINISTIC_ALGO_ARG
 
                 if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
                     uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                         --logs-dir "$_REPEAT_TENSORBOARD_PATH/run_2" \
                         --train-iters $TRAIN_ITERS \
-                        --output-path "${OUTPUT_PATH}/${RESUMED_VALUES_FILENAME}" \
+                        --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
                         "${EXTRACT_ARGS[@]}"
-
+                            
                     echo "Running pytest 1st vs 2nd run comparison"
                     uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
-                        --actual-values-first-run-path "${OUTPUT_PATH}/${ACTUAL_VALUES_FILENAME}" \
-                        --actual-values-second-run-path "${OUTPUT_PATH}/${RESUMED_VALUES_FILENAME}" \
+                        --actual-values-first-run-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+                        --actual-values-second-run-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
                         --train-iters $TRAIN_ITERS \
                         --model-config-path ${TRAINING_PARAMS_PATH} \
                         $ALLOW_NONDETERMINISTIC_ALGO_ARG
