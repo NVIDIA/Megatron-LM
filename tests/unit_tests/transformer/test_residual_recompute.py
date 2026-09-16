@@ -12,6 +12,9 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_inference_stack_spec,
+    gated_delta_product_stack_spec,
+    hybrid_inference_stack_spec,
     hybrid_stack_spec,
     wide_residual_gated_delta_product_inference_stack_spec,
     wide_residual_gated_delta_product_stack_spec,
@@ -479,20 +482,28 @@ class TestResidualStreamRecomputeConfig:
 
 class TestWideResidualHybridConstruction:
     @pytest.mark.parametrize(
-        "wide_stack_spec",
+        ("ordinary_stack_spec", "wide_stack_spec"),
         [
-            wide_residual_hybrid_stack_spec,
-            wide_residual_gated_delta_product_stack_spec,
-            wide_residual_hybrid_inference_stack_spec,
-            wide_residual_gated_delta_product_inference_stack_spec,
+            (hybrid_stack_spec, wide_residual_hybrid_stack_spec),
+            (gated_delta_product_stack_spec, wide_residual_gated_delta_product_stack_spec),
+            (hybrid_inference_stack_spec, wide_residual_hybrid_inference_stack_spec),
+            (
+                gated_delta_product_inference_stack_spec,
+                wide_residual_gated_delta_product_inference_stack_spec,
+            ),
         ],
     )
-    def test_static_specs_name_explicit_wide_layer_classes(self, wide_stack_spec):
-        ordinary = hybrid_stack_spec.submodules
+    def test_static_specs_name_explicit_wide_layer_classes(
+        self, ordinary_stack_spec, wide_stack_spec
+    ):
+        ordinary = ordinary_stack_spec.submodules
         wide = wide_stack_spec.submodules
 
         assert ordinary.mamba_layer.module is MambaLayer
+        assert wide.mamba_layer is not ordinary.mamba_layer
         assert wide.mamba_layer.module is WideResidualMambaLayer
+        assert wide.mamba_layer.params is ordinary.mamba_layer.params
+        assert wide.mamba_layer.submodules is ordinary.mamba_layer.submodules
         for name in (
             "gdn_layer",
             "attention_layer",

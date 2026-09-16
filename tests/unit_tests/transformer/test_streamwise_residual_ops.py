@@ -277,7 +277,7 @@ def test_raw_logit_api_validates_padded_controllers():
         streamwise_sigmoid_writeback(
             residual, torch.empty(2, 4, device="meta"), torch.randn(128), 3
         )
-    with pytest.raises(ValueError, match="same dtype"):
+    with pytest.raises(ValueError, match="must either match residual_stream dtype"):
         streamwise_sigmoid_writeback(residual, update.double(), torch.randn(128), 3)
     with pytest.raises(ValueError, match="retention_logits and residual_stream"):
         streamwise_sigmoid_writeback(

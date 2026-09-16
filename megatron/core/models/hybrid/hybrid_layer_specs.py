@@ -1,5 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
-import copy
+from dataclasses import replace
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -488,16 +488,10 @@ def _get_wide_residual_hybrid_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
             return spec
         if not isinstance(spec, ModuleSpec):
             raise TypeError(f"Expected a ModuleSpec or IdentityOp, got {spec!r}.")
-        return ModuleSpec(
-            module=module,
-            params=copy.deepcopy(spec.params),
-            submodules=copy.deepcopy(spec.submodules),
-            metainfo=copy.deepcopy(spec.metainfo),
-        )
+        return replace(spec, module=module)
 
-    return ModuleSpec(
-        module=stack_spec.module,
-        params=copy.deepcopy(stack_spec.params),
+    return replace(
+        stack_spec,
         submodules=HybridStackSubmodules(
             mamba_layer=layer_spec(WideResidualMambaLayer, submodules.mamba_layer),
             gdn_layer=layer_spec(WideResidualTransformerLayer, submodules.gdn_layer),
@@ -506,9 +500,8 @@ def _get_wide_residual_hybrid_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
             mla_layer=layer_spec(WideResidualTransformerLayer, submodules.mla_layer),
             mlp_layer=layer_spec(WideResidualTransformerLayer, submodules.mlp_layer),
             moe_layer=layer_spec(WideResidualTransformerLayer, submodules.moe_layer),
-            mtp_block_spec=copy.deepcopy(submodules.mtp_block_spec),
+            mtp_block_spec=submodules.mtp_block_spec,
         ),
-        metainfo=copy.deepcopy(stack_spec.metainfo),
     )
 
 
