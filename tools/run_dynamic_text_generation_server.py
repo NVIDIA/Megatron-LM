@@ -395,7 +395,7 @@ if __name__ == "__main__":
 
         # Snapshot what the user actually typed BEFORE we inject defaults below,
         # so parse_args_and_detect_vlm's checkpoint-vs-CLI precedence isn't
-        # confounded by server-specific injected defaults.
+        # confounded by server-specific injected defaults. Precedence: CLI > checkpoint > default.
         user_passed_attrs = set()
         for tok in sys.argv[1:]:
             if tok.startswith('--'):
