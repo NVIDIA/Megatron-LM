@@ -30,7 +30,7 @@ mesh is assumed.
 """
 
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -42,17 +42,19 @@ from .owner_planning import GroupOwnerLayout
 @contextmanager
 def _waiting_stream_scope(stream: torch.cuda.Stream | None) -> Iterator[None]:
     """Run the P2P ops and result assembly on `stream`, which waits on the caller's stream
-    at entry; the caller's stream itself is never blocked.
+    at entry; the caller's stream itself is never blocked. With `stream=None`, everything
+    runs on the caller's current stream with no switching.
 
     The caller's stream is captured before switching: inside a `torch.cuda.stream` block,
     `current_stream()` returns the switched-to stream, so ordering against the caller's
     stream must be set up first. Callers must wait on `stream` before reading the results.
     """
-    default_stream = torch.cuda.current_stream() if stream is not None else None
-    with torch.cuda.stream(stream) if stream is not None else nullcontext():
-        if stream is not None:
-            assert default_stream is not None
-            stream.wait_stream(default_stream)
+    if stream is None:
+        yield
+        return
+    default_stream = torch.cuda.current_stream()
+    with torch.cuda.stream(stream):
+        stream.wait_stream(default_stream)
         yield
 
 
