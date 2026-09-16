@@ -273,20 +273,16 @@ class QuantizedDBuffer:
                 "Expected out rowwise-data placements "
                 f"{new_placements!r}, got {out.rowwise_data.placements!r}."
             )
-        self.rowwise_data.redistribute(new_placements, out=out.rowwise_data)
-        self.columnwise_data.redistribute(new_placements, out=out.columnwise_data)
-        self.rowwise_scale.redistribute(new_placements, out=out.rowwise_scale)
-        self.columnwise_scale.redistribute(
-            _block_atomic_to_flat(new_placements), out=out.columnwise_scale
-        )
+        for plane, out_plane in zip(self.planes, out.planes):
+            plane.redistribute(out_plane.placements, out=out_plane)
         return out
 
     def allgather(
         self, mesh_axis: int, *, out: "QuantizedDBuffer | None" = None
     ) -> "QuantizedDBuffer":
         """All-gather every plane, returning ``out`` when supplied or a new wrapper."""
-        result_planes = tuple(
-            plane.allgather(mesh_axis, out=None if out is None else out.planes[index])
-            for index, plane in enumerate(self.planes)
-        )
-        return out if out is not None else self._from_planes(*result_planes)
+        if out is None:
+            return self._from_planes(*(plane.allgather(mesh_axis) for plane in self.planes))
+        for plane, out_plane in zip(self.planes, out.planes):
+            plane.allgather(mesh_axis, out=out_plane)
+        return out
