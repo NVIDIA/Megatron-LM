@@ -39,6 +39,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -242,6 +243,10 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 f"{supported_fsdp_unit_modules}, "
                 f"got {self.fsdp_unit_modules}."
             )
+        # The inner wrapper changes storage before _BaseDataParallel.__init__ runs.
+        for submodule in module.modules():
+            if isinstance(submodule, MegatronModule):
+                submodule._prepare_for_training()
         super().__init__(
             config=config,
             module=MegatronFSDP(

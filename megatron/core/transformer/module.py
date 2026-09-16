@@ -50,6 +50,12 @@ class MegatronModule(torch.nn.Module):
         receiver calls it after all parameter and buffer transfers have completed.
         """
 
+    def _prepare_for_training(self) -> None:
+        """Claim parameter storage before a training wrapper or optimizer retains it.
+
+        Called on each module during training setup. Overrides must be idempotent.
+        """
+
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
         state dict for saving checkpoints.

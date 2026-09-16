@@ -1006,7 +1006,6 @@ def test_init_refreshes_inference_only_experts_before_first_capture(conversion, 
         hidden_size=4,
         num_attention_heads=1,
         activation_func=squared_relu,
-        inference_only=True,
     )
 
     def init_te_weights(module, num_local_experts, config, **kwargs):
@@ -1026,7 +1025,7 @@ def test_init_refreshes_inference_only_experts_before_first_capture(conversion, 
     with mock.patch.object(TEGroupedMLP, "__init__", init_te_weights):
         experts = InferenceGroupedMLP(2, config, submodules=None)
     assert experts._concatenated_weights_built
-    assert experts.linear_fc1.weight0.data_ptr() == experts._fc1_weight[0].data_ptr()
+    assert experts.linear_fc1.weight0.data_ptr() != experts._fc1_weight[0].data_ptr()
     model = torch.nn.Sequential(experts)
     model.config = config
     if conversion == "dtype":

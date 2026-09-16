@@ -99,7 +99,9 @@ def _make_inference_grouped_mlp_skeleton(device, serving_weights_canonical=False
     torch.nn.Module.__init__(module)
     module.num_local_experts = 2
     module._concatenated_weights_built = False
-    module._serving_weights_canonical = serving_weights_canonical
+    module._serving_weights_canonical = True
+    if not serving_weights_canonical:
+        module._prepare_for_training()
 
     for linear_name, shape in (('linear_fc1', (4, 3)), ('linear_fc2', (3, 2))):
         linear = torch.nn.Module()
@@ -148,6 +150,7 @@ def test_inference_only_grouped_mlp_retains_single_copy_of_expert_weights(device
 
     module._build_concatenated_weights()
     module._concatenated_weights_built = True
+    module.refresh_inference_weights()
 
     # Every parameter is a view into the packed serving buffers: one retained copy.
     for linear, serving_weight in (
@@ -176,6 +179,7 @@ def test_inference_only_grouped_mlp_reattaches_detached_parameters_on_refresh(de
     module = _make_inference_grouped_mlp_skeleton(device, serving_weights_canonical=True)
     module._build_concatenated_weights()
     module._concatenated_weights_built = True
+    module.refresh_inference_weights()
     serving_ptrs = (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr())
 
     if device == "cuda":

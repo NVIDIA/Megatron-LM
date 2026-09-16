@@ -1164,6 +1164,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
     """
 
     _serving_weights_canonical = False
+    _serving_views_attached = False
+    _inference_weights_refreshed = False
 
     def __init__(
         self,
@@ -1182,17 +1184,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
             name=name,
         )
 
-        # Trainable models pack lazily after checkpoint loading.
+        # Allocate in the caller's allocation region, but defer parameter aliasing
+        # until inference preparation, after DDP/optimizer setup has claimed storage.
         self._concatenated_weights_built = False
-
-        # Inference-only models share parameter and serving storage.
-        # MXFP8 retains high-precision parameters for refits.
-        self._serving_weights_canonical = config.inference_only and not (
-            config.fp8 and config.fp8_recipe == Fp8Recipe.mxfp8
-        )
+        self._serving_views_attached = False
+        self._inference_weights_refreshed = False
+        # MXFP8 has separate quantized serving storage and a dedicated refit path.
+        self._serving_weights_canonical = not (config.fp8 and config.fp8_recipe == Fp8Recipe.mxfp8)
         if self._serving_weights_canonical and self.linear_fc1.weight0.device.type != 'meta':
-            # Pack in the caller's allocation region to support offloading and
-            # release the original expert storage before loading weights.
             self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
@@ -1341,8 +1340,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Pack TE expert weights into serving buffers with stable CUDA-graph addresses.
 
         Trainable models retain optimizer/DDP-owned storage and copy on refresh.
-        Inference-only models alias parameters into the buffers, retaining one copy
-        without replacing TE's Parameter objects.
+        Parameter aliasing is deferred to refresh_inference_weights(), after
+        training setup has had a chance to claim parameter storage.
         """
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
@@ -1359,13 +1358,20 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
 
-        if self._serving_weights_canonical:
-            self._attach_serving_views()
-        else:
-            # Preserve optimizer/DDP-owned parameter storage.
-            for i in range(self.num_local_experts):
-                _fc1_weight[i].copy_(getattr(self.linear_fc1, f'weight{i}'))
-                _fc2_weight[i].copy_(getattr(self.linear_fc2, f'weight{i}'))
+        for i in range(self.num_local_experts):
+            _fc1_weight[i].copy_(getattr(self.linear_fc1, f'weight{i}'))
+            _fc2_weight[i].copy_(getattr(self.linear_fc2, f'weight{i}'))
+
+    def _prepare_for_training(self) -> None:
+        """Keep training storage canonical; reject training after serving aliasing."""
+        if self._serving_views_attached:
+            raise RuntimeError(
+                "Cannot attach training to InferenceGroupedMLP after its parameters "
+                "have been aliased into serving buffers. Set up DDP/FSDP and the "
+                "optimizer before preparing inference."
+            )
+        self._serving_weights_canonical = False
+        self._inference_weights_refreshed = False
 
     @torch.no_grad()
     def _attach_serving_views(self) -> bool:
@@ -1385,8 +1391,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 if param.data.data_ptr() == serving_view.data_ptr():
                     continue
                 serving_view.copy_(param)
+                assert not hasattr(param, 'main_grad'), "Cannot redirect DDP-owned parameter storage."
                 param.data = serving_view
                 attached = True
+        self._serving_views_attached = True
         return attached
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
@@ -1407,10 +1415,21 @@ class InferenceGroupedMLP(TEGroupedMLP):
         if isinstance(weight, MXFP8Tensor) or (
             hasattr(weight, 'data') and isinstance(weight.data, MXFP8Tensor)
         ):
+            self._inference_weights_refreshed = True
             return False
 
         if self._serving_weights_canonical:
-            return self._attach_serving_views()
+            # Defense for DDP integrations that bypass the training-setup hook.
+            if any(
+                hasattr(getattr(linear, f'weight{i}'), 'main_grad')
+                for linear in (self.linear_fc1, self.linear_fc2)
+                for i in range(self.num_local_experts)
+            ):
+                self._prepare_for_training()
+            else:
+                attached = self._attach_serving_views()
+                self._inference_weights_refreshed = True
+                return attached
 
         for linear, serving_weight in (
             (self.linear_fc1, self._fc1_weight),
@@ -1419,6 +1438,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             for expert_idx in range(self.num_local_experts):
                 param = getattr(linear, f'weight{expert_idx}')
                 serving_weight[expert_idx].copy_(param)
+        self._inference_weights_refreshed = True
         return True
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
@@ -1527,6 +1547,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
 
         if not InferenceMode.is_active():
+            self._prepare_for_training()
             assert (
                 not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
@@ -1542,6 +1563,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             else:
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
+        if not self._inference_weights_refreshed:
+            self.refresh_inference_weights()
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."

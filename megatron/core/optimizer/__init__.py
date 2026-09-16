@@ -331,6 +331,9 @@ def _get_param_groups(
     params_map = {}
 
     for model_chunk in model_chunks:
+        for module in model_chunk.modules():
+            if isinstance(module, MegatronModule):
+                module._prepare_for_training()
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue

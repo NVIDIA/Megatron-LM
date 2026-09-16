@@ -13,6 +13,9 @@ class _BaseDataParallel(MegatronModule):
 
     def __init__(self, config: TransformerConfig, module: torch.nn.Module):
         super().__init__(config=config)
+        for submodule in module.modules():
+            if isinstance(submodule, MegatronModule):
+                submodule._prepare_for_training()
         self.module = module
 
     def forward(self, *inputs, **kwargs):
