@@ -27,3 +27,15 @@ and real Newton-Schulz updates at TP2 against a complete-matrix TP1 reference,
 including both tall and wide weight matrices.
 `test_duplicated_linear_has_replicated_tensor_parallel_metadata` in
 `tests/unit_tests/transformer/moe/test_latent_moe_layer.py` covers both wrappers.
+
+## Newton-Schulz arithmetic precision
+
+`--muon-fp32-matmul-prec` accepts PyTorch's `medium`, `high`, and `highest`
+settings. The default remains `medium`. The earlier CLI choices incorrectly
+included `low` and omitted `highest`; `low` is not a PyTorch precision setting.
+
+Use `highest` when diagnosing update sensitivity: the pinned Emerging Optimizers
+implementation keeps Newton-Schulz arithmetic in FP32 for this setting, while
+`medium` casts its normalized input to BF16. This changes arithmetic precision;
+it does not change the logical TP matrix or per-head splitting domain. Training
+trajectory parity still requires an end-to-end comparison.
