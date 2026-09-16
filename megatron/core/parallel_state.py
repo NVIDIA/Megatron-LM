@@ -6,8 +6,7 @@ import logging
 import os
 import warnings
 from datetime import timedelta
-from math import log2
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -127,8 +126,10 @@ _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
-# Hybrid context parallel groups
-_HYBRID_DP_CP_GROUPS = {}
+# Dynamic context parallel groups, indexed by the runtime CP group size.
+_DYNAMIC_DP_CP_GROUPS = {}
+# Cartesian TP x dynamic-DP-CP groups used for sequence-parallel CP layout conversion.
+_DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS = {}
 
 # Full data-parallel groups: span every distinct-data rank
 # (size = replicate_DP x gtp_remat). Used for data distribution (batch split, num-microbatches,
@@ -437,29 +438,57 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
+def get_valid_dynamic_context_parallel_group_sizes(total_size: int) -> List[int]:
+    """Return runtime CP sizes that can partition a DPxCP rank list exactly.
+
+    Power-of-two subgroups are used when they evenly divide the rank list. The
+    full DPxCP group is always valid and reuses the existing communicator.
     """
-    Creates groups required for hybrid DPxCP.
-    Creates a new group for every power of 2 up to the number of DPxCP ranks.
+    if total_size < 1:
+        raise ValueError(f"Dynamic CP group size must be positive, got {total_size}")
+
+    group_sizes = []
+    group_size = 1
+    while group_size < total_size:
+        if total_size % group_size == 0:
+            group_sizes.append(group_size)
+        group_size *= 2
+    group_sizes.append(total_size)
+    return group_sizes
+
+
+def create_dynamic_dp_cp_groups(
+    rank: int, ranks: Sequence[int], pg_options: object, min_cp_size: int = 1
+) -> Dict[int, torch.distributed.ProcessGroup]:
+    """
+    Creates groups required for dynamic DPxCP.
+    Creates a new group for every power of 2 from min_cp_size up to the full
+    DPxCP group. The full group reuses the existing DPxCP communicator.
     Returns a dictionary indexed by group size.
     """
-    hybrid_dp_cp_groups = {}
-    # Generate group for every power of 2 up to the number of CP ranks
-    # We limit the allowed group sizes in order to avoid excessive overhead.
-    group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
+    dynamic_dp_cp_groups = {}
+    valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(len(ranks))
+    if min_cp_size not in valid_group_sizes:
+        raise ValueError(
+            f"min_dynamic_context_parallel_size={min_cp_size} is not a valid group size "
+            f"for DPxCP size {len(ranks)}; expected one of {valid_group_sizes}"
+        )
+    group_sizes = [
+        group_size for group_size in valid_group_sizes if min_cp_size <= group_size < len(ranks)
+    ]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
                 ranks[i : i + group_size],
                 pg_options=pg_options,
-                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+                group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
             )
             if rank in ranks[i : i + group_size]:
                 assert (
-                    group_size not in hybrid_dp_cp_groups
-                ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
-                hybrid_dp_cp_groups[group_size] = group
-    return hybrid_dp_cp_groups
+                    group_size not in dynamic_dp_cp_groups
+                ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
+                dynamic_dp_cp_groups[group_size] = group
+    return dynamic_dp_cp_groups
 
 
 class RankGenerator(object):
@@ -621,6 +650,8 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    dynamic_context_parallel: bool = False,
+    min_dynamic_context_parallel_size: int = 1,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -683,6 +714,17 @@ def initialize_model_parallel(
             all-reduce is required in backward. For simplicity, we piggyback
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
+
+        hybrid_context_parallel (bool, default = False):
+            Deprecated alias for ``dynamic_context_parallel``.
+
+        dynamic_context_parallel (bool, default = False):
+            Create the runtime DPxCP subgroup family used by dynamic context
+            parallelism.
+
+        min_dynamic_context_parallel_size (int, default = 1):
+            Smallest runtime CP group to create. It must be one of the valid
+            subgroup sizes for the DPxCP domain.
 
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
@@ -1037,17 +1079,89 @@ def initialize_model_parallel(
             del os.environ["NCCL_COLLNET_ENABLE"]
 
     if hybrid_context_parallel:
-        global _HYBRID_DP_CP_GROUPS
+        warnings.warn(
+            "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if dynamic_context_parallel:
+            raise ValueError("Cannot set both hybrid_context_parallel and dynamic_context_parallel")
+        dynamic_context_parallel = True
+
+    if dynamic_context_parallel:
+        global _DYNAMIC_DP_CP_GROUPS
+        global _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+        dp_cp_rank_groups = decoder_rank_generator.get_ranks('dp-cp')
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
-            assert (
-                len(ranks_with_cp) % 2 == 0
-            ), "Hybrid context parallel requires an even number of ranks"
-            _HYBRID_DP_CP_GROUPS.update(
-                create_hybrid_dp_cp_groups(
-                    rank, ranks_with_cp, get_nccl_options("dp_cp", nccl_comm_cfgs)
+            _DYNAMIC_DP_CP_GROUPS.update(
+                create_dynamic_dp_cp_groups(
+                    rank,
+                    ranks_with_cp,
+                    get_nccl_options("dp_cp", nccl_comm_cfgs),
+                    min_cp_size=min_dynamic_context_parallel_size,
                 )
             )
-        # TODO: Are gloo groups needed for hybrid cp?
+
+        # A layout conversion after TP sequence scattering must communicate
+        # over the Cartesian product of TP and the runtime DPxCP subgroup.
+        # Build those products from matching DPxCP lanes while keeping the
+        # GTP-remat and PP coordinates fixed.
+        if tensor_model_parallel_size > 1:
+            valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
+                data_parallel_size * context_parallel_size
+            )
+            for tp_dp_cp_ranks in decoder_rank_generator.get_ranks('tp-dp-cp'):
+                parent_ranks = set(tp_dp_cp_ranks)
+                dp_cp_lanes = [
+                    lane for lane in dp_cp_rank_groups if set(lane).issubset(parent_ranks)
+                ]
+                assert len(dp_cp_lanes) == tensor_model_parallel_size
+                for group_size in valid_group_sizes:
+                    if group_size < min_dynamic_context_parallel_size:
+                        continue
+                    for start in range(0, len(dp_cp_lanes[0]), group_size):
+                        subgroup_ranks = [
+                            lane[dp_cp_index]
+                            for dp_cp_index in range(start, start + group_size)
+                            for lane in dp_cp_lanes
+                        ]
+                        group = create_group(
+                            subgroup_ranks,
+                            timeout=timeout,
+                            pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+                            group_desc=f"DYNAMIC_TENSOR_DATA_CONTEXT_GROUP_{group_size}",
+                        )
+                        if rank in subgroup_ranks:
+                            assert group_size not in _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+                            _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size] = group
+
+        # NCCL initializes communicators lazily. Touch every local runtime
+        # group, including the singleton CP-off group, in a deterministic order.
+        data_parallel_size_with_cp = data_parallel_size * context_parallel_size
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
+            data_parallel_size_with_cp
+        )
+        if min_dynamic_context_parallel_size not in valid_group_sizes:
+            raise ValueError(
+                "min_dynamic_context_parallel_size="
+                f"{min_dynamic_context_parallel_size} is not a valid group size for "
+                f"DPxCP size {data_parallel_size_with_cp}; expected one of {valid_group_sizes}"
+            )
+        for group_size in valid_group_sizes:
+            if group_size < min_dynamic_context_parallel_size:
+                continue
+            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+            torch.cuda.synchronize()
+            if tensor_model_parallel_size > 1:
+                # TP groups are initialized later in this function, so do not
+                # route this eager communicator touch through the public
+                # accessor (which consults TP parallel state).
+                tp_cp_group = _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size]
+                torch.distributed.barrier(
+                    group=tp_cp_group, device_ids=[torch.cuda.current_device()]
+                )
+                torch.cuda.synchronize()
 
     for ranks in decoder_rank_generator.get_ranks("dp"):
         group = create_group(
@@ -1847,16 +1961,50 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_hybrid_data_context_parallel_groups(check_initialized=True, group_size=None):
-    """Get the hybrid context parallel groups the caller rank belongs to."""
-    # If the group size is the same as the entire DPxCP group, return the original group
-    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+def get_dynamic_data_context_parallel_groups(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Get the dynamic CP group of ``group_size`` containing the caller rank."""
+    # Runtime DCP subdivides the replicate DPxCP domain, not the independent
+    # GTP-remat data-distribution axis.
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
     if check_initialized:
-        assert _HYBRID_DP_CP_GROUPS is not None
-    return _HYBRID_DP_CP_GROUPS[group_size]
+        assert _DYNAMIC_DP_CP_GROUPS is not None
+    return _DYNAMIC_DP_CP_GROUPS[group_size]
+
+
+def get_hybrid_data_context_parallel_groups(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Deprecated alias for :func:`get_dynamic_data_context_parallel_groups`."""
+    warnings.warn(
+        "get_hybrid_data_context_parallel_groups is deprecated; use "
+        "get_dynamic_data_context_parallel_groups instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
+
+
+def get_dynamic_tensor_data_context_parallel_group(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Get the TP x runtime-DPxCP group containing the caller rank.
+
+    ``group_size`` is the runtime CP size; the returned process group has
+    ``tensor_model_parallel_size * group_size`` ranks. With TP1 the dynamic
+    DPxCP group itself is already the required Cartesian product.
+    """
+    if get_tensor_model_parallel_world_size() == 1:
+        return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
+    if check_initialized:
+        assert (
+            group_size in _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+        ), f"Dynamic TPxDPxCP group of CP size {group_size} is not initialized"
+    return _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS[group_size]
 
 
 def get_embedding_group(check_initialized=True):
@@ -2550,6 +2698,12 @@ def destroy_model_parallel():
 
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None
+
+    global _DYNAMIC_DP_CP_GROUPS
+    _DYNAMIC_DP_CP_GROUPS = {}
+
+    global _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS
+    _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS = {}
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
