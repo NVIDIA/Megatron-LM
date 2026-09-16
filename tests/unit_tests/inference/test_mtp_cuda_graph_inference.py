@@ -58,6 +58,64 @@ from megatron.core.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
 
 # --------------------------------------------------------------------------- #
+#  HybridModel helpers
+#
+#  GPTModel is deprecated (it logs a deprecation warning and takes critical bug fixes only),
+#  so every model-building test class below is parametrized over `model_type` in
+#  ("gpt", "hybrid"). The GPT arm is retained deliberately: `MultiTokenPredictionLayer`
+#  forks on `mtp_layer_pattern is not None`, and the GPT arm exercises the single
+#  `TransformerLayer` branch plus the `not is_hybrid_model` branch of the
+#  `enable_mtp_kv_cache` gate in `DynamicInferenceContext`.
+# --------------------------------------------------------------------------- #
+
+
+def _build_hybrid_stack_spec(num_experts=None):
+    """Build a minimal HybridStack spec using local (non-TE) modules."""
+    attention_layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+
+    backend = LocalSpecProvider()
+    norm_impl = backend.layer_norm()
+    col_linear_impl = backend.column_parallel_linear()
+
+    mtp_layer_spec = ModuleSpec(
+        module=MultiTokenPredictionLayer,
+        submodules=MultiTokenPredictionLayerSubmodules(
+            enorm=norm_impl,
+            hnorm=norm_impl,
+            eh_proj=col_linear_impl,
+            mtp_model_layer=None,
+            layer_norm=norm_impl,
+        ),
+    )
+    mtp_block_spec = ModuleSpec(
+        module=MultiTokenPredictionBlock,
+        submodules=MultiTokenPredictionBlockSubmodules(layer_specs=[mtp_layer_spec]),
+    )
+
+    return ModuleSpec(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
+            attention_layer=attention_layer_spec, mtp_block_spec=mtp_block_spec
+        ),
+    )
+
+
+def _hybrid_pattern(num_layers, mtp_num_layers):
+    """Attention-only main pattern plus one single-attention block per MTP depth.
+
+    `*` denotes a whole GPT-equivalent block here rather than the canonical `*-` attention/
+    MLP split from `docs/user-guide/hybrid-model-migration.md`, because
+    `_build_hybrid_stack_spec` supplies `get_gpt_layer_local_spec` as the attention layer and
+    that spec already carries its own MLP/MoE sublayer. So `num_layers` symbols reproduce the
+    GPT arm's `num_layers` blocks one-for-one.
+
+    Each `/<block>` is one MTP depth (`parse_hybrid_pattern`), and a single-`*` MTP block keeps
+    the head one non-recurrent attention layer, which is what `enable_mtp_kv_cache` requires.
+    """
+    return "*" * num_layers + "/*" * mtp_num_layers
+
+
+# --------------------------------------------------------------------------- #
 #  TestMTPCudaGraphInference (TP = 2)
 # --------------------------------------------------------------------------- #
 
@@ -95,9 +153,14 @@ class TestMTPCudaGraphInference:
     # ---- helpers ---------------------------------------------------------- #
 
     def _build_model(
-        self, *, sequence_parallel=False, mtp_num_layers=2, mtp_use_repeated_layer=False
+        self,
+        *,
+        sequence_parallel=False,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        model_type='gpt',
     ):
-        """Build a GPT model with MTP layers and local CUDA graph support."""
+        """Build a GPT or Hybrid model with MTP layers and local CUDA graph support."""
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         config = TransformerConfig(
             num_layers=self.NUM_LAYERS,
@@ -114,20 +177,37 @@ class TestMTPCudaGraphInference:
             sequence_parallel=sequence_parallel,
             cuda_graph_impl="local",
         )
-        layer_spec = get_gpt_layer_local_spec()
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            config=config, spec=layer_spec, use_transformer_engine=False
-        )
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=layer_spec,
-            vocab_size=self.VOCAB_SIZE,
-            max_sequence_length=self.MAX_SEQ_LEN,
-            parallel_output=True,
-            pre_process=True,
-            post_process=True,
-            mtp_block_spec=mtp_block_spec,
-        ).cuda()
+        if model_type == 'gpt':
+            layer_spec = get_gpt_layer_local_spec()
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config=config, spec=layer_spec, use_transformer_engine=False
+            )
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=self.MAX_SEQ_LEN,
+                parallel_output=True,
+                pre_process=True,
+                post_process=True,
+                mtp_block_spec=mtp_block_spec,
+            ).cuda()
+        elif model_type == 'hybrid':
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=_build_hybrid_stack_spec(),
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=self.MAX_SEQ_LEN,
+                parallel_output=True,
+                pre_process=True,
+                post_process=True,
+                hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
+                # GPTModel defaults to learned_absolute; HybridModel defaults to 'none'.
+                # Pin it so both arms build the same position-embedding stack.
+                position_embedding_type='learned_absolute',
+            ).cuda()
+        else:
+            raise ValueError(f"Unknown model_type: {model_type!r}")
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
         model.eval()
@@ -141,6 +221,7 @@ class TestMTPCudaGraphInference:
         mtp_use_repeated_layer=False,
         num_speculative_tokens=2,
         max_requests=16,
+        model_type='gpt',
     ):
         """Build a DynamicInferenceEngine with automatic MTP CUDA graph warmup.
 
@@ -152,6 +233,7 @@ class TestMTPCudaGraphInference:
             sequence_parallel=sequence_parallel,
             mtp_num_layers=mtp_num_layers,
             mtp_use_repeated_layer=mtp_use_repeated_layer,
+            model_type=model_type,
         )
         config = model.config
         context = DynamicInferenceContext(
@@ -242,16 +324,19 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 1: graph output matches eager (no additional padding) ------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_output_matches_eager(self, mtp_use_repeated_layer):
+    def test_cuda_graph_output_matches_eager(self, mtp_use_repeated_layer, model_type):
         """CUDA graph replay produces the same output as eager execution.
 
         The batch sizes exactly match warmed-up graphs (from the engine's
         CUDA graph warmup), so there is no additional padding.  Both paths
         must produce identical hidden states and logits.
         """
-        engine = self._build_engine(mtp_use_repeated_layer=mtp_use_repeated_layer)
+        engine = self._build_engine(
+            mtp_use_repeated_layer=mtp_use_repeated_layer, model_type=model_type
+        )
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
         batch_sizes = self._get_mtp_warmed_batch_sizes(engine)
@@ -297,9 +382,10 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 2: graph matches eager with sequence parallelism ------------ #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_output_matches_eager_with_sp(self, mtp_use_repeated_layer):
+    def test_cuda_graph_output_matches_eager_with_sp(self, mtp_use_repeated_layer, model_type):
         """CUDA graph replay matches eager with sequence parallelism.
 
         Hidden states are in scattered SP format `[batch_size/TP, 1, H]`.
@@ -307,7 +393,9 @@ class TestMTPCudaGraphInference:
         must produce identical outputs.
         """
         engine = self._build_engine(
-            sequence_parallel=True, mtp_use_repeated_layer=mtp_use_repeated_layer
+            sequence_parallel=True,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+            model_type=model_type,
         )
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
@@ -357,9 +445,10 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 3: end-to-end _compute_serial_mtp_and_sample with SP ------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_sp_padding_end_to_end(self, mtp_use_repeated_layer):
+    def test_cuda_graph_sp_padding_end_to_end(self, mtp_use_repeated_layer, model_type):
         """Full `_compute_serial_mtp_and_sample` with CUDA graphs and SP.
 
         Active request counts that are not multiples of TP are padded.
@@ -376,6 +465,7 @@ class TestMTPCudaGraphInference:
             mtp_use_repeated_layer=mtp_use_repeated_layer,
             num_speculative_tokens=num_spec,
             max_requests=max_requests,
+            model_type=model_type,
         )
         ctrl = engine.controller
         context = engine.context
@@ -452,9 +542,10 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 4: SP padding graph vs eager produces same MTP tokens ------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_sp_padding_matches_eager(self, mtp_use_repeated_layer):
+    def test_cuda_graph_sp_padding_matches_eager(self, mtp_use_repeated_layer, model_type):
         """With SP padding, CUDA graph path produces the same MTP tokens as eager.
 
         Uses a single engine (shared model weights) and toggles the CUDA
@@ -470,6 +561,7 @@ class TestMTPCudaGraphInference:
             mtp_use_repeated_layer=mtp_use_repeated_layer,
             num_speculative_tokens=num_spec,
             max_requests=max_requests,
+            model_type=model_type,
         )
         ctrl = engine.controller
         context = engine.context
@@ -559,9 +651,10 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 5: multiple MTP depths with CUDA graphs --------------------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_cuda_graph_multi_depth(self, mtp_use_repeated_layer):
+    def test_cuda_graph_multi_depth(self, mtp_use_repeated_layer, model_type):
         """Run multiple MTP depths with CUDA graphs enabled.
 
         Verifies that the hidden output from one depth feeds correctly into
@@ -570,7 +663,9 @@ class TestMTPCudaGraphInference:
         """
         num_depths = 2
         engine = self._build_engine(
-            mtp_num_layers=num_depths, mtp_use_repeated_layer=mtp_use_repeated_layer
+            mtp_num_layers=num_depths,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+            model_type=model_type,
         )
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
@@ -615,14 +710,17 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 6: caller-driven eager bypass for non-warmed shapes --------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
     @torch.inference_mode()
-    def test_eager_bypass_for_non_warmed_shape(self, mtp_use_repeated_layer):
+    def test_eager_bypass_for_non_warmed_shape(self, mtp_use_repeated_layer, model_type):
         """Passing `eager=True` runs `compute_mtp_single_step` outside the
         CudaGraphManager wrapper. This is the canonical caller-side fallback
         for a shape that warmup did not capture.
         """
-        engine = self._build_engine(mtp_use_repeated_layer=mtp_use_repeated_layer)
+        engine = self._build_engine(
+            mtp_use_repeated_layer=mtp_use_repeated_layer, model_type=model_type
+        )
         model = engine.controller.inference_wrapped_model.model
         unwrapped = unwrap_model(model)
         warmed_sizes = set(self._get_mtp_warmed_batch_sizes(engine))
@@ -659,14 +757,15 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 7: delete_cuda_graphs resets MTP runners -------------------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @torch.inference_mode()
-    def test_delete_cuda_graphs_resets_mtp_runners(self):
+    def test_delete_cuda_graphs_resets_mtp_runners(self, model_type):
         """`delete_cuda_graphs()` resets MTP CUDA graph runners.
 
         MTP runners join the standard `cudagraph_inference_record`, so the
         standard cleanup loop resets their `fwd_graph_recorded` flag.
         """
-        engine = self._build_engine()
+        engine = self._build_engine(model_type=model_type)
         model = engine.controller.inference_wrapped_model.model
 
         self._assert_mtp_cuda_graphs_were_replayed(model, True)
@@ -684,8 +783,9 @@ class TestMTPCudaGraphInference:
 
     # ---- Test 8: last_token_logits under CUDA graph padding ---------------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @torch.inference_mode()
-    def test_last_token_logits_cuda_graph_padding(self):
+    def test_last_token_logits_cuda_graph_padding(self, model_type):
         """num_last_token_logits returns padded count and last_token_logits
         produces the correct shape under CUDA graph padding.
 
@@ -697,7 +797,9 @@ class TestMTPCudaGraphInference:
         """
         num_spec = 2
         max_requests = 16
-        engine = self._build_engine(num_speculative_tokens=num_spec, max_requests=max_requests)
+        engine = self._build_engine(
+            num_speculative_tokens=num_spec, max_requests=max_requests, model_type=model_type
+        )
         context = engine.context
         tokens_per_decode = num_spec + 1
 
@@ -814,6 +916,23 @@ _STATE_DIMS = {
 }
 
 
+def _reset_moe_layer_cache():
+    """Drop the process-global MoE layer cache in `megatron.core.inference.utils`.
+
+    That cache is built once from the first model it is handed, which is correct in production
+    (one model per process) but wrong here, where every test builds a fresh model. With a stale
+    cache, `set_decode_expert_padding` flips `drop_and_pad` on the *previous* model's dispatchers
+    while writing `moe_expert_capacity_factor` onto the *current* model's config. The live
+    dispatchers then reach `preprocess` with `drop_and_pad=False` under a non-None capacity
+    factor, which lowers the sync point to "before_permutation_1" and trips the token
+    dispatcher's "cuda_sync_point must be after cuda_dtoh_point" assertion.
+    """
+    from megatron.core.inference import utils as inference_utils
+
+    inference_utils.moe_layer_cache = None
+    inference_utils._moe_metadata_sync_initialized = False
+
+
 @pytest.mark.internal
 class TestMTPCudaGraphExpertParallel:
     """Tests for MTP CUDA-graphed inference with expert parallelism.
@@ -853,9 +972,11 @@ class TestMTPCudaGraphExpertParallel:
 
     # ---- helpers ---------------------------------------------------------- #
 
-    def _build_model(self, inference_moe_token_dispatcher_type='nccl'):
-        """Build a GPT model with MTP + MoE + local CUDA graphs."""
+    def _build_model(self, inference_moe_token_dispatcher_type='nccl', model_type='gpt'):
+        """Build a GPT or Hybrid model with MTP + MoE + local CUDA graphs."""
+        _reset_moe_layer_cache()
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        mtp_num_layers = 2
         config = TransformerConfig(
             num_layers=self.NUM_LAYERS,
             hidden_size=self.HIDDEN_SIZE,
@@ -867,25 +988,40 @@ class TestMTPCudaGraphExpertParallel:
             num_moe_experts=self.NUM_MOE_EXPERTS,
             moe_token_dispatcher_type="alltoall",
             add_bias_linear=False,
-            mtp_num_layers=2,
+            mtp_num_layers=mtp_num_layers,
             cuda_graph_impl="local",
             moe_pad_experts_for_cuda_graph_inference=True,
             inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
         )
-        layer_spec = get_gpt_layer_local_spec(num_experts=self.NUM_MOE_EXPERTS)
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            config=config, spec=layer_spec, use_transformer_engine=False
-        )
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=layer_spec,
-            vocab_size=self.VOCAB_SIZE,
-            max_sequence_length=self.MAX_SEQ_LEN,
-            parallel_output=True,
-            pre_process=True,
-            post_process=True,
-            mtp_block_spec=mtp_block_spec,
-        ).cuda()
+        if model_type == 'gpt':
+            layer_spec = get_gpt_layer_local_spec(num_experts=self.NUM_MOE_EXPERTS)
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config=config, spec=layer_spec, use_transformer_engine=False
+            )
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=self.MAX_SEQ_LEN,
+                parallel_output=True,
+                pre_process=True,
+                post_process=True,
+                mtp_block_spec=mtp_block_spec,
+            ).cuda()
+        elif model_type == 'hybrid':
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=_build_hybrid_stack_spec(num_experts=self.NUM_MOE_EXPERTS),
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=self.MAX_SEQ_LEN,
+                parallel_output=True,
+                pre_process=True,
+                post_process=True,
+                hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
+                position_embedding_type='learned_absolute',
+            ).cuda()
+        else:
+            raise ValueError(f"Unknown model_type: {model_type!r}")
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
         model.eval()
@@ -916,16 +1052,17 @@ class TestMTPCudaGraphExpertParallel:
 
     # ---- Test 1: all EP ranks run MTP eager forward ----------------------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("batch_size", [2, 4, 8])
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_mtp_eager_forward(self, batch_size):
+    def test_ep_mtp_eager_forward(self, batch_size, model_type):
         """All EP ranks can run MTP forward in eager mode.
 
         The MoE all-to-all collectives must match across EP ranks.  Verifies
         that all ranks complete without hanging and produce valid shapes.
         """
-        model = self._build_model()
+        model = self._build_model(model_type=model_type)
         unwrapped = unwrap_model(model)
 
         # Broadcast identical inputs so all EP ranks see the same data.
@@ -949,16 +1086,17 @@ class TestMTPCudaGraphExpertParallel:
 
     # ---- Test 2: dummy ranks + real ranks in eager mode ------------------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_mtp_eager_dummy_and_real_ranks(self):
+    def test_ep_mtp_eager_dummy_and_real_ranks(self, model_type):
         """Even EP ranks run as dummy (with zeros), odd ranks run with real data.
 
         Both must issue matching MoE all-to-all collectives via the
         MTP eager forward to avoid hangs.
         """
         batch_size = 4
-        model = self._build_model()
+        model = self._build_model(model_type=model_type)
         unwrapped = unwrap_model(model)
 
         ep_rank = parallel_state.get_expert_model_parallel_rank()
@@ -990,10 +1128,11 @@ class TestMTPCudaGraphExpertParallel:
 
     # ---- Test 3: EP state cross product with DynamicInferenceContext ------- #
 
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("rank_states", _STATE_COMBOS, ids=[",".join(s) for s in _STATE_COMBOS])
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_ep_state_cross_product(self, rank_states):
+    def test_ep_state_cross_product(self, rank_states, model_type):
         """Test combinatorial assignments of request states across EP ranks.
 
         Verifies that:
@@ -1005,7 +1144,7 @@ class TestMTPCudaGraphExpertParallel:
         my_state = rank_states[ep_rank]
         is_dummy = my_state == NONE
 
-        model = self._build_model()
+        model = self._build_model(model_type=model_type)
         ctx = self._build_context(model)
 
         # Phase 1: Set up each rank's request state.
@@ -1055,9 +1194,10 @@ class TestMTPCudaGraphExpertParallel:
     @pytest.mark.parametrize(
         "peer_state", [PREFILL, MIXED], ids=[f"peer={s}" for s in [PREFILL, MIXED]]
     )
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_nccl_ep_dummy_bailout_with_decode_only_cuda_graphs(self, peer_state):
+    def test_nccl_ep_dummy_bailout_with_decode_only_cuda_graphs(self, peer_state, model_type):
         """Verify the dummy-rank bail-out path when only decode CUDA graphs
         are available.
 
@@ -1069,7 +1209,7 @@ class TestMTPCudaGraphExpertParallel:
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_even = ep_rank % 2 == 0
 
-        model = self._build_model(inference_moe_token_dispatcher_type='nccl')
+        model = self._build_model(inference_moe_token_dispatcher_type='nccl', model_type=model_type)
         ctx = self._build_context(model, use_cuda_graphs_for_non_decode_steps=False)
 
         # Even ranks are dummy; odd ranks have the peer_state.
@@ -1110,39 +1250,307 @@ class TestMTPCudaGraphExpertParallel:
 
 
 # --------------------------------------------------------------------------- #
-#  TestMTPBlockScopeCudaGraph (TP = 1)
+#  TestMtpKvCacheIdleExpertParallelRank (EP = 2, MTP KV cache ON)
 # --------------------------------------------------------------------------- #
 
+# The engine-level MTP KV cache tests (tests/unit_tests/inference/engines/) drive requests
+# through `_run_test`, which seeds `random.seed(...)` so every EP rank builds an IDENTICAL
+# request list. Real MoE all-to-alls happen there, but no rank is ever idle, so
+# `_run_dummy_serial_mtp_forward` never executes.
+#
+# That path is where the KV cache is most fragile. With the cache on, a rank with work issues
+# D+2 MTP forwards (commit pass, D depths, extra append) while a rank without work must issue
+# exactly D+2 matching ones -- and it must replay the CACHE-FREE ("mtp", ...) graphs, never
+# the KV-aware ("mtp_kv", ...) ones, whose append would target an idle rank's KV cache with no
+# valid block table. A mismatch in count or graph/eager mode does not raise; the MoE
+# all-to-all blocks. These tests therefore assert by COMPLETING.
+#
+# Driving is context + controller directly, matching `TestMTPCudaGraphExpertParallel` above:
+# no engine, no ZMQ consensus, no asyncio -- just the two mixin entry points the production
+# run loop dispatches between, run concurrently on different ranks.
 
-def _build_hybrid_stack_spec():
-    """Build a minimal HybridStack spec using local (non-TE) modules."""
-    attention_layer_spec = get_gpt_layer_local_spec()
 
-    backend = LocalSpecProvider()
-    norm_impl = backend.layer_norm()
-    col_linear_impl = backend.column_parallel_linear()
+@pytest.mark.internal
+class TestMtpKvCacheIdleExpertParallelRank:
+    """Idle vs active EP ranks running the MTP KV cache paths against real collectives."""
 
-    mtp_layer_spec = ModuleSpec(
-        module=MultiTokenPredictionLayer,
-        submodules=MultiTokenPredictionLayerSubmodules(
-            enorm=norm_impl,
-            hnorm=norm_impl,
-            eh_proj=col_linear_impl,
-            mtp_model_layer=None,
-            layer_norm=norm_impl,
-        ),
+    HIDDEN_SIZE = 32
+    VOCAB_SIZE = 100
+    MAX_SEQ_LEN = 128
+    NUM_LAYERS = 2
+    NUM_ATTN_HEADS = 4
+    NUM_MOE_EXPERTS = 2
+    NUM_SPECULATIVE_TOKENS = 2
+
+    @classmethod
+    def setup_class(cls):
+        if Utils.world_size < _EP_SIZE:
+            pytest.skip(f"EP test requires at least {_EP_SIZE} GPUs")
+        if Utils.world_size % _EP_SIZE != 0:
+            pytest.skip(
+                f"world_size ({Utils.world_size}) must be divisible by EP size ({_EP_SIZE})"
+            )
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=_EP_SIZE,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        torch.cuda.synchronize()
+        dist.barrier()
+        delete_cuda_graphs()
+        InferenceMode.unset_active()
+
+    # ---- helpers ---------------------------------------------------------- #
+
+    def _build_model(self, model_type='gpt'):
+        """MoE + MTP model whose head is a single REPEATED attention layer."""
+        _reset_moe_layer_cache()
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        mtp_num_layers = 1
+        config = TransformerConfig(
+            num_layers=self.NUM_LAYERS,
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_heads=self.NUM_ATTN_HEADS,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
+            params_dtype=torch.bfloat16,
+            expert_model_parallel_size=_EP_SIZE,
+            num_moe_experts=self.NUM_MOE_EXPERTS,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=True,
+            cuda_graph_impl="local",
+            # Required by TextGenerationController for local graphs + EP > 1.
+            moe_pad_experts_for_cuda_graph_inference=True,
+            inference_moe_token_dispatcher_type='nccl',
+        )
+        if model_type == 'gpt':
+            layer_spec = get_gpt_layer_local_spec(num_experts=self.NUM_MOE_EXPERTS)
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config=config, spec=layer_spec, use_transformer_engine=False
+            )
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=self.MAX_SEQ_LEN,
+                parallel_output=True,
+                pre_process=True,
+                post_process=True,
+                mtp_block_spec=mtp_block_spec,
+            ).cuda()
+        elif model_type == 'hybrid':
+            # A single-`*` MTP block keeps the head one non-recurrent attention layer, which
+            # `_build_controller` asserts is enough to turn `enable_mtp_kv_cache` on.
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=_build_hybrid_stack_spec(num_experts=self.NUM_MOE_EXPERTS),
+                vocab_size=self.VOCAB_SIZE,
+                max_sequence_length=self.MAX_SEQ_LEN,
+                parallel_output=True,
+                pre_process=True,
+                post_process=True,
+                hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
+                position_embedding_type='learned_absolute',
+            ).cuda()
+        else:
+            raise ValueError(f"Unknown model_type: {model_type!r}")
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
+        model.eval()
+        return model
+
+    def _build_controller(self, model, *, num_cuda_graphs=None):
+        context = DynamicInferenceContext(
+            model_config=model.config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.MAX_SEQ_LEN,
+                buffer_size_gb=0.5,
+                block_size_tokens=256,
+                materialize_only_last_token_logits=False,
+                num_speculative_tokens=self.NUM_SPECULATIVE_TOKENS,
+                num_cuda_graphs=num_cuda_graphs,
+                max_requests=16,
+                sampling_backend='torch',
+            ),
+        )
+        assert context.enable_mtp_kv_cache, (
+            "MTP KV cache is OFF for this config, so these tests would pass vacuously; check "
+            "the mtp_use_repeated_layer / mtp_num_layers / num_speculative_tokens gates"
+        )
+        wrapped = GPTInferenceWrapper(model, context)
+        wrapped.model_is_pipeline_parallel = False
+        InferenceMode.set_active()
+        controller = TextGenerationController(
+            inference_wrapped_model=wrapped, tokenizer=mock.Mock()
+        )
+        return controller, context
+
+    def _prepare_active_rank(self, controller, context, state):
+        """Give this rank real requests and the decoder hidden states MTP consumes."""
+        context.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[state])
+        context.initialize_attention_state()
+
+        active_request_count = context.total_request_count - context.paused_request_count
+        controller._init_mtp_sampling_tensors()
+        controller._sampled_tokens_cuda[:active_request_count] = torch.remainder(
+            torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
+        )
+        # Greedy sampling keeps the draft loop deterministic.
+        context.active_request_metadata["temperature"][:active_request_count] = 1.0
+        context.active_request_metadata["top_k"][:active_request_count] = 1
+        context.active_request_metadata["top_p"][:active_request_count] = 0.0
+
+        token_count = context.padded_active_token_count
+        context.mtp_decoder_hidden_states = torch.randn(
+            token_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+        )
+        controller._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+        return active_request_count
+
+    def _prepare_idle_rank(self, controller, context):
+        """Mirror what the engine run loop does on a rank with no schedulable work."""
+        context.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        controller._init_mtp_sampling_tensors()
+
+    # ---- tests ------------------------------------------------------------ #
+
+    @pytest.mark.parametrize(
+        "peer_state", [DECODE, PREFILL, MIXED], ids=[f"peer={s}" for s in [DECODE, PREFILL, MIXED]]
     )
-    mtp_block_spec = ModuleSpec(
-        module=MultiTokenPredictionBlock,
-        submodules=MultiTokenPredictionBlockSubmodules(layer_specs=[mtp_layer_spec]),
-    )
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_idle_rank_matches_active_rank(self, peer_state, model_type):
+        """Even EP ranks idle, odd ranks run the real MTP KV cache path.
 
-    return ModuleSpec(
-        module=HybridStack,
-        submodules=HybridStackSubmodules(
-            attention_layer=attention_layer_spec, mtp_block_spec=mtp_block_spec
-        ),
-    )
+        The idle rank runs `_run_dummy_serial_mtp_forward`; the active rank runs the commit
+        pass, the draft loop, and the extra append. Their MoE all-to-alls must line up.
+        """
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        is_idle = ep_rank % 2 == 0
+
+        model = self._build_model(model_type=model_type)
+        controller, context = self._build_controller(model)
+
+        if is_idle:
+            self._prepare_idle_rank(controller, context)
+            controller._run_dummy_serial_mtp_forward()
+        else:
+            self._prepare_active_rank(controller, context, peer_state)
+            # base_position=None exercises the legacy derivation from post-rewind CPU state.
+            controller._compute_serial_mtp_and_sample()
+            active = context.total_request_count - context.paused_request_count
+            sampled = controller._sampled_mtp_tokens_cuda[:, :active]
+            assert sampled.shape == (controller.num_mtp_depths, active)
+            assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    @pytest.mark.parametrize("rank_states", _STATE_COMBOS, ids=[",".join(s) for s in _STATE_COMBOS])
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_idle_active_cross_product(self, rank_states, model_type):
+        """Every assignment of per-rank load, including all-idle and all-active."""
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        my_state = rank_states[ep_rank]
+        is_idle = my_state == NONE
+
+        model = self._build_model(model_type=model_type)
+        controller, context = self._build_controller(model)
+
+        # EP ranks must agree on the CUDA-graph decision before either MTP path runs; that
+        # agreement is what keeps the two paths' graph/eager modes matched.
+        if is_idle:
+            self._prepare_idle_rank(controller, context)
+        else:
+            self._prepare_active_rank(controller, context, my_state)
+
+        uses_graph = torch.tensor(
+            [int(context.using_cuda_graph_this_step())], device='cuda', dtype=torch.int32
+        )
+        lo, hi = uses_graph.clone(), uses_graph.clone()
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=ep_group)
+        dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=ep_group)
+        assert lo.item() == hi.item(), (
+            f"EP ranks disagree on CUDA graph usage (rank_states={rank_states}); the real and "
+            f"dummy MTP paths would run in different modes"
+        )
+
+        if is_idle:
+            controller._run_dummy_serial_mtp_forward()
+        else:
+            controller._compute_serial_mtp_and_sample()
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_idle_rank_matches_active_rank_with_cuda_graphs(self, model_type):
+        """Same parity contract with MTP CUDA graphs captured by the engine warmup.
+
+        Graphed is the harder case: the active rank replays the KV-aware ("mtp_kv", ...)
+        graphs while the idle rank must replay the cache-free ("mtp", ...) ones, and both
+        families have to have been captured at the same batch size.
+        """
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        is_idle = ep_rank % 2 == 0
+
+        model = self._build_model(model_type=model_type)
+        controller, context = self._build_controller(model, num_cuda_graphs=-1)
+        # Engine construction runs create_cuda_graphs(), capturing both MTP graph families
+        # exactly as production warmup does.
+        DynamicInferenceEngine(controller, context)
+
+        if is_idle:
+            self._prepare_idle_rank(controller, context)
+        else:
+            self._prepare_active_rank(controller, context, DECODE)
+
+        # Both ranks must agree on the MTP batch size. In production `_mtp_resolved_padded_count`
+        # carries an EP-synced value set during the main decode step, which this test bypasses --
+        # and `_init_mtp_sampling_tensors` (called by both prepare helpers) resets it to None.
+        # Left at None the idle rank falls back to padded_count=1 while the active rank uses its
+        # own request count, so `moe_pad_experts_for_cuda_graph_inference` derives a different
+        # capacity per rank and the fixed-size MoE all-to-alls deadlock. It also forces both
+        # ranks eager, so neither would replay the graphs this test exists to exercise.
+        # `cuda_graph_batch_dimensions_list` is config-derived, so both ranks pick the same size.
+        warmed_sizes = sorted(
+            {dim.req_count for dim in context.cuda_graph_batch_dimensions_list if dim.req_count > 0}
+        )
+        min_count = _STATE_DIMS[DECODE].decode_req_count
+        eligible = [n for n in warmed_sizes if n >= min_count]
+        assert eligible, (
+            f"No MTP CUDA graph was warmed at a batch size >= {min_count}; "
+            f"warmed sizes were {warmed_sizes}"
+        )
+        controller._mtp_resolved_padded_count = eligible[0]
+
+        if is_idle:
+            controller._run_dummy_serial_mtp_forward()
+        else:
+            controller._compute_serial_mtp_and_sample()
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+
+# --------------------------------------------------------------------------- #
+#  TestMTPBlockScopeCudaGraph (TP = 1)
+# --------------------------------------------------------------------------- #
 
 
 class TestMTPBlockScopeCudaGraph:

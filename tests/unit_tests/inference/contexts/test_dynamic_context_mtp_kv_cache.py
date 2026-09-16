@@ -1,0 +1,1060 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Unit tests for the MTP draft-KV bookkeeping on `DynamicInferenceContext`.
+
+The MTP KV cache reserves one extra attention-layer slot in the shared KV buffer and drives its
+own attention metadata (bypassing the coalesced CPU->GPU bookkeeping transfer) so the MTP draft
+forwards never disturb the main step's state. The methods under test are pure GPU tensor
+bookkeeping -- no model forward is involved -- so they are exercised directly against a real
+context with hand-seeded per-request state:
+
+  * `_mtp_begin_decode` -- enter MTP-forward mode for a draft loop
+  * `_mtp_setup_decode_step` -- one draft depth (roll-by-one)
+  * `_mtp_setup_prefill_step` -- the varlen commit pass
+
+The lifecycle itself (`begin_decode_for_capture`, `advance_decode_step`, `end_forward`,
+`snapshot_prerewind_block_table`) lives on `MTPMetadata` and is driven directly; only the
+steps that build metadata have a wrapper here.
+
+The invariants asserted are the ones the draft attention depends on: write position
+`P_r = base_position_r - 1 + depth`, read length `kv_len = P_r + 1` (write-then-attend), and
+padding rows that never index real KV.
+"""
+
+import types
+
+import pytest
+import torch
+
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+
+# Small, fixed geometry: block_size_tokens=8 keeps block-boundary crossings reachable with
+# two-digit positions, and max_sequence_length=64 gives max_kv_block_count=8 block columns.
+BLOCK_SIZE_TOKENS = 8
+MAX_SEQUENCE_LENGTH = 64
+NUM_LAYERS = 4
+
+
+def _make_context(
+    num_speculative_tokens: int = 2,
+    mtp_num_layers=1,
+    mtp_use_repeated_layer: bool = True,
+    mtp_layer_type_list=None,
+    is_hybrid_model: bool = False,
+    max_requests: int = 16,
+) -> DynamicInferenceContext:
+    """Build a real `DynamicInferenceContext`, MTP-KV-enabled unless a gate is switched off."""
+    if is_hybrid_model:
+        mamba_inference_state_config = MambaInferenceStateConfig(
+            layer_type_list=[Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
+            conv_states_shape=(544, 4),
+            ssm_states_shape=(8, 64, 16),
+            conv_states_dtype=torch.bfloat16,
+            ssm_states_dtype=torch.bfloat16,
+        )
+    else:
+        mamba_inference_state_config = None
+
+    return DynamicInferenceContext(
+        model_config=TransformerConfig(
+            params_dtype=torch.bfloat16,
+            num_layers=NUM_LAYERS,
+            kv_channels=16,
+            num_attention_heads=4,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        ),
+        inference_config=InferenceConfig(
+            max_sequence_length=MAX_SEQUENCE_LENGTH,
+            use_cuda_graphs_for_non_decode_steps=True,
+            buffer_size_gb=0.1,
+            paused_buffer_size_gb=0.02,
+            block_size_tokens=BLOCK_SIZE_TOKENS,
+            max_tokens=256,
+            max_requests=max_requests,
+            num_speculative_tokens=num_speculative_tokens,
+            mamba_inference_state_config=mamba_inference_state_config,
+            mtp_layer_type_list=mtp_layer_type_list,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,  # unit tests currently broken with UVM
+        ),
+    )
+
+
+def _seed_requests(context, block_rows, paused_request_count: int = 0):
+    """Populate the per-request block table for `len(block_rows)` active requests.
+
+    `block_rows[r]` is the list of KV block ids request r owns, in position order. Rows before
+    `paused_request_count` are left at the -1 fill, so a test asserting on the active slice fails
+    loudly if the implementation forgets to offset by the paused count.
+    """
+    num_active = len(block_rows)
+    context.paused_request_count = paused_request_count
+    context.total_request_count = paused_request_count + num_active
+    for i, blocks in enumerate(block_rows):
+        row = paused_request_count + i
+        context.request_to_kv_block_ids[row, : len(blocks)] = torch.tensor(
+            blocks, dtype=context.request_to_kv_block_ids.dtype
+        )
+    return num_active
+
+
+class TestMtpKvCacheGating:
+    """`enable_mtp_kv_cache` is derived, not configured, so it must track every gate exactly."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_enabled_reserves_one_extra_attention_slot(self):
+        """The draft KV lives in a reserved slot appended after the main attention layers."""
+        context = _make_context()
+        assert context.enable_mtp_kv_cache is True
+        # The slot index is the pre-increment attention-layer count, and the count grows by one
+        # so the shared KV buffer is sized for it.
+        assert context.mtp_kv_layer_slot == NUM_LAYERS
+        assert context.num_attention_layers == NUM_LAYERS + 1
+
+    def test_disabled_without_speculative_decoding(self):
+        """No drafts means no draft KV to populate."""
+        context = _make_context(num_speculative_tokens=0)
+        assert context.enable_mtp_kv_cache is False
+        assert context.mtp_kv_layer_slot is None
+        assert context.num_attention_layers == NUM_LAYERS
+
+    def test_disabled_without_mtp_layers(self):
+        """A model with no MTP head has nothing to seed."""
+        context = _make_context(mtp_num_layers=None)
+        assert context.enable_mtp_kv_cache is False
+        assert context.mtp_kv_layer_slot is None
+
+    def test_disabled_for_per_depth_head(self):
+        """A per-depth head has no single `mtp.layers[0]` to seed through."""
+        context = _make_context(mtp_use_repeated_layer=False)
+        assert context.enable_mtp_kv_cache is False
+        assert context.mtp_kv_layer_slot is None
+
+    def test_disabled_for_recurrent_mtp_head(self):
+        """A Mamba MTP head has no KV to append, so the reserved slot would go unused."""
+        context = _make_context(mtp_layer_type_list=[Symbols.MAMBA, Symbols.MLP])
+        assert context.enable_mtp_kv_cache is False
+
+    def test_disabled_for_multi_attention_mtp_head(self):
+        """Two attention layers in the head would collide on the single reserved slot."""
+        context = _make_context(mtp_layer_type_list=[Symbols.ATTENTION, Symbols.ATTENTION])
+        assert context.enable_mtp_kv_cache is False
+
+    def test_disabled_for_multi_attention_head_on_an_attention_only_hybrid(self):
+        """`****/**`: no recurrent main layer, so the head pattern is the only gate input."""
+        context = _make_context(
+            is_hybrid_model=False, mtp_layer_type_list=[Symbols.ATTENTION, Symbols.ATTENTION]
+        )
+        assert context.enable_mtp_kv_cache is False
+
+    def test_disabled_for_recurrent_head_on_an_attention_only_hybrid(self):
+        """`****/M`: a recurrent head has no KV to append even with a pure-attention backbone."""
+        context = _make_context(is_hybrid_model=False, mtp_layer_type_list=[Symbols.MAMBA])
+        assert context.enable_mtp_kv_cache is False
+
+    def test_enabled_for_hybrid_main_decoder_with_attention_mtp_head(self):
+        """The gate is on the MTP head, not the main decoder: a hybrid backbone is fine."""
+        context = _make_context(
+            is_hybrid_model=True, mtp_layer_type_list=[Symbols.ATTENTION, Symbols.MLP]
+        )
+        assert context.enable_mtp_kv_cache is True
+
+
+class TestMtpDecodeBookkeeping:
+    """The per-depth draft write/read metadata."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_begin_decode_seeds_offsets_and_block_table(self):
+        context = _make_context()
+        _seed_requests(context, [[3, 4], [7, 9]])
+        start_positions = torch.tensor([5, 11], device=torch.cuda.current_device())
+
+        context._mtp_begin_decode(2, 2, start_positions)
+
+        assert context.mtp_metadata.forward_active is True
+        assert context.mtp_metadata.graphed is False
+        assert context.mtp_metadata.active_request_count == 2
+        assert context.mtp_metadata.padded_count == 2
+        assert context.mtp_metadata.active_offsets.dtype == torch.int32
+        assert context.mtp_metadata.active_offsets.cpu().tolist() == [5, 11]
+        assert context.mtp_metadata.active_block_table[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
+
+    def test_begin_decode_clones_caller_start_positions(self):
+        """`advance_decode_step` must not mutate the caller's `base_position - 1` tensor."""
+        context = _make_context()
+        _seed_requests(context, [[3], [7]])
+        start_positions = torch.tensor([5, 11], device=torch.cuda.current_device())
+
+        context._mtp_begin_decode(2, 2, start_positions)
+        context.mtp_metadata.advance_decode_step()
+        context.mtp_metadata.advance_decode_step()
+
+        assert start_positions.cpu().tolist() == [
+            5,
+            11,
+        ], "advancing the MTP write positions aliased and corrupted the caller's tensor"
+        assert context.mtp_metadata.active_offsets.cpu().tolist() == [7, 13]
+
+    def test_begin_decode_honors_paused_request_offset(self):
+        """Active requests start at `paused_request_count`, not at row 0."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4], [7, 9]], paused_request_count=2)
+        start_positions = torch.tensor([5, 11], device=torch.cuda.current_device())
+
+        context._mtp_begin_decode(2, 2, start_positions)
+
+        # Rows 0-1 are paused (still the -1 fill); the block table must hold the ACTIVE rows.
+        assert context.mtp_metadata.active_block_table[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
+
+    def test_begin_decode_prefers_prerewind_block_table(self):
+        """Deep drafts extend past the accepted range into blocks rewind has since released."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
+        # Simulate `_rewind_kv_cache` releasing the second block and clearing it to -1.
+        context.request_to_kv_block_ids[0, 1] = -1
+
+        context._mtp_begin_decode(1, 1, torch.tensor([9], device=torch.cuda.current_device()))
+
+        assert int(context.mtp_metadata.active_block_table[0, 1].item()) == 4, (
+            "the draft loop read the post-rewind block table and would send deep drafts to "
+            "block -1"
+        )
+
+    def test_begin_decode_falls_back_to_live_block_table(self):
+        """With no snapshot taken (e.g. a pure-prefill step) the live table is used."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        assert context.mtp_metadata.prerewind_block_table is None
+
+        context._mtp_begin_decode(1, 1, torch.tensor([9], device=torch.cuda.current_device()))
+
+        assert context.mtp_metadata.active_block_table[0, :2].cpu().tolist() == [3, 4]
+
+    def test_snapshot_is_a_copy_not_an_alias(self):
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
+        context.request_to_kv_block_ids[0, 0] = 99
+
+        assert int(context.mtp_metadata.prerewind_block_table[0, 0].item()) == 3
+
+    def test_snapshot_is_a_noop_when_disabled(self):
+        context = _make_context(num_speculative_tokens=0)
+        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
+        assert context.mtp_metadata.prerewind_block_table is None
+
+    def test_setup_decode_step_writes_roll_by_one_maps(self):
+        """Depth 0 writes at `base_position - 1` and attends over `position + 1` keys."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4], [7, 9]])
+        # Positions 5 and 11: 5 is in block-column 0 (local 5); 11 is in block-column 1 (local 3).
+        context._mtp_begin_decode(2, 2, torch.tensor([5, 11], device=torch.cuda.current_device()))
+
+        context._mtp_setup_decode_step()
+
+        gv = context.gpu_view
+        assert gv.token_to_block_idx[:2].cpu().tolist() == [3, 9]
+        assert gv.token_to_local_position_within_kv_block[:2].cpu().tolist() == [5, 3]
+        assert gv.token_to_request_idx[:2].cpu().tolist() == [0, 1]
+        assert gv.token_to_position_in_request[:2].cpu().tolist() == [5, 11]
+        assert gv.token_to_pos_ids[:2].cpu().tolist() == [5, 11]
+        # One query token per request; kv_len = P + 1 (write-then-attend).
+        assert gv.mha_query_lengths[:2].cpu().tolist() == [1, 1]
+        assert gv.mha_cu_query_seq_lengths[:3].cpu().tolist() == [0, 1, 2]
+        assert gv.mha_kv_seq_lengths[:2].cpu().tolist() == [6, 12]
+        assert gv.mha_cu_kv_seq_lengths[:3].cpu().tolist() == [0, 6, 18]
+
+    def test_setup_decode_step_crosses_block_boundary(self):
+        """A draft that steps past a block boundary must land in the NEXT block at local 0."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        # Start at the last slot of block-column 0, so depth 1 lands in block-column 1.
+        context._mtp_begin_decode(
+            1, 1, torch.tensor([BLOCK_SIZE_TOKENS - 1], device=torch.cuda.current_device())
+        )
+        gv = context.gpu_view
+
+        context._mtp_setup_decode_step()
+        assert int(gv.token_to_block_idx[0].item()) == 3
+        assert int(gv.token_to_local_position_within_kv_block[0].item()) == BLOCK_SIZE_TOKENS - 1
+
+        context.mtp_metadata.advance_decode_step()
+        context._mtp_setup_decode_step()
+        assert int(gv.token_to_block_idx[0].item()) == 4
+        assert int(gv.token_to_local_position_within_kv_block[0].item()) == 0
+        assert int(gv.mha_kv_seq_lengths[0].item()) == BLOCK_SIZE_TOKENS + 1
+
+    def test_setup_decode_step_advances_by_exactly_one_per_depth(self):
+        """Across D depths the write position must advance by 1 per depth and never skip."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4, 5], [7, 9, 11]])
+        context._mtp_begin_decode(2, 2, torch.tensor([5, 11], device=torch.cuda.current_device()))
+        gv = context.gpu_view
+
+        seen = []
+        for _ in range(4):
+            context._mtp_setup_decode_step()
+            seen.append(gv.token_to_position_in_request[:2].cpu().tolist())
+            context.mtp_metadata.advance_decode_step()
+
+        assert seen == [[5, 11], [6, 12], [7, 13], [8, 14]]
+
+    def test_setup_decode_step_neutralizes_padding_rows(self):
+        """Padded slots must never index real KV or contribute query/key length."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        context._mtp_begin_decode(1, 4, torch.tensor([5], device=torch.cuda.current_device()))
+
+        context._mtp_setup_decode_step()
+
+        gv = context.gpu_view
+        dummy = context.kv_block_allocator.dummy_block_idx
+        assert gv.token_to_block_idx[1:4].cpu().tolist() == [dummy, dummy, dummy]
+        assert gv.token_to_local_position_within_kv_block[1:4].cpu().tolist() == [0, 0, 0]
+        assert gv.mha_query_lengths[1:4].cpu().tolist() == [0, 0, 0]
+        assert gv.mha_kv_seq_lengths[1:4].cpu().tolist() == [0, 0, 0]
+        # Cumulative lengths flat-line across the padding so the varlen kernel sees empty rows.
+        assert gv.mha_cu_query_seq_lengths[1:5].cpu().tolist() == [1, 1, 1, 1]
+        assert gv.mha_cu_kv_seq_lengths[1:5].cpu().tolist() == [6, 6, 6, 6]
+        assert (gv.mha_block_table[1:4] == -1).all()
+
+    def test_setup_decode_step_eager_routes_to_non_graph_metadata(self):
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        context._mtp_begin_decode(
+            1, 1, torch.tensor([5], device=torch.cuda.current_device()), graphed=False
+        )
+
+        context._mtp_setup_decode_step()
+
+        assert context.active_attn_metadata is context.non_graph_attn_metadata
+        assert context._using_cuda_graph_this_step is False
+        assert context.active_token_count == 1
+        assert context.padded_active_token_count == 1
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        # Eager takes a tight per-step max: kv_len = 5 + 1.
+        assert mha.state_data["max_seqlen_k"] == 6
+        assert mha.state_data["max_seqlen_q"] == 1
+
+    def test_setup_decode_step_graphed_routes_to_graph_metadata(self):
+        """Graphed replay must use the fixed capture-time bound, not a per-step `.item()` sync."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        context._mtp_begin_decode(
+            1, 4, torch.tensor([5], device=torch.cuda.current_device()), graphed=True
+        )
+
+        context._mtp_setup_decode_step()
+
+        assert context.active_attn_metadata is context.graph_attn_metadata
+        assert context._using_cuda_graph_this_step is True
+        assert context.padded_active_token_count == 4
+        mha = context.graph_attn_metadata["mha_metadata"]
+        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen == MAX_SEQUENCE_LENGTH
+        assert mha.state_data["max_seqlen_q"] == 1
+        # The metadata is sized by the PADDED count so the graph's launch bounds stay stable.
+        assert mha.state_data["query_lengths"].shape[0] == 4
+
+    def test_setup_decode_step_restores_the_graph_flag_clobbered_by_the_commit_pass(self):
+        """The commit pass runs eager and leaves the live graph flag False.
+
+        The depth loop reads `using_cuda_graph_this_step()` to pick `eager=` and `cache_key=`
+        for each draft forward, so `_mtp_setup_decode_step` must put the flag back before the
+        forward sees it. If it did not, a graphed step would run eager with `cache_key=None`
+        and trigger an illegal CUDA-graph capture at runtime.
+        """
+        context = _make_context()
+        device = torch.cuda.current_device()
+        _seed_requests(context, [[3, 4]])
+
+        # The commit pass: a varlen eager forward that clobbers the flag.
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([2], device=device),
+            block_table_prefill=torch.full(
+                (1, context.max_kv_block_count),
+                3,
+                dtype=context.gpu_view.mha_block_table.dtype,
+                device=device,
+            ),
+        )
+        context.mtp_metadata.end_forward()
+        assert context.using_cuda_graph_this_step() is False
+
+        context._mtp_begin_decode(1, 1, torch.tensor([5], device=device), graphed=True)
+        context._mtp_setup_decode_step()
+
+        assert context.using_cuda_graph_this_step() is True
+
+    def test_graphed_bounds_are_position_independent(self):
+        """Graphed replay must use the fixed capture-time bound, never a per-step max.
+
+        A per-step `int(kv_len.max().item())` would both desync from the captured launch bounds
+        and add a GPU->CPU sync inside the draft loop.
+        """
+        context = _make_context()
+        device = torch.cuda.current_device()
+        _seed_requests(context, [[3, 4, 5]])
+        mha = context.graph_attn_metadata["mha_metadata"]
+
+        context._mtp_begin_decode(1, 1, torch.tensor([2], device=device), graphed=True)
+        context._mtp_setup_decode_step()
+        bound_at_low_position = mha.state_data["max_seqlen_k"]
+
+        context._mtp_begin_decode(1, 1, torch.tensor([20], device=device), graphed=True)
+        context._mtp_setup_decode_step()
+        bound_at_high_position = mha.state_data["max_seqlen_k"]
+
+        assert bound_at_low_position == bound_at_high_position == MAX_SEQUENCE_LENGTH
+        # The real per-request lengths still come from the GPU cu_kv tensors.
+        assert int(context.gpu_view.mha_kv_seq_lengths[0].item()) == 21
+
+    def test_capture_advances_positions_while_staying_on_scratch(self):
+        """Warmup walks the same setup/advance sequence as a real step, on scratch memory only."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        dummy = context.kv_block_allocator.dummy_block_idx
+        gv = context.gpu_view
+
+        context.mtp_metadata.begin_decode_for_capture(2)
+        seen_positions = []
+        for _ in range(3):
+            context._mtp_setup_decode_step()
+            seen_positions.append(gv.token_to_position_in_request[:2].cpu().tolist())
+            assert (gv.token_to_block_idx[:2] == dummy).all()
+            context.mtp_metadata.advance_decode_step()
+        context.mtp_metadata.end_forward()
+
+        assert seen_positions == [[0, 0], [1, 1], [2, 2]]
+        assert context.mtp_metadata.forward_active is False
+
+    def test_capture_crossing_a_block_boundary_stays_on_scratch(self):
+        """Even past a block boundary the capture must not touch a real block."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        dummy = context.kv_block_allocator.dummy_block_idx
+
+        context.mtp_metadata.begin_decode_for_capture(1)
+        for _ in range(BLOCK_SIZE_TOKENS + 2):
+            context._mtp_setup_decode_step()
+            assert int(context.gpu_view.token_to_block_idx[0].item()) == dummy
+            context.mtp_metadata.advance_decode_step()
+
+    def test_capture_uses_graph_metadata_at_the_padded_size(self):
+        """Capture-time launch bounds must match the runtime graphed step's."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+
+        context.mtp_metadata.begin_decode_for_capture(4)
+        context._mtp_setup_decode_step()
+
+        assert context.active_attn_metadata is context.graph_attn_metadata
+        assert context._using_cuda_graph_this_step is True
+        mha = context.graph_attn_metadata["mha_metadata"]
+        assert mha.state_data["max_seqlen_q"] == 1
+        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen
+        assert mha.state_data["query_lengths"].shape[0] == 4
+        # Every capture row is a real (non-padding) row, so nothing is sentinel-filled.
+        assert context.gpu_view.mha_query_lengths[:4].cpu().tolist() == [1, 1, 1, 1]
+
+    def test_begin_decode_for_capture_touches_only_scratch_kv(self):
+        """Capture-time metadata must point every row at the scratch block."""
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+
+        context.mtp_metadata.begin_decode_for_capture(4)
+
+        dummy = context.kv_block_allocator.dummy_block_idx
+        assert context.mtp_metadata.graphed is True
+        assert context.mtp_metadata.forward_active is True
+        assert context.mtp_metadata.active_request_count == 4
+        assert context.mtp_metadata.padded_count == 4
+        assert (context.mtp_metadata.active_offsets == 0).all()
+        assert (context.mtp_metadata.active_block_table == dummy).all()
+
+        # A capture-time setup step must not write any real block id.
+        context._mtp_setup_decode_step()
+        assert (context.gpu_view.token_to_block_idx[:4] == dummy).all()
+
+    def test_end_decode_leaves_mtp_forward_mode(self):
+        context = _make_context()
+        _seed_requests(context, [[3, 4]])
+        context._mtp_begin_decode(1, 1, torch.tensor([5], device=torch.cuda.current_device()))
+        assert context.mtp_metadata.forward_active is True
+
+        context.mtp_metadata.end_forward()
+
+        assert context.mtp_metadata.forward_active is False
+
+    def test_begin_decode_asserts_when_disabled(self):
+        context = _make_context(num_speculative_tokens=0)
+        with pytest.raises(AssertionError):
+            context._mtp_begin_decode(1, 1, torch.tensor([5], device=torch.cuda.current_device()))
+
+
+class TestMtpDraftBlockCoverage:
+    """Every draft write must land on a block the main model actually allocated.
+
+    The main path pre-allocates a block once `request_last_kv_block_offset` reaches
+    `block_size_tokens - 1 - num_speculative_tokens`, reserving headroom for the speculative
+    positions. The draft loop writes `base_position - 1 + depth` for depth 0..D, so its deepest
+    write is one position BELOW the main model's own next forward. These tests pin that
+    relationship at and around the block boundary, where an off-by-one would send a deep draft
+    to an unallocated column (-1) and silently corrupt its KV.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _blocks_for(context, num_positions):
+        """Block ids a request owns after prefilling `num_positions`, per the REAL allocator.
+
+        Asks `_compute_prefix_match` for the block count rather than reimplementing the rule.
+        An earlier version of this helper modelled the allocation itself, agreed with the very
+        assumption that was wrong, and so passed while the draft loop was writing to block -1.
+        """
+        req = types.SimpleNamespace(
+            request_id=1,
+            finished_chunk_token_count=0,
+            prompt_tokens=torch.arange(num_positions, dtype=torch.int64),
+            precomputed_block_hashes=[],
+        )
+        match = context._compute_prefix_match(req, num_positions)
+        # `overall_required_blocks` is what the PROMPT occupies; the draft loop's extra block is
+        # carried separately, and the request owns both.
+        owned = match.overall_required_blocks + match.speculative_reserve_blocks
+        # Block 0 is the dummy block, so start real ids at 1.
+        return list(range(1, owned + 1))
+
+    @pytest.mark.parametrize("prompt_length", list(range(1, 2 * BLOCK_SIZE_TOKENS + 1)))
+    def test_every_draft_depth_lands_on_an_allocated_block(self, prompt_length):
+        """Sweep every offset within two blocks, including both exact boundaries."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        depth = context.num_speculative_tokens
+
+        blocks = self._blocks_for(context, prompt_length)
+        _seed_requests(context, [blocks])
+        # Depth 0 writes the roll-by-one entry for main position `prompt_length - 1`.
+        base_position = torch.tensor([prompt_length], device=device)
+        context._mtp_begin_decode(
+            active_request_count=1, padded_count=1, start_positions=(base_position - 1)
+        )
+
+        for d in range(depth + 1):
+            context._mtp_setup_decode_step()
+            destination = context.gpu_view.token_to_block_idx[0].item()
+            position = prompt_length - 1 + d
+            assert destination != -1, (
+                f"prompt_length={prompt_length} depth={d} writes MTP position {position} "
+                f"(block column {position // context.block_size_tokens}) but the request only "
+                f"owns {len(blocks)} block(s); the main path under-allocated for the draft loop."
+            )
+            assert destination in blocks, (
+                f"prompt_length={prompt_length} depth={d} writes to block {destination}, "
+                f"which this request does not own ({blocks})."
+            )
+            context.mtp_metadata.advance_decode_step()
+        context.mtp_metadata.end_forward()
+
+
+class TestMtpMainExecutionState:
+    """Every MTP forward republishes the context's execution state; it must be put back."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_prefill_step_restores_the_main_forward_counts(self):
+        """Log-prob computation runs after the MTP phase and reads these as the MAIN counts."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        # Stand in for a 4-token prefill forward.
+        context.active_attn_metadata = context.non_graph_attn_metadata
+        context.active_token_count = 4
+        context.padded_active_token_count = 8
+        context._using_cuda_graph_this_step = False
+
+        table = torch.full(
+            (1, context.max_kv_block_count),
+            3,
+            dtype=context.gpu_view.mha_block_table.dtype,
+            device=device,
+        )
+        with context._mtp_forward_phase():
+            context.paused_request_count = 0
+            context.total_request_count = 1
+            context._mtp_setup_prefill_step(
+                append_counts=torch.tensor([1], device=device), block_table_prefill=table
+            )
+            # The MTP forward has overwritten the counts with its own one-token geometry.
+            assert context.active_token_count == 1
+
+        assert context.active_token_count == 4
+        assert context.padded_active_token_count == 8
+        assert context._using_cuda_graph_this_step is False
+        assert context.active_attn_metadata is context.non_graph_attn_metadata
+        # Leaving the scope must also leave MTP-forward mode, or KV routing stays on the
+        # draft plane and `is_decode_only` stays False for the rest of the run.
+        assert context.mtp_metadata.forward_active is False
+
+    def test_state_is_restored_when_a_draft_forward_raises(self):
+        """A failed draft must not leave its counts behind for the log-prob code."""
+        context = _make_context()
+        context.active_attn_metadata = context.non_graph_attn_metadata
+        context.active_token_count = 4
+        context.padded_active_token_count = 8
+
+        with pytest.raises(RuntimeError, match="draft blew up"):
+            with context._mtp_forward_phase():
+                context.active_token_count = 1
+                context.padded_active_token_count = 1
+                raise RuntimeError("draft blew up")
+
+        assert context.active_token_count == 4
+        assert context.padded_active_token_count == 8
+        assert context.mtp_metadata.forward_active is False
+
+
+class TestMtpPrefillBookkeeping:
+    """The varlen commit pass: prompt seeding and the per-step committed-KV refresh."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _block_table(context, block_rows):
+        """Build the GPU block table argument the controller passes in.
+
+        Also declares `len(block_rows)` active requests on the context: `_mtp_setup_prefill_step`
+        reads `request_matched_prefix_blocks` over the active slice to keep writes out of
+        inherited blocks, so the slice must be at least as long as the block table.
+        """
+        context.paused_request_count = 0
+        context.total_request_count = len(block_rows)
+        table = torch.full(
+            (len(block_rows), context.max_kv_block_count),
+            -1,
+            dtype=context.gpu_view.mha_block_table.dtype,
+            device=torch.cuda.current_device(),
+        )
+        for i, blocks in enumerate(block_rows):
+            table[i, : len(blocks)] = torch.tensor(blocks, dtype=table.dtype, device=table.device)
+        return table
+
+    def test_prompt_seed_writes_positions_from_zero(self):
+        """Prompt seeding (no start positions) writes each request's positions 0..count-1."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        append_counts = torch.tensor([3, 2], device=device)
+        block_table = self._block_table(context, [[3, 4], [7, 9]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=append_counts, block_table_prefill=block_table
+        )
+
+        gv = context.gpu_view
+        assert gv.token_to_position_in_request[:5].cpu().tolist() == [0, 1, 2, 0, 1]
+        assert gv.token_to_request_idx[:5].cpu().tolist() == [0, 0, 0, 1, 1]
+        assert gv.token_to_block_idx[:5].cpu().tolist() == [3, 3, 3, 7, 7]
+        assert gv.token_to_local_position_within_kv_block[:5].cpu().tolist() == [0, 1, 2, 0, 1]
+        # Fresh causal prefill: kv_length == query_length per request.
+        assert gv.mha_query_lengths[:2].cpu().tolist() == [3, 2]
+        assert gv.mha_kv_seq_lengths[:2].cpu().tolist() == [3, 2]
+        assert gv.mha_cu_query_seq_lengths[:3].cpu().tolist() == [0, 3, 5]
+        assert gv.mha_cu_kv_seq_lengths[:3].cpu().tolist() == [0, 3, 5]
+
+    def test_commit_refresh_shifts_by_request_start_positions(self):
+        """The decode refresh rewrites each request's own committed offset range."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        append_counts = torch.tensor([2, 3], device=device)
+        start_positions = torch.tensor([4, 9], device=device)
+        block_table = self._block_table(context, [[3, 4], [7, 9]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=append_counts,
+            block_table_prefill=block_table,
+            request_start_positions=start_positions,
+        )
+
+        gv = context.gpu_view
+        assert gv.token_to_position_in_request[:5].cpu().tolist() == [4, 5, 9, 10, 11]
+        # Request 0 stays in block-column 0; request 1's positions 9-11 are in block-column 1.
+        assert gv.token_to_block_idx[:5].cpu().tolist() == [3, 3, 9, 9, 9]
+        assert gv.token_to_local_position_within_kv_block[:5].cpu().tolist() == [4, 5, 1, 2, 3]
+
+    def test_commit_refresh_crosses_block_boundary_mid_run(self):
+        """A refreshed run that straddles a block boundary must switch blocks mid-run."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        block_table = self._block_table(context, [[3, 4]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([3], device=device),
+            block_table_prefill=block_table,
+            request_start_positions=torch.tensor([BLOCK_SIZE_TOKENS - 1], device=device),
+        )
+
+        gv = context.gpu_view
+        assert gv.token_to_block_idx[:3].cpu().tolist() == [3, 4, 4]
+        assert gv.token_to_local_position_within_kv_block[:3].cpu().tolist() == [
+            BLOCK_SIZE_TOKENS - 1,
+            0,
+            1,
+        ]
+
+    def test_prefill_step_neutralizes_token_and_request_padding(self):
+        """SP token padding and request padding must never index real KV."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        append_counts = torch.tensor([3, 2], device=device)
+        block_table = self._block_table(context, [[3, 4], [7, 9]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=append_counts,
+            block_table_prefill=block_table,
+            padded_token_count=8,
+            padded_request_count=4,
+        )
+
+        gv = context.gpu_view
+        dummy = context.kv_block_allocator.dummy_block_idx
+        assert gv.token_to_block_idx[5:8].cpu().tolist() == [dummy, dummy, dummy]
+        assert gv.token_to_local_position_within_kv_block[5:8].cpu().tolist() == [0, 0, 0]
+        # Row 2 is the trailing pad request carrying the 3 SP pad tokens; it reads the dummy
+        # block. Row 3 is request padding proper: zero-length and never indexed.
+        assert gv.mha_query_lengths[2:4].cpu().tolist() == [3, 0]
+        assert gv.mha_kv_seq_lengths[2:4].cpu().tolist() == [3, 0]
+        assert gv.mha_cu_query_seq_lengths[2:5].cpu().tolist() == [5, 8, 8]
+        assert gv.mha_cu_kv_seq_lengths[2:5].cpu().tolist() == [5, 8, 8]
+        assert (gv.mha_block_table[2] == dummy).all()
+        assert (gv.mha_block_table[3:4] == -1).all()
+        assert context.active_token_count == 5
+        assert context.padded_active_token_count == 8
+
+    @pytest.mark.parametrize(
+        "append_counts_list, padded_token_count",
+        [([0, 1, 0], 4), ([3, 2], 8), ([2, 2], 4)],
+        ids=["single_token_tp4", "five_tokens_pad8", "already_aligned"],
+    )
+    def test_prefill_step_query_metadata_covers_every_padded_token(
+        self, append_counts_list, padded_token_count
+    ):
+        """`cu_seqlens_q` must describe the SP pad rows, not only the committed ones.
+
+        The packed hidden is padded to a TP multiple before the sequence-parallel scatter, so
+        after the MTP layer's internal gather the attention receives `padded_token_count` query
+        rows. Varlen attention requires `q.shape[0] == cu_seqlens_q[-1]`, so every padded row
+        has to be accounted for by some request in the metadata.
+
+        `single_token_tp4` is the shape that arises whenever exactly one draft position is
+        committed under TP=4: one real token padded up to four.
+        """
+        context = _make_context()
+        device = torch.cuda.current_device()
+        append_counts = torch.tensor(append_counts_list, device=device)
+        num_requests = len(append_counts_list)
+        total = int(append_counts.sum())
+        pad_tokens = padded_token_count - total
+        block_table = self._block_table(context, [[3, 4]] * num_requests)
+
+        context._mtp_setup_prefill_step(
+            append_counts=append_counts,
+            block_table_prefill=block_table,
+            padded_token_count=padded_token_count,
+            padded_request_count=num_requests,
+        )
+
+        gv = context.gpu_view
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        padded_p = mha.state_data["cu_query_seq_lengths"].numel() - 1
+        cu_q = gv.mha_cu_query_seq_lengths[: padded_p + 1].cpu().tolist()
+
+        assert cu_q[0] == 0
+        assert cu_q[-1] == padded_token_count, (
+            f"cu_seqlens_q ends at {cu_q[-1]} but attention will be handed "
+            f"{padded_token_count} query rows"
+        )
+        assert int(gv.mha_query_lengths[:padded_p].sum()) == padded_token_count
+        # Causal prefill: the kv run matches the query run for every request, pad row included.
+        assert gv.mha_cu_kv_seq_lengths[: padded_p + 1].cpu().tolist() == cu_q
+        # The kernel's seqlen bound has to cover the pad run as well as the real requests.
+        assert mha.state_data["max_seqlen_q"] >= max([*append_counts_list, pad_tokens])
+        if pad_tokens > 0:
+            # The pad request must read a real (dummy) block; -1 is not a valid page index.
+            assert (
+                gv.mha_block_table[num_requests] == context.kv_block_allocator.dummy_block_idx
+            ).all()
+        assert context.active_token_count == total
+        assert context.padded_active_token_count == padded_token_count
+
+    def test_prefill_step_pads_query_metadata_with_every_request_slot_taken(self):
+        """A full batch leaves no spare request row, so the pad rows join the last request.
+
+        `mha_query_lengths` and friends are sized to `max_requests`, so when every slot holds a
+        real request the trailing-request form has nowhere to go. `cu_seqlens_q[-1]` must still
+        equal the padded query-row count.
+        """
+        max_requests = 3
+        context = _make_context(max_requests=max_requests)
+        device = torch.cuda.current_device()
+        append_counts = torch.tensor([0, 1, 0], device=device)
+        block_table = self._block_table(context, [[3, 4]] * max_requests)
+        padded_token_count = 4
+
+        context._mtp_setup_prefill_step(
+            append_counts=append_counts,
+            block_table_prefill=block_table,
+            padded_token_count=padded_token_count,
+            padded_request_count=max_requests,
+        )
+
+        gv = context.gpu_view
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        assert gv.mha_query_lengths.numel() == max_requests, "test needs a fully occupied batch"
+        cu_q = gv.mha_cu_query_seq_lengths[: max_requests + 1].cpu().tolist()
+        assert cu_q[-1] == padded_token_count
+        assert int(gv.mha_query_lengths[:max_requests].sum()) == padded_token_count
+        # The pad rows joined the last real request, so its run grew by the pad amount.
+        assert gv.mha_query_lengths[max_requests - 1].item() == 3
+        assert gv.mha_kv_seq_lengths[max_requests - 1].item() == 3
+        assert gv.mha_cu_kv_seq_lengths[: max_requests + 1].cpu().tolist() == cu_q
+        assert mha.state_data["max_seqlen_q"] >= 3
+        assert context.padded_active_token_count == padded_token_count
+
+    def test_prefill_step_forces_varlen_path_on_a_pure_decode_step(self):
+        """The commit pass declares itself varlen, so the ragged forward avoids the decode kernel.
+
+        `num_prefill_requests` is left truthful: the flag states the mode directly rather than
+        faking a prefill count to imply it.
+        """
+        context = _make_context()
+        device = torch.cuda.current_device()
+        context.num_prefill_requests = 0
+        context._using_cuda_graph_this_step = True
+        block_table = self._block_table(context, [[3], [7]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([2, 1], device=device),
+            block_table_prefill=block_table,
+            request_start_positions=torch.tensor([4, 6], device=device),
+        )
+
+        assert context.num_prefill_requests == 0  # untouched
+        assert context.mtp_metadata.is_varlen_forward is True
+        assert context.is_decode_only() is False
+        assert context._using_cuda_graph_this_step is False
+        assert context.mtp_metadata.forward_active is True
+        assert context.active_attn_metadata is context.non_graph_attn_metadata
+        mha = context.non_graph_attn_metadata["mha_metadata"]
+        assert mha.state_data["max_seqlen_q"] == 2
+        assert mha.state_data["max_seqlen_k"] == 2
+
+    def test_finalize_clears_the_varlen_mode(self):
+        """The commit pass must hand the step back exactly as it found it."""
+        context = _make_context()
+        device = torch.cuda.current_device()
+        context.num_prefill_requests = 0
+        block_table = self._block_table(context, [[3]])
+
+        context._mtp_setup_prefill_step(
+            append_counts=torch.tensor([2], device=device), block_table_prefill=block_table
+        )
+        assert context.mtp_metadata.is_varlen_forward is True
+        assert context.is_decode_only() is False
+
+        context.mtp_metadata.end_forward()
+
+        assert context.mtp_metadata.is_varlen_forward is False
+        assert context.mtp_metadata.forward_active is False
+        # With the flag cleared, the step's own counts decide again.
+        assert context.num_prefill_requests == 0
+        assert context.is_decode_only() is True
+
+    def test_prefill_step_asserts_when_disabled(self):
+        context = _make_context(num_speculative_tokens=0)
+        device = torch.cuda.current_device()
+        with pytest.raises(AssertionError):
+            context._mtp_setup_prefill_step(
+                append_counts=torch.tensor([2], device=device),
+                block_table_prefill=self._block_table(context, [[3]]),
+            )
+
+
+class TestMtpChunkBoundaryCarry:
+    """The chunked-prefill boundary carry on `MTPMetadata`.
+
+    The carry is the one piece of MTP state that must survive BETWEEN steps, which is exactly
+    what makes a stale one dangerous. It is keyed by request id AND by the prompt position the
+    hidden was computed at, so a carry left behind by a request that has since restarted at a
+    different offset can never be consumed.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _meta():
+        """A freshly allocated context's MTPMetadata (`__init__` runs initialize_all_tensors)."""
+        return _make_context().mtp_metadata
+
+    @staticmethod
+    def _hidden(meta, fill):
+        return torch.full((1, 1, meta.hidden_size), fill, device="cuda", dtype=meta.hidden_dtype)
+
+    def test_carry_then_take_at_the_recorded_position(self):
+        meta = self._meta()
+        hidden = self._hidden(meta, 7.0)
+        meta.carry_chunk_boundary(hidden=hidden, req_id=42, position=3)
+
+        taken = meta.take_chunk_boundary(req_id=42, seam_position=3)
+        assert taken is not None
+        assert taken.shape == (1, 1, meta.hidden_size)
+        assert torch.equal(taken, hidden)
+
+    def test_take_raises_on_a_position_mismatch(self):
+        """A carry-holding continuation chunk takes no prefix skip, so its seam lands here.
+
+        `_compute_prefix_match` gives up that chunk's ENTIRE match to guarantee it. A mismatch
+        therefore means the back-off stopped holding, not that the carry is merely stale, and
+        declining would leave a committed position unwritten.
+        """
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        with pytest.raises(AssertionError, match="sits at position 3"):
+            meta.take_chunk_boundary(req_id=42, seam_position=9)
+
+    def test_take_raises_on_a_request_mismatch(self):
+        """The caller derives `req_id` from the carry itself, so a mismatch is a caller bug."""
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        with pytest.raises(AssertionError, match="belongs to request 42"):
+            meta.take_chunk_boundary(req_id=7, seam_position=3)
+
+    def test_a_first_chunk_can_never_consume_a_carry(self):
+        """off == 0 asks for seam position -1; a valid carry always records position >= 0."""
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=0)
+        with pytest.raises(AssertionError, match="sits at position 0"):
+            meta.take_chunk_boundary(req_id=42, seam_position=-1)
+
+    def test_invalidate_drops_the_carry_but_keeps_the_buffer(self):
+        meta = self._meta()
+        buf_before = meta.chunk_boundary_hidden
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        meta.invalidate_chunk_boundary()
+
+        assert not meta.chunk_boundary_valid
+        assert meta.chunk_boundary_req_id == -1
+        assert meta.chunk_boundary_position == -1
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)
+        # The buffer address is stable across invalidation -- only the keys are cleared.
+        assert meta.chunk_boundary_hidden is buf_before
+
+    def test_reset_metadata_invalidates_the_carry(self):
+        """The gap this closes: a request restarted after a reset must not match its old carry."""
+        context = _make_context()
+        meta = context.mtp_metadata
+        meta.carry_chunk_boundary(
+            hidden=torch.zeros((1, 1, meta.hidden_size), device="cuda", dtype=meta.hidden_dtype),
+            req_id=42,
+            position=3,
+        )
+        context.reset_metadata()
+
+        assert not meta.chunk_boundary_valid
+        assert context.chunked_prefill_request_id == -1
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)
+
+    def test_deallocate_invalidates_the_carry(self):
+        """This is what makes the carry safe: it dies with every other piece of MTP state."""
+        meta = self._meta()
+        meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
+        meta.deallocate()
+
+        assert not meta.chunk_boundary_valid
+        assert meta.chunk_boundary_hidden is None
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)
+
+    def test_carry_is_a_private_copy(self):
+        """The producing step's activation buffer is reused; the carry must not alias it."""
+        meta = self._meta()
+        src = self._hidden(meta, 5.0)
+        meta.carry_chunk_boundary(hidden=src, req_id=42, position=3)
+        src.fill_(-1.0)
+
+        taken = meta.take_chunk_boundary(req_id=42, seam_position=3)
+        assert torch.all(taken == 5.0)
+
+    def test_disabled_context_never_carries(self):
+        context = _make_context(num_speculative_tokens=0)
+        assert not context.enable_mtp_kv_cache
+        meta = context.mtp_metadata
+        meta.carry_chunk_boundary(
+            hidden=torch.zeros((1, 1, 8), device="cuda"), req_id=42, position=3
+        )
+        assert not meta.chunk_boundary_valid
+        with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
+            meta.take_chunk_boundary(req_id=42, seam_position=3)

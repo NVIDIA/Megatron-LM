@@ -868,6 +868,35 @@ class DynamicInferenceEngine(AbstractEngine):
                                 cache_key=("mtp", n, depth),
                             )
 
+                        # KV-aware MTP graph: when the MTP KV cache is enabled, ALSO capture a graph
+                        # that includes the draft-attention KV append+attend (the cache-free graph
+                        # above does not), under a distinct ("mtp_kv", n, depth) key that the real
+                        # spec-decode path replays. The EP dummy path keeps the cache-free graph.
+                        # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
+                        # replay overwrites it from gpu_view each step, so only shapes/bounds count.
+                        if context.enable_mtp_kv_cache:
+                            context.mtp_metadata.begin_decode_for_capture(n)
+                            for depth in mtp_warmup_depths:
+                                context._mtp_setup_decode_step()
+                                unwrapped.compute_mtp_single_step(
+                                    hidden_states=torch.zeros(
+                                        (batch_dim, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.int64
+                                    ),
+                                    depth=depth,
+                                    mtp_inference_context=context,
+                                    cache_key=("mtp_kv", n, depth),
+                                )
+                                context.mtp_metadata.advance_decode_step()
+                            context.mtp_metadata.end_forward()
+
                 context.reset()
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
@@ -2208,6 +2237,34 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                 )
 
+                # Record tokens emitted (and kept) this step so a client can reconstruct
+                # per-step acceptance lengths. Runs AFTER the stop-word check, which may
+                # truncate the last step in place, so subtract the trim to keep the list
+                # summing to `generated_length`. The same reason excludes a consumed chunked
+                # prefill: it samples tokens that are never appended. Spec decoding only.
+                if (
+                    self.num_speculative_tokens > 0
+                    and request_id != consumed_chunked_prefill_request_id
+                    and request_id not in self.stop_word_being_finished_ids
+                ):
+                    emitted = len(tokens) - num_stop_word_trim
+                    if emitted > 0:
+                        request.acceptance_step_lengths.append(emitted)
+                    else:
+                        # A stop sequence can reach back past this step's tokens, removing ones
+                        # earlier entries already counted. Unwind them so the list keeps summing
+                        # to `generated_length`; a client reconstructing acceptance from it
+                        # would otherwise read a length longer than the output.
+                        residual = -emitted
+                        while residual > 0 and request.acceptance_step_lengths:
+                            last = request.acceptance_step_lengths[-1]
+                            if last > residual:
+                                request.acceptance_step_lengths[-1] = last - residual
+                                residual = 0
+                            else:
+                                residual -= last
+                                request.acceptance_step_lengths.pop()
+
                 # Track per-position acceptance statistics for logging.
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
@@ -2918,9 +2975,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
-                    _, _, _, _, prefix_skip, _ = self.context._compute_prefix_match(
+                    prefix_skip = self.context._compute_prefix_match(
                         req, remaining_len
-                    )
+                    ).prefix_skip_tokens
                     prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
 
                 computed_budget = min(remaining_len - prefix_skip, token_budget)
@@ -2998,9 +3055,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # admits the request). For >= 2 computed tokens add_request computes
                 # exactly this chunk, which already fits the budget.
                 if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
+                    actual_effective = self.context._compute_prefix_match(
                         req, prefill_chunk_length
-                    )
+                    ).effective_prefill_chunk_length
                     if self.context.active_token_count + actual_effective > self.context.max_tokens:
                         can_schedule = False
                         break

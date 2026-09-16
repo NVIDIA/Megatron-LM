@@ -3349,7 +3349,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # The serial MTP path lives in the MTP mixin, so patch the SP collectives there.
-        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
+        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_controller_mixin"
         with (
             mock.patch(f"{mtp_module}.gather_from_sequence_parallel_region", mock_gather),
             mock.patch(

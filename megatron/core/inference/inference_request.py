@@ -775,6 +775,10 @@ class DynamicInferenceRequest(InferenceRequest):
     events: List[DynamicInferenceEvent] = field(default_factory=list)
     event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
     generated_tokens: List[int] = field(default_factory=list)
+    # Speculative decoding (e.g. MTP): tokens emitted for this request on each engine step --
+    # accepted drafts + 1 for a decode step, 1 for the prefill step. Sums to `generated_length`,
+    # so a client can reconstruct per-step acceptance lengths. Empty when spec decoding is off.
+    acceptance_step_lengths: List[int] = field(default_factory=list)
 
     def finalize_text(self, tokenizer: Any) -> "DynamicInferenceRequest":
         """Populate generated text by decoding the complete generated token stream.
@@ -1180,6 +1184,7 @@ class DynamicInferenceRequestRecord:
             generated_text=None,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
+            acceptance_step_lengths=merge_lists("acceptance_step_lengths"),
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,

@@ -74,6 +74,16 @@ class KVBlockAllocator:
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros((self.pool_size,), dtype=torch.int32, device='cpu')
 
+            # Token the block's FINAL MTP draft slot was computed against, or -1 when that slot
+            # holds no draft KV. A block's last draft entry pairs its last hidden with the first
+            # token of the NEXT block, so it is reusable only by a consumer whose next token
+            # matches; the hash alone does not determine it. -1 is the safe default: only the
+            # prefill path that knows the producer's next token records one, so blocks
+            # registered by any other route (a disaggregated import, say) stay uninheritable.
+            self.block_mtp_next_token = torch.full(
+                (self.pool_size,), -1, dtype=torch.int64, device='cpu'
+            )
+
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -462,6 +472,7 @@ class KVBlockAllocator:
             self.block_timestamps[block_ids] = 0
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
+        self.block_mtp_next_token[block_ids] = -1
 
         # Return blocks to free pool
         self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
