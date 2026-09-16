@@ -10,6 +10,7 @@ High-level refit/reshard orchestration:
 
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Optional, Union
+from weakref import ReferenceType, ref
 
 import torch
 
@@ -55,8 +56,8 @@ class _PlanCacheKey:
     """
 
     rank: int
-    src_config: Optional[_ParallelConfig]
-    dst_config: Optional[_ParallelConfig]
+    src_config: _ParallelConfig | ReferenceType | None
+    dst_config: _ParallelConfig | ReferenceType | None
     num_experts: Optional[int]
     # Adding inference nodes leaves the configs and offsets unchanged, so without
     # world_size the stale pre-growth plan would be reused.
@@ -74,15 +75,19 @@ class _PlanCacheKey:
     execution_batch_bytes: int | None = None
 
 
-def _get_parallel_config(core) -> Optional[_ParallelConfig]:
-    """Extract TP/PP/EP/DP/expert-TP/GTP-remat sizes, memoized on the core.
+def _get_parallel_config(core) -> _ParallelConfig | ReferenceType | None:
+    """Return a composite model identity or memoized single-model group sizes.
 
-    Process-group sizes don't change after init, so the result is cached on the
-    core object itself to avoid repeated ``get_process_group_ranks`` calls on
-    the hot path (each refit looks the key up 2-3x).
+    Process-group sizes don't change after init, so ordinary models cache them
+    on the core to avoid repeated group queries on the hot path.
     """
     if core is None:
         return None
+    if getattr(core, "refit_modules", None) is not None:
+        # Composite models have multiple meshes. A weak identity distinguishes
+        # their plans without retaining tensors or adding a second metadata cache.
+        # Rebuilding a layout requires new models and collective cache clearing.
+        return ref(core)
     cached = getattr(core, '_refit_parallel_config', None)
     if cached is not None:
         return cached
@@ -210,7 +215,7 @@ def _unwrap_model_cores(src_model, target_model):
     """Extract (src_core, tgt_core, num_experts) from model arguments.
 
     Handles list-wrapped modules and None (non-collocated) models.
-    Fills in missing DP groups from Megatron's parallel state on the source.
+    Fills in missing source DP groups for legacy single-mesh models.
 
     Returns:
         (src_core, tgt_core, num_experts)
@@ -221,20 +226,26 @@ def _unwrap_model_cores(src_model, target_model):
 
     if src_model is not None:
         src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
-        num_experts = src_lm.config.num_moe_experts
         src_core = unwrap_model(src_lm)
-        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
-            raise RuntimeError("Source model missing pg_collection required for reshard")
-        # Fill missing DP group on the source using Megatron's parallel state if not provided
-        if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
+        num_experts = getattr(getattr(src_core, "config", None), "num_moe_experts", None)
+        pg = getattr(src_core, "pg_collection", None)
+        # Preserve the legacy single-model fallback; module providers own
+        # their groups independently of any root collection.
+        if getattr(src_core, "refit_modules", None) is None:
+            if pg is None:
+                raise RuntimeError("Source model missing pg_collection required for reshard")
+            if getattr(pg, "dp", None) is None:
+                pg.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
-        if num_experts is None:
-            num_experts = tgt_lm.config.num_moe_experts
         tgt_core = unwrap_model(tgt_lm)
-        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
+        if num_experts is None:
+            num_experts = getattr(getattr(tgt_core, "config", None), "num_moe_experts", None)
+        if (
+            getattr(tgt_core, "refit_modules", None) is None
+            and getattr(tgt_core, "pg_collection", None) is None
+        ):
             raise RuntimeError("Target model missing pg_collection required for reshard")
 
     return src_core, tgt_core, num_experts
@@ -500,28 +511,37 @@ def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
     sending fp32 bytes into a bf16 receive buffer corrupts the data — so dst's
     buffer must match src's dtype before the transfer.
 
-    The canonical dtype map is collected once via ``all_gather_object`` and
-    cached on the plan.  Subsequent refits reuse the cached map and only do
-    the per-buffer dtype check / replacement (no collective).
+    Source dtypes are collected once via ``all_gather_object``, matched by
+    transfer ID, and cached under local destination buffer names on the plan.
+    Subsequent refits reuse the cached map and only do the per-buffer dtype
+    check / replacement (no collective).
     """
     if plan.buffer_dtypes is None:
-        local_src_dtypes: dict[str, torch.dtype] = {}
+        source_buffers = {}
         if src_core is not None:
-            for full_name, _sub, _buf_name, buf in named_persistent_buffers(src_core):
-                local_src_dtypes[full_name] = buf.dtype
-
+            source_buffers = {
+                name: buf.dtype for name, _, _, buf in named_persistent_buffers(src_core)
+            }
+        # Transfer IDs already pair source and destination tensors, even when
+        # their storage names or local pipeline indices differ.
+        local_src_dtypes = {
+            op.task_id: source_buffers[op.param_name]
+            for op in plan.send_ops
+            if op.param_name in source_buffers
+        }
         world_size = group.size() if group is not None else torch.distributed.get_world_size()
         gathered: list = [None] * world_size
         torch.distributed.all_gather_object(gathered, local_src_dtypes, group=group)
-
-        canonical: dict[str, torch.dtype] = {}
-        for d in gathered:
-            if not d:
+        transfer_dtypes = {task_id: dtype for part in gathered for task_id, dtype in part.items()}
+        destination_dtypes = {}
+        for op in plan.recv_ops:
+            if op.task_id not in transfer_dtypes:
                 continue
-            for name, dtype in d.items():
-                # Replicated buffers agree across ranks; first writer wins.
-                canonical.setdefault(name, dtype)
-        plan.buffer_dtypes = canonical
+            dtype = transfer_dtypes[op.task_id]
+            previous = destination_dtypes.setdefault(op.param_name, dtype)
+            if previous != dtype:
+                raise ValueError(f"Source shards disagree on buffer dtype for {op.param_name}")
+        plan.buffer_dtypes = destination_dtypes
 
     if tgt_core is None:
         return
