@@ -178,3 +178,39 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     assert output is expected
     assert bias is None
     assert captured["output"] is None
+
+
+def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe import token_dispatcher_inference
+
+    dispatcher_cls = token_dispatcher_inference.NVLSAllGatherVDispatcher
+    base_cls = token_dispatcher_inference.InferenceAllGatherDispatcherBase
+    calls = []
+
+    class RoutingTensor:
+        def fill_(self, value):
+            calls.append(("clear", value))
+
+    monkeypatch.setattr(dispatcher_cls, "_symm_agv_routing", {"tensor": RoutingTensor()})
+    monkeypatch.setattr(
+        dispatcher_cls, "_symm_metadata", {"tensor": object(), "handle": object()}, raising=False
+    )
+    monkeypatch.setattr(dispatcher_cls, "_step_metadata", object())
+    monkeypatch.setattr(base_cls, "_host_valid_tokens_estimate", 0)
+    monkeypatch.setattr(
+        token_dispatcher_inference,
+        "fused_metadata_update",
+        lambda **kwargs: calls.append(("metadata", kwargs["local_tokens"])),
+    )
+    dispatcher = SimpleNamespace(
+        config=SimpleNamespace(
+            inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER
+        ),
+        ep_size=4,
+    )
+
+    dispatcher_cls.update_metadata(dispatcher, local_tokens=7)
+
+    assert calls == [("clear", -1), ("metadata", 7)]
+    assert base_cls._host_valid_tokens_estimate == 28

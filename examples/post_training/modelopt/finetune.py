@@ -157,16 +157,10 @@ class SFTDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _load_dataset_synchronized(load_dataset_func):
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return load_dataset_func()
-
-        if torch.distributed.get_rank() == 0:
-            raw_samples = load_dataset_func()
-        torch.distributed.barrier()
-        if torch.distributed.get_rank() != 0:
-            raw_samples = load_dataset_func()
-        torch.distributed.barrier()
-        return raw_samples
+        # Megatron only builds datasets on tensor-parallel rank zero, so a global
+        # barrier here deadlocks whenever tensor parallelism is greater than one.
+        # Hugging Face Hub serializes concurrent cache writes with file locks.
+        return load_dataset_func()
 
     @staticmethod
     def _normalize_input_ids(input_ids) -> List[int]:
