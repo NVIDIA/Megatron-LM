@@ -202,7 +202,8 @@ no-build-isolation-package = [
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
-# TileLang 0.1.8 fails to import with 0.1.12; cuDNN Frontend requires >=0.1.11.
+# cuDNN Frontend 1.28 requires the newer TVM FFI package family. Mamba 2.3.2 still
+# pins TileLang 0.1.8, so override that stale transitive pin until Mamba updates it.
 constraint-dependencies = ["apache-tvm-ffi==0.1.11"]
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
@@ -211,6 +212,7 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    "tilelang==0.1.12",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
