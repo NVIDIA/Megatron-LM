@@ -178,6 +178,7 @@ class RADIOEncoderWrapper(MegatronModule):
         apply_pixel_shuffle: bool = True,
         force_eval_mode: bool = False,
         dynamic_resolution: bool = False,
+        name: str | None = None,
     ) -> None:
         super().__init__(config=transformer_config)
         self.class_token_len = class_token_len
@@ -200,6 +201,7 @@ class RADIOEncoderWrapper(MegatronModule):
             dynamic_resolution=dynamic_resolution,
             force_eval_mode=force_eval_mode,
             pg_collection=pg_collection,
+            name=(name + ".radio_model") if name is not None else None,
         )
 
     def forward(

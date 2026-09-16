@@ -56,6 +56,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import set_log_quantization_types
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -4470,6 +4471,15 @@ def train(
     # Tracking loss.
     total_loss_dict = {}
 
+    # Describes the model's quantization once on the first step; cleared below. In
+    # non-colocated MIMO the vision encoder holds rank 0 and the language model starts
+    # at --mimo-llm-offset, so logging one rank would only ever describe the encoder.
+    quantization_log_ranks = {0}
+    mimo_llm_offset = getattr(args, "mimo_llm_offset", None)
+    if mimo_llm_offset:
+        quantization_log_ranks.add(mimo_llm_offset)
+    set_log_quantization_types(args.log_quantization_types, quantization_log_ranks)
+
     # Iterations.
     iteration = args.iteration
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
@@ -4888,6 +4898,8 @@ def train(
                     p2p_communicator=p2p_communicator,
                 )
                 ft_integration.on_training_step_end()
+                # The quantization log describes the model, so one step is enough.
+                set_log_quantization_types(False)
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                     _maybe_raise_workload_exception()
                 # Fault delay timing can start at the end of iteration N. Self-firing faults

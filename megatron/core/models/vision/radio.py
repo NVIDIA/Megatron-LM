@@ -93,6 +93,7 @@ class RADIOViTModel(VisionModule):
         separate_video_embedder: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ) -> None:
         super().__init__(config=transformer_config)
 
@@ -238,6 +239,7 @@ class RADIOViTModel(VisionModule):
             post_process=False,
             pg_collection=self.pg_collection,
             vp_stage=self.vp_stage,
+            name=(name + ".decoder") if name is not None else None,
         )
 
         if self.force_eval_mode:
