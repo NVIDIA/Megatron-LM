@@ -313,12 +313,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 and self.mtp_num_depths == 0
                 and self.config.mtp_hybrid_override_pattern is None
             ):
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
+                raise ValueError(
                     "HybridModel has mtp_num_layers set but no MTP template. "
                     "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM') "
-                    "or hybrid_layer_config_list with MTPSplit markers.",
+                    "or hybrid_layer_config_list with MTPSplit markers."
                 )
             layer_config_list, layer_offset = select_pipeline_segment(
                 parsed_pattern.main_pattern or '',
@@ -351,14 +349,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "The supported position embedding types are rope and none."
             )
         if self.config.mtp_hsm and self.mtp_num_depths < 2:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "mtp_hsm needs at least two MTP layers to mix anything, but "
-                f"the HybridModel architecture defines {self.mtp_num_depths} MTP heads. "
-                "Disabling Hidden State Mixing.",
+            raise ValueError(
+                "mtp_hsm=True requires at least two MTP heads in the HybridModel architecture."
             )
-            self.config.mtp_hsm = False
 
         if self.hybrid_layer_config_list is not None:
             # Synchronize model-global depths, including inferred MTP depth, on physical clones

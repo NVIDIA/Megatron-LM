@@ -137,21 +137,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         if self.config.mtp_hsm and (
             self.config.mtp_num_layers is None or self.config.mtp_num_layers < 2
         ):
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "mtp_hsm needs at least two MTP layers to mix anything, but "
-                f"mtp_num_layers is {self.config.mtp_num_layers}. "
-                "Disabling Hidden State Mixing.",
-            )
-            self.config.mtp_hsm = False
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
         if self.config.mtp_hybrid_override_pattern is not None:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "mtp_hybrid_override_pattern is for Mamba/hybrid models only. "
-                "For GPT models, MTP replicates the main transformer layer structure. "
-                "This argument will be ignored.",
+            raise ValueError(
+                "mtp_hybrid_override_pattern is not supported by GPTModel. "
+                "For GPT models, define MTP layers through mtp_block_spec."
             )
 
         if has_config_logger_enabled(config):
