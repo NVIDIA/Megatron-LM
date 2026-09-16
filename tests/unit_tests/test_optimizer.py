@@ -1193,8 +1193,8 @@ def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_
 
 def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state_dict():
     """Fused-LN MLA keeps the input LayerNorm params on linear_qkv_down_proj at runtime while the
-    checkpoint canonicalizes them to input_layernorm.*; reloading main params through a
-    DDP-wrapped model must still match every parameter."""
+    checkpoint keeps them fused on linear_qkv_down_proj.layer_norm_*; reloading main
+    params through a DDP-wrapped model must still match every parameter."""
     if not is_te_min_version("1.10.0"):
         pytest.skip("Requires TE >= 1.10.0")
 
@@ -1245,9 +1245,9 @@ def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state
             if isinstance(sh_ten, ShardedTensor)
         }
         assert any(
-            key.startswith("decoder.layers.0.self_attention.input_layernorm.") for key in state_dict
+            key.startswith("decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_")
+            for key in state_dict
         )
-        assert not any("linear_qkv_down_proj.layer_norm_" in key for key in state_dict)
 
         optim.reload_model_params(state_dict)
 
