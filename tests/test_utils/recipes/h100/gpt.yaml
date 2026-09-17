@@ -224,6 +224,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce]
     products:
       - environment: [dev]
+        cadence: [nightly]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
@@ -266,6 +267,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split]
     products:
       - environment: [dev]
+        cadence: [nightly]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
@@ -273,6 +275,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic]
     products:
       - environment: [dev]
+        cadence: [nightly]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
@@ -328,6 +331,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic]
     products:
       - environment: [dev]
+        cadence: [nightly]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
@@ -429,6 +433,7 @@ products:
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce]
     products:
       - environment: [dev]
+        cadence: [nightly]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
@@ -508,6 +513,7 @@ products:
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
+        cadence: [nightly]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
       - environment: [lts]
