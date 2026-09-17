@@ -1,11 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for LayerShardedMuon.
+"""Unit tests for LayerShardedMuon.
 
-Invariant under test: ``LayerShardedMuon.step()`` equals the duplicated-mode step
-(same momentum update, same full-matrix Newton-Schulz, same weight update); only the
-communication pattern differs. 1-D tests treat all ranks as one GTP_remat group and run
-at any world size; 2-D tests need exactly 4 ranks (TP 2 x GTP_remat 2).
+Sections, in order:
+
+- Constructor guards: ``_validate_ns_config`` rejects every Newton-Schulz configuration
+  the installed stack cannot run (each condition simulated on both sides, independent of
+  the installed stack), and ``_run_ns`` forwards ``use_syrk`` unchanged to every chunk.
+- Routing: the all_to_all exchange primitives assemble each home's complete matrices and
+  round-trip bit-for-bit over uneven shapes and homes.
+- Step parity: ``LayerShardedMuon.step()`` equals the duplicated-mode step (same momentum
+  update, same full-matrix Newton-Schulz, same weight update); only the communication
+  pattern differs. 1-D tests treat all ranks as one GTP_remat group and run at any world
+  size; 2-D tests need exactly 4 ranks (TP 2 x GTP_remat 2). Batched Newton-Schulz, GTP
+  padding, the update hooks and the exchange-plan cache follow.
 
 Launch: torchrun --nproc-per-node=4 -m pytest tests/unit_tests/optimizer/test_layer_sharded_muon.py
 """
@@ -21,12 +29,16 @@ pytest.importorskip("emerging_optimizers", reason="LayerShardedMuon requires eme
 
 from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
 
+from megatron.core.optimizer import emerging_optimizers as eo_mod
+from megatron.core.optimizer import layer_sharded_muon as lsm
+from megatron.core.optimizer.layer_sharded_a2a import route_from_ns_home, route_to_ns_home
 from megatron.core.optimizer.layer_sharded_muon import (
     LayerShardedMuon,
     ParamSharding,
     ParamShardSpec,
 )
 from megatron.core.utils import is_emerging_optimizers_min_version
+from tests.unit_tests.test_utilities import Utils
 
 # Batched (3-D) Newton-Schulz needs emerging-optimizers >= 0.3.0; the per-matrix path
 # runs on any version with the newton_schulz API.
@@ -46,15 +58,36 @@ _MUON_KW = dict(
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _torchrun_dist_init(layer_sharded_dist_init):
+def _torchrun_dist_init():
+    """Initialize the torchrun-managed process group for this module.
+
+    Binds this rank to its GPU and makes it the default device (``Utils`` uses the NCCL
+    backend, so exchanged tensors must live there), seeds, and pins the fp32 matmul
+    precision to the optimizer's so reference Newton-Schulz calls compare exactly.
+    Teardown drops the ad-hoc TP / GTP_remat / EGTP subgroups, resets the default device
+    with ``None`` (``set_default_device`` installs a global mode that only ``None``
+    removes; ``"cpu"`` would leave it active for later modules of the same torchrun
+    session) and destroys the process group.
+    """
+    Utils.initialize_model_parallel()
+    cuda = os.environ.get("TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu") == "cuda"
+    if cuda:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        torch.set_default_device(f"cuda:{local_rank}")
+    torch.manual_seed(_SEED)
+    prev_prec = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
     yield
-    # Drop the ad-hoc TP / GTP_remat / EGTP subgroups before the shared fixture tears
-    # down the process group.
     global _TP_GROUP, _GTP_REMAT_GROUP, _EGTP_GROUP
     for group in (_TP_GROUP, _GTP_REMAT_GROUP, _EGTP_GROUP):
         if group is not None:
             dist.destroy_process_group(group)
     _TP_GROUP = _GTP_REMAT_GROUP = _EGTP_GROUP = None
+    torch.set_float32_matmul_precision(prev_prec)
+    if cuda:
+        torch.set_default_device(None)
+    Utils.destroy_model_parallel()
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +174,20 @@ def _pg_stub(**groups):
     return SimpleNamespace(**fields)
 
 
+def _make_opt(monkeypatch=None, **kwargs):
+    if monkeypatch is not None:
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
+        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: True)
+    p = torch.nn.Parameter(torch.randn(4, 4))
+    return LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, **kwargs)
+
+
+def _simulate_hardware(monkeypatch, sm=(9, 0), triton_340=True):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: sm)
+    monkeypatch.setattr(lsm.triton_kernels, "HAS_TRITON_340", triton_340, raising=False)
+
+
 _TP_GROUP = None
 _GTP_REMAT_GROUP = None
 _EGTP_GROUP = None
@@ -191,6 +238,224 @@ def _dense_and_expert_params(t, g, ep_rank, egtp_rank, n_same_experts):
     homes = {id(p): h for p, (_, h) in zip(dense, dense_specs)}
     homes.update({id(p): (i % 2, 0) for i, p in enumerate(expert)})
     return dense, dense_w, dense_g, expert, expert_w, expert_g, homes
+
+
+# ---------------------------------------------------------------------------
+# Constructor guards: _validate_ns_config and the use_syrk forwarding in _run_ns
+# ---------------------------------------------------------------------------
+
+# No version skip on purpose: these tests pin guard/dispatch LOGIC and never execute a
+# real Newton-Schulz (newton_schulz is mocked, step() is never called), so they must
+# run — and give CI signal — on any installed emerging-optimizers. Constructions with
+# ns_batch_size > 1 bypass the batched-NS version floor via _make_opt(monkeypatch, ...).
+
+
+class TestValidateNsConfig:
+    def test_rejects_ns_batch_size_below_one(self):
+        with pytest.raises(ValueError, match="ns_batch_size must be at least 1"):
+            lsm._validate_ns_config(False, ns_batch_size=0)
+
+    def test_rejects_batched_ns_on_old_emerging_optimizers(self, monkeypatch):
+        asked = []
+
+        def fake_min_version(version, check_equality=True):
+            asked.append(version)
+            return False
+
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", fake_min_version)
+        with pytest.raises(ValueError, match="batched Newton-Schulz"):
+            lsm._validate_ns_config(False, ns_batch_size=4)
+        assert asked == [lsm._BATCHED_NS_MIN_EO_VERSION]
+
+    def test_unbatched_ns_needs_no_version_check(self, monkeypatch):
+        """ns_batch_size=1 uses the 2-D API every release ships: no floor consulted."""
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        lsm._validate_ns_config(False, ns_batch_size=1)
+
+    def test_use_syrk_false_skips_the_syrk_checks(self, monkeypatch):
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        lsm._validate_ns_config(False, ns_batch_size=32)
+
+    def test_rejects_without_cuda_device(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        with pytest.raises(ValueError, match="CUDA device"):
+            lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_rejects_old_triton(self, monkeypatch):
+        _simulate_hardware(monkeypatch, triton_340=False)
+        with pytest.raises(ValueError, match="Triton >= 3.4.0"):
+            lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_rejects_unvalidated_sm(self, monkeypatch):
+        _simulate_hardware(monkeypatch, sm=(12, 0))
+        with pytest.raises(ValueError, match=r"SM \(12, 0\)"):
+            lsm._validate_ns_config(True, ns_batch_size=1)
+
+    @pytest.mark.parametrize("sm", [(8, 0), (9, 0), (10, 0), (10, 3)])
+    def test_accepts_validated_sms(self, monkeypatch, sm):
+        _simulate_hardware(monkeypatch, sm=sm)
+        lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_rejects_batched_syrk_on_old_emerging_optimizers(self, monkeypatch):
+        _simulate_hardware(monkeypatch)
+        asked = []
+
+        def fake_min_version(version, check_equality=True):
+            asked.append(version)
+            return version == lsm._BATCHED_NS_MIN_EO_VERSION  # 0.3.x: batched NS, no batched SYRK
+
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", fake_min_version)
+        with pytest.raises(ValueError, match="batched SYRK kernel"):
+            lsm._validate_ns_config(True, ns_batch_size=4)
+        assert asked == [lsm._BATCHED_NS_MIN_EO_VERSION, lsm._BATCHED_SYRK_MIN_EO_VERSION]
+
+    def test_unbatched_syrk_needs_no_batched_kernel(self, monkeypatch):
+        """2-D SYRK predates the batched kernel: ns_batch_size=1 must not consult it."""
+        _simulate_hardware(monkeypatch)
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: False)
+        lsm._validate_ns_config(True, ns_batch_size=1)
+
+    def test_accepts_batched_syrk_on_new_emerging_optimizers(self, monkeypatch):
+        _simulate_hardware(monkeypatch)
+        monkeypatch.setattr(lsm, "is_emerging_optimizers_min_version", lambda v: True)
+        lsm._validate_ns_config(True, ns_batch_size=4)
+
+    def test_constructor_runs_the_validation(self, monkeypatch):
+        """No CUDA in this process: use_syrk=True must be rejected at construction."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        with pytest.raises(ValueError, match="CUDA device"):
+            _make_opt(monkeypatch, use_syrk=True)
+
+    def test_hardware_check_precedes_parent_version_gate(self, monkeypatch):
+        """A stack that cannot run SYRK at all reports that first: no emerging-optimizers
+        upgrade would help, so the parent's version gate must not mask that message."""
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(eo_mod, "is_emerging_optimizers_min_version", lambda v: False)
+        with pytest.raises(ValueError, match="CUDA device"):
+            _make_opt(use_syrk=True)
+
+
+class TestRunNsDispatch:
+    """_run_ns forwards use_syrk unchanged to every chunk: on a validated stack the
+    batched (3-D) chunks reach newton_schulz's batched SYRK dispatch."""
+
+    def _record_ns_calls(self, monkeypatch):
+        calls = []
+
+        def fake_newton_schulz(x, **kwargs):
+            calls.append((x.dim(), kwargs["use_syrk"]))
+            return x
+
+        monkeypatch.setattr(lsm, "newton_schulz", fake_newton_schulz)
+        return calls
+
+    def _mats(self):
+        # Two same-shape matrices (batchable) + one odd shape (never batched).
+        return {0: torch.randn(4, 4), 1: torch.randn(4, 4), 2: torch.randn(4, 6)}
+
+    def test_baseline_stays_2d_gemm(self, monkeypatch):
+        calls = self._record_ns_calls(monkeypatch)
+        opt = _make_opt(use_syrk=False, ns_batch_size=1)
+        out = opt._run_ns(self._mats())
+        assert calls == [(2, False)] * 3, "baseline must be per-matrix 2-D, use_syrk=False"
+        assert set(out) == {0, 1, 2}
+
+    def test_use_syrk_reaches_batched_and_unbatched_chunks(self, monkeypatch):
+        calls = self._record_ns_calls(monkeypatch)
+        opt = _make_opt(monkeypatch, use_syrk=False, ns_batch_size=2)
+        opt.use_syrk = True  # as if _validate_ns_config had passed on a validated stack
+        opt._run_ns(self._mats())
+        assert sorted(calls) == [(2, True), (3, True)]
+
+    def test_batch_of_one_is_2d_even_with_batching_enabled(self, monkeypatch):
+        """ns_batch_size>1 with nothing to batch must preserve unbatched numerics."""
+        calls = self._record_ns_calls(monkeypatch)
+        opt = _make_opt(monkeypatch, use_syrk=False, ns_batch_size=8)
+        opt._run_ns({0: torch.randn(4, 4), 1: torch.randn(4, 6)})
+        assert calls == [(2, False)] * 2
+
+
+class TestConstructorGuards:
+    def test_tp_mode_layer_sharded_is_rejected(self):
+        """'layer_sharded' is the registry selector, not a class mode; direct-API
+        misuse would otherwise fall silently into the parent's distributed
+        branch — reject at construction like the other guards."""
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="registry-level selector"):
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, tp_mode="layer_sharded")
+
+    def test_split_qkv_is_rejected(self):
+        """split_qkv would only apply on the fallback/degenerate paths, making
+        the update rule depend on whether homes are set — reject at the class."""
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="split-QKV"):
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, split_qkv=True)
+
+    def test_ns_batch_size_below_one_is_rejected(self):
+        """ns_batch_size is validated like the parent's num_ns_steps, not clamped."""
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ValueError, match="ns_batch_size"):
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None, ns_batch_size=0)
+
+
+# ---------------------------------------------------------------------------
+# Routing: the all_to_all exchange primitives
+# ---------------------------------------------------------------------------
+# The forward exchange must assemble each home's complete matrices from the per-rank
+# shards, and a fwd -> identity -> bwd roundtrip over uneven shapes and homes must
+# reproduce the input bit-for-bit. Pure routing properties: a failure is an indexing bug.
+
+
+def test_fwd_reconstructs_complete_matrix():
+    """Each NS-home rank assembles the full (P, Q) matrix from the row shards."""
+    _require_multi_rank()
+    S, r = dist.get_world_size(), dist.get_rank()
+    P, Q = 16 * S, 8
+    N = S
+
+    # Same seed on all ranks: every rank derives its shard from identical full
+    # tensors, so each home can be checked against ground truth locally.
+    torch.manual_seed(_SEED)
+    full = [torch.randn(P, Q) for _ in range(N)]
+    shards = [m[r * (P // S) : (r + 1) * (P // S), :].clone() for m in full]
+    homes = {i: i % S for i in range(N)}
+
+    complete, my_indices = route_to_ns_home(shards, homes, _world(), shard_dim=0)
+
+    assert my_indices == [i for i in range(N) if i % S == r]
+    for got, idx in zip(complete, my_indices):
+        torch.testing.assert_close(
+            got, full[idx], msg=lambda m: f"reconstruction of param {idx} on rank {r}\n\n{m}"
+        )
+
+
+def test_roundtrip_without_ns_is_identity():
+    """fwd -> identity -> bwd returns the original shards, heterogeneous shapes included.
+
+    Shapes and assignments are deliberately uneven (different sizes, one rank
+    with more homes than others) to exercise the per-param split-size paths.
+    """
+    _require_multi_rank()
+    S, r = dist.get_world_size(), dist.get_rank()
+
+    torch.manual_seed(_SEED + 2)
+    shapes = [(16 * S, 8), (4 * S, 24), (16 * S, 8), (8 * S, 4)]
+    full = [torch.randn(*s) for s in shapes]
+    shards = [m[r * (m.size(0) // S) : (r + 1) * (m.size(0) // S), :].clone() for m in full]
+    homes = {0: 0, 1: 0, 2: min(1, S - 1), 3: min(2, S - 1)}
+
+    complete, my_indices = route_to_ns_home(shards, homes, _world(), shard_dim=0)
+    identity = [m.clone() for m in complete]
+    recovered = route_from_ns_home(identity, my_indices, shards, homes, _world(), shard_dim=0)
+
+    for i, (orig, back) in enumerate(zip(shards, recovered)):
+        assert back is not None, f"missing roundtrip result for param {i}"
+        assert torch.equal(orig, back), (
+            f"roundtrip changed param {i} on rank {r}: "
+            f"max |diff| = {(orig - back).abs().max().item():.3e}"
+        )
 
 
 # ---------------------------------------------------------------------------
