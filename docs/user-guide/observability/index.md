@@ -23,6 +23,7 @@ span-groups
 metrics
 pipeline-parallel
 extending
+inference-bugfix-statistics
 ```
 
 ## Scope
