@@ -373,8 +373,12 @@ class MultiLatentAttention(Attention):
         sequence_len_offset: int | None = None,
         *,
         inference_params: BaseInferenceContext | None = None,
+        packed_sequence_cp_metadata=None,
     ):
         """Forward pass for multi-latent attention"""
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "MLA does not support packed-sequence chunkwise CP metadata."
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."
         assert (

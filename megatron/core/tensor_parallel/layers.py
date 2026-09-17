@@ -1271,7 +1271,11 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             # Check the weight passed in is the correct shape
             expected_shape = (self.output_size_per_partition, self.input_size)
-            if weight.shape != expected_shape:
+            # Deferred to break the tensor_parallel package import cycle (gtp_api ->
+            # generalized_tensor_parallelism -> tensor_parallel/__init__ -> layers).
+            from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+            if weight.shape != expected_shape and not is_gtp_param(weight):
                 raise RuntimeError(
                     f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"

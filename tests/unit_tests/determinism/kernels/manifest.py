@@ -167,10 +167,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
         ),
-        tests=(K + "test_fused_activations.py",),
+        tests=(
+            K + "test_fused_activations.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+        ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
-        "the rest of the file is orchestration around registered TE / RoPE / CSA kernels.",
+        "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
+        "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
     ),
     # ---------------------------------------------------------------- Megatron Triton fusions
     KernelEntry(
@@ -436,6 +440,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="cuda-ext",
         exempt_reason="Pluggable allocator (ncclMemAlloc); allocation only, no compute kernel.",
     ),
+    KernelEntry(
+        name="vmm_symm_allocator",
+        sources=("megatron/core/allocator/vmm_symm_allocator.py",),
+        kind="cuda-ext",
+        exempt_reason="Pluggable allocator (CUDA VMM driver calls); allocation only, no "
+        "compute kernel.",
+    ),
     # ---------------------------------------------------------------- inference (single GPU)
     KernelEntry(
         name="inference_kv_cache_tensor_ops",
@@ -638,6 +649,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
+    ),
+    # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
+    KernelEntry(
+        name="csa_teacher_lse",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
+        ),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
