@@ -68,10 +68,6 @@ class MTPMetadata:
     graphed: bool = False
     active_request_count: int = 0
     padded_count: int = 0
-    # Block table as of just before `_rewind_kv_cache` released the draft blocks. None until
-    # the first snapshot of the run.
-    prerewind_block_table: Optional[Tensor] = field(default=None, repr=False)
-
     # ---- Chunked-prefill boundary carry (lives BETWEEN steps). ----
     # The MTP entry at position `off - 1` straddles two prefill chunks: it pairs the previous
     # chunk's last hidden with the next chunk's first token, so neither chunk can write it alone.
@@ -97,8 +93,6 @@ class MTPMetadata:
     kv_lengths: Optional[Tensor] = field(default=None, repr=False)
     # [max_requests] int64: constant [0, 1, ..., max_requests - 1].
     row_ids: Optional[Tensor] = field(default=None, repr=False)
-    # Pinned CPU destination for the pre-rewind block-table snapshot.
-    prerewind_buf: Optional[Tensor] = field(default=None, repr=False)
 
     # ---- Views into the buffers, refreshed once per draft loop by begin_decode(). ----
     active_offsets: Optional[Tensor] = field(default=None, repr=False)
@@ -114,14 +108,11 @@ class MTPMetadata:
         """Whether the current MTP forward has ragged per-request query lengths."""
         return self.forward_mode is MTPForwardMode.COMMIT
 
-    def allocate(self, device: torch.device, block_table_template: Tensor) -> None:
+    def allocate(self, device: torch.device) -> None:
         """Reserve the persistent buffers. No-op when MTP KV caching is disabled.
 
         Args:
             device (torch.device): Device for the GPU-resident buffers.
-            block_table_template (Tensor): The context's CPU block table
-                (`request_to_kv_block_ids`); the pre-rewind snapshot buffer mirrors its shape
-                and dtype.
         """
         if not self.enabled:
             return
@@ -135,7 +126,6 @@ class MTPMetadata:
         self.query_lengths = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
         self.kv_lengths = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
         self.row_ids = torch.arange(self.max_requests, dtype=torch.int64, device=device)
-        self.prerewind_buf = torch.empty_like(block_table_template).pin_memory()
         self.chunk_boundary_hidden = torch.zeros(
             (1, 1, self.hidden_size), dtype=self.hidden_dtype, device=device
         )
@@ -152,8 +142,6 @@ class MTPMetadata:
         self.query_lengths = None
         self.kv_lengths = None
         self.row_ids = None
-        self.prerewind_buf = None
-        self.prerewind_block_table = None
         self.active_offsets = None
         self.active_block_table = None
         self.forward_mode = MTPForwardMode.NONE
@@ -231,13 +219,6 @@ class MTPMetadata:
     # ------------------------------------------------------------------
     # Draft-loop lifecycle.
     # ------------------------------------------------------------------
-    def snapshot_prerewind_block_table(self, block_ids: Tensor) -> None:
-        """Copy the current block table into the pre-rewind snapshot buffer."""
-        if not self.enabled:
-            return
-        self.prerewind_buf.copy_(block_ids)
-        self.prerewind_block_table = self.prerewind_buf
-
     def begin_decode(
         self,
         active_request_count: int,

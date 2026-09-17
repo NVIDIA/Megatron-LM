@@ -245,6 +245,21 @@ class TextGenerationController(MTPControllerMixin):
         else:
             self.vocab_size = unwrapped_model.vocab_size
 
+        if self.num_speculative_tokens > 0:
+            language_model = (
+                unwrapped_model.language_model
+                if isinstance(unwrapped_model, LLaVAModel)
+                else unwrapped_model
+            )
+            if language_model.position_embedding_type != "none":
+                raise ValueError(
+                    "MTP inference requires position_embedding_type='none'; positional "
+                    "embeddings are not supported."
+                )
+            if language_model.config.multi_latent_attention:
+                # MLA constructs its own RoPE/YaRN, independently of the model's position type.
+                raise ValueError("MTP inference does not support MLA's rotary position embeddings.")
+
         # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
         # unique generation seed (avoids identical samples when the same prompt is
         # assigned to multiple DP ranks, which can corrupt RL training). Controlled by
@@ -869,7 +884,18 @@ class TextGenerationController(MTPControllerMixin):
             num_speculative_tokens=self.num_speculative_tokens,
             block_size_tokens=context.block_size_tokens,
             num_active_requests=active_request_count,
+            keep_extra_blocks=context.enable_mtp_kv_cache,
         )
+        if context.enable_mtp_kv_cache:
+            committed_blocks = (
+                context.request_kv_length_offsets[active_request_slice]
+                + context.request_query_lengths[active_request_slice]
+                + context.block_size_tokens
+                - 1
+            ) // context.block_size_tokens
+            context.request_has_spare_block[active_request_slice] = (
+                context.request_kv_block_counts[active_request_slice] > committed_blocks
+            )
 
         # Mamba speculative rewind stays on GPU because it mutates GPU-resident
         # SSM/conv state that the next forward pass reads directly.
@@ -1629,6 +1655,13 @@ class TextGenerationController(MTPControllerMixin):
             request_id = int(context.request_ids[finished_idx].item())
             blocks = context.request_to_kv_block_ids[finished_idx]
             valid_blocks = [int(block) for block in blocks.tolist() if block != -1]
+            # Drop the speculative reserve. This runs BEFORE `update_requests`, so a row that
+            # just prefilled still holds an unentered block: it carries draft KV only, not
+            # prompt KV. The decode side requires exactly `ceil(len(prompt)/block_size)` blocks
+            # (`inference_state_handoff` and `decode_admission`), so shipping it both fails that
+            # check and pins the block until RELEASE_KV. It is always the final column.
+            if valid_blocks and bool(context.request_has_spare_block[finished_idx]):
+                valid_blocks.pop()
             if valid_blocks:
                 finished_block_ids[request_id] = valid_blocks
                 # Retain across context cleanup. For an exclusively owned block:
@@ -1720,6 +1753,13 @@ class TextGenerationController(MTPControllerMixin):
                 req_id = int(context.request_ids[fidx].item())
                 blocks = context.request_to_kv_block_ids[fidx]
                 valid = blocks[blocks >= 0].tolist()
+                # Drop the speculative reserve, same as the handoff collector below. The main
+                # model never wrote into it, so it has no stored routing, and
+                # `reconstruct_routing_from_blocks` tests `routing is None` BEFORE its
+                # `remaining <= 0` break -- a trailing routing-less block aborts the whole
+                # reconstruction and silently drops `moe_topk_indices` from the response.
+                if valid and bool(context.request_has_spare_block[fidx]):
+                    valid.pop()
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
@@ -2969,12 +3009,6 @@ class TextGenerationController(MTPControllerMixin):
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
-                # Snapshot the block table BEFORE rewind releases the rejected-draft blocks;
-                # the MTP draft loop reuses it so its speculative writes land on valid blocks.
-                if getattr(context, "enable_mtp_kv_cache", False):
-                    context.mtp_metadata.snapshot_prerewind_block_table(
-                        context.request_to_kv_block_ids
-                    )
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
                 # No separate MTP rewind: the draft loop re-derives its start from the (rewound)
                 # main KV offsets, so rejected drafts are naturally overwritten next step.

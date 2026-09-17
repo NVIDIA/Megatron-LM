@@ -191,6 +191,7 @@ class TestMTPCudaGraphInference:
                 pre_process=True,
                 post_process=True,
                 mtp_block_spec=mtp_block_spec,
+                position_embedding_type="none",
             ).cuda()
         elif model_type == 'hybrid':
             model = HybridModel(
@@ -204,7 +205,7 @@ class TestMTPCudaGraphInference:
                 hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
                 # GPTModel defaults to learned_absolute; HybridModel defaults to 'none'.
                 # Pin it so both arms build the same position-embedding stack.
-                position_embedding_type='learned_absolute',
+                position_embedding_type='none',
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")
@@ -1007,6 +1008,7 @@ class TestMTPCudaGraphExpertParallel:
                 pre_process=True,
                 post_process=True,
                 mtp_block_spec=mtp_block_spec,
+                position_embedding_type="none",
             ).cuda()
         elif model_type == 'hybrid':
             model = HybridModel(
@@ -1018,7 +1020,7 @@ class TestMTPCudaGraphExpertParallel:
                 pre_process=True,
                 post_process=True,
                 hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
-                position_embedding_type='learned_absolute',
+                position_embedding_type='none',
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")
@@ -1259,8 +1261,8 @@ class TestMTPCudaGraphExpertParallel:
 # `_run_dummy_serial_mtp_forward` never executes.
 #
 # That path is where the KV cache is most fragile. With the cache on, a rank with work issues
-# D+2 MTP forwards (commit pass, D depths, extra append) while a rank without work must issue
-# exactly D+2 matching ones -- and it must replay the CACHE-FREE ("mtp", ...) graphs, never
+# D+1 MTP forwards (commit pass and D depths) while a rank without work must issue
+# exactly D+1 matching ones -- and it must replay the CACHE-FREE ("mtp", ...) graphs, never
 # the KV-aware ("mtp_kv", ...) ones, whose append would target an idle rank's KV cache with no
 # valid block table. A mismatch in count or graph/eager mode does not raise; the MoE
 # all-to-all blocks. These tests therefore assert by COMPLETING.
@@ -1346,6 +1348,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
                 pre_process=True,
                 post_process=True,
                 mtp_block_spec=mtp_block_spec,
+                position_embedding_type="none",
             ).cuda()
         elif model_type == 'hybrid':
             # A single-`*` MTP block keeps the head one non-recurrent attention layer, which
@@ -1359,7 +1362,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
                 pre_process=True,
                 post_process=True,
                 hybrid_layer_pattern=_hybrid_pattern(self.NUM_LAYERS, mtp_num_layers),
-                position_embedding_type='learned_absolute',
+                position_embedding_type='none',
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")
@@ -1433,7 +1436,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
         """Even EP ranks idle, odd ranks run the real MTP KV cache path.
 
         The idle rank runs `_run_dummy_serial_mtp_forward`; the active rank runs the commit
-        pass, the draft loop, and the extra append. Their MoE all-to-alls must line up.
+        pass and the draft loop. Their MoE all-to-alls must line up.
         """
         ep_rank = parallel_state.get_expert_model_parallel_rank()
         is_idle = ep_rank % 2 == 0
@@ -1614,7 +1617,7 @@ class TestMTPBlockScopeCudaGraph:
                 parallel_output=True,
                 pre_process=True,
                 post_process=True,
-                position_embedding_type='rope',
+                position_embedding_type='none',
             ).cuda()
         elif model_type == 'hybrid':
             hybrid_stack_spec = _build_hybrid_stack_spec()
@@ -1627,7 +1630,7 @@ class TestMTPBlockScopeCudaGraph:
                 pre_process=True,
                 post_process=True,
                 hybrid_layer_pattern="****/*",
-                position_embedding_type='rope',
+                position_embedding_type='none',
             ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")

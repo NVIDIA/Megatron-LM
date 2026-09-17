@@ -728,6 +728,10 @@ class DynamicInferenceRequest(InferenceRequest):
     # match rather than computed. Accumulated across prefill chunks by the context,
     # which uses it to avoid rewriting KV into blocks that already hold it.
     num_matched_prefix_blocks: int = 0
+    # First block kept private after MTP declines a cached prefix block. Neither it nor
+    # its descendants may be registered or inherited by a later chunk: the request does
+    # not own the canonical ancestor. Persists across prefill chunks.
+    mtp_private_suffix_start: Optional[int] = None
     block_hash_salt: Optional[str] = None  # Media identity for multimodal KV safety.
 
     # Computed field - not passed by caller

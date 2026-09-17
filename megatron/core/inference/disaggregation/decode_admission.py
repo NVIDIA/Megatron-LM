@@ -9,11 +9,16 @@ import math
 import torch
 
 
-def additional_decode_blocks(prompt_length: int, input_token_count: int, block_size: int) -> int:
-    """Return blocks needed beyond those containing the imported prompt."""
+def additional_decode_blocks(
+    prompt_length: int, input_token_count: int, block_size: int, mtp_kv_cache: bool = False
+) -> int:
+    """Return blocks for verification and drafting beyond the imported prompt."""
 
     prompt_blocks = math.ceil(prompt_length / block_size)
-    blocks_after_input = math.ceil((prompt_length + input_token_count) / block_size)
+    draft_lookahead = max(0, input_token_count - 2) if mtp_kv_cache else 0
+    blocks_after_input = math.ceil(
+        (prompt_length + input_token_count + draft_lookahead) / block_size
+    )
     return blocks_after_input - prompt_blocks
 
 
@@ -57,7 +62,10 @@ def admit_prefilled_decode(
             f"got {len(prompt_block_ids)}"
         )
     expected_decode_blocks = additional_decode_blocks(
-        prompt_length, input_token_count, context.block_size_tokens
+        prompt_length,
+        input_token_count,
+        context.block_size_tokens,
+        mtp_kv_cache=getattr(context, "enable_mtp_kv_cache", False),
     )
     if len(continuation_block_ids) != expected_decode_blocks:
         raise ValueError(
@@ -102,7 +110,10 @@ def admit_prefilled_decode(
     )
     context.request_in_prefill_status_tensor[current_id] = 0
     context.request_kv_block_counts[current_id] = len(all_block_ids)
-    context.request_last_kv_block_id[current_id] = all_block_ids[-1]
+    last_main_block = (prompt_length + input_token_count - 1) // context.block_size_tokens
+    context.request_last_kv_block_id[current_id] = all_block_ids[last_main_block]
+    # Any draft-only continuation remains spare; recycled rows must not keep a stale flag.
+    context.request_has_spare_block[current_id] = len(all_block_ids) > last_main_block + 1
     context.request_last_kv_block_offset[current_id] = (
         prompt_length - 1 + input_token_count
     ) % context.block_size_tokens

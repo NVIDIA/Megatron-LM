@@ -9,7 +9,7 @@ Two things are covered:
     chained-draft-hidden value. It packs one varlen roll-by-one forward covering both decode
     requests (their accepted-draft positions) and prefill requests (their chunk positions).
   * `_compute_serial_mtp_and_sample` -- the draft loop that consumes it: which requests draft,
-    which CUDA-graph key is replayed, and the extra D+1th append.
+    which CUDA-graph key is replayed, and whether every causal read has valid KV.
 
 Both are pure tensor assembly around one model call, so they are driven against a fake context
 and a fake model that record what they were handed. The assertions target the arithmetic that
@@ -140,9 +140,7 @@ def _make_context(
         hidden_size=HIDDEN_SIZE,
         hidden_dtype=torch.float32,
     )
-    context.mtp_metadata.allocate(
-        device=torch.device(DEVICE), block_table_template=request_to_kv_block_ids
-    )
+    context.mtp_metadata.allocate(device=torch.device(DEVICE))
 
     # The commit pass finalises by calling `end_forward` directly; count it so the tests can
     # still assert that it ran exactly once per issued forward.
@@ -773,8 +771,8 @@ def _make_draft_loop_controller(
 class TestSerialMtpDraftLoop:
     """The draft loop's KV-cache-specific behaviour."""
 
-    def test_runs_one_extra_append_beyond_the_depth_loop(self):
-        """D depths produce D+1 committed positions next step, so the KV needs D+1 entries."""
+    def test_runs_one_forward_per_draft_depth(self):
+        """Only the D forwards that produce sampled draft tokens are needed."""
         context = _make_context(num_decode_requests=2)
         controller, model, context = _make_draft_loop_controller(context, num_mtp_depths=2)
 
@@ -782,10 +780,10 @@ class TestSerialMtpDraftLoop:
             base_position=torch.tensor([10, 12], device=DEVICE)
         )
 
-        assert len(model.mtp_step_calls) == 3, "expected D depth forwards plus one extra append"
+        assert len(model.mtp_step_calls) == 2
         # Every forward writes KV, and the write position advances once per forward.
-        assert context._mtp_setup_decode_step.call_count == 3
-        assert context.mtp_metadata.advance_decode_step.call_count == 3
+        assert context._mtp_setup_decode_step.call_count == 2
+        assert context.mtp_metadata.advance_decode_step.call_count == 2
         context.mtp_metadata.end_forward.assert_called_once()
 
     def test_begins_decode_at_base_position_minus_one(self):
@@ -879,7 +877,6 @@ class TestSerialMtpDraftLoop:
         for call in model.mtp_step_calls:
             assert call["cache_key"] is not None
             assert call["cache_key"][0] == "mtp_kv"
-        # The extra append reuses the last depth's key rather than capturing at runtime.
         assert model.mtp_step_calls[-1]["eager"] is False
 
     def test_cache_free_graph_key_when_the_kv_cache_is_off(self):
@@ -893,7 +890,7 @@ class TestSerialMtpDraftLoop:
             base_position=torch.tensor([10, 12], device=DEVICE)
         )
 
-        assert len(model.mtp_step_calls) == 2, "no extra append when the KV cache is off"
+        assert len(model.mtp_step_calls) == 2
         for call in model.mtp_step_calls:
             assert call["cache_key"][0] == "mtp"
             # The kwarg must be ABSENT, not None: the cache-free ("mtp", ...) graph is captured
@@ -918,8 +915,8 @@ class TestSerialMtpDraftLoop:
         for call in model.mtp_step_calls:
             assert call["mtp_inference_context"] is context
 
-    def test_positions_advance_one_per_depth_then_the_extra_append(self):
-        """The extra append is at `base + D`, one past the last depth."""
+    def test_positions_advance_one_per_depth(self):
+        """Each sampled token advances the input position once."""
         context = _make_context(num_decode_requests=2)
         controller, model, context = _make_draft_loop_controller(context, num_mtp_depths=2)
         base_position = torch.tensor([10, 12], device=DEVICE)
@@ -935,7 +932,7 @@ class TestSerialMtpDraftLoop:
 
         controller._compute_serial_mtp_and_sample(base_position=base_position)
 
-        assert seen == [[10, 12], [11, 13], [12, 14]]
+        assert seen == [[10, 12], [11, 13]]
 
     def test_commit_pass_falls_back_to_a_dummy_slot(self):
         """Every rank runs exactly one commit-pass forward per step, real or dummy."""
@@ -1008,26 +1005,6 @@ class TestMtpCudaGraphs:
         assert all(key is not None for key in replayed)
         assert set(replayed) <= captured, f"uncaptured keys: {set(replayed) - captured}"
 
-    def test_extra_append_reuses_the_last_depth_captured_key(self):
-        """The D+1th append is a structurally identical forward, so it must not capture anew."""
-        context = _make_context(num_decode_requests=2)
-        controller, model, context = _make_draft_loop_controller(
-            context, num_mtp_depths=2, active_request_count=2, graphed=True
-        )
-        context.using_cuda_graph_this_step = lambda: True
-        captured = _captured_graph_keys(batch_sizes=[2], num_mtp_depths=2)
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        extra_append = model.mtp_step_calls[-1]
-        assert extra_append["cache_key"] in captured
-        assert extra_append["cache_key"][0] == "mtp_kv"
-        assert (
-            extra_append["eager"] is False
-        ), "leaving eager=True while graphed would capture the extra append at runtime"
-
     def test_graph_keys_use_the_ep_synced_padded_count(self):
         """The replayed batch size must be the padded/EP-synced one, not the live active count."""
         context = _make_context(num_decode_requests=2)
@@ -1068,7 +1045,7 @@ class TestMtpCudaGraphs:
         assert context._mtp_begin_decode.call_args.kwargs["graphed"] is True
 
     def test_eager_main_step_never_replays_a_graph(self):
-        """An eager main step must keep the whole draft loop (and the extra append) eager."""
+        """An eager main step must keep the whole draft loop eager."""
         context = _make_context(num_decode_requests=2)
         controller, model, context = _make_draft_loop_controller(
             context, num_mtp_depths=2, active_request_count=2, graphed=False
@@ -1338,6 +1315,75 @@ def _build_step(
     return controller, model, context, state
 
 
+class TestSerialMtpCacheReadBounds:
+    @pytest.mark.parametrize("depth,accepted", [(d, a) for d in (1, 2, 3) for a in range(d + 1)])
+    @pytest.mark.parametrize("graphed", [False, True])
+    def test_omitted_append_is_overwritten_before_any_causal_read(self, depth, accepted, graphed):
+        """Compare a populated final slot with an unwritten one for every acceptance count.
+
+        Run the real commit packing and draft loop against an attention oracle that writes
+        KV before reading the causal prefix. A NaN in any unwritten slot makes a premature
+        read observable. Graph mode exercises the same position setup through replay keys.
+        """
+        previous_start = 7
+        omitted_position = previous_start + depth
+
+        def run(omitted_value):
+            controller, model, context, state = _build_step(
+                num_decode_requests=1,
+                accepted=(accepted,),
+                num_mtp_depths=depth,
+                num_speculative_tokens=depth,
+                graphed=graphed,
+            )
+            controller._last_accepted_seq_indices = torch.tensor([accepted], device=DEVICE)
+            controller._sample_from_logits_2d = lambda logits: logits.argmax(dim=-1)
+            cache = torch.full((32,), float("nan"), device=DEVICE)
+            # The preceding D draft forwards populated up to, but not including, this slot.
+            cache[:omitted_position] = torch.arange(omitted_position, device=DEVICE) + 1
+            cache[omitted_position] = omitted_value
+            logits_seen = []
+            writes = []
+
+            def attend(position, hidden, token):
+                cache[position] = hidden.flatten()[0] + token
+                writes.append(position)
+                prefix = cache[: position + 1]
+                assert torch.isfinite(prefix).all(), "read KV that no forward has written"
+                return prefix.mean()
+
+            def commit_forward(**kwargs):
+                if kwargs["inference_context"] is None:
+                    return  # Empty commit pass: the EP placeholder must not touch the cache.
+                metadata = context.setup_prefill_calls[-1]
+                start = int(metadata["request_start_positions"][0])
+                count = int(metadata["append_counts"][0])
+                for i in range(count):
+                    attend(start + i, kwargs["hidden_states"][i], kwargs["next_token_ids"][0, i])
+
+            def draft_forward(**kwargs):
+                position = int(state["offsets"][0])
+                value = attend(position, kwargs["hidden_states"][0], kwargs["next_token_ids"][0, 0])
+                hidden = torch.ones_like(kwargs["hidden_states"]) * value
+                distance = torch.arange(VOCAB_SIZE, device=DEVICE) - (value % VOCAB_SIZE)
+                logits = -distance.square().view(1, 1, -1)
+                logits_seen.append(logits.clone())
+                return hidden, logits
+
+            model.mtp.layers[0].forward_single_position = commit_forward
+            model.compute_mtp_single_step = draft_forward
+            # Main verification starts one position beyond the previous depth-0 write.
+            base_position = torch.tensor([previous_start + accepted + 2], device=DEVICE)
+            controller._compute_serial_mtp_and_sample(base_position=base_position)
+            assert omitted_position in writes
+            return torch.cat(logits_seen), controller._sampled_mtp_tokens_cuda[:, :1].clone()
+
+        with_append = run(12345.0)
+        without_append = run(float("nan"))
+        for expected, actual in zip(with_append, without_append):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _identity_sp_patches():
     """Patch the SP collectives to identities so shapes/paddings stay observable."""
     return (
@@ -1406,7 +1452,7 @@ class TestExpertParallelForwardParity:
 
         dummy_forwards = self._dummy_rank_forwards(num_mtp_depths, graphed, kv_cache_on)
 
-        expected = num_mtp_depths + (2 if kv_cache_on else 0)
+        expected = num_mtp_depths + (1 if kv_cache_on else 0)
         assert len(real_forwards) == expected
         assert len(dummy_forwards) == len(real_forwards), (
             f"EP mismatch: real rank issued {len(real_forwards)} MTP forwards, "
@@ -1441,7 +1487,7 @@ class TestExpertParallelForwardParity:
         )
 
         # The commit pass issued nothing, so the EP-balance dummy slot ran in its place.
-        assert len(model.all_forwards) == 4
+        assert len(model.all_forwards) == 3
         assert model.all_forwards[0][0] == "mtp_layer"
         assert model.all_forwards[0][1]["inference_context"] is None
         dummy = self._dummy_rank_forwards(2, graphed=False, kv_cache_on=True)
@@ -1604,11 +1650,11 @@ class TestMtpKvCacheCombinations:
         with patches[0], patches[1]:
             controller._compute_serial_mtp_and_sample(base_position=base_position)
 
-        # 1. EP: exactly one commit-pass slot, D depth forwards, one extra append.
+        # 1. EP: exactly one commit-pass slot and D depth forwards.
         slots = [tag for tag, _ in model.all_forwards if tag == "mtp_layer"]
         steps = [kw for tag, kw in model.all_forwards if tag == "mtp_step"]
         assert len(slots) == 1
-        assert len(steps) == num_mtp_depths + 1
+        assert len(steps) == num_mtp_depths
 
         # 2. CUDA graphs: keys are all-or-nothing, and every replayed key was captured.
         padded = controller._mtp_resolved_padded_count or active
@@ -1625,8 +1671,8 @@ class TestMtpKvCacheCombinations:
             assert all(kw["eager"] is True for kw in steps)
 
         # 3. Draft writes: one setup+advance per forward, positions strictly +1 per depth.
-        assert context._mtp_setup_decode_step.call_count == num_mtp_depths + 1
-        assert context.mtp_metadata.advance_decode_step.call_count == num_mtp_depths + 1
+        assert context._mtp_setup_decode_step.call_count == num_mtp_depths
+        assert context.mtp_metadata.advance_decode_step.call_count == num_mtp_depths
         # One `end_forward` closes each MTP forward phase: the draft loop always, plus the
         # commit pass whenever it had rows to write (one `_mtp_setup_prefill_step` per forward).
         assert context.mtp_metadata.end_forward.call_count == 1 + len(context.setup_prefill_calls)

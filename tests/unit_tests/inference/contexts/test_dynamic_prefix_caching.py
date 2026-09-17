@@ -2729,7 +2729,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             enable_chunked_prefill=feature == "chunked",
             num_speculative_tokens=2 if feature == "mtp" else 0,
             materialize_only_last_token_logits=feature != "mtp",
-            position_embedding_type="rope" if feature == "fused-rope" else "learned_absolute",
+            position_embedding_type="rope" if feature == "fused-rope" else None,
             # Use the smallest head width handled by FlashInfer's dedicated
             # cos/sin-cache RoPE kernel rather than its generic fallback.
             hidden_size=256 if feature == "fused-rope" else None,
@@ -3401,14 +3401,12 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
-    def test_mtp_draws_two_extra_blocks_from_the_pool(self):
-        """One block for the back-off, one for the draft loop's speculative headroom.
+    def test_back_off_costs_exactly_one_extra_block_from_the_pool(self):
+        """The back-off gives up the last matched block and recomputes it privately.
 
-        The back-off gives up the last matched block and recomputes it privately. Separately,
-        a prefill reserves a block when its last one is within D+1 of full, because the draft
-        loop runs in the same step and writes past the prompt's final position -- decode keeps
-        that headroom by pausing, which a prefill cannot do. The sibling's prompt is a whole
-        number of blocks here, so the reservation always fires.
+        MTP draws two extra blocks here, and only two: the private recomputed copy, plus the
+        speculative reserve that the draft loop writes into on the prefill step. These prompts
+        are block-aligned, so the reserve always applies.
         """
         bs = None
         drawn = {}
@@ -3422,7 +3420,10 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
             ctx.add_request(self._req(ctx, s_prompt, request_id=2))
             drawn[mtp_on] = avail - alloc.pool_avail
 
-        assert drawn[True] == drawn[False] + 2
+        assert drawn[True] == drawn[False] + 2, (
+            f"MTP drew {drawn[True]} blocks vs {drawn[False]} without it; expected exactly two "
+            f"more (private recomputed block + speculative reserve)."
+        )
 
     @pytest.mark.internal
     def test_a_single_matched_block_is_given_up_entirely(self):
@@ -3474,65 +3475,140 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert s_blocks[2] != p_blocks[2]
         self._assert_hash_registry_is_injective(alloc)
 
-    @pytest.mark.internal
-    def test_backed_off_blocks_survive_the_allocation_that_follows_them(self):
-        """A declined block is still this chain's parent, so our allocation must not evict it.
+    @staticmethod
+    def _assert_chained_ancestry(alloc, *requests):
+        for req in requests:
+            for index, block_hash in enumerate(req.precomputed_block_hashes):
+                if block_hash in alloc.kv_hash_to_block_id:
+                    assert all(
+                        ancestor in alloc.kv_hash_to_block_id
+                        for ancestor in req.precomputed_block_hashes[:index]
+                    ), "registered descendant has an orphaned ancestor"
 
-        The back-off drops a matched block without inheriting it, and the sibling then
-        allocates its own. Those declined blocks are unpinned and sit at ref_count 0 once the
-        producer finishes, so the allocation can evict them -- while the blocks the sibling
-        registers afterwards hang off their hashes. Losing one leaves a registered hash above a
-        missing one, and that hole breaks two things at once: `_find_kv_match_count` scans
-        backwards for the last present hash and then subscripts every hash below it, and
-        `evict_lru_blocks` only treats a block as evictable once its child count reaches zero.
-        """
+    @pytest.mark.internal
+    def test_admission_can_evict_declined_blocks_without_orphaning_descendants(self):
+        """Availability and allocation agree even when all available blocks are cached."""
         ctx = self._mtp_ctx()
         alloc = ctx.kv_block_allocator
-        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3, tail_blocks=2)
-
+        bs = ctx.block_size_tokens
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=1, tail_blocks=2)
         producer = self._req(ctx, p_prompt)
         ctx.add_request(producer)
-        p_blocks = self._block_ids(ctx, 0, 5)
-        # Release the producer so its blocks are cached at ref_count 0 -- i.e. evictable, which
-        # is the state that makes the declined blocks vulnerable.
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.int32))
+        held = alloc.allocate_memory_blocks(alloc.pool_avail).clone()
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 3
 
-        # Drain the free pool so the sibling's allocation can only be satisfied by evicting,
-        # and the producer's released blocks are the only eviction candidates. Not
-        # `_fill_pool_with_one_evictable_block`: that helper asserts exactly one evictable
-        # block, which is incompatible with having just released a whole chain.
-        held = alloc.allocate_memory_blocks(alloc.pool_avail)
-        assert alloc.pool_avail == 0, "pool was not drained, so no eviction will be forced"
-        assert int(alloc.get_evictable_block_count()) > 0, "producer's blocks are not evictable"
-        del held
+        # Two prompt blocks plus a speculative reserve need every evictable block.
+        sibling = self._req(ctx, s_prompt[: 2 * bs], request_id=2)
+        assert ctx._compute_prefix_match(sibling, len(sibling.prompt_tokens)).backed_off_blocks == 1
+        assert all(ctx.check_availability(sibling))
+        ctx.add_request(sibling)
+        assert sibling.mtp_private_suffix_start == 0
+        assert not alloc.kv_hash_to_block_id
+        assert all(alloc.block_hashes[b].item() == -1 for b in self._block_ids(ctx, 1, 3))
+        self._assert_chained_ancestry(alloc, producer, sibling)
+        alloc.release_memory_blocks(held)
 
+    @pytest.mark.internal
+    @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
+    def test_private_suffix_survives_producer_release_and_cache_eviction(self, policy):
+        ctx = self._mtp_ctx(prefix_caching_eviction_policy=policy)
+        alloc = ctx.kv_block_allocator
+        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3, tail_blocks=2)
+        producer = self._req(ctx, p_prompt)
         sibling = self._req(ctx, s_prompt, request_id=2)
-        match = ctx._compute_prefix_match(sibling, len(s_prompt))
-        assert match.backed_off_blocks > 0, "fixture produced no back-off, so nothing is at risk"
-        declined = list(match.backed_off_block_ids)
-        assert declined, "back-off reported a count but no block ids to pin"
+        ctx.add_request(producer)
+        ctx.add_request(sibling)
+        sibling_blocks = self._block_ids(ctx, 1, 5)
+        assert sibling.mtp_private_suffix_start == 2
+        assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[2:])
 
-        declined_hashes = [alloc.block_hashes[b].item() for b in declined]
-        assert all(h != -1 for h in declined_hashes), "declined blocks were not registered"
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.int32))
+        self._assert_chained_ancestry(alloc, producer, sibling)
+        # Lookup must never discover a descendant above a missing canonical parent.
+        matched, _ = ctx._find_kv_match_count(sibling, 0, 5)
+        assert matched[:2] == sibling_blocks[:2]
+        assert len(matched) == (3 if policy == PrefixCachingEvictionPolicy.LRU else 2)
 
-        try:
-            ctx.add_request(sibling, prefill_chunk_length=len(s_prompt))
-        except Exception:  # pool exhaustion is a valid outcome; the pin must still be released
-            pass
+        held = alloc.allocate_memory_blocks(alloc.pool_avail).clone()
+        evictable = int(alloc.get_evictable_block_count())
+        if evictable:
+            reclaimed = alloc.allocate_memory_blocks(evictable)
+            assert reclaimed is not None
+            assert len(reclaimed) == evictable
+            alloc.release_memory_blocks(reclaimed)
+        self._assert_chained_ancestry(alloc, producer, sibling)
+        assert ctx._find_kv_match_count(sibling, 0, 5)[0] == sibling_blocks[:2]
+        assert all(alloc.block_ref_counts[b].item() == 1 for b in sibling_blocks)
+        alloc.release_memory_blocks(held)
 
-        for block_id, block_hash in zip(declined, declined_hashes):
-            assert alloc.block_hashes[block_id].item() == block_hash, (
-                f"declined block {block_id} was evicted during the sibling's allocation, "
-                f"leaving a hole in the hash chain it parents"
-            )
+    @pytest.mark.internal
+    @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
+    @pytest.mark.parametrize("first_chunk_blocks", [0, 2])
+    def test_nonaligned_chunk_keeps_completed_private_block_and_descendants_unregistered(
+        self, policy, first_chunk_blocks
+    ):
+        ctx = self._mtp_ctx(enable_chunked_prefill=True, prefix_caching_eviction_policy=policy)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        p_prompt, s_prompt = self._diverging_pair(
+            ctx, shared_blocks=first_chunk_blocks + 1, tail_blocks=2
+        )
+        producer = self._req(ctx, p_prompt)
+        sibling = self._req(ctx, s_prompt, request_id=2)
+        ctx.add_request(producer)
+        first_chunk_length = first_chunk_blocks * bs + bs // 2
+        ctx.add_request(sibling, prefill_chunk_length=first_chunk_length)
+        assert sibling.mtp_private_suffix_start == first_chunk_blocks
+        private_block = self._block_ids(ctx, 1, first_chunk_blocks + 1)[-1]
+        assert alloc.block_hashes[private_block].item() == -1
 
+        sibling.finished_chunk_token_count = first_chunk_length
+        sibling.remaining_prompt_tokens = sibling.remaining_prompt_tokens[first_chunk_length:]
+        ctx.total_request_count -= 1
+        ctx.active_token_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.add_request(sibling)
+
+        blocks = self._block_ids(ctx, 1, len(s_prompt) // bs)
+        assert blocks[first_chunk_blocks] == private_block
+        assert all(alloc.block_hashes[b].item() == -1 for b in blocks[first_chunk_blocks:])
         self._assert_hash_registry_is_injective(alloc)
-        # The pin is transient: holding it past `add_request` would make the producer's blocks
-        # permanently unevictable.
-        for block_id in declined:
-            assert (
-                alloc.block_ref_counts[block_id].item() == 0
-            ), f"declined block {block_id} kept a reference after add_request returned"
+        self._assert_chained_ancestry(alloc, producer, sibling)
+
+    @pytest.mark.internal
+    def test_later_chunks_cannot_inherit_beyond_a_private_ancestor(self):
+        ctx = self._mtp_ctx(enable_chunked_prefill=True)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 5)
+        producer = self._req(ctx, prompt)
+        ctx.add_request(producer)
+        producer_blocks = self._block_ids(ctx, 0, 5)
+        # Model a block whose boundary slot has not been filled by its producer yet.
+        alloc.block_mtp_next_token[producer_blocks[1]] = -1
+        sibling = self._req(ctx, prompt.clone(), request_id=2)
+        ctx.add_request(sibling, prefill_chunk_length=2 * bs)
+        assert sibling.mtp_private_suffix_start == 1
+        alloc.block_mtp_next_token[producer_blocks[1]] = int(prompt[2 * bs])
+        sibling.finished_chunk_token_count = 2 * bs
+        sibling.remaining_prompt_tokens = sibling.remaining_prompt_tokens[2 * bs :]
+        ctx.total_request_count -= 1
+        ctx.active_token_count = 0
+        ctx.num_prefill_requests = 0
+
+        # Even after the original boundary becomes reusable, descendants stay private.
+        match = ctx._compute_prefix_match(sibling, 3 * bs)
+        assert match.matched_block_ids == []
+        assert match.backed_off_blocks == 3
+        ctx.add_request(sibling)
+        sibling_blocks = self._block_ids(ctx, 1, 5)
+        assert sibling_blocks[0] == producer_blocks[0]
+        assert set(sibling_blocks[1:]).isdisjoint(producer_blocks)
+        assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[1:])
+        self._assert_hash_registry_is_injective(alloc)
+        self._assert_chained_ancestry(alloc, producer, sibling)
 
     @pytest.mark.internal
     def test_a_recycled_block_carries_no_stale_lookahead_token(self):
@@ -3628,13 +3704,13 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         meta = ctx.mtp_metadata
         prompt = self._prompt(bs * 5)
 
+        # Publish the canonical chain first. A later request that declines an ancestor
+        # keeps its suffix private, so it cannot publish these descendants for us.
+        ctx.add_request(self._req(ctx, prompt[: bs * 4].clone(), request_id=2))
         r = self._req(ctx, prompt.clone(), request_id=1)
         ctx.add_request(r, prefill_chunk_length=bs * 2)
         r.finished_chunk_token_count += bs * 2
         r.remaining_prompt_tokens = r.remaining_prompt_tokens[bs * 2 :]
-
-        # Another request publishes the blocks request 1 has not prefilled yet.
-        ctx.add_request(self._req(ctx, prompt[: bs * 4].clone(), request_id=2))
 
         # Without a carry the continuation chunk would take the match (minus the last block).
         assert not meta.chunk_boundary_valid

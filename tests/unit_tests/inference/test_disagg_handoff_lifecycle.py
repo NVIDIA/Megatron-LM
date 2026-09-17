@@ -248,6 +248,7 @@ def test_prefilled_decode_admission_uses_exact_ssm_state_without_prompt_tokens()
         request_output_lengths=torch.zeros(2, dtype=torch.int32),
         request_in_prefill_status_tensor=torch.ones(2, dtype=torch.int32),
         request_kv_block_counts=torch.zeros(2, dtype=torch.int32),
+        request_has_spare_block=torch.zeros(2, dtype=torch.bool),
         request_last_kv_block_id=torch.full((2,), -1, dtype=torch.int32),
         request_last_kv_block_offset=torch.zeros(2, dtype=torch.int32),
         token_to_input_ids=torch.zeros(8, dtype=torch.int64),

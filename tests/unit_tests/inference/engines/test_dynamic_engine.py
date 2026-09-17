@@ -419,7 +419,7 @@ class DynamicEngineTestConfig:
     # Required by transformer_config validation when transformer_impl == "inference_optimized"
     # and num_moe_experts is set: fp32 routing avoids dtype conversions during decode.
     moe_router_dtype: Optional[str] = None
-    position_embedding_type: str = "learned_absolute"
+    position_embedding_type: Optional[str] = None
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
     temperature: float = 1.0
@@ -439,6 +439,10 @@ class DynamicEngineTestConfig:
     softmax_type: str = "vanilla"
 
     def __post_init__(self):
+        if self.position_embedding_type is None:
+            self.position_embedding_type = (
+                "none" if self.num_speculative_tokens else "learned_absolute"
+            )
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -3793,6 +3797,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ctx.block_size_tokens = block_size
         ctx.enable_prefix_caching = True
         ctx.is_hybrid_model = True
+        # This case is about the Mamba restore depth; the MTP draft plane is off, so neither
+        # the speculative block reserve nor the draft-slot back-off applies.
+        ctx.num_speculative_tokens = 0
+        ctx.enable_mtp_kv_cache = False
         ctx.kv_block_allocator = types.SimpleNamespace(
             kv_hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
         )
@@ -4637,11 +4645,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # MUST go to the second block.
         token_blocks = context.token_to_block_idx[: context.active_token_count].tolist()
 
-        assert token_blocks == [
-            second_block,
-            second_block,
-            second_block,
-        ], f"Expected all new tokens to go to block {second_block}, but got {token_blocks}."
+        assert token_blocks == [second_block, second_block, second_block], (
+            f"Expected all new tokens to go to block {second_block}, but got {token_blocks}. "
+            f"The prompt exactly filled block {assigned_blocks[0].item()}, so every speculative "
+            f"token crosses into the block prefill reserved for them."
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

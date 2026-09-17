@@ -161,23 +161,13 @@ class MTPContextMixin:
         """
         assert self.enable_mtp_kv_cache
         active_slice = slice(self.paused_request_count, self.total_request_count)
-        # Block table for the active requests. MUST use the PRE-REWIND snapshot: the MTP draft
-        # loop writes D+1 speculative positions (up to committed-1+D), which extend past the
-        # accepted range into blocks that `_rewind_kv_cache` releases (and clears to -1) when a
-        # draft crosses a block boundary. Using the post-rewind `request_to_kv_block_ids` would
-        # send the deepest drafts to block -1 (corrupt), decaying acceptance with draft depth.
-        # The pre-rewind table (captured right after the main forward, before rewind) still holds
-        # every block the main model allocated for its own D+1 forward positions.
-        block_table_src = (
-            self.mtp_metadata.prerewind_block_table
-            if self.mtp_metadata.prerewind_block_table is not None
-            else self.request_to_kv_block_ids
-        )
+        # Rewind retains MTP lookahead blocks, so the live table owns every draft write.
+        # Reading the live row also follows compaction and sync/async scheduler transitions.
         self.mtp_metadata.begin_decode(
             active_request_count=active_request_count,
             padded_count=padded_count,
             start_positions=start_positions,
-            block_table_src=block_table_src[active_slice],
+            block_table_src=self.request_to_kv_block_ids[active_slice],
             graphed=graphed,
         )
 

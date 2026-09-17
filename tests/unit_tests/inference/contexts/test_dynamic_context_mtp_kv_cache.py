@@ -12,9 +12,9 @@ context with hand-seeded per-request state:
   * `_mtp_setup_decode_step` -- one draft depth (roll-by-one)
   * `_mtp_setup_prefill_step` -- the varlen commit pass
 
-The lifecycle itself (`begin_decode_for_capture`, `advance_decode_step`, `end_forward`,
-`snapshot_prerewind_block_table`) lives on `MTPMetadata` and is driven directly; only the
-steps that build metadata have a wrapper here.
+The lifecycle itself (`begin_decode_for_capture`, `advance_decode_step`, `end_forward`)
+lives on `MTPMetadata` and is driven directly; only the steps that build metadata have a
+wrapper here.
 
 The invariants asserted are the ones the draft attention depends on: write position
 `P_r = base_position_r - 1 + depth`, read length `kv_len = P_r + 1` (write-then-attend), and
@@ -28,6 +28,12 @@ import torch
 
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.disaggregation.decode_admission import admit_prefilled_decode
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -47,6 +53,7 @@ def _make_context(
     mtp_layer_type_list=None,
     is_hybrid_model: bool = False,
     max_requests: int = 16,
+    max_tokens: int = 256,
 ) -> DynamicInferenceContext:
     """Build a real `DynamicInferenceContext`, MTP-KV-enabled unless a gate is switched off."""
     if is_hybrid_model:
@@ -75,7 +82,7 @@ def _make_context(
             buffer_size_gb=0.1,
             paused_buffer_size_gb=0.02,
             block_size_tokens=BLOCK_SIZE_TOKENS,
-            max_tokens=256,
+            max_tokens=max_tokens,
             max_requests=max_requests,
             num_speculative_tokens=num_speculative_tokens,
             mamba_inference_state_config=mamba_inference_state_config,
@@ -232,43 +239,16 @@ class TestMtpDecodeBookkeeping:
         # Rows 0-1 are paused (still the -1 fill); the block table must hold the ACTIVE rows.
         assert context.mtp_metadata.active_block_table[:, :2].cpu().tolist() == [[3, 4], [7, 9]]
 
-    def test_begin_decode_prefers_prerewind_block_table(self):
-        """Deep drafts extend past the accepted range into blocks rewind has since released."""
+    def test_begin_decode_reads_current_ownership_after_row_reuse(self):
+        """A previous forward's table cannot survive compaction or request-slot reuse."""
         context = _make_context()
         _seed_requests(context, [[3, 4]])
-        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
-        # Simulate `_rewind_kv_cache` releasing the second block and clearing it to -1.
-        context.request_to_kv_block_ids[0, 1] = -1
-
-        context._mtp_begin_decode(1, 1, torch.tensor([9], device=torch.cuda.current_device()))
-
-        assert int(context.mtp_metadata.active_block_table[0, 1].item()) == 4, (
-            "the draft loop read the post-rewind block table and would send deep drafts to "
-            "block -1"
-        )
-
-    def test_begin_decode_falls_back_to_live_block_table(self):
-        """With no snapshot taken (e.g. a pure-prefill step) the live table is used."""
-        context = _make_context()
-        _seed_requests(context, [[3, 4]])
-        assert context.mtp_metadata.prerewind_block_table is None
-
-        context._mtp_begin_decode(1, 1, torch.tensor([9], device=torch.cuda.current_device()))
-
-        assert context.mtp_metadata.active_block_table[0, :2].cpu().tolist() == [3, 4]
-
-    def test_snapshot_is_a_copy_not_an_alias(self):
-        context = _make_context()
-        _seed_requests(context, [[3, 4]])
-        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
-        context.request_to_kv_block_ids[0, 0] = 99
-
-        assert int(context.mtp_metadata.prerewind_block_table[0, 0].item()) == 3
-
-    def test_snapshot_is_a_noop_when_disabled(self):
-        context = _make_context(num_speculative_tokens=0)
-        context.mtp_metadata.snapshot_prerewind_block_table(context.request_to_kv_block_ids)
-        assert context.mtp_metadata.prerewind_block_table is None
+        positions = torch.tensor([9], device=torch.cuda.current_device())
+        context._mtp_begin_decode(1, 1, positions)
+        context.mtp_metadata.end_forward()
+        context.request_to_kv_block_ids[0, :2] = torch.tensor([7, 9], dtype=torch.int32)
+        context._mtp_begin_decode(1, 1, positions)
+        assert context.mtp_metadata.active_block_table[0, :2].cpu().tolist() == [7, 9]
 
     def test_setup_decode_step_writes_roll_by_one_maps(self):
         """Depth 0 writes at `base_position - 1` and attends over `position + 1` keys."""
@@ -523,10 +503,9 @@ class TestMtpDraftBlockCoverage:
 
     The main path pre-allocates a block once `request_last_kv_block_offset` reaches
     `block_size_tokens - 1 - num_speculative_tokens`, reserving headroom for the speculative
-    positions. The draft loop writes `base_position - 1 + depth` for depth 0..D, so its deepest
-    write is one position BELOW the main model's own next forward. These tests pin that
-    relationship at and around the block boundary, where an off-by-one would send a deep draft
-    to an unallocated column (-1) and silently corrupt its KV.
+    positions. The draft loop writes `base_position - 1 + depth` for depth 0..D-1.
+    These tests check the prefill reservation at and around the block boundary, where an
+    off-by-one would send a deep draft to an unallocated column (-1) and corrupt its KV.
     """
 
     @classmethod
@@ -555,18 +534,26 @@ class TestMtpDraftBlockCoverage:
             precomputed_block_hashes=[],
         )
         match = context._compute_prefix_match(req, num_positions)
-        # `overall_required_blocks` is what the PROMPT occupies; the draft loop's extra block is
-        # carried separately, and the request owns both.
+        # A prompt ending within `num_speculative_tokens` of a block boundary also gets the
+        # speculative reserve block, which the draft loop writes into on this very step.
         owned = match.overall_required_blocks + match.speculative_reserve_blocks
         # Block 0 is the dummy block, so start real ids at 1.
         return list(range(1, owned + 1))
 
     @pytest.mark.parametrize("prompt_length", list(range(1, 2 * BLOCK_SIZE_TOKENS + 1)))
-    def test_every_draft_depth_lands_on_an_allocated_block(self, prompt_length):
-        """Sweep every offset within two blocks, including both exact boundaries."""
+    def test_every_draft_depth_writes_an_owned_block_or_nothing(self, prompt_length):
+        """Sweep every offset within two blocks, including both exact boundaries.
+
+        A prompt ending within `num_speculative_tokens` of a block boundary needs a block for
+        the loop's deepest positions on the step that prefilled it, before decode bookkeeping
+        has run. Prefill reserves that block, so those writes land on a real owned block rather
+        than being dropped. What must never happen is a write to block -1, which indexes the KV
+        buffer out of range and corrupts an unrelated request.
+        """
         context = _make_context()
         device = torch.cuda.current_device()
         depth = context.num_speculative_tokens
+        dummy = context.mtp_metadata.dummy_block_idx
 
         blocks = self._blocks_for(context, prompt_length)
         _seed_requests(context, [blocks])
@@ -576,18 +563,17 @@ class TestMtpDraftBlockCoverage:
             active_request_count=1, padded_count=1, start_positions=(base_position - 1)
         )
 
-        for d in range(depth + 1):
+        for d in range(depth):
             context._mtp_setup_decode_step()
             destination = context.gpu_view.token_to_block_idx[0].item()
             position = prompt_length - 1 + d
-            assert destination != -1, (
+            owned = position // context.block_size_tokens < len(blocks)
+            expected = blocks[position // context.block_size_tokens] if owned else dummy
+            assert destination == expected, (
                 f"prompt_length={prompt_length} depth={d} writes MTP position {position} "
-                f"(block column {position // context.block_size_tokens}) but the request only "
-                f"owns {len(blocks)} block(s); the main path under-allocated for the draft loop."
-            )
-            assert destination in blocks, (
-                f"prompt_length={prompt_length} depth={d} writes to block {destination}, "
-                f"which this request does not own ({blocks})."
+                f"(block column {position // context.block_size_tokens}) to block "
+                f"{destination}; expected {expected} "
+                f"({'the owning block' if owned else 'the dummy block, since it is unallocated'})."
             )
             context.mtp_metadata.advance_decode_step()
         context.mtp_metadata.end_forward()
@@ -1058,3 +1044,464 @@ class TestMtpChunkBoundaryCarry:
         assert not meta.chunk_boundary_valid
         with pytest.raises(AssertionError, match="no live chunk-boundary carry"):
             meta.take_chunk_boundary(req_id=42, seam_position=3)
+
+
+class TestMtpSpareBlockLifecycle:
+    """The reserved block's life AFTER the step that prefilled it.
+
+    `_compute_prefix_match` reserves one block when a prompt ends within `num_speculative_tokens`
+    of a block boundary, because the draft loop runs in the SAME step as the prefill and writes
+    past the prompt's last position (`TestMtpDraftBlockCoverage` pins those writes). The block is
+    counted in `request_kv_block_counts` and sits in the block table, but
+    `request_last_kv_block_id` deliberately still names the last token-bearing block: the pointer
+    drives the MAIN model's writes, whose local offsets are `position % block_size_tokens`, so
+    entering the block early would send the next main token to the wrong block.
+
+    `request_has_spare_block` carries that "owned but not yet entered" state. Every path that
+    would otherwise grant a block has to honour it, or the row ends up with two blocks where it
+    needs one and a pointer whose column does not match the next main token's position.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    # A prompt whose last token sits at offset 6 of an 8-token block, i.e. within
+    # num_speculative_tokens (2) of the boundary, so the reserve triggers.
+    SPARE_PROMPT_LENGTH = 7
+    # Last token at offset 3: comfortably clear of the boundary, so no reserve.
+    NO_SPARE_PROMPT_LENGTH = 4
+
+    @staticmethod
+    def _request(context, prompt_length, request_id=1):
+        return DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=torch.arange(prompt_length, device=torch.cuda.current_device()),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=context.block_size_tokens,
+            enable_prefix_caching=False,
+        )
+
+    @staticmethod
+    def _step(context, active_mask_values):
+        """Run one `update_requests` over the active rows, with all-new tokens.
+
+        `update_requests` indexes `new_speculative_tokens` unconditionally once
+        `num_speculative_tokens > 0`, and expects `[D, num_active]` in active-row order.
+        """
+        device = torch.cuda.current_device()
+        num_active = len(active_mask_values)
+        active_mask = torch.tensor(active_mask_values, device=device, dtype=torch.int32)
+        new_tokens = torch.full((num_active,), 100, device=device, dtype=torch.int64)
+        new_speculative_tokens = None
+        if context.num_speculative_tokens > 0:
+            new_speculative_tokens = torch.full(
+                (context.num_speculative_tokens, num_active), 101, device=device, dtype=torch.int64
+            )
+        return context.update_requests(active_mask, new_tokens, new_speculative_tokens)
+
+    @staticmethod
+    def _row_blocks(context, row):
+        count = int(context.request_kv_block_counts[row].item())
+        return context.request_to_kv_block_ids[row, :count].tolist()
+
+    @staticmethod
+    def _rewind(context, accepted):
+        controller = TextGenerationController.__new__(TextGenerationController)
+        controller.inference_wrapped_model = types.SimpleNamespace(inference_context=context)
+        controller.num_speculative_tokens = context.num_speculative_tokens
+        released, mask = controller._rewind_kv_cache(accepted_counts_cpu=accepted)
+        assert not mask.any(), "MTP lookahead must remain owned after rejection"
+        context.kv_block_allocator.release_memory_blocks(released[mask])
+
+    @staticmethod
+    def _assert_main_token_mapping(context):
+        n = context.active_token_count
+        positions = context.token_to_pos_ids[:n].long()
+        rows = context.token_to_request_idx[:n].long()
+        columns = positions // context.block_size_tokens
+        expected = context.request_to_kv_block_ids[rows, columns]
+        assert (expected >= 0).all()
+        torch.testing.assert_close(
+            context.token_to_block_idx[:n], expected.to(context.token_to_block_idx.dtype)
+        )
+        active = slice(context.paused_request_count, context.total_request_count)
+        last_columns = (
+            context.request_kv_length_offsets[active] + context.request_query_lengths[active] - 1
+        ) // context.block_size_tokens
+        request_rows = torch.arange(context.paused_request_count, context.total_request_count)
+        torch.testing.assert_close(
+            context.request_last_kv_block_id[active],
+            context.request_to_kv_block_ids[request_rows, last_columns.long()],
+        )
+
+    @pytest.mark.parametrize("depth,accepted", [(d, a) for d in (1, 2, 4, 7) for a in range(d + 1)])
+    @pytest.mark.parametrize("successor_path", ["update", "prepare"])
+    def test_verification_and_drafting_own_every_write(self, depth, accepted, successor_path):
+        """Sweep every block offset and acceptance count, including D=block_size-1.
+
+        The first transition includes the original B=8,D=2,prompt=5 failure. A second
+        verification/draft step exercises retained lookahead after rewind and both schedulers.
+        """
+        context = _make_context(num_speculative_tokens=depth)
+        count = 2 * context.block_size_tokens
+        for length in range(1, count + 1):
+            context.add_request(self._request(context, length, request_id=length))
+        self._step(context, [1] * count)
+        self._assert_main_token_mapping(context)
+
+        for acceptance in (accepted, depth - accepted):
+            owned = context.request_to_kv_block_ids.clone()
+            available = context.kv_block_allocator.get_allocatable_count()
+            self._rewind(context, torch.full((count,), acceptance, dtype=torch.int64))
+            torch.testing.assert_close(context.request_to_kv_block_ids, owned)
+            assert context.kv_block_allocator.get_allocatable_count() == available
+            starts = (
+                context.request_kv_length_offsets[:count]
+                + context.request_query_lengths[:count]
+                - 1
+            ).to(device="cuda", dtype=torch.int64)
+            with context._mtp_forward_phase():
+                context._mtp_begin_decode(count, count, starts)
+                for draft_depth in range(depth):
+                    context._mtp_setup_decode_step()
+                    positions = (starts + draft_depth).cpu().long()
+                    expected = owned[torch.arange(count), positions // context.block_size_tokens]
+                    assert (expected >= 0).all(), "draft reached an unallocated block"
+                    torch.testing.assert_close(
+                        context.gpu_view.token_to_block_idx[:count].cpu(),
+                        expected.to(context.gpu_view.token_to_block_idx.dtype),
+                    )
+                    context.mtp_metadata.advance_decode_step()
+
+            if successor_path == "update":
+                self._step(context, [1] * count)
+            else:
+                assert context.can_prepare_requests()
+                context.prepare_requests()
+            self._assert_main_token_mapping(context)
+
+    def test_insufficient_draft_headroom_pauses_before_verification(self):
+        context = _make_context()
+        # Main positions 5..7 fit the first block, but the following draft can write 8.
+        context.add_request(self._request(context, 5, request_id=1))
+        context.add_request(self._request(context, 7, request_id=2))
+        held = context.kv_block_allocator.allocate_memory_blocks(
+            context.kv_block_allocator.pool_avail
+        ).clone()
+        self._step(context, [1, 1])
+        assert context.paused_request_count == 1
+        assert int(context.request_ids[0]) == 1
+        assert context.request_kv_length_offsets[0] == 0, "paused before preparing verification"
+        self._assert_main_token_mapping(context)
+
+        context.kv_block_allocator.release_memory_blocks(held[:1])
+        self._step(context, [1])
+        assert context.paused_request_count == 0
+        row = int(torch.nonzero(context.request_ids[:2] == 1)[0])
+        assert context.request_kv_block_counts[row] == 2
+        assert context.request_has_spare_block[row]
+        self._assert_main_token_mapping(context)
+        context.kv_block_allocator.release_memory_blocks(held[1:])
+
+    def test_async_prepare_checks_draft_headroom_before_mutating_state(self):
+        context = _make_context()
+        context.add_request(self._request(context, 4))
+        self._step(context, [1])  # verification writes 4..6, draft fits through 7
+        assert context.request_kv_block_counts[0] == 1
+        held = context.kv_block_allocator.allocate_memory_blocks(
+            context.kv_block_allocator.pool_avail
+        ).clone()
+        self._rewind(context, torch.tensor([0]))  # committed position 4; next draft reaches 8
+        before = context.request_kv_length_offsets.clone()
+        assert not context.can_prepare_requests()
+        with pytest.raises(RuntimeError, match="cannot pause requests"):
+            context.prepare_requests()
+        torch.testing.assert_close(context.request_kv_length_offsets, before)
+        context.kv_block_allocator.release_memory_blocks(held[:1])
+        assert context.can_prepare_requests()
+        context.prepare_requests()
+        assert context.request_kv_block_counts[0] == 2
+        self._assert_main_token_mapping(context)
+        context.kv_block_allocator.release_memory_blocks(held[1:])
+
+    @pytest.mark.parametrize("depth", [2, 7])
+    def test_imported_decode_reserves_draft_headroom(self, depth):
+        context = _make_context(num_speculative_tokens=depth)
+        # Main verification fits through position 15; drafting reaches the next block.
+        prompt_length = 2 * context.block_size_tokens - (depth + 1)
+        request = self._request(context, prompt_length)
+        blocks = context.kv_block_allocator.allocate_memory_blocks(3).tolist()
+        prompt_blocks = (prompt_length + context.block_size_tokens - 1) // context.block_size_tokens
+        admit_prefilled_decode(
+            context,
+            request,
+            prompt_block_ids=blocks[:prompt_blocks],
+            continuation_block_ids=blocks[prompt_blocks:],
+            input_tokens=list(range(depth + 1)),
+        )
+        assert context.request_has_spare_block[0]
+        assert int(context.request_last_kv_block_id[0]) == blocks[1]
+        self._assert_main_token_mapping(context)
+
+    def test_prefill_reserves_a_block_the_pointer_does_not_name(self):
+        """The reserve is counted and owned, but the row has not entered it yet."""
+        context = _make_context()
+        context.add_request(self._request(context, self.SPARE_PROMPT_LENGTH))
+
+        assert bool(context.request_has_spare_block[0])
+        blocks = self._row_blocks(context, 0)
+        # One block for the 7 prompt tokens, one reserved for the draft writes past them.
+        assert len(blocks) == 2
+        assert int(context.request_last_kv_block_id[0]) == blocks[0], (
+            "the pointer must still name the last token-bearing block, or the next main token "
+            "is written into the reserve at the wrong local offset"
+        )
+
+    def test_a_prompt_clear_of_the_boundary_reserves_nothing(self):
+        context = _make_context()
+        context.add_request(self._request(context, self.NO_SPARE_PROMPT_LENGTH))
+
+        assert not bool(context.request_has_spare_block[0])
+        blocks = self._row_blocks(context, 0)
+        assert len(blocks) == 1
+        assert int(context.request_last_kv_block_id[0]) == blocks[0]
+
+    def test_without_speculative_decoding_nothing_is_ever_reserved(self):
+        """The whole mechanism is inert at D=0, whatever the prompt length."""
+        context = _make_context(num_speculative_tokens=0)
+        for request_id, prompt_length in enumerate(range(1, 2 * BLOCK_SIZE_TOKENS + 1), start=1):
+            context.add_request(self._request(context, prompt_length, request_id=request_id))
+        assert not context.request_has_spare_block.any()
+
+    def test_update_requests_crosses_into_the_spare_without_pausing_or_allocating(self):
+        """The row already owns the block it is crossing into, so nothing is drawn or paused."""
+        context = _make_context()
+        context.add_request(self._request(context, self.SPARE_PROMPT_LENGTH))
+        blocks = self._row_blocks(context, 0)
+        allocatable_before = context.kv_block_allocator.get_allocatable_count()
+
+        self._step(context, [1])
+
+        assert context.paused_request_count == 0, "a row holding a reserve has nothing to wait for"
+        assert context.kv_block_allocator.get_allocatable_count() == allocatable_before
+        assert not bool(context.request_has_spare_block[0]), "the reserve was consumed"
+        assert int(context.request_last_kv_block_id[0]) == blocks[1]
+        assert self._row_blocks(context, 0) == blocks, "no block was added past the reserve"
+
+    def test_resume_keeps_the_spare_until_main_token_positions_are_prepared(self):
+        """Resume grants capacity; preparing the next main inputs advances their pointer.
+
+        A force-paused row already owns the block it will enter. Neither phase may
+        allocate another block or route main inputs into the reserve before they reach it.
+        """
+        context = _make_context()
+        context.add_request(self._request(context, self.SPARE_PROMPT_LENGTH))
+        blocks = self._row_blocks(context, 0)
+
+        # Park the row in the paused region without disturbing its block state, exactly as the
+        # force-pause swap leaves it.
+        context.paused_request_count = 1
+        allocatable_before = context.kv_block_allocator.get_allocatable_count()
+
+        active_request_count, _ = context.resume_paused_requests(0, None)
+
+        assert active_request_count == 1
+        assert (
+            context.kv_block_allocator.get_allocatable_count() == allocatable_before
+        ), "resume granted a second block to a row that already owned the one it crosses into"
+        assert bool(context.request_has_spare_block[0])
+        assert int(context.request_last_kv_block_id[0]) == blocks[0]
+        assert self._row_blocks(context, 0) == blocks
+
+        self._step(context, [1])
+        assert not bool(context.request_has_spare_block[0])
+        assert int(context.request_last_kv_block_id[0]) == blocks[1]
+        assert context.kv_block_allocator.get_allocatable_count() == allocatable_before
+        self._assert_main_token_mapping(context)
+
+    def test_resume_still_grants_a_block_when_there_is_no_spare(self):
+        """Control: the spare exclusion must not starve an ordinary boundary-crossing row."""
+        context = _make_context(num_speculative_tokens=0)
+        # Last token at offset 7 of 8, so the row needs a block to keep decoding.
+        context.add_request(self._request(context, 2 * BLOCK_SIZE_TOKENS))
+        assert not bool(context.request_has_spare_block[0])
+        blocks = self._row_blocks(context, 0)
+
+        context.paused_request_count = 1
+        allocatable_before = context.kv_block_allocator.get_allocatable_count()
+
+        context.resume_paused_requests(0, None)
+
+        assert context.kv_block_allocator.get_allocatable_count() == allocatable_before - 1
+        new_blocks = self._row_blocks(context, 0)
+        assert len(new_blocks) == len(blocks) + 1
+        assert int(context.request_last_kv_block_id[0]) == new_blocks[-1]
+
+    def test_the_flag_follows_the_row_when_a_force_pause_reorders_the_batch(self):
+        """End-to-end: force-pause moves the spare holder, and resuming it allocates nothing.
+
+        `max_tokens // (num_speculative_tokens + 1)` caps the active count, so the last rows are
+        force-paused regardless of whether they hold a reserve. The spare holder is added last so
+        it is the one evicted from the active window, which also exercises the flag surviving
+        `_move_book_keeping_tensors`.
+        """
+        max_allowed_active = 8
+        context = _make_context(max_tokens=max_allowed_active * 3)
+        num_filler = max_allowed_active
+        for request_id in range(1, num_filler + 1):
+            context.add_request(self._request(context, 1, request_id=request_id))
+        spare_request_id = num_filler + 1
+        context.add_request(
+            self._request(context, self.SPARE_PROMPT_LENGTH, request_id=spare_request_id)
+        )
+        spare_blocks = self._row_blocks(context, num_filler)
+        assert bool(context.request_has_spare_block[num_filler])
+        allocatable_before = context.kv_block_allocator.get_allocatable_count()
+
+        # Step 1: the batch is one over the cap, so the spare holder is force-paused.
+        self._step(context, [1] * (num_filler + 1))
+
+        assert context.paused_request_count == 1
+        paused_row = 0
+        assert int(context.request_ids[paused_row]) == spare_request_id
+        assert bool(
+            context.request_has_spare_block[paused_row]
+        ), "the reserve is still owned; pausing does not release it"
+        assert self._row_blocks(context, paused_row) == spare_blocks
+
+        # Step 2: retire one filler so the paused row fits back in the active window.
+        active_mask = [1] * (context.total_request_count - context.paused_request_count)
+        active_mask[0] = 0
+        self._step(context, active_mask)
+
+        assert context.paused_request_count == 0, "the row should have resumed"
+        resumed_row = context.request_ids[: context.total_request_count] == spare_request_id
+        resumed_row = int(torch.nonzero(resumed_row)[0].item())
+        assert not bool(context.request_has_spare_block[resumed_row])
+        assert (
+            self._row_blocks(context, resumed_row) == spare_blocks
+        ), "resume granted a block past the reserve instead of crossing into it"
+        assert int(context.request_last_kv_block_id[resumed_row]) == spare_blocks[1]
+        # The only pool movement is the finished filler's block going back.
+        assert context.kv_block_allocator.get_allocatable_count() >= allocatable_before
+
+    def test_a_vacated_row_does_not_advertise_a_spare_it_no_longer_holds(self):
+        """The finished-request move copies the flag left; the source slot must be cleared.
+
+        `_move_book_keeping_tensors` copies src -> dst without clearing src, and step 6's advance
+        only sees the active slice, so the vacated slot keeps a `True` that no longer describes
+        anything it owns. The next request admitted into that slot would inherit a phantom spare
+        and cross a block boundary without being granted a block.
+        """
+        context = _make_context()
+        # Row 0 finishes this step; row 1 holds a reserve and is copied left into row 0.
+        context.add_request(self._request(context, self.NO_SPARE_PROMPT_LENGTH, request_id=1))
+        context.add_request(self._request(context, self.SPARE_PROMPT_LENGTH, request_id=2))
+        assert bool(context.request_has_spare_block[1])
+
+        self._step(context, [0, 1])
+
+        assert int(context.request_ids[0]) == 2, "the surviving row moved left"
+        stale = context.request_has_spare_block[context.total_request_count :]
+        assert not stale.any(), "a vacated slot still claims to own a spare block"
+
+    def test_admitting_imported_decode_state_clears_a_recycled_spare_flag(self):
+        """`admit_prefilled_decode` writes every other per-row field, so it must write this one.
+
+        An imported decode row owns exactly its prompt blocks plus the decode continuation, so it
+        has no unentered spare. Landing on a slot that a previous spare holder vacated must not
+        leave the row excluded from every "needs a block" check.
+        """
+        context = _make_context()
+        input_token_count = context.num_speculative_tokens + 1
+        # Prompt length 12 puts the row's offset at 6 of 8 after the imported decode tokens, so
+        # it is one step from a boundary and MUST be seen as needing a block.
+        prompt_length = 12
+        request = self._request(context, prompt_length, request_id=7)
+        # Poison the target slot exactly as a vacated spare holder would have.
+        context.request_has_spare_block[0] = True
+
+        admit_prefilled_decode(
+            context,
+            request,
+            prompt_block_ids=[1, 2],
+            continuation_block_ids=[],
+            input_tokens=list(range(input_token_count)),
+        )
+
+        assert not bool(context.request_has_spare_block[0])
+        assert bool(
+            context._get_async_sched_rows_requiring_new_block()[0]
+        ), "the row crosses a block boundary next step and owns nothing to cross into"
+
+    def test_eviction_does_not_charge_a_spare_holder_for_a_block_it_will_not_draw(self):
+        """A paused reserve holder resumes for free, so it must not push the evict count up.
+
+        `evict_overflow_paused_requests` sizes the eviction from how many blocks the survivors
+        need. Counting a spare holder there evicts a request that could have resumed without
+        touching the pool, throwing away a full prefill under exactly the memory pressure the
+        reserve exists to survive.
+        """
+
+        def _context_with_one_overflow_paused_row(has_spare):
+            context = _make_context()
+            context.add_request(self._request(context, self.SPARE_PROMPT_LENGTH))
+            assert bool(context.request_has_spare_block[0])
+            if not has_spare:
+                reserve = context.request_to_kv_block_ids[0, 1:2].clone()
+                context.kv_block_allocator.release_memory_blocks(reserve)
+                context.request_to_kv_block_ids[0, 1] = -1
+                context.request_kv_block_counts[0] -= 1
+                context.request_has_spare_block[0] = False
+            context.paused_request_count = 1
+            # Force a one-row overflow of the paused retention budget, and an empty pool, so the
+            # decision turns purely on whether the row is charged for a block.
+            context._get_paused_request_count_within_block_budget = lambda: 0
+            context._get_releasable_block_counts = lambda start, end: [0, 1]
+            context.kv_block_allocator.get_allocatable_count = lambda: 0
+            return context
+
+        device = torch.cuda.current_device()
+        next_tokens = torch.full((1,), 100, device=device, dtype=torch.int64)
+
+        spare_context = _context_with_one_overflow_paused_row(has_spare=True)
+        assert (
+            spare_context.evict_overflow_paused_requests(0, next_tokens) is None
+        ), "a paused row that already owns its next block was evicted to free one"
+        assert spare_context.paused_request_count == 1
+
+        # Control: the identical row without a reserve genuinely needs a block, so it is evicted.
+        plain_context = _context_with_one_overflow_paused_row(has_spare=False)
+        evicted = plain_context.evict_overflow_paused_requests(0, next_tokens)
+        assert evicted is not None and evicted.numel() == 1
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"mtp_use_repeated_layer": False},
+            {"mtp_layer_type_list": [Symbols.MAMBA, Symbols.MLP]},
+            {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.ATTENTION]},
+        ],
+        ids=["per-depth-head", "recurrent-head", "multi-attention-head"],
+    )
+    def test_a_head_that_writes_no_draft_kv_reserves_nothing(self, kwargs):
+        """The reserve exists only for draft KV writes, so it follows `enable_mtp_kv_cache`.
+
+        These heads still draft (`num_speculative_tokens > 0`) but write no KV into the main
+        block table, so the ordinary step-5 pause grants their blocks a step later as usual.
+        Reserving would pin an extra block per boundary-adjacent prompt for its whole lifetime.
+        """
+        context = _make_context(**kwargs)
+        assert context.num_speculative_tokens > 0 and not context.enable_mtp_kv_cache
+        context.add_request(self._request(context, self.SPARE_PROMPT_LENGTH))
+
+        assert not bool(context.request_has_spare_block[0])
+        assert self._row_blocks(context, 0) == [int(context.request_last_kv_block_id[0])]

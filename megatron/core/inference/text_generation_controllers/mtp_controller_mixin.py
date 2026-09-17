@@ -651,33 +651,10 @@ class MTPControllerMixin:
             next_token_ids = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
 
-        # MTP KV cache: append one extra entry for the final draft (spec[D-1]). The loop ran
-        # D depths (base + spec[0..D-2]); the main model forwards all D+1 positions next step
-        # (base + spec[0..D-1]), so the MTP KV must hold D+1 too, else it is one short at full
-        # acceptance. This forward only populates K/V (its logits feed no further depth). No
-        # explicit MTP rewind is needed: next step derives its start from base_position (which
-        # advances by 1 + accepted) and overwrites the rejected drafts' positions.
-        if mtp_kv_cache_on and has_mtp:
-            token_ids_buf[0, :active_request_count] = next_token_ids
-            position_ids_buf[0, :active_request_count] = base_position + self.num_mtp_depths
-            context._mtp_setup_decode_step()
-            extra_depth = (
-                None if unwrapped_model.mtp.mtp_use_repeated_layer else self.num_mtp_depths - 1
-            )
-            # The extra-append is a structurally identical one-token append+attend, so it reuses the
-            # last depth's captured KV-aware graph key (repeated-layer -> ("mtp_kv", n, None);
-            # otherwise ("mtp_kv", n, D-1)); both are captured during warmup. Leaving cache_key=None
-            # while graphed would trigger an illegal runtime capture.
-            unwrapped_model.compute_mtp_single_step(
-                hidden_states=current_hidden,
-                next_token_ids=token_ids_buf,
-                position_ids=position_ids_buf,
-                depth=extra_depth,
-                eager=not mtp_graphed,
-                cache_key=(("mtp_kv", padded_count, extra_depth) if mtp_graphed else None),
-                mtp_inference_context=context,
-            )
-            context.mtp_metadata.advance_decode_step()
+        # The final sampled token needs no additional MTP forward. On the next step, its
+        # position is either refreshed from a main hidden by the commit pass (if accepted),
+        # overwritten by draft depth 0, or remains beyond the causal read range until a later
+        # depth overwrites it. The main verifier reads a separate KV plane.
 
     @torch.inference_mode()
     def _run_dummy_serial_mtp_forward(self) -> None:
@@ -733,9 +710,9 @@ class MTPControllerMixin:
 
         context = self.inference_wrapped_model.inference_context
 
-        # When the MTP KV cache is active, real ranks run one prefill-slot forward BEFORE the depth
-        # loop and one extra-append forward AFTER it. The dummy EP rank must mirror both the COUNT
-        # (D+2 forwards) and the graph/eager MODE, else the shared MoE all-to-all count/shape
+        # When the MTP KV cache is active, real ranks run one commit-pass forward before the
+        # depth loop. The dummy EP rank must mirror both the count (D+1 forwards) and the
+        # graph/eager mode, else the shared MoE all-to-all count/shape
         # mismatches and the collective hangs. Mirror the real path's mode via the EP-synced
         # `_mtp_resolved_padded_count` (None iff the main step was eager) -- NOT the local live
         # `using_cuda_graph_this_step()`, which the commit pass clobbers on the real ranks.
@@ -775,18 +752,3 @@ class MTPControllerMixin:
                     pp_group=self.pp_group,
                 )
             nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
-
-        # Extra-append forward to match the real path's D+1th MTP forward (no PP broadcast,
-        # mirroring the real extra append which does not broadcast its logits).
-        if mtp_cache_active and has_mtp:
-            extra_depth = (
-                None if unwrapped_model.mtp.mtp_use_repeated_layer else self.num_mtp_depths - 1
-            )
-            unwrapped_model.compute_mtp_single_step(
-                hidden_states=dummy_hidden,
-                next_token_ids=dummy_token_ids,
-                position_ids=dummy_position_ids,
-                depth=extra_depth,
-                eager=mtp_forward_eager,
-                cache_key=(("mtp", padded_count, extra_depth) if not mtp_forward_eager else None),
-            )
