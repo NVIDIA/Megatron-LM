@@ -3,7 +3,7 @@
 
 Exit code:
   0 — all metrics within tolerance
-  1 — at least one regression OR an improvement large enough to require baseline refresh
+  1 — incompatible metadata, a regression, or an improvement requiring baseline refresh
 
 For throughput-style metrics:
   - Fail when measured < baseline * (1 - tol).        ← regression
@@ -31,6 +31,7 @@ import yaml
 
 THROUGHPUT_METRICS = {"throughput_tok_per_sec"}
 LATENCY_METRICS = {"avg_latency_ms", "p50_latency_ms", "p99_latency_ms", "tpot_ms_per_tok"}
+COMPARISON_METADATA = ("dataset", "batch_size", "num_output_tokens", "num_iters")
 
 
 def _check(
@@ -112,6 +113,7 @@ def main() -> int:
     print(f"Metrics: {metrics}")
 
     all_ok = True
+    metadata_failed = False
     for batch_key, baseline_entry in baseline.items():
         if batch_key not in results:
             print(f"FAIL: {batch_key} present in baseline but missing from results")
@@ -119,6 +121,26 @@ def main() -> int:
             continue
         print(f"\n[{batch_key}]")
         measured_entry = results[batch_key]
+        metadata_ok = True
+        for field in COMPARISON_METADATA:
+            missing = [
+                name
+                for name, entry in (("results", measured_entry), ("baseline", baseline_entry))
+                if field not in entry
+            ]
+            if missing:
+                print(f"FAIL: metadata {field!r} missing from {' and '.join(missing)}")
+                metadata_ok = False
+            elif measured_entry[field] != baseline_entry[field]:
+                print(
+                    f"FAIL: metadata {field!r} differs: "
+                    f"results={measured_entry[field]!r}, baseline={baseline_entry[field]!r}"
+                )
+                metadata_ok = False
+        if not metadata_ok:
+            metadata_failed = True
+            all_ok = False
+            continue
         for metric in metrics:
             if metric not in baseline_entry or metric not in measured_entry:
                 continue
@@ -135,6 +157,9 @@ def main() -> int:
             print(line)
 
     print()
+    if metadata_failed:
+        print("INCOMPARABLE: results and baseline metadata differ — see above.")
+        return 1
     if all_ok:
         print("OK: all metrics within tolerance.")
         return 0
