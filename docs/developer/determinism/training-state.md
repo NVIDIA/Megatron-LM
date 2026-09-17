@@ -60,9 +60,9 @@ The H100 and GB200 `determinism-state.yaml` recipes each select two per-step job
 `mcore_gpt` pilot and the `megatron_gpt` training adapter, with eight and four
 ranks respectively. They use the existing integration-test
 selection path; actual scheduling still depends on the CI scope and protected
-runner approval. Each also adds three stop-point jobs to nightly cadence (or an
-explicit cadence bypass): both original GPU adapters plus a TP=2/PP=2 training
-recipe, using steps 3 and 5 of a five-step schedule. The normal
+runner approval. Each also adds four stop-point jobs to nightly cadence (or an
+explicit cadence bypass): both original GPU adapters plus TP=2/PP=2 training
+with one or two virtual chunks, using steps 3 and 5 of a five-step schedule. The normal
 PR selection retains its two existing jobs. A configured recipe is not GPU
 execution evidence.
 
@@ -134,9 +134,40 @@ All stages must supply model state, gradients and local optimizer moments;
 missing stage records cannot pass. The actual synchronous distributed checkpoint
 is retained and verified for every rank, including both pipeline stages.
 
-Only PP=1/2 without virtual stages is supported by this recipe. Other pipeline
-sizes, VPP, overlapped P2P and deferred embedding-gradient work require additional
-state/boundary validation. They cannot be enabled by changing the declared rank count.
+Add `--virtual-pipeline-size 2` to the PP=2 recipe to exercise four transformer
+layers with two virtual chunks per physical stage, one layer per chunk:
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 \
+  --pipeline-size 2 --virtual-pipeline-size 2 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-virtual-pipeline-stop-points
+```
+
+Megatron requires P2P overlap for this two-stage interleaved schedule. The
+adapter requires its ordinary overlap policy with output deallocation enabled,
+non-batched P2P, and warmup/flush overlap disabled. The existing schedule waits
+on sends before output deallocation, drains backward sends, and asserts its
+receive-work queues are empty before returning. The observer retains that
+schedule and captures after optimizer/scheduler updates; target capture also
+synchronizes the device. Grad/parameter-gather overlap and deferred embedding
+weight gradients remain unsupported.
+
+Every virtual chunk has an explicit identity, global layer number, endpoint
+role, communication policy and loader slot in provenance. Missing, reordered
+or duplicated chunks cannot pass. With this layout only chunk zero on physical
+stage zero owns embeddings/data, and chunk one on physical stage one owns the
+output/loss data; only TP rank zero builds their loaders. Other local slots
+explicitly record that they have no loader. Each live chunk iterator retains
+its own data/index arrays, RNG and checked actual sample cursor. Model and
+gradient state include both chunks; the optimizer adapter includes all local
+parameter/moment shards. The reference's actual distributed checkpoint must
+restore all of them.
+
+Only the documented PP=1/2 recipes and the two-chunk PP=2 virtual recipe are
+supported. Other pipeline sizes, virtual layouts and overlap policies require
+additional state/boundary validation. Declaring more ranks does not enable them.
 
 The diagnostic worker temporarily observes the training module's loader,
 train, checkpoint and post-step callbacks. The callbacks retain their original
@@ -167,7 +198,7 @@ changed, missing or additional shards invalidate the evidence. Checkpoint
 hashes identify the loaded files; state comparisons still use raw bytes.
 
 This is an additional GPU validation recipe, **not an executed GPU result**.
-FP8/FP4, precision-aware/offloaded optimizers, communication overlap,
+FP8/FP4, precision-aware/offloaded optimizers, other communication overlap policies,
 broader PP/VPP/CP/EP/FSDP layouts, real datasets and production recipe stop-point validation
 remain separate work. Unsupported state formats fail visibly.
 

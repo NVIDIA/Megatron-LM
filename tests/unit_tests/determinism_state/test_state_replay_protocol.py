@@ -202,3 +202,80 @@ def test_pp2_is_rejected_by_adapters_that_do_not_use_a_pipeline(tmp_path, backen
             stop_steps=[3, 5],
         )
     assert not (tmp_path / "invalid").exists()
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+@pytest.mark.parametrize(
+    "change", ["missing", "reordered", "duplicate", "layer", "endpoint", "loader", "p2p"]
+)
+def test_virtual_layout_requires_all_chunks_and_actual_owners(tmp_path, world_size, change):
+    for rank, (tp, pp, dp) in enumerate(product(range(2), range(2), range(world_size // 4))):
+        chunks = [
+            {
+                "VP": index,
+                "pre_process": pp == 0 and index == 0,
+                "post_process": pp == 1 and index == 1,
+                "layers": [index * 2 + pp + 1],
+                "owns_loader": tp == 0 and index == pp,
+                "p2p": {
+                    "overlap_p2p_comm": True,
+                    "batch_p2p_comm": False,
+                    "deallocate_pipeline_outputs": True,
+                    "overlap_p2p_comm_warmup_flush": False,
+                },
+            }
+            for index in range(2)
+        ]
+        record = {
+            "global_rank": rank,
+            "world_size": world_size,
+            "sizes": {"TP": 2, "PP": 2, "DP": world_size // 4, "CP": 1},
+            "TP": tp,
+            "PP": pp,
+            "DP": dp,
+            "CP": 0,
+            "VPP": 2,
+            "owns_loader": tp == 0,
+            "chunks": chunks,
+        }
+        (tmp_path / f"complete-rank-{rank:06d}.json").write_text(
+            json.dumps({"provenance": {"rank_layout": record}})
+        )
+    replay._verify_megatron_layout(tmp_path, world_size, 2, 2)
+    path = tmp_path / "complete-rank-000000.json"
+    record = json.loads(path.read_text())
+    chunks = record["provenance"]["rank_layout"]["chunks"]
+    if change == "missing":
+        chunks.pop()
+    elif change == "reordered":
+        chunks.reverse()
+    elif change == "duplicate":
+        chunks[1] = chunks[0]
+    elif change == "layer":
+        chunks[1]["layers"] = [2]
+    elif change == "endpoint":
+        chunks[1]["pre_process"] = True
+    elif change == "loader":
+        chunks[1]["owns_loader"] = True
+    else:
+        chunks[1]["p2p"]["deallocate_pipeline_outputs"] = False
+    path.write_text(json.dumps(record))
+    with pytest.raises(UnverifiedState, match="virtual chunks"):
+        replay._verify_megatron_layout(tmp_path, world_size, 2, 2)
+
+
+@pytest.mark.parametrize("backend", ["cpu", "mcore_gpt", "megatron_gpt"])
+def test_virtual_pipeline_requires_real_training_with_two_physical_stages(tmp_path, backend):
+    with pytest.raises(ValueError, match="VPP=2"):
+        run_stop_points(
+            tmp_path / "invalid",
+            backend=backend,
+            world_size=4,
+            pipeline_size=1,
+            virtual_pipeline_size=2,
+            steps=5,
+            checkpoint_step=2,
+            control="rng",
+            stop_steps=[3, 5],
+        )
+    assert not (tmp_path / "invalid").exists()

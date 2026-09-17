@@ -40,14 +40,25 @@ from tools.determinism.training_state import (
 
 
 def recipe_arguments(
-    world_size: int, steps: int, stop_step: int | None = None, *, pipeline_size: int = 1
+    world_size: int,
+    steps: int,
+    stop_step: int | None = None,
+    *,
+    pipeline_size: int = 1,
+    virtual_pipeline_size: int = 1,
 ) -> list[str]:
-    """Freeze the real-training recipe: TP=2, PP=1/2, BF16 distributed Adam."""
+    """Freeze BF16 distributed Adam with TP=2, PP=1/2 and optional two-chunk VPP."""
     if world_size not in (4, 8) or type(pipeline_size) is not int or pipeline_size not in (1, 2):
         raise ValueError("The Megatron training recipe requires four/eight ranks and PP=1/2")
+    if (
+        type(virtual_pipeline_size) is not int
+        or virtual_pipeline_size not in (1, 2)
+        or (virtual_pipeline_size == 2 and pipeline_size != 2)
+    ):
+        raise ValueError("The two-chunk virtual pipeline requires PP=2")
     arguments = [
         "--num-layers",
-        "2",
+        str(2 * virtual_pipeline_size),
         "--hidden-size",
         "128",
         "--ffn-hidden-size",
@@ -121,6 +132,9 @@ def recipe_arguments(
         "torch_dist",
         "--use-checkpoint-opt-param-scheduler",
     ]
+    if virtual_pipeline_size == 2:
+        # Megatron requires P2P overlap for an interleaved two-stage pipeline.
+        arguments += ["--num-virtual-stages-per-pipeline-rank", "2"]
     if stop_step is not None:
         # train-iters also controls data indexing and scheduler construction.
         arguments += ["--exit-interval", str(stop_step)]
@@ -136,8 +150,9 @@ class TrainingCapture:
         self.checkpointing = checkpointing
         self.rank = int(os.environ["RANK"])
         self.world_size = int(os.environ["WORLD_SIZE"])
-        self.loader = None
-        self.iterator = None
+        self.loaders: list = []
+        self.iterators: list = []
+        self.chunks: list = []
         self.provenance = None
         self.resumed = None
         self.captured_steps: list[int] = []
@@ -166,6 +181,7 @@ class TrainingCapture:
                 self.args.steps,
                 self.args.stop_step,
                 pipeline_size=self.args.pipeline_size,
+                virtual_pipeline_size=self.args.virtual_pipeline_size,
             ),
             "capture": self.capture_config,
             "checkpoint_step": self.args.checkpoint_step,
@@ -187,9 +203,48 @@ class TrainingCapture:
             "DP": parallel_state.get_data_parallel_rank(),
             "CP": parallel_state.get_context_parallel_rank(),
             "VPP": parallel_state.get_virtual_pipeline_model_parallel_world_size(),
-            "owns_loader": self.loader is not None and self.iterator is not None,
+            "owns_loader": any(self.loader_owners()),
         }
+        if self.args.virtual_pipeline_size == 2:
+            record["rank_layout"]["chunks"] = self.chunk_layout()
         return record
+
+    def loader_owners(self) -> list[bool]:
+        """Require one correctly paired loader/iterator slot per local chunk."""
+        count = self.args.virtual_pipeline_size
+        if len(self.loaders) != count or len(self.iterators) != count:
+            raise UnverifiedState("Missing or extra pipeline loader/iterator slot")
+        owners = []
+        for loader, iterator in zip(self.loaders, self.iterators):
+            if (loader is None) != (iterator is None):
+                raise UnverifiedState("Pipeline loader and iterator ownership disagree")
+            owners.append(loader is not None)
+        return owners
+
+    def chunk_layout(self) -> list[dict]:
+        """Read actual virtual chunk identity, global layers, endpoints and P2P policy."""
+        owners = self.loader_owners()
+        if len(self.chunks) != len(owners):
+            raise UnverifiedState("Model and loader chunk counts disagree")
+        return [
+            {
+                "VP": chunk.vp_stage,
+                "pre_process": chunk.pre_process,
+                "post_process": chunk.post_process,
+                "layers": [layer.layer_number for layer in chunk.decoder.layers],
+                "owns_loader": owners[index],
+                "p2p": {
+                    key: getattr(chunk.config, key)
+                    for key in (
+                        "overlap_p2p_comm",
+                        "batch_p2p_comm",
+                        "deallocate_pipeline_outputs",
+                        "overlap_p2p_comm_warmup_flush",
+                    )
+                },
+            }
+            for index, chunk in enumerate(self.chunks)
+        ]
 
     def validate_configuration(self) -> None:
         """Reject unimplemented precision, overlap, loader and checkpoint variants."""
@@ -219,8 +274,8 @@ class TrainingCapture:
             "skip_train",
             "perform_rl_step",
             "optimizer_cuda_graph",
-            "overlap_p2p_comm",
             "defer_embedding_wgrad_compute",
+            "overlap_p2p_comm_warmup_flush",
         ):
             if getattr(args, name, None):
                 raise UnverifiedState(f"State adapter does not cover {name}")
@@ -228,9 +283,12 @@ class TrainingCapture:
             args.tensor_model_parallel_size != 2
             or args.pipeline_model_parallel_size != self.args.pipeline_size
             or args.context_parallel_size != 1
-            or args.virtual_pipeline_model_parallel_size is not None
+            or args.virtual_pipeline_model_parallel_size
+            != (2 if self.args.virtual_pipeline_size == 2 else None)
+            or bool(getattr(args, "overlap_p2p_comm", False))
+            != (self.args.virtual_pipeline_size == 2)
         ):
-            raise UnverifiedState("Expected TP=2, requested PP, CP=1 and no virtual pipeline")
+            raise UnverifiedState("Expected TP=2, requested PP/VPP, CP=1 and matching P2P overlap")
         if self.args.stop_step is not None:
             if (
                 args.train_iters != self.args.steps
@@ -307,12 +365,12 @@ class TrainingCapture:
         return save
 
     def wrap_loaders(self, original):
-        """Retain the actual training loader and its dedicated generator."""
+        """Retain every actual loader in the same order as virtual chunk construction."""
 
         @functools.wraps(original)
         def loaders(*positional, **keywords):
             result = original(*positional, **keywords)
-            self.loader = result[0]
+            self.loaders.append(result[0])
             return result
 
         return loaders
@@ -323,7 +381,14 @@ class TrainingCapture:
         @functools.wraps(original)
         def train(*positional, **keywords):
             bound = inspect.signature(original).bind(*positional, **keywords)
-            self.iterator = bound.arguments["train_data_iterator"]
+            iterator = bound.arguments["train_data_iterator"]
+            if self.args.virtual_pipeline_size == 2:
+                if not isinstance(iterator, list):
+                    raise UnverifiedState("Virtual pipeline requires a list of data iterators")
+                self.iterators = iterator
+            else:
+                self.iterators = [iterator]
+            self.chunks = self.training.unwrap_model(bound.arguments["model"])
             self.validate_configuration()
             if (self.args.resume is not None) != (self.resumed is not None):
                 raise UnverifiedState("Missing or unexpected Megatron checkpoint load")
@@ -397,9 +462,7 @@ class TrainingCapture:
             "precision": precision,
             "rng": _rng_state(True),
             "scheduler": scheduler.state_dict(),
-            "dataloader": capture_single_pass_loader(
-                self.loader, self.iterator, consumed_samples=args.consumed_train_samples
-            ),
+            "dataloader": self.capture_dataloaders(args.consumed_train_samples),
         }
         write_snapshot(
             self.args.output,
@@ -413,11 +476,40 @@ class TrainingCapture:
         )
         self.captured_steps.append(step)
 
+    def capture_dataloaders(self, consumed_samples: int) -> dict:
+        """Capture each actual iterator, including explicit loader-free virtual chunks."""
+        self.loader_owners()
+        states = {
+            str(index): (
+                {"mode": "no_local_loader_for_virtual_chunk"}
+                if self.args.virtual_pipeline_size == 2 and loader is None
+                else capture_single_pass_loader(loader, iterator, consumed_samples=consumed_samples)
+            )
+            for index, (loader, iterator) in enumerate(zip(self.loaders, self.iterators))
+        }
+        if self.args.virtual_pipeline_size == 1:
+            return states["0"]
+        return {"mode": "virtual_pipeline_chunks", "chunks": states}
+
     def validate_partition(self, chunks: list) -> None:
         """Require the expected local layer count and pipeline endpoint ownership."""
         pipeline_size = self.args.pipeline_size
         pipeline_rank = self.provenance["rank_layout"]["PP"]
-        if len(chunks) != 1 or (
+        if self.args.virtual_pipeline_size == 2:
+            if len(chunks) != 2 or any(
+                chunk.vp_stage != index
+                or chunk.pre_process != (pipeline_rank == 0 and index == 0)
+                or chunk.post_process != (pipeline_rank == 1 and index == 1)
+                or [layer.layer_number for layer in chunk.decoder.layers]
+                != [index * pipeline_size + pipeline_rank + 1]
+                or not chunk.config.overlap_p2p_comm
+                or chunk.config.batch_p2p_comm
+                or not chunk.config.deallocate_pipeline_outputs
+                or chunk.config.overlap_p2p_comm_warmup_flush
+                for index, chunk in enumerate(chunks)
+            ):
+                raise UnverifiedState("Model partition or P2P policy differs from the VPP recipe")
+        elif len(chunks) != 1 or (
             chunks[0].pre_process != (pipeline_rank == 0)
             or chunks[0].post_process != (pipeline_rank == pipeline_size - 1)
             or len(chunks[0].decoder.layers) != 2 // pipeline_size
@@ -475,7 +567,11 @@ def run_worker(args: argparse.Namespace) -> None:
     command = [
         str(ROOT / "pretrain_gpt.py"),
         *recipe_arguments(
-            capture.world_size, args.steps, args.stop_step, pipeline_size=args.pipeline_size
+            capture.world_size,
+            args.steps,
+            args.stop_step,
+            pipeline_size=args.pipeline_size,
+            virtual_pipeline_size=args.virtual_pipeline_size,
         ),
     ]
     command += [
@@ -524,6 +620,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
     parser.add_argument("--stop-step", type=int)

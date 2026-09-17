@@ -200,12 +200,13 @@ def make_capture(monkeypatch, tmp_path):
         steps=4,
         stop_step=None,
         pipeline_size=1,
+        virtual_pipeline_size=1,
         omit_restore="rng",
         output=tmp_path / "resume",
         run_id="resume-run",
     )
     training_args = SimpleNamespace(load=str(root / "megatron-checkpoints"), no_load_rng=False)
-    training = SimpleNamespace(get_args=lambda: training_args)
+    training = SimpleNamespace(get_args=lambda: training_args, unwrap_model=lambda model: model)
     return TrainingCapture(args, training, None), training_args, record
 
 
@@ -312,7 +313,7 @@ def test_only_successful_target_exit_completes_training(monkeypatch, tmp_path, f
     monkeypatch.setattr(capture, "runtime_provenance", lambda: {"fixture": True})
     error = SystemExit(1 if failure == "nonzero_exit" else 0)
 
-    def train(train_data_iterator):
+    def train(train_data_iterator, model):
         if failure != "no_capture":
             capture.captured_steps = [3]
         if failure != "no_decision":
@@ -323,13 +324,14 @@ def test_only_successful_target_exit_completes_training(monkeypatch, tmp_path, f
 
     if failure is None:
         with pytest.raises(SystemExit) as raised:
-            capture.wrap_train(train)("live-iterator")
+            capture.wrap_train(train)("live-iterator", ["live-model"])
         assert raised.value is error is capture.expected_exit
         assert capture.train_completed
-        assert capture.iterator == "live-iterator"
+        assert capture.iterators == ["live-iterator"]
+        assert capture.chunks == ["live-model"]
     else:
         with pytest.raises(UnverifiedState):
-            capture.wrap_train(train)("live-iterator")
+            capture.wrap_train(train)("live-iterator", ["live-model"])
         assert not capture.train_completed
         assert capture.expected_exit is None
 
@@ -405,3 +407,167 @@ def test_pipeline_partition_requires_its_layer_and_endpoint(
     else:
         with pytest.raises(UnverifiedState, match="partition"):
             capture.validate_partition(chunks)
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_virtual_recipe_preserves_horizon_and_selects_real_interleaved_schedule(world_size):
+    command = recipe_arguments(world_size, 5, 3, pipeline_size=2, virtual_pipeline_size=2)
+    for flag, value in (
+        ("--num-layers", "4"),
+        ("--num-virtual-stages-per-pipeline-rank", "2"),
+        ("--global-batch-size", str(world_size)),
+        ("--train-iters", "5"),
+        ("--lr-decay-iters", "5"),
+        ("--exit-interval", "3"),
+    ):
+        assert command[command.index(flag) + 1] == value
+    assert "--no-overlap-p2p-communication" not in command
+
+
+def virtual_chunks(pipeline_rank):
+    return [
+        SimpleNamespace(
+            vp_stage=index,
+            pre_process=pipeline_rank == 0 and index == 0,
+            post_process=pipeline_rank == 1 and index == 1,
+            decoder=SimpleNamespace(
+                layers=[SimpleNamespace(layer_number=index * 2 + pipeline_rank + 1)]
+            ),
+            config=SimpleNamespace(
+                overlap_p2p_comm=True,
+                batch_p2p_comm=False,
+                deallocate_pipeline_outputs=True,
+                overlap_p2p_comm_warmup_flush=False,
+            ),
+        )
+        for index in range(2)
+    ]
+
+
+@pytest.mark.parametrize("pipeline_rank", [0, 1])
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "missing",
+        "reordered",
+        "layer",
+        "endpoint",
+        "no_overlap",
+        "batch",
+        "no_deallocation",
+        "warmup",
+    ],
+)
+def test_virtual_partition_checks_both_chunks_and_completed_schedule_policy(
+    monkeypatch, tmp_path, pipeline_rank, change
+):
+    capture, _, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.pipeline_size = capture.args.virtual_pipeline_size = 2
+    capture.provenance = {"rank_layout": {"PP": pipeline_rank}}
+    chunks = virtual_chunks(pipeline_rank)
+    if change == "missing":
+        chunks.pop()
+    elif change == "reordered":
+        chunks.reverse()
+    elif change == "layer":
+        chunks[1].decoder.layers[0].layer_number += 1
+    elif change == "endpoint":
+        chunks[1].post_process = not chunks[1].post_process
+    elif change == "no_overlap":
+        chunks[1].config.overlap_p2p_comm = False
+    elif change == "batch":
+        chunks[1].config.batch_p2p_comm = True
+    elif change == "no_deallocation":
+        chunks[1].config.deallocate_pipeline_outputs = False
+    elif change == "warmup":
+        chunks[1].config.overlap_p2p_comm_warmup_flush = True
+    if change is None:
+        capture.validate_partition(chunks)
+    else:
+        with pytest.raises(UnverifiedState, match="partition"):
+            capture.validate_partition(chunks)
+
+
+@pytest.mark.parametrize("pipeline_rank", [0, 1])
+def test_virtual_loader_slots_capture_actual_cursor_and_reject_wrong_pairing(
+    monkeypatch, tmp_path, pipeline_rank
+):
+    capture, _, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.virtual_pipeline_size = 2
+    loader, iterator = make_loader(0)
+    for _ in range(3):
+        next(iterator.iterable)
+    wrapper = capture.wrap_loaders(lambda value: (value, None, None))
+    for index in range(2):
+        wrapper(loader if index == pipeline_rank else None)
+    capture.iterators = [iterator if index == pipeline_rank else None for index in range(2)]
+    monkeypatch.setattr(
+        "tools.determinism.megatron_state_worker.capture_single_pass_loader",
+        capture_mock_loader_state,
+    )
+    capture.chunks = virtual_chunks(pipeline_rank)
+    layout = capture.chunk_layout()
+    assert [chunk["VP"] for chunk in layout] == [0, 1]
+    assert [chunk["owns_loader"] for chunk in layout] == [pipeline_rank == 0, pipeline_rank == 1]
+    state = capture.capture_dataloaders(6)
+    assert state["mode"] == "virtual_pipeline_chunks"
+    assert set(state["chunks"]) == {"0", "1"}
+    assert state["chunks"][str(pipeline_rank)]["next_global_sample"] == 6
+    assert state["chunks"][str(1 - pipeline_rank)] == {"mode": "no_local_loader_for_virtual_chunk"}
+    # A different live iterator cannot stand in for this chunk's actual loader.
+    _, other_iterator = make_loader(0)
+    capture.iterators[pipeline_rank] = other_iterator
+    with pytest.raises(UnverifiedState, match="does not belong"):
+        capture.capture_dataloaders(6)
+
+
+@pytest.mark.parametrize("change", ["missing_loader", "missing_iterator", "wrong_owner", "extra"])
+def test_virtual_loader_slots_cannot_be_omitted_or_mispaired(monkeypatch, tmp_path, change):
+    capture, _, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.virtual_pipeline_size = 2
+    capture.loaders = [object(), None]
+    capture.iterators = [object(), None]
+    if change == "missing_loader":
+        capture.loaders.pop()
+    elif change == "missing_iterator":
+        capture.iterators.pop()
+    elif change == "wrong_owner":
+        capture.iterators.reverse()
+    else:
+        capture.loaders.append(None)
+        capture.iterators.append(None)
+    with pytest.raises(UnverifiedState, match="slot|ownership"):
+        capture.capture_dataloaders(4)
+
+
+@pytest.mark.parametrize("change", [None, "no_overlap", "wrong_vpp", "warmup", "deferred_wgrad"])
+def test_virtual_configuration_requires_the_validated_p2p_schedule(monkeypatch, tmp_path, change):
+    capture, args, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.pipeline_size = capture.args.virtual_pipeline_size = 2
+    args.__dict__.update(
+        bf16=True,
+        use_distributed_optimizer=True,
+        deterministic_mode=True,
+        ckpt_format="torch_dist",
+        dataloader_type="single",
+        num_workers=0,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=1,
+        virtual_pipeline_model_parallel_size=2,
+        overlap_p2p_comm=True,
+    )
+    if change == "no_overlap":
+        args.overlap_p2p_comm = False
+    elif change == "wrong_vpp":
+        args.virtual_pipeline_model_parallel_size = 3
+    elif change == "warmup":
+        args.overlap_p2p_comm_warmup_flush = True
+    elif change == "deferred_wgrad":
+        args.defer_embedding_wgrad_compute = True
+    if change is None:
+        capture.validate_configuration()
+    else:
+        with pytest.raises(UnverifiedState):
+            capture.validate_configuration()
