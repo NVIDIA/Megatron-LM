@@ -22,8 +22,8 @@ _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
-    PREFIX_SPLICE_BOUNDARY_FIELD,
-    PREFIX_SPLICE_SUFFIX_FIELD,
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     unwrap_serialized_tensors,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -559,9 +559,14 @@ def _replace_prefix_tokens(
     if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
-    last_eos_token_id_index = _prefix_replacement_start(
-        eos_token_id, retokeenized_previous_turn_token_ids, current_turn_token_ids
-    )
+    # Find the last EOS token id in the previous turn token ids
+    last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
+    # Note that the current conversation stat may be shorter than the previous conversation state.
+    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
+        if current_turn_token_ids[i] == eos_token_id:
+            last_eos_token_id_index = i
+            break
 
     # Replace the current turn token ids with the tokens from the previous generation
     current_turn_additional_token_ids = current_turn_token_ids[last_eos_token_id_index:]
@@ -570,31 +575,31 @@ def _replace_prefix_tokens(
     return previous_turn_token_ids + current_turn_additional_token_ids
 
 
-def _prefix_replacement_start(
-    eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids
-):
-    """Locate the rendered boundary at which an exact prior prefix is spliced."""
-    last_eos_token_id_index = len(retokenized_previous_turn_token_ids) - 1
-    # The current conversation state may be shorter than the previous conversation state.
-    scan_len = min(len(retokenized_previous_turn_token_ids), len(current_turn_token_ids))
-    for i in reversed(range(scan_len)):
-        if current_turn_token_ids[i] == eos_token_id:
-            last_eos_token_id_index = i
-            break
-    return last_eos_token_id_index
-
-
-def _build_prefix_splice_metadata(
-    eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids, offload_params
-):
-    """Describe the rendered boundary so an engine-side preparer can splice exact prior tokens."""
-    start = _prefix_replacement_start(
-        eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids
+def _has_previous_turn_tokens(last_assistant_message):
+    """True when the last assistant message carries the token ids of a previous
+    Megatron-Inference response, so the endpoint can replace the prefix with the exact prior turn here.
+    Dataset-provided conversation history won't have these fields."""
+    return last_assistant_message is not None and (
+        isinstance(last_assistant_message.get("prompt_token_ids"), list)
+        and isinstance(last_assistant_message.get("generation_token_ids"), list)
     )
+
+
+def _last_assistant_message(template_messages):
+    """Return ``(index, message)`` of the last assistant turn, or ``(None, None)``."""
+    for i in reversed(range(len(template_messages))):
+        if template_messages[i]["role"] == "assistant":
+            return i, template_messages[i]
+    return None, None
+
+
+def _replace_prefix_tokens_metadata(eos_token_id, template_prefix_token_ids, offload_params):
+    """Ship the rendered prior-turn tokens so the engine's RequestPromptPreparer can replace the
+    prefix with the exact prior tokens itself (NeMo RL's ``replace_prefix_tokens``)."""
     return {
         **offload_params,
-        PREFIX_SPLICE_SUFFIX_FIELD: list(current_turn_token_ids[start:]),
-        PREFIX_SPLICE_BOUNDARY_FIELD: eos_token_id,
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: list(template_prefix_token_ids),
+        PREFIX_EOS_TOKEN_ID_FIELD: eos_token_id,
     }
 
 
@@ -789,14 +794,6 @@ try:
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
-        # Client-supplied token ids of the conversation through its last assistant message.
-        # They replace the previous turn's compact prompt + generation ids as the stitched prefix.
-        required_prefix_token_ids = req.get("required_prefix_token_ids") or None
-        if required_prefix_token_ids is not None and not (
-            isinstance(required_prefix_token_ids, list)
-            and all(isinstance(token_id, int) for token_id in required_prefix_token_ids)
-        ):
-            return Response("'required_prefix_token_ids' must be a list of token ids", status=400)
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
@@ -824,6 +821,26 @@ try:
             multi_modal_data = {"video": video_bytes_list}
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
+
+        # The exact tokens of the previous turn can come from one of two places, never both:
+        #  - the last assistant message, when the client echoed back the token ids of a
+        #    previous Megatron-Inference response (prefix replaced here), or
+        #  - a store the engine's RequestPromptPreparer can reach, when the client sent
+        #    offload_params (prefix replaced in the engine; we ship what the preparer needs).
+        last_assistant_message_idx, last_assistant_message = _last_assistant_message(
+            template_messages
+        )
+        has_previous_turn_tokens = _has_previous_turn_tokens(last_assistant_message)
+        if has_previous_turn_tokens and offload_params is not None:
+            return Response(
+                "prompt_token_ids/generation_token_ids on the last assistant message and "
+                "'offload_params' are mutually exclusive prefix sources",
+                status=400,
+            )
+        replace_prefix_tokens_here = prevent_retokenization and has_previous_turn_tokens
+        replace_prefix_tokens_in_engine = (
+            offload_params is not None and last_assistant_message is not None
+        )
 
         # Inject the server-configured chat template (e.g. pretraining.jinja for
         # VLM checkpoints). Loaded once at server startup from --chat-template
@@ -897,137 +914,84 @@ try:
                         ),
                     )
 
-                if (
-                    prevent_retokenization
-                    or required_prefix_token_ids is not None
-                    or offload_params is not None
-                ):
-                    # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
+                if replace_prefix_tokens_here or replace_prefix_tokens_in_engine:
+                    # Replace the re-rendered prefix with the exact tokens of the previous turn.
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
-
-                    # Find the last assistant message
-                    last_assistant_message_idx = None
-                    for i in reversed(range(len(template_messages))):
-                        if template_messages[i]["role"] == "assistant":
-                            last_assistant_message_idx = i
-                            break
-
-                    last_assistant_message = (
-                        template_messages[last_assistant_message_idx]
-                        if last_assistant_message_idx is not None
-                        else None
-                    )
-                    if required_prefix_token_ids is not None and last_assistant_message is None:
-                        raise ValueError(
-                            "An exact token prefix was requested but the conversation has no "
-                            "assistant message to anchor it."
-                        )
-
-                    # Dataset-provided conversation history won't carry token ids from a
-                    # previous generation.
-                    has_previous_turn_tokens = last_assistant_message is not None and (
-                        isinstance(last_assistant_message.get("prompt_token_ids"), list)
-                        and isinstance(last_assistant_message.get("generation_token_ids"), list)
-                    )
-                    # Splice here when the client supplied the prior turn's tokens. When it
-                    # only supplied offload_params, the exact prior tokens live in a store
-                    # the engine's RequestPromptPreparer can reach: ship the rendered
-                    # boundary and let the engine splice before admission.
-                    splice_here = required_prefix_token_ids is not None or has_previous_turn_tokens
-                    splice_in_engine = (
-                        not splice_here
-                        and offload_params is not None
-                        and last_assistant_message is not None
-                    )
-
-                    if last_assistant_message is not None and (splice_here or splice_in_engine):
-                        messages_to_last_assistant_message = template_messages[
-                            : last_assistant_message_idx + 1
-                        ]
-                        previous_media_slots = [
-                            slot for slot in media_slots if slot[2] <= last_assistant_message_idx
-                        ]
+                    messages_to_last_assistant_message = template_messages[
+                        : last_assistant_message_idx + 1
+                    ]
+                    previous_media_slots = [
+                        slot for slot in media_slots if slot[2] <= last_assistant_message_idx
+                    ]
+                    if replace_prefix_tokens_here:
                         previous_prompt_token_ids = last_assistant_message.get(
                             "compact_prompt_token_ids"
                         )
-                        if (
-                            splice_here
-                            and required_prefix_token_ids is None
-                            and not isinstance(previous_prompt_token_ids, list)
-                        ):
+                        if not isinstance(previous_prompt_token_ids, list):
                             raise ValueError(
                                 "Prefix stitching requires compact_prompt_token_ids "
                                 "from the previous Megatron-Inference response."
                             )
-                        eos_token_id = tokenizer.eos_id
-                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+                    eos_token_id = tokenizer.eos_id
+                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
-                        warnings.warn(
-                            "Avoiding prefix retokenization."
-                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                    warnings.warn(
+                        "Avoiding prefix retokenization."
+                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
+                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                    )
+
+                    # Get the templated tokenization of just the previous generation.
+                    if previous_media_slots:
+                        retokenized_previous_turn_token_ids = (
+                            await asyncio.get_running_loop().run_in_executor(
+                                current_app.config.get('tokenize_executor'),
+                                partial(
+                                    _tokenize_with_media_slots_sync,
+                                    tokenize_chat_tok,
+                                    messages_to_last_assistant_message,
+                                    previous_media_slots,
+                                    prompt_config,
+                                    tools=template_tools,
+                                    chat_template_kwargs=chat_template_kwargs,
+                                    add_generation_prompt=False,
+                                ),
+                            )
+                        )
+                    else:
+                        retokenized_previous_turn_token_ids = (
+                            await asyncio.get_running_loop().run_in_executor(
+                                current_app.config.get('tokenize_executor'),
+                                partial(
+                                    _apply_chat_template_sync,
+                                    tokenize_chat_tok,
+                                    messages_to_last_assistant_message,
+                                    template_tools,
+                                    chat_template_kwargs,
+                                    add_generation_prompt=False,
+                                ),
+                            )
                         )
 
-                        # Get the templated tokenization of just the previous generation.
-                        if previous_media_slots:
-                            retokenized_previous_turn_token_ids = (
-                                await asyncio.get_running_loop().run_in_executor(
-                                    current_app.config.get('tokenize_executor'),
-                                    partial(
-                                        _tokenize_with_media_slots_sync,
-                                        tokenize_chat_tok,
-                                        messages_to_last_assistant_message,
-                                        previous_media_slots,
-                                        prompt_config,
-                                        tools=template_tools,
-                                        chat_template_kwargs=chat_template_kwargs,
-                                        add_generation_prompt=False,
-                                    ),
-                                )
-                            )
-                        else:
-                            retokenized_previous_turn_token_ids = (
-                                await asyncio.get_running_loop().run_in_executor(
-                                    current_app.config.get('tokenize_executor'),
-                                    partial(
-                                        _apply_chat_template_sync,
-                                        tokenize_chat_tok,
-                                        messages_to_last_assistant_message,
-                                        template_tools,
-                                        chat_template_kwargs,
-                                        add_generation_prompt=False,
-                                    ),
-                                )
-                            )
-
-                        if splice_in_engine:
-                            offload_params = _build_prefix_splice_metadata(
-                                eos_token_id,
-                                retokenized_previous_turn_token_ids,
-                                prompt_tokens,
-                                offload_params,
-                            )
-                        else:
-                            if required_prefix_token_ids is not None:
-                                # Tokens for the previous turn are supplied by the user.
-                                previous_turn_token_ids = required_prefix_token_ids
-                            else:
-                                previous_turn_token_ids = (
-                                    previous_prompt_token_ids
-                                    + last_assistant_message["generation_token_ids"]
-                                )
-                            prompt_tokens = _replace_prefix_tokens(
-                                eos_token_id,
-                                previous_turn_token_ids,
-                                retokenized_previous_turn_token_ids,
-                                prompt_tokens,
-                            )
+                    if replace_prefix_tokens_in_engine:
+                        offload_params = _replace_prefix_tokens_metadata(
+                            eos_token_id, retokenized_previous_turn_token_ids, offload_params
+                        )
+                    else:
+                        previous_turn_token_ids = (
+                            previous_prompt_token_ids
+                            + last_assistant_message["generation_token_ids"]
+                        )
+                        prompt_tokens = _replace_prefix_tokens(
+                            eos_token_id,
+                            previous_turn_token_ids,
+                            retokenized_previous_turn_token_ids,
+                            prompt_tokens,
+                        )
 
             else:
                 if media_slots:
                     raise ValueError("Multimodal chat requests require a chat template.")
-                if required_prefix_token_ids is not None:
-                    raise ValueError("exact token prefixes require a tokenizer chat template")
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
                 )

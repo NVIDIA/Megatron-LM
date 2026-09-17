@@ -1322,11 +1322,12 @@ class RequestPayloadStager(Protocol):
 
 
 # Request-metadata keys written by the chat endpoint when it defers the prompt
-# prefix splice to a RequestPromptPreparer: the current render's tokens from the
-# turn boundary onward, and the boundary (EOS) token id. The preparer supplies the
-# exact prior-turn tokens and concatenates ``prefix_without_boundary + suffix``.
-PREFIX_SPLICE_SUFFIX_FIELD = "prefix_splice_suffix_token_ids"
-PREFIX_SPLICE_BOUNDARY_FIELD = "prefix_splice_boundary_token_id"
+# prefix replacement to a RequestPromptPreparer: the chat-template render of the
+# conversation through its last assistant message, and the EOS token id. The
+# consumer is out-of-tree (NeMo RL's ``TQMegatronPromptPreparer``), which passes
+# them straight to its ``replace_prefix_tokens``; the names mirror its arguments.
+PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
+PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
 
 
 class RequestPromptPreparer(Protocol):
