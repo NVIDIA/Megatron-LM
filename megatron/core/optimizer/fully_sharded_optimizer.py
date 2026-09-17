@@ -341,12 +341,15 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # same global shape and dtype but no local rows, so it contributes no data and
                 # only keeps the DTensor keyspace identical on every rank.
                 # TODO: delete this branch, together with _gather_state_keys_by_fqn and the
-                # owned_fqns filter in load_state_dict, once the empty-shard filter in
-                # get_megatron_optimizer goes away. That filter works around
-                # https://github.com/NVIDIA/TransformerEngine/issues/3207, fixed by
-                # https://github.com/NVIDIA/TransformerEngine/pull/3212, which has not yet
-                # propagated to the LTS container the MFSDP v2 tests also run in. With the
-                # filter gone the keyspace is rank-invariant by construction.
+                # owned_fqns filter in load_state_dict, once MFSDP v2 drops support for
+                # TE < 2.18. The filter that makes them necessary is applied only there
+                # (see get_megatron_optimizer), working around
+                # https://github.com/NVIDIA/TransformerEngine/issues/3207, which
+                # https://github.com/NVIDIA/TransformerEngine/pull/3212 fixed in 2.18. On a
+                # newer TE every rank already holds every parameter, so no placeholder is
+                # ever synthesized and this branch is dead -- it is left unconditional
+                # rather than version-gated so there is one keyspace to reason about
+                # instead of two.
                 packed_state[fqn] = {
                     key: torch.zeros_like(param) for key in state_keys_by_fqn.get(fqn, ())
                 }
