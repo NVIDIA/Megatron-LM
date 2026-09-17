@@ -13,6 +13,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 
+from megatron.core.utils import ensure_params_ready
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
@@ -648,6 +649,7 @@ class Qwen3MoEModel(nn.Module):
     def _head_weight_for_fused_ce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.head is not None
         weight = self.head.col.linear.weight
+        ensure_params_ready((weight,))
         if weight.dtype == hidden_states.dtype:
             return weight
         return weight.to(dtype=hidden_states.dtype)
