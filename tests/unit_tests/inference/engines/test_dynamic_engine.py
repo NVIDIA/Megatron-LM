@@ -1056,7 +1056,7 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
         dynamic_engine.msgpack.packb([3, 4], use_bin_type=True),
         dynamic_engine.msgpack.packb(None, use_bin_type=True),
     ]
-    engine.add_request = lambda *_: engine._handle_failed_request(42)
+    engine.add_request = lambda *_, **__: engine._handle_failed_request(42)
     socket = engine.socket_for_receiving_requests = mock.Mock()
     socket.recv_multipart.side_effect = [message, dynamic_engine.zmq.Again]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
@@ -1591,9 +1591,8 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     engine.socket_for_receiving_requests = mock.Mock()
     completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25], streaming=streaming)
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
-    records = [types.SimpleNamespace(merge=lambda r=r: r) for r in (completed, failed)]
 
-    engine._send_request_records_to_coordinator(records)
+    engine._send_requests_to_coordinator([completed, failed])
 
     engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
@@ -4611,16 +4610,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 ),
             )
         )
-        finished_records = []
+        finished_requests = []
         while engine.has_unfinished_requests():
-            finished_records.extend(engine.step_modern()["finished_request_records"])
-        merged = finished_records[0].merge()
+            finished_requests.extend(engine.step_modern()["finished_requests"])
+        finished = finished_requests[0]
 
         # The staged payload is the exact per-token data of the request, keyed by its uid.
         ((uid, payload),) = engine.payload_stager.staged
-        assert uid == merged.uid
-        assert payload.prompt_token_ids == merged.prompt_tokens.tolist()
-        assert payload.generated_token_ids == list(merged.generated_tokens)
+        assert uid == finished.uid
+        assert payload.prompt_token_ids == finished.prompt_tokens.tolist()
+        assert payload.generated_token_ids == list(finished.generated_tokens)
         assert len(payload.generated_log_probs) == len(payload.generated_token_ids)
 
         # The reply drops the staged payload and marks the takeover; token ids stay.

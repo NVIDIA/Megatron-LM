@@ -337,6 +337,10 @@ class DynamicInferenceEngine(AbstractEngine):
     # the += in resume() still rebinds onto the instance.
     _weight_epoch: int = 0
 
+    # Defaults for instances created without __init__ (tests build the engine via __new__).
+    payload_stager: Optional[RequestPayloadStager] = None
+    prompt_preparer: Optional[RequestPromptPreparer] = None
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",

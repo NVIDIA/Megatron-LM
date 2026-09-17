@@ -135,7 +135,11 @@ class DummyEngine(DynamicInferenceEngine):
         self.rank = torch.distributed.get_rank()
 
     def add_request(
-        self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
+        self,
+        request_id: int,
+        prompt: str,
+        sampling_params: Optional[SamplingParams] = None,
+        offload_params=None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
@@ -451,11 +455,14 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         _identity, metadata_frame, _prompt, _media = self._submit(coordinator, block_hashes=[])
-        header, request_id, sampling_params, media_meta = msgpack.unpackb(metadata_frame, raw=False)
+        header, request_id, sampling_params, media_meta, offload_params = msgpack.unpackb(
+            metadata_frame, raw=False
+        )
         assert header == Headers.SUBMIT_REQUEST.value
         assert request_id == 0  # server-side id, not the client's 7
         assert sampling_params == {"temperature": 1.0}
         assert media_meta is None
+        assert offload_params is None
         assert coordinator.request_id_to_client_request_id[0] == 7
 
 
