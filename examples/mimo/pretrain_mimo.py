@@ -11,6 +11,12 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 # cannot reach them.
 suppress_duplicate_logs_off_rank0()
 
+# Apply policy before Core/TE imports can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import argparse
 from functools import partial
 

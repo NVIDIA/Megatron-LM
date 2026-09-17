@@ -2,8 +2,8 @@
 
 """CPU policy contracts; use --confcutdir here to avoid the GPU suite's conftest.
 
-Load the policy module directly because importing the full MCore package needs
-Triton. The separate library integration test exercises the public import on GPU.
+The public early package imports without the Core GPU dependencies. The separate
+library integration test exercises subsequent Core and training imports on GPU.
 """
 
 import importlib.util
@@ -31,7 +31,10 @@ def load_module(name, path):
 
 @pytest.fixture
 def policy(monkeypatch):
-    module = load_module("_test_core_determinism", "megatron/core/determinism.py")
+    from megatron.determinism import _policy as module
+
+    monkeypatch.setattr(module, "_configured_pid", None)
+    monkeypatch.setattr(module, "_configured_environment", None)
     enabled = torch.are_deterministic_algorithms_enabled()
     warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     benchmark = torch.backends.cudnn.benchmark
@@ -187,13 +190,12 @@ def test_late_policy_drift_is_rejected(policy, monkeypatch, change):
         policy.configure_determinism({"deterministic_mode": True})
 
 
-def test_actual_model_parallel_config_and_training_adapter_share_policy(policy, monkeypatch):
+def test_actual_model_parallel_config_and_training_adapter_share_policy(policy):
     model_module = load_module(
         "_test_model_parallel_config", "megatron/core/model_parallel_config.py"
     )
     model = model_module.ModelParallelConfig(deterministic_mode=True)
     model_report = policy.configure_determinism(model)
-    monkeypatch.setitem(sys.modules, "megatron.core.determinism", policy)
     adapter = load_module("_test_training_determinism", "megatron/training/determinism.py")
     args = SimpleNamespace(cross_entropy_loss_fusion=False, tp_comm_overlap=False)
     assert adapter.apply_determinism_to_args(args) == model_report
@@ -201,12 +203,29 @@ def test_actual_model_parallel_config_and_training_adapter_share_policy(policy, 
     assert adapter.apply_determinism_env is policy.apply_determinism_env
 
 
+def test_training_adapter_rejects_disabled_mode_after_bootstrap(policy):
+    policy.configure_determinism({"deterministic_mode": True})
+    adapter = load_module("_test_training_determinism", "megatron/training/determinism.py")
+    args = SimpleNamespace(
+        deterministic_mode=False, cross_entropy_loss_fusion=False, tp_comm_overlap=False
+    )
+    with pytest.raises(AssertionError, match="deterministic_mode=True"):
+        adapter.apply_determinism_to_args(args)
+
+
+def test_configured_status_tracks_process_intent_even_after_drift(policy):
+    assert not policy.is_determinism_configured()
+    policy.configure_determinism({"deterministic_mode": True})
+    assert policy.is_determinism_configured()
+    torch.use_deterministic_algorithms(False)
+    assert policy.is_determinism_configured()  # Validation must still reject drift.
+    policy._configured_pid -= 1
+    assert not policy.is_determinism_configured()
+
+
 def test_optimized_python_still_rejects_invalid_settings():
     script = '''
-import importlib.util
-spec = importlib.util.spec_from_file_location('policy', 'megatron/core/determinism.py')
-policy = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(policy)
+import megatron.determinism as policy
 for action in (
     lambda: policy.validate_determinism_config({'deterministic_mode':True, 'tp_comm_overlap':True}),
     lambda: policy.apply_determinism_env({'NCCL_ALGO':'Tree'}),
@@ -218,3 +237,101 @@ for action in (
     raise RuntimeError('Validation was optimized away')
 '''
     subprocess.run([sys.executable, "-O", "-c", script], cwd=ROOT, check=True, timeout=60)
+
+
+def test_public_early_import_needs_no_core_and_does_not_initialize_cuda():
+    script = '''
+import os
+import sys
+import torch
+before = dict(os.environ)
+state = torch.get_rng_state().clone()
+enabled = torch.are_deterministic_algorithms_enabled()
+import megatron.determinism as policy
+assert dict(os.environ) == before
+assert torch.are_deterministic_algorithms_enabled() == enabled
+assert not policy.is_determinism_configured()
+policy.configure_determinism({'deterministic_mode': True})
+assert policy.is_determinism_configured()
+assert not torch.cuda.is_initialized()
+assert not torch.distributed.is_initialized()
+assert torch.equal(state, torch.get_rng_state())
+assert not any(name == 'megatron.core' or name.startswith(('megatron.core.', 'transformer_engine'))
+               for name in sys.modules)
+'''
+    subprocess.run([sys.executable, "-c", script], cwd=ROOT, check=True, timeout=60)
+
+
+def test_cli_bootstrap_only_applies_when_requested(policy):
+    from megatron.determinism import bootstrap_training_determinism
+
+    before = dict(os.environ)
+    enabled = torch.are_deterministic_algorithms_enabled()
+    assert bootstrap_training_determinism(["--train-iters", "2"]) is None
+    assert not policy.is_determinism_configured()
+    assert dict(os.environ) == before
+    assert torch.are_deterministic_algorithms_enabled() == enabled
+    argv = ["--deterministic-mode", "--train-iters", "2"]
+    assert bootstrap_training_determinism(argv)["options"]["deterministic_mode"]
+    assert argv == ["--deterministic-mode", "--train-iters", "2"]
+
+
+@pytest.mark.parametrize(
+    "yaml_text,enabled",
+    [
+        ("deterministic_mode: true", True),
+        ("deterministic_mode: false", False),
+        ("model_parallel:\n  deterministic_mode: true", True),
+        ("deterministic_mode: true\nmodel_parallel:\n  deterministic_mode: false", False),
+        (
+            "model_parallel:\n  deterministic_mode: false\nlanguage_model:\n  deterministic_mode: true",
+            True,
+        ),
+    ],
+)
+def test_yaml_bootstrap_replaces_cli_and_matches_config_precedence(
+    policy, tmp_path, yaml_text, enabled
+):
+    from megatron.determinism import bootstrap_training_determinism
+
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml_text)
+    report = bootstrap_training_determinism(["--deterministic-mode", "--yaml-cfg", str(path)])
+    assert (report is not None) is enabled
+    assert policy.is_determinism_configured() is enabled
+
+
+@pytest.mark.parametrize("module_mode", [False, True])
+def test_launcher_preserves_arguments_and_target_imports(tmp_path, module_mode):
+    target = tmp_path / "startup_target.py"
+    (tmp_path / "startup_sibling.py").write_text("VALUE = 17\n")
+    target.write_text('''
+import json
+import sys
+from pathlib import Path
+import startup_sibling
+from megatron.determinism import is_determinism_configured
+assert is_determinism_configured()
+assert 'megatron.core' not in sys.modules
+assert startup_sibling.VALUE == 17
+Path(sys.argv[1]).write_text(json.dumps(sys.argv))
+''')
+    report_path = tmp_path / "argv.json"
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(ROOT), str(tmp_path)]))
+    command = [sys.executable, "-m", "megatron.determinism"]
+    command += ["-m", "startup_target"] if module_mode else [str(target)]
+    result = subprocess.run(
+        [*command, str(report_path), "--literal", "a b"],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(report_path.read_text()) == [
+        str(target),
+        str(report_path),
+        "--literal",
+        "a b",
+    ]
