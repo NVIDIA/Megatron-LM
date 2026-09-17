@@ -9,7 +9,11 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -21,6 +25,7 @@ from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -78,6 +83,57 @@ class TestDynamicContext:
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
+
+    @pytest.mark.internal
+    def test_recompute_rebinds_nvls_real_token_count_tensor(self):
+        """A RECOMPUTE resume binds NVLS to the newly allocated GPU view."""
+        previous_real_token_count = NVLSAllGatherVDispatcher._real_token_count_tensor
+        try:
+            model_config = TransformerConfig(
+                params_dtype=torch.float32,
+                num_layers=4,
+                hidden_size=16,
+                ffn_hidden_size=16,
+                kv_channels=8,
+                num_attention_heads=2,
+                num_moe_experts=2,
+                moe_ffn_hidden_size=16,
+                moe_router_topk=2,
+                moe_router_dtype="fp32",
+                moe_grouped_gemm=True,
+                transformer_impl="inference_optimized",
+                inference_grouped_gemm_backend="torch",
+                normalization="RMSNorm",
+                add_bias_linear=False,
+                add_qkv_bias=False,
+                use_cpu_initialization=True,
+            )
+            context = DynamicInferenceContext(
+                model_config=model_config,
+                inference_config=InferenceConfig(
+                    max_sequence_length=512,
+                    buffer_size_gb=0.03,
+                    paused_buffer_size_gb=0.006,
+                    block_size_tokens=128,
+                    kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+                    use_flashinfer_fused_rope=False,
+                    unified_memory_level=0,
+                ),
+            )
+
+            old_real_token_count = context.gpu_view.real_token_count
+            assert NVLSAllGatherVDispatcher._real_token_count_tensor is old_real_token_count
+
+            context.deallocate_inference_state_buffers()
+            context.reinitialize_inference_state_buffers()
+
+            assert context.gpu_view.real_token_count is not old_real_token_count
+            assert (
+                NVLSAllGatherVDispatcher._real_token_count_tensor
+                is context.gpu_view.real_token_count
+            )
+        finally:
+            NVLSAllGatherVDispatcher._real_token_count_tensor = previous_real_token_count
 
     def _get_dynamic_context(
         self,
@@ -4230,6 +4286,8 @@ class TestDynamicContext:
     [
         ([0, 0, 0], [0.0, 1.0, 1.0], [None, None, None]),  # all no-op: fast path
         ([4, 0], [0.0, 1.0], [4, None]),  # mixed batch: per-row repair
+        ([1], [1.0], [1]),  # greedy: exactly one finite argmax, even on a tie
+        ([1], [0.9], [1]),  # top-k=1 remains greedy when combined with top-p
     ],
 )
 def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite_counts):
@@ -4255,6 +4313,8 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
     )
 
     backend = FlashInferSampling(64, torch.Generator(device="cuda"))
+    if top_k.tolist() == [1]:
+        logits[0, 0] = logits[0, 1] = logits.max()
     log_probs = backend.log_probs_kernel(logits, context)
     expected = torch.log_softmax(logits, dim=-1)
     for row, finite_count in enumerate(finite_counts):
@@ -4262,6 +4322,8 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert torch.equal(log_probs[row], expected[row])
         else:
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
+    if top_k.tolist() == [1]:
+        assert log_probs[0, 0].item() == 0.0
 
 
 @pytest.mark.parametrize(
@@ -4300,7 +4362,13 @@ def test_flashinfer_sample_kernel_dispatch(
             temperature=torch.ones(n),
             top_k=torch.tensor(top_k, dtype=torch.int32),
             top_p=torch.tensor(top_p),
-        )
+        ),
+        active_request_metadata={
+            "top_k": torch.tensor(top_k, dtype=torch.int32),
+            "top_p": torch.tensor(top_p),
+        },
+        total_request_count=n,
+        paused_request_count=0,
     )
     rng = torch.Generator()
     backend = FlashInferSampling(vocab_size, rng)
@@ -4332,3 +4400,78 @@ def test_flashinfer_sample_kernel_dispatch(
     }
     for safe_arg, expected in zip(args[1:], expected_safe.get(expected_kernel, [])):
         assert torch.equal(safe_arg, expected)
+
+
+@pytest.mark.parametrize("top_p_value", [1.0, 0.9])
+def test_flashinfer_top_k_one_ties_use_deterministic_argmax(monkeypatch, top_p_value):
+    """top_k=1 is greedy on ties, including when combined with top-p."""
+    fake = mock.MagicMock()
+    fake.sampling.top_k_sampling_from_probs.return_value = torch.tensor([3, 1])
+    fake.sampling.top_k_top_p_sampling_from_logits.return_value = torch.tensor([3, 1])
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
+    n, vocab_size = logits.shape
+    top_k = torch.ones(n, dtype=torch.int32)
+    top_p = torch.full((n,), top_p_value)
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(temperature=torch.ones(n), top_k=top_k, top_p=top_p),
+        active_request_metadata={"top_k": top_k, "top_p": top_p},
+        total_request_count=n,
+        paused_request_count=0,
+    )
+
+    backend = FlashInferSampling(vocab_size, torch.Generator())
+    sampled = backend.sample_kernel(logits, n, context, no_top_k=False, no_top_p=top_p_value >= 1.0)
+
+    assert torch.equal(sampled, torch.tensor([1, 0]))
+    fake.sampling.top_k_sampling_from_probs.assert_not_called()
+    fake.sampling.top_k_top_p_sampling_from_logits.assert_not_called()
+
+
+def test_flashinfer_mixed_batch_repairs_greedy_ties(monkeypatch):
+    """Greedy rows remain deterministic alongside stochastic top-k rows."""
+    fake = mock.MagicMock()
+    fake.sampling.top_k_top_p_sampling_from_logits.return_value = torch.tensor(
+        [3, 2], dtype=torch.int32
+    )
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
+    top_k = torch.tensor([1, 2], dtype=torch.int32)
+    top_p = torch.full((2,), 0.9)
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(temperature=torch.ones(2), top_k=top_k, top_p=top_p),
+        active_request_metadata={"top_k": top_k, "top_p": top_p},
+        total_request_count=2,
+        paused_request_count=0,
+    )
+
+    backend = FlashInferSampling(logits.size(1), torch.Generator())
+    sampled = backend.sample_kernel(logits, 2, context, no_top_k=False, no_top_p=False)
+
+    assert torch.equal(sampled, torch.tensor([1, 2]))
+    fake.sampling.top_k_top_p_sampling_from_logits.assert_called_once()
+
+
+def test_torch_processed_log_probs_match_top_k_one_greedy_tie_breaking():
+    """Torch processed log-probs match deterministic top_k=1 sampling on ties."""
+    logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
+    top_k = torch.ones(2, dtype=torch.int32)
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        active_request_metadata={
+            "temperature": torch.ones(2),
+            "top_k": top_k,
+            "top_p": torch.zeros(2),
+        },
+    )
+
+    backend = TorchSampling(torch.Generator(), vocab_size=logits.size(1))
+    log_probs = backend.log_probs_kernel(logits, context)
+
+    expected = torch.full_like(logits, float("-inf"))
+    expected[0, 1] = 0.0
+    expected[1, 0] = 0.0
+    assert torch.equal(log_probs, expected)

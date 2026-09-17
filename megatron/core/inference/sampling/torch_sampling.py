@@ -158,6 +158,14 @@ class TorchSampling(Sampling):
         log_probs = torch.empty_like(logits)
         for (t, k, p), rows in buckets.items():
             idx = torch.tensor(rows, device=logits.device, dtype=torch.long)
+            if int(k) == 1:
+                # Sampling treats top_k=1 as deterministic first-argmax. Preserve
+                # that exact distribution when maximum logits tie instead of
+                # retaining every value equal to the top-k cutoff.
+                bucket_log_probs = torch.full_like(logits[idx], float("-inf"))
+                bucket_log_probs.scatter_(1, torch.argmax(logits[idx], dim=-1, keepdim=True), 0.0)
+                log_probs[idx] = bucket_log_probs
+                continue
             filtered = TorchSampling.filter_logits(
                 logits[idx], float(t), int(k), float(p), vocab_size=self._vocab_size
             )
