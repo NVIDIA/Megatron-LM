@@ -9,6 +9,9 @@ is present in the input state_dict.
 
 """
 
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -447,27 +450,22 @@ def _worker_helper_padded_inproj_pad_case(rank, world_size, port):
         dp_cp_group=_cached_new_group(list(range(world_size))),
     )
     st = sharded["weight"]
-    # Helper saves the padded global. ``allow_shape_mismatch=True`` is what
-    # makes the saved tensor portable to a different load-time GTP_remat topology
-    # (different alignment choice yields a different padded size).
+    # Helper saves the padded global. Cross-topology portability (allow_shape_mismatch) is
+    # decided later, at load time, by grant_shape_mismatch_for_gtp_padding -- it's a save-time
+    # no-op regardless, so it's not baked in here.
     assert (
         st.global_shape[0] == dim0_padded
     ), f"rank={rank} pad case: global_shape[0] {st.global_shape[0]} != {dim0_padded}"
     assert st.global_offset[0] == rank * per_shard
-    assert st.allow_shape_mismatch is True, (
-        f"rank={rank} pad case: allow_shape_mismatch must be True when GTP_remat padding fires; "
-        f"otherwise the ckpt cannot be loaded at a different GTP_remat topology."
-    )
 
 
 def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
     """Pin the cross-topology reshard contract via ShardedTensor metadata.
 
-    We can't run a real DCP save/load against itself within a single torchrun
-    (need separate worlds), but we can verify the saved ShardedTensor carries
-    everything DCP needs to do the reshard: ``allow_shape_mismatch=True`` and
-    a global_shape large enough to cover any compatible load-side topology
-    (≥ unpadded original).
+    Can't run a real DCP save/load against itself in one torchrun (needs separate worlds), but we
+    can verify the saved global_shape covers any compatible load-side topology (>= unpadded
+    original). allow_shape_mismatch, the other half of the contract, is decided later at load
+    time by grant_shape_mismatch_for_gtp_padding, not baked in here.
     """
     update_gtp_config(pad_for_alignment=16)
     dim0_unpadded = 1160
@@ -496,10 +494,7 @@ def _worker_helper_cross_topology_reshard_metadata(rank, world_size, port):
         f"rank={rank} saved global_shape ({st.global_shape[0]}) < unpadded ({dim0_unpadded}); "
         f"would lose valid data on cross-topology reshard."
     )
-    # 2. ``allow_shape_mismatch=True`` lets DCP tolerate that the load-side
-    #    padded size may differ.
-    assert st.allow_shape_mismatch is True
-    # 3. Each rank's offset+local_shape covers a contiguous slice of the
+    # 2. Each rank's offset+local_shape covers a contiguous slice of the
     #    padded global; together the ranks cover [0, padded_global).
     assert st.global_offset[0] + st.local_shape[0] <= st.global_shape[0]
     assert st.global_offset[0] + st.local_shape[0] == (rank + 1) * per_shard
@@ -1468,6 +1463,272 @@ def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt
         ps.initialize_model_parallel()
 
 
+def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
+    """Regression: a checkpoint saved at one GTP degree must still load at a different one, even
+    when only one side pads. Small-scale mirror of GTP64(pads 3072->4096)/GTP8(no pad) with
+    pad_for_alignment=32, dim0=192: saves at gtp_remat_size=4 (pads 192->256), loads at
+    gtp_remat_size=2 (no pad needed). grant_shape_mismatch_for_gtp_padding, called right before
+    load() (as production does), recognizes 256 as padding of true dim0=192 and sets
+    allow_shape_mismatch=True, so DCP's overlap-copy completes the load with correct data -- even
+    though the load-side shard grid doesn't line up with the save-side one (GTP2 rank 0 spans real
+    data written by both GTP4 rank 0 and rank 1).
+    """
+    from megatron.core.dist_checkpointing import load, save
+    from megatron.core.utils import grant_shape_mismatch_for_gtp_padding
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    update_gtp_config(pad_for_alignment=32)  # mxfp8-like alignment
+    dim0, in_features = 192, 4  # 192 % 128 (GTP4 align) != 0 -> pads; 192 % 64 (GTP2 align) == 0
+
+    world_group = _cached_new_group(list(range(world_size)))
+    save_gtp_group = world_group  # gtp_remat_size=4 -> pads (like the reported GTP64 save)
+    load_gtp_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+    # tp_group also doubles as the (trivial) GTP replica_group: save_gtp_group is the whole
+    # world, so no two ranks share a shard -- no real replication.
+    trivial_replica_group = _cached_new_group([rank])
+    # ranks 0&2 and 1&3 land on the same GTP2 shard (two independent GTP2 groups over 4 ranks),
+    # so they're REPLICAS and must share a replica_group -- else DCP sees two ranks claim the
+    # same (offset, replica_id) and raises "Invalid access pattern".
+    load_replica_group = _cached_new_group([0, 2]) if rank % 2 == 0 else _cached_new_group([1, 3])
+
+    golden = torch.arange(dim0 * in_features, dtype=torch.bfloat16, device="cuda").reshape(
+        dim0, in_features
+    )
+
+    def _wrap(tensor, key, **extra):
+        return {
+            key: make_tp_sharded_tensor_for_checkpoint(
+                tensor=tensor,
+                key=key,
+                tp_axis=0,
+                prepend_offsets=(),
+                tp_group=trivial_replica_group,
+                dp_cp_group=world_group,
+                **extra,
+            )
+        }
+
+    ps.destroy_model_parallel()
+    try:
+        weight_save = _make_gtp_shard(
+            dim0, in_features, save_gtp_group, replica_group=trivial_replica_group
+        )  # save_gtp_group covers the whole world -- no replication, trivial replica group
+        assert getattr(weight_save, "pad_length", 0) == 64, weight_save.pad_length
+        sharded_save = _wrap(weight_save, "weight")
+        assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
+
+        weight_load = _make_gtp_shard(
+            dim0, in_features, load_gtp_group, replica_group=load_replica_group
+        )
+        assert getattr(weight_load, "pad_length", 0) == 0, weight_load.pad_length
+        with torch.no_grad():
+            weight_load.fill_(-999.0)  # scribble so a no-op load cannot pass
+        sharded_load = _wrap(weight_load, "weight")
+        assert sharded_load["weight"].global_shape[0] == 192, sharded_load["weight"].global_shape
+
+        with TempNamedDir(ckpt_base / 'gtp_cross_degree_roundtrip', sync=True) as ckpt_dir:
+            save(sharded_save, ckpt_dir)
+            # THE FIX: without this, allow_shape_mismatch stays False (pad_length==0 here) and
+            # strict validation raises comparing the checkpoint's 256 against the expected 192.
+            grant_shape_mismatch_for_gtp_padding(sharded_load, ckpt_dir, pad_for_alignment=32)
+            assert sharded_load["weight"].allow_shape_mismatch is True
+            # Pre-fix: raises CheckpointingException("Global shape mismatch ... (256) vs (192)").
+            loaded = load(sharded_load, ckpt_dir)
+
+        load_gtp_rank = torch.distributed.get_rank(load_gtp_group)
+        shard_dim0_load = dim0 // load_gtp_group.size()  # 96
+        expected = golden[load_gtp_rank * shard_dim0_load : (load_gtp_rank + 1) * shard_dim0_load]
+        torch.testing.assert_close(loaded["weight"].cpu(), expected.cpu(), rtol=0, atol=0)
+    finally:
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckpt_base):
+    """grant_shape_mismatch_for_gtp_padding sets allow_shape_mismatch from whether the
+    checkpoint-vs-expected difference is caused by GTP padding: OFF for a mismatch that isn't
+    (catches a wrong checkpoint DCP would otherwise silently accept), ON for one that is --
+    including for a plain non-GTP tensor, closing the GTP-saved -> non-GTP-loaded gap where that
+    consumer previously had no signal at all.
+    """
+    from megatron.core.dist_checkpointing import save
+    from megatron.core.utils import grant_shape_mismatch_for_gtp_padding
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    pad_for_alignment = 32  # mxfp8-like alignment
+    update_gtp_config(pad_for_alignment=pad_for_alignment)
+    dim0, in_features = 192, 4  # same weight as the cross-degree roundtrip test above
+
+    world_group = _cached_new_group(list(range(world_size)))
+    trivial_replica_group = _cached_new_group([rank])
+
+    def _wrap(tensor, key, prepend_offsets=(), **extra):
+        return {
+            key: make_tp_sharded_tensor_for_checkpoint(
+                tensor=tensor,
+                key=key,
+                tp_axis=0,
+                prepend_offsets=prepend_offsets,
+                tp_group=trivial_replica_group,
+                dp_cp_group=world_group,
+                **extra,
+            )
+        }
+
+    ps.destroy_model_parallel()
+    try:
+        # Save at GTP4 (pads 192 -> 256), exactly like the cross-degree roundtrip test.
+        weight_save = _make_gtp_shard(
+            dim0, in_features, world_group, replica_group=trivial_replica_group
+        )
+        sharded_save = _wrap(weight_save, "weight")
+        assert sharded_save["weight"].global_shape[0] == 256, sharded_save["weight"].global_shape
+
+        with TempNamedDir(ckpt_base / 'gtp_restrict_bound', sync=True) as ckpt_dir:
+            save(sharded_save, ckpt_dir)
+
+            # Legit: SAME logical weight (dim0=192), read at GTP2 -- expected global_shape=192,
+            # dim0_unpadded=192. declared=256 IS padding of 192 (256>=192, 256%32==0).
+            legit_group = _cached_new_group([0, 1]) if rank in (0, 1) else _cached_new_group([2, 3])
+            weight_legit = _make_gtp_shard(
+                dim0, in_features, legit_group, replica_group=trivial_replica_group
+            )
+            sharded_legit = _wrap(weight_legit, "weight")
+            grant_shape_mismatch_for_gtp_padding(sharded_legit, ckpt_dir, pad_for_alignment)
+            assert (
+                sharded_legit["weight"].allow_shape_mismatch is True
+            ), "padding-caused shape difference (256 vs dim0_unpadded=192) must NOT be restricted"
+
+            # Bogus: a DIFFERENT weight (dim0=300) reusing the same key -- declared=256 <
+            # dim0_unpadded=300, not padding, flag must flip to False. Needs legit_group (size 2):
+            # a size-1 group makes wrap_module_params_gtp a no-op, so is_gtp_param never fires.
+            weight_bogus = _make_gtp_shard(
+                300, in_features, legit_group, replica_group=trivial_replica_group
+            )
+            sharded_bogus = _wrap(weight_bogus, "weight")
+            grant_shape_mismatch_for_gtp_padding(sharded_bogus, ckpt_dir, pad_for_alignment)
+            assert sharded_bogus["weight"].allow_shape_mismatch is False, (
+                "unexplainable shape discrepancy (declared=256 < dim0_unpadded=300) must stay "
+                "strictly validated, never granted a mismatch-tolerant bypass"
+            )
+
+            # Non-GTP: a PLAIN tensor (never wrapped by wrap_module_params_gtp) loading the same
+            # GTP4-saved key -- the GTP-saved -> non-GTP-loaded gap. allow_shape_mismatch starts
+            # False and must flip ON: declared=256 is still explainable padding of dim0_unpadded=192.
+            plain_weight = torch.nn.Parameter(
+                torch.zeros(dim0, in_features, dtype=torch.bfloat16, device="cuda")
+            )
+            assert not hasattr(plain_weight, "pad_length"), "must be a genuinely plain tensor"
+            sharded_plain = _wrap(plain_weight, "weight")
+            assert sharded_plain["weight"].global_shape[0] == 192, sharded_plain[
+                "weight"
+            ].global_shape
+            assert (
+                sharded_plain["weight"].allow_shape_mismatch is False
+            ), "a plain non-GTP tensor must never get allow_shape_mismatch from the GTP branch"
+            grant_shape_mismatch_for_gtp_padding(sharded_plain, ckpt_dir, pad_for_alignment)
+            assert sharded_plain["weight"].allow_shape_mismatch is True, (
+                "GTP-saved (256) -> non-GTP-loaded (192) is explainable padding and must be "
+                "reconciled to allow_shape_mismatch=True, closing the non-GTP load gap"
+            )
+
+        # Reverse: a PLAIN (non-GTP) save -- declared0 == dim0_unpadded == 100 exactly, which is NOT
+        # a multiple of pad_for_alignment=32 (100 % 32 == 4) since raw hidden dims have no reason
+        # to be tile-aligned. Loaded into a GTP4 config that DOES pad (100 -> 128). declared0
+        # equalling dim0_unpadded exactly must be unconditionally valid, regardless of alignment.
+        assert 100 % pad_for_alignment != 0, "must be unaligned to actually exercise the bound"
+        plain_unaligned = torch.nn.Parameter(
+            torch.zeros(100, in_features, dtype=torch.bfloat16, device="cuda")
+        )
+        sharded_plain_save = _wrap(plain_unaligned, "weight_unaligned")
+        assert sharded_plain_save["weight_unaligned"].global_shape[0] == 100
+
+        with TempNamedDir(ckpt_base / 'gtp_restrict_bound_reverse', sync=True) as ckpt_dir2:
+            save(sharded_plain_save, ckpt_dir2)
+
+            weight_gtp_load = _make_gtp_shard(
+                100, in_features, legit_group, replica_group=trivial_replica_group
+            )
+            assert getattr(weight_gtp_load, "pad_length", 0) == 28, weight_gtp_load.pad_length
+            sharded_gtp_load = _wrap(weight_gtp_load, "weight_unaligned")
+            assert sharded_gtp_load["weight_unaligned"].global_shape[0] == 128
+            grant_shape_mismatch_for_gtp_padding(sharded_gtp_load, ckpt_dir2, pad_for_alignment)
+            assert sharded_gtp_load["weight_unaligned"].allow_shape_mismatch is True, (
+                "declared0 (100) == dim0_unpadded (100) must always count as valid padding, even "
+                "though 100 is not itself a multiple of pad_for_alignment"
+            )
+
+        # Pre-set: a tensor whose allow_shape_mismatch=True was already granted for a reason
+        # unrelated to GTP (e.g. VocabParallelEmbedding's own vocab-padding logic) -- declared=50
+        # vs expected=80 is NOT explainable as GTP padding (50 < 80, and 50 % 32 != 0), so without
+        # the "already True -> skip" guard this function would incorrectly clobber it to False.
+        weight_vocab_like = torch.nn.Parameter(
+            torch.zeros(50, in_features, dtype=torch.bfloat16, device="cuda")
+        )
+        sharded_vocab_save = _wrap(weight_vocab_like, "weight_vocab_like")
+        with TempNamedDir(ckpt_base / 'gtp_restrict_bound_preset', sync=True) as ckpt_dir3:
+            save(sharded_vocab_save, ckpt_dir3)
+
+            weight_vocab_like_load = torch.nn.Parameter(
+                torch.zeros(80, in_features, dtype=torch.bfloat16, device="cuda")
+            )
+            sharded_vocab_load = _wrap(
+                weight_vocab_like_load,
+                "weight_vocab_like",
+                allow_shape_mismatch=True,  # e.g. what VocabParallelEmbedding sets
+            )
+            grant_shape_mismatch_for_gtp_padding(sharded_vocab_load, ckpt_dir3, pad_for_alignment)
+            assert sharded_vocab_load["weight_vocab_like"].allow_shape_mismatch is True, (
+                "a pre-set allow_shape_mismatch=True (non-GTP reason) must never be clobbered, "
+                "even when the shape difference (50 vs 80) doesn't look like GTP padding"
+            )
+
+        # Bf16 bound: pad_for_alignment=1 (bf16 -- no tile-size requirement) must not make the
+        # alignment check vacuous. declared0 % 1 == 0 for every integer, so without gating the
+        # alignment disjunct on pad_for_alignment > 1, any declared0 >= expected0 would be wrongly
+        # accepted as "padding" even for two genuinely incompatible plain tensors.
+        weight_incompatible = torch.nn.Parameter(
+            torch.zeros(200, in_features, dtype=torch.bfloat16, device="cuda")
+        )
+        sharded_incompatible_save = _wrap(weight_incompatible, "weight_incompatible")
+        with TempNamedDir(ckpt_base / 'gtp_restrict_bound_bf16', sync=True) as ckpt_dir4:
+            save(sharded_incompatible_save, ckpt_dir4)
+
+            weight_expected = torch.nn.Parameter(
+                torch.zeros(150, in_features, dtype=torch.bfloat16, device="cuda")
+            )
+            sharded_incompatible_load = _wrap(weight_expected, "weight_incompatible")
+            grant_shape_mismatch_for_gtp_padding(sharded_incompatible_load, ckpt_dir4, 1)
+            assert sharded_incompatible_load["weight_incompatible"].allow_shape_mismatch is False, (
+                "declared0=200 vs expected0=150 at pad_for_alignment=1 is a genuine shape "
+                "mismatch, not GTP padding -- must stay strictly validated"
+            )
+
+        # Prepended axis: a PP-layer axis ahead of dim0 (both sides' global_shape[0] is
+        # num_layers=3, always equal) -- would wrongly early-exit as "no difference" if the
+        # padded axis were read from index 0 instead of prepend_axis_num. Mocks the metadata
+        # read (no real save/load) -- only the axis-indexing math is under test here.
+        layer_axis = ((0, 1, 3),)  # (axis, layer_idx=1, num_layers=3)
+        weight_layer_load = _make_gtp_shard(
+            dim0, in_features, legit_group, replica_group=trivial_replica_group
+        )
+        sharded_layer_load = _wrap(weight_layer_load, "layer.weight", prepend_offsets=layer_axis)
+        assert sharded_layer_load["layer.weight"].global_shape == (3, 192, in_features)
+        fake_metadata = {"layer.weight": SimpleNamespace(global_shape=(3, 256, in_features))}
+        with mock.patch(
+            "megatron.core.dist_checkpointing.serialization.load_tensors_metadata",
+            return_value=fake_metadata,
+        ):
+            grant_shape_mismatch_for_gtp_padding(sharded_layer_load, "unused", pad_for_alignment)
+        assert sharded_layer_load["layer.weight"].allow_shape_mismatch is True, (
+            "prepended-axis padding (declared dim0=256 vs expected dim0=192) must be "
+            "recognized via prepend_axis_num, not silently no-op'd by comparing num_layers"
+        )
+    finally:
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
 # ---------------------------------------------------------------------------
 # Test class wrappers (4-GPU)
 # ---------------------------------------------------------------------------
@@ -1568,3 +1829,13 @@ class TestGtpDcpHelper:
     def test_save_then_load_offsets_symmetric(self):
         _require_world_size(4)
         _worker_save_then_load_offsets_symmetric(dist.get_rank(), 4, None)
+
+    def test_cross_gtp_degree_save_load_roundtrip(self, tmp_path_dist_ckpt):
+        _require_world_size(4)
+        _worker_cross_gtp_degree_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
+
+    def test_restrict_shape_mismatch_to_explainable_padding(self, tmp_path_dist_ckpt):
+        _require_world_size(4)
+        _worker_restrict_shape_mismatch_to_explainable_padding(
+            dist.get_rank(), 4, tmp_path_dist_ckpt
+        )

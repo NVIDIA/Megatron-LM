@@ -386,11 +386,6 @@ if __name__ == "__main__":
         # prompt log-probs can be computed for lm-eval / MCQ likelihood scoring.
         if "return_log_probs" not in user_passed_attrs:
             _defaults.append("--return-log-probs")
-        # Avoid running prefill through CUDA graphs: under a graphed prefill,
-        # is_decode_only() returns True and calculate_log_probs short-circuits
-        # to a single logprob per request, breaking logprob-based eval.
-        if "decode_only_cuda_graphs" not in user_passed_attrs:
-            _defaults.append("--decode-only-cuda-graphs")
         sys.argv[1:1] = _defaults
 
         parse_and_validate_args(
