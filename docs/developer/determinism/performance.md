@@ -134,6 +134,43 @@ Keep H100 and GB200 baselines separate. The GB200 recipe uses
 Historical baseline bundles are described below. Enforcing calibrated
 changed-kernel budgets remains separate from publishing measurements.
 
+### Diagnose a timing difference
+
+Use `--diagnostics` for a focused investigation on the same case, phase, shape,
+precision and allocation policy. It runs the existing CUDA-event timing loop
+with an external `nvidia-smi` sampler, then profiles three calls in the same
+process. Forward and backward are supported; each backward trace excludes
+forward/graph construction and upstream-gradient allocation. All kernels from
+each profiled call are retained, including unfused or multi-kernel dispatches.
+
+```bash
+TRITON_CACHE_DIR=/tmp/diagnostic-triton TORCHINDUCTOR_CACHE_DIR=/tmp/diagnostic-inductor \
+uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/benchmark.py \
+  --output /tmp/swiglu-diagnostic --kernel-case bias_swiglu --phase backward --gpus 1 \
+  --dtype float32 --pairs 3 --warmup 50 --steps 100 --diagnostics
+```
+
+Each arm retains `diagnostics/diagnostics.json`, the original event samples,
+three Chrome traces, telemetry CSV/stderr, CPU affinity and thread settings,
+and hashes of selected compiler-cache files before/after profiling. Cache roots
+are read from the two explicit environment variables; the tool does not change
+them. Unset, empty or unreadable inventories produce
+`compiler_cache_unchanged: null`. Missing telemetry is recorded as unavailable,
+and a timing/profile failure preserves partial diagnostics and fails the run.
+
+The report has status **`diagnostic`** (exit 0 means collection succeeded), and
+both raw results and report measurements carry `diagnostic_only: true`.
+Diagnostic runs cannot use performance limits, supply author performance
+evidence, or be published as baselines. Default benchmark runs are unchanged.
+
+External sampling can affect timing. The sparse telemetry interval includes
+compilation, warmup, timing, hashing and profiling, so it does not isolate the
+measured event samples. Post-timing profiles observe later calls; unchanged
+cache hashes do not prove the actual earlier dispatch identity. Shared cache
+changes can come from another process. Keep profiles and event intervals
+distinct, and do not infer a historical cause or calibrated speed limit from
+these diagnostics alone.
+
 ## Join author checks and phase timings
 
 Run the coverage producer and performance driver from the **same clean source

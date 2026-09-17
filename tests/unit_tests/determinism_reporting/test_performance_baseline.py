@@ -84,6 +84,30 @@ def test_publication_reuses_identical_content_without_overwriting(baseline, tmp_
     assert path.stat().st_mtime_ns == before
 
 
+@pytest.mark.parametrize("location", ["report", "embedded", "raw"])
+def test_diagnostic_results_cannot_be_published_even_if_status_is_relabelled(
+    baseline, tmp_path, location
+):
+    covered, leaderboard = artifacts(tmp_path)
+    reports = json.loads(leaderboard.read_text())
+    if location == "report":
+        reports[0]["measurement"]["diagnostic_only"] = True
+    elif location == "embedded":
+        reports[0]["runs"][0]["kernel"]["diagnostics"] = {"status": "observed"}
+    else:
+        path = next(leaderboard.parent.rglob("kernel.json"))
+        raw = json.loads(path.read_text())
+        raw["measurement"]["diagnostic_only"] = True
+        raw["diagnostics"] = {"status": "observed"}
+        write_json(path, raw)
+    write_json(leaderboard, reports)
+    joined = baseline.author_evidence.join(json.loads(covered.read_text()), reports, REVISION)
+    assert joined["evidence_complete"] is (location == "raw")
+    with pytest.raises(ValueError):
+        baseline.publish(covered, leaderboard, tmp_path / "store", REVISION, "CPU-fixture")
+    assert not (tmp_path / "store").exists()
+
+
 @pytest.mark.parametrize(
     "problem", ["missing_raw", "raw_changed", "separate_report_changed", "duplicate_attempt"]
 )

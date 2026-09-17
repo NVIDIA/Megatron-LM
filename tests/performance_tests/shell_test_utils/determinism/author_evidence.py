@@ -199,6 +199,10 @@ def _timing(report: dict, contract: dict, revision: str, phase: str) -> dict:
     if report.get("schema_version") != 1 or report.get("kind") != "determinism_kernel_performance":
         raise ValueError("Only versioned operator timing reports can supply phase evidence")
     measurement = report["measurement"]
+    if "diagnostic_only" in measurement:
+        raise ValueError(
+            "Diagnostic timings cannot supply author performance evidence or baselines"
+        )
     arguments = contract["inputs"]
     expected_width = arguments[0]["shape"][-1]
     if contract["case"] != "weighted_squared_relu":

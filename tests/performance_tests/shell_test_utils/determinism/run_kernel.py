@@ -21,13 +21,25 @@ def read_result(path: Path, measurement: dict, mode: str) -> dict:
 def validate_result(result: dict, measurement: dict, mode: str) -> None:
     """Apply the same timing contract to embedded and separately saved results."""
     keys = ("kernel_case", "phase", "tokens", "hidden_size", "dtype", "warmup", "steps")
+    expected = {key: measurement[key] for key in keys}
+    diagnostic = "diagnostic_only" in measurement
+    if diagnostic:
+        if measurement["diagnostic_only"] is not True:
+            raise ValueError("Invalid diagnostic measurement marker")
+        expected["diagnostic_only"] = True
     if (
         not isinstance(result, dict)
-        or result.get("measurement") != {key: measurement[key] for key in keys}
+        or result.get("measurement") != expected
         or result.get("mode") != mode
         or result.get("deterministic_algorithms") is not (mode == "det")
+        or ("diagnostics" in result) != diagnostic
     ):
         raise ValueError("Kernel timing configuration does not match the requested arm")
+    if diagnostic and (
+        not isinstance(result["diagnostics"], dict)
+        or result["diagnostics"].get("status") != "observed"
+    ):
+        raise ValueError("Kernel diagnostics did not complete")
     samples = result.get("samples_ms")
     if (
         not isinstance(samples, list)
@@ -78,7 +90,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), required=True)
     parser.add_argument("--warmup", type=int, required=True)
     parser.add_argument("--steps", type=int, required=True)
+    parser.add_argument("--diagnostics", action="store_true")
     args = parser.parse_args(argv)
+    measurement = {key: value for key, value in vars(args).items() if key != "diagnostics"}
+    if args.diagnostics:
+        measurement["diagnostic_only"] = True
     import torch
 
     mode = os.environ["DETERMINISM_PERF_MODE"]
@@ -103,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         signature = case_signature(torch, args.kernel_case, arguments)
         device_uuid = getattr(torch.cuda.get_device_properties(0), "uuid", None)
         result = {
-            "measurement": vars(args),
+            "measurement": measurement,
             "mode": mode,
             "op_id": op_id,
             "implementation": "torch.compile:" + args.kernel_case,
@@ -124,10 +140,24 @@ def main(argv: list[str] | None = None) -> int:
             "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
             "fill_uninitialized_memory": torch.utils.deterministic.fill_uninitialized_memory,
             "seed": signature["input_seed"],
-            "samples_ms": measure(
-                torch, lambda: function(*arguments), inputs, args.phase, args.warmup, args.steps
-            ),
         }
+        if args.diagnostics:
+            from kernel_diagnostics import measure_with_diagnostics
+
+            result["samples_ms"], result["diagnostics"] = measure_with_diagnostics(
+                measure,
+                torch,
+                lambda: function(*arguments),
+                inputs,
+                args.phase,
+                args.warmup,
+                args.steps,
+                Path(os.environ["DETERMINISM_PERF_LOG_DIR"]) / "diagnostics",
+            )
+        else:
+            result["samples_ms"] = measure(
+                torch, lambda: function(*arguments), inputs, args.phase, args.warmup, args.steps
+            )
     path = Path(os.environ["DETERMINISM_PERF_LOG_DIR"]) / "kernel.json"
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")

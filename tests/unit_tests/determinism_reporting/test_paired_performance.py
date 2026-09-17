@@ -291,7 +291,10 @@ def test_invalid_kernel_measurements_are_rejected(tmp_path, problem):
         kernel.read_result(path, measurement, "det")
 
 
-def test_kernel_driver_uses_real_subprocesses_and_preserves_raw_samples(tmp_path, monkeypatch):
+@pytest.mark.parametrize("diagnostics", [False, True])
+def test_kernel_driver_uses_real_subprocesses_and_preserves_raw_samples(
+    tmp_path, monkeypatch, diagnostics
+):
     monkeypatch.syspath_prepend(str(SCRIPTS))
     monkeypatch.setattr(benchmark, "_source", lambda path: {"revision": "a" * 40, "dirty": False})
     monkeypatch.setattr(benchmark, "_machine", lambda: {"gpus": ["CPU fixture only"]})
@@ -299,12 +302,18 @@ def test_kernel_driver_uses_real_subprocesses_and_preserves_raw_samples(tmp_path
     fixture.write_text("""
 import json, os, sys
 from pathlib import Path
+diagnostic = '--diagnostics' in sys.argv
+if diagnostic:
+    sys.argv.remove('--diagnostics')
 options = dict(zip((arg[2:].replace('-', '_') for arg in sys.argv[1::2]), sys.argv[2::2]))
 for key in ('tokens', 'hidden_size', 'warmup', 'steps'):
     options[key] = int(options[key])
 mode = os.environ['DETERMINISM_PERF_MODE']
 result = dict(measurement=options, mode=mode, deterministic_algorithms=mode == 'det',
               samples_ms=[12.0 if mode == 'det' else 10.0] * options['steps'])
+if diagnostic:
+    result['measurement']['diagnostic_only'] = True
+    result['diagnostics'] = dict(status='observed')
 (Path(os.environ['DETERMINISM_PERF_LOG_DIR']) / 'kernel.json').write_text(json.dumps(result))
 """)
     real_run = subprocess.run
@@ -331,12 +340,14 @@ result = dict(measurement=options, mode=mode, deterministic_algorithms=mode == '
                 "2",
                 "--steps",
                 "3",
+                *(["--diagnostics"] if diagnostics else []),
             ]
         )
         == 0
     )
     report = json.loads((output / "benchmark.json").read_text())
-    assert report["status"] == "reported"
+    assert report["status"] == ("diagnostic" if diagnostics else "reported")
+    assert report["measurement"].get("diagnostic_only", False) is diagnostics
     assert report["kind"] == "determinism_kernel_performance"
     assert report["measurement"]["timing"] == "cuda_event_ms"
     assert "recipe" not in report["measurement"]
