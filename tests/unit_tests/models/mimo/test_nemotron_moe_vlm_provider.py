@@ -139,11 +139,12 @@ def test_build_communicator_wires_bridge_receive_shape(
         image_token_id=42,
         hidden_size=2688,
     )
+    language_config = SimpleNamespace(params_dtype=torch.bfloat16, pipeline_dtype=torch.float32)
 
     monkeypatch.setattr(
         provider,
         "language_model_spec",
-        lambda args, pg_collection, grid: SimpleNamespace(params={"config": object()}),
+        lambda args, pg_collection, grid: SimpleNamespace(params={"config": language_config}),
     )
     monkeypatch.setattr(provider, "radio_vision_config", lambda args, tp, pp: object())
     monkeypatch.setattr(provider, "_vision_projection_input_size", lambda args, config: 5120)
@@ -155,6 +156,7 @@ def test_build_communicator_wires_bridge_receive_shape(
     monkeypatch.setattr(provider, "MultiModulePipelineCommunicator", capture_communicator)
 
     assert build_nemotron_communicator(args, topology) is communicator
+    assert captured["bridge_comm_dtypes"] == {RADIO_ENCODER_MODULE_NAME: torch.bfloat16}
     shape_fns = captured["bridge_recv_shape_fns"]
     if enabled:
         assert shape_fns[RADIO_ENCODER_MODULE_NAME]({"input_ids": torch.tensor([[42, 7, 42]])}) == (
@@ -353,11 +355,16 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
     """Dense vision and projector configs must not inherit language-only settings."""
     from types import SimpleNamespace
 
+    import torch
+
     from examples.mimo.model_providers.radio_encoder import _make_dense_non_hybrid
 
     config = SimpleNamespace(
         activation_func_tanh_clamp_scale=2.0,
         activation_func_tanh_clamp_scale_linear=1.0,
+        fp32_residual_connection=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.float32,
         num_moe_experts=128,
         moe_ffn_hidden_size=1856,
         moe_shared_expert_intermediate_size=3712,
@@ -378,6 +385,9 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
 
     assert config.activation_func_tanh_clamp_scale is None
     assert config.activation_func_tanh_clamp_scale_linear is None
+    assert config.fp32_residual_connection is False
+    assert config.params_dtype is torch.bfloat16
+    assert config.pipeline_dtype is torch.bfloat16
     assert config.num_moe_experts is None
     assert config.moe_ffn_hidden_size is None
     assert config.moe_shared_expert_intermediate_size is None
@@ -392,6 +402,35 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
     assert config.use_fused_weighted_squared_relu is False
     assert config.recompute_modules == ["moe_act"]
     assert config.offload_modules == ["core_attn"]
+
+
+def test_modality_configs_do_not_inherit_language_fp32_residuals():
+    """FP32 language residuals must not change the frozen tower or projector math."""
+    import torch
+
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        nemotron_language_config,
+        nemotron_projection_config,
+        vision_submodules_spec,
+    )
+
+    args = _parse_validate(_build_argv(*_PRESET_20L) + ["--fp32-residual-connection"])
+    language_config = nemotron_language_config(
+        args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1
+    )
+    modality_configs = [
+        nemotron_projection_config(args, tp_size=1, projection_input_size=5120),
+        vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+        .submodules["encoders"][RADIO_ENCODER_MODULE_NAME]
+        .params["transformer_config"],
+    ]
+
+    assert language_config.fp32_residual_connection is True
+    assert language_config.pipeline_dtype is torch.float32
+    for config in modality_configs:
+        assert config.fp32_residual_connection is False
+        assert config.params_dtype is torch.bfloat16
+        assert config.pipeline_dtype is torch.bfloat16
 
 
 def test_language_model_spec_builds_mamba():
@@ -409,6 +448,22 @@ def test_language_model_spec_builds_mamba():
     assert spec.params["config"].expert_model_parallel_size == 2
     assert spec.params["config"].expert_tensor_parallel_size == 2
     assert spec.params["max_sequence_length"] == args.seq_length
+    assert spec.params["logit_dtype"] is None
+
+
+@pytest.mark.parametrize(
+    ("cli_dtype", "expected_dtype"), [("bf16", "bfloat16"), ("fp32", "float32")]
+)
+def test_language_model_spec_propagates_logit_dtype(cli_dtype, expected_dtype):
+    """The requested output-logit dtype reaches the MIMO language model."""
+    import torch
+
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+
+    args = _parse_validate(_build_argv(*_PRESET_20L) + ["--output-logit-dtype", cli_dtype])
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+
+    assert spec.params["logit_dtype"] is getattr(torch, expected_dtype)
 
 
 def test_vision_submodules_spec_wires_radio_encoder():

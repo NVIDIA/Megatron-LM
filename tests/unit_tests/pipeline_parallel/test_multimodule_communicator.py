@@ -70,14 +70,25 @@ class TestMultiModulePipelineCommunicator:
             'llm': ['generator'],
             'generator': [],
         }
-        config = ModelParallelConfig(bf16=True)
+        config = ModelParallelConfig(bf16=True, pipeline_dtype=torch.float32)
         # Initialize communicator
-        mllm_comm = MultiModulePipelineCommunicator(module_to_grid_map, topology, config)
+        mllm_comm = MultiModulePipelineCommunicator(
+            module_to_grid_map,
+            topology,
+            config,
+            bridge_comm_dtypes={'image_encoder': torch.bfloat16},
+        )
         # Test attributes match expectations
         assert mllm_comm.module_to_grid_map == module_to_grid_map
         assert mllm_comm.topology == topology
         assert mllm_comm.config == config
         assert mllm_comm.current_rank == dist.get_rank()
+        assert mllm_comm.bridge_comm_dtypes == {'image_encoder': torch.bfloat16}
+        assert {bridge.src_module_name: bridge.comm_dtype for bridge in mllm_comm.bridge_comms} == {
+            'image_encoder': torch.bfloat16,
+            'audio_encoder': config.pipeline_dtype,
+            'llm': config.pipeline_dtype,
+        }
 
         for module_name, rank_module_info in mllm_comm.rank_module_map.items():
             assert mllm_comm.is_module_pp_first_stage(module_name) == (
