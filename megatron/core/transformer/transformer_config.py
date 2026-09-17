@@ -102,6 +102,17 @@ class TransformerConfig(ModelParallelConfig):
     since a single depth has nothing to mix. Model constructors validate this
     against the resolved architecture."""
 
+    mtp_loss_early_backward: bool = False
+    """Run each MTP head's vocabulary projection, cross-entropy and their backward back-to-back
+    during the forward pass instead of deferring the backward to the main backward pass.
+    By default autograd keeps the [seq, batch, vocab] fp32 softmax of every MTP head alive from
+    the forward until the main backward reaches it, on top of the main head's, so peak memory
+    grows by one full logits tensor per MTP depth. With this option the loop is
+    fwd(head_k) -> bwd(head_k) for every head: the head's logits/softmax are freed before the
+    next head starts, the output-layer weight gradient is accumulated immediately, and only the
+    [seq, batch, hidden] gradient of the head input is kept and injected into the main backward.
+    No recomputation is involved; total FLOPs are unchanged."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.

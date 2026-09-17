@@ -34,6 +34,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
+    MTPLossAutoScaler,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     MultiTokenPredictionInputs,
@@ -1298,6 +1299,166 @@ class TestMultiTokenPredictionLayer:
 
         torch.testing.assert_close(main_hidden_states.grad, torch.ones_like(main_hidden_states))
         assert torch.count_nonzero(mtp_hidden_states.grad[seq_len:]) > 0
+
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    def test_process_mtp_loss_early_backward_matches_deferred_path(
+        self, monkeypatch, calculate_per_token_loss
+    ):
+        """mtp_loss_early_backward must reproduce the deferred path's output and gradients
+        (including the MTP loss scale) while running each head's projection exactly once and
+        accumulating the output-weight gradient already during the forward pass."""
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", lambda *a, **k: None)
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(0.5))
+        seq_len, batch_size, vocab_size, hidden_size, num_heads = 5, 2, 16, 8, 2
+        torch.manual_seed(_SEED)
+        base_hidden = torch.randn((1 + num_heads) * seq_len, batch_size, hidden_size)
+        base_weight = torch.randn(vocab_size, hidden_size)
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+        loss_mask = torch.ones(batch_size, seq_len)
+        loss_mask[0, -2:] = 0.0
+
+        def run(early_backward):
+            config = TransformerConfig(
+                mtp_num_layers=num_heads,
+                num_layers=2,
+                hidden_size=hidden_size,
+                num_attention_heads=2,
+                use_cpu_initialization=True,
+                calculate_per_token_loss=calculate_per_token_loss,
+                mtp_loss_early_backward=early_backward,
+            )
+            hidden_states = base_hidden.clone().requires_grad_(True)
+            output_weight = torch.nn.Parameter(base_weight.clone())
+            calls = {"output_layer": 0}
+
+            def output_layer(hidden, weight=None, runtime_gather_output=None):
+                calls["output_layer"] += 1
+                return torch.matmul(hidden, weight.t()), None
+
+            def compute_language_model_loss(labels, logits):
+                return (
+                    torch.nn.functional.cross_entropy(
+                        logits.float().view(-1, vocab_size),
+                        labels.transpose(0, 1).reshape(-1),
+                        reduction="none",
+                    )
+                    .view(seq_len, batch_size)
+                    .transpose(0, 1)
+                )
+
+            result = process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=True,
+                is_training=True,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                metric_avg_group=object(),
+            )
+            weight_grad_after_forward = (
+                None if output_weight.grad is None else output_weight.grad.clone()
+            )
+            assert hidden_states.grad is None
+            # Main-loss backward: unit upstream gradient on the returned hidden states.
+            result.backward(torch.ones_like(result))
+            return (
+                result.detach(),
+                hidden_states.grad,
+                output_weight.grad,
+                weight_grad_after_forward,
+                calls["output_layer"],
+            )
+
+        deferred = run(early_backward=False)
+        early = run(early_backward=True)
+
+        torch.testing.assert_close(early[0], deferred[0])
+        torch.testing.assert_close(early[1], deferred[1])
+        torch.testing.assert_close(early[2], deferred[2])
+        # Deferred: weight grad only exists after the main backward.
+        assert deferred[3] is None
+        # Early: the full MTP contribution to the weight grad is already there after forward.
+        torch.testing.assert_close(early[3], deferred[2])
+        # No recompute in either mode: one vocab projection per head.
+        assert deferred[4] == num_heads and early[4] == num_heads
+
+    def test_process_mtp_loss_early_backward_frees_head_graph_before_next_head(self):
+        """Each head's logits must be released (backward done) before the next head runs."""
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            mtp_loss_early_backward=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(3 * seq_len, 1, config.hidden_size, requires_grad=True)
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+        weight_grad_snapshots = []
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            # Entering head k: head k-1 must already have back-propagated into the weight.
+            weight_grad_snapshots.append(None if weight.grad is None else weight.grad.clone())
+            return torch.matmul(hidden, weight.t()), None
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.square()
+            .sum(dim=-1)
+            .transpose(0, 1),
+            config=config,
+        )
+        assert weight_grad_snapshots[0] is None
+        assert weight_grad_snapshots[1] is not None
+        assert torch.count_nonzero(weight_grad_snapshots[1]) > 0
+        assert torch.count_nonzero(output_weight.grad - weight_grad_snapshots[1]) > 0
+
+        result.sum().backward()
+        # The injected head gradients reach the MTP head inputs through the main backward.
+        assert torch.count_nonzero(hidden_states.grad[seq_len:]) > 0
+
+    def test_process_mtp_loss_early_backward_is_skipped_without_grad(self):
+        """Under no_grad there is no graph to back-propagate; the plain path must be taken."""
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            mtp_loss_early_backward=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(2 * seq_len, 1, config.hidden_size)
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+        with torch.no_grad():
+            result = process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=torch.arange(seq_len).unsqueeze(0),
+                loss_mask=torch.ones(1, seq_len),
+                output_layer=lambda hidden, weight=None, runtime_gather_output=None: (
+                    torch.matmul(hidden, weight.t()),
+                    None,
+                ),
+                output_weight=output_weight,
+                runtime_gather_output=None,
+                is_training=False,
+                compute_language_model_loss=lambda labels, logits: logits.square()
+                .sum(dim=-1)
+                .transpose(0, 1),
+                config=config,
+            )
+        assert output_weight.grad is None
+        torch.testing.assert_close(result, hidden_states[:seq_len])
 
 
 class TestMTPHiddenStateRollUnderParallelism:
