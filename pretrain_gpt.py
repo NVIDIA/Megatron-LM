@@ -42,8 +42,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt import GPTModel
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -67,7 +67,6 @@ from megatron.core.utils import (
 from megatron.training import (
     get_args,
     get_timers,
-    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -114,12 +113,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(
-        args,
-        tokenizer_vocab_size=(
-            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-        ),
-    )
+    config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
         return get_batch_on_this_rank_for_sequence_packing(
@@ -419,12 +413,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = core_transformer_config_from_args(
-        args,
-        tokenizer_vocab_size=(
-            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-        ),
-    )
+    config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
@@ -564,12 +553,7 @@ def get_embedding_ranks(pp_ranks: List[int]):
         args = get_args()
         if not args.untie_embeddings_and_output_weights:
             embedding_ranks.append(pp_ranks[-1])
-        config = core_transformer_config_from_args(
-            args,
-            tokenizer_vocab_size=(
-                get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-            ),
-        )
+        config = core_transformer_config_from_args(args)
         mtp_ranks = get_mtp_ranks(pp_ranks, config)
         embedding_ranks.extend(mtp_ranks)
     embedding_ranks = list(set(embedding_ranks))
@@ -600,15 +584,10 @@ if __name__ == "__main__":
     )
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
-    tokenizer_vocab_size = (
-        get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-    )
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = gpt_config_from_args(
-            args, model_config_cls=ModelOptModelConfig, tokenizer_vocab_size=tokenizer_vocab_size
-        )
+        model_cfg = gpt_config_from_args(args, model_config_cls=ModelOptModelConfig)
     else:
-        model_cfg = gpt_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+        model_cfg = gpt_config_from_args(args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,

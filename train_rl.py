@@ -11,7 +11,6 @@ from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
@@ -21,16 +20,14 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
-from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
-from megatron.training.argument_utils import (
-    gpt_config_from_args,
-    hybrid_config_from_args,
-    pretrain_cfg_container_from_args,
-)
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
 from model_provider import model_provider
+
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
 stimer = StragglerDetector()
 
@@ -47,12 +44,7 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
             recompute_granularity_from_args = args.recompute_granularity
             args.recompute_granularity = None
 
-        config = core_transformer_config_from_args(
-            args,
-            tokenizer_vocab_size=(
-                get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-            ),
-        )
+        config = core_transformer_config_from_args(args)
 
         if recompute_granularity_from_args is not None:
             config.recompute_granularity = recompute_granularity_from_args
@@ -425,13 +417,10 @@ if __name__ == "__main__":
         "--reset-attention-mask is not supported in RL training: "
         "the forward pass masks via PackedSeqParams and never consumes a dense attention mask."
     )
-    tokenizer_vocab_size = (
-        get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-    )
     if is_hybrid_model(args):
-        model_cfg = hybrid_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+        model_cfg = hybrid_config_from_args(args)
     else:
-        model_cfg = gpt_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+        model_cfg = gpt_config_from_args(args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,
