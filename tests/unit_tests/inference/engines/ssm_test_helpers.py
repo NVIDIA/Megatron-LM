@@ -17,8 +17,8 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_stack_spec,
 )
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
-from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
+from megatron.core.ops.ssm.common.packed_seq import check_fla_sequence_packing_support
+from megatron.core.ops.ssm.mamba2.mixer import _check_mamba_sequence_packing_support
 
 try:
     import einops  # noqa: F401

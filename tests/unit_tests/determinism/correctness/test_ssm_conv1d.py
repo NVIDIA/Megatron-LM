@@ -11,10 +11,10 @@ import pytest
 import torch
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.ops.ssm.common import causal_conv1d_cp as causal_conv1d_module
+from megatron.core.ops.ssm.common.causal_conv1d_cp import assert_causal_conv1d_deterministic
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm import causal_conv1d as causal_conv1d_module
-from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
-from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.determinism.configs import hybrid_base

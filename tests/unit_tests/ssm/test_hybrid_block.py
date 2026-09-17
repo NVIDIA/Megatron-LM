@@ -19,11 +19,11 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.ops.ssm.gated_delta import HAVE_FLA as HAVE_GDN
+from megatron.core.ops.ssm.gated_delta import GatedDeltaNet, GatedDeltaNet2
+from megatron.core.ops.ssm.gdp.mixer import HAVE_FLA as HAVE_GDP
+from megatron.core.ops.ssm.gdp.mixer import HAVE_MAMBA_SSM as HAVE_GDP_MAMBA
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
-from megatron.core.ssm.gated_delta_product import HAVE_FLA as HAVE_GDP
-from megatron.core.ssm.gated_delta_product import HAVE_MAMBA_SSM as HAVE_GDP_MAMBA
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig

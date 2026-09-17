@@ -283,8 +283,8 @@ def _worker_gdp_uses_custom_gtp_group(rank, world_size, port):
     """GDP projections must use the caller-owned GTP group when MPU owns another topology."""
     from megatron.core import parallel_state as ps
     from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
+    from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
     from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
     ps.destroy_model_parallel()

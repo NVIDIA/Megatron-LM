@@ -29,14 +29,14 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
-from megatron.core.ssm.gated_delta_product import (
+from megatron.core.ops.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.ops.ssm.gdp.mixer import (
     HAVE_CUTEDSL_GDP_CP,
     GatedDeltaProductMixer,
     GatedDeltaProductMixerSubmodules,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_causal_conv1d_min_version
