@@ -143,7 +143,10 @@ def set_global_variables(args, build_tokenizer=True):
     set_args(args)
 
     if args.step_batch_size_schedule is not None:
-        print(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+        # Imported here, as elsewhere in this module: megatron.training.utils imports back
+        # into megatron.training, which imports this module.
+        from megatron.training.utils import print_rank_0
+        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
         rank=args.rank,

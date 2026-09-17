@@ -229,19 +229,31 @@ class MimoOptimizer(MegatronOptimizer):
 
 
 def _iter_optimizer_sub_dicts(module_sd, optimizer):
-    """Yield (sub_state_dict, inner_optimizer) pairs.
+    """Yield (sub_state_dict, inner_optimizer) pairs, one per leaf optimizer.
 
-    For a single optimizer, yields (module_sd, optimizer) once.
-    For ChainedOptimizer with N>1 inner optimizers, yields
-    (module_sd[i], chained_optimizers[i]) for each.
+    ChainedOptimizer nests: its state dict is keyed by integer index when the chain
+    holds more than one optimizer, and delegates straight to the single child when it
+    holds exactly one. A child can itself be a ChainedOptimizer, so this recurses.
+
+    Descending only one level hands the caller an integer-keyed dict where a leaf
+    state dict is expected. That is silent on save -- _extract_param_groups looks for
+    an 'optimizer' key, finds none, and writes no param_groups -- and raises
+    AttributeError on load when the restore helpers call str.startswith on an int key.
     """
     from megatron.core.optimizer.optimizer import ChainedOptimizer
 
-    if isinstance(optimizer, ChainedOptimizer) and len(optimizer.chained_optimizers) > 1:
-        for idx, inner_opt in enumerate(optimizer.chained_optimizers):
-            yield module_sd[idx], inner_opt
-    else:
-        yield module_sd, optimizer
+    if isinstance(optimizer, ChainedOptimizer):
+        inner_optimizers = optimizer.chained_optimizers
+        if len(inner_optimizers) > 1:
+            for idx, inner_opt in enumerate(inner_optimizers):
+                yield from _iter_optimizer_sub_dicts(module_sd[idx], inner_opt)
+            return
+        if len(inner_optimizers) == 1:
+            # Both state_dict() and sharded_state_dict() return the single child's
+            # state dict directly, so module_sd already belongs to that child.
+            yield from _iter_optimizer_sub_dicts(module_sd, inner_optimizers[0])
+            return
+    yield module_sd, optimizer
 
 
 def _extract_param_groups(sub_sd, module_name, suffix, replica_id):
@@ -292,7 +304,7 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
     # Find the _mimo_param_groups key (may have a suffix for chained optimizers)
     pg_key = None
     for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_param_groups'):
+        if isinstance(k, str) and k.startswith('_mimo_param_groups'):
             pg_key = k
             break
     if pg_key is None:
@@ -320,7 +332,7 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
 def _restore_param_state_sharding_type(sub_sd):
     """Load: restore param_state_sharding_type from ShardedObject key."""
     for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_param_state_sharding_type'):
+        if isinstance(k, str) and k.startswith('_mimo_param_state_sharding_type'):
             sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
             break
 
@@ -328,7 +340,7 @@ def _restore_param_state_sharding_type(sub_sd):
 def _restore_grad_scaler(sub_sd):
     """Load: restore grad_scaler from ShardedObject key."""
     for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_grad_scaler'):
+        if isinstance(k, str) and k.startswith('_mimo_grad_scaler'):
             sub_sd['grad_scaler'] = sub_sd.pop(k)
             break
 
