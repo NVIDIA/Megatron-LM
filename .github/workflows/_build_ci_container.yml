@@ -234,7 +234,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      - name: Select cache donor
+      - name: Collect available build caches
         id: cache_from
         shell: bash
         env:
@@ -253,14 +253,26 @@ jobs:
             CANDIDATES=("$RUN_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
           fi
 
-          DONOR_CACHE="$LEGACY_CACHE"
+          # An older PR cache can exist but miss layers present in the main
+          # baseline. Give BuildKit every available source so it can reuse both.
+          CACHE_SOURCES=()
+          declare -A SEEN_CACHES=()
           for candidate in "${CANDIDATES[@]}"; do
+            if [[ -n "${SEEN_CACHES[$candidate]:-}" ]]; then
+              continue
+            fi
+            SEEN_CACHES[$candidate]=1
             if docker buildx imagetools inspect "$candidate" >/dev/null 2>&1; then
-              DONOR_CACHE="$candidate"
-              break
+              CACHE_SOURCES+=("type=registry,ref=$candidate")
             fi
           done
-          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
+          {
+            echo 'sources<<CACHE_SOURCES'
+            if [[ ${#CACHE_SOURCES[@]} -gt 0 ]]; then
+              printf '%s\n' "${CACHE_SOURCES[@]}"
+            fi
+            echo 'CACHE_SOURCES'
+          } | tee -a "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -274,7 +286,7 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
-          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
+          cache-from: ${{ steps.cache_from.outputs.sources }}
           cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
           tags: |
