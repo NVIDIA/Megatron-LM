@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from argparse import ArgumentParser
+from dataclasses import replace
 from functools import partial
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -320,6 +322,132 @@ def test_config_accepts_hybrid_model_ratio_tail():
     assert config.csa_compress_ratios == [0, 4, 128, 4]
 
 
+def test_hybrid_stack_spec_uses_static_ratio_agnostic_specs():
+    """C/H/W use static norm/no-norm specs; layer configs provide their ratios."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_dsv4_stack_spec,
+        hybrid_stack_spec,
+    )
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    assert isinstance(hybrid_dsv4_stack_spec, ModuleSpec)
+    assert hybrid_dsv4_stack_spec is hybrid_stack_spec
+    attention = hybrid_stack_spec.submodules.csa_layer.submodules.self_attention
+    assert attention.module is DSv4HybridSelfAttention
+    assert "compress_ratio" not in attention.params
+    assert attention.submodules.q_layernorm is IdentityOp
+    assert attention.submodules.kv_layernorm is IdentityOp
+    normalized = hybrid_stack_spec.submodules.csa_qk_layernorm_layer.submodules.self_attention
+    assert normalized.module is DSv4HybridSelfAttention
+    assert "compress_ratio" not in normalized.params
+    assert normalized.submodules.q_layernorm is not IdentityOp
+    assert normalized.submodules.kv_layernorm is not IdentityOp
+
+
+@pytest.mark.parametrize("variant", [None, "dsa"])
+@pytest.mark.parametrize("entrypoint", ["hybrid_stack", "attention"])
+def test_dsv4_construction_rejects_incompatible_variant_before_backend_work(variant, entrypoint):
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+    from megatron.core.transformer.attention import Attention
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention,
+    )
+    from megatron.core.transformer.spec_utils import build_module
+
+    config = replace(_make_config(), experimental_attention_variant=variant)
+    with (
+        patch.object(Attention, "__init__", return_value=None) as attention_init,
+        pytest.raises(ValueError, match="DSv4 attention requires.*dsv4_hybrid"),
+    ):
+        if entrypoint == "hybrid_stack":
+            build_module(
+                hybrid_dsv4_stack_spec.submodules.csa_layer.submodules.self_attention,
+                config=config,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection(),
+            )
+        else:
+            DSv4HybridSelfAttention(
+                config=config,
+                submodules=None,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection(),
+            )
+    attention_init.assert_not_called()
+
+
+def _build_cpu_attention_for_ratio_resolution(monkeypatch, config, explicit_ratio=None):
+    """Build enough of DSv4 attention on CPU to exercise ratio selection."""
+    from megatron.core.transformer import identity_op
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    class SizeOneGroup:
+        def size(self) -> int:
+            return 1
+
+    monkeypatch.setattr(dsv4_attention, "RotaryEmbedding", identity_op.IdentityOp)
+    monkeypatch.setattr(dsv4_attention, "YarnRotaryEmbedding", identity_op.IdentityOp)
+    monkeypatch.setattr(dsv4_attention, "TELinear", identity_op.IdentityOp)
+
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = SizeOneGroup()
+    pg_collection.cp = SizeOneGroup()
+    submodules = dsv4_attention.DSv4HybridSelfAttentionSubmodules(
+        q_layernorm=identity_op.IdentityOp,
+        kv_layernorm=identity_op.IdentityOp,
+        linear_q_down_proj=identity_op.IdentityOp,
+        linear_q_up_proj=identity_op.IdentityOp,
+        linear_kv_proj=identity_op.IdentityOp,
+        core_attention=ModuleSpec(module=identity_op.IdentityOp),
+        linear_proj=identity_op.IdentityOp,
+    )
+    kwargs = {}
+    if explicit_ratio is not None:
+        kwargs["compress_ratio"] = explicit_ratio
+    return dsv4_attention.DSv4HybridSelfAttention(
+        config=config,
+        submodules=submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=pg_collection,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("config_ratio", "explicit_ratio", "expected_ratio"),
+    [
+        pytest.param(None, None, 4, id="global-list-fallback"),
+        pytest.param(128, None, 128, id="layer-config-precedes-global-list"),
+        pytest.param(128, 4, 4, id="explicit-argument-precedes-layer-config"),
+    ],
+)
+def test_compress_ratio_resolution_precedence(
+    monkeypatch, config_ratio, explicit_ratio, expected_ratio
+):
+    """Resolve explicit, per-layer, and legacy-list ratios in that priority order."""
+    from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+        CSALayerConfig,
+    )
+
+    config = _make_config(perform_initialization=False, csa_compress_ratios=[4, 0, 0, 0])
+    if config_ratio is not None:
+        config = CSALayerConfig.from_config(config)
+        config.compress_ratio = config_ratio
+
+    attention = _build_cpu_attention_for_ratio_resolution(
+        monkeypatch, config, explicit_ratio=explicit_ratio
+    )
+
+    assert attention._dsv4_compress_ratio == expected_ratio
+
+
 def test_constructor_requires_explicit_process_groups():
     """Production DSv4 construction must not read process groups from global MPU state."""
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
@@ -331,10 +459,16 @@ def test_constructor_requires_explicit_process_groups():
 
 
 def _build_attention(config, layer_number, pg_collection, **kwargs):
-    """Instantiate a DSv4HybridSelfAttention from config."""
+    """Instantiate DSv4 attention through HybridModel's static spec."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.spec_utils import build_module
 
-    spec = _make_attention_spec(config)
+    layer_spec = (
+        hybrid_stack_spec.submodules.csa_qk_layernorm_layer
+        if config.qk_layernorm
+        else hybrid_stack_spec.submodules.csa_layer
+    )
+    spec = layer_spec.submodules.self_attention
     return build_module(
         spec, config=config, layer_number=layer_number, pg_collection=pg_collection, **kwargs
     )
@@ -363,6 +497,7 @@ class TestDSv4HybridAttentionConstructor:
         from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
             DSv4HybridSelfAttention,
         )
+        from megatron.core.transformer.identity_op import IdentityOp
 
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
@@ -378,8 +513,11 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'linear_proj')
         assert hasattr(attn, 'linear_o_group_proj')
         assert hasattr(attn, 'core_attention')
-        assert hasattr(attn, 'q_layernorm')
-        assert hasattr(attn, 'kv_layernorm')
+        assert isinstance(attn.q_layernorm, IdentityOp)
+        assert isinstance(attn.kv_layernorm, IdentityOp)
+        assert not any(
+            key.startswith(("q_layernorm.", "kv_layernorm.")) for key in attn.state_dict()
+        )
 
     def test_latent_norm_epsilon_is_scoped_to_q_and_kv_latents(self):
         """The dedicated epsilon must not change the compressor norm."""
@@ -394,6 +532,8 @@ class TestDSv4HybridAttentionConstructor:
 
         assert attn.q_layernorm.eps == pytest.approx(1e-6)
         assert attn.kv_layernorm.eps == pytest.approx(1e-6)
+        assert attn.state_dict()["q_layernorm.weight"].shape == (config.q_lora_rank,)
+        assert attn.state_dict()["kv_layernorm.weight"].shape == (config.v_head_dim,)
         assert attn.core_attention.compressor.norm.eps == pytest.approx(1e-5)
 
     def test_q_head_dim_equals_v_head_dim(self):

@@ -15,6 +15,15 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 
+_NVTE_ATTN_ENV_VARS = (
+    'NVTE_FLASH_ATTN',
+    'NVTE_FUSED_ATTN',
+    'NVTE_UNFUSED_ATTN',
+    'NVTE_FLASH_ATTN_V2',
+    'NVTE_FLASH_ATTN_V3',
+    'NVTE_FLASH_ATTN_V4',
+)
+
 
 class TestModel(torch.nn.Module):
     def __init__(
@@ -34,10 +43,9 @@ class TestModel(torch.nn.Module):
 
 
 def clear_nvte_env_vars():
-    """Clear NVTE env vars set by conftest set_env fixture."""
-    os.environ.pop('NVTE_FLASH_ATTN', None)
-    os.environ.pop('NVTE_FUSED_ATTN', None)
-    os.environ.pop('NVTE_UNFUSED_ATTN', None)
+    """Clear NVTE attention backend environment variables."""
+    for name in _NVTE_ATTN_ENV_VARS:
+        os.environ.pop(name, None)
 
 
 def is_nccl_ep_available():
@@ -126,10 +134,7 @@ class Utils:
 
     @staticmethod
     def initialize_distributed():
-
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        clear_nvte_env_vars()
 
         if not torch.distributed.is_initialized() and Utils.rank >= 0:
             print(
@@ -177,9 +182,7 @@ class Utils:
 
     @staticmethod
     def destroy_model_parallel():
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        clear_nvte_env_vars()
         if not Utils.inited:
             return
 
@@ -204,9 +207,7 @@ class Utils:
     ):
         # Need to unset these variables to make sure previous
         # tests setting them doesn't interfere current test.
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        clear_nvte_env_vars()
 
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
