@@ -3018,6 +3018,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # future request skip prefill is silently dropped. Stop a partial
                 # (non-final) chunk short at the nearest lower block boundary so the
                 # running `finished_chunk_token_count` stays block-aligned.
+                """
                 if (
                     self.context.is_hybrid_model
                     and self.context.mamba_slot_allocator is not None
@@ -3032,6 +3033,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # than a block cannot be block-aligned; leave it unchanged).
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
+                """
 
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
                 # final chunk, reduce by 1 (or defer if we only have 1 computed token).

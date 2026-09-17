@@ -2296,21 +2296,31 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
     """
 
     @pytest.mark.internal
-    def test_reset_preserves_prefix_cache_when_requested(self):
+    @pytest.mark.parametrize("enable_mtp", [False, True])
+    def test_reset_preserves_prefix_cache_when_requested(self, enable_mtp):
         # LRU + prefix caching enabled: reset(preserve_prefix_cache=True) keeps the
         # KV hash index (so an idle dummy_forward does not wipe cross-request reuse),
         # while a plain reset() clears it.
-        ctx = self._ctx(enable_prefix_caching=True)
+        ctx = self._ctx(
+            enable_prefix_caching=True,
+            num_speculative_tokens=2 if enable_mtp else 0,
+            mtp_num_layers=1 if enable_mtp else None,
+        )
         bs = ctx.block_size_tokens
         ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
         cached = dict(ctx.kv_block_allocator.kv_hash_to_block_id)
         assert len(cached) == 2
+        next_tokens = ctx.kv_block_allocator.block_mtp_next_token.clone()
+        if enable_mtp:
+            assert (next_tokens >= 0).any()
 
         ctx.reset(preserve_prefix_cache=True)
         assert ctx.kv_block_allocator.kv_hash_to_block_id == cached  # preserved
+        torch.testing.assert_close(ctx.kv_block_allocator.block_mtp_next_token, next_tokens)
 
         ctx.reset()  # default: full reset
         assert len(ctx.kv_block_allocator.kv_hash_to_block_id) == 0  # cleared
+        assert (ctx.kv_block_allocator.block_mtp_next_token == -1).all()
 
     @pytest.mark.internal
     @pytest.mark.parametrize("enable_prefix_caching", [False, True])
@@ -3578,6 +3588,43 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[1:])
         self._assert_hash_registry_is_injective(alloc)
         self._assert_chained_ancestry(alloc, producer, sibling)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
+    @pytest.mark.parametrize("extra_tokens", [0, 1])
+    def test_completing_an_inherited_block_preserves_its_successor(self, policy, extra_tokens):
+        """Completing a shared block must not replace its producer's successor metadata."""
+        ctx = self._mtp_ctx(enable_chunked_prefill=True, prefix_caching_eviction_policy=policy)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(3 * bs)
+        producer = self._req(ctx, prompt)
+        ctx.add_request(producer)
+        producer_blocks = self._block_ids(ctx, 0, 3)
+
+        sibling = self._req(ctx, prompt.clone(), request_id=2)
+        first_chunk_length = bs + bs // 2
+        ctx.add_request(sibling, prefill_chunk_length=first_chunk_length)
+        assert self._block_ids(ctx, 1, 2) == producer_blocks[:2]
+        expected_next_token = int(prompt[2 * bs])
+        assert alloc.block_mtp_next_token[producer_blocks[1]].item() == expected_next_token
+
+        sibling.finished_chunk_token_count = first_chunk_length
+        sibling.remaining_prompt_tokens = sibling.remaining_prompt_tokens[first_chunk_length:]
+        ctx.total_request_count -= 1
+        ctx.active_token_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.add_request(sibling, prefill_chunk_length=bs // 2 + extra_tokens)
+
+        # The completion chunk may end before the successor. It must not mark the
+        # producer's already-written boundary slot unknown or change its ancestry.
+        assert alloc.block_mtp_next_token[producer_blocks[1]].item() == expected_next_token
+        assert alloc.block_ref_counts[producer_blocks[1]].item() == 2
+        self._assert_hash_registry_is_injective(alloc)
+        self._assert_chained_ancestry(alloc, producer, sibling)
+        consumer = self._req(ctx, prompt.clone(), request_id=3)
+        match = ctx._compute_prefix_match(consumer, len(prompt))
+        assert match.matched_block_ids == producer_blocks[:2]
 
     @pytest.mark.internal
     def test_a_recycled_block_carries_no_stale_lookahead_token(self):

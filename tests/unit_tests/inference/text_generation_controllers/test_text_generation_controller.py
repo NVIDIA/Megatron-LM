@@ -95,6 +95,7 @@ class TextGenerationControllerTestBase:
         cuda_graph_impl: str = 'none',
         transformer_impl: str = None,
         position_embedding_type: str = None,
+        mtp_use_repeated_layer: bool = False,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -131,6 +132,7 @@ class TextGenerationControllerTestBase:
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             pipeline_dtype=dtype,
             mtp_num_layers=mtp_num_layers if mtp_num_layers > 0 else None,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
             sequence_parallel=sequence_parallel,
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
@@ -1889,31 +1891,34 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
-    def test_mtp_inference_rejects_positional_embeddings(self, position_embedding_type):
+    def test_mtp_kv_cache_rejects_positional_embeddings(self, position_embedding_type):
         with pytest.raises(
-            ValueError, match="MTP inference requires position_embedding_type='none'"
+            ValueError, match="MTP KV caching requires position_embedding_type='none'"
         ):
             self.setup_model(
                 torch.float32,
                 static=False,
                 num_speculative_tokens=2,
                 mtp_num_layers=1,
+                mtp_use_repeated_layer=True,
                 position_embedding_type=position_embedding_type,
             )
 
     @pytest.mark.internal
-    def test_mtp_inference_rejects_mla_rotary_embeddings(self):
+    def test_mtp_kv_cache_rejects_mla_rotary_embeddings(self):
         self.setup_model(
             torch.float32,
             static=False,
             num_speculative_tokens=2,
             mtp_num_layers=1,
+            mtp_use_repeated_layer=True,
             position_embedding_type="none",
         )
         controller = self.text_generation_controller
+        assert controller.inference_wrapped_model.inference_context.enable_mtp_kv_cache
         # MLA's position type is internal: the top-level "none" must not bypass the guard.
         with mock.patch.object(controller.model_config, "multi_latent_attention", True):
-            with pytest.raises(ValueError, match="MTP inference does not support MLA"):
+            with pytest.raises(ValueError, match="MTP KV caching does not support MLA"):
                 TextGenerationController(
                     inference_wrapped_model=controller.inference_wrapped_model,
                     tokenizer=self.mock_tokenizer,
@@ -1932,9 +1937,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             static=False,
             num_speculative_tokens=num_speculative_tokens,
             mtp_num_layers=1,
+            mtp_use_repeated_layer=num_speculative_tokens > 0,
             position_embedding_type=position_embedding_type,
         )
         assert self.text_generation_controller.num_speculative_tokens == num_speculative_tokens
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        assert context.enable_mtp_kv_cache == (num_speculative_tokens > 0)
 
     @pytest.mark.internal
     def test_async_sched_no_overlap_pauses_boundary_request(self):

@@ -245,7 +245,7 @@ class TextGenerationController(MTPControllerMixin):
         else:
             self.vocab_size = unwrapped_model.vocab_size
 
-        if self.num_speculative_tokens > 0:
+        if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
             language_model = (
                 unwrapped_model.language_model
                 if isinstance(unwrapped_model, LLaVAModel)
@@ -253,12 +253,12 @@ class TextGenerationController(MTPControllerMixin):
             )
             if language_model.position_embedding_type != "none":
                 raise ValueError(
-                    "MTP inference requires position_embedding_type='none'; positional "
+                    "MTP KV caching requires position_embedding_type='none'; positional "
                     "embeddings are not supported."
                 )
             if language_model.config.multi_latent_attention:
                 # MLA constructs its own RoPE/YaRN, independently of the model's position type.
-                raise ValueError("MTP inference does not support MLA's rotary position embeddings.")
+                raise ValueError("MTP KV caching does not support MLA's rotary position embeddings.")
 
         # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
         # unique generation seed (avoids identical samples when the same prompt is

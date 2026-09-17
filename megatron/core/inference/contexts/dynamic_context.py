@@ -253,6 +253,8 @@ class PrefixMatch:
         backed_off_blocks (int): Matched blocks deliberately NOT inherited, dropped from the tail
             of `matched_block_ids` -- see `_compute_prefix_match` for why. Registration must
             stop at the first declined block to preserve chained ancestry.
+        speculative_reserve_blocks (int): Extra block held for the draft loop's writes past
+            the prompt; see `_mtp_prefill_reserve_blocks`.
     """
 
     matched_block_ids: list
@@ -263,7 +265,6 @@ class PrefixMatch:
     effective_prefill_chunk_length: int
     backed_off_blocks: int = 0
     speculative_reserve_blocks: int = 0
-    """Extra block held for the draft loop's writes past the prompt; see `_compute_prefix_match`."""
 
 
 class DynamoHelper:
@@ -3629,7 +3630,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 parent_hashes_slice = [
                     req.precomputed_block_hashes[k - 1] if k > 0 else 0 for k in range(start, end)
                 ]
-                self.kv_block_allocator.register_kv_block_hashes(
+                registered_block_ids = self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice, parent_hashes_slice
                 )
                 if self.enable_mtp_kv_cache:
@@ -3638,7 +3639,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     # actually computed count: a block completed exactly at a chunk boundary has
                     # its successor in the NEXT chunk and its slot is still unwritten, so it
                     # records -1 here and is upgraded below once that chunk arrives.
+                    # A prior chunk's partial block may already be shared. Preserve its
+                    # producer's metadata when registration skips it.
+                    newly_registered = set(registered_block_ids)
                     for offset, block_id in enumerate(block_ids_to_hash):
+                        if block_id not in newly_registered:
+                            continue
                         next_token_idx = (start + offset + 1) * self.block_size_tokens
                         self.kv_block_allocator.block_mtp_next_token[block_id] = (
                             int(req.prompt_tokens[next_token_idx])

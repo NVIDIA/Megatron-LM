@@ -310,6 +310,7 @@ class KVBlockAllocator:
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
+            self.block_mtp_next_token.fill_(-1)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
                 self.block_parent_id.fill_(-1)
@@ -327,7 +328,7 @@ class KVBlockAllocator:
         block_ids: list[int],
         block_hashes: list[int],
         parent_hashes: Optional[list[int]] = None,
-    ) -> None:
+    ) -> list[int]:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Registration is idempotent: a block that already carries the hash being
@@ -354,9 +355,13 @@ class KVBlockAllocator:
                 length as block_ids); 0 marks a root block with no parent. Used
                 by LRU eviction to avoid evicting a parent before its children.
                 If None, parents default to 0.
+
+        Returns:
+            Newly registered block IDs, in input order. Already registered blocks
+            are excluded so callers can preserve their existing metadata.
         """
         if not block_ids:
-            return
+            return []
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
         # Tensor views of the batch, used to index the per-block state arrays.
@@ -384,7 +389,7 @@ class KVBlockAllocator:
             # hash-map update and the child-count bumps all see the same subset.
             keep = torch.nonzero(~already_registered, as_tuple=True)[0]
             if keep.numel() == 0:
-                return
+                return []
             keep_list = keep.tolist()
             block_ids = [block_ids[i] for i in keep_list]
             block_hashes = [block_hashes[i] for i in keep_list]
@@ -422,6 +427,7 @@ class KVBlockAllocator:
                     parent_id_tensor[has_parent],
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
+        return block_ids
 
     def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
         """Register a callback invoked when cached blocks are deregistered.
