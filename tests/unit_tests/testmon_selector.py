@@ -5,13 +5,26 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import shutil
 import sys
 from importlib.metadata import distributions
 from pathlib import Path
 
-from testmon_cache import is_tracked_package, record_phase, validate_phase
+# Spawned workers re-execute this script after its directory leaves sys.path.
+# Load the sibling directly without running tests/unit_tests/__init__.py.
+_cache_spec = importlib.util.spec_from_file_location(
+    "testmon_cache", Path(__file__).with_name("testmon_cache.py")
+)
+if _cache_spec is None or _cache_spec.loader is None:
+    raise ImportError("Unable to load the Testmon cache helper")
+_cache = importlib.util.module_from_spec(_cache_spec)
+sys.modules[_cache_spec.name] = _cache
+_cache_spec.loader.exec_module(_cache)
+is_tracked_package = _cache.is_tracked_package
+record_phase = _cache.record_phase
+validate_phase = _cache.validate_phase
 
 PHASES = ("prod", "experimental")
 
