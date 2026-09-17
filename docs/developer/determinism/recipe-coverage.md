@@ -40,9 +40,13 @@ and source/environment provenance. It records successful forward calls and uses
 output-gradient hooks to record that backward traversed a call. It neither
 copies tensor contents nor adds CUDA synchronization.
 
-When the command requests `--deterministic-mode`, canonical determinism policy
-is applied before importing bound modules, including import-time SSM policy.
-The training program still validates its own configuration.
+The capture entrypoint uses `megatron.determinism.bootstrap_training_determinism`
+before importing bound modules or initializing CUDA. It honors both
+`--deterministic-mode` and the effective `--yaml-cfg` policy, including YAML
+precedence over CLI flags. This requires the early MCore startup API from
+[#7419](https://github.com/NVIDIA/Megatron-LM/pull/7419). The training program
+still validates its full configuration. Capture with determinism disabled does
+not opt the recipe into deterministic mode.
 
 Bindings are explicit because a function name alone cannot establish the
 backend or numerical variant. Include every numerical option in the arguments
