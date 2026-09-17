@@ -1052,11 +1052,13 @@ class TopKRouter(Router):
         compute_aux = self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled()
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss") if compute_aux else 0.0
         aux_loss_groups = self._get_aux_loss_groups(None)
-        dense_indices = self._dense_route_indices_dtype() == torch.int64 or (
-            self.config.moe_token_dispatcher_type == "flex"
-            and self.config.moe_flex_dispatcher_backend in ("deepep", "deepepv2", "ncclep")
-            and self.config.moe_expert_capacity_factor is None
-        )
+        # The bool routing map, not the dense top-k indices: the dispatcher then recovers the
+        # slot order with the same torch.topk over the probs as the eager path, so the k expert
+        # outputs are combined in the same order (the Function's own slot order is by biased
+        # score; the two A/B runs with dense indices reproduced the eager lm loss to 1e-5 only,
+        # the sum order of the DeepEP combine differing).  The dense form stays available
+        # (FusedSigmoidRouterChain's ``dense_indices``) for the dispatcher's fused-index path.
+        dense_indices = False
         probs, routing_map, aux_loss = fused_sigmoid_router_chain(
             logits,
             self.expert_bias,
