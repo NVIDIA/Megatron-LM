@@ -49,6 +49,21 @@ would certainly have encountered an incorrect result. The probes identify
 corrected conditions. Missing files do not establish zero activity, and there is
 no denominator for all jobs or requests.
 
+## Prefix-cache campaign probes
+
+| Name (after `prefix_cache.`) | Recorded condition |
+| --- | --- |
+| `failed_admission_accounting` | A request matched cached blocks, but allocation failed and the matched references were rolled back. Retried failures count separately. |
+| `cached_tokens_backoff` | Successful admission skips fewer tokens than the number of matched KV blocks suggests, so cached-token accounting must use the actual skip. |
+| `rl_greedy_temperature` | The RL client preserves an explicitly zero temperature instead of replacing it with the default. This campaign fix can execute without prefix caching. |
+| `mamba_aligned_chunk_endpoint` | A non-final, block-aligned Mamba prefill chunk with reusable block hashes stages its endpoint state for caching. This measures staging, not later publication or reuse. |
+| `checkpoint_optional_results` | Merging multiple request segments recovers nonempty log probabilities or top-N scores when the first segment has `None`. One merge counts once even if both fields qualify. |
+| `checkpoint_routing` | Finalizing a checkpointed request reconstructs nonempty routing results from its KV blocks after merging request segments. |
+
+Only fixes already present in the baseline are instrumented. Pending prompt
+log-probability sidecar work is deferred; historical, withdrawn, and test-only
+changes do not receive probes.
+
 ## Storage and failure behavior
 
 The first hit starts a daemon writer. It writes an initial snapshot, then a

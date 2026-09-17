@@ -1,12 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
+from unittest.mock import MagicMock
 
 import msgpack
 import numpy as np
 import pytest
 import torch
 
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -240,7 +242,7 @@ def test_dynamic_inference_request_tracked_metadata_defaults_termination_id():
     assert req.sampling_params.termination_id == -1
 
 
-def test_dynamic_inference_request_record_checkpoint_and_merge():
+def test_dynamic_inference_request_record_checkpoint_and_merge(monkeypatch):
     """RequestRecord.checkpoint() rolls the current request forward — prompt
     becomes prompt+generated, num_tokens_to_generate is debited, and the
     prefix-cache configuration is inherited while hashes are recomputed for the
@@ -249,6 +251,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     back into a single request with concatenated tokens, routing_indices, and
     the record's latency while leaving text finalization to the caller. Both
     are non-trivial state machines."""
+    probe = MagicMock(wraps=record_bugfix)
+    monkeypatch.setattr("megatron.core.inference.inference_request.record_bugfix", probe)
     sp = SamplingParams(num_tokens_to_generate=8, termination_id=0)
 
     # checkpoint() inherits prefix-cache configuration and event_add_engine.
@@ -329,6 +333,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     rec = DynamicInferenceRequestRecord(requests=[a, b])
     rec.latency = 4.2
     merged = rec.merge()
+    probe.assert_called_once_with("prefix_cache.checkpoint_optional_results")
     assert merged.generated_tokens == [10, 11, 12]
     assert (merged.prompt, merged.generated_text) == (None, None)
     assert merged.generated_log_probs == [-0.5]
@@ -392,6 +397,29 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     # Never-stamped requests record None epochs (non-RL serving).
     finished_cd = FinishedRequestRecord.from_request(merged_cd)
     assert finished_cd.policy_epoch is None and finished_cd.num_evictions == 0
+
+
+@pytest.mark.parametrize("field", ["generated_log_probs", "generated_top_n_logprobs"])
+@pytest.mark.parametrize("first", [None, [], [-0.1]])
+@pytest.mark.parametrize("later", [None, [], [-0.2]])
+def test_checkpoint_optional_results_probe(monkeypatch, field, first, later):
+    probe = MagicMock(wraps=record_bugfix)
+    monkeypatch.setattr("megatron.core.inference.inference_request.record_bugfix", probe)
+    requests = [_make_dynamic_request(), _make_dynamic_request()]
+    # Top-N values are lists of token-score dictionaries; the merge contract is
+    # the same for both optional fields.
+    if field == "generated_top_n_logprobs":
+        first = None if first is None else [{1: value} for value in first]
+        later = None if later is None else [{2: value} for value in later]
+    setattr(requests[0], field, first)
+    setattr(requests[1], field, later)
+    merged = DynamicInferenceRequestRecord(requests=requests).merge()
+    expected = None if first is None and later is None else (first or []) + (later or [])
+    assert getattr(merged, field) == expected
+    if first is None and later:
+        probe.assert_called_once_with("prefix_cache.checkpoint_optional_results")
+    else:
+        probe.assert_not_called()
 
 
 def test_checkpoint_preserves_runtime_state_without_aliasing():

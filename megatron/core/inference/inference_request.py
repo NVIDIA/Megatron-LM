@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
@@ -1198,6 +1199,12 @@ class DynamicInferenceRequestRecord:
             num_cached_tokens=self.requests[0].num_cached_tokens,
             disaggregated_params=disaggregated_params,
         )
+
+        if len(self.requests) > 1 and any(
+            getattr(first_request, key) is None and getattr(request, key)
+            for key in ("generated_log_probs", "generated_top_n_logprobs")
+        ):
+            record_bugfix("prefix_cache.checkpoint_optional_results")
 
         return request
 

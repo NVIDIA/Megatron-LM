@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from pydantic import Field, ValidationError
 
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.rl.agent.api import (
     EpisodeResult,
     GroupedRolloutGenerator,
@@ -34,13 +35,17 @@ from megatron.rl.inference.megatron import MegatronLocal
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "temperature, expected_temperature", [(None, 1.0), (0.0, 0.0)], ids=["default", "greedy"]
+    "temperature, expected_temperature",
+    [(None, 1.0), (0.0, 0.0), (0.7, 0.7)],
+    ids=["default", "greedy", "sampling"],
 )
 async def test_megatron_local_preserves_explicit_greedy_temperature(
     monkeypatch, temperature, expected_temperature
 ):
     monkeypatch.setattr("megatron.rl.inference.megatron.get_args", lambda: MagicMock())
     monkeypatch.setattr("megatron.rl.inference.megatron.get_tokenizer", lambda: MagicMock(bos=None))
+    probe = MagicMock(wraps=record_bugfix)
+    monkeypatch.setattr("megatron.rl.inference.megatron.record_bugfix", probe)
 
     choice = MagicMock(finish_reason="stop")
     choice.message.model_dump.return_value = {"role": "assistant", "content": "response"}
@@ -67,6 +72,10 @@ async def test_megatron_local_preserves_explicit_greedy_temperature(
 
     client.chat.completions.create.assert_awaited_once()
     assert client.chat.completions.create.await_args.kwargs["temperature"] == expected_temperature
+    if temperature == 0.0:
+        probe.assert_called_once_with("prefix_cache.rl_greedy_temperature")
+    else:
+        probe.assert_not_called()
 
 
 class MockInferenceInterface(ReturnsRaw):

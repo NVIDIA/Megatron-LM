@@ -14,6 +14,7 @@ try:
 except ImportError:
     use_http2 = False
 
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
@@ -58,6 +59,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # - Add BOS token
         # - Skip prompt logprobs
         temperature = request.generation_args.temperature
+        if temperature == 0.0:
+            record_bugfix("prefix_cache.rl_greedy_temperature")
         response = await client.chat.completions.create(
             model="",
             messages=[message.model_dump() for message in request.prompt],
@@ -147,7 +150,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                start_text_gen_server,
+            )
 
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
@@ -212,7 +217,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.stop()
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+                stop_text_gen_server,
+            )
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):

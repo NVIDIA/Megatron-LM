@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Dict
 import torch
 from torch import Tensor
 
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 
@@ -518,6 +519,8 @@ class MambaSlotAllocator:
                     last_block_idx
                 ]
                 self._has_intermediates = True
+                if chunk_end < prompt_len and req.precomputed_block_hashes:
+                    record_bugfix("prefix_cache.mamba_aligned_chunk_endpoint")
             else:
                 self._eos_cache_block_id_cpu[current_id] = -1
         else:

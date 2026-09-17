@@ -23,6 +23,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     KVCacheManagementMode,
@@ -2234,6 +2235,12 @@ class DynamicInferenceEngine(AbstractEngine):
                                 block_ids, total_tokens - 1
                             )
                         )
+                        if (
+                            len(self.requests[request_id].record.requests) > 1
+                            and request.routing_indices is not None
+                            and request.routing_indices.size > 0
+                        ):
+                            record_bugfix("prefix_cache.checkpoint_routing")
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
