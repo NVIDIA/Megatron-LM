@@ -651,20 +651,20 @@ class HyperConnectionModule(MegatronModule):
 
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
 
-        # Both forward and recompute must populate the graph's captured input address.
-        # Read writer per call so each invocation gets a fresh detached view.
-        if output_slot is None:
-            aggregate_function = self.aggregate
-        else:
+        def aggregate_function(x, h):
+            if output_slot is None:
+                return self.aggregate(x, h)
 
-            def aggregate_function(x, h):
-                out = output_slot.writer
-                if out.dtype == x.dtype:
-                    return self.aggregate(x, h, out=out)
-                # FP32 residual streams can feed a lower-precision attention graph.
-                # Preserve the aggregation precision and checkpoint the cast/copy too,
-                # so recompute restores the captured bytes before attention backward.
-                return out.copy_(self.aggregate(x, h))
+            # Both forward and recompute must populate the graph's captured input address.
+            # Read writer per call so each invocation gets a fresh detached view.
+            out = output_slot.writer
+            if out.dtype == x.dtype:
+                return self.aggregate(x, h, out=out)
+
+            # FP32 residual streams can feed a lower-precision attention graph.
+            # Preserve the aggregation precision and checkpoint the cast/copy too,
+            # so recompute restores the captured bytes before attention backward.
+            return out.copy_(self.aggregate(x, h))
 
         aggregated = CheckpointWithoutOutput(
             ckpt_manager=manager, output_slot=output_slot
