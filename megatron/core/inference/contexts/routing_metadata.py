@@ -41,7 +41,7 @@ class RoutingMetadata:
         if self.routing_indices_buffer is not None:
             return
 
-        self.num_moe_layers = len(RouterReplay.global_router_replay_instances)
+        self.num_moe_layers = len(RouterReplay.replay_instances())
 
         if self.num_moe_layers == 0:
             return

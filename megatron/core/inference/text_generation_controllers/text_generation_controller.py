@@ -2942,7 +2942,7 @@ class TextGenerationController(MTPInferenceMixin):
             if tracer is not None and routing_indices is not None:
                 layer_ids = [
                     r.layer_number
-                    for r in RouterReplay.global_router_replay_instances
+                    for r in RouterReplay.replay_instances()
                     if r.layer_number is not None
                 ] or None
                 tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)
