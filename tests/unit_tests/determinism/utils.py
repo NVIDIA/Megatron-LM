@@ -63,12 +63,21 @@ def restore_rng_state(state: dict) -> None:
 def collect_grads(modules) -> dict:
     """Snapshot every parameter's gradient across one or more modules.
 
-    Handles BOTH eager autograd (``p.grad``) and Megatron-FSDP
-    (``p.main_grad`` — the adapter ``del``s ``p.grad`` post-backward, so
-    we have to fall through to ``main_grad`` when ``p.grad`` is None).
+    Megatron-FSDP must finish reduction and attach gradients before local
+    optimizer shards can be read. Eager/autograd callers retain the usual
+    ``main_grad``/``grad`` path. No DTensor gather is needed for local replay.
     """
     grads = {}
     for i, m in enumerate(modules):
+        buffer = getattr(m, "param_and_grad_buffer", None)
+        if buffer is not None:
+            m.finish_grad_sync()
+            for name, parameter in buffer.optimizer_named_parameters:
+                grad = parameter.grad
+                if grad is not None:
+                    local = grad.to_local() if hasattr(grad, "to_local") else grad
+                    grads[f"chunk{i}.{name}"] = local.detach().clone()
+            continue
         for name, p in m.named_parameters():
             g = getattr(p, "main_grad", None)
             if g is None:
@@ -275,8 +284,13 @@ def maybe_fsdp_wrap(model: torch.nn.Module, parallelism: dict) -> torch.nn.Modul
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=False,
-        overlap_grad_reduce=False,  # determinism — disable async overlap
-        overlap_param_gather=False,
+        use_megatron_fsdp=True,
+        megatron_fsdp_version=1,
+        data_parallel_sharding_strategy="optim_grads_params",
+        # Megatron-FSDP v1 requires overlap for full parameter/gradient sharding.
+        # collect_grads finishes both operations before snapshotting shards.
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
         use_distributed_optimizer=True,
         bucket_size=40_000_000,
     )

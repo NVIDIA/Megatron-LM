@@ -135,7 +135,7 @@ HYBRID_CONFIGS = [
 #   VPP   virtual_pipeline_model_parallel_size
 #   CP    context_parallel_size
 #   EP    expert_model_parallel_size      (implies MoE preset)
-#   FSDP  data-parallel sharding size     (wraps model with fully_shard_model)
+#   FSDP  data-parallel sharding size     (Megatron-FSDP v1 adapter)
 #
 # A test must skip an entry if Utils.world_size cannot host it; see
 # ``required_world_size``.
@@ -162,6 +162,15 @@ PARALLELISM_CONFIGS = [
     # gets the correct layer slice; runner uses num_layers = pp*vpp (one
     # layer per chunk; was bumped 2× before the vp_stage fix landed).
     pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
+]
+
+# GPT supplies CP-sharded tokens, positions and attention-mask query rows.
+# Hybrid/layer fixtures retain their own matrix until they supply CP inputs.
+GPT_PARALLELISM_CONFIGS = PARALLELISM_CONFIGS + [
+    pytest.param({"CP": 2}, id="cp2"),
+    pytest.param({"TP": 2, "CP": 2}, id="tp2-cp2"),
+    pytest.param({"PP": 2, "CP": 2}, id="pp2-cp2"),
+    pytest.param({"TP": 2, "PP": 2, "CP": 2}, id="tp2-pp2-cp2"),
 ]
 
 
@@ -216,6 +225,8 @@ def apply_parallelism(parallelism: dict) -> tuple[dict, bool, bool]:
     init_kwargs = {}
     for shortname, init_key in _SHORTNAME_TO_INIT_KWARG.items():
         if shortname in parallelism:
+            if shortname == "VPP" and parallelism[shortname] == 1:
+                continue  # The non-interleaved schedule requires VPP=None.
             init_kwargs[init_key] = parallelism[shortname]
     needs_fsdp = parallelism.get("FSDP", 1) > 1
     needs_moe = parallelism.get("EP", 1) > 1

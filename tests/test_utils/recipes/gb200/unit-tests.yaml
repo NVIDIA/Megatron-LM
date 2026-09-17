@@ -62,10 +62,10 @@ spec:
         REQUIRED_CASES=()
         if [[ "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ]]; then
             EVIDENCE_SCOPE=model
-            REQUIRED_CASES=(--require-case '*fp8-mxfp8*' --require-case '*fp4-nvfp4*')
+            REQUIRED_CASES=(--require-parallelism --require-case '*fp8-mxfp8*' --require-case '*fp4-nvfp4*')
         fi
-        export PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:-}} -p tools.determinism.pytest_plugin --determinism-evidence-scope=$EVIDENCE_SCOPE --determinism-evidence-dir={assets_dir}/logs/determinism-shards"
-        trap 'status=$?; cd "$TEST_PATH"; python -m tools.determinism.coverage "{assets_dir}/logs/determinism-shards" --output "{assets_dir}/logs/determinism-coverage.json" --revision "$(git rev-parse HEAD)" --require-verified "${{REQUIRED_CASES[@]}}" || status=1; exit "$status"' EXIT
+        export PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:-}} -p tools.determinism.pytest_plugin --determinism-evidence-scope=$EVIDENCE_SCOPE --determinism-branch-coverage --determinism-evidence-dir={assets_dir}/logs/determinism-shards"
+        trap 'status=$?; cd "$TEST_PATH"; python -m tools.determinism.coverage "{assets_dir}/logs/determinism-shards" --output "{assets_dir}/logs/determinism-coverage.json" --revision "$(git rev-parse HEAD)" --require-verified --require-branches "${{REQUIRED_CASES[@]}}" || status=1; exit "$status"' EXIT
     fi
 
     bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \

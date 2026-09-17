@@ -11,6 +11,7 @@ comparisons, not pytest passes or xfails.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import importlib.util
 import json
@@ -22,7 +23,9 @@ from pathlib import Path
 
 import pytest
 
+from tools.determinism.branch_coverage import BranchRecorder
 from tools.determinism.coverage import SCHEMA_VERSION, collect_observations, triton_signature
+from tools.determinism.parallelism import normalize_parallelism
 
 ENVIRONMENT_KEYS = (
     "CUDA_DEVICE_MAX_CONNECTIONS",
@@ -92,11 +95,19 @@ def _context(root: Path) -> dict:
 class EvidencePlugin:
     """Persist planned cases before execution so interruptions retain unknowns."""
 
-    def __init__(self, directory: Path, root: Path, scope: str = "kernel"):
+    def __init__(
+        self,
+        directory: Path,
+        root: Path,
+        scope: str = "kernel",
+        branch_sources: list[str] | None = None,
+    ):
         self.directory = directory
         self.root = root
         self.scope = scope
         self.data = None
+        self.branch_sources = branch_sources
+        self.branches = None
         self.path = directory / f"rank-{os.environ.get('RANK', '0')}-{os.getpid()}.json"
 
     def _write(self):
@@ -113,6 +124,21 @@ class EvidencePlugin:
             if marker is None:
                 continue
             declaration = dict(marker.kwargs)
+            plan = None
+            if self.scope == "model":
+                plan = declaration.pop("parallelism", None)
+                parameters = getattr(getattr(item, "callspec", None), "params", {})
+                if "parallelism" in parameters:
+                    if plan is not None and normalize_parallelism(plan) != normalize_parallelism(
+                        parameters["parallelism"]
+                    ):
+                        raise pytest.UsageError("Marker and parametrized parallelism plans differ")
+                    plan = parameters["parallelism"]
+                if plan is not None:
+                    try:
+                        plan = normalize_parallelism(plan)
+                    except ValueError as error:
+                        raise pytest.UsageError(str(error)) from error
             required = {"model_id"} if self.scope == "model" else {"op_id", "implementation"}
             if (
                 marker.args
@@ -127,6 +153,7 @@ class EvidencePlugin:
                 "declaration": declaration,
                 "observations": [],
                 "test_complete": False,
+                **({"parallelism_plan": plan} if plan is not None else {}),
             }
         if not cases:
             return
@@ -145,6 +172,18 @@ class EvidencePlugin:
             "cases": cases,
         }
         self._write()
+        if self.branch_sources is not None:
+            self.data["branches"] = {
+                "complete": False,
+                "reason": "Branch collection did not finish",
+            }
+            self._write()
+            try:
+                self.branches = BranchRecorder(
+                    self.root, self.branch_sources, self.directory / "branch-data" / self.path.name
+                )
+            except (ImportError, ValueError) as error:
+                raise pytest.UsageError(str(error)) from error
 
     def _inventory(self, cases):
         if self.scope == "model":
@@ -172,7 +211,10 @@ class EvidencePlugin:
             case["observations"].append(observation)
             self._write()
 
-        with collect_observations(record):
+        branch_context = (
+            self.branches.case(item.nodeid) if self.branches else contextlib.nullcontext()
+        )
+        with branch_context, collect_observations(record):
             return (yield)
 
     @pytest.hookimpl(wrapper=True)
@@ -193,6 +235,16 @@ class EvidencePlugin:
         if self.data is not None:
             self.data["complete"] = int(exitstatus) in (0, 1)
             self.data["exit_status"] = int(exitstatus)
+            if self.branches is not None:
+                try:
+                    self.data["branches"], arcs = self.branches.finish()
+                    for case_id, branches in arcs.items():
+                        self.data["cases"][case_id]["branch_arcs"] = branches
+                except Exception as error:
+                    self.data["branches"] = {
+                        "complete": False,
+                        "reason": f"{type(error).__name__}: {error}",
+                    }
             self._write()
 
 
@@ -200,6 +252,13 @@ def pytest_addoption(parser):
     """Register the opt-in output path."""
     parser.addoption("--determinism-evidence-dir", type=Path, default=None)
     parser.addoption("--determinism-evidence-scope", choices=("kernel", "model"), default="kernel")
+    parser.addoption("--determinism-branch-coverage", action="store_true", default=False)
+    parser.addoption(
+        "--determinism-branch-source",
+        action="append",
+        default=[],
+        help="Repository Python path; repeat for multiple sources (default: megatron/core)",
+    )
 
 
 def pytest_configure(config):
@@ -207,12 +266,25 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "determinism_case(op_id, implementation): measured kernel replay case"
     )
-    config.addinivalue_line("markers", "determinism_model(model_id): model output/gradient replay")
+    config.addinivalue_line(
+        "markers", "determinism_model(model_id, parallelism=None): model output/gradient replay"
+    )
     directory = config.getoption("--determinism-evidence-dir")
+    branches = config.getoption("--determinism-branch-coverage")
+    sources = config.getoption("--determinism-branch-source")
+    if (branches or sources) and directory is None:
+        raise pytest.UsageError("Branch collection requires --determinism-evidence-dir")
+    if sources and not branches:
+        raise pytest.UsageError(
+            "--determinism-branch-source requires --determinism-branch-coverage"
+        )
     if directory is not None:
         config.pluginmanager.register(
             EvidencePlugin(
-                directory, Path(config.rootpath), config.getoption("--determinism-evidence-scope")
+                directory,
+                Path(config.rootpath),
+                config.getoption("--determinism-evidence-scope"),
+                (sources or ["megatron/core"]) if branches else None,
             ),
             "determinism-evidence",
         )

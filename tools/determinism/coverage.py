@@ -17,6 +17,9 @@ import os
 from pathlib import Path
 from typing import Callable, Iterator
 
+from tools.determinism.branch_coverage import branch_report
+from tools.determinism.parallelism import parallelism_report
+
 SCHEMA_VERSION = 1
 DETERMINISTIC = "verified_deterministic"
 NONDETERMINISTIC = "verified_nondeterministic"
@@ -24,6 +27,9 @@ UNVERIFIED = "not_verified"
 STATUSES = (DETERMINISTIC, NONDETERMINISTIC, UNVERIFIED)
 _OBSERVER: contextvars.ContextVar[Callable[[dict], None] | None] = contextvars.ContextVar(
     "determinism_observer", default=None
+)
+_CONFIGURATION: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "determinism_replay_configuration", default=None
 )
 
 
@@ -68,6 +74,16 @@ def collect_observations(sink: Callable[[dict], None]) -> Iterator[None]:
 
 
 @contextlib.contextmanager
+def replay_configuration(configuration: dict) -> Iterator[None]:
+    """Attach runtime configuration observed by the replay adapter, not its plan."""
+    token = _CONFIGURATION.set({**(_CONFIGURATION.get() or {}), **configuration})
+    try:
+        yield
+    finally:
+        _CONFIGURATION.reset(token)
+
+
+@contextlib.contextmanager
 def observe_replay(signature: dict, protocol: dict) -> Iterator[dict]:
     """Record completed comparisons; preserve the original exception on failure.
 
@@ -75,6 +91,7 @@ def observe_replay(signature: dict, protocol: dict) -> Iterator[dict]:
     An unrelated assertion, unsupported operation, or infrastructure error remains
     unverified, even if pytest marks it as an expected failure.
     """
+    signature = {**signature, **(_CONFIGURATION.get() or {})}
     observation: dict = {"signature": signature, "protocol": protocol, "status": UNVERIFIED}
     try:
         yield observation
@@ -149,6 +166,9 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
         declaration = present[0]["declaration"]
         if any(case["declaration"] != declaration for case in present):
             raise ValueError(f"Different declarations for {case_id}")
+        plan = present[0].get("parallelism_plan")
+        if any(case.get("parallelism_plan") != plan for case in present):
+            raise ValueError(f"Different parallelism plans for {case_id}")
         observations = [
             {**observation, "rank": rank}
             for rank, shard in sorted(by_rank.items())
@@ -182,6 +202,7 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
                 "status": status,
                 "reasons": reasons,
                 "observations": observations,
+                **({"parallelism_plan": plan} if plan is not None else {}),
             }
         )
     counts = {status: sum(case["status"] == status for case in cases) for status in STATUSES}
@@ -190,7 +211,7 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
     inventory = first.get("inventory", {})
     if any(shard.get("inventory", {}) != inventory for shard in shards):
         raise ValueError("Kernel inventories differ")
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "kind": "determinism_coverage" if scope == "kernel" else "model_determinism_replay",
         "run_id": first["run_id"],
@@ -210,6 +231,17 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
         },
         "cases": cases,
     }
+    branches = branch_report(
+        shards,
+        cases,
+        not context.get("dirty", True)
+        and (expected_revision is None or context["revision"] == expected_revision),
+    )
+    if branches is not None:
+        report["branches"] = branches
+    if scope == "model":
+        report["parallelism"] = parallelism_report(cases)
+    return report
 
 
 def markdown_report(report: dict) -> str:
@@ -244,6 +276,31 @@ def markdown_report(report: dict) -> str:
         reasons = "; ".join(case["reasons"]).replace("|", "\\|").replace("\n", " ")
         lines.append(f"| `{name}` | `{case['op_id']}` | {case['status']} | {reasons} |")
     gaps = report["inventory_without_declared_cases"]
+    branches = report.get("branches")
+    if branches is not None:
+        lines.extend(["", "## Python branch execution", ""])
+        if branches["counts"] is not None:
+            branch_counts = branches["counts"]
+            lines.append(
+                f"{branch_counts['passing_replay']}/{branch_counts['total']} source branches "
+                "were exercised by cases with passing replay on all ranks. "
+                f"{branch_counts['never_observed']} were never observed in declared test calls. "
+                "This is execution coverage, not branch-level numerical correctness."
+            )
+        if not branches["complete"]:
+            lines.append("Branch measurement is incomplete: " + "; ".join(branches["reasons"]))
+        lines.append("The JSON retains every branch, its source hash, supporting cases and ranks.")
+    if "parallelism" in report:
+        view = report["parallelism"]
+        lines.extend(["", "## Parallelism interactions", "", view["scope"], ""])
+        lines.append(
+            f"{view['counts'][DETERMINISTIC]}/{view['counts']['total']} declared value-pairs "
+            f"have matching passing replay; {len(view['unplanned_cases'])} cases lack a plan."
+        )
+        lines.extend(["", "| Model | Axis values | Status |", "| --- | --- | --- |"])
+        for pair in view["pairs"]:
+            values = ", ".join(f"{axis}={size}" for axis, size in pair["values"].items())
+            lines.append(f"| `{pair['model_id']}` | {values} | {pair['status']} |")
     if report["kind"] == "model_determinism_replay":
         return "\n".join(lines) + "\n"
     lines.extend(
@@ -272,6 +329,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Fail unless at least one case has passing comparisons on every rank",
     )
     parser.add_argument(
+        "--require-branches",
+        action="store_true",
+        help="Require complete Python branch measurement with branches exercised by passing replay",
+    )
+    parser.add_argument(
+        "--require-parallelism",
+        action="store_true",
+        help="Require at least one model case with matching runtime parallelism and passing replay",
+    )
+    parser.add_argument(
         "--require-case",
         action="append",
         default=[],
@@ -286,6 +353,16 @@ def main(argv: list[str] | None = None) -> int:
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     args.output.with_suffix(".md").write_text(markdown_report(report))
     print(markdown_report(report))
+    if args.require_branches:
+        branches = report.get("branches", {})
+        if not branches.get("complete") or not branches["counts"]["passing_replay"]:
+            print("No complete branch measurement associated with passing replay")
+            return 1
+    if args.require_parallelism and not any(
+        row["status"] == DETERMINISTIC for row in report.get("parallelism", {}).get("rows", [])
+    ):
+        print("No passing model replay with runtime parallelism matching its plan")
+        return 1
     if args.require_verified and not report["counts"][DETERMINISTIC]:
         print("No case completed passing replay comparisons on every required rank")
         return 1
