@@ -1307,6 +1307,83 @@ class TestDecomposeReconstruct:
         assert set(kw.keys()) == keys
 
 
+def _build_chunk_model(H, nh, nkv, ffn, max_seqlen, max_num_seqs):
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=H,
+        num_attention_heads=nh,
+        num_query_groups=nkv,
+        ffn_hidden_size=ffn,
+        max_seqlen_per_dp_cp_rank=max_seqlen,
+        thd_max_packed_sequences=max_num_seqs,
+        bf16=True,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_granularity="chunk",
+        cuda_graph_modules=[],
+        cuda_graph_dynamic_microbatches=True,
+        sequence_packing_scheduler="dp_balanced",
+        pad_packed_seq_alignment="max",
+        use_cpu_initialization=True,
+    )
+    model_parallel_cuda_manual_seed(42)
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=max_seqlen,
+        position_embedding_type="rope",
+    ).cuda()
+
+
+@pytest.mark.internal
+class TestChunkStaticInputs:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_chunk_static_inputs_and_packed_sequence_round_trip(self):
+        block = _build_chunk_model(256, 4, 4, 1024, 128, 8).decoder
+
+        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        assert static_inputs["hidden_states"].shape == (128, 1, 256)
+        assert static_inputs["cu_seqlens_q"].shape == (9,)
+        assert static_inputs["cu_seqlens_kv_padded"].shape == (9,)
+        assert static_inputs["padding_mask"].shape == (1, 128)
+        assert not static_inputs["padding_mask"].any()
+
+        packed_seq_params = _make_psp([64, 32])
+        kwargs = {'packed_seq_params': packed_seq_params}
+        block._decompose_packed_seq_params_to_kwargs(kwargs)
+        block._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        reconstructed = kwargs['packed_seq_params']
+        assert reconstructed.pad_between_seqs is True
+        assert reconstructed.max_seqlen_q == 128
+        assert torch.equal(reconstructed.cu_seqlens_q, packed_seq_params.cu_seqlens_q)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_postprocess_block_is_attached_and_excluded_from_state_dict(self):
+        model = _build_chunk_model(256, 4, 4, 1024, 128, 8)
+        block = model.postprocess_block
+        assert block is not None and block.post_process and not block.pre_process
+        assert block.output_layer is model.output_layer
+        assert not any(key.startswith('postprocess_block.') for key in model.state_dict())
+        assert not any(key.startswith('postprocess_block.') for key in model.sharded_state_dict())
+        # Loading the model's own state dict must not report the shared block parameters missing.
+        model.load_state_dict(model.state_dict(), strict=True)
+        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        assert static_inputs["labels"].shape == (1, 128)
+        assert static_inputs["hidden_states"].shape == (128, 1, 256)
+
+
 class TestStaticInputs:
 
     def setup_method(self):

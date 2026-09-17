@@ -1638,6 +1638,11 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
+def is_chunk_cuda_graph_granularity(config) -> bool:
+    """Whether ``config`` selects chunk-granularity (whole decoder block) TE CUDA graphs."""
+    return getattr(config, 'cuda_graph_granularity', 'layer') == "chunk"
+
+
 def _layer_is_graphable(layer, config):
     """
     Check if a layer is graphable.
@@ -1646,6 +1651,11 @@ def _layer_is_graphable(layer, config):
     # Only GraphableMegatronModule can be graphed.
     if not isinstance(layer, GraphableMegatronModule):
         return False
+
+    # Chunk granularity graphs the decoder block (and the post-process block) as a whole; the
+    # per-layer module scopes below do not describe those callables.
+    if is_chunk_cuda_graph_granularity(config):
+        return bool(getattr(layer, 'is_cuda_graph_chunk_callable', False))
 
     # If cuda_graph_modules is not set, every layer is graphed.
     if not config.cuda_graph_modules:
@@ -2228,15 +2238,39 @@ class TECudaGraphHelper:
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
-                callables = _get_graphable_te_callables(
-                    chunk_with_decoder.decoder.layers, self.config
-                )
-                callables_is_mtp = [False] * len(callables)
-                for layer_number in range(num_mtp_layers):
-                    mtp_model_layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    mtp_callables = _get_mtp_te_callables(mtp_model_layer, self.config)
-                    callables.extend(mtp_callables)
-                    callables_is_mtp.extend([True] * len(mtp_callables))
+                if is_chunk_cuda_graph_granularity(self.config):
+                    # The decoder block is the callable (exactly the PP/VPP chunk boundary the
+                    # schedule drives). On the last stage the post-process block (which runs MTP,
+                    # so the MTP layers are not separate callables) follows it in the same
+                    # capture order, so both share the graph memory pool.
+                    callables, callables_is_mtp = [], []
+                    if num_decoder_layers > 0 and _layer_is_graphable(
+                        chunk_with_decoder.decoder, self.config
+                    ):
+                        # HybridBlock does not record its virtual pipeline stage; the chunk
+                        # capture keys paged-stash and offload state by it.
+                        if getattr(chunk_with_decoder.decoder, 'vp_stage', None) is None:
+                            chunk_with_decoder.decoder.vp_stage = getattr(
+                                chunk_with_decoder, 'vp_stage', None
+                            )
+                        callables.append(chunk_with_decoder.decoder)
+                        callables_is_mtp.append(False)
+                    postprocess_block = getattr(chunk_with_decoder, 'postprocess_block', None)
+                    if callables and postprocess_block is not None:
+                        callables.append(postprocess_block)
+                        callables_is_mtp.append(False)
+                else:
+                    callables = _get_graphable_te_callables(
+                        chunk_with_decoder.decoder.layers, self.config
+                    )
+                    callables_is_mtp = [False] * len(callables)
+                    for layer_number in range(num_mtp_layers):
+                        mtp_model_layer = chunk_with_decoder.mtp.layers[
+                            layer_number
+                        ].mtp_model_layer
+                        mtp_callables = _get_mtp_te_callables(mtp_model_layer, self.config)
+                        callables.extend(mtp_callables)
+                        callables_is_mtp.extend([True] * len(mtp_callables))
                 num_graphable_layers = len(callables)
                 log_on_each_pipeline_stage(
                     logger=logger,
@@ -2364,10 +2398,15 @@ class TECudaGraphHelper:
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
             """
-            Get the static inputs for a layer.
+            Get the static inputs for a layer, a decoder block or a post-process block.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or _is_mtp_te_callable(
-                layer, chunk_of_the_layer
+            is_chunk_callable = layer is chunk_of_the_layer.decoder
+            is_postprocess_callable = getattr(layer, 'is_cuda_graph_postprocess_callable', False)
+            assert (
+                is_chunk_callable
+                or is_postprocess_callable
+                or layer in chunk_of_the_layer.decoder.layers
+                or _is_mtp_te_callable(layer, chunk_of_the_layer)
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
@@ -2383,11 +2422,20 @@ class TECudaGraphHelper:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
-                    if rotary_seq_len not in rotary_pos_emb_cache:
-                        rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                    # A captured block applies RoPE with the fused THD kernel, which indexes the
+                    # table by global packed position (as GPTModel._preprocess builds it), so it
+                    # needs the full packed table rather than the per-CP-rank slice.
+                    packed_seq = (is_chunk_callable or is_postprocess_callable) and bool(
+                        layer._is_thd_cuda_graph()
+                    )
+                    cache_key = (rotary_seq_len, packed_seq)
+                    if cache_key not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[cache_key] = (
+                            transformer_module.rotary_pos_emb(rotary_seq_len, packed_seq=True)
+                            if packed_seq
+                            else transformer_module.rotary_pos_emb(rotary_seq_len)
                         )
-                    return rotary_pos_emb_cache[rotary_seq_len]
+                    return rotary_pos_emb_cache[cache_key]
                 else:
                     return None
 
@@ -2405,16 +2453,30 @@ class TECudaGraphHelper:
             attention_layer = (
                 layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
             )
-            contains_self_attn = (
-                isinstance(attention_layer, TransformerLayer)
-                and not isinstance(attention_layer.self_attention, IdentityOp)
-                and (
-                    not self.config.cuda_graph_modules
-                    or CudaGraphModule.attn in self.config.cuda_graph_modules
+            if is_chunk_callable:
+                contains_self_attn = any(
+                    isinstance(module, TransformerLayer)
+                    and not isinstance(module.self_attention, IdentityOp)
+                    for module in layer.modules()
                 )
-            )
+            elif is_postprocess_callable:
+                # The post-process runs the MTP transformer layer(s).
+                contains_self_attn = bool(getattr(chunk_of_the_layer, 'mtp_process', False))
+            else:
+                contains_self_attn = (
+                    isinstance(attention_layer, TransformerLayer)
+                    and not isinstance(attention_layer.self_attention, IdentityOp)
+                    and (
+                        not self.config.cuda_graph_modules
+                        or CudaGraphModule.attn in self.config.cuda_graph_modules
+                    )
+                )
 
-            if contains_self_attn and not self.config.multi_latent_attention:
+            if (
+                contains_self_attn
+                and not self.config.multi_latent_attention
+                and not (is_chunk_callable or is_postprocess_callable)
+            ):
                 position_embedding_type = getattr(
                     chunk_of_the_layer, 'position_embedding_type', None
                 )
@@ -3013,6 +3075,22 @@ class TECudaGraphHelper:
                 # invariant after capture.
                 kwargs['_reuse_graph_input_output_buffers'] = True
 
+            if is_chunk_cuda_graph_granularity(self.config):
+                te_parameters = inspect.signature(make_graphed_callables).parameters
+                # One process-wide pool: the optimizer step graph (optimizer_cuda_graph) is
+                # captured into the same pool and reuses the blocks the chunk graphs leave idle.
+                if 'pool' in te_parameters:
+                    from megatron.core.full_cuda_graph import get_shared_graph_pool
+
+                    kwargs['pool'] = get_shared_graph_pool()
+                # With gradient accumulation fusion the parameter grads a graph returns are
+                # placeholders (the real wgrad goes to main_grad), so there is nothing to clone.
+                if (
+                    self.config.gradient_accumulation_fusion
+                    and 'clone_param_grads_on_return' in te_parameters
+                ):
+                    kwargs['clone_param_grads_on_return'] = False
+
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
 
@@ -3024,6 +3102,10 @@ class TECudaGraphHelper:
                 # since TE currently uses fp8_autocast for both FP8 and FP4 quantization
 
                 def _get_fp8_enabled():
+                    if is_chunk_cuda_graph_granularity(self.config):
+                        # Per-layer FP8/BF16 selection happens inside the block forward; the
+                        # outer TE context only enables the quantization bookkeeping.
+                        return tuple(True for _ in self.flattened_callables)
                     if is_te_min_version("2.8.0"):
                         from megatron.core.fp8_utils import is_first_last_bf16_layer
 
@@ -3141,6 +3223,9 @@ class TECudaGraphHelper:
             self.config.moe_paged_stash
             and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
             and has_local_moe_layer
+            # Chunk callables capture with the runtime-keyed stash instead of TE's per-layer
+            # capture order (see paged_stash_prepare_for_cuda_graph_capture).
+            and not is_chunk_cuda_graph_granularity(self.config)
         )
 
     def create_cudagraphs(self):
@@ -3148,6 +3233,12 @@ class TECudaGraphHelper:
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         validate_moe_cuda_graph_support(self.config)
+        if self.config.moe_paged_stash and is_chunk_cuda_graph_granularity(self.config):
+            from megatron.core.transformer.moe.paged_stash import (
+                paged_stash_prepare_for_cuda_graph_capture,
+            )
+
+            paged_stash_prepare_for_cuda_graph_capture(self.config)
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -3167,17 +3258,33 @@ class TECudaGraphHelper:
                 rng_context = nullcontext()
             from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
 
-            with (
-                rng_context,
-                paged_stash_te_graph_capture(
-                    self._should_enable_paged_stash_capture(),
-                    order=kwargs['_order'],
-                    config=self.config,
-                ),
-            ):
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
+            block_offload_capture = (
+                self.config.fine_grained_activation_offloading
+                and is_chunk_cuda_graph_granularity(self.config)
+            )
+            if block_offload_capture:
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
                 )
+
+                off_interface.enter_block_capture(
+                    keep_last_group=self.config.fine_grained_offloading_graph_keep_last_group
+                )
+            try:
+                with (
+                    rng_context,
+                    paged_stash_te_graph_capture(
+                        self._should_enable_paged_stash_capture(),
+                        order=kwargs['_order'],
+                        config=self.config,
+                    ),
+                ):
+                    graphs = make_graphed_callables(
+                        tuple(self.flattened_callables), sample_args, **kwargs
+                    )
+            finally:
+                if block_offload_capture:
+                    off_interface.exit_block_capture()
             self._validate_mhc_static_hidden_inputs(sample_args)
 
             # Push the captured graphs to the corresponding TransformerBlock.
@@ -3430,6 +3537,8 @@ def set_current_microbatch(model, microbatch_id):
                 mtp_model_layer.current_microbatch = microbatch_id
                 for inner_layer in getattr(mtp_model_layer, 'layers', []):
                     inner_layer.current_microbatch = microbatch_id
+        if getattr(model_with_decoder, 'postprocess_block', None) is not None:
+            model_with_decoder.postprocess_block.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,

@@ -15,7 +15,11 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import (
+    get_fp8_context,
+    get_fp8_disabled_context,
+    is_first_last_bf16_layer,
+)
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -23,6 +27,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
+from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
@@ -276,7 +281,7 @@ def _get_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
-class TransformerBlock(GraphableMegatronModule, MegatronModule):
+class TransformerBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule, MegatronModule):
     """Transformer class."""
 
     def __init__(
@@ -339,6 +344,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+    def _get_inner_quantization_context(self, layer):
+        """Return the per-layer quantization context used inside this block."""
+        if self.config.fp8:
+            layer_idx = layer.layer_number - 1
+            if getattr(
+                self.config, 'cuda_graph_granularity', 'layer'
+            ) == "chunk" and is_first_last_bf16_layer(self.config, layer_idx):
+                # The captured block runs under one FP8 context, so BF16 boundary layers must
+                # opt out explicitly instead of inheriting it.
+                return get_fp8_disabled_context(self.config)
+            return get_fp8_context(self.config, layer_idx)
+        if self.config.fp4:
+            return get_fp4_context(self.config, layer.layer_number - 1)
+        return nullcontext()
 
     def _build_layers(self):
         # Transformer layers.
@@ -640,17 +660,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        # TODO: check if fp4 is supported in this case
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
+                        inner_quantization_context = self._get_inner_quantization_context(layer)
                     else:
                         inner_quantization_context = nullcontext()
 
@@ -993,16 +1003,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
-                        if self.config.fp8:
-                            inner_quantization_context = get_fp8_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        elif self.config.fp4:
-                            inner_quantization_context = get_fp4_context(
-                                self.config, layer.layer_number - 1
-                            )
-                        else:
-                            inner_quantization_context = nullcontext()
+                        inner_quantization_context = self._get_inner_quantization_context(layer)
                     else:
                         inner_quantization_context = nullcontext()
 

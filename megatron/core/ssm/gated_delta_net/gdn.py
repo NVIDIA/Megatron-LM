@@ -207,7 +207,9 @@ class GatedDeltaNet(_GDNBase):
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            assert torch.cuda.is_current_stream_capturing() or torch.equal(
+                cu_seqlens_q, cu_seqlens_kv
+            ), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )

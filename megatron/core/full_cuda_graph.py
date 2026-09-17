@@ -19,13 +19,22 @@ _shared_capture_stream = None
 
 
 def get_shared_capture_stream():
-    """Return one `torch.cuda.Stream` for all full-iter and optimizer graph captures.
+    """Return the stream shared by every CUDA graph capture in the process.
+
+    ``torch.cuda.graph`` (and therefore Transformer Engine's ``make_graphed_callables``) captures
+    on its class-level ``default_capture_stream`` unless told otherwise. Full-iteration and
+    optimizer graphs capture on that same stream so that, in a shared pool, they can reuse the
+    blocks the other graphs leave idle: the caching allocator keys a pool's free blocks by the
+    stream that allocated them, so a capture on another stream could not reuse them.
 
     Call after the target CUDA device is selected.
     """
     global _shared_capture_stream
     if _shared_capture_stream is None:
-        _shared_capture_stream = torch.cuda.Stream()
+        graph_cls = torch.cuda.graphs.graph
+        if graph_cls.default_capture_stream is None:
+            graph_cls.default_capture_stream = torch.cuda.Stream()
+        _shared_capture_stream = graph_cls.default_capture_stream
     return _shared_capture_stream
 
 
