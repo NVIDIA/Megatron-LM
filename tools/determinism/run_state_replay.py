@@ -61,11 +61,16 @@ def _run_worker(command: list[str], env: dict, log) -> int:
 def _validate_optimizer_mode(
     backend: str, pipeline_size: int, virtual_pipeline_size: int, optimizer_mode: str
 ) -> None:
-    if optimizer_mode not in ("standard", "precision_aware_fp16") or (
+    if optimizer_mode not in (
+        "standard",
+        "precision_aware_fp16",
+        "hybrid_fp32",
+        "hybrid_precision_aware_fp32",
+    ) or (
         optimizer_mode != "standard"
         and (backend != "megatron_gpt" or pipeline_size != 1 or virtual_pipeline_size != 1)
     ):
-        raise ValueError("Precision-aware FP16 moments require the Megatron PP=1 recipe")
+        raise ValueError("Precision-aware or hybrid optimizers require the Megatron PP=1 recipe")
 
 
 def _verify_stop_point(directory: Path, world_size: int, capture: dict) -> None:
@@ -365,7 +370,9 @@ def main() -> int:
     parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
-        "--optimizer-mode", choices=("standard", "precision_aware_fp16"), default="standard"
+        "--optimizer-mode",
+        choices=("standard", "precision_aware_fp16", "hybrid_fp32", "hybrid_precision_aware_fp32"),
+        default="standard",
     )
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)

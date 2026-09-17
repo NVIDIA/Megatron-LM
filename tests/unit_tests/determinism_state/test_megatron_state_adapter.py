@@ -633,3 +633,68 @@ def test_precision_aware_configuration_rejects_uncovered_storage(monkeypatch, tm
     else:
         with pytest.raises(UnverifiedState):
             capture.validate_configuration()
+
+
+@pytest.mark.parametrize("mode", ["hybrid_fp32", "hybrid_precision_aware_fp32"])
+@pytest.mark.parametrize("change", [None, "fraction", "overlap", "pin", "moments", "mode", "pp"])
+def test_hybrid_configuration_requires_declared_native_policy(monkeypatch, tmp_path, mode, change):
+    capture, args, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.optimizer_mode = mode
+    args.__dict__.update(
+        bf16=True,
+        use_distributed_optimizer=True,
+        deterministic_mode=True,
+        ckpt_format="torch_dist",
+        dataloader_type="single",
+        num_workers=0,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        use_precision_aware_optimizer=mode == "hybrid_precision_aware_fp32",
+        optimizer_cpu_offload=True,
+        optimizer_offload_fraction=0.5,
+        overlap_cpu_optimizer_d2h_h2d=True,
+        pin_cpu_params=True,
+        pin_cpu_grads=True,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
+    )
+    if change == "fraction":
+        args.optimizer_offload_fraction = 1.0
+    elif change == "overlap":
+        args.overlap_cpu_optimizer_d2h_h2d = False
+    elif change == "pin":
+        args.pin_cpu_grads = False
+    elif change == "moments":
+        args.exp_avg_sq_dtype = torch.float16
+    elif change == "mode":
+        args.optimizer_cpu_offload = False
+    elif change == "pp":
+        capture.args.pipeline_size = args.pipeline_model_parallel_size = 2
+    if change is None:
+        capture.validate_configuration()
+    else:
+        with pytest.raises(UnverifiedState):
+            capture.validate_configuration()
+
+
+def test_hybrid_pending_transfer_is_rejected_before_capture_barrier(monkeypatch, tmp_path):
+    from tools.determinism import megatron_state_worker as worker
+
+    capture, _, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.optimizer_mode = "hybrid_fp32"
+    capture.provenance = {"initialized": True}
+    inner = SimpleNamespace()
+    optimizer = SimpleNamespace(chained_optimizers=[SimpleNamespace(optimizer=inner)])
+
+    def reject(value):
+        assert value is inner
+        raise UnverifiedState("pending transfer")
+
+    monkeypatch.setattr(worker, "require_completed_hybrid_transfers", reject)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: pytest.fail("Barrier masked transfer"))
+    with pytest.raises(UnverifiedState, match="pending transfer"):
+        capture.capture([], optimizer, None, 3)

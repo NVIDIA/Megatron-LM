@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch
 
+from tools.determinism.hybrid_state import capture_hybrid_adam_state
 from tools.determinism.training_state import UnverifiedState
 
 
@@ -20,7 +21,7 @@ def _type_name(value) -> str:
 
 def capture_optimizer(optimizer, *, model_chunks: list | None = None) -> tuple[dict, dict]:
     """Capture every chained optimizer, local moment and master-parameter shard."""
-    from megatron.core.optimizer import Adam, ChainedOptimizer
+    from megatron.core.optimizer import Adam, ChainedOptimizer, HybridDeviceOptimizer
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
     from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
@@ -36,6 +37,19 @@ def capture_optimizer(optimizer, *, model_chunks: list | None = None) -> tuple[d
         if child.is_stub_optimizer:
             raise UnverifiedState("A stub optimizer needs an explicit no-parameter-rank adapter")
         inner = child.optimizer
+        if type(inner) is HybridDeviceOptimizer:
+            if (
+                type(child) is not DistributedOptimizer
+                or inner.cpu_optimizer_cls is not torch.optim.AdamW
+                or inner.gpu_optimizer_cls is not Adam
+                or _type_name(inner.gpu_optimizer)
+                != "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
+            ):
+                raise UnverifiedState("Hybrid state requires distributed Torch AdamW/TE FusedAdam")
+            state[str(index)], precision[str(index)] = capture_hybrid_adam_state(
+                child, model_chunks
+            )
+            continue
         if type(inner) not in (Adam, torch.optim.Adam, torch.optim.AdamW):
             raise UnverifiedState(f"Unsupported inner optimizer: {_type_name(inner)}")
         if getattr(child.config, "use_precision_aware_optimizer", False):

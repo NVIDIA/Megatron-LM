@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import torch
 
+from tools.determinism.hybrid_state import require_completed_hybrid_transfers
 from tools.determinism.megatron_state import (
     capture_model,
     capture_optimizer,
@@ -57,10 +58,13 @@ def recipe_arguments(
         or (virtual_pipeline_size == 2 and pipeline_size != 2)
     ):
         raise ValueError("The two-chunk virtual pipeline requires PP=2")
-    if optimizer_mode not in ("standard", "precision_aware_fp16") or (
-        optimizer_mode != "standard" and (pipeline_size != 1 or virtual_pipeline_size != 1)
-    ):
-        raise ValueError("Precision-aware FP16 moments require the PP=1 non-virtual recipe")
+    if optimizer_mode not in (
+        "standard",
+        "precision_aware_fp16",
+        "hybrid_fp32",
+        "hybrid_precision_aware_fp32",
+    ) or (optimizer_mode != "standard" and (pipeline_size != 1 or virtual_pipeline_size != 1)):
+        raise ValueError("Precision-aware or hybrid optimizers require the PP=1 non-virtual recipe")
     arguments = [
         "--num-layers",
         str(2 * virtual_pipeline_size),
@@ -152,6 +156,23 @@ def recipe_arguments(
             "--exp-avg-sq-dtype",
             "fp16",
         ]
+    if optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32"):
+        arguments += [
+            "--optimizer-cpu-offload",
+            "--optimizer-offload-fraction",
+            "0.5",
+            "--overlap-cpu-optimizer-d2h-h2d",
+            "--main-params-dtype",
+            "fp32",
+            "--main-grads-dtype",
+            "fp32",
+            "--exp-avg-dtype",
+            "fp32",
+            "--exp-avg-sq-dtype",
+            "fp32",
+        ]
+        if optimizer_mode == "hybrid_precision_aware_fp32":
+            arguments += ["--use-precision-aware-optimizer"]
     if stop_step is not None:
         # train-iters also controls data indexing and scheduler construction.
         arguments += ["--exit-interval", str(stop_step)]
@@ -202,6 +223,11 @@ class TrainingCapture:
                 optimizer_mode=self.args.optimizer_mode,
             ),
             "optimizer_mode": self.args.optimizer_mode,
+            "optimizer_capture_schema": (
+                "hybrid_adam_v1_implicit_false_default_and_constructor_membership"
+                if self.args.optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32")
+                else "native_adam"
+            ),
             "capture": self.capture_config,
             "checkpoint_step": self.args.checkpoint_step,
             "mock_documents": 512,
@@ -280,7 +306,6 @@ class TrainingCapture:
             "fp16",
             "fp8",
             "fp4",
-            "optimizer_cpu_offload",
             "use_megatron_fsdp",
             "use_torch_fsdp2",
             "overlap_param_gather",
@@ -297,10 +322,29 @@ class TrainingCapture:
         ):
             if getattr(args, name, None):
                 raise UnverifiedState(f"State adapter does not cover {name}")
-        precision_aware = self.args.optimizer_mode == "precision_aware_fp16"
+        hybrid = self.args.optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32")
+        precision_aware = self.args.optimizer_mode in (
+            "precision_aware_fp16",
+            "hybrid_precision_aware_fp32",
+        )
+        if bool(getattr(args, "optimizer_cpu_offload", False)) != hybrid:
+            raise UnverifiedState("Requested and actual optimizer offload modes disagree")
+        if hybrid and (
+            self.args.pipeline_size != 1
+            or self.args.virtual_pipeline_size != 1
+            or args.optimizer_offload_fraction != 0.5
+            or not args.overlap_cpu_optimizer_d2h_h2d
+            or not args.pin_cpu_grads
+            or not args.pin_cpu_params
+            or args.main_params_dtype != torch.float32
+            or args.main_grads_dtype != torch.float32
+            or args.exp_avg_dtype != torch.float32
+            or args.exp_avg_sq_dtype != torch.float32
+        ):
+            raise UnverifiedState("Unsupported hybrid optimizer recipe")
         if bool(getattr(args, "use_precision_aware_optimizer", False)) != precision_aware:
             raise UnverifiedState("Requested and actual optimizer modes disagree")
-        if precision_aware and (
+        if self.args.optimizer_mode == "precision_aware_fp16" and (
             self.args.pipeline_size != 1
             or self.args.virtual_pipeline_size != 1
             or args.main_params_dtype != torch.float32
@@ -470,6 +514,11 @@ class TrainingCapture:
         """Snapshot live state after updates and consumed-sample bookkeeping."""
         if self.provenance is None:
             raise UnverifiedState("State capture occurred before training initialization")
+        if self.args.optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32"):
+            # Check the native boundary before the existing capture barrier.
+            # A pending transfer is unsupported, not silently drained to pass.
+            for child in optimizer.chained_optimizers:
+                require_completed_hybrid_transfers(child.optimizer)
         torch.cuda.synchronize()
         args = self.training.get_args()
         chunks = self.training.unwrap_model(model)
@@ -657,7 +706,9 @@ def main() -> None:
     parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
-        "--optimizer-mode", choices=("standard", "precision_aware_fp16"), default="standard"
+        "--optimizer-mode",
+        choices=("standard", "precision_aware_fp16", "hybrid_fp32", "hybrid_precision_aware_fp32"),
+        default="standard",
     )
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
