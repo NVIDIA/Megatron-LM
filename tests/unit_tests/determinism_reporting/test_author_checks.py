@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tests.performance_tests.shell_test_utils.determinism.kernel_case import kernel_policy
 from tests.unit_tests.determinism.comparison import _as_bytes, bytes_equal
 from tests.unit_tests.determinism_reporting.test_coverage_evidence import shard
 from tools.check_kernel_determinism_coverage import load_manifest
@@ -235,7 +236,7 @@ def test_required_author_ids_match_the_gpu_parameter_matrix_and_gb200_selection(
         if isinstance(node, ast.FunctionDef) and node.name == "test_mlp_activation_author_evidence"
     )
     function.body = [ast.copy_location(ast.Pass(), function.body[0])]
-    namespace = {"pytest": pytest, "torch": torch}
+    namespace = {"pytest": pytest, "torch": torch, "kernel_policy": kernel_policy}
     exec(
         compile(ast.Module(body=[op_ids, function], type_ignores=[]), str(path), "exec"), namespace
     )

@@ -86,7 +86,15 @@ incremental onboarding, not an accuracy percentage for the repository.
 
 The first six required cases cover biased SwiGLU, weighted SwiGLU and weighted
 squared ReLU in BF16/FP32 with FP32 token weights, 4,096 tokens and FFN width
-8,192. They compare independent eager autograd outputs and every input gradient,
+8,192. The shared `tests/performance_tests/shell_test_utils/determinism/kernel_case.py`
+adapter generates native-dtype inputs from seed 1234 and uses all-ones upstream
+gradients, matching the timing driver. Author cases use strict Torch mode with
+warn-only disabled and restore prior settings after execution. A versioned
+`configuration.kernel_case` records the adapter source hash, exact input-byte
+fingerprints, complete positional arguments and actual GPU/software/runtime
+settings. Hashing occurs outside the timing intervals.
+
+The cases compare independent eager autograd outputs and every input gradient,
 including BF16-path weight gradients, and inject comparator errors. Replays run
 with side-stream contention. Candidate tolerances are `rtol=0.02, atol=0.001`
 for BF16 and `rtol=atol=1e-6` for FP32, taken from existing weighted-fusion tests.
@@ -95,8 +103,10 @@ BF16 rounding can differ from the fused implementation. A failed comparison
 therefore calls for an accuracy-contract review, not an automatic kernel-bug
 conclusion or tolerance increase. The first H100/GB200 run must validate these
 reference semantics, tolerances and runtime before landing the gate. CPU reporting
-checks establish none of those hardware results. Performance evidence joining
-and calibrated budgets remain separate follow-ups.
+checks establish none of those hardware results. The companion performance
+driver joins this contract to separate forward/backward timings from the same
+clean source revision. A matched report still needs calibrated budgets and GPU
+validation before it can establish acceptable production overhead.
 
 ## Running and reporting
 

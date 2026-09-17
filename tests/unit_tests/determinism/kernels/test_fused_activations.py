@@ -26,6 +26,11 @@ from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_r
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
+from tests.performance_tests.shell_test_utils.determinism.kernel_case import (
+    case_signature,
+    kernel_policy,
+    make_case,
+)
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
     _assert_replay_matches,
@@ -167,21 +172,15 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     ],
 )
 @pytest.mark.launch_on_gb200
+@kernel_policy(torch, True)
 def test_mlp_activation_author_evidence(case, dtype):
     """Check a wide reduction against eager autograd, including BF16 weight grads."""
-    seeded()
-    fn, inputs = GATED_CASES[case]()
-    # Weights intentionally remain FP32, matching the training and timing adapters.
-    inputs = tuple(
-        (
-            value.detach().to(dtype).requires_grad_(value.requires_grad)
-            if isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16
-            else value
-        )
-        for value in inputs
+    fn, inputs, _ = make_case(torch, case, TOKENS, FFN, dtype)
+    configuration = {"kernel_case": case_signature(torch, case, inputs)}
+    actual = assert_replays_bit_exact(
+        fn, inputs, replays=3, contention=True, what=case, configuration=configuration
     )
-    actual = assert_replays_bit_exact(fn, inputs, replays=3, contention=True, what=case)
-    signature = replay_signature(inputs, backward=True)
+    signature = replay_signature(inputs, backward=True, configuration=configuration)
     assert_replay_sensitivity(
         actual,
         lambda perturbed: _assert_replay_matches(2, *actual, *perturbed, what=case),

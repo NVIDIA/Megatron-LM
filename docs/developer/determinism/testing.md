@@ -152,7 +152,9 @@ See `test_mlp_activation_author_evidence` for the pilot implementation and
 
 PR evidence should link the reference/replay artifacts and separate, uninstrumented
 forward/backward timings, with the source revision, hardware, inputs, software
-versions, and deterministic/default settings. Performance evidence joining and
-calibrated hardware budgets are follow-up work; these accuracy checks impose no
-performance threshold. Investigate a reference or historical-golden mismatch
+versions, and deterministic/default settings. The performance driver can join
+these artifacts using the shared local-activation contract; missing/mismatched
+phases remain unverified and unbudgeted timing rows cannot give a performance
+pass. Calibrated hardware budgets and broad CI enforcement remain follow-up work;
+these accuracy checks impose no performance threshold. Investigate a reference or historical-golden mismatch
 before accepting a changed baseline, even when same-implementation replay passes.
