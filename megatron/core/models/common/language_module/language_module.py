@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -20,11 +19,10 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, set_attention_backend
 from megatron.core.utils import (
     get_pg_rank,
     get_tensor_model_parallel_group_if_none,
@@ -44,7 +42,7 @@ class LanguageModule(MegatronModule):
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
-        self._set_attention_backend()
+        set_attention_backend(self.config)
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -114,59 +112,6 @@ class LanguageModule(MegatronModule):
         return False
 
     # pylint: disable=line-too-long
-    def _set_attention_backend(self):
-        """Set attention backend
-
-        Transformer engine works based on optout. By default all three attention backend flags are set to 1. So if the user choses a particular attention backend we set the other two to 0. If the user choses local, we set all 3 TE env variables to 0.
-        """
-        if self.config.batch_invariant_mode:
-            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-                assert_te_supports_batch_invariant_attention,
-            )
-
-            assert_te_supports_batch_invariant_attention()
-
-        def check_and_set_env_variable(
-            env_variable_name: str, expected_value: int, attn_type: AttnBackend
-        ) -> None:
-            current_value = os.getenv(env_variable_name)
-            assert current_value is None or current_value == str(
-                expected_value
-            ), f'{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash/fused/unfused/auto/local). Default is auto.'
-            os.environ[env_variable_name] = str(expected_value)
-
-        if self.config.attention_backend == AttnBackend.local:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flash)
-        elif self.config.attention_backend == AttnBackend.flash:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flash)
-        elif self.config.attention_backend == AttnBackend.fused:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.fused)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.fused)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.fused)
-        elif self.config.attention_backend == AttnBackend.unfused:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.unfused)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.unfused)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.unfused)
-        elif self.config.attention_backend == AttnBackend.auto:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
-
-        # Pin the FlashAttention generation for TransformerEngine by disabling the
-        # other versions via NVTE_FLASH_ATTN_V2/V3/V4 (default 1). This keeps the
-        # training-side attention on the same kernel as the mcore inference path,
-        # which honors config.flash_attention_version directly.
-        if self.config.flash_attention_version is not None:
-            for version in (2, 3, 4):
-                if version != self.config.flash_attention_version:
-                    check_and_set_env_variable(
-                        f"NVTE_FLASH_ATTN_V{version}", 0, self.config.attention_backend
-                    )
-
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
 
