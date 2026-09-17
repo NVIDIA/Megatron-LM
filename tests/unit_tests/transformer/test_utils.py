@@ -57,6 +57,26 @@ def test_set_attention_backend_accepts_all_enums_and_string(backend, isolated_nv
     assert all(name not in os.environ for name in _NVTE_FLASH_VERSION_ENV_VARS)
 
 
+@pytest.mark.parametrize("backend_values", [None, ('1', '0', '1'), ('0', '1', '0')])
+@pytest.mark.parametrize("flash_version", [None, 3])
+def test_set_attention_backend_none_preserves_environment(
+    backend_values, flash_version, isolated_nvte_attention_env
+):
+    if backend_values is not None:
+        os.environ.update(zip(_NVTE_BACKEND_ENV_VARS, backend_values))
+    before = tuple(os.environ.get(name) for name in _NVTE_BACKEND_ENV_VARS)
+
+    set_attention_backend(
+        _attention_config(attention_backend=None, flash_attention_version=flash_version)
+    )
+
+    assert tuple(os.environ.get(name) for name in _NVTE_BACKEND_ENV_VARS) == before
+    if flash_version is None:
+        assert all(name not in os.environ for name in _NVTE_FLASH_VERSION_ENV_VARS)
+    else:
+        assert tuple(os.environ[name] for name in _NVTE_FLASH_VERSION_ENV_VARS) == ('0', '1', '0')
+
+
 def test_set_attention_backend_rejects_process_wide_conflicts(isolated_nvte_attention_env):
     set_attention_backend(
         _attention_config(attention_backend=AttnBackend.flash, flash_attention_version=3)
