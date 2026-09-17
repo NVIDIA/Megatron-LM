@@ -301,24 +301,38 @@ def test_identity_without_image_diagnostics_preserves_usable_cache(
 
 
 @pytest.mark.parametrize(
-    "mode,publication,expected",
+    "mode,publication,main_conclusion,main_exit_code,expected_success,expected_exit_code",
     [
-        ("baseline", "failure", "false"),
-        ("baseline", "skipped", "false"),
-        ("baseline", "success", "true"),
-        ("enforce", "skipped", "true"),
+        ("baseline", "failure", "success", "0", "false", "Testmon cache publication failed"),
+        ("baseline", "skipped", "success", "0", "false", "Testmon cache publication failed"),
+        ("baseline", "success", "success", "0", "true", "0"),
+        ("enforce", "skipped", "success", "0", "true", "0"),
+        ("baseline", "skipped", "failure", "1", "false", "1"),
+        ("baseline", "skipped", "failure", "", "false", "failure"),
+        ("baseline", "skipped", "cancelled", "", "false", "cancelled"),
+        ("baseline", "skipped", "skipped", "", "false", "skipped"),
     ],
 )
-def test_producer_result_requires_cache_publication(mode, publication, expected):
+def test_producer_result_preserves_test_failures_and_requires_cache_publication(
+    mode, publication, main_conclusion, main_exit_code, expected_success, expected_exit_code
+):
     script = _action_script("Check result")
     script = script[script.index('EXIT_CODE="${MAIN_EXIT_CODE') :]
     script = script.split('if [[ "$IS_SUCCESS" == "false"', 1)[0]
     result = subprocess.run(
-        ["bash", "-e", "-u", "-o", "pipefail", "-c", script + 'printf "%s" "$IS_SUCCESS"'],
+        [
+            "bash",
+            "-e",
+            "-u",
+            "-o",
+            "pipefail",
+            "-c",
+            script + 'printf "%s\\n%s\\n" "$IS_SUCCESS" "$EXIT_CODE"',
+        ],
         env={
             **os.environ,
-            "MAIN_EXIT_CODE": "0",
-            "MAIN_CONCLUSION": "success",
+            "MAIN_EXIT_CODE": main_exit_code,
+            "MAIN_CONCLUSION": main_conclusion,
             "TESTMON_MODE": mode,
             "CACHE_PUBLICATION": publication,
         },
@@ -326,7 +340,7 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         text=True,
         check=True,
     )
-    assert result.stdout == expected
+    assert result.stdout.splitlines() == [expected_success, expected_exit_code]
 
 
 @pytest.mark.parametrize(

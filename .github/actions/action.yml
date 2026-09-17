@@ -412,7 +412,8 @@ runs:
         else
           IS_SUCCESS=false
         fi
-        if [[ "$TESTMON_MODE" == "baseline" && "$CACHE_PUBLICATION" != "success" ]]; then
+        if [[ "$MAIN_CONCLUSION" == "success" && "$TESTMON_MODE" == "baseline" \
+          && "$CACHE_PUBLICATION" != "success" ]]; then
           IS_SUCCESS=false
           EXIT_CODE="Testmon cache publication failed"
         fi
