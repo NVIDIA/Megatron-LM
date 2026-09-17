@@ -607,7 +607,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_batch=cp_batch,
             )
             if mtp_inputs.decoder_input is None:
-                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None
+                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
+                    "MTP requires both input_ids and position_ids when precomputed "
+                    "decoder_input embeddings are not provided."
+                )
             mtp_hidden_states = self.mtp(
                 input_ids=mtp_inputs.input_ids,
                 position_ids=mtp_inputs.position_ids,
