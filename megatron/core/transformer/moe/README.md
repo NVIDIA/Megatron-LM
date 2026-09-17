@@ -309,7 +309,85 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **HybridEP with virtual-expert load balancing** | Balances overloaded experts with runtime virtual-expert slots and asynchronously transfers only selected weights/gradients | Fixed-shape NVLink HybridEP training | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep --moe-virtual-expert-load-balance` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+
+Virtual-expert load balancing requires fixed local token counts across its EP group, per-expert
+`weight0..weightN` parameters in BF16 or native MXFP8 storage, grouped GEMM with the Transformer
+Engine op fuser, and FP32 router probabilities. If `moe_expert_rank_capacity_factor` is omitted,
+it defaults to `1.0` for this mode. It retains the standard HybridEP activation semantics while
+using a deterministic planner to map routes to native or virtual-expert slots; virtual-expert slots are
+populated asynchronously from the optimizer-owned weights and reduced back into their owners
+after expert backward. Virtual-expert gradients use FP32 transport and storage by default. With
+`--grad-reduce-in-bf16`, they remain BF16 in their symmetric-memory transport arena, are summed
+with the owner's BF16 gradient locally in FP32, and are downcast to BF16 once. To retain FP32
+accumulation in subsequent reductions, also enable
+`--ddp-reduce-scatter-with-fp32-accumulation` and, when expert GTP is enabled,
+`--gtp-remat-reduce-scatter-with-fp32-accumulation`.
+
+Each layer fixes its local token count on its first forward and rejects later changes.
+The planner specializes on that count, and the layer sizes its transport capacity once.
+
+Virtual-expert load balancing supports EP sizes 2–64, up to 8,192 experts evenly divided
+across EP ranks, and top-k from 1 to min(32, number of experts). It does not support
+Sinkhorn routing, DeepSeek-style expert bias (`--moe-router-enable-expert-bias`), or
+full/whole-MoE recomputation. `TransformerConfig` validates these restrictions, the expert
+layout, and the dispatcher SM budget at construction; the load-balancer initializer checks
+the actual process-group layout before allocating resources.
+
+Virtual experts require HybridEP's compact `topk_idx` API alongside dense probabilities;
+the fused TE router must expose its `topk_indices` output buffer. Ordinary HybridEP retains
+its older-build compatibility. Supported routing includes FP32 sigmoid scores, fusion,
+`seq_aux_loss` and quantile balancing with its own bias update. To use `micro_batch` quantile balancing,
+set `--moe-router-load-balancing-type quantile_balancing --moe-aux-loss-coeff 0`, omit
+`--moe-router-enable-expert-bias` and `--moe-router-fusion`, and disable
+`--moe-router-force-load-balancing` for real routing. QB uses its existing unfused scorer and dual
+update; virtual experts only change the routing output format. QB requires token-count × top-k
+divisible by the number of experts and does not support padding masks or group-limited routing.
+
+With expert GTP, virtual experts request GTP's persistent wgrad rings automatically during eager
+training. Eager execution and CUDA graphs share the ring allocator and reduce-scatter storage.
+Same-shaped layers share two buffers per FC role and local expert, guarded by the
+previous reduce-scatter's completion. Gradient targets bind before the backward GEMMs; their
+pointer tables are created at the first reduction and reused without CPU-to-GPU pointer updates.
+Without GTP, native weights alias model storage. DDP natives accumulate directly into their
+stable `main_grad` buffers, where the reduction also adds remote partials. Virtual gradient slots
+are cleared before each backward because TE uses one accumulation flag for all grouped experts.
+Callers without persistent main gradients, or with overwrite semantics, retain fixed staging.
+With GTP, weight push peeks at the actual gather: it launches a missing gather, drains one in
+flight, or waits on an already-ready gather's completion event. It then binds the runtime
+parameters to the returned buffers. The GEMM consumes those same buffers and advances prefetch.
+Forward and backward keep separate pointer tables, including BF16. GTP's first consume may change
+its forward ticket while building the chain, so the bridge discards that startup table and binds
+again on the next push. Once the deterministic host schedule is established, table lookups check
+fixed addresses and reuse the existing device tables without uploads. Virtual slots use the
+shared symmetric weight and gradient arenas.
+
+Each MoE layer has one runtime owner for both FC layers' native parameters, runtime weights,
+GTP bindings and pointer tables. A shared storage object owns the arenas, NCCL registrations and
+virtual slot parameters for each compatible storage layout, allocated during late initialization.
+Layers share an EP topology; their precision, member shapes, gradient dtype, GTP layout and
+accumulation mode determine which storage they reuse. This allows MXFP8 main experts and BF16 MTP experts in the same model.
+BF16 precision overrides retain the unfused activation and recomputation path, with runtime weights
+attached to grouped linears that enter each original linear's precision context. Virtual parameters
+remain outside the model's optimizer and checkpoint parameter sets. Finalization releases every
+layout's shared slots and registrations before the EP process group is destroyed.
+
+Runtime parameters receive fused wgrad writes through `main_grad` without allocating dummy leaf
+gradients; the semantic parameters retain their normal DDP gradient hooks.
+
+The planner uses one fused cooperative launch with a fixed 32-block grid. Contiguous 512-route tiles
+avoid padding top-k to a power of two. It sorts tiles by expert and original position and scans the
+sorted runs to recover stable route ordinals, preserving placement tie breaks and token order.
+Binary search over cumulative allocations selects the destination rank for each route.
+Up to 32 blocks exchange histograms and place experts, handling two ranks each at EP64.
+EP sizes up to 64 are supported independently of the fixed planner grid. There are no separate
+planner configuration arguments.
+
+Planning always runs on its side stream, after waiting for the router's indices. Weight prefetch
+and dispatch wait for the completed plan, allowing independent shared-expert or paired-attention
+computation to overlap it. Stream recording protects tensors across these handoffs. CUDA graph
+capture records the same stream fork and consumer joins.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.

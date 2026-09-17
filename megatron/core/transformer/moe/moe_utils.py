@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
 )
 from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
+from megatron.core.transformer.moe.fused_a2a import hybrid_ep_dense_topk_routing
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -835,7 +836,12 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        return fused_topk_with_score_function(
+        index_output = {}
+        if dense_output:
+            index_output["topk_indices"] = torch.empty(
+                (num_tokens, topk), dtype=torch.int64, device=logits.device
+            )
+        probs, routing_map = fused_topk_with_score_function(
             logits=logits,
             topk=topk,
             use_pre_softmax=use_pre_softmax,
@@ -844,7 +850,11 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
+            **index_output,
         )
+        if dense_output:
+            probs = probs.gather(1, routing_map)
+        return probs, routing_map
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -937,7 +947,15 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
+    return dense_routing_from_topk(logits, top_indices, probs)
 
+
+def dense_routing_from_topk(
+    logits: torch.Tensor, top_indices: torch.Tensor, probs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Scatter ``[num_tokens, topk]`` probabilities and expert ids into the dense
+    ``[num_tokens, num_experts]`` routing probabilities and bool routing map."""
+    num_tokens = logits.shape[0]
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
         routing_probs = torch.zeros_like(logits)
@@ -955,6 +973,39 @@ def topk_routing_with_score_function(
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     return routing_probs, routing_map
+
+
+def uses_compact_routes(config) -> bool:
+    """Whether the router hands the token dispatcher its compact ``[num_tokens, topk]`` expert ids
+    and probabilities instead of the dense ``[num_tokens, num_experts]`` map and probabilities.
+
+    Ordinary HybridEP keeps its dense format when compact routing is unsupported, or with fused
+    or Sinkhorn routing, expert bias, token dropping, capacity/uneven padding and expert TP.
+    Virtual-expert planning requires compact support for both native and virtual slots, and uses TE's newer
+    index-output API for fused top-k routing.
+    """
+    if config.moe_virtual_expert_load_balance:
+        assert hybrid_ep_dense_topk_routing(
+            2 * config.num_moe_experts,
+            2 * config.num_moe_experts // config.expert_model_parallel_size,
+        ), "Virtual experts require HybridEP's compact top-k routing API for their runtime experts."
+        return True
+    routing_types = config.moe_router_load_balancing_type
+    if isinstance(routing_types, str):
+        routing_types = [routing_types]
+    return (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+        and not config.moe_router_fusion
+        and not config.moe_router_enable_expert_bias
+        and "sinkhorn" not in routing_types
+        and config.moe_expert_capacity_factor is None
+        and config.expert_tensor_parallel_size == 1
+        and not config.moe_hybridep_pad_uneven_dispatch_inputs
+        and hybrid_ep_dense_topk_routing(
+            config.num_moe_experts, config.num_moe_experts // config.expert_model_parallel_size
+        )
+    )
 
 
 def compute_routing_scores_for_aux_loss(

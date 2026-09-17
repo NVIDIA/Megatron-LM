@@ -15,7 +15,7 @@ import logging
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Self
 
 import torch
 
@@ -76,6 +76,21 @@ class GraphWgradRingSlot:
     ready_event: torch.cuda.Event
     key: tuple
     index: int
+
+    @classmethod
+    def allocate(cls, param, *, key: tuple, index: int = 0) -> Self:
+        """Allocate padded persistent storage; the caller records its initial ready event."""
+        symm = is_gtp_symm_pool_registered(param.group)
+        with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
+            tensor = torch.empty(
+                param._unsharded_shape_padded,
+                dtype=param.main_grad.dtype,
+                device=param.device,
+                memory_format=torch.contiguous_format,
+            )
+        if param.pad_length > 0:
+            tensor.narrow(0, param._unsharded_shape[0], param.pad_length).zero_()
+        return cls(tensor=tensor, ready_event=torch.cuda.Event(external=True), key=key, index=index)
 
 
 @dataclass
@@ -274,26 +289,11 @@ def allocate_graph_wgrad_rings(
             "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
             "every param sharing a ring key must share its process group"
         )
-        symm = is_gtp_symm_pool_registered(exemplar.group)
         for slot_index in range(slot_count):
-            with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
-                tensor = torch.empty(
-                    exemplar._unsharded_shape_padded,
-                    dtype=exemplar.main_grad.dtype,
-                    device=exemplar.device,
-                    memory_format=torch.contiguous_format,
-                )
-            if exemplar.pad_length > 0:
-                tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
-            slot = GraphWgradRingSlot(
-                tensor=tensor,
-                ready_event=torch.cuda.Event(external=True),
-                key=key,
-                index=slot_index,
-            )
+            slot = GraphWgradRingSlot.allocate(exemplar, key=key, index=slot_index)
             slots.append(slot)
             new_slots.append(slot)
-            total_bytes += tensor.numel() * tensor.element_size()
+            total_bytes += slot.tensor.numel() * slot.tensor.element_size()
             buffer_count += 1
 
         _GRAPH_WGRAD_RINGS[key] = slots
