@@ -24,7 +24,9 @@ JSON_SAFE_LOGPROB_FLOOR = -9999.0
 
 def json_safe_logprob(logprob: float) -> float:
     """Clamp one logprob to a finite, JSON-representable value."""
-    return logprob if math.isfinite(logprob) else JSON_SAFE_LOGPROB_FLOOR
+    if math.isfinite(logprob):
+        return logprob
+    return JSON_SAFE_LOGPROB_FLOOR
 
 
 def json_safe_logprobs(logprobs: Iterable[float]) -> list[float]:
