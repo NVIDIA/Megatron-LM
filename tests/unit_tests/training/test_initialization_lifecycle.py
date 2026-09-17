@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Tests for config construction before training runtime initialization."""
 
 from argparse import ArgumentParser, Namespace
