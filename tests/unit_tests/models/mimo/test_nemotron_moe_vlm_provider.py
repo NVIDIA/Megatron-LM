@@ -19,6 +19,7 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 )
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.args import add_hetero_grid_args
+from megatron.core.transformer.enums import AttnBackend
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
@@ -91,6 +92,17 @@ def test_freeze_flags_drive_tower_freezing():
     assert args.freeze_vit is True
     assert args.freeze_lm is True
     assert args.freeze_projection is False
+
+
+@pytest.mark.parametrize("backend", [None, *AttnBackend])
+def test_vision_encoder_attention_backend_arg_uses_full_enum(backend):
+    argv = ["--model-provider", NEMOTRON_MODEL_PROVIDER]
+    if backend is not None:
+        argv.extend(["--mimo-vision-encoder-attention-backend", backend.name])
+
+    args = _parse(argv)
+
+    assert args.mimo_vision_encoder_attention_backend is backend
 
 
 # --- Config parity gate (requires torch; runs in CI) ----------------------
@@ -312,6 +324,37 @@ def test_vision_submodules_spec_wires_radio_encoder():
     assert projection.params["projector_type"] == "affine"
     assert projection.params["input_size"] == encoder.params["transformer_config"].hidden_size * 4
     assert projection.params["config"].ffn_hidden_size == projection.params["input_size"] * 4
+
+
+@pytest.mark.parametrize(
+    ("encoder_args", "expected_backend", "expected_flash_version"),
+    [
+        ([], AttnBackend.flash, 2),
+        (["--mimo-vision-encoder-attention-backend", "fused"], AttnBackend.fused, 2),
+        (
+            [
+                "--mimo-vision-encoder-attention-backend",
+                "flash",
+                "--mimo-vision-encoder-flash-attention-version",
+                "4",
+            ],
+            AttnBackend.flash,
+            4,
+        ),
+    ],
+)
+def test_vision_attention_backend_overrides(encoder_args, expected_backend, expected_flash_version):
+    """Encoder settings inherit global values unless explicitly overridden."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import vision_submodules_spec
+
+    argv = _build_argv(*_PRESET_20L)
+    argv.extend(["--flash-attention-version", "2", *encoder_args])
+    args = _parse_validate(argv)
+    spec = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+    config = spec.submodules["encoders"][RADIO_ENCODER_MODULE_NAME].params["transformer_config"]
+
+    assert config.attention_backend is expected_backend
+    assert config.flash_attention_version == expected_flash_version
 
 
 @pytest.mark.parametrize(
