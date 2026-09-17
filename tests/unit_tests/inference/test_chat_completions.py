@@ -17,6 +17,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _extract_media_url_bytes,
     _has_previous_turn_tokens,
     _last_assistant_message,
+    _replace_prefix_tokens,
     _replace_prefix_tokens_metadata,
     _sanitize_messages_for_template,
     _tokenize_with_media_slots_sync,
@@ -284,3 +285,29 @@ async def test_n_choices_prepare_and_serialize_shared_media_once():
     assert all(wire == client.serialized_media[0] for wire in client.serialized_media)
     assert all(wire is not client.serialized_media[0] for wire in client.serialized_media[1:])
     assert compute_key.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("prior", "rerender", "render", "expected"),
+    [
+        # EOS = 2. The re-render kept turn 1's reasoning block (50, 51, 52); the render dropped it
+        # and appended the user turn (21, 22, 2). A positional scan would cut at that turn's EOS.
+        (
+            [11, 12, 13, 2, 40, 41, 50, 51, 52, 220, 17, 2],
+            [11, 12, 13, 2, 40, 41, 50, 51, 52, 1001, 2],
+            [11, 12, 13, 2, 40, 41, 1001, 2, 21, 22, 2, 40, 41],
+            [11, 12, 13, 2, 40, 41, 50, 51, 52, 220, 17, 2, 21, 22, 2, 40, 41],
+        ),
+        # The boundary EOS comes from the render whether or not the prior generation ended on one.
+        ([7, 8, 2], [1, 2], [1, 2, 5], [7, 8, 2, 5]),
+        ([7, 8], [1, 2], [1, 2, 5], [7, 8, 2, 5]),
+        ([7, 8, 2], [1, 2, 3, 2], [1, 2, 3], "EOS #2 not found"),
+    ],
+    ids=["history_stripped", "prior_with_eos", "prior_without_eos", "eos_missing"],
+)
+def test_replace_prefix_tokens_cuts_at_the_nth_eos(prior, rerender, render, expected):
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            _replace_prefix_tokens(2, prior, rerender, render)
+    else:
+        assert _replace_prefix_tokens(2, prior, rerender, render) == expected

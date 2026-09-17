@@ -573,7 +573,7 @@ def _sanitize_chat_template_kwargs(raw_kwargs):
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
-    retokeenized_previous_turn_token_ids,
+    retokenized_previous_turn_token_ids,
     current_turn_token_ids,
 ):
     """Replace the token ids that are associated with the previous turn with the actual tokens
@@ -583,20 +583,20 @@ def _replace_prefix_tokens(
     if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
-    # Find the last EOS token id in the previous turn token ids
-    last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    # Note that the current conversation stat may be shorter than the previous conversation state.
-    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
-    for i in reversed(range(scan_len)):
-        if current_turn_token_ids[i] == eos_token_id:
-            last_eos_token_id_index = i
-            break
+    eos_count_needed = retokenized_previous_turn_token_ids.count(eos_token_id)
+    eos_count_seen = 0
+    for boundary_index, token_id in enumerate(current_turn_token_ids):
+        if token_id == eos_token_id:
+            eos_count_seen += 1
+            if eos_count_seen == eos_count_needed:
+                break
+    else:
+        raise ValueError(
+            f"prefix stitching: EOS #{eos_count_needed} not found (found {eos_count_seen})"
+        )
 
-    # Replace the current turn token ids with the tokens from the previous generation
-    current_turn_additional_token_ids = current_turn_token_ids[last_eos_token_id_index:]
-
-    # Return the previous turn token ids + the current turn token ids
-    return previous_turn_token_ids + current_turn_additional_token_ids
+    # Return the previous turn token ids + the current turn token ids from the boundary onward
+    return previous_turn_token_ids + current_turn_token_ids[boundary_index:]
 
 
 def _has_previous_turn_tokens(last_assistant_message):
