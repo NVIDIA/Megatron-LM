@@ -298,10 +298,28 @@ def _has_nccl_m2n_python_package() -> bool:
         return False
 
 
+@pytest.fixture
+def nccl_m2n_host_proxy(monkeypatch: pytest.MonkeyPatch):
+    """Use host-proxy GIN for native M2N correctness tests on Blackwell.
+
+    The dedicated GB200 CI bucket gives these tests a fresh process before NCCL
+    initializes. Monkeypatch restores the environment after each test, but NCCL
+    caches its transport settings, so process isolation is still required.
+    """
+    if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
+        pytest.skip("Native NCCL M2N coverage runs on the Blackwell CI lane")
+
+    monkeypatch.setenv("NCCL_GIN_TYPE", "2")
+    monkeypatch.setenv("NCCL_NET_PLUGIN", "none")
+    monkeypatch.setenv("NCCL_GIN_PLUGIN", "none")
+    monkeypatch.setenv("NCCL_RMA_PLUGIN", "none")
+
+
 @pytest.mark.skipif(
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
+@pytest.mark.usefixtures("nccl_m2n_host_proxy")
 @pytest.mark.launch_on_gb200
 def test_nccl_m2n_reshards_parameter_between_tensor_dimensions(monkeypatch: pytest.MonkeyPatch):
     """Exercise packed TP shard-to-shard M2N transfer on GPUs."""
@@ -383,6 +401,7 @@ def test_nccl_m2n_reshards_parameter_between_tensor_dimensions(monkeypatch: pyte
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
 @pytest.mark.parametrize("grouped_gemm_backend", ["torch", "vllm", "flashinfer"])
+@pytest.mark.usefixtures("nccl_m2n_host_proxy")
 @pytest.mark.launch_on_gb200
 def test_nccl_m2n_refits_selective_mxfp8_from_te(
     grouped_gemm_backend: str, monkeypatch: pytest.MonkeyPatch

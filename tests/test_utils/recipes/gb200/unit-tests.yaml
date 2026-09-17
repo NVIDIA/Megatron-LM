@@ -46,15 +46,6 @@ spec:
     UNIT_TEST_REPEAT={n_repeat}
     export GPUS_PER_NODE={gpus}
 
-    # Keep the M2N transport override in a separate process because NCCL caches
-    # its environment settings. Other GB200 tests retain their default backend.
-    if [[ "$BUCKET" == "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py" ]]; then
-        export NCCL_GIN_TYPE=2
-        export NCCL_NET_PLUGIN=none
-        export NCCL_GIN_PLUGIN=none
-        export NCCL_RMA_PLUGIN=none
-    fi
-
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
     else
@@ -79,6 +70,7 @@ spec:
 
 # GB200 selection is marker-driven. find_test_cases.py excludes the dedicated
 # M2N bucket from the catch-all bucket, so each marked test runs only once.
+# Keep M2N in a separate process: NCCL caches the test fixture's transport settings.
 products:
   - test_case: [tests/unit_tests/**/*.py]
     products:
