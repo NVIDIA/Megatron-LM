@@ -2,7 +2,7 @@
 
 import asyncio
 import gc
-from collections import deque
+from collections import Counter, deque
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
@@ -41,6 +42,25 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.fixture
+def bugfix_hits(monkeypatch):
+    """Witness probe placement while retaining the configured real reporter."""
+    counts = Counter()
+
+    def record(name):
+        counts[name] += 1
+        record_bugfix(name)
+
+    for module in (
+        "contexts.dynamic_context",
+        "contexts.mamba_slot_allocator",
+        "inference_request",
+        "engines.dynamic_engine",
+    ):
+        monkeypatch.setattr(f"megatron.core.inference.{module}.record_bugfix", record)
+    return counts
 
 
 class PrefixCachingTestBase:
@@ -556,7 +576,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.kv_hash_to_block_id[h1] == s1
 
     @pytest.mark.internal
-    def test_failed_partial_hit_admission_rolls_back_and_retries(self):
+    def test_failed_partial_hit_admission_rolls_back_and_retries(self, bugfix_hits):
         """A failed allocation must not pin or double-count a matched prefix."""
         ctx = self._ctx()
         alloc = ctx.kv_block_allocator
@@ -579,8 +599,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         follower = self._req(ctx, self._prompt(3 * bs), request_id=2)
         hits_before = ctx.prefix_cache_hits
         blocks_before = ctx.prefix_cache_blocks_matched
+        assert bugfix_hits["prefix_cache.failed_admission_accounting"] == 0
         with pytest.raises(BlockOverflowError):
             ctx.add_request(follower)
+        assert bugfix_hits["prefix_cache.failed_admission_accounting"] == 1
 
         assert ctx.total_request_count == 0
         assert follower.num_cached_tokens == 0
@@ -601,6 +623,12 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert ctx.prefix_cache_blocks_matched == blocks_before + 2
         assert self._block_ids(ctx, 0, 2) == matched_blocks
         assert len(set(self._block_ids(ctx, 0, 3))) == 3
+        assert bugfix_hits["prefix_cache.failed_admission_accounting"] == 1
+        assert bugfix_hits["prefix_cache.cached_tokens_backoff"] == 0
+        unmatched = self._req(ctx, self._prompt(3 * bs) + 100, request_id=3)
+        with pytest.raises(BlockOverflowError):
+            ctx.add_request(unmatched)
+        assert bugfix_hits["prefix_cache.failed_admission_accounting"] == 1
 
     @pytest.mark.internal
     def test_check_availability_excludes_already_pinned_matches(self):
@@ -1053,7 +1081,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
 
     @pytest.mark.internal
-    def test_mamba_prefill_skip_and_zero_prefill(self):
+    def test_mamba_prefill_skip_and_zero_prefill(self, bugfix_hits):
         # mamba match limits prefill skip
         ctx = self._mctx()
         bs = ctx.block_size_tokens
@@ -1061,6 +1089,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         msa = ctx.mamba_slot_allocator
         prompt = self._prompt(bs * 3)
         ctx.add_request(self._req(ctx, prompt.clone()))
+        assert bugfix_hits["prefix_cache.cached_tokens_backoff"] == 0
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
@@ -1070,6 +1099,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert req2.num_cached_tokens == prefix_skip
         assert ctx.prefix_cache_hits == 1
         assert ctx.prefix_cache_blocks_matched == 3
+        assert bugfix_hits["prefix_cache.cached_tokens_backoff"] == 1
 
         # no mamba match means no skip
         ctx2 = self._mctx()
@@ -1093,6 +1123,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert req3.num_cached_tokens == ps3
         assert ctx3.prefix_cache_hits == 1
         assert ctx3.prefix_cache_blocks_matched == 3
+        assert bugfix_hits["prefix_cache.cached_tokens_backoff"] == 2
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
         # are skipped and only the trailing tokens remain for prefill.
@@ -1106,6 +1137,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         m4, _, _, _, ps4, ec4 = ctx4._compute_prefix_match(req4b, len(p4))
         assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
+        assert bugfix_hits["prefix_cache.cached_tokens_backoff"] == 2
 
         # KV eviction invalidates mamba
         ctx5 = self._mctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
@@ -1978,7 +2010,10 @@ class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
     @pytest.mark.internal
-    def test_finished_checkpointed_request_reconstructs_full_routing(self):
+    @pytest.mark.parametrize("checkpointed", [False, True])
+    def test_finished_checkpointed_request_reconstructs_full_routing(
+        self, bugfix_hits, checkpointed
+    ):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         generated = [bs + 1, bs + 2, bs + 3, bs + 4]
@@ -2003,11 +2038,12 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         future = engine._add_request(request)
         engine.waiting_request_ids.clear()
         record = engine.requests[request.request_id].record
-        record.checkpoint()
+        if checkpointed:
+            record.checkpoint()
         current = record[-1]
         current.generated_tokens = generated[:3]
         current.generated_log_probs = [-0.1, -0.2, -0.3]
-        assert len(record.requests) == 2
+        assert len(record.requests) == (2 if checkpointed else 1)
         assert all(part.routing_indices is None for part in record.requests)
 
         block_ids = self._block_ids(ctx, 1, 2)
@@ -2048,6 +2084,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         assert merged.routing_indices.shape[0] == (
             len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
         )
+        assert bugfix_hits["prefix_cache.checkpoint_routing"] == int(checkpointed)
 
     @pytest.mark.internal
     def test_store_and_get_block_routing(self):
@@ -2383,7 +2420,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    def test_mamba_aligned_chunk_endpoint_commits_and_restores(self):
+    def test_mamba_aligned_chunk_endpoint_commits_and_restores(self, bugfix_hits):
         # A block boundary exactly at a non-final chunk end is not an extractable
         # interior offset. Commit it from the live state, then prove that a
         # matching request skips to and restores that exact boundary.
@@ -2399,6 +2436,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         ctx.add_request(seed)
         msa = ctx.mamba_slot_allocator
 
+        assert bugfix_hits["prefix_cache.mamba_aligned_chunk_endpoint"] == 0
         seed.finished_chunk_token_count = bs
         msa.compute_and_store_offsets(
             seed,
@@ -2410,6 +2448,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
             overall_required_blocks=ctx.request_kv_block_counts[0].item(),
         )
         seed.finished_chunk_token_count = 0
+        assert bugfix_hits["prefix_cache.mamba_aligned_chunk_endpoint"] == 1
 
         endpoint_block = ctx.request_to_kv_block_ids[0][1].item()
         assert msa._intermediate_counts_cpu[0].item() == 0
@@ -2437,6 +2476,33 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         follower_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
         assert torch.all(ctx.mamba_conv_states[:, follower_mamba_idx] == 17)
         assert torch.all(ctx.mamba_ssm_states[:, follower_mamba_idx] == 23)
+        assert bugfix_hits["prefix_cache.mamba_aligned_chunk_endpoint"] == 1
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("boundary", ["final", "unaligned", "no_hashes"])
+    def test_mamba_endpoint_probe_ignores_other_boundaries(self, bugfix_hits, boundary):
+        ctx = self._ctx(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        bs = ctx.block_size_tokens
+        seed = self._req(ctx, self._prompt(2 * bs))
+        ctx.add_request(seed)
+        if boundary == "no_hashes":
+            seed.precomputed_block_hashes = []
+        chunk_length = {"final": 2 * bs, "unaligned": bs - 1, "no_hashes": bs}[boundary]
+        ctx.mamba_slot_allocator.compute_and_store_offsets(
+            seed,
+            current_id=0,
+            skip_tokens=0,
+            prefill_chunk_length=chunk_length,
+            num_matched_blocks=0,
+            matched_block_ids=[],
+            overall_required_blocks=ctx.request_kv_block_counts[0].item(),
+        )
+        assert bugfix_hits["prefix_cache.mamba_aligned_chunk_endpoint"] == 0
 
 
 PREFIX_CACHE_CONTEXT_CASES = [

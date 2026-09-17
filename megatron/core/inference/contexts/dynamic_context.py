@@ -17,6 +17,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
+from megatron.core.inference.bugfix_stats import record_bugfix
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -3394,6 +3395,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # the matched blocks (which would make them permanently unevictable).
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
+                    record_bugfix("prefix_cache.failed_admission_accounting")
                 raise BlockOverflowError(req.request_id)
 
         # Track prefix cache hits only after allocation succeeds. Matched blocks
@@ -3403,6 +3405,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
             req.num_cached_tokens += prefix_skip_tokens
+            if prefix_skip_tokens != num_matched_blocks * self.block_size_tokens:
+                record_bugfix("prefix_cache.cached_tokens_backoff")
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
