@@ -387,6 +387,7 @@ class TestStreamwiseSigmoidWideResidualConnection:
             assert not parameter.tensor_model_parallel
             assert parameter.sequence_parallel == sequence_parallel
             assert parameter.average_gradients_across_tp_domain is not sequence_parallel
+        assert connection.retention.retention_logit.is_wide_residual_retention_parameter
 
     def test_nested_module_hooks_run_before_controller_access(self):
         config = _wide_config(learned_retention=True)
