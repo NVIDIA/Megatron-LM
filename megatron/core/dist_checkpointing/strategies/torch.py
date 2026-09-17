@@ -37,6 +37,7 @@ from torch.distributed.checkpoint import (
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
+from torch.distributed.checkpoint.planner import WriteItemType
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from ..core import CheckpointingException
@@ -474,7 +475,20 @@ class MCoreSavePlanner(DefaultSavePlanner):
         return local_plan
 
     def transform_object(self, write_item: WriteItem, object: Any):
-        """Make no transformations - bytes objects are already serialized."""
+        """Make no transformations - bytes objects are already serialized.
+
+        For tensor writes, dequantize GPU quantized tensors (e.g. TE's MXFP8Tensor)
+        before handing them to the storage writer. Writing them in quantized form
+        causes infinite recursion in TE's `__torch_dispatch__` when the checkpoint
+        is later read back and the quantized tensor is copied into.
+        """
+        if (
+            write_item.type != WriteItemType.BYTE_IO
+            and isinstance(object, torch.Tensor)
+            and object.device.type == "cuda"
+            and "dequantize" in type(object).__dict__
+        ):
+            object = object.dequantize()
         return object
 
 
