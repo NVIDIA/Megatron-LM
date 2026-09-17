@@ -94,16 +94,39 @@ warn-only disabled and restore prior settings after execution. A versioned
 fingerprints, complete positional arguments and actual GPU/software/runtime
 settings. Hashing occurs outside the timing intervals.
 
-The cases compare independent eager autograd outputs and every input gradient,
-including BF16-path weight gradients, and inject comparator errors. Replays run
-with side-stream contention. Candidate tolerances are `rtol=0.02, atol=0.001`
-for BF16 and `rtol=atol=1e-6` for FP32, taken from existing weighted-fusion tests.
-The FP32 eager reference rounds outputs back to the input dtype; intermediate
-BF16 rounding can differ from the fused implementation. A failed comparison
-therefore calls for an accuracy-contract review, not an automatic kernel-bug
-conclusion or tolerance increase. The first H100/GB200 run must validate these
-reference semantics, tolerances and runtime before landing the gate. CPU reporting
-checks establish none of those hardware results. The companion performance
+The cases compare independent **FP64 eager autograd** outputs and every input
+gradient and inject both numerical and byte-comparator errors. Replays run with
+side-stream contention. Pointwise tolerances remain `rtol=0.02, atol=0.001` for
+BF16 and `rtol=atol=1e-6` for FP32, taken from existing weighted-fusion tests.
+The versioned `eager_fp64_autograd_staged_reductions:v2` reference explicitly
+rounds the per-token bias gradient to the input dtype **before** summation,
+matching the custom backward's interface. The report also retains errors against
+the ideal FP64 mathematical gradient; staging does not erase those differences.
+
+Reduction gradients require **both** a per-component bound and an L2 guard.
+For `n` independent terms, let `S = sum(abs(term))`, inflated for FP64 summation
+rounding, and `E = n*atol + rtol*S`. The component budget is
+`B = E + gamma32(n-1)*(S+E) + gamma64(n-1)*S`, plus
+`eps(output_dtype)*(abs(FP64_sum)+B)` for final casts, where
+`gamma(k)=k*u/(1-k*u)` and `u=eps/2`. This uses the conservative summation bound
+without assuming a compiler reduction tree; see
+[Higham's summation analysis, equation 2.6](https://nhigham.com/wp-content/uploads/2023/10/high93s.pdf).
+The additional guard requires
+`norm(actual-reference) <= atol*sqrt(component_count) + rtol*norm(reference)`.
+It retains the original tolerances and rejects systematic drift that the
+conservative component budget could admit. The report records term counts,
+precision, rounding, conditioning, component violations and both norm values.
+This is an explicit test policy, not a proof of intrinsic accuracy or a license
+to accept arbitrary per-component relative error near cancellation.
+
+Every tensor must reject a finite perturbation exceeding its numerical budget,
+including the smallest reference component. Missing controls cannot receive
+passing credit. Eighteen additional accuracy-only tests exercise two independent
+seeds, non-power-of-two widths, exact cancellation, and squared-ReLU dynamic
+range. They retain numerical checks in JUnit properties and do not add replay
+coverage credit. The revised policy still needs H100/GB200 validation and review
+before landing. CPU checks establish none of those hardware results.
+The companion performance
 driver joins this contract to separate forward/backward timings from the same
 clean source revision. A matched report still needs calibrated budgets and GPU
 validation before it can establish acceptable production overhead.

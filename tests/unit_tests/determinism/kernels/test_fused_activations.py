@@ -10,6 +10,8 @@ reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``)
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
 
+import json
+
 import pytest
 import torch
 
@@ -41,6 +43,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
+from tools.determinism.activation_reference import activation_reference
 from tools.determinism.reference import assert_reference_close, assert_replay_sensitivity
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -174,7 +177,7 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
 @pytest.mark.launch_on_gb200
 @kernel_policy(torch, True)
 def test_mlp_activation_author_evidence(case, dtype):
-    """Check a wide reduction against eager autograd, including BF16 weight grads."""
+    """Check wide reductions against independent FP64 autograd and explicit rounding."""
     fn, inputs, _ = make_case(torch, case, TOKENS, FFN, dtype)
     configuration = {"kernel_case": case_signature(torch, case, inputs)}
     actual = assert_replays_bit_exact(
@@ -187,34 +190,69 @@ def test_mlp_activation_author_evidence(case, dtype):
         signature=signature,
     )
 
-    def reference(*values):
-        # Independent eager graph: do not reuse the fused autograd.Function or
-        # compiled activation helpers, including for the weight-gradient reduction.
-        x = values[0].float()
-        if case == "weighted_squared_relu":
-            output = torch.relu(x).square() * values[1].float()
-        else:
-            if case == "bias_swiglu":
-                x = x + values[1].float()
-            gate, linear = x.chunk(2, dim=-1)
-            output = torch.nn.functional.silu(gate) * linear
-            if case == "weighted_swiglu":
-                output = output * values[2].float()
-        return output.to(values[0].dtype)
-
-    expected = run_once(reference, inputs)
-    # Candidate tolerances from the existing weighted-fusion tests. The all-FP32
-    # reference uses different BF16 rounding boundaries; validate the accuracy
-    # contract on both GPU platforms before adopting this gate for landing.
+    expected, reductions, mathematical = activation_reference(case, inputs)
     rtol, atol = (2e-2, 1e-3) if dtype == torch.bfloat16 else (1e-6, 1e-6)
     assert_reference_close(
         actual,
         expected,
         signature=signature,
-        reference_id="eager_fp32_autograd:v1:" + case,
+        reference_id="eager_fp64_autograd_staged_reductions:v2:" + case,
         rtol=rtol,
         atol=atol,
+        reductions=reductions,
+        mathematical_reference=mathematical,
+        numerical_controls=True,
     )
+
+
+@pytest.mark.parametrize("case", ["bias_swiglu", "weighted_swiglu", "weighted_squared_relu"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("profile", ["seed17", "seed91", "cancellation"])
+@pytest.mark.launch_on_gb200
+@kernel_policy(torch, True)
+def test_mlp_activation_reference_stress(case, dtype, profile, record_property):
+    """Accuracy-only stress cases; these do not add replay-coverage credit."""
+    tokens, hidden = (127, 1023) if profile == "seed91" else (64, 258)
+    fn, inputs, _ = make_case(torch, case, tokens, hidden, dtype)
+    seed = 91 if profile == "seed91" else 17
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for value in inputs:
+            if value is not None:
+                value.copy_(torch.randn_like(value))
+        if profile == "cancellation":
+            x = inputs[0]
+            if case == "bias_swiglu":
+                # Paired opposite linear halves cancel the gate's bias gradient.
+                inputs[1].zero_()
+                x[:, :hidden].zero_()
+                x[1::2, hidden:] = -x[::2, hidden:]
+            elif case == "weighted_swiglu":
+                # Equal gates and opposite linear terms cancel each weight sum.
+                x[:, :hidden].fill_(1)
+                x[:, hidden + 1 :: 2] = -x[:, hidden::2]
+            else:
+                # Squared ReLU with unit upstream gradients has no signed sum.
+                # Exercise zeros and dynamic range instead of claiming cancellation.
+                x[:, ::2] = -1
+                x[:, 1::4] = 1e-3
+                x[:, 3::4] = 100
+    expected, reductions, mathematical = activation_reference(case, inputs)
+    actual = run_once(fn, inputs)
+    check = assert_reference_close(
+        actual,
+        expected,
+        signature=replay_signature(
+            inputs, backward=True, configuration={"accuracy_profile": profile, "seed": seed}
+        ),
+        reference_id="eager_fp64_autograd_staged_reductions:v2:" + case,
+        rtol=0.02 if dtype == torch.bfloat16 else 1e-6,
+        atol=0.001 if dtype == torch.bfloat16 else 1e-6,
+        reductions=reductions,
+        mathematical_reference=mathematical,
+        numerical_controls=True,
+    )
+    record_property("independent_reference", json.dumps(check, allow_nan=False))
 
 
 # --- plain compiled activations -----------------------------------------------------------

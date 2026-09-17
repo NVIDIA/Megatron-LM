@@ -134,6 +134,16 @@ The signature must include the same explicit `configuration` as the replay.
 The helper records per-tensor error magnitudes, violations, and a sample;
 it rejects missing keys, incompatible shapes/dtypes, and nonfinite values.
 
+For reductions, supply explicit `ReductionReference` entries computed from
+independent terms, keyed by `gradient:<tensor name>`. Document any rounding before
+the sum and retain ideal values using `mathematical_reference`. Reduction checks
+apply both a component budget based on accumulation precision/length/conditioning
+and an L2 guard using the original tolerances; see the
+[accuracy policy](./coverage.md#independent-accuracy-and-sensitivity). These
+worst-case budgets are conservative and do not prove kernel correctness.
+Set `numerical_controls=True` to require out-of-budget perturbations to fail for
+every tensor. This exercises the numerical gate separately from byte sensitivity.
+
 Use `assert_replay_sensitivity` with the same actual pair and the real byte
 comparator. It first checks the unchanged baseline, then flips a bit separately
 in every output and gradient. All perturbations must be detected. This verifies

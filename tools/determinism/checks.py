@@ -37,6 +37,17 @@ def has_comparisons(check: dict) -> bool:
         and gradients >= 0
         and (check["signature"].get("phase") != "forward_backward" or gradients > 0)
         and (
+            not check.get("protocol", {}).get("numerical_controls_required", False)
+            or (
+                len(check.get("numerical_controls", {})) == outputs + gradients
+                and check["numerical_controls"].keys() == check.get("metrics", {}).keys()
+                and all(
+                    control.get("detected") is True
+                    for control in check["numerical_controls"].values()
+                )
+            )
+        )
+        and (
             check["kind"] != "sensitivity"
             or (
                 type(check.get("detected_perturbations")) is int
