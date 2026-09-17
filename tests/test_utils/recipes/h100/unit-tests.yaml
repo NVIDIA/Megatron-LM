@@ -8,7 +8,7 @@ spec:
   nodes: 1
   build: mcore-pyt-{environment}
   gpus: 8
-  platforms: dgx_h500
+  platforms: dgx_h100
   script_setup: |
     set -euo pipefail
     unset https_proxy
