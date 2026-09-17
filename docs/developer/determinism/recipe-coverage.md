@@ -52,6 +52,11 @@ Bindings are explicit because a function name alone cannot establish the
 backend or numerical variant. Include every numerical option in the arguments
 or give distinct variants distinct implementation IDs. A binding must cover
 the same callable contract as the corresponding test, including hidden state.
+Module attributes that alias `torch.autograd.Function.apply` are supported,
+including bias-GELU's explicit classmethod override. The original bound class,
+autograd behavior and class descriptor are preserved. Instance-bound methods
+(including native methods), arbitrary classmethods and class descriptors are
+rejected; their hidden state needs an explicit adapter.
 
 ## Query evidence
 
