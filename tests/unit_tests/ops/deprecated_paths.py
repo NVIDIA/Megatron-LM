@@ -69,5 +69,3 @@ FORWARDED = {
     "megatron.core.ssm.ops.gdp.solve_tril": ("megatron.core.ops.ssm.gdp.solve_tril",),
     "megatron.core.ssm.ops.gdp.wy_fast": ("megatron.core.ops.ssm.gdp.wy_fast",),
 }
-
-PACKAGE_MARKERS = ("megatron.core.ssm", "megatron.core.transformer.experimental_attention_variant")

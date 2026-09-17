@@ -38,9 +38,9 @@ from megatron.core.extensions.transformer_engine import (  # noqa: E402
 )
 from megatron.core.fp8_utils import is_float8tensor  # noqa: E402
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add  # noqa: E402
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
-from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
