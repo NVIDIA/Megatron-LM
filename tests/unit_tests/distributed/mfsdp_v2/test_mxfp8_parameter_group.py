@@ -41,6 +41,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
     changed_mesh_axis,
     sharded_reduce_group,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization import (
+    COLWISE,
+    ROWWISE,
+)
 
 TENSOR_SHAPES = ((256, 128),)
 HFSDP_DENSE = ((Replicate(), Flat()), (Flat(), Flat()))
@@ -88,6 +92,38 @@ class _UnshardStub(Fp8ParameterGroup):
         pass
 
 
+class _FakeQuantizer:
+    """The ``Quantizer`` surface the unshard path touches, without TE."""
+
+    def __init__(self):
+        self.rowwise_usage = True
+        self.columnwise_usage = True
+
+    def set_usage(self, rowwise=None, columnwise=None):
+        if rowwise is not None:
+            self.rowwise_usage = rowwise
+        if columnwise is not None:
+            self.columnwise_usage = columnwise
+
+
+class _FakeFp8Tensor:
+    """The ``MXFP8Tensor`` surface the unshard path touches, without TE.
+
+    ``_rowwise_scale_inv`` / ``_columnwise_scale_inv`` are the grids TE fills at
+    quantization and *drops* from any direction ``update_usage`` disables, and
+    ``_quantizer`` carries the usage flags TE propagates into ``update_usage``.
+    Both are what the orientation-aware unshard has to manage.
+    """
+
+    def __init__(self, shape):
+        self.shape = torch.Size(shape)
+        self._rowwise_data = None
+        self._columnwise_data = None
+        self._rowwise_scale_inv = torch.zeros(4, dtype=torch.float32)
+        self._columnwise_scale_inv = torch.zeros(4, dtype=torch.float32)
+        self._quantizer = _FakeQuantizer()
+
+
 def _make_unshard_stub(mesh, parameter_placements, optimizer_placements, device):
     ro_storage, ro_view = _make_payload(mesh, parameter_placements, optimizer_placements, device)
     co_storage, co_view = _make_payload(mesh, parameter_placements, optimizer_placements, device)
@@ -95,7 +131,7 @@ def _make_unshard_stub(mesh, parameter_placements, optimizer_placements, device)
     stub.mesh = mesh
     stub._symm_mem_pool = None  # _symmetric_memory_context() -> nullcontext()
     stub.fsdp_parameters = tuple(
-        types.SimpleNamespace(unsharded=torch.zeros(shape)) for shape in TENSOR_SHAPES
+        types.SimpleNamespace(unsharded=_FakeFp8Tensor(shape)) for shape in TENSOR_SHAPES
     )
     stub._rowwise_buffer = ro_storage
     stub._colwise_buffer = co_storage
@@ -103,6 +139,9 @@ def _make_unshard_stub(mesh, parameter_placements, optimizer_placements, device)
     stub.post_optimizer_colwise = co_view
     stub._rowwise_is_stale = True
     stub._colwise_is_stale = True
+    stub._materialized_directions = frozenset()
+    stub._rowwise_scale_invs = None
+    stub._colwise_scale_invs = None
     stub._unsharded_rowwise = DBuffer.empty(
         mesh=mesh,
         placements=(Replicate(),) * mesh.ndim,
@@ -261,14 +300,15 @@ def test_quantize_call_site_uses_masters_derived_reduce_group(distributed_setup,
 
 
 @pytest.mark.parametrize(
-    "name, placements, expected_axes",
+    "name, placements, per_direction_axes",
     [
-        pytest.param("hfsdp-dense", HFSDP_DENSE, (0, 0, 1, 1), id="hfsdp-dense"),
-        pytest.param("expert-zero1", EXPERT_ZERO1, (0, 0), id="expert-zero1"),
+        pytest.param("hfsdp-dense", HFSDP_DENSE, (0, 1), id="hfsdp-dense"),
+        pytest.param("expert-zero1", EXPERT_ZERO1, (0,), id="expert-zero1"),
     ],
 )
+@pytest.mark.parametrize("orientation", ["rowwise", "colwise", "both"])
 def test_unshard_moves_change_at_most_one_axis(
-    distributed_setup, monkeypatch, name, placements, expected_axes
+    distributed_setup, monkeypatch, name, placements, per_direction_axes, orientation
 ):
     """Every view/redistribute on the unshard path changes at most one mesh axis.
 
@@ -276,8 +316,16 @@ def test_unshard_moves_change_at_most_one_axis(
     each real call proves the alignment removed the multi-axis move: HFSDP dense
     only widens the outer axis into the storage and the inner axis to everything
     Replicate, and expert ZeRO-1 only widens its single optimizer axis.
+
+    Only the orientations actually requested are gathered, so the recorded move
+    sequence repeats once per requested direction, and only those directions'
+    staleness is cleared.
     """
     parameter_placements, optimizer_placements = placements
+    directions = {"rowwise": (ROWWISE,), "colwise": (COLWISE,), "both": (ROWWISE, COLWISE)}[
+        orientation
+    ]
+    expected_axes = tuple(per_direction_axes) * len(directions)
     if len(parameter_placements) == 2:
         _require_two_axis(distributed_setup)
         mesh = _two_axis_mesh(distributed_setup)
@@ -311,18 +359,36 @@ def test_unshard_moves_change_at_most_one_axis(
             output_tensor.narrow(0, index * chunk, chunk).copy_(input_tensor)
 
     # Only the placement bookkeeping is under test, not the communication, so the
-    # collective and the TE payload binding are stubbed out.
+    # collective is stubbed out; the payload binders only record what was bound.
     monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather_into_tensor)
-    monkeypatch.setattr(parameter_group, "set_rowwise_payload", lambda tensor, data: None)
-    monkeypatch.setattr(parameter_group, "set_columnwise_payload", lambda tensor, data: None)
+    monkeypatch.setattr(
+        parameter_group,
+        "set_rowwise_payload",
+        lambda tensor, data: setattr(tensor, "_rowwise_data", data),
+    )
+    monkeypatch.setattr(
+        parameter_group,
+        "set_columnwise_payload",
+        lambda tensor, data: setattr(tensor, "_columnwise_data", data),
+    )
 
-    Fp8ParameterGroup.unshard_parameters(stub)
+    Fp8ParameterGroup.unshard_parameters(stub, orientation)
 
     # changed_mesh_axis would have raised inside the recorders on any two-axis move.
     assert all(axis in (0, 1, None) for axis in recorded_axes), recorded_axes
     assert tuple(recorded_axes) == expected_axes, recorded_axes
-    assert stub._rowwise_is_stale is False
-    assert stub._colwise_is_stale is False
+    # Only the requested directions were redistributed out of the optimizer view,
+    # so only their staleness is cleared; the other one waits for its own unshard.
+    assert stub._rowwise_is_stale is (ROWWISE not in directions)
+    assert stub._colwise_is_stale is (COLWISE not in directions)
+    # Exactly the requested payloads were bound, and TE's usage flags were kept in
+    # step with them so ``update_usage`` never asks for a payload that is absent.
+    for fsdp_parameter in stub.fsdp_parameters:
+        tensor = fsdp_parameter.unsharded
+        assert (tensor._rowwise_data is not None) is (ROWWISE in directions)
+        assert (tensor._columnwise_data is not None) is (COLWISE in directions)
+        assert tensor._quantizer.rowwise_usage is (ROWWISE in directions)
+        assert tensor._quantizer.columnwise_usage is (COLWISE in directions)
 
     # And the exact placement pairs the two FP8 moves use are single-axis.
     for source, target in (
@@ -331,6 +397,85 @@ def test_unshard_moves_change_at_most_one_axis(
     ):
         changed_axis = changed_mesh_axis(source, target)
         assert changed_axis is None or changed_axis in range(mesh.ndim)
+
+
+def test_restore_scale_inverses_reattaches_grids_te_dropped(distributed_setup):
+    """A narrowed unshard re-attaches the scale-inverse grids TE dropped.
+
+    ``MXFP8Tensor.update_usage`` sets a disabled direction's grid to ``None``, so
+    after a forward-only materialization TE has dropped the column-wise grid. The
+    group has to bring it back itself, or ``update_usage(rowwise_usage=True)`` and
+    TE's quantization workspaces (which alias the grids) fail on the next step.
+    """
+    _require_world_size(distributed_setup, 2)
+    mesh = _one_axis_mesh(distributed_setup)
+    stub, *_ = _make_unshard_stub(mesh, *EXPERT_ZERO1, distributed_setup.device)
+    tensor = stub.fsdp_parameters[0].unsharded
+    rowwise_scale_inv = tensor._rowwise_scale_inv
+    colwise_scale_inv = tensor._columnwise_scale_inv
+
+    # Construction leaves both grids present; the first restore caches them.
+    Fp8ParameterGroup._restore_scale_inverses(stub)
+    assert stub._rowwise_scale_invs == (rowwise_scale_inv,)
+    assert stub._colwise_scale_invs == (colwise_scale_inv,)
+
+    # TE's ``update_usage`` drops every direction it disables.
+    tensor._rowwise_scale_inv = None
+    tensor._columnwise_scale_inv = None
+    Fp8ParameterGroup._restore_scale_inverses(stub)
+    assert tensor._rowwise_scale_inv is rowwise_scale_inv
+    assert tensor._columnwise_scale_inv is colwise_scale_inv
+
+    # A grid that is still attached is left exactly as it is.
+    replacement = torch.ones(4, dtype=torch.float32)
+    tensor._rowwise_scale_inv = replacement
+    Fp8ParameterGroup._restore_scale_inverses(stub)
+    assert tensor._rowwise_scale_inv is replacement
+    assert tensor._columnwise_scale_inv is colwise_scale_inv
+
+
+def test_unshard_widens_resident_rowwise_materialization(distributed_setup, monkeypatch):
+    """A second, wider unshard gathers only the direction still missing.
+
+    A module can be materialized row-wise and then asked for the column-wise
+    payload with no reshard in between (activation recomputation runs a forward
+    between ``pre_backward`` and ``post_backward``; the module widens it to
+    ``"both"``). Re-running the row-wise collective for a payload that is already
+    bound would give back the volume this change exists to remove, so only the
+    missing direction may be gathered.
+    """
+    _require_world_size(distributed_setup, 2)
+    mesh = _one_axis_mesh(distributed_setup)
+    stub, *_ = _make_unshard_stub(mesh, *EXPERT_ZERO1, distributed_setup.device)
+    # The optimizer-view-to-storage move is not under test here.
+    stub._rowwise_is_stale = False
+    stub._colwise_is_stale = False
+
+    gathered = []
+    monkeypatch.setattr(
+        Fp8ParameterGroup,
+        "_gather_payload",
+        lambda self, source, target: gathered.append(
+            ROWWISE if source is self._rowwise_buffer else COLWISE
+        ),
+    )
+    monkeypatch.setattr(parameter_group, "set_rowwise_payload", lambda tensor, data: None)
+    monkeypatch.setattr(parameter_group, "set_columnwise_payload", lambda tensor, data: None)
+
+    Fp8ParameterGroup.unshard_parameters(stub, ROWWISE)
+    assert gathered == [ROWWISE]
+    assert stub._materialized_directions == frozenset((ROWWISE,))
+
+    Fp8ParameterGroup.unshard_parameters(stub, "both")
+    # Only the direction that was still missing is gathered the second time.
+    assert gathered == [ROWWISE, COLWISE]
+    assert stub._materialized_directions == frozenset((ROWWISE, COLWISE))
+
+    # Releasing the storage forgets what was bound, so the next cycle re-gathers.
+    stub._unsharded_rowwise.release_storage = lambda: None
+    stub._unsharded_colwise.release_storage = lambda: None
+    Fp8ParameterGroup.release_unsharded_storage(stub)
+    assert stub._materialized_directions == frozenset()
 
 
 @pytest.mark.parametrize(

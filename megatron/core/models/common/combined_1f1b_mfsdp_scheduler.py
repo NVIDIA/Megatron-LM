@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization import (
+    COLWISE,
+    ROWWISE,
+)
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -10,7 +14,10 @@ def _make_unshard_forward_hook(owner: FsdpModule):
         if owner.is_root():
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
-        owner.unshard()
+        # A forward GEMM consumes the row-wise MXFP8 payload. If the same
+        # materialization also has to serve a backward pass (activation
+        # recomputation with no reshard between them), the module widens it.
+        owner.unshard(orientation=ROWWISE)
 
     return hook
 
@@ -19,7 +26,8 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     """Backward pre-hook: unshard the owning FSDP module before the submodule backward."""
 
     def hook(submodule, _grad_output):
-        owner.unshard()
+        # The backward GEMM consumes the column-wise MXFP8 payload.
+        owner.unshard(orientation=COLWISE)
 
     return hook
 
