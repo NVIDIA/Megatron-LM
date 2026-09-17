@@ -71,8 +71,11 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
 
 try:
     if is_torch_min_version("2.4.0a0"):
-        custom_fwd = partial(torch.amp.custom_fwd, device_type="cuda")
-        custom_bwd = partial(torch.amp.custom_bwd, device_type="cuda")
+        _CUSTOM_FWD_DEVICE_TYPE = getattr(
+            torch.accelerator.current_accelerator(), "type", "cuda"
+        )
+        custom_fwd = partial(torch.amp.custom_fwd, device_type=_CUSTOM_FWD_DEVICE_TYPE)
+        custom_bwd = partial(torch.amp.custom_bwd, device_type=_CUSTOM_FWD_DEVICE_TYPE)
     else:
         custom_fwd = torch.cuda.amp.custom_fwd
         custom_bwd = torch.cuda.amp.custom_bwd
