@@ -201,6 +201,7 @@ def make_capture(monkeypatch, tmp_path):
         stop_step=None,
         pipeline_size=1,
         virtual_pipeline_size=1,
+        optimizer_mode="standard",
         omit_restore="rng",
         output=tmp_path / "resume",
         run_id="resume-run",
@@ -566,6 +567,67 @@ def test_virtual_configuration_requires_the_validated_p2p_schedule(monkeypatch, 
         args.overlap_p2p_comm_warmup_flush = True
     elif change == "deferred_wgrad":
         args.defer_embedding_wgrad_compute = True
+    if change is None:
+        capture.validate_configuration()
+    else:
+        with pytest.raises(UnverifiedState):
+            capture.validate_configuration()
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_precision_aware_recipe_keeps_horizon_and_declares_storage_dtypes(world_size):
+    command = recipe_arguments(world_size, 5, 3, optimizer_mode="precision_aware_fp16")
+    assert "--use-precision-aware-optimizer" in command
+    for option, value in (
+        ("--train-iters", "5"),
+        ("--exit-interval", "3"),
+        ("--pipeline-model-parallel-size", "1"),
+        ("--main-params-dtype", "fp32"),
+        ("--main-grads-dtype", "fp32"),
+        ("--exp-avg-dtype", "fp16"),
+        ("--exp-avg-sq-dtype", "fp16"),
+    ):
+        assert command[command.index(option) + 1] == value
+    assert "--use-precision-aware-optimizer" not in recipe_arguments(world_size, 5, 3)
+    with pytest.raises(ValueError, match="Precision-aware"):
+        recipe_arguments(world_size, 5, 3, pipeline_size=2, optimizer_mode="precision_aware_fp16")
+
+
+@pytest.mark.parametrize(
+    "change", [None, "moments", "masters", "gradients", "offload", "pp", "mode"]
+)
+def test_precision_aware_configuration_rejects_uncovered_storage(monkeypatch, tmp_path, change):
+    capture, args, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.optimizer_mode = "precision_aware_fp16"
+    args.__dict__.update(
+        bf16=True,
+        use_distributed_optimizer=True,
+        deterministic_mode=True,
+        ckpt_format="torch_dist",
+        dataloader_type="single",
+        num_workers=0,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        use_precision_aware_optimizer=True,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        exp_avg_dtype=torch.float16,
+        exp_avg_sq_dtype=torch.float16,
+    )
+    if change == "moments":
+        args.exp_avg_sq_dtype = torch.bfloat16
+    elif change == "masters":
+        args.main_params_dtype = torch.float16
+    elif change == "gradients":
+        args.main_grads_dtype = torch.bfloat16
+    elif change == "offload":
+        args.optimizer_cpu_offload = True
+    elif change == "pp":
+        capture.args.pipeline_size = args.pipeline_model_parallel_size = 2
+    elif change == "mode":
+        args.use_precision_aware_optimizer = False
     if change is None:
         capture.validate_configuration()
     else:

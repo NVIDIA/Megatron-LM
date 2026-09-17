@@ -60,9 +60,10 @@ The H100 and GB200 `determinism-state.yaml` recipes each select two per-step job
 `mcore_gpt` pilot and the `megatron_gpt` training adapter, with eight and four
 ranks respectively. They use the existing integration-test
 selection path; actual scheduling still depends on the CI scope and protected
-runner approval. Each also adds four stop-point jobs to nightly cadence (or an
+runner approval. Each also adds five stop-point jobs to nightly cadence (or an
 explicit cadence bypass): both original GPU adapters plus TP=2/PP=2 training
-with one or two virtual chunks, using steps 3 and 5 of a five-step schedule. The normal
+with one or two virtual chunks, and the precision-aware optimizer recipe below,
+using steps 3 and 5 of a five-step schedule. The normal
 PR selection retains its two existing jobs. A configured recipe is not GPU
 execution evidence.
 
@@ -182,6 +183,37 @@ intentionally omits parameter-dependent moments and is insufficient. Both Adam
 moments, group/step state, local master parameters/gradients, loss scale and
 scaler state are captured without gathering shards. Every rank is required.
 
+### Precision-aware Adam storage
+
+Select `--optimizer-mode precision_aware_fp16` for a separate BF16 TP=2/PP=1
+recipe with FP32 main gradients, scaled FP16 first/second moments, and the
+native BF16-plus-`int16` master-parameter remainder representation:
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 --optimizer-mode precision_aware_fp16 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-precision-aware-stop-points
+```
+
+TE's checkpoint `state_dict()` converts low-precision moments and does not
+include the separate scaling map. This adapter reads the raw optimizer state
+through the base PyTorch serializer, retaining FP16 moment bytes, both FP32
+scales, `int16` remainder bytes, group/step state, optimizer policy, dtype-range
+tensors and overflow state. It neither casts these states to FP32 nor changes
+the native checkpoint save/load implementation.
+
+Every local optimizer shard is bound to its actual model chunk, parameter name
+and byte-sharing element range. Missing moments, scales or remainders, wrong
+dtypes, copied or misidentified shards, unsupported hooks and unknown state
+keys cannot pass. CPU controls independently perturb the second moment,
+master remainder and scale bytes and require the unchanged state comparator
+to detect each difference.
+
+This named optimizer recipe does not enable other moment/master dtypes,
+offloading, quantized model parameters, capturable optimizers or combinations
+with PP/VPP. Those require their own complete storage and boundary adapters.
+
 The loader adapter supports the single-pass MockGPT sampler with zero workers.
 It records the actual index arrays, document lengths, cached masks/positions,
 dedicated loader RNG and sampler configuration. It derives the absolute next
@@ -198,7 +230,7 @@ changed, missing or additional shards invalidate the evidence. Checkpoint
 hashes identify the loaded files; state comparisons still use raw bytes.
 
 This is an additional GPU validation recipe, **not an executed GPU result**.
-FP8/FP4, precision-aware/offloaded optimizers, other communication overlap policies,
+FP8/FP4, other precision-aware/offloaded optimizer configurations, other communication overlap policies,
 broader PP/VPP/CP/EP/FSDP layouts, real datasets and production recipe stop-point validation
 remain separate work. Unsupported state formats fail visibly.
 

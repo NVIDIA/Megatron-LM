@@ -12,6 +12,37 @@ from tools.determinism.run_state_replay import run_protocol, run_stop_points
 from tools.determinism.training_state import UnverifiedState, capture_configuration, snapshot_path
 
 
+@pytest.mark.parametrize("run", [run_protocol, run_stop_points])
+@pytest.mark.parametrize(
+    "backend,pipeline_size,virtual_pipeline_size,mode",
+    [
+        ("cpu", 1, 1, "precision_aware_fp16"),
+        ("mcore_gpt", 1, 1, "precision_aware_fp16"),
+        ("megatron_gpt", 2, 1, "precision_aware_fp16"),
+        ("megatron_gpt", 2, 2, "precision_aware_fp16"),
+        ("megatron_gpt", 1, 1, "unknown"),
+    ],
+)
+def test_unsupported_optimizer_modes_fail_before_output(
+    tmp_path, run, backend, pipeline_size, virtual_pipeline_size, mode
+):
+    output = tmp_path / "never-created"
+    with pytest.raises(ValueError, match="Precision-aware"):
+        run(
+            output,
+            backend=backend,
+            world_size=1 if backend == "cpu" else 4,
+            steps=5,
+            checkpoint_step=2,
+            control="rng",
+            pipeline_size=pipeline_size,
+            virtual_pipeline_size=virtual_pipeline_size,
+            optimizer_mode=mode,
+            **({"stop_steps": [3, 5]} if run is run_stop_points else {}),
+        )
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("control,first_component", [("rng", "model"), ("scheduler", "scheduler")])
 def test_cpu_training_replay_resume_and_omitted_state_control(tmp_path, control, first_component):
     output = tmp_path / "protocol"

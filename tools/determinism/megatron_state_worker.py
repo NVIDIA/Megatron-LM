@@ -46,6 +46,7 @@ def recipe_arguments(
     *,
     pipeline_size: int = 1,
     virtual_pipeline_size: int = 1,
+    optimizer_mode: str = "standard",
 ) -> list[str]:
     """Freeze BF16 distributed Adam with TP=2, PP=1/2 and optional two-chunk VPP."""
     if world_size not in (4, 8) or type(pipeline_size) is not int or pipeline_size not in (1, 2):
@@ -56,6 +57,10 @@ def recipe_arguments(
         or (virtual_pipeline_size == 2 and pipeline_size != 2)
     ):
         raise ValueError("The two-chunk virtual pipeline requires PP=2")
+    if optimizer_mode not in ("standard", "precision_aware_fp16") or (
+        optimizer_mode != "standard" and (pipeline_size != 1 or virtual_pipeline_size != 1)
+    ):
+        raise ValueError("Precision-aware FP16 moments require the PP=1 non-virtual recipe")
     arguments = [
         "--num-layers",
         str(2 * virtual_pipeline_size),
@@ -135,6 +140,18 @@ def recipe_arguments(
     if virtual_pipeline_size == 2:
         # Megatron requires P2P overlap for an interleaved two-stage pipeline.
         arguments += ["--num-virtual-stages-per-pipeline-rank", "2"]
+    if optimizer_mode == "precision_aware_fp16":
+        arguments += [
+            "--use-precision-aware-optimizer",
+            "--main-params-dtype",
+            "fp32",
+            "--main-grads-dtype",
+            "fp32",
+            "--exp-avg-dtype",
+            "fp16",
+            "--exp-avg-sq-dtype",
+            "fp16",
+        ]
     if stop_step is not None:
         # train-iters also controls data indexing and scheduler construction.
         arguments += ["--exit-interval", str(stop_step)]
@@ -182,7 +199,9 @@ class TrainingCapture:
                 self.args.stop_step,
                 pipeline_size=self.args.pipeline_size,
                 virtual_pipeline_size=self.args.virtual_pipeline_size,
+                optimizer_mode=self.args.optimizer_mode,
             ),
+            "optimizer_mode": self.args.optimizer_mode,
             "capture": self.capture_config,
             "checkpoint_step": self.args.checkpoint_step,
             "mock_documents": 512,
@@ -261,7 +280,6 @@ class TrainingCapture:
             "fp16",
             "fp8",
             "fp4",
-            "use_precision_aware_optimizer",
             "optimizer_cpu_offload",
             "use_megatron_fsdp",
             "use_torch_fsdp2",
@@ -279,6 +297,18 @@ class TrainingCapture:
         ):
             if getattr(args, name, None):
                 raise UnverifiedState(f"State adapter does not cover {name}")
+        precision_aware = self.args.optimizer_mode == "precision_aware_fp16"
+        if bool(getattr(args, "use_precision_aware_optimizer", False)) != precision_aware:
+            raise UnverifiedState("Requested and actual optimizer modes disagree")
+        if precision_aware and (
+            self.args.pipeline_size != 1
+            or self.args.virtual_pipeline_size != 1
+            or args.main_params_dtype != torch.float32
+            or args.main_grads_dtype != torch.float32
+            or args.exp_avg_dtype != torch.float16
+            or args.exp_avg_sq_dtype != torch.float16
+        ):
+            raise UnverifiedState("Unsupported precision-aware optimizer recipe")
         if (
             args.tensor_model_parallel_size != 2
             or args.pipeline_model_parallel_size != self.args.pipeline_size
@@ -445,9 +475,13 @@ class TrainingCapture:
         chunks = self.training.unwrap_model(model)
         self.validate_partition(chunks)
         model_state, gradients = capture_model(chunks)
-        optimizer_state, precision = capture_optimizer(optimizer)
+        optimizer_state, precision = capture_optimizer(optimizer, model_chunks=chunks)
         precision.update(
-            mode="bf16_with_fp32_master_parameters",
+            mode=(
+                "bf16_precision_aware_fp16_moments"
+                if self.args.optimizer_mode == "precision_aware_fp16"
+                else "bf16_with_fp32_master_parameters"
+            ),
             fp8="disabled",
             fp4="disabled",
             autocast=False,
@@ -572,6 +606,7 @@ def run_worker(args: argparse.Namespace) -> None:
             args.stop_step,
             pipeline_size=args.pipeline_size,
             virtual_pipeline_size=args.virtual_pipeline_size,
+            optimizer_mode=args.optimizer_mode,
         ),
     ]
     command += [
@@ -621,6 +656,9 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--optimizer-mode", choices=("standard", "precision_aware_fp16"), default="standard"
+    )
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
     parser.add_argument("--stop-step", type=int)
