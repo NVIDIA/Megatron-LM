@@ -89,6 +89,8 @@ def main(
         magic_values["artifacts_dir"] = "$OUTPUT_PATH"
         magic_values["environment"] = environment
         magic_values["test_case"] = workload.spec["test_case"]
+        # Local unit-test generation remains exhaustive.
+        magic_values["unit_testmon_mode"] = "full"
         magic_values["name"] = workload.spec["name"].format(**magic_values)
 
         file_path = (
