@@ -24,11 +24,6 @@ For PR-label or trigger questions, lead with the exact values:
   for a container or dependency change.**
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
 - `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite.
-- `Run selective unit tests` requests Testmon-based unit-test selection for an
-  eligible synthetic PR push. It restores a compatible shared baseline from
-  `main`; PRs never record or save Testmon databases. A missing or invalid cache
-  or selection failure runs the full bucket. `populate-build-cache.yml` records
-  fresh baselines every six hours and supports manual dispatch from `main`.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
   `pull-request/<branch>`. Always run with `--dry-run` first and confirm the
@@ -85,7 +80,6 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
 | **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite |
-| **`Run selective unit tests`** | Restore a compatible shared main baseline and select unit tests. Missing/incompatible caches, full-test labels, forced runs, LTS, and merge queue validation use the full unit-test path. PRs never generate or save a baseline. |
 
 Adding a label does not itself start `cicd-main.yml`; apply it before the next
 synthetic PR push or rerun the workflow after applying it.
