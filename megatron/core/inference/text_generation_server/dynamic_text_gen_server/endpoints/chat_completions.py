@@ -39,7 +39,12 @@ from ..openai_streaming import (
     json_safe_top_n_logprobs,
     openai_stream,
 )
-from .common import abort_requests
+from .common import (
+    abort_requests,
+    attach_stage_metadata,
+    collect_stage_metadata,
+    validate_offload_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -789,8 +794,9 @@ try:
 
         req = await request.get_json()
         offload_params = req.get("offload_params")
-        if offload_params is not None and not isinstance(offload_params, dict):
-            return Response("'offload_params' must be an object", status=400)
+        offload_params_error = validate_offload_params(offload_params)
+        if offload_params_error is not None:
+            return Response(offload_params_error, status=400)
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
@@ -1257,13 +1263,7 @@ try:
             result = unwrap_serialized_tensors(result_item)
             if response_uid is None:
                 response_uid = result["uid"]
-            stage_metadata = result.get("payload_stage_metadata") or {}
-            for key, value in stage_metadata.items():
-                if key in response_metadata and response_metadata[key] != value:
-                    raise ValueError(
-                        f"payload stager returned conflicting response metadata for {key!r}"
-                    )
-                response_metadata[key] = value
+            collect_stage_metadata(response_metadata, result)
 
             text_output = TextGenerationController.detokenize(
                 tokenizer,
@@ -1427,12 +1427,7 @@ try:
                 "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
-        overlap = set(response).intersection(response_metadata)
-        if overlap:
-            raise ValueError(
-                f"payload stager response metadata collides with reserved fields: {sorted(overlap)}"
-            )
-        response.update(response_metadata)
+        attach_stage_metadata(response, response_metadata)
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

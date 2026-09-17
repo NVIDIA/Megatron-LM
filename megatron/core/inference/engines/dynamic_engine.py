@@ -83,6 +83,11 @@ from megatron.core.utils import (
 
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
 
+# Engine-owned control field written into ``offload_params`` on MP rank 0 when the
+# RequestPromptPreparer fails, and read back by ``_apply_prompt_preparation_error``
+# on every rank. The HTTP endpoints reject client-supplied ``offload_params`` keys
+# that start with ``_`` (see ``endpoints.common.validate_offload_params``), so
+# this namespace cannot be forged from a request body.
 _PROMPT_PREPARATION_ERROR_FIELD = "_request_prompt_preparation_error"
 
 # Wire encoding of a None offload frame: msgpack nil is the single byte 0xc0,
