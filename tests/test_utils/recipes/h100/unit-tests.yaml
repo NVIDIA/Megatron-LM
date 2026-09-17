@@ -53,6 +53,12 @@ spec:
 
     # Collect branch contexts and numerical evidence in the dedicated buckets.
     if [[ "$TAG" == "latest" && ( "$BUCKET" == "tests/unit_tests/determinism/kernels/**/*.py" || "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ) ]]; then
+        # Match the timing runner's deterministic policy before importing Torch.
+        export CUDA_DEVICE_MAX_CONNECTIONS=1
+        export NCCL_ALGO=Ring CUBLAS_WORKSPACE_CONFIG=:4096:8
+        export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+        export MAMBA_DETERMINISTIC=1 CAUSAL_CONV1D_DETERMINISTIC=1
+        unset TRITON_CACHE_AUTOTUNING
         export DETERMINISM_EVIDENCE_RUN_ID="{environment}-{platforms}-{tag}"
         EVIDENCE_SCOPE=kernel
         REQUIRED_VIEWS=(--require-author-checks)
