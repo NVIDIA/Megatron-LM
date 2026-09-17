@@ -673,6 +673,7 @@ def setup_logging() -> None:
             'GroupedGemmDsreluSm100',
             'GroupedGemmSreluSm100',
             'GroupedGemmWgradSm100',
+            'GroupedGemmWgradBlockScaledAPI',
             'absl',
         ]:
             logging.getLogger(noisy_logger_name).setLevel(logging.ERROR)
