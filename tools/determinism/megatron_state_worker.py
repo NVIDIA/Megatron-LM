@@ -39,10 +39,12 @@ from tools.determinism.training_state import (
 )
 
 
-def recipe_arguments(world_size: int, steps: int, stop_step: int | None = None) -> list[str]:
-    """Freeze the first real-training recipe: TP=2, DP=2/4, BF16 distributed Adam."""
-    if world_size not in (4, 8):
-        raise ValueError("The Megatron training recipe requires four or eight ranks")
+def recipe_arguments(
+    world_size: int, steps: int, stop_step: int | None = None, *, pipeline_size: int = 1
+) -> list[str]:
+    """Freeze the real-training recipe: TP=2, PP=1/2, BF16 distributed Adam."""
+    if world_size not in (4, 8) or type(pipeline_size) is not int or pipeline_size not in (1, 2):
+        raise ValueError("The Megatron training recipe requires four/eight ranks and PP=1/2")
     arguments = [
         "--num-layers",
         "2",
@@ -79,7 +81,7 @@ def recipe_arguments(world_size: int, steps: int, stop_step: int | None = None) 
         "--tensor-model-parallel-size",
         "2",
         "--pipeline-model-parallel-size",
-        "1",
+        str(pipeline_size),
         "--context-parallel-size",
         "1",
         "--use-distributed-optimizer",
@@ -148,6 +150,8 @@ class TrainingCapture:
 
     def runtime_provenance(self) -> dict:
         """Record actual runtime plus the complete, path-independent CLI recipe."""
+        from megatron.core import parallel_state
+
         record = _provenance(
             "megatron_gpt",
             self.world_size,
@@ -157,12 +161,33 @@ class TrainingCapture:
         record["recipe"] = {
             "id": "megatron_pretrain_gpt_dist_optimizer_bf16_v1",
             "entrypoint": "pretrain_gpt.py",
-            "arguments": recipe_arguments(self.world_size, self.args.steps, self.args.stop_step),
+            "arguments": recipe_arguments(
+                self.world_size,
+                self.args.steps,
+                self.args.stop_step,
+                pipeline_size=self.args.pipeline_size,
+            ),
             "capture": self.capture_config,
             "checkpoint_step": self.args.checkpoint_step,
             "mock_documents": 512,
             "mock_max_sequence_length": 64,
             "capture_boundary": "post_training_step_callbacks_before_checkpoint",
+        }
+        record["rank_layout"] = {
+            "global_rank": torch.distributed.get_rank(),
+            "world_size": torch.distributed.get_world_size(),
+            "sizes": {
+                "TP": parallel_state.get_tensor_model_parallel_world_size(),
+                "PP": parallel_state.get_pipeline_model_parallel_world_size(),
+                "DP": parallel_state.get_data_parallel_world_size(),
+                "CP": parallel_state.get_context_parallel_world_size(),
+            },
+            "TP": parallel_state.get_tensor_model_parallel_rank(),
+            "PP": parallel_state.get_pipeline_model_parallel_rank(),
+            "DP": parallel_state.get_data_parallel_rank(),
+            "CP": parallel_state.get_context_parallel_rank(),
+            "VPP": parallel_state.get_virtual_pipeline_model_parallel_world_size(),
+            "owns_loader": self.loader is not None and self.iterator is not None,
         }
         return record
 
@@ -194,15 +219,18 @@ class TrainingCapture:
             "skip_train",
             "perform_rl_step",
             "optimizer_cuda_graph",
+            "overlap_p2p_comm",
+            "defer_embedding_wgrad_compute",
         ):
             if getattr(args, name, None):
                 raise UnverifiedState(f"State adapter does not cover {name}")
         if (
             args.tensor_model_parallel_size != 2
-            or args.pipeline_model_parallel_size != 1
+            or args.pipeline_model_parallel_size != self.args.pipeline_size
             or args.context_parallel_size != 1
+            or args.virtual_pipeline_model_parallel_size is not None
         ):
-            raise UnverifiedState("Expected TP=2, PP=CP=1")
+            raise UnverifiedState("Expected TP=2, requested PP, CP=1 and no virtual pipeline")
         if self.args.stop_step is not None:
             if (
                 args.train_iters != self.args.steps
@@ -349,7 +377,9 @@ class TrainingCapture:
             raise UnverifiedState("State capture occurred before training initialization")
         torch.cuda.synchronize()
         args = self.training.get_args()
-        model_state, gradients = capture_model(self.training.unwrap_model(model))
+        chunks = self.training.unwrap_model(model)
+        self.validate_partition(chunks)
+        model_state, gradients = capture_model(chunks)
         optimizer_state, precision = capture_optimizer(optimizer)
         precision.update(
             mode="bf16_with_fp32_master_parameters",
@@ -382,6 +412,17 @@ class TrainingCapture:
             resume_from=self.resumed,
         )
         self.captured_steps.append(step)
+
+    def validate_partition(self, chunks: list) -> None:
+        """Require the expected local layer count and pipeline endpoint ownership."""
+        pipeline_size = self.args.pipeline_size
+        pipeline_rank = self.provenance["rank_layout"]["PP"]
+        if len(chunks) != 1 or (
+            chunks[0].pre_process != (pipeline_rank == 0)
+            or chunks[0].post_process != (pipeline_rank == pipeline_size - 1)
+            or len(chunks[0].decoder.layers) != 2 // pipeline_size
+        ):
+            raise UnverifiedState("Model partition does not match the declared GPT pipeline")
 
     def wrap_post_step(self, original):
         """Observe after the existing callbacks, before checkpoint save or zero_grad."""
@@ -433,7 +474,9 @@ def run_worker(args: argparse.Namespace) -> None:
     capture = TrainingCapture(args, training, checkpointing)
     command = [
         str(ROOT / "pretrain_gpt.py"),
-        *recipe_arguments(capture.world_size, args.steps, args.stop_step),
+        *recipe_arguments(
+            capture.world_size, args.steps, args.stop_step, pipeline_size=args.pipeline_size
+        ),
     ]
     command += [
         "--save",
@@ -480,6 +523,7 @@ def main() -> None:
     parser.add_argument("--backend", choices=("megatron_gpt",), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
     parser.add_argument("--stop-step", type=int)

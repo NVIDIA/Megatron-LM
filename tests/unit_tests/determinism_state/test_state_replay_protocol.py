@@ -3,6 +3,7 @@
 """Exercise actual subprocess training, checkpoint load and a broken RNG restore."""
 
 import json
+from itertools import product
 
 import pytest
 
@@ -149,3 +150,55 @@ def test_one_unsuccessful_target_cannot_pass_the_aggregate(tmp_path, monkeypatch
     )
     assert calls == [3, 5]
     assert result["status"] == status
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+@pytest.mark.parametrize("pipeline_size", [1, 2])
+@pytest.mark.parametrize("change", ["duplicate", "loader_owner"])
+def test_megatron_layout_requires_every_pipeline_and_data_rank(
+    tmp_path, world_size, pipeline_size, change
+):
+    data_size = world_size // (2 * pipeline_size)
+    for rank, (tp, pp, dp) in enumerate(product(range(2), range(pipeline_size), range(data_size))):
+        record = {
+            "global_rank": rank,
+            "world_size": world_size,
+            "sizes": {"TP": 2, "PP": pipeline_size, "DP": data_size, "CP": 1},
+            "TP": tp,
+            "PP": pp,
+            "DP": dp,
+            "CP": 0,
+            "VPP": None,
+            "owns_loader": tp == 0,
+        }
+        (tmp_path / f"complete-rank-{rank:06d}.json").write_text(
+            json.dumps({"provenance": {"rank_layout": record}})
+        )
+    replay._verify_megatron_layout(tmp_path, world_size, pipeline_size)
+    # Every global-rank file is present, but the final coordinate was duplicated.
+    path = tmp_path / f"complete-rank-{world_size - 1 if change == 'duplicate' else 0:06d}.json"
+    record = json.loads(path.read_text())
+    if change == "duplicate":
+        record["provenance"]["rank_layout"]["DP"] = 0
+        record["provenance"]["rank_layout"]["PP"] = 0
+    else:
+        record["provenance"]["rank_layout"]["owns_loader"] = False
+    path.write_text(json.dumps(record))
+    with pytest.raises(UnverifiedState, match="coordinates|rank layout"):
+        replay._verify_megatron_layout(tmp_path, world_size, pipeline_size)
+
+
+@pytest.mark.parametrize("backend", ["cpu", "mcore_gpt"])
+def test_pp2_is_rejected_by_adapters_that_do_not_use_a_pipeline(tmp_path, backend):
+    with pytest.raises(ValueError, match="PP=2"):
+        run_stop_points(
+            tmp_path / "invalid",
+            backend=backend,
+            world_size=4,
+            pipeline_size=2,
+            steps=5,
+            checkpoint_step=2,
+            control="rng",
+            stop_steps=[3, 5],
+        )
+    assert not (tmp_path / "invalid").exists()

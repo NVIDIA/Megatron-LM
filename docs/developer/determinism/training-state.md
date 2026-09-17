@@ -60,8 +60,9 @@ The H100 and GB200 `determinism-state.yaml` recipes each select two per-step job
 `mcore_gpt` pilot and the `megatron_gpt` training adapter, with eight and four
 ranks respectively. They use the existing integration-test
 selection path; actual scheduling still depends on the CI scope and protected
-runner approval. Each also adds two stop-point jobs to nightly cadence (or an
-explicit cadence bypass), using steps 3 and 5 of a five-step schedule. The normal
+runner approval. Each also adds three stop-point jobs to nightly cadence (or an
+explicit cadence bypass): both original GPU adapters plus a TP=2/PP=2 training
+recipe, using steps 3 and 5 of a five-step schedule. The normal
 PR selection retains its two existing jobs. A configured recipe is not GPU
 execution evidence.
 
@@ -106,10 +107,36 @@ production acceptance claim.
 `megatron_gpt` executes the repository's `pretrain_gpt.py`, including its real
 language-model loss, forward/backward schedule, distributed Adam optimizer,
 learning-rate scheduler, sampler, and synchronous `torch_dist` save/load path.
-It uses TP=2, PP=CP=1 and DP=2/4 on four/eight GPUs, BF16 model weights and FP32
+By default it uses TP=2, PP=CP=1 and DP=2/4 on four/eight GPUs, BF16 model weights and FP32
 master parameters, dropout, and two 128-hidden-size transformer layers.
 MockGPT uses 512 documents with maximum document length 64; those explicit
 test-data dimensions are recorded alongside the full training arguments.
+
+Select `--pipeline-size 2` with `--backend megatron_gpt` to exercise the existing
+pipeline schedule with one layer per stage. On four GPUs this is TP=2/PP=2/DP=1;
+on eight GPUs it is TP=2/PP=2/DP=2. Global batch size remains the world size, so
+each step uses four microbatches and covers pipeline warmup, steady state and
+cooldown. For example:
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 --pipeline-size 2 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-pipeline-stop-points
+```
+
+Every rank records its actual TP/PP/DP/CP group sizes and coordinates. The
+coordinator requires each TP/PP/DP coordinate exactly once, with the expected
+data-loader owners. With two stages, both first and last stages construct data
+on TP rank zero; their TP peers receive the broadcast. Capture also checks one
+model chunk, the local layer count, and the embedding/output endpoint roles.
+All stages must supply model state, gradients and local optimizer moments;
+missing stage records cannot pass. The actual synchronous distributed checkpoint
+is retained and verified for every rank, including both pipeline stages.
+
+Only PP=1/2 without virtual stages is supported by this recipe. Other pipeline
+sizes, VPP, overlapped P2P and deferred embedding-gradient work require additional
+state/boundary validation. They cannot be enabled by changing the declared rank count.
 
 The diagnostic worker temporarily observes the training module's loader,
 train, checkpoint and post-step callbacks. The callbacks retain their original
@@ -141,7 +168,7 @@ hashes identify the loaded files; state comparisons still use raw bytes.
 
 This is an additional GPU validation recipe, **not an executed GPU result**.
 FP8/FP4, precision-aware/offloaded optimizers, communication overlap,
-PP/VPP/CP/EP/FSDP, real datasets and production recipe stop-point validation
+broader PP/VPP/CP/EP/FSDP layouts, real datasets and production recipe stop-point validation
 remain separate work. Unsupported state formats fail visibly.
 
 ## Capture contract

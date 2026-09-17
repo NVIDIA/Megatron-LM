@@ -199,6 +199,7 @@ def make_capture(monkeypatch, tmp_path):
         checkpoint_step=2,
         steps=4,
         stop_step=None,
+        pipeline_size=1,
         omit_restore="rng",
         output=tmp_path / "resume",
         run_id="resume-run",
@@ -331,3 +332,76 @@ def test_only_successful_target_exit_completes_training(monkeypatch, tmp_path, f
             capture.wrap_train(train)("live-iterator")
         assert not capture.train_completed
         assert capture.expected_exit is None
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+@pytest.mark.parametrize("pipeline_size", [1, 2])
+def test_pipeline_recipe_preserves_training_horizon_and_global_batch(world_size, pipeline_size):
+    command = recipe_arguments(world_size, 5, 3, pipeline_size=pipeline_size)
+    for option, value in (
+        ("--tensor-model-parallel-size", "2"),
+        ("--pipeline-model-parallel-size", str(pipeline_size)),
+        ("--global-batch-size", str(world_size)),
+        ("--train-iters", "5"),
+        ("--lr-decay-iters", "5"),
+        ("--exit-interval", "3"),
+    ):
+        assert command[command.index(option) + 1] == value
+
+
+@pytest.mark.parametrize("change", [None, "wrong_pp", "vpp", "p2p_overlap", "deferred_wgrad"])
+def test_pipeline_configuration_rejects_uncovered_variants(monkeypatch, tmp_path, change):
+    capture, args, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.pipeline_size = 2
+    args.__dict__.update(
+        bf16=True,
+        use_distributed_optimizer=True,
+        deterministic_mode=True,
+        ckpt_format="torch_dist",
+        dataloader_type="single",
+        num_workers=0,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+    )
+    if change == "wrong_pp":
+        args.pipeline_model_parallel_size = 1
+    elif change == "vpp":
+        args.virtual_pipeline_model_parallel_size = 2
+    elif change == "p2p_overlap":
+        args.overlap_p2p_comm = True
+    elif change == "deferred_wgrad":
+        args.defer_embedding_wgrad_compute = True
+    if change is None:
+        capture.validate_configuration()
+    else:
+        with pytest.raises(UnverifiedState):
+            capture.validate_configuration()
+
+
+@pytest.mark.parametrize("pipeline_size,pipeline_rank", [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("change", [None, "endpoint", "missing_layer", "extra_chunk"])
+def test_pipeline_partition_requires_its_layer_and_endpoint(
+    monkeypatch, tmp_path, pipeline_size, pipeline_rank, change
+):
+    capture, _, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.pipeline_size = pipeline_size
+    capture.provenance = {"rank_layout": {"PP": pipeline_rank}}
+    chunk = SimpleNamespace(
+        pre_process=pipeline_rank == 0,
+        post_process=pipeline_rank == pipeline_size - 1,
+        decoder=SimpleNamespace(layers=[object() for _ in range(2 // pipeline_size)]),
+    )
+    chunks = [chunk]
+    if change == "endpoint":
+        chunk.pre_process = not chunk.pre_process
+    elif change == "missing_layer":
+        chunk.decoder.layers = []
+    elif change == "extra_chunk":
+        chunks.append(chunk)
+    if change is None:
+        capture.validate_partition(chunks)
+    else:
+        with pytest.raises(UnverifiedState, match="partition"):
+            capture.validate_partition(chunks)
