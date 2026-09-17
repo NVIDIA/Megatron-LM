@@ -23,9 +23,9 @@ from types import SimpleNamespace
 
 import torch.nn.functional as F
 
-from megatron.core.determinism import configure_determinism
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.determinism import configure_determinism, is_determinism_configured
 from megatron.training.utils import print_rank_0
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -110,9 +110,9 @@ def validate_yaml(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
-    # Apply before the grouped-GEMM capability probe can initialize CUDA.
+    # Recheck the early entrypoint policy against the resolved YAML options.
     policy_config = vars(args) | vars(args.model_parallel) | vars(args.language_model)
-    if policy_config.get('deterministic_mode', False):
+    if policy_config.get('deterministic_mode', False) or is_determinism_configured():
         policy = configure_determinism(policy_config)
         print_rank_0(f"Determinism policy: {json.dumps(policy, sort_keys=True)}", args.rank)
 

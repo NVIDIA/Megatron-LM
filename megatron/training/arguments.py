@@ -682,8 +682,10 @@ def validate_args(args, defaults={}):
         else:
             setattr(args, key, defaults[key])
 
-    # Apply before hardware capability probes can initialize CUDA.
-    if args.deterministic_mode:
+    # Recheck the early entrypoint policy against the fully resolved options.
+    from megatron.determinism import is_determinism_configured
+
+    if args.deterministic_mode or is_determinism_configured():
         from megatron.training.determinism import apply_determinism_to_args
 
         policy = apply_determinism_to_args(args)

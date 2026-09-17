@@ -14,8 +14,8 @@ import os
 import pytest
 import torch
 
-from megatron.core import determinism as core_determinism
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.determinism import _policy as core_determinism
 from megatron.training.determinism import (
     ARG_VALUES_REQUIRED_FOR_DETERMINISM,
     apply_determinism_to_args,

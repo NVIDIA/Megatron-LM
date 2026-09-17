@@ -11,7 +11,7 @@
 
 Deterministic training aims to reproduce outputs and training state for the same inputs, configuration, software stack and hardware topology. Startup settings select supported deterministic paths; replay tests must verify the particular recipe and execution environment.
 
-Pass `--deterministic-mode` to any Megatron training entry point (e.g. `pretrain_hybrid.py`):
+Pass `--deterministic-mode` to a supported Megatron pretraining entry point (e.g. `pretrain_hybrid.py`):
 
 ```bash
 python pretrain_hybrid.py \
@@ -19,17 +19,28 @@ python pretrain_hybrid.py \
   <other args ...>
 ```
 
-When enabled, CLI and YAML validation apply the shared `megatron.core.determinism.configure_determinism` policy before their CUDA capability probes. CLI callers retain the compatibility entrypoint `megatron.training.determinism.apply_determinism_to_args`. Both paths log the effective policy on rank zero and reject incompatible configuration instead of changing it.
+GPT, Hybrid, VLM, BERT, T5, MIMO and elastification pretraining scripts bootstrap `megatron.determinism.configure_determinism` before heavy imports. The deprecated Mamba entrypoint delegates to Hybrid. YAML uses the effective `deterministic_mode` from the root, `model_parallel`, then `language_model` settings, with later sections taking precedence, as in full YAML validation. Full CLI/YAML validation rechecks the resolved config and logs policy on rank zero. A config cannot silently disable deterministic mode after the process opted in.
+
+For custom scripts or module entrypoints, use the explicit early launcher:
+
+```bash
+python -m megatron.determinism train.py <args ...>
+python -m megatron.determinism -m my_package.train <args ...>
+# With one fresh worker per GPU:
+torchrun --nproc-per-node=8 --module megatron.determinism train.py <args ...>
+```
+
+The launcher establishes process policy before importing the target. It does not rewrite the model config: enable `deterministic_mode` in that config too. CLI callers retain the compatibility entrypoint `megatron.training.determinism.apply_determinism_to_args` for final validation.
 
 ## Library startup
 
 `ModelParallelConfig.deterministic_mode=True` selects deterministic implementation paths, but does not configure process-wide settings. MCore library callers, including integrations built on Megatron Bridge, can use the public startup API:
 
 ```python
-from megatron.core.determinism import configure_determinism
+from megatron.determinism import configure_determinism
 
-# Use the effective values from the model recipe. Some config constructors
-# query CUDA, so configure the process before constructing those configs.
+# Configure before importing megatron.core or megatron.bridge: their GPU
+# dependencies can query CUDA during import. Use the final recipe options.
 options = {
     "deterministic_mode": True,
     "cross_entropy_loss_fusion": False,
@@ -39,19 +50,19 @@ options = {
 }
 policy = configure_determinism(options)
 
-# Next: initialize devices/process groups, seed all required RNGs, then
-# construct the model using the same options and explicit process groups.
+# Import Core/Bridge next, then initialize devices/process groups and seed
+# all required RNGs. Construct the model with the same options and groups.
 ```
 
 The API also accepts a `ModelParallelConfig`, `TransformerConfig`, or argparse Namespace when constructing that object does not initialize CUDA. `validate_determinism_config(config)` performs only the config checks and does not change the object or process. Passing a dictionary does not transfer its options to the model: the caller must use the same effective values when constructing it.
 
-Call the startup API before CUDA initialization, process-group creation, and backend first use. A first call after PyTorch CUDA or distributed initialization raises `RuntimeError`; restart the process and configure it earlier. Repeated calls after initialization are allowed only if this process already applied the policy and its tracked environment and Torch settings are unchanged. The check cannot detect CUDA contexts created outside PyTorch, or every library that caches environment variables during import. Put environment settings in the launcher before such imports.
+Call the startup API before importing Core or Bridge, CUDA initialization, process-group creation, and backend first use. The lightweight `megatron.determinism` package does not import the Core GPU stack. The legacy `megatron.core.determinism` path re-exports the same functions and process state, but importing its parent can already initialize CUDA. Use the early path for first setup. A first call after PyTorch CUDA or distributed initialization raises `RuntimeError`; restart the process and configure it earlier. Repeated calls after initialization are allowed only if this process already applied the policy and its tracked environment and Torch settings are unchanged. The check cannot detect CUDA contexts created outside PyTorch, or every library that caches environment variables during import. Put environment settings in the launcher before such imports.
 
 Startup enables `torch.use_deterministic_algorithms(True, warn_only=False)`, sets `torch.backends.cudnn.deterministic=True`, and disables cuDNN benchmarking. This removes benchmark-driven algorithm selection and asks PyTorch to reject operations without a supported deterministic implementation. See [PyTorch's reproducibility guidance](https://docs.pytorch.org/docs/stable/notes/randomness.html). These settings can affect performance and need measurement on the target recipe.
 
 The returned dictionary is JSON-serializable and is also logged at INFO. It records the validated options, tracked environment (including Triton block overrides), Torch version and effective Torch/cuDNN settings. It is a settings record, not replay evidence. In particular, a cache path does not establish cache-content agreement, and selecting `Ring` does not pin NCCL's physical reduction order across allocations.
 
-The API does not seed RNGs. The caller still owns Python, NumPy, Torch CPU/CUDA and model-parallel RNG state, data order, precision state, optimizer/scheduler state and checkpoint restore order. Megatron training retains its existing seed initialization. Validate independent runs and checkpoint resume separately; this API alone does not establish full-state equality. Bridge's own startup flow must call the API at the same early boundary before this policy is shared automatically there.
+The API does not seed RNGs. The caller still owns Python, NumPy, Torch CPU/CUDA and model-parallel RNG state, data order, precision state, optimizer/scheduler state and checkpoint restore order. Megatron training retains its existing seed initialization. Validate independent runs and checkpoint resume separately; this API alone does not establish full-state equality. Bridge recipes need the same early call or launcher before Bridge imports, followed by validation of their resolved model options.
 
 ## Environment variables
 
