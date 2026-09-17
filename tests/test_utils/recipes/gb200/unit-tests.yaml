@@ -53,13 +53,20 @@ spec:
     fi
 
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --platform gb200 \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    if [[ "$BUCKET" == "tests/unit_tests/virtual_experts/**/*.py" ]]; then
+        # One pytest launch, with TE fusion flags set before import and a 240s budget.
+        cd $TEST_PATH
+        VIRTUAL_EXPERT_TEST_COVERAGE=1 \
+          bash tests/unit_tests/run_virtual_expert_tests.sh -m launch_on_gb200
+    else
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --platform gb200 \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+    fi
 
     ls -al
 
@@ -68,10 +75,8 @@ spec:
     cp .coverage {assets_dir}/coverage_report
     cp coverage.xml {assets_dir}
 
-# GB200 unit-test selection is marker-driven: a single catch-all bucket is
-# narrowed to files carrying @pytest.mark.launch_on_gb200 by find_test_cases.py
-# (see tests/unit_tests/run_ci_test.sh --platform gb200). Re-shard into smaller
-# buckets here if the marked set grows large enough to need parallelism.
+# find_test_cases.py excludes the dedicated child bucket from the catch-all.
+# Only the MXFP8 virtual-expert cases carry @pytest.mark.launch_on_gb200.
 products:
   - test_case: [tests/unit_tests/**/*.py]
     products:
@@ -80,3 +85,11 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+
+  - test_case: [tests/unit_tests/virtual_experts/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [600]

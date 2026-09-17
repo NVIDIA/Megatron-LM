@@ -51,12 +51,19 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    if [[ "$BUCKET" == "tests/unit_tests/virtual_experts/**/*.py" ]]; then
+        # Use all eight H100 GPUs; only MXFP8 computation needs Blackwell.
+        cd $TEST_PATH
+        GPUS_PER_NODE={gpus} VIRTUAL_EXPERT_TEST_COVERAGE=1 \
+          bash tests/unit_tests/run_virtual_expert_tests.sh -m "not launch_on_gb200"
+    else
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+    fi
 
     ls -al 
 
@@ -66,6 +73,14 @@ spec:
     cp coverage.xml {assets_dir}
 
 products:
+  # Excluded from the catch-all by find_test_cases.py; one bounded pytest launch.
+  - test_case: [tests/unit_tests/virtual_experts/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [600]
   - test_case: [tests/unit_tests/test_model_configs.py]
     products:
       - environment: [lts, dev]
