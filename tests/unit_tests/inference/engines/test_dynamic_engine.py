@@ -1651,6 +1651,63 @@ def test_engine_prepares_prompt_before_model_parallel_broadcast():
     assert msgpack.unpackb(prepared[1], raw=False) == [1, 2, 3, 4]
 
 
+@pytest.mark.parametrize("bad_output", ["numpy_prompt", "tensor_in_params"])
+def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_output):
+    """An unserializable preparer result fails the request instead of killing rank 0."""
+    import numpy as np
+
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            if bad_output == "numpy_prompt":
+                return [np.int64(1), *prompt], offload_params
+            return prompt, {**(offload_params or {}), "embedding": torch.tensor([1.0])}
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    sampling_params = SamplingParams(temperature=0.5).serialize()
+    original_params = {"ng_capture": {"rollout_id": "r0"}}
+    message = [
+        msgpack.packb(
+            [Headers.SUBMIT_REQUEST.value, 17, sampling_params, None, original_params],
+            use_bin_type=True,
+        ),
+        msgpack.packb([3, 4], use_bin_type=True),
+        msgpack.packb(None, use_bin_type=True),
+    ]
+
+    prepared = engine._prepare_submit_request_message(message)
+    metadata = msgpack.unpackb(prepared[0], raw=False)
+
+    assert metadata[:4] == [Headers.SUBMIT_REQUEST.value, 17, sampling_params, None]
+    assert metadata[4]["ng_capture"] == {"rollout_id": "r0"}
+    assert metadata[4][dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
+    assert msgpack.unpackb(prepared[1], raw=False) == [3, 4]
+    assert prepared[2] == message[2]
+
+
+def test_handle_failed_request_releases_vlm_request_data():
+    """Media registered before admission is dropped when the request fails."""
+    request = DynamicInferenceRequest(
+        request_id=42,
+        prompt_tokens=torch.tensor([3, 4]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    entry = types.SimpleNamespace(record=record)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {42: entry}
+    engine.failed_request_ids = []
+    engine.rank, engine.use_coordinator = 1, False
+    engine.context = mock.Mock()
+    engine._complete_request = mock.Mock(return_value=record[-1])
+
+    engine._handle_failed_request(42)
+
+    engine.context.remove_vlm_request_data.assert_called_once_with(42)
+    engine._complete_request.assert_called_once_with(entry)
+    assert (record[-1].status, engine.failed_request_ids) == (Status.FAILED, [42])
+
+
 def test_streaming_partials_buffer_until_token_interval():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}

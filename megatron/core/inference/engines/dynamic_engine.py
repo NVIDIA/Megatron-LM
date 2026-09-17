@@ -1486,6 +1486,9 @@ class DynamicInferenceEngine(AbstractEngine):
         request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
+        # Media registered by _build_vlm_request is never consumed for a request
+        # that fails before admission, so drop it here (a no-op for text-only).
+        self.context.remove_vlm_request_data(request_id)
         finished_request = self._complete_request(request_entry)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
@@ -1818,16 +1821,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 media_tokens_preexpanded=media_tokens_preexpanded,
                 offload_params=offload_params,
             )
-            prompt_preparation_error = (
-                offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
-                if isinstance(offload_params, dict)
-                else None
-            )
-            if prompt_preparation_error is not None:
-                request.status = Status.FAILED
-                request.add_event_error_nontransient(
-                    PromptPreparationError(request_id, str(prompt_preparation_error))
-                )
+            self._apply_prompt_preparation_error(request, offload_params)
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
             # _add_request now rejects the request (oversized prompt, cache
@@ -1855,18 +1849,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 # generation its sender hashed under.
                 block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
-            prompt_preparation_error = (
-                offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
-                if isinstance(offload_params, dict)
-                else None
-            )
-            if prompt_preparation_error is not None:
-                request.status = Status.FAILED
-                request.add_event_error_nontransient(
-                    PromptPreparationError(request_id, str(prompt_preparation_error))
-                )
+            self._apply_prompt_preparation_error(request, offload_params)
 
         return self._add_request(request)
+
+    def _apply_prompt_preparation_error(self, request, offload_params) -> None:
+        """Fail a request whose prompt preparer reported an error on MP rank zero."""
+        error = (
+            offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
+            if isinstance(offload_params, dict)
+            else None
+        )
+        if error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(
+                PromptPreparationError(request.request_id, str(error))
+            )
 
     def _build_vlm_request(
         self,
@@ -3934,23 +3932,29 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id, sampling_params, media_meta = data[1:4]
         offload_params = data[4] if len(data) == 5 else None
         prompt = msgpack.unpackb(message[1], raw=False)
+
+        def _pack(prompt, offload_params):
+            if isinstance(prompt, torch.Tensor):
+                prompt = prompt.tolist()
+            header = [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta]
+            return [
+                msgpack.packb([*header, offload_params], use_bin_type=True),
+                msgpack.packb(prompt, use_bin_type=True),
+                *message[2:],
+            ]
+
         try:
-            prompt, offload_params = self.prompt_preparer.prepare_prompt(
-                prompt, offload_params=offload_params
+            # Packing stays inside the try: an unserializable preparer result must
+            # fail this request, not exit rank 0 and hang the other MP ranks.
+            return _pack(
+                *self.prompt_preparer.prepare_prompt(prompt, offload_params=offload_params)
             )
         except Exception as error:  # pylint: disable=broad-except
-            logging.exception("prompt preparation failed for request %s", request_id)
-            offload_params = dict(offload_params or {})
-            offload_params[_PROMPT_PREPARATION_ERROR_FIELD] = f"{type(error).__name__}: {error}"
-        if isinstance(prompt, torch.Tensor):
-            prompt = prompt.tolist()
-        prepared = list(message)
-        prepared[0] = msgpack.packb(
-            [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta, offload_params],
-            use_bin_type=True,
-        )
-        prepared[1] = msgpack.packb(prompt, use_bin_type=True)
-        return prepared
+            logger.exception("prompt preparation failed for request %s", request_id)
+            # The original prompt and params came off the wire, so they pack safely.
+            failed_params = dict(offload_params) if isinstance(offload_params, dict) else {}
+            failed_params[_PROMPT_PREPARATION_ERROR_FIELD] = f"{type(error).__name__}: {error}"
+            return _pack(prompt, failed_params)
 
     async def shutdown(self):
         """Shut down the engine and clean up ZMQ resources.
