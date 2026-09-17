@@ -27,14 +27,6 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
-def _make_grouped_mlp_shell():
-    """An ordinary expert module whose linears will be supplied by the test."""
-    module = TEGroupedMLP.__new__(TEGroupedMLP)
-    torch.nn.Module.__init__(module)
-    module._virtual_experts = None
-    return module
-
-
 def test_op_fuser_transformer_config_args_are_exposed():
     parser = argparse.ArgumentParser()
     _add_network_size_args(parser)
@@ -158,7 +150,9 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
     )
     monkeypatch.setattr(experts_module, "te", fake_te)
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._virtual_experts = None
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=16,
         delay_wgrad_compute=False,
@@ -216,7 +210,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
             self.args = args
             return args[0] + 1
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
     # `_fused_forward` calls `skip_routed_expert_padding(config)` (added by PR 4071), which
     # reads `moe_token_dispatcher_type` and `moe_flex_dispatcher_backend` after the
     # `moe_router_padding_for_quantization` short-circuit fails.
@@ -294,7 +288,8 @@ def test_apply_bias_combines_packed_grouped_bias_and_accumulates_gradient():
 
 
 def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
     fc1_child = torch.nn.Linear(2, 2)
     fc2_child = torch.nn.Linear(2, 2)
     module.linear_fc1 = torch.nn.Sequential(fc1_child)
@@ -321,7 +316,8 @@ def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
 
 
 def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
     fc1_child = torch.nn.Linear(2, 2)
     module.linear_fc1 = torch.nn.Sequential(fc1_child)
     module.linear_fc2 = torch.nn.Sequential(torch.nn.Linear(2, 2))
@@ -342,7 +338,8 @@ def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad
             self.weight = torch.nn.Parameter(torch.ones(2, 2))
             self.bias = torch.nn.Parameter(torch.zeros(2))
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
     module.linear_fc1 = FakeGroupedLinear(fuse_wgrad_accumulation=True)
     module.linear_fc2 = FakeGroupedLinear(fuse_wgrad_accumulation=False)
 
@@ -425,7 +422,9 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     )
     monkeypatch.setattr(experts_module, "te", fake_te)
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._virtual_experts = None
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=8,
         delay_wgrad_compute=False,
@@ -575,7 +574,9 @@ def test_make_fused_ops_uses_clamped_qgeglu(
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._virtual_experts = None
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
@@ -614,7 +615,9 @@ def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch)
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._virtual_experts = None
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -648,7 +651,9 @@ def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch)
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._virtual_experts = None
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -702,7 +707,8 @@ def _make_fused_impl_support_module(
     use_fused_weighted_squared_relu=False,
     activation_func_clamp_value=None,
 ):
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
     module.config = SimpleNamespace(
         activation_func=activation_func,
         activation_func_clamp_value=activation_func_clamp_value,
@@ -855,7 +861,9 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._virtual_experts = None
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=2,
         delay_wgrad_compute=False,
@@ -929,7 +937,8 @@ def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
     fc2_op = _Recorder("fc2")
     fake_seq = _FakeSequential([fc1_op, activation_op, fc2_op])
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
     module._with_fused_impl = True
     module._fused_ops = (fake_seq,)
     module.linear_fc1 = _FakeWrapper("fc1_wrapper")
@@ -960,7 +969,8 @@ def test_backward_dw_falls_back_to_wrappers_when_delay_wgrad_off():
         def backward_dw(self):
             self.backward_dw_calls += 1
 
-    module = _make_grouped_mlp_shell()
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
     module._with_fused_impl = True
     module._fused_ops = None
     module.linear_fc1 = _FakeWrapper()
