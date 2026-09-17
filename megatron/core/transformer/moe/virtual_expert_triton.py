@@ -7,9 +7,9 @@ computes the deterministic virtual-expert placement and maps every route to its 
 writing HybridEP's inputs in one cooperative launch. The transport kernels move only weights and
 gradients: owners push weights straight into their peers' virtual-expert slots in symmetric memory
 and pull the virtual-expert gradients back into native wgrad staging. Within the reserved SM budget
-only TMA saturates NVLink, so both are ``tl.make_tensor_descriptor`` copies over runtime peer
-addresses under Triton's loop pipeliner. Ordering against the expert GEMMs is stream order plus the
-layer's collectives: the planner's exchange precedes every push and the reduction's rendezvous
+TMA reads feed coalesced peer stores for weight pushes; gradient returns use tensor-descriptor
+peer reads under Triton's loop pipeliner. Ordering against the expert GEMMs is stream order plus
+the layer's collectives: the planner's exchange precedes every push and the reduction's rendezvous
 brackets every gradient exchange. When native gradients accumulate directly into DDP buffers,
 virtual-expert gradient slots are cleared before the accumulating grouped GEMM; other layouts
 use overwrite semantics for their staging buffers.
@@ -29,10 +29,10 @@ MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
 # Constants a kernel reads must be ``tl.constexpr`` objects (``.value`` on the host).
 # A tiled TMA descriptor caps its innermost box at 256 elements, so a flat stream is
-# addressed as ``[rows, _ROW]``: bytes for the push, gradient elements for the reduction.
+# addressed as ``[rows, _ROW]``: uint64 words for the push, gradient elements for reduction.
 _ROW = tl.constexpr(256)
-# Measured on GB300 at 32 SMs: 32 KiB tiles over four pipeline stages sustain the peer
-# bandwidth both ways; smaller tiles or three stages cost 3-20%, eight stages exceed SMEM.
+# GB300 transport tiles: four pipeline stages sustain peer bandwidth at 32 blocks.
+# Weight pushes keep local TMA reads but use ordinary peer stores to avoid a second descriptor.
 _MAX_TILE_BYTES = 32768
 _MAX_SCALE_TILE_BYTES = 8192
 _NUM_STAGES = tl.constexpr(4)
@@ -50,14 +50,6 @@ PLANNER_PROGRAMS = 32
 _PLANNER_PROGRAMS = tl.constexpr(PLANNER_PROGRAMS)
 # One 128-byte line per flag word of the planner's scratch arena.
 _FLAG_STRIDE = tl.constexpr(32)
-
-
-@triton.jit
-def _emit_on_every_thread(ASM: tl.constexpr, THREADS: tl.constexpr):
-    """Run side-effecting PTX (proxy fences, bulk-group waits) on every thread of the block."""
-    tl.inline_asm_elementwise(
-        ASM, "=r,r", [tl.zeros([THREADS], tl.int32)], dtype=tl.int32, is_pure=False, pack=1
-    )
 
 
 @triton.jit
@@ -537,25 +529,14 @@ def _rendezvous(signal_bases, rank, peers, valid, dummy, LABEL: tl.constexpr):
 
 @triton.jit
 def _cross_rank_barrier(
-    signal_bases,
-    grid_barrier,
-    dummy_signal,
-    rank,
-    WORLD: tl.constexpr,
-    WORLD_POW2: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-    THREADS: tl.constexpr,
+    signal_bases, grid_barrier, dummy_signal, rank, WORLD: tl.constexpr, NUM_SMS: tl.constexpr
 ):
-    """Publish preceding stores and acquire peer stores entirely on device."""
-    # TMA stores complete asynchronously and Triton only waits for their shared-memory reads:
-    # wait for this thread's bulk groups to be performed and order the async proxy before the
-    # generic release below.
-    _emit_on_every_thread(
-        "cp.async.bulk.wait_group 0; fence.proxy.async.global; mov.u32 $0, 0;", THREADS
-    )
+    """Publish ordinary stores and acquire peer writes before subsequent TMA reads."""
+    # Both transports use ordinary stores. The grid release/acquire publishes all blocks'
+    # writes to block 0, whose system-scope handshake publishes them to the peers.
     _grid_sync(grid_barrier, _GRID_SYNC_TAG, NUM_SMS)
     if tl.program_id(0) == 0:
-        peers = tl.arange(0, WORLD_POW2)
+        peers = tl.arange(0, 1 << (WORLD - 1).bit_length())
         _rendezvous(
             signal_bases,
             rank,
@@ -565,9 +546,16 @@ def _cross_rank_barrier(
             LABEL="virtual-expert transport rendezvous stalled",
         )
     _grid_sync(grid_barrier, _GRID_SYNC_TAG, NUM_SMS)
-    # The system-scope acquire above published peer writes through the generic
-    # proxy. Bridge that visibility before a following asynchronous transaction.
-    _emit_on_every_thread("fence.proxy.async.global; mov.u32 $0, 0;", THREADS)
+    # Bridge the system-scope acquire's generic-proxy visibility to subsequent TMA reads.
+    threads = tl.zeros([tl.extra.cuda.num_threads()], tl.int32)
+    tl.inline_asm_elementwise(
+        "fence.proxy.async.global; mov.u32 $0, 0;",
+        "=r,r",
+        [threads],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -589,12 +577,13 @@ def _push_fc_layer(
 ):
     """Push this block's share of one component into every virtual-expert slot.
 
-    Both descriptors span a whole member and stay fixed across the tile loop.
-    That is a requirement, not a convenience: Triton cannot predicate a descriptor
-    construction, so one built inside the pipelined loop would refuse to compile.
+    TMA reads feed coalesced uint64 stores to the peer without converting BF16/MXFP8
+    bytes. Build the source descriptor outside the pipeline: Triton cannot predicate
+    descriptor construction. Four stages balance bandwidth and shared-memory use.
     """
-    ROWS: tl.constexpr = MEMBER_BYTES // _ROW
-    TILE_ROWS: tl.constexpr = TILE_BYTES // _ROW
+    ROW: tl.constexpr = min(_ROW, TILE_BYTES // 8)
+    ROWS: tl.constexpr = MEMBER_BYTES // 8 // ROW
+    TILE_ROWS: tl.constexpr = TILE_BYTES // 8 // ROW
     TILES: tl.constexpr = ROWS // TILE_ROWS
     # Cut each virtual-expert into as many segments as it takes to occupy the grid, and
     # give every block one contiguous run. Striping every virtual-expert across every
@@ -613,16 +602,13 @@ def _push_fc_layer(
         expert = tl.load(plan + chosen) - rank * NUM_LOCAL_EXPERTS
         arena = tl.load(peer_bases.to(tl.pointer_type(tl.int64)) + destination)
         source = tl.make_tensor_descriptor(
-            tl.load(bases + expert).to(tl.pointer_type(tl.uint8)),
-            [ROWS, _ROW],
-            [_ROW, 1],
-            [TILE_ROWS, _ROW],
+            tl.load(bases + expert).to(tl.pointer_type(tl.uint64)),
+            [ROWS, ROW],
+            [ROW, 1],
+            [TILE_ROWS, ROW],
         )
-        virtual_expert_slot = tl.make_tensor_descriptor(
-            (arena + ARENA_BYTES + slot * MEMBER_BYTES).to(tl.pointer_type(tl.uint8)),
-            [ROWS, _ROW],
-            [_ROW, 1],
-            [TILE_ROWS, _ROW],
+        destination_base = tl.multiple_of(arena + ARENA_BYTES + slot * MEMBER_BYTES, 16).to(
+            tl.pointer_type(tl.uint64)
         )
         for tile in tl.range(
             segment * TILES // segments,
@@ -631,7 +617,11 @@ def _push_fc_layer(
             num_stages=_NUM_STAGES,
         ):
             row = tile * TILE_ROWS
-            virtual_expert_slot.store([row, 0], source.load([row, 0]))
+            values = source.load([row, 0])
+            offsets = (row + tl.arange(0, TILE_ROWS)[:, None]).to(tl.int64) * ROW + tl.arange(
+                0, ROW
+            )[None, :]
+            tl.store(destination_base + offsets, values)
 
 
 # ``rank`` must not be specialized: Triton would otherwise compile one kernel per rank value.
@@ -655,10 +645,7 @@ def _virtual_expert_weight_push_kernel(
     SCALE_TILE_BYTES: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
-    WORLD_POW2: tl.constexpr,
-    PLAN_POW2: tl.constexpr,
     NUM_SMS: tl.constexpr,
-    THREADS: tl.constexpr,
 ):
     """Push every owner-local expert into its virtual-expert slots and rendezvous.
 
@@ -673,7 +660,7 @@ def _virtual_expert_weight_push_kernel(
     FC1_SCALE_ARENA: tl.constexpr = NUM_LOCAL_EXPERTS * FC1_BYTES
     FC2_ARENA: tl.constexpr = FC1_SCALE_ARENA + NUM_LOCAL_EXPERTS * FC1_SCALE_BYTES
     FC2_SCALE_ARENA: tl.constexpr = FC2_ARENA + NUM_LOCAL_EXPERTS * FC2_BYTES
-    entry = tl.arange(0, PLAN_POW2)
+    entry = tl.arange(0, 1 << (WORLD * NUM_LOCAL_EXPERTS - 1).bit_length())
     planned = entry < WORLD * NUM_LOCAL_EXPERTS
     owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_EXPERTS
     mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_EXPERTS)
@@ -681,30 +668,25 @@ def _virtual_expert_weight_push_kernel(
     active = tl.sum(mine.to(tl.int32), 0)
     block = tl.program_id(0)
 
-    # One bulk-copy engine per block serves every component, so the much smaller
-    # scale transfers follow the data rather than competing with it.
-    # fmt: off
-    _push_fc_layer(
-        fc1_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-        FC1_BYTES, 0, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+    # Unroll data first, then scales: small scale transfers must not compete with data.
+    bases = (fc1_bases, fc2_bases, fc1_scale_bases, fc2_scale_bases)
+    # (member bytes, arena byte offset, tile bytes); keep geometry compile-time.
+    components: tl.constexpr = (
+        (FC1_BYTES, 0, TILE_BYTES),
+        (FC2_BYTES, FC2_ARENA, TILE_BYTES),
+        (FC1_SCALE_BYTES, FC1_SCALE_ARENA, SCALE_TILE_BYTES),
+        (FC2_SCALE_BYTES, FC2_SCALE_ARENA, SCALE_TILE_BYTES),
     )
-    _push_fc_layer(
-        fc2_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-        FC2_BYTES, FC2_ARENA, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
-    )
-    if FC1_SCALE_BYTES > 0:
-        _push_fc_layer(
-            fc1_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-            FC1_SCALE_BYTES, FC1_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
-        )
-        _push_fc_layer(
-            fc2_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
-            FC2_SCALE_BYTES, FC2_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
-        )
-    # fmt: on
-    _cross_rank_barrier(
-        signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
-    )
+    for component in tl.static_range(len(components)):
+        if components[component][0] > 0:
+            # fmt: off
+            _push_fc_layer(
+                bases[component], plan, peer_bases, entry, mine, ordinal, active, block, rank,
+                components[component][0], components[component][1], components[component][2],
+                NUM_LOCAL_EXPERTS, NUM_SMS,
+            )
+            # fmt: on
+    _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
 
 
 @triton.jit
@@ -740,10 +722,7 @@ def _virtual_expert_grad_reduce_kernel(
     TILE_END: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
-    WORLD_POW2: tl.constexpr,
-    PLAN_POW2: tl.constexpr,
     NUM_SMS: tl.constexpr,
-    THREADS: tl.constexpr,
 ):
     """Reduce every peer's virtual-expert gradients into native wgrad staging.
 
@@ -762,12 +741,11 @@ def _virtual_expert_grad_reduce_kernel(
     proves every owner has read, so a peer may rewrite its slots on the next backward.
     """
     FC1_TILES: tl.constexpr = FC1_ROWS // TILE_ROWS
-    TILES: tl.constexpr = FC1_TILES + FC2_ROWS // TILE_ROWS
     FC2_BASE_ROW: tl.constexpr = NUM_LOCAL_EXPERTS * FC1_ROWS
     ARENA_ROWS: tl.constexpr = NUM_LOCAL_EXPERTS * (FC1_ROWS + FC2_ROWS)
     block = tl.program_id(0)
 
-    entry = tl.arange(0, PLAN_POW2)
+    entry = tl.arange(0, 1 << (WORLD * NUM_LOCAL_EXPERTS - 1).bit_length())
     planned = entry < WORLD * NUM_LOCAL_EXPERTS
     owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_EXPERTS
     mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_EXPERTS)
@@ -802,9 +780,7 @@ def _virtual_expert_grad_reduce_kernel(
         [(tl.load(bases + 1) - base) // ELEMENT_BYTES, _ROW, 1],
         [1, TILE_ROWS, _ROW],
     )
-    _cross_rank_barrier(
-        signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
-    )
+    _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
     materialized = tl.load(virtual_experts + NUM_LOCAL_EXPERTS)
 
     low = TILE_BEGIN + block * (TILE_END - TILE_BEGIN) // NUM_SMS
@@ -819,13 +795,13 @@ def _virtual_expert_grad_reduce_kernel(
             tile = low + work // count
             index = work - (tile - low) * count
             chosen = tl.load(sources + expert * WORLD + index)
-            destination = chosen // NUM_LOCAL_EXPERTS
+            peer = chosen // NUM_LOCAL_EXPERTS
             second = tile >= FC1_TILES
             tile_row = (tile - tl.where(second, FC1_TILES, 0)) * TILE_ROWS
             # The peer's arena stores every FC1 member first, then every FC2 member.
             row = (
                 tl.where(second, FC2_BASE_ROW, 0)
-                + (chosen - destination * NUM_LOCAL_EXPERTS) * tl.where(second, FC2_ROWS, FC1_ROWS)
+                + (chosen - peer * NUM_LOCAL_EXPERTS) * tl.where(second, FC2_ROWS, FC1_ROWS)
                 + tile_row
             )
             native = tl.where(second, fc2, fc1) + tile_row * _ROW
@@ -836,13 +812,11 @@ def _virtual_expert_grad_reduce_kernel(
             # summation order ``native + s0 + s1 + ...``.
             offset = tl.arange(0, TILE_ROWS)[None, :, None].to(tl.int64) * _ROW + tl.arange(0, _ROW)
             staged = tl.load(native + offset).to(tl.float32)
-            partial = tl.where(index == 0, staged, partial) + window.load([destination, row, 0]).to(
+            partial = tl.where(index == 0, staged, partial) + window.load([peer, row, 0]).to(
                 tl.float32
             )
             tl.store(native + offset, partial.to(arena.dtype.element_ty), mask=index == count - 1)
-    _cross_rank_barrier(
-        signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
-    )
+    _cross_rank_barrier(signal_bases, grid_barrier, dummy_signal, rank, WORLD, NUM_SMS)
 
 
 def _transport_tile(limit: int, *components: int) -> int:
@@ -856,7 +830,9 @@ def _transport_tile(limit: int, *components: int) -> int:
     return tile
 
 
-def _check_table(tensor: torch.Tensor, dtype: torch.dtype, shape: tuple, what: str):
+def _check_table(
+    tensor: torch.Tensor, dtype: torch.dtype, shape: tuple[int, ...], what: str
+) -> torch.Tensor:
     """Validate a kernel input table (pointer tables are int64 ``[L]``, plans int32 ``[W, L]``)."""
     if tensor.dtype != dtype or tuple(tensor.shape) != shape or not tensor.is_contiguous():
         raise ValueError(
@@ -933,10 +909,7 @@ def launch_virtual_expert_weight_prefetch(
         SCALE_TILE_BYTES=(_transport_tile(_MAX_SCALE_TILE_BYTES, *scale_bytes) if mxfp8 else 0),
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
-        WORLD_POW2=triton.next_power_of_2(world_size),
-        PLAN_POW2=triton.next_power_of_2(world_size * num_local_experts),
         NUM_SMS=num_sms,
-        THREADS=32 * _PUSH_NUM_WARPS,
         num_warps=_PUSH_NUM_WARPS,
         launch_cooperative_grid=True,
     )
@@ -990,10 +963,7 @@ def launch_virtual_expert_grad_reduce(
         TILE_END=fc1_tiles + fc2_tiles if 1 in fc_layers else fc1_tiles,
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
-        WORLD_POW2=triton.next_power_of_2(world_size),
-        PLAN_POW2=triton.next_power_of_2(world_size * num_local_experts),
         NUM_SMS=num_sms,
-        THREADS=32 * _GRAD_NUM_WARPS,
         num_warps=_GRAD_NUM_WARPS,
         launch_cooperative_grid=True,
     )
