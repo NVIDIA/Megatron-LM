@@ -46,10 +46,19 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
+from megatron.core.post_training.modelopt.checkpointing import (
+    save_modelopt_state,
+    save_sharded_modelopt_state,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    grant_shape_mismatch_for_gtp_padding,
+    resolve_gtp_pad_for_alignment,
+    unwrap_model,
+)
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
@@ -1273,6 +1282,8 @@ def save_tokenizer_assets(
     tokenizer: MegatronTokenizer,
     config: TokenizerConfig,
     checkpoint_path: str,
+    *,
+    raise_on_error: bool = False,
 ) -> None:
     """Save tokenizer files to the checkpoint directory.
 
@@ -1284,6 +1295,7 @@ def save_tokenizer_assets(
         tokenizer: The tokenizer instance to save.
         config: Tokenizers config.
         checkpoint_path: The checkpoint directory path.
+        raise_on_error: Propagate tokenizer persistence errors to the caller.
     """
     if tokenizer is None:
         return
@@ -1402,6 +1414,8 @@ def save_tokenizer_assets(
             import traceback
 
             logger.error(traceback.format_exc())
+        if raise_on_error:
+            raise
 
 
 @_disable_gc()
@@ -1966,6 +1980,15 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
+
+    # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
+    # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
+    gtp_pad_for_alignment = resolve_gtp_pad_for_alignment(
+        fp4=getattr(args, 'fp4', None) is not None,
+        fp8_recipe=getattr(args, 'fp8_recipe', None),
+        fp8=getattr(args, 'fp8', None) is not None,
+    )
+    grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
         checkpoint_name,
@@ -2327,6 +2350,13 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_router_topk_scaling_factor', force=True)
     _set_arg('moe_hybridep_routing_map_mode', force=False)
 
+    # ScMoE shortcut-connection args. Both of these change the parameter set: every shortcut pair
+    # owns an extra pre-MLP norm, and moe_shortcut_post_norm adds a second norm per pair, so they
+    # must follow the checkpoint. moe_shortcut_parallel is deliberately not restored; it only
+    # selects the all-to-all overlap schedule and should stay under launch-time control.
+    _set_arg('moe_shortcut_connection', force=True)
+    _set_arg('moe_shortcut_post_norm', force=True)
+
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
     _set_arg('mamba_head_dim', force=True)
@@ -2406,6 +2436,10 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         return False
 
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
+    if not vars(ckpt_args):
+        # Checkpoints imported by Megatron Bridge may omit training args entirely.
+        # Without explicit source-model metadata, keep the regular loading path.
+        return None, False
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
     )
@@ -3070,7 +3104,33 @@ def load_checkpoint(
                 'exiting ...'.format(checkpoint_name)
             )
             raise e
+
+        # Quantized weights are stored dequantized to BF16 with no block scales, so loading
+        # them re-quantizes a value that has already been through one quantization round
+        # trip, while a training step quantizes the main weights. Same quantizer, different
+        # input, so for MXFP8 the block scales do not come back the same. Recover the compute
+        # weights from the main weights in the optimizer state instead. Reaching here already
+        # implies they were loaded: the enclosing block excludes --no-load-optim, --finetune
+        # and release checkpoints, and the load above re-raises on failure.
+        if (
+            not skip_load_to_model_and_opt
+            and optimizer is not None
+            and not getattr(optimizer, 'is_stub_optimizer', False)
+            and (
+                getattr(args, 'fp8_param_gather', False)
+                or getattr(args, 'fp4_param_gather', False)
+            )
+        ):
+            optimizer.quantize_and_sync_model_params_from_main_params()
     else:
+        if getattr(args, 'fp8_param_gather', False) or getattr(args, 'fp4_param_gather', False):
+            print_rank_0(
+                'WARNING: quantized params were loaded without the optimizer main params, so '
+                'they were re-quantized from the dequantized values in the checkpoint rather '
+                'than re-derived from the main params. The block scales need not match the '
+                'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
+                'identical to those saved. Load the optimizer state to avoid this.'
+            )
         if (args.fp16 or args.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)

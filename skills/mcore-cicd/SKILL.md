@@ -24,6 +24,11 @@ For PR-label or trigger questions, lead with the exact values:
   for a container or dependency change.**
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
 - `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite.
+- `Run selective unit tests` requests Testmon-based unit-test selection for an
+  eligible synthetic PR push. It restores a compatible shared baseline from
+  `main`; PRs never record or save Testmon databases. A missing or invalid cache
+  or selection failure runs the full bucket. `populate-build-cache.yml` records
+  fresh baselines every six hours and supports manual dispatch from `main`.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
   `pull-request/<branch>`. Always run with `--dry-run` first and confirm the
@@ -39,7 +44,7 @@ For PR-label or trigger questions, lead with the exact values:
 
 The main workflow is `.github/workflows/cicd-main.yml`. It triggers on pushes
 to branches matching `pull-request/[0-9]+` and `deploy-release/*`, on merge
-groups, on a daily schedule, and on manual dispatch.
+groups, and on manual dispatch.
 
 ```text
 is-not-external-contributor
@@ -80,6 +85,10 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
 | **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite |
+| **`Run selective unit tests`** | Restore a compatible shared main baseline and select unit tests. Missing/incompatible caches, full-test labels, forced runs, LTS, and merge queue validation use the full unit-test path. PRs never generate or save a baseline. |
+
+Adding a label does not itself start `cicd-main.yml`; apply it before the next
+synthetic PR push or rerun the workflow after applying it.
 
 ### Which label to attach when opening a PR
 
@@ -95,8 +104,6 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` (add `container::lts` **only if the user explicitly asks** to validate LTS) |
 | Touches MBridge integration | add `Run MBridge tests` |
 | Could affect NeMo RL's Megatron integration | add `Run NeMoRL tests` |
-
-**Rule of thumb:** default to `Run tests`. Always use `Run functional tests` when the PR adds new test cases (golden values must be generated) or when the change could plausibly shift loss curves.
 
 ---
 

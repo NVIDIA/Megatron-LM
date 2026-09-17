@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import warnings
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
@@ -15,10 +15,9 @@ from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layo
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -61,11 +60,6 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
-
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-else:
-    TESpecProvider = None
 
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -284,28 +278,42 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
     prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
 
-    # Start send and recv ops
+    # Keep each boundary exchange on its CP communicator. Using the default WORLD
+    # communicator couples otherwise independent DP lanes and can deadlock when
+    # packed batches issue different P2P sequences.
     ops = []
     if local_rank != 0:
-        req_send_first_part = torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank)
-        ops.append(req_send_first_part)
-        req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
-        ops.append(req_recv_second_part)
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
+            )
+        )
     else:
         # Inserted elements are set to be 0.0.
         tensor_recv_list[1] = 0
     if local_rank != len(global_ranks) - 1:
-        req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
-        ops.append(req_recv_first_part)
-        req_send_second_part = torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank)
-        ops.append(req_send_second_part)
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
+            )
+        )
     else:
         # For the last CP rank, the removed elements of second part go into the first part
         tensor_recv_list[0] = tensor_send_list[1]
 
     # Wait for all communication operations to complete
-    for op in ops:
-        op.wait()
+    for request in torch.distributed.batch_isend_irecv(ops):
+        request.wait()
 
     # Splicing: Replace boundary elements with received elements from adjacent ranks
     # This ensures proper sequence continuity across CP boundaries
@@ -404,19 +412,35 @@ def _roll_tensor_packed_seq(
 
         ops = []
         if local_rank != 0:
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
+                )
+            )
         else:
             tensor_recv_list[1].zero_()
 
         if local_rank != cp_size - 1:
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
+                )
+            )
         else:
             tensor_recv_list[0].copy_(tensor_send_list[1])
 
-        for op in ops:
-            op.wait()
+        for request in torch.distributed.batch_isend_irecv(ops):
+            request.wait()
 
         index = [slice(None)] * rolled_chunks[0].dim()
         index[dims] = shifts
@@ -761,7 +785,7 @@ class MultiTokenPredictionLayerSubmodules:
 
 
 def get_mtp_layer_spec(
-    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool
+    mtp_model_layer_spec: ModuleSpec, use_transformer_engine: bool, rms_norm: bool = False
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -770,20 +794,25 @@ def get_mtp_layer_spec(
     """
     return get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec,
-        backend=TESpecProvider() if use_transformer_engine else LocalSpecProvider(),
+        backend=get_backend("transformer_engine" if use_transformer_engine else "local"),
+        rms_norm=rms_norm,
     )
 
 
 def get_mtp_layer_spec_for_backend(
-    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider, rms_norm: bool = False
 ) -> ModuleSpec:
     """Get the MTP layer spec.
+
+    Args:
+        rms_norm: whether the model uses RMSNorm. Must match ``config.normalization``: a
+            backend may answer with a LayerNorm-only kernel that refuses an RMSNorm config.
 
     Returns:
         ModuleSpec: Module specification with modules from the backend.
     """
     column_parallel_linear_impl: type = backend.column_parallel_linear()
-    layer_norm_impl = backend.layer_norm()
+    layer_norm_impl = backend.layer_norm(rms_norm=rms_norm)
     mtp_layer_spec = ModuleSpec(
         module=MultiTokenPredictionLayer,
         submodules=MultiTokenPredictionLayerSubmodules(
@@ -1313,6 +1342,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 "skip_bias_add": False,
                 "is_expert": False,
                 "tp_group": pg_collection.tp if pg_collection is not None else None,
+                # Pass the collection, not just tp: the linear reads its GTP axis from it.
+                # With only tp_group it falls back to the MPU globals, which a MIMO run
+                # never creates, and the projection is then silently built unsharded.
+                "pg_collection": pg_collection,
             }
             self.e_proj = build_module(
                 self.submodules.e_proj,
@@ -1345,6 +1378,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_expert=False,
                 tp_comm_buffer_name="mtp_eh_proj",
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                # Same reason as projection_kwargs above: the GTP axis comes from the
+                # collection, and tp_group alone leaves it to the MPU fallback.
+                pg_collection=pg_collection,
                 name=(name + ".eh_proj") if name is not None else None,
             )
             self.e_proj = None
@@ -1426,6 +1462,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 setattr(self.hc_head_base, "sequence_parallel", True)
                 setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
+
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained MTP execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            return get_fp8_context(self.config)
+
+        # FP4 in MTP layers still needs numerical validation.
+        return nullcontext()
 
     def _get_embeddings(
         self,
@@ -1747,8 +1791,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
     ):
-        """Forward through ``_proj_and_transformer_layer`` with activation
-        recomputation.
+        """Forward a legacy GPT MTP layer with activation recomputation.
 
         Mirrors ``transformer_block._checkpointed_forward``:
 
@@ -1760,6 +1803,10 @@ class MultiTokenPredictionLayer(MegatronModule):
           context entered before ``te_checkpoint``; see the
           ``outer_quantization_context`` block below.
         """
+
+        assert (
+            self.mtp_layer_pattern is None
+        ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
 
         def custom_forward(
             hidden_states,
@@ -1947,7 +1994,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
         )
 
-        if self.config.recompute_granularity == 'full' and self.training:
+        # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
+        # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
+        # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
+        use_outer_recompute = (
+            self.config.recompute_granularity == 'full'
+            and self.training
+            and self.mtp_layer_pattern is None
+        )
+        if use_outer_recompute:
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -2164,6 +2219,13 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
+
+        if self.mtp_use_repeated_layer:
+            # One layer object, called once per MTP depth, every call adding into the same
+            # main_grad. A True would make one of those calls overwrite instead of add.
+            for m in self.layers.modules():
+                if hasattr(m, 'is_first_microbatch'):
+                    m.is_repeated_layer = True
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)

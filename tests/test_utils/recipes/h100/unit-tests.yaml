@@ -61,9 +61,13 @@ spec:
     ls -al 
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml 
-    cp .coverage {assets_dir}/coverage_report
-    cp coverage.xml {assets_dir}
+    if [[ -f .coverage ]]; then
+        /opt/venv/bin/coverage xml
+        cp .coverage {assets_dir}/coverage_report
+        cp coverage.xml {assets_dir}
+    else
+        echo "No unit-test coverage data was produced; skipping coverage export."
+    fi
 
 products:
   - test_case: [tests/unit_tests/test_model_configs.py]
@@ -294,6 +298,15 @@ products:
     products:
       # tag: [latest] only — this directory is new in this PR, so legacy
       # CI refs (/opt/megatron-lm-legacy/) don't have the path yet.
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/determinism/kernels/**/*.py]
+    products:
+      # Operator-level bit-exact kernel tests. tag: [latest] only for the same
+      # reason as correctness/ above.
       - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]

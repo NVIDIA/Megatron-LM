@@ -10,6 +10,7 @@ import torch
 import megatron.core.transformer.moe.moe_utils as moe_utils
 import megatron.core.transformer.moe.router as router_module
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias,
@@ -693,7 +694,7 @@ class TestAuxLossFreeTop2Router:
         finally:
             torch.use_deterministic_algorithms(previous_deterministic)
 
-        expected = torch.tensor([2, 0, 1, 1, 0, 1, 0, 1], device="cuda", dtype=torch.float32)
+        expected = torch.tensor([2, 0, 1, 1, 0, 1, 0, 1], device="cuda", dtype=torch.int64)
         torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
 
     @pytest.mark.internal
@@ -724,8 +725,27 @@ class TestAuxLossFreeTop2Router:
         expected = torch.bincount(
             topk_indices[~padding_mask.reshape(-1)].reshape(-1),
             minlength=self.router.config.num_moe_experts,
-        ).to(torch.float32)
+        ).to(self.router.local_tokens_per_expert.dtype)
         torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_update_preserves_large_integer_count_ordering(self):
+        counts = torch.tensor([2**24 + 1, 2**24], dtype=torch.int64, device="cuda")
+        bias = torch.zeros(2, dtype=torch.float32, device="cuda")
+
+        updated_bias = get_updated_expert_bias(
+            counts, bias, self.router.config.moe_router_bias_update_rate
+        )
+
+        expected = torch.tensor([-0.1, 0.1], dtype=torch.float32, device="cuda")
+        torch.testing.assert_close(updated_bias, expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_token_counts_survive_float16_module(self):
+        wrapped = Float16Module(self.transformer_config, self.moe_layer.cuda())
+        router = cast(Router, wrapped.module.router)
+
+        assert router.local_tokens_per_expert.dtype == torch.int64
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -879,3 +899,24 @@ def test_topk_routing_precomputed_indices_equivalence(score_function, use_pre_so
     )
     expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, alt_indices, True)
     assert torch.equal(map_alt, expected_map)
+
+
+def test_moe_router_aux_loss_fusion_defaults_to_router_fusion():
+    """Unset resolves to moe_router_fusion; an explicit value is left alone."""
+    kwargs = dict(num_layers=1, hidden_size=8, num_attention_heads=1, num_moe_experts=4)
+
+    for routing in (False, True):
+        config = TransformerConfig(moe_router_fusion=routing, **kwargs)
+        assert config.moe_router_aux_loss_fusion is routing
+
+    for routing, aux in ((True, False), (False, True)):
+        config = TransformerConfig(
+            moe_router_fusion=routing, moe_router_aux_loss_fusion=aux, **kwargs
+        )
+        assert config.moe_router_aux_loss_fusion is aux
+
+    # Resolving at construction means the value is concrete afterwards, so a child built
+    # by dataclasses.replace inherits it rather than re-deriving from its own flag.
+    parent = TransformerConfig(moe_router_fusion=False, **kwargs)
+    child = dataclasses.replace(parent, moe_router_fusion=True)
+    assert child.moe_router_aux_loss_fusion is False

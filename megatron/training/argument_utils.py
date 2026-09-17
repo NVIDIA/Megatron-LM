@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -345,8 +345,25 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+
+        pattern = args.hybrid_layer_pattern
+        has_dsv4_attention = any(
+            symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
+        )
+        variant = getattr(args, 'experimental_attention_variant', None)
+        if has_dsv4_attention:
+            if variant not in (None, 'dsv4_hybrid'):
+                raise ValueError(
+                    "Hybrid C/H/W attention requires experimental_attention_variant='dsv4_hybrid', "
+                    f"got {variant!r} for pattern {pattern!r}."
+                )
+            kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+        elif variant is None and Symbols.DS_ATTENTION in pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
+
+        from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -463,6 +480,7 @@ def gpt_config_from_args(
     kwargs["rotary_base"] = args.rotary_base
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
     kwargs["rope_scaling"] = args.use_rope_scaling
+    kwargs["rope_scaling_factor"] = args.rope_scaling_factor
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings
@@ -505,7 +523,10 @@ def hybrid_config_from_args(
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
-        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+        hybrid_stack_spec = import_module(args.spec)
+        if not isinstance(hybrid_stack_spec, ModuleSpec):
+            raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
+        kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
