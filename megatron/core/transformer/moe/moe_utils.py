@@ -280,8 +280,8 @@ def get_tokens_per_expert_and_token_count(
         local_tokens_per_expert, reduce_group
     )
     if with_padding_mask:
-        local_num_tokens = local_tokens_per_expert.sum() / topk
-        total_num_tokens = global_tokens_per_expert.sum() / topk
+        local_num_tokens = local_tokens_per_expert.sum() // topk
+        total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
         local_num_tokens = routing_map.shape[0]
         total_num_tokens = local_num_tokens * reduce_group.size()
