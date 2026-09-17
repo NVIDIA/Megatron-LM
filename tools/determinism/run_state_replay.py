@@ -13,7 +13,12 @@ import sys
 import uuid
 from pathlib import Path
 
-from tools.determinism.training_state import compare_runs
+from tools.determinism.training_state import (
+    UnverifiedState,
+    capture_configuration,
+    compare_runs,
+    snapshot_path,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -35,14 +40,41 @@ def _run_worker(command: list[str], env: dict, log) -> int:
             raise
 
 
+def _verify_stop_point(directory: Path, world_size: int, capture: dict) -> None:
+    """Require only the target snapshot, not a subset of per-step instrumentation."""
+    expected = {
+        snapshot_path(directory, capture["stop_step"], rank).with_suffix(suffix)
+        for rank in range(world_size)
+        for suffix in (".json", ".bin")
+    }
+    actual = {path for path in directory.glob("step-*/*") if path.is_file()}
+    if actual != expected or any(path.is_symlink() for path in expected):
+        raise UnverifiedState(f"Stop-point snapshot inventory differs: {directory}")
+    for rank in range(world_size):
+        completion = json.loads((directory / f"complete-rank-{rank:06d}.json").read_text())
+        if (
+            completion["steps"] != [capture["stop_step"]]
+            or completion["provenance"]["recipe"].get("capture") != capture
+        ):
+            raise UnverifiedState(f"Missing or incompatible stop-point declaration: {directory}")
+
+
 def run_protocol(
-    output: Path, *, backend: str, world_size: int, steps: int, checkpoint_step: int, control: str
+    output: Path,
+    *,
+    backend: str,
+    world_size: int,
+    steps: int,
+    checkpoint_step: int,
+    control: str,
+    stop_step: int | None = None,
 ) -> dict:
     """Run two independent trainings, a resume, and a deliberately broken resume.
 
     The output must be new. Raw state, command lines, checkpoint identity and
     worker logs remain available when a comparison or child process fails.
     """
+    capture = capture_configuration(steps, checkpoint_step, stop_step)
     if backend not in ("cpu", "mcore_gpt", "megatron_gpt") or world_size not in (1, 2, 4, 8):
         raise ValueError("Unsupported backend or world size")
     if backend == "cpu" and world_size != 1:
@@ -66,6 +98,7 @@ def run_protocol(
         "steps": steps,
         "checkpoint_step": checkpoint_step,
         "control_injection": f"omit_restore_{control}",
+        "capture": capture,
     }
     worker_env = dict(os.environ)
     for key in list(worker_env):
@@ -111,6 +144,8 @@ def run_protocol(
                 "--checkpoint-step",
                 str(checkpoint_step),
             ]
+            if stop_step is not None:
+                command += ["--stop-step", str(stop_step)]
             if name in ("resume", "control"):
                 command += ["--resume", str(output / "reference")]
             if name == "control":
@@ -121,10 +156,13 @@ def run_protocol(
             if exit_code:
                 result.update(reason=f"{name} worker failed", exit_code=exit_code)
                 return result
+        if stop_step is not None:
+            for name in ("reference", "repeat", "resume", "control"):
+                _verify_stop_point(output / name, world_size, capture)
         result["fresh"] = compare_runs(
             output / "reference",
             output / "repeat",
-            steps=list(range(1, steps + 1)),
+            steps=[stop_step] if stop_step is not None else list(range(1, steps + 1)),
             world_size=world_size,
             comparison="fresh",
         )
@@ -132,7 +170,11 @@ def run_protocol(
             result[name] = compare_runs(
                 output / "reference",
                 output / name,
-                steps=list(range(checkpoint_step + 1, steps + 1)),
+                steps=(
+                    [stop_step]
+                    if stop_step is not None
+                    else list(range(checkpoint_step + 1, steps + 1))
+                ),
                 world_size=world_size,
                 comparison="resume",
             )
@@ -149,11 +191,59 @@ def run_protocol(
         else:
             result.update(status="failed", reason="Replay/resume mismatch or insensitive control")
         return result
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
         result["reason"] = str(error)
         return result
     finally:
         (output / "report.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
+def run_stop_points(
+    output: Path,
+    *,
+    backend: str,
+    world_size: int,
+    steps: int,
+    checkpoint_step: int,
+    control: str,
+    stop_steps: list[int],
+) -> dict:
+    """Run a separate four-launch protocol for every selected target step."""
+    if not stop_steps or len(set(stop_steps)) != len(stop_steps):
+        raise ValueError("Require a nonempty list of unique stop steps")
+    for step in stop_steps:
+        capture_configuration(steps, checkpoint_step, step)
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    result: dict = {
+        "kind": "megatron_training_state_stop_points_v1",
+        "status": "not_verified",
+        "backend": backend,
+        "world_size": world_size,
+        "steps": steps,
+        "checkpoint_step": checkpoint_step,
+        "stop_steps": sorted(stop_steps),
+        "control_injection": f"omit_restore_{control}",
+        "targets": [],
+    }
+    try:
+        for step in sorted(stop_steps):
+            target = run_protocol(
+                output / f"stop-{step:08d}",
+                backend=backend,
+                world_size=world_size,
+                steps=steps,
+                checkpoint_step=checkpoint_step,
+                control=control,
+                stop_step=step,
+            )
+            result["targets"].append(target)
+        statuses = {target["status"] for target in result["targets"]}
+        if "not_verified" not in statuses:
+            result["status"] = "passed" if statuses == {"passed"} else "failed"
+    finally:
+        (output / "report.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
 
 
 def main() -> int:
@@ -165,16 +255,21 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
     parser.add_argument(
+        "--stop-steps", type=int, nargs="+", help="Separate runs capturing only each target step"
+    )
+    parser.add_argument(
         "--control", choices=("rng", "optimizer", "scheduler", "dataloader"), default="rng"
     )
     args = parser.parse_args()
-    result = run_protocol(
+    run = run_protocol if args.stop_steps is None else run_stop_points
+    result = run(
         args.output,
         backend=args.backend,
         world_size=args.world_size,
         steps=args.steps,
         checkpoint_step=args.checkpoint_step,
         control=args.control,
+        **({} if args.stop_steps is None else {"stop_steps": args.stop_steps}),
     )
     return {"passed": 0, "failed": 1, "not_verified": 2}[result["status"]]
 

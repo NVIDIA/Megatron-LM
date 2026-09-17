@@ -56,11 +56,50 @@ optimizer, mixed-precision master weights, FP8/FP4 and production data loaders
 need additional adapters and validation. This pilot does not certify those
 paths or the named Nemotron/DSV recipes.
 
-The H100 and GB200 `determinism-state.yaml` recipes each select two jobs: the
+The H100 and GB200 `determinism-state.yaml` recipes each select two per-step jobs: the
 `mcore_gpt` pilot and the `megatron_gpt` training adapter, with eight and four
 ranks respectively. They use the existing integration-test
 selection path; actual scheduling still depends on the CI scope and protected
-runner approval. A configured recipe is not GPU execution evidence.
+runner approval. Each also adds two stop-point jobs to nightly cadence (or an
+explicit cadence bypass), using steps 3 and 5 of a five-step schedule. The normal
+PR selection retains its two existing jobs. A configured recipe is not GPU
+execution evidence.
+
+## Compare selected stop points
+
+Per-step state capture synchronizes the device and copies state to the host.
+To remove that diagnostic work between steps, launch independent protocols
+that each capture only one selected boundary:
+
+```bash
+python -m tools.determinism.run_state_replay \
+  --backend megatron_gpt --world-size 4 \
+  --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
+  --output /tmp/state-stop-points
+```
+
+This runs eight independent worker groups: fresh reference, fresh repeat,
+resume and omitted-restore control for step 3, then four new groups for step 5.
+Every target must follow the checkpoint and be at most `--steps`. Each rank
+must publish exactly one snapshot and completion step; earlier capture files,
+missing ranks, mismatched capture declarations and failed workers are unverified.
+The aggregate passes only when every requested target passes all three comparisons.
+Each resume identifies its own target's reference checkpoint.
+
+`--steps` remains the original training horizon. The real Megatron adapter uses
+`--exit-interval` to stop at the target while preserving `--train-iters`, the
+learning-rate schedule and dataset indexing. It observes the existing exit
+decision and accepts only a successful target-step exit after training cleanup.
+It keeps the original post-step callbacks and checkpoint save/load behavior.
+The TP-only/CPU worker similarly skips diagnostic state collection, explicit
+device synchronization and scalar extraction before the target.
+
+The result is still a scoped diagnostic recipe. Normal logging, callbacks and
+synchronous checkpoints remain, including checkpoint identity checks. These
+runs do not prove an absence of all synchronization, validate unsupported
+overlap modes or reproduce a production recipe's contention. Use the original
+recipe for performance measurements and extend the adapter before making a
+production acceptance claim.
 
 ## Real Megatron training adapter
 
@@ -76,7 +115,8 @@ The diagnostic worker temporarily observes the training module's loader,
 train, checkpoint and post-step callbacks. The callbacks retain their original
 behavior and return values. Capture runs after optimizer/scheduler updates and
 consumed-sample bookkeeping, before checkpoint save and the next zero-grad.
-Successful entrypoint completion and every required step remain mandatory.
+Successful entrypoint completion (or the validated stop-point exit) and every
+required capture remain mandatory.
 
 The optimizer adapter reads each chained optimizer's **inner** state dict and
 local master-parameter groups. The distributed optimizer's outer `state_dict`
@@ -150,6 +190,9 @@ the adapter continues to use Megatron's existing producer/restore path.
 snapshot counts, provenance, and the first differing step, rank and state path.
 Byte differences also report byte offset and, for arrays, flat element index.
 Command lines, worker logs, raw state and checkpoint files remain alongside it.
+In stop-point mode the root report aggregates `stop-00000003/report.json`, etc.;
+each subdirectory retains a complete four-launch protocol. Capture mode, full
+training horizon, checkpoint and target step are included in provenance.
 
 The protocol exits 0 only when both normal comparisons match and the
 deliberately broken resume differs. Exit 1 means a comparison/control failed;
@@ -169,6 +212,6 @@ These results cover the declared adapter, ranks and steps. They are separate
 from operator coverage, independent-reference correctness and performance.
 Capture synchronizes and copies state to the host; use the original,
 uninstrumented recipe for performance measurements. Per-step capture can also
-change scheduling between steps. This instrumented pilot is diagnostic; final
-production validation needs checks at selected stop points under the original
-recipe's execution and contention conditions.
+change scheduling between steps. The stop-point mode removes earlier diagnostic
+snapshots, but final production validation still needs the original recipe's
+execution and contention conditions and complete adapters for its state.

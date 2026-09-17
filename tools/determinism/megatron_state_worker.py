@@ -31,6 +31,7 @@ from tools.determinism.megatron_state import (
 from tools.determinism.state_replay_worker import ROOT, _provenance, _rng_state
 from tools.determinism.training_state import (
     UnverifiedState,
+    capture_configuration,
     complete_rank,
     read_checkpoint_record,
     record_checkpoint_directory,
@@ -38,11 +39,11 @@ from tools.determinism.training_state import (
 )
 
 
-def recipe_arguments(world_size: int, steps: int) -> list[str]:
+def recipe_arguments(world_size: int, steps: int, stop_step: int | None = None) -> list[str]:
     """Freeze the first real-training recipe: TP=2, DP=2/4, BF16 distributed Adam."""
     if world_size not in (4, 8):
         raise ValueError("The Megatron training recipe requires four or eight ranks")
-    return [
+    arguments = [
         "--num-layers",
         "2",
         "--hidden-size",
@@ -118,6 +119,10 @@ def recipe_arguments(world_size: int, steps: int) -> list[str]:
         "torch_dist",
         "--use-checkpoint-opt-param-scheduler",
     ]
+    if stop_step is not None:
+        # train-iters also controls data indexing and scheduler construction.
+        arguments += ["--exit-interval", str(stop_step)]
+    return arguments
 
 
 class TrainingCapture:
@@ -135,16 +140,25 @@ class TrainingCapture:
         self.resumed = None
         self.captured_steps: list[int] = []
         self.train_completed = False
+        self.capture_config = capture_configuration(
+            args.steps, args.checkpoint_step, args.stop_step
+        )
+        self.stop_requested = False
+        self.expected_exit: SystemExit | None = None
 
     def runtime_provenance(self) -> dict:
         """Record actual runtime plus the complete, path-independent CLI recipe."""
         record = _provenance(
-            "megatron_gpt", self.world_size, torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+            "megatron_gpt",
+            self.world_size,
+            torch.device("cuda", int(os.environ["LOCAL_RANK"])),
+            capture=self.capture_config,
         )
         record["recipe"] = {
             "id": "megatron_pretrain_gpt_dist_optimizer_bf16_v1",
             "entrypoint": "pretrain_gpt.py",
-            "arguments": recipe_arguments(self.world_size, self.args.steps),
+            "arguments": recipe_arguments(self.world_size, self.args.steps, self.args.stop_step),
+            "capture": self.capture_config,
             "checkpoint_step": self.args.checkpoint_step,
             "mock_documents": 512,
             "mock_max_sequence_length": 64,
@@ -189,6 +203,16 @@ class TrainingCapture:
             or args.context_parallel_size != 1
         ):
             raise UnverifiedState("Expected TP=2, PP=CP=1")
+        if self.args.stop_step is not None:
+            if (
+                args.train_iters != self.args.steps
+                or args.lr_decay_iters != self.args.steps
+                or args.exit_interval != self.args.stop_step
+                or args.exit_duration_in_mins
+                or args.exit_signal_handler
+                or args.phase_transition_iterations
+            ):
+                raise UnverifiedState("Stop-point training horizon or exit policy changed")
 
     def wrap_load(self, original):
         """Verify checkpoint files on both sides of Megatron's actual load call."""
@@ -266,7 +290,7 @@ class TrainingCapture:
         return loaders
 
     def wrap_train(self, original):
-        """Retain the live iterator and accept completion only after train returns."""
+        """Require normal completion or a successful, observed target-step exit."""
 
         @functools.wraps(original)
         def train(*positional, **keywords):
@@ -276,13 +300,48 @@ class TrainingCapture:
             if (self.args.resume is not None) != (self.resumed is not None):
                 raise UnverifiedState("Missing or unexpected Megatron checkpoint load")
             self.provenance = self.runtime_provenance()
-            result = original(*positional, **keywords)
+            try:
+                result = original(*positional, **keywords)
+            except SystemExit as error:
+                if (
+                    self.args.stop_step is None
+                    or error.code not in (None, 0)
+                    or not self.stop_requested
+                    or self.captured_steps != [self.args.stop_step]
+                ):
+                    raise UnverifiedState(
+                        "Megatron exited without completing the stop point"
+                    ) from error
+                self.train_completed = True
+                self.expected_exit = error
+                raise
+            if self.args.stop_step is not None:
+                raise UnverifiedState("Megatron did not exit at the requested stop point")
             if result[0] != self.args.steps:
                 raise UnverifiedState("Megatron training stopped before the requested step")
             self.train_completed = True
             return result
 
         return train
+
+    def wrap_decide_exit(self, original):
+        """Observe the existing checkpoint/exit decision, without overriding it."""
+
+        @functools.wraps(original)
+        def decide(*positional, **keywords):
+            bound = inspect.signature(original).bind(*positional, **keywords)
+            result = original(*positional, **keywords)
+            if self.args.stop_step is not None:
+                step = bound.arguments["iteration"]
+                if (result and step != self.args.stop_step) or (
+                    step >= self.args.stop_step and not result
+                ):
+                    raise UnverifiedState("Unexpected Megatron stop-point exit decision")
+                if result:
+                    self.stop_requested = True
+            return result
+
+        return decide
 
     def capture(self, model, optimizer, scheduler, step: int) -> None:
         """Snapshot live state after updates and consumed-sample bookkeeping."""
@@ -332,7 +391,8 @@ class TrainingCapture:
             result = original(
                 model, optimizer, opt_param_scheduler, iteration, *positional, **keywords
             )
-            self.capture(model, optimizer, opt_param_scheduler, iteration)
+            if self.args.stop_step is None or iteration == self.args.stop_step:
+                self.capture(model, optimizer, opt_param_scheduler, iteration)
             return result
 
         return post_step
@@ -340,9 +400,12 @@ class TrainingCapture:
     def finish(self) -> None:
         """Only publish evidence after the entrypoint returns successfully."""
         start = self.args.checkpoint_step if self.args.resume else 0
-        if not self.train_completed or self.captured_steps != list(
-            range(start + 1, self.args.steps + 1)
-        ):
+        expected = (
+            [self.args.stop_step]
+            if self.args.stop_step is not None
+            else list(range(start + 1, self.args.steps + 1))
+        )
+        if not self.train_completed or self.captured_steps != expected:
             raise UnverifiedState("Missing training completion or required step captures")
         if self.runtime_provenance() != self.provenance:
             raise UnverifiedState("Source/runtime changed during training")
@@ -368,7 +431,10 @@ def run_worker(args: argparse.Namespace) -> None:
     from megatron.training import checkpointing, training
 
     capture = TrainingCapture(args, training, checkpointing)
-    command = [str(ROOT / "pretrain_gpt.py"), *recipe_arguments(capture.world_size, args.steps)]
+    command = [
+        str(ROOT / "pretrain_gpt.py"),
+        *recipe_arguments(capture.world_size, args.steps, args.stop_step),
+    ]
     command += [
         "--save",
         str(args.output / "megatron-checkpoints"),
@@ -396,10 +462,15 @@ def run_worker(args: argparse.Namespace) -> None:
             ("build_train_valid_test_data_loaders", capture.wrap_loaders),
             ("train", capture.wrap_train),
             ("post_training_step_callbacks", capture.wrap_post_step),
+            ("checkpoint_and_decide_exit", capture.wrap_decide_exit),
         ):
             stack.enter_context(patch.object(training, name, wrapper(getattr(training, name))))
         stack.enter_context(patch.object(sys, "argv", command))
-        runpy.run_path(str(ROOT / "pretrain_gpt.py"), run_name="__main__")
+        try:
+            runpy.run_path(str(ROOT / "pretrain_gpt.py"), run_name="__main__")
+        except SystemExit as error:
+            if error is not capture.expected_exit:
+                raise
     capture.finish()
 
 
@@ -411,9 +482,14 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
+    parser.add_argument("--stop-step", type=int)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--omit-restore", choices=("rng",))
     args = parser.parse_args()
+    try:
+        capture_configuration(args.steps, args.checkpoint_step, args.stop_step)
+    except ValueError as error:
+        parser.error(str(error))
     if not 0 < args.checkpoint_step < args.steps or (args.omit_restore and not args.resume):
         parser.error("Require a real resume interval and a checkpoint for the control")
     logging.basicConfig(level=logging.INFO)

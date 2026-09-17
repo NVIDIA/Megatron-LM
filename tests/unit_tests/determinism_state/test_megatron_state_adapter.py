@@ -15,7 +15,7 @@ from tools.determinism.megatron_state import (
     capture_mock_loader_state,
     capture_model,
 )
-from tools.determinism.megatron_state_worker import TrainingCapture
+from tools.determinism.megatron_state_worker import TrainingCapture, recipe_arguments
 from tools.determinism.training_state import (
     UnverifiedState,
     read_checkpoint_record,
@@ -198,6 +198,7 @@ def make_capture(monkeypatch, tmp_path):
         resume=root,
         checkpoint_step=2,
         steps=4,
+        stop_step=None,
         omit_restore="rng",
         output=tmp_path / "resume",
         run_id="resume-run",
@@ -261,3 +262,72 @@ def test_incomplete_training_cannot_publish_completion(monkeypatch, tmp_path):
     with pytest.raises(UnverifiedState, match="Missing training completion"):
         capture.finish()
     assert not capture.args.output.exists()
+
+
+def test_stop_point_keeps_original_training_and_schedule_horizon():
+    full = recipe_arguments(4, 5)
+    stopped = recipe_arguments(4, 5, 3)
+    assert stopped == [*full, "--exit-interval", "3"]
+    assert stopped[stopped.index("--train-iters") + 1] == "5"
+    assert stopped[stopped.index("--lr-decay-iters") + 1] == "5"
+    assert stopped[stopped.index("--eval-interval") + 1] == "6"
+
+
+def test_stop_point_runs_original_callbacks_without_earlier_capture(monkeypatch, tmp_path):
+    capture, _, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.stop_step = 3
+    events = []
+
+    def callback(model, optimizer, scheduler, iteration):
+        events.append(("original", iteration))
+        return iteration
+
+    monkeypatch.setattr(capture, "capture", lambda *args: events.append(("capture", args[-1])))
+    wrapped = capture.wrap_post_step(callback)
+    for step in (1, 2, 3):
+        assert wrapped(None, None, None, step) == step
+    assert events == [("original", 1), ("original", 2), ("original", 3), ("capture", 3)]
+
+
+@pytest.mark.parametrize("step,decision", [(2, True), (3, False), (4, True)])
+def test_wrong_exit_decision_cannot_complete_stop_point(monkeypatch, tmp_path, step, decision):
+    capture, _, _ = make_capture(monkeypatch, tmp_path)
+    capture.args.stop_step = 3
+
+    def decide(iteration):
+        return decision
+
+    with pytest.raises(UnverifiedState, match="exit decision"):
+        capture.wrap_decide_exit(decide)(iteration=step)
+    assert not capture.stop_requested
+
+
+@pytest.mark.parametrize("failure", [None, "nonzero_exit", "no_decision", "no_capture", "returned"])
+def test_only_successful_target_exit_completes_training(monkeypatch, tmp_path, failure):
+    capture, _, record = make_capture(monkeypatch, tmp_path)
+    capture.args.stop_step = 3
+    capture.resumed = record
+    monkeypatch.setattr(capture, "validate_configuration", lambda: None)
+    monkeypatch.setattr(capture, "runtime_provenance", lambda: {"fixture": True})
+    error = SystemExit(1 if failure == "nonzero_exit" else 0)
+
+    def train(train_data_iterator):
+        if failure != "no_capture":
+            capture.captured_steps = [3]
+        if failure != "no_decision":
+            assert capture.wrap_decide_exit(lambda iteration: True)(3)
+        if failure == "returned":
+            return 3, 0.0
+        raise error
+
+    if failure is None:
+        with pytest.raises(SystemExit) as raised:
+            capture.wrap_train(train)("live-iterator")
+        assert raised.value is error is capture.expected_exit
+        assert capture.train_completed
+        assert capture.iterator == "live-iterator"
+    else:
+        with pytest.raises(UnverifiedState):
+            capture.wrap_train(train)("live-iterator")
+        assert not capture.train_completed
+        assert capture.expected_exit is None

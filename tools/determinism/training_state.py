@@ -31,6 +31,26 @@ class UnverifiedState(ValueError):
     """The declared state cannot support a complete comparison."""
 
 
+def capture_configuration(steps: int, checkpoint_step: int, stop_step: int | None = None) -> dict:
+    """Declare a capture boundary without shortening the training schedule."""
+    if (
+        type(steps) is not int
+        or type(checkpoint_step) is not int
+        or not 0 < checkpoint_step < steps
+        or (
+            stop_step is not None
+            and (type(stop_step) is not int or not checkpoint_step < stop_step <= steps)
+        )
+    ):
+        raise ValueError("Require 0 < checkpoint-step < stop-step <= steps (or no stop-step)")
+    return {
+        "mode": "per_step" if stop_step is None else "stop_point",
+        "training_steps": steps,
+        "checkpoint_step": checkpoint_step,
+        "stop_step": stop_step,
+    }
+
+
 def _write_tree(value, path: list, stream, index: list) -> None:
     """Write one value at a time; retain only the small index in memory."""
     import numpy as np

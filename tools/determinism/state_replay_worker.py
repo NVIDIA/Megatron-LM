@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from tools.determinism.training_state import (
+    capture_configuration,
     checkpoint_path,
     complete_rank,
     file_sha256,
@@ -167,7 +168,7 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _provenance(backend: str, world_size: int, device: torch.device) -> dict:
+def _provenance(backend: str, world_size: int, device: torch.device, *, capture: dict) -> dict:
     def command(*args):
         return subprocess.check_output(args, cwd=ROOT, text=True).strip()
 
@@ -219,6 +220,7 @@ def _provenance(backend: str, world_size: int, device: torch.device) -> dict:
         },
         "recipe": {
             "id": f"{backend}_training_state_pilot_v1",
+            "capture": capture,
             "seed": 123,
             "data_seed": 739,
             "world_size": world_size,
@@ -255,7 +257,9 @@ def _save_checkpoint(root, step, rank, run_id, model, optimizer, scheduler, data
 
 
 def run_worker(args: argparse.Namespace) -> None:
-    """Train the declared recipe and record every post-step state."""
+    """Train the full schedule up to the requested boundary and capture state."""
+    capture = capture_configuration(args.steps, args.checkpoint_step, args.stop_step)
+    last_step = args.steps if args.stop_step is None else args.stop_step
     gpu = args.backend != "cpu"
     rank = int(os.environ.get("RANK", "0")) if gpu else 0
     world_size = int(os.environ.get("WORLD_SIZE", "1")) if gpu else 1
@@ -265,7 +269,8 @@ def run_worker(args: argparse.Namespace) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, foreach=False, fused=False)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
     data = PilotData(args.backend, device)
-    provenance = _provenance(args.backend, world_size, device)
+    provenance = _provenance(args.backend, world_size, device, capture=capture)
+    captured_steps = []
     resumed = None
     start = 0
     try:
@@ -297,10 +302,10 @@ def run_worker(args: argparse.Namespace) -> None:
             if args.omit_restore != "rng":
                 _restore_rng(rng, gpu)
             start = checkpoint["step"]
-        if start >= args.steps:
+        if start >= last_step:
             raise ValueError("Resume must execute at least one new training step")
         model.train()
-        for step in range(start + 1, args.steps + 1):
+        for step in range(start + 1, last_step + 1):
             optimizer.zero_grad(set_to_none=True)
             inputs, target = data.next_batch()
             output = model(**inputs) if gpu else model(inputs)
@@ -312,6 +317,13 @@ def run_worker(args: argparse.Namespace) -> None:
             loss.backward()
             optimizer.step()
             scheduler.step()
+            if args.stop_step is not None and step != args.stop_step:
+                if step == args.checkpoint_step and resumed is None:
+                    _save_checkpoint(
+                        args.output, step, rank, args.run_id, model, optimizer, scheduler, data, gpu
+                    )
+                # No diagnostic sync, CPU copies, state enumeration or loss.item().
+                continue
             if gpu:
                 torch.cuda.synchronize(device)
             state = {
@@ -348,19 +360,20 @@ def run_worker(args: argparse.Namespace) -> None:
                 provenance=provenance,
                 resume_from=resumed,
             )
+            captured_steps.append(step)
             logger.info("Captured step=%d rank=%d loss=%s", step, rank, loss.detach().item())
             if step == args.checkpoint_step and resumed is None:
                 _save_checkpoint(
                     args.output, step, rank, args.run_id, model, optimizer, scheduler, data, gpu
                 )
-        if _provenance(args.backend, world_size, device) != provenance:
+        if _provenance(args.backend, world_size, device, capture=capture) != provenance:
             raise ValueError("Source/runtime provenance changed during training")
         complete_rank(
             args.output,
             rank=rank,
             world_size=world_size,
             run_id=args.run_id,
-            steps=list(range(start + 1, args.steps + 1)),
+            steps=captured_steps,
             provenance=provenance,
         )
     finally:
@@ -379,11 +392,14 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--checkpoint-step", type=int, default=2)
+    parser.add_argument("--stop-step", type=int)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--omit-restore", choices=("rng", "optimizer", "scheduler", "dataloader"))
     args = parser.parse_args()
-    if not 0 < args.checkpoint_step < args.steps:
-        parser.error("Require 0 < checkpoint-step < steps")
+    try:
+        capture_configuration(args.steps, args.checkpoint_step, args.stop_step)
+    except ValueError as error:
+        parser.error(str(error))
     if args.omit_restore and args.resume is None:
         parser.error("An omitted-restore control requires a checkpoint resume")
     logging.basicConfig(level=logging.INFO)
