@@ -356,7 +356,9 @@ def _bf16_override_recipe(pattern):
     )
 
 
-def _worker_egtp_precision_override_backward(rank, world_size, port, egtp_remat_size):
+def _worker_egtp_precision_override_backward(
+    rank, world_size, port, egtp_remat_size, force_te_unsupported=False
+):
     """Grouped experts that a precision override keeps unfused must still complete backward.
 
     The override drives ``_with_fused_impl`` to False, but ``use_transformer_engine_op_fuser``
@@ -368,8 +370,14 @@ def _worker_egtp_precision_override_backward(rank, world_size, port, egtp_remat_
     from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.moe import experts as experts_mod
     from megatron.core.transformer.moe.experts import TEGroupedMLP
     from megatron.core.transformer.transformer_config import TransformerConfig
+
+    if force_te_unsupported:
+        # Pin the fallback: with a TE that supports sharded weights, nothing else in this file
+        # would exercise the split-quantize branch of the guard.
+        experts_mod._te_grouped_tensor_supports_sharded_weights = lambda: False
 
     HIDDEN, FFN, NUM_EXPERTS, SEQ = 512, 256, 4, 16
     dtype = torch.bfloat16
@@ -434,7 +442,10 @@ def _worker_egtp_precision_override_backward(rank, world_size, port, egtp_remat_
         # leaving an unsharded grouped-tensor run alone is what keeps the flag usable at large.
         sharded = any(isinstance(p, GTPShardedParam) for p in experts.parameters())
         assert sharded == (egtp_remat_size > 1)
-        expect_grouped_tensor = not sharded
+        # A TE that handles sharded weights on its grouped-tensor path keeps the layer there.
+        expect_grouped_tensor = (
+            not sharded or experts_mod._te_grouped_tensor_supports_sharded_weights()
+        )
         assert experts._use_grouped_tensor == expect_grouped_tensor
         assert experts.linear_fc1.use_grouped_tensor == expect_grouped_tensor
         assert experts.linear_fc2.use_grouped_tensor == expect_grouped_tensor
@@ -481,3 +492,14 @@ class TestMoEEGTPPrecisionOverride:
         # would be unfused for the wrong reason and the override would prove nothing.
         monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         _run_distributed(_worker_egtp_precision_override_backward, 4, egtp_remat_size)
+
+    def test_egtp_precision_override_backward_te_fallback(self, monkeypatch):
+        """Same repro with TE reporting no sharded-weight support: must fall back and still work.
+
+        Without this the split-quantize branch of the guard goes uncovered on a TE that does
+        support sharded weights.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires at least 4 CUDA devices")
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        _run_distributed(_worker_egtp_precision_override_backward, 4, 2, True)
