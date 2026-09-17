@@ -11,6 +11,7 @@ import torch
 
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -102,3 +103,49 @@ def test_fused_adam_step_replays():
         assert len(got) == len(ref)
         for j, (a, b) in enumerate(zip(ref, got)):
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
+
+
+def test_hybrid_adam_step_replays() -> None:
+    """Replay both owners, mixed dtypes and a skipped update with transfer overlap."""
+    seeded()
+    initial = [
+        torch.randn(65536, device="cuda", dtype=dtype)
+        for dtype in (torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.float32)
+    ]
+    gradients = [torch.randn_like(value, dtype=torch.float32) for value in initial]
+
+    def run_steps():
+        params = [torch.nn.Parameter(value.clone()) for value in initial]
+        optimizer = HybridDeviceOptimizer(
+            params,
+            offload_fraction=0.5,
+            cpu_optimizer_cls=torch.optim.AdamW,
+            gpu_optimizer_cls=Adam,
+            param_update_in_fp32=True,
+            overlap_cpu_optimizer_d2h_h2d=True,
+            lr=0.01,
+        )
+        assert len(optimizer.gpu_params_map_cpu_copy) == 2
+        assert optimizer.gpu_optimizer is not None
+        with RacingStreams():
+            for skip in (False, True, False):
+                for param, grad in zip(params, gradients):
+                    param.decoupled_grad = None if skip else grad.clone()
+                optimizer.step()
+        torch.cuda.synchronize()
+        values = [param.detach().clone() for param in params]
+        for param in params:
+            state = optimizer.state[param]
+            values.extend(
+                state[key].clone() for key in sorted(state) if torch.is_tensor(state[key])
+            )
+        return values
+
+    reference = run_steps()
+    for replay in range(1, 4):
+        candidate = run_steps()
+        assert len(reference) == len(candidate)
+        for index, (left, right) in enumerate(zip(reference, candidate)):
+            assert bytes_equal(
+                left, right
+            ), f"Hybrid Adam tensor {index} differs on replay {replay}"

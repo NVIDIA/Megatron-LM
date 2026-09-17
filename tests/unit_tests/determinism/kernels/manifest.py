@@ -419,13 +419,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/clip_grads.py",
             "megatron/core/optimizer/__init__.py",
             "megatron/core/optimizer/optimizer.py",
+            "megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
         tests=(K + "test_optimizer_kernels.py",),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
         name="ddp_grad_buffer_reductions",
