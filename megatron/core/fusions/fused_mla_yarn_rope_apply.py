@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -25,6 +26,54 @@ if not HAVE_TRITON:
     triton.autotune = null_decorator
     triton.heuristics = null_decorator
     tl = MagicMock()
+
+
+def _capture_vmm_output(reference: torch.Tensor, shape) -> Optional[torch.Tensor]:
+    """Allocate a two-domain VMM output only while capturing the MLPerf graph."""
+    if (
+        os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") != "1"
+        or len(shape) != 4
+        or shape[1] != 1
+        or shape[0] % 256 != 0
+    ):
+        return None
+    # Build green contexts during eager warmup. Context creation is not part of
+    # stream capture, while the VMM buffers themselves must have graph-stable VAs.
+    from transformer_engine.pytorch.tensor.localized_mxfp8 import _get_localization_context
+
+    device_index = reference.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    _get_localization_context(device_index)
+    if not torch.cuda.is_current_stream_capturing():
+        return None
+    from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
+
+    allocator = VMMRowSplitAllocator(reference.device)
+    return allocator.allocate(tuple(shape), reference.dtype)
+
+
+def _localization_streams(tensor: torch.Tensor):
+    """Return the two green streams for a VMM-backed SBHD tensor."""
+    if not hasattr(tensor, "_nvte_vmm_allocator"):
+        return None
+    from transformer_engine.pytorch.tensor.localized_mxfp8 import _get_localization_context
+
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _get_localization_context(device_index)[2]
+
+
+def _fork_localized_streams(streams, device):
+    """Fork the current stream to two green streams for graph-safe launches."""
+    parent_stream = torch.cuda.current_stream(device)
+    fork_event = torch.cuda.Event(enable_timing=False)
+    join_events = tuple(torch.cuda.Event(enable_timing=False) for _ in streams)
+    fork_event.record(parent_stream)
+    for stream in streams:
+        stream.wait_event(fork_event)
+    return parent_stream, fork_event, join_events
 
 
 @triton.jit
@@ -338,10 +387,14 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         max_seqlen = None
         batch_size = None
         seq_num = None
+        localization_streams = None
+        localization_allocator = getattr(q, "_nvte_vmm_allocator", None)
         if cu_seqlens_q is None:
             # sbhd
             assert position_ids is None
             max_seqlen, batch_size, nheads, headdim = q.shape
+            if batch_size == 1:
+                localization_streams = _localization_streams(q)
             q = q.view(-1, nheads, headdim)
             total_seqlen = q.shape[0]
         else:
@@ -357,26 +410,67 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         assert emb_dim % 4 == 0
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_fwd_inplace_kernel[grid](
-            q,
-            cos,
-            sin,
-            nope_dim,
-            emb_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            cu_seqlens_q,
-            position_ids,
-            q.stride(0),
-            q.stride(1),
-            cos.stride(0),
-            sin.stride(0),
-            cp_rank,
-            cp_size,
-            INVERSE=inverse,
-            REMOVE_INTERLEAVING=remove_interleaving,
-        )
+        if localization_streams is None:
+            _mla_rope_fwd_inplace_kernel[grid](
+                q,
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                cu_seqlens_q,
+                position_ids,
+                q.stride(0),
+                q.stride(1),
+                cos.stride(0),
+                sin.stride(0),
+                cp_rank,
+                cp_size,
+                INVERSE=inverse,
+                REMOVE_INTERLEAVING=remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, q.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_q = q[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_fwd_inplace_kernel[local_grid](
+                        local_q,
+                        local_cos,
+                        local_sin,
+                        nope_dim,
+                        emb_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        None,
+                        local_q.stride(0),
+                        local_q.stride(1),
+                        local_cos.stride(0),
+                        local_sin.stride(0),
+                        0,
+                        1,
+                        INVERSE=inverse,
+                        REMOVE_INTERLEAVING=remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_events = (fork_event, *join_events)
         ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
         ctx.has_position_ids = position_ids is not None
         ctx.nope_dim = nope_dim
@@ -389,6 +483,8 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         ctx.cp_size = cp_size
         if cu_seqlens_q is None:
             q = q.view(max_seqlen, batch_size, nheads, headdim)
+            if localization_allocator is not None:
+                q._nvte_vmm_allocator = localization_allocator
         return q
 
     @staticmethod
@@ -408,8 +504,16 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         max_seqlen = None
         batch_size = None
         seq_num = None
+        grad_root = None
+        localization_streams = None
         if ctx.cu_seqlens_q is None:
             max_seqlen, batch_size, nheads, headdim = grad.shape
+            grad_root = _capture_vmm_output(grad, grad.shape)
+            if grad_root is not None:
+                grad_root.copy_(grad)
+                grad = grad_root
+                if batch_size == 1:
+                    localization_streams = _localization_streams(grad_root)
             grad = grad.contiguous().view(-1, nheads, headdim)
             total_seqlen = grad.shape[0]
         else:
@@ -420,28 +524,72 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         assert grad.stride(-1) == 1
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_bwd_inplace_kernel[grid](
-            grad,
-            cos,
-            sin,
-            ctx.nope_dim,
-            ctx.emb_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            ctx.cu_seqlens_q,
-            position_ids,
-            grad.stride(0),
-            grad.stride(1),
-            cos.stride(0),
-            sin.stride(0),
-            ctx.cp_rank,
-            ctx.cp_size,
-            INVERSE=ctx.inverse,
-            REMOVE_INTERLEAVING=ctx.remove_interleaving,
-        )
+        if localization_streams is None:
+            _mla_rope_bwd_inplace_kernel[grid](
+                grad,
+                cos,
+                sin,
+                ctx.nope_dim,
+                ctx.emb_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                ctx.cu_seqlens_q,
+                position_ids,
+                grad.stride(0),
+                grad.stride(1),
+                cos.stride(0),
+                sin.stride(0),
+                ctx.cp_rank,
+                ctx.cp_size,
+                INVERSE=ctx.inverse,
+                REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, grad.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_grad = grad[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_bwd_inplace_kernel[local_grid](
+                        local_grad,
+                        local_cos,
+                        local_sin,
+                        ctx.nope_dim,
+                        ctx.emb_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        None,
+                        local_grad.stride(0),
+                        local_grad.stride(1),
+                        local_cos.stride(0),
+                        local_sin.stride(0),
+                        0,
+                        1,
+                        INVERSE=ctx.inverse,
+                        REMOVE_INTERLEAVING=ctx.remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_bwd_events = (fork_event, *join_events)
         if ctx.cu_seqlens_q is None:
-            grad = grad.view(max_seqlen, batch_size, nheads, headdim)
+            if grad_root is None:
+                grad = grad.view(max_seqlen, batch_size, nheads, headdim)
+            else:
+                grad = grad_root
         return grad, None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -937,35 +1085,87 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             # when no autograd graph is being constructed.
             if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
                 ctx.mark_dirty(out_key, out_value)
+        localization_streams = None
+        if cu_seqlens_kv is None and batch_size == 1:
+            localization_streams = _localization_streams(out_key)
         o_key = out_key.view(total_seqlen, nheads, emb_dim + k_dim)
         o_value = out_value.view(total_seqlen, nheads, v_dim)
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_fwd_kv_split_kernel[grid](
-            kv,
-            k_pos_emb,
-            o_key,
-            o_value,
-            cos,
-            sin,
-            emb_dim,
-            k_dim,
-            v_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            cu_seqlens_kv,
-            kv.stride(0),
-            kv.stride(1),
-            k_pos_emb.stride(0),
-            o_key.stride(0),
-            o_key.stride(1),
-            o_value.stride(0),
-            o_value.stride(1),
-            cp_rank,
-            cp_size,
-            REMOVE_INTERLEAVING=remove_interleaving,
-        )
+        if localization_streams is None:
+            _mla_rope_fwd_kv_split_kernel[grid](
+                kv,
+                k_pos_emb,
+                o_key,
+                o_value,
+                cos,
+                sin,
+                emb_dim,
+                k_dim,
+                v_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                cu_seqlens_kv,
+                kv.stride(0),
+                kv.stride(1),
+                k_pos_emb.stride(0),
+                o_key.stride(0),
+                o_key.stride(1),
+                o_value.stride(0),
+                o_value.stride(1),
+                cp_rank,
+                cp_size,
+                REMOVE_INTERLEAVING=remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, kv.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_kv = kv[row_start:row_end]
+                local_k_pos_emb = k_pos_emb[row_start:row_end]
+                local_key = o_key[row_start:row_end]
+                local_value = o_value[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_fwd_kv_split_kernel[local_grid](
+                        local_kv,
+                        local_k_pos_emb,
+                        local_key,
+                        local_value,
+                        local_cos,
+                        local_sin,
+                        emb_dim,
+                        k_dim,
+                        v_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        local_kv.stride(0),
+                        local_kv.stride(1),
+                        local_k_pos_emb.stride(0),
+                        local_key.stride(0),
+                        local_key.stride(1),
+                        local_value.stride(0),
+                        local_value.stride(1),
+                        0,
+                        1,
+                        REMOVE_INTERLEAVING=remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_events = (fork_event, *join_events)
         ctx.save_for_backward(cos, sin)
         ctx.remove_interleaving = remove_interleaving
         ctx.rotary_interleaved = rotary_interleaved
@@ -991,9 +1191,19 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         max_seqlen = None
         batch_size = None
         seq_num = None
+        d_kv_root = None
         if ctx.cu_seqlens_kv is None:
             # sbhd
             max_seqlen, batch_size, nheads, _ = dk.shape
+            d_kv_root = _capture_vmm_output(
+                dk,
+                (
+                    max_seqlen,
+                    batch_size,
+                    nheads,
+                    ctx.k_dim + ctx.v_dim,
+                ),
+            )
             dk = dk.contiguous().view(-1, nheads, ctx.emb_dim + ctx.k_dim)
             dv = dv.contiguous().view(-1, nheads, ctx.v_dim)
             total_seqlen = dk.shape[0]
@@ -1004,37 +1214,95 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         assert dk.stride(-1) == 1
         assert dv.stride(-1) == 1
 
-        d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
+        if d_kv_root is None:
+            d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
+        else:
+            d_kv = d_kv_root.view(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
         d_emb = dk.new_empty(total_seqlen, 1, ctx.emb_dim)
+        localization_streams = (
+            _localization_streams(d_kv_root) if d_kv_root is not None and batch_size == 1 else None
+        )
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_bwd_kv_split_kernel[grid](
-            dk,
-            dv,
-            d_kv,
-            d_emb,
-            cos,
-            sin,
-            ctx.emb_dim,
-            ctx.k_dim,
-            ctx.v_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            ctx.cu_seqlens_kv,
-            dk.stride(0),
-            dk.stride(1),
-            dv.stride(0),
-            dv.stride(1),
-            d_kv.stride(0),
-            d_kv.stride(1),
-            d_emb.stride(0),
-            ctx.cp_rank,
-            ctx.cp_size,
-            REMOVE_INTERLEAVING=ctx.remove_interleaving,
-        )
+        if localization_streams is None:
+            _mla_rope_bwd_kv_split_kernel[grid](
+                dk,
+                dv,
+                d_kv,
+                d_emb,
+                cos,
+                sin,
+                ctx.emb_dim,
+                ctx.k_dim,
+                ctx.v_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                ctx.cu_seqlens_kv,
+                dk.stride(0),
+                dk.stride(1),
+                dv.stride(0),
+                dv.stride(1),
+                d_kv.stride(0),
+                d_kv.stride(1),
+                d_emb.stride(0),
+                ctx.cp_rank,
+                ctx.cp_size,
+                REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, dk.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_dk = dk[row_start:row_end]
+                local_dv = dv[row_start:row_end]
+                local_d_kv = d_kv[row_start:row_end]
+                local_d_emb = d_emb[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_bwd_kv_split_kernel[local_grid](
+                        local_dk,
+                        local_dv,
+                        local_d_kv,
+                        local_d_emb,
+                        local_cos,
+                        local_sin,
+                        ctx.emb_dim,
+                        ctx.k_dim,
+                        ctx.v_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        local_dk.stride(0),
+                        local_dk.stride(1),
+                        local_dv.stride(0),
+                        local_dv.stride(1),
+                        local_d_kv.stride(0),
+                        local_d_kv.stride(1),
+                        local_d_emb.stride(0),
+                        0,
+                        1,
+                        REMOVE_INTERLEAVING=ctx.remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_bwd_events = (fork_event, *join_events)
         if ctx.cu_seqlens_kv is None:
-            d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
+            if d_kv_root is None:
+                d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
+            else:
+                d_kv = d_kv_root
             d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
         return (
             d_kv,
@@ -1130,6 +1398,13 @@ def fused_apply_mla_rope_for_q(
     :func:`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
     its original mutation behavior and does not add a clone to the hot path.
     """
+    localized_q = _capture_vmm_output(t, t.shape)
+    if localized_q is not None:
+        # The profiled Q kernel is in-place. Preserve its API while moving the
+        # producer output into VMM; replacing this copy with Q-up GEMM out=
+        # support is the next optimization step.
+        localized_q.copy_(t)
+        t = localized_q
     return fused_mla_rope_inplace(
         t,
         cos,
@@ -1159,6 +1434,15 @@ def fused_apply_mla_rope_for_kv(
     out_value: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compatible name for the MLA key/value split RoPE API."""
+    if out_key is None and out_value is None and cu_seqlens_kv is None and kv.ndim == 4:
+        seqlen, batch_size, nheads, _ = kv.shape
+        out_key = _capture_vmm_output(
+            kv, (seqlen, batch_size, nheads, emb_dim + k_dim)
+        )
+        if out_key is not None:
+            out_value = _capture_vmm_output(
+                kv, (seqlen, batch_size, nheads, v_dim)
+            )
     return fused_mla_rope_kv_split(
         kv,
         k_pos_emb,
