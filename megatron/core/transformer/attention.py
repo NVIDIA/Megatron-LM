@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams, TreeQueryRun
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -32,7 +32,10 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    all_gather_last_dim_from_tensor_parallel_region,
+    gather_from_sequence_parallel_region,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
@@ -1334,6 +1337,103 @@ class Attention(MegatronModule, ABC):
 
         return output_total
 
+    @staticmethod
+    def _tree_attention_key_indices(
+        packed_seq_params: TreePackedSeqParams, run: TreeQueryRun, device: torch.device
+    ) -> Tensor:
+        """Return the root-to-query-prefix physical indices for one query run."""
+        chain = []
+        segment_index = run.segment_index
+        while segment_index != -1:
+            chain.append(segment_index)
+            segment_index = packed_seq_params.tree_segment_parents[segment_index]
+        chain.reverse()
+
+        pieces = []
+        for segment_index in chain:
+            start = packed_seq_params.tree_segment_starts[segment_index]
+            if segment_index == run.segment_index:
+                end = run.global_end
+            else:
+                end = start + packed_seq_params.tree_segment_lengths[segment_index]
+            pieces.append(torch.arange(start, end, dtype=torch.long, device=device))
+        return torch.cat(pieces)
+
+    def _tree_attention_forward(
+        self, query: Tensor, key: Tensor, value: Tensor, packed_seq_params: TreePackedSeqParams
+    ) -> Tensor:
+        """Run causal tree attention while gathering only CP-sharded K/V."""
+        if flash_attn_varlen_func is None:
+            raise RuntimeError("tree attention requires flash-attn varlen support")
+        if self.attention_type != "self":
+            raise NotImplementedError("tree attention only supports self attention")
+        if self.config.softmax_type != "vanilla":
+            raise NotImplementedError("tree attention currently supports vanilla softmax only")
+        if self.config.attn_logit_softcapping is not None:
+            raise NotImplementedError("tree attention does not support attention logit softcapping")
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        ):
+            raise NotImplementedError("tree attention does not support sliding windows")
+
+        cp_size = get_pg_size(self.pg_collection.cp)
+        if cp_size > 1:
+            key_rank_order = gather_from_sequence_parallel_region(key, group=self.pg_collection.cp)
+            value_rank_order = gather_from_sequence_parallel_region(
+                value, group=self.pg_collection.cp
+            )
+            key = key_rank_order.index_select(0, packed_seq_params.tree_cp_gather_inverse)
+            value = value_rank_order.index_select(0, packed_seq_params.tree_cp_gather_inverse)
+
+        outputs = []
+        output_indices = []
+        dropout_p = self.config.attention_dropout if self.training else 0.0
+        softmax_scale = self.config.softmax_scale
+        for run in packed_seq_params.tree_query_runs:
+            key_indices = self._tree_attention_key_indices(packed_seq_params, run, query.device)
+            cu_q = torch.tensor(
+                [0, run.local_indices.numel()], dtype=torch.int32, device=query.device
+            )
+            cu_kv = torch.tensor([0, key_indices.numel()], dtype=torch.int32, device=query.device)
+
+            def run_attention(
+                q: Tensor,
+                k: Tensor,
+                v: Tensor,
+                local_indices: Tensor = run.local_indices,
+                selected_key_indices: Tensor = key_indices,
+                cu_query: Tensor = cu_q,
+                cu_key_value: Tensor = cu_kv,
+            ) -> Tensor:
+                # Bind run metadata now: checkpoint recomputes this closure
+                # after the loop has advanced to later tree segments.
+                q_run = q.index_select(0, local_indices)
+                k_run = k.index_select(0, selected_key_indices)
+                v_run = v.index_select(0, selected_key_indices)
+                return flash_attn_varlen_func(
+                    q_run,
+                    k_run,
+                    v_run,
+                    cu_query,
+                    cu_key_value,
+                    int(local_indices.numel()),
+                    int(selected_key_indices.numel()),
+                    dropout_p=dropout_p,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
+
+            if self.training and torch.is_grad_enabled():
+                run_output = tensor_parallel.checkpoint(run_attention, False, query, key, value)
+            else:
+                run_output = run_attention(query, key, value)
+            outputs.append(run_output)
+            output_indices.append(run.local_indices)
+
+        if not outputs:
+            return torch.zeros_like(query)
+        return torch.zeros_like(query).index_copy(0, torch.cat(output_indices), torch.cat(outputs))
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -1574,37 +1674,56 @@ class Attention(MegatronModule, ABC):
                 self.pg_collection.cp = self._build_time_cp_group
 
             if split_qkv:
-                if q_pos_emb is not None:
-                    # TODO VIJAY: simplify
-                    if inference_context is None or inference_context.is_static_batching():
+                if isinstance(packed_seq_params, TreePackedSeqParams):
+                    position_ids = packed_seq_params.tree_local_position_ids
+                    if q_pos_emb is not None:
                         query = apply_rotary_pos_emb(
-                            query,
-                            q_pos_emb,
+                            query.unsqueeze(1),
+                            q_pos_emb.index_select(0, position_ids),
                             config=self.config,
-                            cu_seqlens=cu_seqlens_q,
+                            mscale=self._yarn_concentration_factor,
+                            cp_group=self.pg_collection.cp,
+                        ).squeeze(1)
+                    if k_pos_emb is not None:
+                        key = apply_rotary_pos_emb(
+                            key.unsqueeze(1),
+                            k_pos_emb.index_select(0, position_ids),
+                            config=self.config,
+                            mscale=self._yarn_concentration_factor,
+                            cp_group=self.pg_collection.cp,
+                        ).squeeze(1)
+                else:
+                    if q_pos_emb is not None:
+                        # TODO VIJAY: simplify
+                        if inference_context is None or inference_context.is_static_batching():
+                            query = apply_rotary_pos_emb(
+                                query,
+                                q_pos_emb,
+                                config=self.config,
+                                cu_seqlens=cu_seqlens_q,
+                                mscale=self._yarn_concentration_factor,
+                                cp_group=self.pg_collection.cp,
+                                max_seqlen=rope_freqs_max_seqlen,
+                            )
+                        else:
+                            query = inference_context.apply_rotary_emb_query(
+                                query,
+                                q_pos_emb,
+                                self.config,
+                                cu_seqlens_q,
+                                self.pg_collection.cp,
+                                mscale=self._yarn_concentration_factor,
+                            )
+                    if k_pos_emb is not None:
+                        key = apply_rotary_pos_emb(
+                            key,
+                            k_pos_emb,
+                            config=self.config,
+                            cu_seqlens=cu_seqlens_kv,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
                             max_seqlen=rope_freqs_max_seqlen,
                         )
-                    else:
-                        query = inference_context.apply_rotary_emb_query(
-                            query,
-                            q_pos_emb,
-                            self.config,
-                            cu_seqlens_q,
-                            self.pg_collection.cp,
-                            mscale=self._yarn_concentration_factor,
-                        )
-                if k_pos_emb is not None:
-                    key = apply_rotary_pos_emb(
-                        key,
-                        k_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=self._yarn_concentration_factor,
-                        cp_group=self.pg_collection.cp,
-                        max_seqlen=rope_freqs_max_seqlen,
-                    )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
                     mixed_qkv, q_pos_emb, k_pos_emb, qkv_split_arg_list
@@ -1624,7 +1743,17 @@ class Attention(MegatronModule, ABC):
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
-        if self.checkpoint_core_attention and self.training:
+        if isinstance(packed_seq_params, TreePackedSeqParams):
+            if inference_context is not None:
+                raise NotImplementedError("tree attention is training-only")
+            if attention_bias is not None:
+                raise NotImplementedError("tree attention does not support attention bias")
+            if self.offload_core_attention:
+                raise NotImplementedError(
+                    "tree attention does not support fine-grained core-attention offload"
+                )
+            core_attn_out = self._tree_attention_forward(query, key, value, packed_seq_params)
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,

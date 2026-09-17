@@ -21,7 +21,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
@@ -525,7 +525,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            if isinstance(packed_seq_params, TreePackedSeqParams):
+                y = self._ssm_tree_training(zxBCdt, packed_seq_params)
+            else:
+                y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
 
@@ -736,6 +739,102 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             y = self.norm(y)
 
         return y
+
+    def _ssm_tree_training(
+        self, zxBCdt: torch.Tensor, packed_seq_params: TreePackedSeqParams
+    ) -> torch.Tensor:
+        """Run convolution and selective scan once per physical tree segment."""
+        if causal_conv1d_fn is None:
+            raise RuntimeError("tree Mamba training requires causal-conv1d")
+        if not self.rmsnorm:
+            raise NotImplementedError("tree Mamba training requires gated RMSNorm")
+
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+        if zxBCdt.shape[0] != 1:
+            raise ValueError("tree Mamba training expects a packed batch dimension of one")
+        A = -torch.exp(self.cp.get_A_log().float())
+        z, xBC, dt = torch.split(
+            zxBCdt,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp,
+            ],
+            dim=-1,
+        )
+        conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+        conv_bias = self.cp.get_conv1d_bias()
+        D = (
+            rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+            if self.D_has_hdim
+            else self.cp.get_D()
+        )
+        state_dtype_kwarg = (
+            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+        )
+
+        final_conv_states = []
+        final_ssm_states = []
+        segment_outputs = []
+        conv_history = self.d_conv - 1
+        zero_conv_state = xBC.new_zeros(1, conv_history, xBC.shape[-1])
+        for segment_index, (start, length, parent) in enumerate(
+            zip(
+                packed_seq_params.tree_segment_starts,
+                packed_seq_params.tree_segment_lengths,
+                packed_seq_params.tree_segment_parents,
+            )
+        ):
+            segment_xBC = xBC[:, start : start + length]
+            initial_conv_state = zero_conv_state if parent == -1 else final_conv_states[parent]
+            conv_input = torch.cat([initial_conv_state, segment_xBC], dim=1)
+            conv_output = causal_conv1d_fn(
+                x=rearrange(conv_input, "b l d -> b d l").contiguous(),
+                weight=conv_weight,
+                bias=conv_bias,
+                activation=self.activation,
+            )
+            conv_output = rearrange(conv_output[..., -length:], "b d l -> b l d").contiguous()
+            final_conv_states.append(
+                conv_input[:, -conv_history:] if conv_history else conv_input[:, :0]
+            )
+
+            x_segment, B_segment, C_segment = torch.split(
+                conv_output,
+                [
+                    self.cp.d_inner_local_tpcp,
+                    self.cp.ngroups_local_tpcp * self.d_state,
+                    self.cp.ngroups_local_tpcp * self.d_state,
+                ],
+                dim=-1,
+            )
+            x_segment = rearrange(x_segment, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+            B_segment = rearrange(B_segment, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            C_segment = rearrange(C_segment, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            initial_ssm_state = None if parent == -1 else final_ssm_states[parent]
+            y_segment, final_ssm_state = mamba_chunk_scan_combined(
+                x_segment,
+                dt[:, start : start + length].contiguous(),
+                A,
+                B_segment,
+                C_segment,
+                self.chunk_size,
+                D=D,
+                z=None,
+                dt_bias=self.cp.get_dt_bias().float(),
+                dt_softplus=True,
+                return_final_states=True,
+                initial_states=initial_ssm_state,
+                **state_dtype_kwarg,
+            )
+            segment_outputs.append(y_segment)
+            final_ssm_states.append(final_ssm_state)
+
+        y = rearrange(torch.cat(segment_outputs, dim=1), "b l h p -> l b (h p)").contiguous()
+        z = rearrange(z, "b l (h p) -> l b (h p)", p=self.headdim).contiguous()
+        y = self.cp.post_conv_ssm(y, packed_seq_params)
+        z = self.cp.post_conv_ssm(z, packed_seq_params)
+        return self.norm(y, z)
 
     def ssm_prefill(
         self,

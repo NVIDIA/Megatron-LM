@@ -22,7 +22,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -718,6 +718,13 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
+        if (
+            isinstance(packed_seq_params, TreePackedSeqParams)
+            and self.config.mtp_num_layers
+            and not in_inference_mode
+        ):
+            raise NotImplementedError("tree packed GPT sequences do not support MTP computation")
+
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -782,6 +789,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         sequence_parallel_override = False
 
         if output_processor is not None:
+            if isinstance(packed_seq_params, TreePackedSeqParams):
+                raise NotImplementedError(
+                    "tree packed sequences do not support a custom output processor"
+                )
             return output_processor(
                 hidden_states=hidden_states,
                 output_layer=self.output_layer,
@@ -824,9 +835,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        if isinstance(packed_seq_params, TreePackedSeqParams) and labels is not None:
+            raise NotImplementedError(
+                "tree packed sequences require externally prepared edge losses"
+            )
+        hidden_states, restore_tree_sequence_parallel = self._select_tree_edge_hidden_states(
+            hidden_states, packed_seq_params, self.output_layer
         )
+        try:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        finally:
+            if restore_tree_sequence_parallel:
+                self.output_layer.sequence_parallel = True
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)

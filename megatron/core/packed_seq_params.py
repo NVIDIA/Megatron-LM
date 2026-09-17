@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import Tuple
 
 import torch
 import torch.distributed as dist
@@ -72,3 +73,48 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+@dataclass(frozen=True)
+class TreeQueryRun:
+    """One contiguous CP-local query run within a tree segment."""
+
+    segment_index: int
+    global_start: int
+    global_end: int
+    local_indices: Tensor
+
+
+@dataclass
+class TreePackedSeqParams(PackedSeqParams):
+    """Packed-sequence metadata for a DFS-linearized prefix tree.
+
+    Physical tokens occur once in DFS order. Segment parent/depth metadata
+    restores the logical causal path for attention and recurrent state scans.
+    """
+
+    tree_segment_starts: Tuple[int, ...] = ()
+    tree_segment_lengths: Tuple[int, ...] = ()
+    tree_segment_parents: Tuple[int, ...] = ()
+    tree_segment_depths: Tuple[int, ...] = ()
+    tree_local_position_ids: Tensor = None
+    tree_cp_gather_inverse: Tensor = None
+    tree_query_runs: Tuple[TreeQueryRun, ...] = ()
+    tree_cp_local_token_count: int = 0
+    tree_edge_local_indices: Tensor = None
+    tree_edge_output_indices: Tensor = None
+    tree_edge_count: int = 0
+    tree_edge_padded_width: int = 0
+
+    def __post_init__(self):
+        super().__post_init__()
+        segment_count = len(self.tree_segment_lengths)
+        if not (
+            segment_count
+            == len(self.tree_segment_starts)
+            == len(self.tree_segment_parents)
+            == len(self.tree_segment_depths)
+        ):
+            raise ValueError("tree packed-sequence segment metadata must align")
+        if any(length <= 0 for length in self.tree_segment_lengths):
+            raise ValueError("tree packed-sequence segments must be non-empty")

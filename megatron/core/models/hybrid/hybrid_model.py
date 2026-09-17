@@ -17,7 +17,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.layers import utils as layer_utils
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, TreePackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -591,6 +591,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
         mtp_hidden_states = hidden_states
         mtp_inputs = None
+        if isinstance(packed_seq_params, TreePackedSeqParams) and mtp_forward_ran:
+            raise NotImplementedError("tree packed sequences require MTP loss to be disabled")
         if mtp_forward_ran:
             mtp_inputs = self.mtp.prepare_cp_layout(
                 input_ids=input_ids,
@@ -688,9 +690,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        if isinstance(packed_seq_params, TreePackedSeqParams) and labels is not None:
+            raise NotImplementedError(
+                "tree packed sequences require externally prepared edge losses"
+            )
+        hidden_states, restore_sequence_parallel = self._select_tree_edge_hidden_states(
+            hidden_states, packed_seq_params, self.output_layer
         )
+        try:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        finally:
+            if restore_sequence_parallel:
+                self.output_layer.sequence_parallel = True
         logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.

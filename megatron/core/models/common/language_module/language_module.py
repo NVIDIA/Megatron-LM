@@ -12,6 +12,7 @@ from megatron.core.models.backends import (
     get_backend_from_config,
     select_cross_entropy,
 )
+from megatron.core.packed_seq_params import TreePackedSeqParams
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -19,6 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
@@ -86,6 +88,55 @@ class LanguageModule(MegatronModule):
                 need_backward=False,
                 inline_capture=True,
             )
+
+    def _select_tree_edge_hidden_states(
+        self, hidden_states: Tensor, packed_seq_params, output_layer
+    ) -> tuple[Tensor, bool]:
+        """Select CP-owned sampled-edge states before vocabulary projection.
+
+        Sequence-parallel decoder outputs are split contiguously across TP.
+        Each TP rank inserts only the edge states it owns into a fixed edge
+        axis, then a TP reduction reconstructs that axis on every rank. The
+        output layer must temporarily disable its normal sequence gather
+        because the selected edge axis is already replicated.
+        """
+        if not isinstance(packed_seq_params, TreePackedSeqParams):
+            return hidden_states, False
+
+        edge_count = packed_seq_params.tree_edge_output_indices.numel()
+        if edge_count == 0:
+            hidden_states = hidden_states[:1] * 0.0
+        elif output_layer.sequence_parallel:
+            tp_size = self.tp_group.size()
+            tp_rank = self.tp_group.rank()
+            local_token_count = hidden_states.shape[0]
+            if local_token_count * tp_size != packed_seq_params.tree_cp_local_token_count:
+                raise ValueError(
+                    "tree edge projection expected contiguous TP sequence shards: "
+                    f"local={local_token_count}, tp={tp_size}, "
+                    f"cp_local={packed_seq_params.tree_cp_local_token_count}"
+                )
+            edge_cp_indices = packed_seq_params.tree_edge_local_indices[:edge_count]
+            shard_start = tp_rank * local_token_count
+            shard_end = shard_start + local_token_count
+            owned = (edge_cp_indices >= shard_start) & (edge_cp_indices < shard_end)
+            owned_edge_positions = owned.nonzero(as_tuple=False).flatten()
+            owned_hidden = hidden_states.index_select(0, edge_cp_indices[owned] - shard_start)
+            edge_hidden = hidden_states.new_zeros(edge_count, *hidden_states.shape[1:]).index_copy(
+                0, owned_edge_positions, owned_hidden
+            )
+            hidden_states = reduce_from_tensor_model_parallel_region(
+                edge_hidden, group=self.tp_group
+            )
+        else:
+            hidden_states = hidden_states.index_select(
+                0, packed_seq_params.tree_edge_local_indices[:edge_count]
+            )
+
+        restore_sequence_parallel = output_layer.sequence_parallel
+        if restore_sequence_parallel:
+            output_layer.sequence_parallel = False
+        return hidden_states, restore_sequence_parallel
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
