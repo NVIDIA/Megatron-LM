@@ -1342,6 +1342,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 "skip_bias_add": False,
                 "is_expert": False,
                 "tp_group": pg_collection.tp if pg_collection is not None else None,
+                # Pass the collection, not just tp: the linear reads its GTP axis from it.
+                # With only tp_group it falls back to the MPU globals, which a MIMO run
+                # never creates, and the projection is then silently built unsharded.
+                "pg_collection": pg_collection,
             }
             self.e_proj = build_module(
                 self.submodules.e_proj,
@@ -1374,6 +1378,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_expert=False,
                 tp_comm_buffer_name="mtp_eh_proj",
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                # Same reason as projection_kwargs above: the GTP axis comes from the
+                # collection, and tp_group alone leaves it to the MPU fallback.
+                pg_collection=pg_collection,
                 name=(name + ".eh_proj") if name is not None else None,
             )
             self.e_proj = None

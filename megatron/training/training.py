@@ -140,6 +140,12 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
+from megatron.training.callbacks import (
+    Callback,
+    CallbackContext,
+    CallbackManager,
+    normalize_callbacks,
+)
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -1558,6 +1564,7 @@ def pretrain(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
+    callbacks: list[Callback] | CallbackManager | None = None,
 ):
     """Main training program.
 
@@ -1604,6 +1611,8 @@ def pretrain(
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+
+    callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1860,6 +1869,8 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.trigger("on_setup_start")
+
     if args.train_full_dataset:
         if not getattr(
             train_valid_test_dataset_provider, 'supports_train_full_dataset', False
@@ -2008,6 +2019,11 @@ def pretrain(
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
+    callback_manager.callback_context.model = model
+    callback_manager.callback_context.optimizer = optimizer
+    callback_manager.callback_context.scheduler = opt_param_scheduler
+    callback_manager.trigger("on_data_init_start")
+
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
     # startup on its own -- the 'data_loading' span group exists exactly for this.
@@ -2119,6 +2135,7 @@ def pretrain(
                     inference_model,
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
+                    callback_manager=callback_manager,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2188,7 +2205,9 @@ def pretrain(
                 iteration, process_non_loss_data_func, model_cfg,
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
                 non_loss_data_func=non_loss_data_func,
-                pg_collection=pg_collection, p2p_communicator=p2p_communicator
+                pg_collection=pg_collection, p2p_communicator=p2p_communicator,
+                callback_manager=callback_manager,
+                is_test=False,
             )
 
     if args.do_test:
@@ -2206,6 +2225,8 @@ def pretrain(
             non_loss_data_func=non_loss_data_func,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=True,
         )
 
     wandb_writer = get_wandb_writer()
@@ -3578,9 +3599,12 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    model=None,
+    callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
 ):
     """Log training information such as losses, timing, ...."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -3983,6 +4007,12 @@ def training_log(
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+
+        log_fragments: list[str] = []
+        callback_manager.callback_context.log_fragments = log_fragments
+        callback_manager.callback_context.timers_to_log = timers_to_log
+        callback_manager.trigger("on_log")
+        log_string += "".join(log_fragments)
         print_rank_last(log_string)
 
         # OTel: emit training metrics at log interval (export rank only). Loss and
@@ -4513,6 +4543,7 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    callback_manager: CallbackManager | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4521,6 +4552,7 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     """
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
 
@@ -4907,6 +4939,8 @@ def train(
             args.train_samples and args.consumed_train_samples >= args.train_samples
         )
 
+    callback_manager.trigger("on_train_start")
+
     # Run training iterations till done.
     buffered_rollouts = None
     while not _finished_training(iteration):
@@ -4972,6 +5006,8 @@ def train(
                     f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                                 "transition, saving checkpoint before exiting.")
                     save_checkpoint_and_time(
                         iteration,
                         model,
@@ -4981,6 +5017,16 @@ def train(
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
                     )
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
+                                 "exiting so the run can be relaunched at the new batch size.")
+                    # Break here rather than leaving it to the `should_exit` check further
+                    # down the loop body, which sits after train_step and would run one more
+                    # iteration at the new microbatch count before stopping.
+                    should_exit = True
+                    break
+                print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                             "transition but --save is unset, so there is no checkpoint to "
+                             "relaunch from; continuing at the new batch size.")
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
@@ -5056,6 +5102,9 @@ def train(
             samples_seen_in_iteration = None
             _step_span = None
         else:
+
+            callback_manager.trigger("on_train_step_start")
+
             # OTel: dedicated span for the first iteration actually executed in this
             # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
             # just the first one that runs. Kept separate from the per-step span below
@@ -5101,6 +5150,12 @@ def train(
                     _otel_safe_set_attrs(
                         _step_span, {'megatron.skipped': bool(skipped_iter)}
                     )
+
+            callback_manager.callback_context.loss_dict = loss_dict
+            callback_manager.callback_context.grad_norm = grad_norm
+            callback_manager.callback_context.skipped_iter = bool(skipped_iter)
+            callback_manager.trigger("on_train_step_end")
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -5270,6 +5325,8 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    model=model,
+                    callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
@@ -5328,7 +5385,8 @@ def train(
                                        config, verbose=False, write_to_tensorboard=True,
                                        non_loss_data_func=non_loss_data_func,
                                        pg_collection=pg_collection,
-                                       p2p_communicator=p2p_communicator)
+                                       p2p_communicator=p2p_communicator,
+                                       callback_manager=callback_manager, is_test=False)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -5417,6 +5475,8 @@ def train(
     if args.rl_profile:
         shutdown_rl_profiler()
 
+    callback_manager.trigger("on_train_end")
+
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
         # Deregister NCCL user-buffer memory pools before exit.
@@ -5477,10 +5537,16 @@ def evaluate(
     eval_iters=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Evaluation."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
+
+    step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
+    step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -5556,7 +5622,7 @@ def evaluate(
 
             # Don't care about timing during evaluation
             config.timers = None
-            ft_integration.on_eval_step_start()
+
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
                     (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
@@ -5567,6 +5633,11 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
+
+            ft_integration.on_eval_step_start()
+
+            callback_manager.trigger(step_start_event)
+
             with _otel_managed_span('evaluate', 'megatron.evaluate.step',
                                     **{'megatron.eval_iteration': iteration}):
                 loss_dicts = forward_backward_func(
@@ -5582,6 +5653,9 @@ def evaluate(
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                 )
+
+            callback_manager.trigger(step_end_event)
+
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
 
@@ -5690,13 +5764,19 @@ def evaluate_and_print_results(
     non_loss_data_func=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Helper function to evaluate and dump results on screen."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
         writer = None
+
+    start_event = "on_test_start" if is_test else "on_eval_start"
+    end_event = "on_test_end" if is_test else "on_eval_end"
 
     wandb_writer = get_wandb_writer()
 
@@ -5730,6 +5810,8 @@ def evaluate_and_print_results(
             f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
             f"the number of validation datasets ({len(data_iterators)})"
 
+    callback_manager.trigger(start_event)
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -5737,6 +5819,7 @@ def evaluate_and_print_results(
                 suffix = f"-{args.validation_set_names[index]}"
             else:
                 suffix = f"-{index}"
+
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
@@ -5748,6 +5831,8 @@ def evaluate_and_print_results(
             eval_iters=iterations,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=is_test,
         )
         # Timelimit hit during evaluation
         if timelimit:
@@ -5781,6 +5866,9 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+    callback_manager.callback_context.total_loss_dict = total_loss_dict
+    callback_manager.trigger(end_event)
 
 
 def cyclic_iter(iterable):
