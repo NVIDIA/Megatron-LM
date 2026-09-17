@@ -14,6 +14,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid import hybrid_block as hybrid_block_module
 from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -33,6 +34,7 @@ def _wide_config(
     hidden_size: int,
     mtp_num_layers: int | None = None,
     with_moe: bool = False,
+    with_shortcut: bool = False,
     fp32_residual_connection: bool = False,
 ):
     moe_config = {}
@@ -45,6 +47,14 @@ def _wide_config(
             "moe_grouped_gemm": True,
             "add_bias_linear": False,
         }
+    if with_shortcut:
+        moe_config.update(
+            moe_shortcut_connection=True,
+            moe_shortcut_post_norm=True,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shared_expert_intermediate_size=2 * hidden_size,
+        )
     return TransformerConfig(
         num_layers=num_layers,
         mtp_num_layers=mtp_num_layers,
@@ -150,9 +160,10 @@ class TestWideResidualMTPAndMIMO:
         replay_plan_calls = []
         build_replay_plan = hybrid_block_module.build_residual_stream_recompute_plan
 
-        def track_replay_plan(num_layers, block_size):
-            replay_plan_calls.append((num_layers, block_size))
-            return build_replay_plan(num_layers, block_size)
+        def track_replay_plan(num_layers, block_size, *, atomic_layer_pairs=()):
+            atomic_layer_pairs = tuple(atomic_layer_pairs)
+            replay_plan_calls.append((num_layers, block_size, atomic_layer_pairs))
+            return build_replay_plan(num_layers, block_size, atomic_layer_pairs=atomic_layer_pairs)
 
         monkeypatch.setattr(
             hybrid_block_module, "build_residual_stream_recompute_plan", track_replay_plan
@@ -190,7 +201,9 @@ class TestWideResidualMTPAndMIMO:
         loss.mean().backward()
 
         mtp_stack = model.mtp.layers[0].mtp_model_layer
-        assert replay_plan_calls == [(len(model.decoder.layers), 1)]
+        assert replay_plan_calls == [
+            (model.decoder.num_layers_per_pipeline_rank, 1, model.decoder._shortcut_layer_pairs())
+        ]
         assert model.decoder.uses_wide_residual_stream
         assert model.decoder.residual_stream_readout is not None
         assert type(model.decoder.layers[0]) is WideResidualMambaLayer
@@ -262,5 +275,82 @@ class TestWideResidualMTPAndMIMO:
         assert model.language_model.decoder.residual_stream_readout is not None
         assert model.language_model.embedding.word_embeddings.weight.grad is not None
         assert model.language_model.decoder.residual_stream_readout.exit_map.logit.grad is not None
+        assert returned_loss_mask is loss_mask
+        assert loss.shape == input_ids.shape
+
+    def test_mimo_hybrid_shortcut_mtp_wide_fp32_forward_backward(self):
+        config = _wide_config(
+            num_layers=4,
+            hidden_size=256,
+            mtp_num_layers=2,
+            with_moe=True,
+            with_shortcut=True,
+            fp32_residual_connection=True,
+        )
+        language_spec = ModuleSpec(
+            module=HybridModel,
+            params={
+                "config": config,
+                "hybrid_stack_spec": wide_residual_hybrid_stack_spec,
+                "vocab_size": 128,
+                "max_sequence_length": 4,
+                "hybrid_layer_pattern": "MEME/*E/*E",
+                "position_embedding_type": "none",
+            },
+        )
+        model = _move_model_to_configured_dtype(
+            MimoModel(
+                MimoModelConfig(
+                    language_model_spec=language_spec,
+                    modality_submodules_spec={},
+                    special_token_ids={},
+                )
+            ),
+            config,
+        )
+
+        shortcuts = model.language_model.decoder.layers
+        assert len(shortcuts) == 2
+        assert all(isinstance(shortcut, ShortcutMoEBlock) for shortcut in shortcuts)
+        second_shortcut_input_dtypes = []
+
+        def record_second_shortcut_input_dtype(_module, inputs):
+            second_shortcut_input_dtypes.append(inputs[0].dtype)
+
+        shortcuts[1].shortcut_residual_read.register_forward_pre_hook(
+            record_second_shortcut_input_dtype
+        )
+        input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda")
+        position_ids = torch.arange(4, device="cuda").unsqueeze(0).expand(2, -1)
+        labels = input_ids.roll(-1, dims=1)
+        loss_mask = torch.ones_like(labels, dtype=torch.float32)
+
+        with patch.object(
+            model.language_model.decoder, "forward", wraps=model.language_model.decoder.forward
+        ) as decoder_forward:
+            loss, returned_loss_mask = model(
+                input_ids=input_ids, position_ids=position_ids, labels=labels, loss_mask=loss_mask
+            )
+        loss.mean().backward()
+
+        decoder_input = decoder_forward.call_args.kwargs["hidden_states"]
+        mtp_stack = model.language_model.mtp.layers[0].mtp_model_layer
+        assert decoder_input.dtype == torch.float32
+        assert second_shortcut_input_dtypes
+        assert all(dtype == torch.float32 for dtype in second_shortcut_input_dtypes)
+        for shortcut in shortcuts:
+            assert shortcut.shortcut_residual_read is not None
+            assert shortcut.shortcut_residual_read.read_map.logit.grad is not None
+            assert shortcut.attn_layer.residual_connection.read_map.logit.grad is not None
+            assert shortcut.moe_layer.residual_connection_mlp.read_map.logit.grad is not None
+            assert shortcut.shortcut_post_norm.weight.grad is not None
+        assert not mtp_stack.uses_wide_residual_stream
+        assert len(mtp_stack.layers) == 1
+        assert isinstance(mtp_stack.layers[0], ShortcutMoEBlock)
+        assert mtp_stack.layers[0].is_mtp_layer
+        assert mtp_stack.layers[0].shortcut_residual_read is None
+        assert mtp_stack.layers[0].shortcut_post_norm.weight.grad is not None
+        assert model.language_model.mtp.layers[0].eh_proj.weight.grad is not None
+        assert model.language_model.embedding.word_embeddings.weight.grad is not None
         assert returned_loss_mask is loss_mask
         assert loss.shape == input_ids.shape

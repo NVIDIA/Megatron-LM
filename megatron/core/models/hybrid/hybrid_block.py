@@ -381,6 +381,20 @@ class HybridStack(MegatronModule):
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
 
+    def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
+        """Return physical layer indices that must share one residual replay block."""
+
+        pairs = []
+        for layer in self.layers:
+            if not isinstance(layer, ShortcutMoEBlock):
+                continue
+            if layer.attn_local_idx is None or layer.moe_local_idx is None:
+                raise RuntimeError("A registered ShortcutMoEBlock is missing physical indices.")
+            if layer.moe_local_idx != layer.attn_local_idx + 1:
+                raise RuntimeError("A ShortcutMoEBlock must contain adjacent physical layers.")
+            pairs.append((layer.attn_local_idx, layer.moe_local_idx))
+        return tuple(pairs)
+
     @property
     def layer_type_list(self) -> list[str]:
         """Return layer symbols derived from the per-layer configs.
@@ -593,10 +607,12 @@ class HybridStack(MegatronModule):
         )
         residual_stream_recompute_plan = (
             build_residual_stream_recompute_plan(
-                len(self.layers), self.config.residual_stream_recompute_num_layers
+                self.num_layers_per_pipeline_rank,
+                self.config.residual_stream_recompute_num_layers,
+                atomic_layer_pairs=self._shortcut_layer_pairs(),
             )
             if use_residual_stream_recompute
-            else [None] * len(self.layers)
+            else [None] * self.num_layers_per_pipeline_rank
         )
 
         with outer_fp8_context:
@@ -625,7 +641,9 @@ class HybridStack(MegatronModule):
                     )
                 ):
                     layer_packed_seq_params = packed_seq_params
-                    residual_stream_recompute_context = residual_stream_recompute_plan[layer_idx]
+                    residual_stream_recompute_context = residual_stream_recompute_plan[
+                        physical_layer_idx
+                    ]
                     mhc_manager = mhc_layer_managers[layer_idx]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
@@ -637,10 +655,11 @@ class HybridStack(MegatronModule):
                     )
 
                     if isinstance(layer, ShortcutMoEBlock):
-                        if residual_stream_recompute_context is not None:
-                            raise TypeError(
-                                "Residual-stream recomputation does not support ShortcutMoEBlock."
+                        if layer.moe_local_idx is None:
+                            raise RuntimeError(
+                                "A registered ShortcutMoEBlock is missing its MoE physical index."
                             )
+                        moe_recompute_context = residual_stream_recompute_plan[layer.moe_local_idx]
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -652,7 +671,10 @@ class HybridStack(MegatronModule):
                             quant_context_factory=get_inner_quant_context,
                             cp_layout_state=cp_layout_state,
                             packed_sequence_cp_metadata=layer_cp_metadata,
+                            attn_recompute_context=residual_stream_recompute_context,
+                            moe_recompute_context=moe_recompute_context,
                         )
+                        residual_stream_recompute_context = moe_recompute_context
                     else:
                         if cp_layout_state is not None:
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
