@@ -4,7 +4,10 @@
 
 import copy
 import json
+import os
+import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -276,19 +279,12 @@ def test_cli_strict_unknown_and_matching_failure(tmp_path):
 
 
 @pytest.mark.parametrize("exit_code,complete", [(0, True), (1, False)])
-def test_capture_entrypoint_preserves_exit_and_incomplete_evidence(
-    tmp_path, monkeypatch, exit_code, complete
-):
-    torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setattr(capture_recipe, "source_context", lambda torch: inventory()["context"])
-    monkeypatch.setenv("RANK", "0")
+def test_capture_entrypoint_preserves_exit_and_incomplete_evidence(tmp_path, exit_code, complete):
     bindings = tmp_path / "bindings.json"
     bindings.write_text("[]")
     (tmp_path / "helper.py").write_text(f"EXIT_CODE = {exit_code}\n")
     script = tmp_path / "train.py"
     script.write_text("from helper import EXIT_CODE\nraise SystemExit(EXIT_CODE)\n")
-    monkeypatch.delitem(sys.modules, "helper", raising=False)
     output = tmp_path / "capture"
     args = [
         "--bindings",
@@ -300,13 +296,111 @@ def test_capture_entrypoint_preserves_exit_and_incomplete_evidence(
         "--",
         str(script),
     ]
-    previous_argv, previous_path = sys.argv[:], sys.path[:]
-    if complete:
-        assert capture_recipe.main(args) == 0
-    else:
-        with pytest.raises(SystemExit) as error:
-            capture_recipe.main(args)
-        assert error.value.code == exit_code
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from tools.determinism.capture_recipe import main\n"
+            "previous_argv, previous_path = sys.argv[:], sys.path[:]\n"
+            "try:\n"
+            "    main(sys.argv[1:])\n"
+            "finally:\n"
+            "    assert sys.argv == previous_argv and sys.path == previous_path\n",
+            *args,
+        ],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "RANK": "0", "WORLD_SIZE": "1"},
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == exit_code, result.stderr
     assert json.loads((output / "rank-0.json").read_text())["complete"] == complete
-    assert sys.argv == previous_argv
-    assert sys.path == previous_path
+
+
+@pytest.mark.parametrize("mode", ["cli", "yaml", "yaml-overrides-cli"])
+def test_capture_bootstraps_effective_policy_before_binding_import(tmp_path, mode):
+    enabled = mode != "yaml-overrides-cli"
+    module = tmp_path / "policy_probe.py"
+    module.write_text(
+        "import os, sys, torch\n"
+        "assert 'megatron.core' not in sys.modules\n"
+        "assert 'transformer_engine.pytorch' not in sys.modules\n"
+        f"assert torch.are_deterministic_algorithms_enabled() is {enabled}\n"
+        f"assert torch.backends.cudnn.deterministic is {enabled}\n"
+        "assert not torch.cuda.is_initialized()\n"
+        "assert not torch.is_deterministic_algorithms_warn_only_enabled()\n"
+        + (
+            "assert os.environ['TRITON_CACHE_AUTOTUNING'] == '0'\n"
+            "assert os.environ['MAMBA_DETERMINISTIC'] == '1'\n"
+            "assert os.environ['CAUSAL_CONV1D_DETERMINISTIC'] == '1'\n"
+            if enabled
+            else "assert 'TRITON_CACHE_AUTOTUNING' not in os.environ\n"
+        )
+        + "def activation(value):\n    return value.square()\n"
+    )
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text(
+        json.dumps(
+            [
+                {
+                    "target": "policy_probe:activation",
+                    "op_id": "policy-probe",
+                    "implementation": "torch:square",
+                }
+            ]
+        )
+    )
+    script = tmp_path / "train.py"
+    script.write_text(
+        "import torch\nfrom policy_probe import activation\n"
+        "activation(torch.ones(2, requires_grad=True)).sum().backward()\n"
+    )
+    command = [str(script)]
+    if mode in ("cli", "yaml-overrides-cli"):
+        command.append("--deterministic-mode")
+    if mode != "cli":
+        config = tmp_path / "training.yaml"
+        config.write_text(f"language_model:\n  deterministic_mode: {str(enabled).lower()}\n")
+        command.extend(["--yaml-cfg", str(config)])
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("NCCL_", "NVTE_", "CUBLAS_", "MAMBA_", "CAUSAL_CONV1D_", "TRITON_"))
+    }
+    root = Path(__file__).resolve().parents[3]
+    environment.update(
+        CUDA_VISIBLE_DEVICES="",
+        RANK="0",
+        WORLD_SIZE="1",
+        PYTHONPATH=os.pathsep.join([str(tmp_path), str(root)]),
+    )
+    output = tmp_path / "capture"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.determinism.capture_recipe",
+            "--bindings",
+            str(bindings),
+            "--output",
+            str(output),
+            "--recipe-id",
+            mode,
+            "--",
+            *command,
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    capture = json.loads((output / "rank-0.json").read_text())
+    assert capture["complete"] and not capture["truncated"]
+    assert {item["signature"]["phase"] for item in capture["operations"]} == {
+        "forward",
+        "forward_backward",
+    }
+    assert all(
+        item["signature"]["deterministic_algorithms"] is enabled for item in capture["operations"]
+    )

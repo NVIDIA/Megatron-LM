@@ -226,25 +226,14 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command or args.max_signatures < 1:
         parser.error("A training script and positive signature limit are required")
-    deterministic = "--deterministic-mode" in command
-    if deterministic:
-        # Seed defaults before importing Torch or Megatron: importing the
-        # policy module can itself import libraries that cache these flags.
-        for name, value in {
-            "NCCL_ALGO": "Ring",
-            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
-            "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-            "MAMBA_DETERMINISTIC": "1",
-            "CAUSAL_CONV1D_DETERMINISTIC": "1",
-        }.items():
-            os.environ.setdefault(name, value)
+    # Honor the effective CLI/YAML policy before bound modules can import Core,
+    # initialize CUDA or cache backend settings. Training still validates all
+    # model options through its normal parser.
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism(command[1:])
     import torch
 
-    if deterministic:
-        torch.use_deterministic_algorithms(True)
-        from megatron.training.determinism import apply_determinism_env
-
-        apply_determinism_env(os.environ)
     if torch.cuda.is_available():
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     args.output.mkdir(parents=True, exist_ok=True)
