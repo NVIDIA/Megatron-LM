@@ -34,6 +34,10 @@ class TrainState(Stateful):
             their corresponding tensor representations.
         """
         return {
+            # TrainState comes from Megatron-Bridge, however that repo used 'step' instead of 'iteration'
+            # for both the state dict and the dataclass attribute. 'iteration' is more consistent with
+            # Megatron-LM, but using 'step' for the state dict will allow pre-unification Bridge checkpoints
+            # to work without issue when loading in Megatron-LM after unification.
             "step": torch.tensor(self.iteration, dtype=torch.int64),
             "consumed_train_samples": torch.tensor(self.consumed_train_samples, dtype=torch.int64),
             "skipped_train_samples": torch.tensor(self.skipped_train_samples, dtype=torch.int64),
