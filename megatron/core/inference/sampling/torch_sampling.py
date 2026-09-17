@@ -144,7 +144,7 @@ class TorchSampling(Sampling):
                 each logits row to its request index.
 
         Returns:
-            Tensor: Per-row log probabilities for the processed distribution.
+            Tensor: Per-row float32 log probabilities for the processed distribution.
         """
         active_request_count = context.total_request_count - context.paused_request_count
         metadata = context.active_request_metadata
@@ -165,7 +165,11 @@ class TorchSampling(Sampling):
         for row, key in enumerate(zip(temps, top_ks, top_ps)):
             buckets[key].append(row)
 
-        log_probs = torch.empty_like(logits)
+        # fp32: `torch.log_softmax(..., dtype=torch.float32)` below is computed in
+        # fp32 precisely to avoid the tail erosion bf16/fp16 causes on wide vocabularies;
+        # allocating this buffer in `logits.dtype` would silently downcast the result
+        # back on assignment and defeat that precision fix.
+        log_probs = torch.empty_like(logits, dtype=torch.float32)
         for (t, k, p), rows in buckets.items():
             idx = torch.tensor(rows, device=logits.device, dtype=torch.long)
             filtered = TorchSampling.filter_logits(
