@@ -46,6 +46,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
+    FinishedRequestRecord,
     RequestPayloadStageResult,
     Status,
     compute_block_hashes_batched,
@@ -1559,13 +1560,17 @@ class _RecordingStager:
         return RequestPayloadStageResult()
 
 
-def _reply_request(uid, status, log_probs, *, streaming=False):
+def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tokens=False):
     request = DynamicInferenceRequest(
         request_id=1,
         uid=uid,
         prompt_tokens=torch.tensor([1, 2, 3]),
         sampling_params=SamplingParams(
-            num_tokens_to_generate=2, termination_id=0, return_log_probs=True, streaming=streaming
+            num_tokens_to_generate=2,
+            termination_id=0,
+            return_log_probs=True,
+            streaming=streaming,
+            return_prompt_tokens=return_prompt_tokens,
         ),
         generated_tokens=[10, 11],
     )
@@ -1584,14 +1589,23 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     """A stager offloads completed non-streaming replies only.
 
     Failed and streaming requests are neither staged nor stripped, and replies are untouched
-    without a stager. The ledger is a separate mechanism and stays off here.
+    without a stager. An offloaded reply never carries the prompt tensors, even when the
+    request opted into return_prompt_tokens (the stager holds the prompt ids); a reply that
+    is not offloaded still honours the opt-in. The ledger is a separate mechanism and stays
+    off here.
     """
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.local_metadata_ledger_enabled = False
     engine.local_metadata_ledger = {}
     engine.payload_stager = _RecordingStager() if with_stager else None
     engine.socket_for_receiving_requests = mock.Mock()
-    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25], streaming=streaming)
+    completed = _reply_request(
+        "chatcmpl-ok",
+        Status.COMPLETED,
+        [-0.5, -0.25],
+        streaming=streaming,
+        return_prompt_tokens=True,
+    )
     failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
 
     engine._send_requests_to_coordinator([completed, failed])
@@ -1611,13 +1625,44 @@ def test_payload_offload_stages_only_eligible_completed_replies(
         assert payload.generated_token_ids == [10, 11]
         assert payload.generated_log_probs == [-0.5, -0.25]
         assert ok_wire["payload_offloaded"] is True and ok_wire["generated_log_probs"] is None
+        for prompt_field in ("prompt_tokens", "compact_prompt_tokens", "remaining_prompt_tokens"):
+            assert ok_wire[prompt_field] is None, prompt_field
     else:
         assert not getattr(engine.payload_stager, "staged", [])
         assert ok_wire["generated_log_probs"] == [-0.5, -0.25]
         assert ok_wire["payload_stage_metadata"] == {}
-    # Token ids stay on the wire, and the drop is wire-only: the request keeps its log probs.
+        assert ok_wire["prompt_tokens"] == ["tensor", [1, 2, 3]]
+        assert ok_wire["remaining_prompt_tokens"] == ["tensor", [1, 2, 3]]
+    # prompt_length is always reported; generated token ids stay on the wire, and the drop is
+    # wire-only: the request keeps its prompt and log probs.
+    assert ok_wire["prompt_length"] == 3
     assert ok_wire["generated_tokens"] == [10, 11]
     assert completed.generated_log_probs == [-0.5, -0.25]
+    assert completed.prompt_tokens.tolist() == [1, 2, 3]
+
+
+def test_finished_request_record_is_built_once_for_ledger_and_stager():
+    """With both the ledger and a stager on, one FinishedRequestRecord per completed request
+    is shared by both; failed requests build none."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = True
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = _RecordingStager()
+    engine.socket_for_receiving_requests = mock.Mock()
+    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
+    failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+
+    with mock.patch.object(
+        FinishedRequestRecord, "from_request", wraps=FinishedRequestRecord.from_request
+    ) as from_request:
+        engine._send_requests_to_coordinator([completed, failed])
+
+    from_request.assert_called_once_with(completed)
+    record = engine.local_metadata_ledger["chatcmpl-ok"]
+    assert record is engine.payload_stager.finished_metadata
+    assert record.num_evictions == 0
+    ((uid, _),) = engine.payload_stager.staged
+    assert uid == "chatcmpl-ok"
 
 
 def _submit_request_message(request_id, sampling_params, prompt, offload_params):

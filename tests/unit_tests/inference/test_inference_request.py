@@ -470,13 +470,7 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
             ("tensor", [1, 99, 4]),
             ("tensor", [1, 2, 3, 4]),
         ),
-        (  # offload preserves explicit prompt
-            True,
-            True,
-            ("tensor", [1, 2, 3, 4]),
-            ("tensor", [1, 99, 4]),
-            ("tensor", [1, 2, 3, 4]),
-        ),
+        (True, True, None, None, None),  # offload drops the prompt even when opted in
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
@@ -489,7 +483,8 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
     prompt_tokens tensor from the wire payload unless
-    SamplingParams.return_prompt_tokens is True. This is the load-bearing
+    SamplingParams.return_prompt_tokens is True. Payload offload always drops
+    them: the stager already holds the prompt ids. This is the load-bearing
     wire-cost optimization for long agentic-RL prompts. The same call must
     (a) leave self.prompt_tokens intact on the local instance — the drop is
     wire-only — and (b) keep the routing_indices shape check honest, which
@@ -529,6 +524,21 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     else:
         assert isinstance(obj["routing_indices"], tuple)
         assert obj["routing_indices"][0] == "ndarray"
+
+
+def test_dynamic_inference_request_serialize_without_sampling_params_drops_prompt():
+    """With sampling_params=None nothing can opt in to return_prompt_tokens, so the
+    prompt tensors stay off the wire (prompt_length is still reported)."""
+    prompt = torch.tensor([1, 2, 3, 4])
+    req = _make_dynamic_request(prompt_tokens=prompt, sampling_params=None)
+
+    obj = req.serialize()
+
+    assert obj["prompt_length"] == 4
+    assert obj["prompt_tokens"] is None
+    assert obj["remaining_prompt_tokens"] is None
+    assert obj["payload_offloaded"] is False
+    assert req.prompt_tokens is prompt
 
 
 def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(monkeypatch):

@@ -741,11 +741,13 @@ class DynamicInferenceRequest(InferenceRequest):
     # Hybrid models may add kv_meta["ssm"] for recurrent state.
     disaggregated_params: Optional[dict] = None
 
-    # Wire marker: serialize(payload_offloaded=True) writes this key after dropping the
-    # per-token payload (log probs, MoE routing indices) from the wire; the engine sets it
-    # only for requests whose payload it handed to its RequestPayloadStager.
+    # Wire-only keys. Nothing reads or sets these instance attributes: serialize() writes
+    # the wire keys from its own arguments (payload_offloaded=True after dropping the
+    # per-token payload and prompt tensors the RequestPayloadStager took custody of;
+    # payload_stage_metadata from the stager's response metadata) and the REST endpoints
+    # read them off the wire dict. The fields exist only so deserialize()'s cls(**obj)
+    # accepts a reply that carries them.
     payload_offloaded: bool = False
-    # Response-only metadata returned by the payload stager.
     payload_stage_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -854,13 +856,13 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        sampling_params = self.sampling_params
-        # Payload offload must not override an explicit request to return prompt
-        # tokens. Some endpoints include those tokens in their response contract.
-        should_drop_prompt_tokens = (
-            payload_offloaded
-            if sampling_params is None
-            else not getattr(sampling_params, "return_prompt_tokens", False)
+        # An offloaded reply never carries the prompt tensors: the stager already holds
+        # the prompt ids in OffloadedRequestPayload.prompt_token_ids, and for long
+        # conversations they dominate the reply size that offload exists to remove.
+        # Otherwise they are opt-in via SamplingParams.return_prompt_tokens (and dropped
+        # when sampling_params is None).
+        should_drop_prompt_tokens = payload_offloaded or not getattr(
+            self.sampling_params, "return_prompt_tokens", False
         )
         dropped_fields = {}
         if should_drop_prompt_tokens:
@@ -1106,7 +1108,7 @@ class DynamicInferenceRequestRecord:
             prompt_tokens=new_prompt_tokens,
             compact_prompt_tokens=old_request.compact_prompt_tokens,
             sampling_params=old_request.sampling_params,
-            offload_params=copy.deepcopy(old_request.offload_params),
+            offload_params=old_request.offload_params,
             status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
@@ -1206,7 +1208,7 @@ class DynamicInferenceRequestRecord:
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             compact_prompt_tokens=first_request.compact_prompt_tokens,
-            offload_params=copy.deepcopy(first_request.offload_params),
+            offload_params=first_request.offload_params,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=None,
@@ -1278,7 +1280,12 @@ class OffloadedRequestPayload:
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
-        """Copy the payload off a finished (merged) request as plain host-side values."""
+        """Copy the payload off a finished (merged) request as plain host-side values.
+
+        Side effect: replaces ``request.prompt_tokens`` with its host copy when it is a
+        tensor, so one device-to-host copy serves both this payload and every later
+        host-side read of the finished request (its reply and the caller's result).
+        """
 
         def to_plain_list(value):
             if value is None:

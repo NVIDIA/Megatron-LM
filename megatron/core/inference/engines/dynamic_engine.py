@@ -1433,20 +1433,24 @@ class DynamicInferenceEngine(AbstractEngine):
         # A reply is stripped only when its payload was staged.
         serialized = []
         for request in requests:
-            completed = request.status != Status.FAILED
-            if completed and self.local_metadata_ledger_enabled:
+            if request.status == Status.FAILED:
+                serialized.append(request.serialize())
+                continue
+            # One metadata record per completed request serves both the ledger and the stager.
+            finished_metadata = None
+            if self.local_metadata_ledger_enabled or self.payload_stager is not None:
+                finished_metadata = FinishedRequestRecord.from_request(request)
+            if self.local_metadata_ledger_enabled:
                 assert (
                     request.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {request.uid!r}"
-                self.local_metadata_ledger[request.uid] = FinishedRequestRecord.from_request(
-                    request
-                )
-            serialized.append(
-                self._serialize_finished_request(request) if completed else request.serialize()
-            )
+                self.local_metadata_ledger[request.uid] = finished_metadata
+            serialized.append(self._serialize_finished_request(request, finished_metadata))
         self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
-    def _serialize_finished_request(self, request: DynamicInferenceRequest) -> Dict:
+    def _serialize_finished_request(
+        self, request: DynamicInferenceRequest, finished_metadata: Optional[FinishedRequestRecord]
+    ) -> Dict:
         """Stage a non-streaming accepted payload before constructing its coordinator reply."""
         stage_result = None
         if self.payload_stager is not None and not getattr(
@@ -1455,7 +1459,7 @@ class DynamicInferenceEngine(AbstractEngine):
             stage_result = self.payload_stager.stage(
                 request.uid,
                 OffloadedRequestPayload.from_request(request),
-                finished_metadata=FinishedRequestRecord.from_request(request),
+                finished_metadata=finished_metadata,
                 offload_params=request.offload_params,
             )
         return request.serialize(
