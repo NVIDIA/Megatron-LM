@@ -46,6 +46,20 @@ def validate_moe_cuda_graph_support(config) -> None:
     ):
         return
 
+    if getattr(config, "cuda_graph_granularity", "layer") == "chunk":
+        # The whole decoder block is captured, so the MoE only needs static shapes: a rank
+        # capacity with the sync-free HybridEP dispatcher, or a megakernel backend.
+        assert config.moe_megakernel_backend is not None or (
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_flex_dispatcher_backend == "hybridep"
+            and config.moe_expert_rank_capacity_factor is not None
+        ), (
+            "chunk CUDA graphs with MoE need static token shapes: use drop-padding MoE "
+            "(moe_expert_capacity_factor + moe_pad_expert_input_to_capacity), the HybridEP "
+            "flex dispatcher with moe_expert_rank_capacity_factor, or a MoE megakernel backend."
+        )
+        return
+
     assert (
         config.cuda_graph_impl == "transformer_engine"
         and config.moe_token_dispatcher_type == "flex"

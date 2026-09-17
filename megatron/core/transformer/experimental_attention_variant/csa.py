@@ -2254,31 +2254,44 @@ class CompressedSparseAttention(MegatronModule):
             if balanced
             else self._active_thd_compact_indexer_workspace
         )
-        if capturing:
-            if workspace is not None and workspace.matches(
-                q=q,
-                k=k,
-                topk=topk,
-                ratio=ratio,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                q_causal_offsets=q_causal_offsets,
-                return_softmax=return_softmax,
-                precision=precision,
-            ):
-                return workspace
-            raise ValueError(
-                "THD compact CUDA graph capture requires an eagerly prepared compact "
-                "workspace for the active packed geometry. Run eager warmup before capture."
-            )
-
         workspaces = (
             self._balanced_thd_compact_indexer_workspaces.setdefault(workspace_slot, [])
             if balanced
             else self._thd_compact_indexer_workspaces
         )
+        if capturing:
+            # Under full activation recompute the checkpoint forward (no_grad) and its recompute
+            # alternate between two geometries (return_softmax differs), so the last prepared
+            # workspace is not necessarily the one this capture needs. Any warmed-up workspace of
+            # this slot may be reused: matching is shape-only (no host synchronization).
+            candidates = [workspace] if workspace is not None else []
+            candidates += [w for w in workspaces if w is not workspace]
+            for candidate in candidates:
+                if candidate.matches(
+                    q=q,
+                    k=k,
+                    topk=topk,
+                    ratio=ratio,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    q_causal_offsets=q_causal_offsets,
+                    return_softmax=return_softmax,
+                    precision=precision,
+                ):
+                    if balanced:
+                        self._active_balanced_thd_compact_indexer_workspaces[workspace_slot] = (
+                            candidate
+                        )
+                    else:
+                        self._active_thd_compact_indexer_workspace = candidate
+                    return candidate
+            raise ValueError(
+                "THD compact CUDA graph capture requires an eagerly prepared compact "
+                "workspace for the active packed geometry. Run eager warmup before capture."
+            )
+
         for workspace in workspaces:
             if workspace.matches(
                 q=q,

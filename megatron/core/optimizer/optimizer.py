@@ -1936,11 +1936,19 @@ class ChainedOptimizer(MegatronOptimizer):
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
         else:
-            grad_norms = []
-            for optimizer in self.chained_optimizers:
-                _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+            # Keep tensors as tensors: ``if tensor`` and ``math.sqrt(tensor)`` synchronize with
+            # the host, which is illegal while the optimizer step is captured into a CUDA graph.
+            grad_norms = [
+                _grad_norm
+                for _grad_norm in (opt.get_grad_norm() for opt in self.chained_optimizers)
+                if _grad_norm is not None
+            ]
+            if not grad_norms:
+                grad_norm = 0.0
+            elif any(isinstance(x, torch.Tensor) for x in grad_norms):
+                grad_norm = torch.sqrt(sum(x**2 for x in grad_norms))
+            else:
+                grad_norm = math.sqrt(sum(x**2 for x in grad_norms))
         return grad_norm
 
     @torch.no_grad()

@@ -366,13 +366,12 @@ def _build_contiguous_packed_seq_roll_plan(
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
 
     cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
-    if cu.numel() > 1:
-        # Static packed metadata can repeat its final boundary to pad the number
-        # of cu_seqlens entries. Remove duplicates before assigning positions to
-        # packed intervals so every retained interval has a nonzero length.
-        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
-        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
-        cu = cu[nonduplicate_boundaries]
+    # Static packed metadata can repeat its final boundary to pad the number of cu_seqlens
+    # entries (zero-length intervals). They are harmless below: ``bucketize(right=True)``
+    # returns the first boundary strictly greater than a position, so a repeated boundary never
+    # becomes the end of a live position, and ``cu[-1]`` is unchanged. They are deliberately not
+    # compacted with a boolean mask: that indexing is data-dependent (host synchronization) and
+    # cannot be captured when the post-process runs inside a CUDA graph.
 
     has_sequences = cu.numel() > 1
     if local_seq_len == 0 or not has_sequences:
@@ -774,83 +773,92 @@ def _roll_tensor_packed_seq_cp1(tensor, shifts, dims, sequence_end_indices, fill
 
 
 def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0):
-    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries."""
-    cp_size = cp_group.size()
-    rolled_tensor = tensor.clone()
+    """Roll a zigzag-CP THD shard by one token without crossing packed sequence boundaries.
 
-    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
+    Zigzag layout: for packed sequence ``i`` with padded global length ``L_i`` (divisible by
+    ``2 * cp``), CP rank ``r`` owns two chunks of ``h_i = L_i / (2 cp)`` rows -- global chunk ``r``
+    (front) and global chunk ``2cp-1-r`` (tail) -- stored contiguously at local rows
+    ``[cu_i / cp, cu_i / cp + 2 h_i)``. A left roll by one inside the global sequence means every
+    local row takes its right neighbour except (a) the last row of the front chunk, whose successor
+    is the first row of global chunk ``r+1`` = rank ``r+1``'s front chunk (rank ``cp-1``: its own
+    tail chunk), and (b) the last row of the tail chunk, whose successor is the first row of global
+    chunk ``2cp-r`` = rank ``r-1``'s tail chunk (rank 0: the sequence end -> ``fill_value``).
+
+    All indices are computed on the device and the halo exchange is one fixed-shape
+    ``[num_seq_slots, ...]`` batch per direction, so the communication structure does not depend
+    on the data and the roll can be captured in a CUDA graph. Static ``cu_seqlens`` with repeated
+    boundaries (empty slots) are supported: empty slots exchange junk rows that are scattered into
+    a discarded column. Rows beyond the packed data (trailing padding) are left untouched.
+    """
+    assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
+    if dims < 0:
+        dims += tensor.dim()
+    assert dims == tensor.dim() - 1, "Packed sequence roll only supports the last dimension."
+
+    cp_size = cp_group.size()
     local_rank = torch.distributed.get_rank(group=cp_group)
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
     next_rank = global_ranks[(local_rank + 1) % cp_size]
     prev_rank = global_ranks[(local_rank - 1) % cp_size]
 
-    # Iterate over each sequence individually
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i]
-        end_idx = cu_seqlens[i + 1]
+    t_local = tensor.size(-1)
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    local_start = cu[:-1] // cp_size
+    half = (cu[1:] - cu[:-1]) // (2 * cp_size)
+    valid = half > 0
+    front_first = local_start
+    tail_first = local_start + half
+    front_last = local_start + half - 1
+    tail_last = local_start + 2 * half - 1
 
-        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
-        local_start_idx = start_idx // cp_size
-        local_end_idx = end_idx // cp_size
+    # Halo payloads (one row per sequence slot). Clamping only affects empty slots, whose rows
+    # are never scattered back.
+    send_to_prev = tensor.index_select(-1, front_first.clamp(0, t_local - 1)).contiguous()
+    send_to_next = tensor.index_select(-1, tail_first.clamp(0, t_local - 1)).contiguous()
+    recv_from_next = torch.empty_like(send_to_prev)  # successor of our front chunk
+    recv_from_prev = torch.empty_like(send_to_next)  # successor of our tail chunk
 
-        # Skip empty sequences - this can happen when a sequence is very short and
-        # after dividing by cp_size, the local slice has zero length
-        local_seq_len = local_end_idx - local_start_idx
-        if local_seq_len == 0:
-            continue
+    p2p_ops = []
+    if local_rank != 0:
+        p2p_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, send_to_prev, prev_rank, group=cp_group
+            )
+        )
+        p2p_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_from_prev, prev_rank, group=cp_group
+            )
+        )
+    else:
+        recv_from_prev.fill_(fill_value)
+    if local_rank != cp_size - 1:
+        p2p_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, recv_from_next, next_rank, group=cp_group
+            )
+        )
+        p2p_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, send_to_next, next_rank, group=cp_group
+            )
+        )
+    else:
+        recv_from_next.copy_(send_to_next)
+    if p2p_ops:
+        for work in torch.distributed.batch_isend_irecv(p2p_ops):
+            work.wait()
 
-        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
-
-        # The following code is very similar as the code in roll_tensor function
-        local_chunks = tensor_slice.chunk(2, dim=dims)
-        rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
-
-        tensor_send_list = []
-        tensor_recv_list = []
-        for chunk in rolled_chunks:
-            # Skip empty chunks that can occur when the sequence slice is very small
-            if chunk.size(dims) == 0:
-                tensor_send_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                tensor_recv_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                continue
-            boundary = chunk.select(dims, shifts).contiguous().clone()
-            tensor_send_list.append(boundary)
-            tensor_recv_list.append(torch.empty_like(boundary))
-
-        ops = []
-        if local_rank != 0:
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
-        else:
-            tensor_recv_list[1].fill_(fill_value)
-
-        if local_rank != cp_size - 1:
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
-        else:
-            tensor_recv_list[0].copy_(tensor_send_list[1])
-
-        for op in ops:
-            op.wait()
-
-        index = [slice(None)] * rolled_chunks[0].dim()
-        index[dims] = shifts
-        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
-            # Skip empty chunks
-            if chunk.size(dims) == 0:
-                continue
-            chunk[tuple(index)] = recv
-
-        seq_result = torch.cat(rolled_chunks, dim=dims)
-
-        # update the rolled tensor
-        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
-
-    return rolled_tensor
+    rolled = torch.roll(tensor, shifts=-1, dims=-1)
+    # Scatter the halos into the chunk ends; empty slots target an extra junk column.
+    junk = torch.full_like(front_last, t_local)
+    extended = torch.cat([rolled, rolled.new_zeros(rolled.shape[:-1] + (1,))], dim=-1)
+    extended.index_copy_(-1, torch.where(valid, front_last, junk), recv_from_next)
+    extended.index_copy_(-1, torch.where(valid, tail_last, junk), recv_from_prev)
+    rolled = extended.narrow(-1, 0, t_local)
+    # Trailing padding rows (beyond the packed data) keep their original values.
+    in_data = torch.arange(t_local, device=tensor.device) < (cu[-1] // cp_size)
+    return torch.where(in_data, rolled, tensor).contiguous()
 
 
 def _prefetch_contiguous_packed_cp_roll_halos(
@@ -1287,7 +1295,13 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def clean_loss_in_tracker():
-        """Clear per-step MTP loss and acceptance counters."""
+        """Clear per-step MTP loss and acceptance counters while retaining replay metadata.
+
+        The reduce groups are kept: when the post-process runs inside a CUDA graph, the captured
+        accumulation into ``loss_sums`` / ``num_tokens`` replays every step but
+        ``save_loss_to_tracker`` itself does not, so resetting the groups here would leave the
+        replayed losses unreduced (rank-local) in the logs.
+        """
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" in tracker:
             tracker["loss_sums"].zero_()
@@ -1297,8 +1311,6 @@ class MTPLossLoggingHelper:
             tracker["values"].zero_()
         if "loss_values" in tracker:
             tracker["loss_values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
         MTPLossLoggingHelper._clean_acceptance_in_tracker()
 
     @staticmethod
@@ -1690,7 +1702,20 @@ class MTPLossAutoScaler(torch.autograd.Function):
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        MTPLossAutoScaler.main_loss_backward_scale = scale
+        # Keep one persistent device tensor and update it in place (same contract as
+        # MoEAuxLossAutoScaler): a CUDA graph that captured the MTP loss backward holds this
+        # tensor's address, so rebinding a new tensor every step would make the replayed
+        # backward read freed memory.
+        current = MTPLossAutoScaler.main_loss_backward_scale
+        if (
+            not torch.is_tensor(current)
+            or current.device != scale.device
+            or current.shape != scale.shape
+            or current.dtype != scale.dtype
+        ):
+            MTPLossAutoScaler.main_loss_backward_scale = scale.detach().clone()
+        else:
+            current.copy_(scale)
 
 
 def process_mtp_loss(
@@ -2498,10 +2523,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # A legacy GPT MTP layer is already a single Transformer-layer recompute unit.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            # The MTP layer is a single recompute unit regardless of the decoder's
+            # recompute_num_layers, which only groups decoder layers.
             with outer_quantization_context:
                 outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
