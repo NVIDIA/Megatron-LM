@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
+
 import logging
 import os
 import random
@@ -39,6 +40,91 @@ from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 logger = logging.getLogger(__name__)
 
 
+def _native_cp_model_unavailable_reason(model_config, args):
+    """Recognize the default GPT builder before any dynamic CP groups are created.
+
+    Unknown specs/builders are deliberately left on ProcessGroups: identifying one
+    TE layer does not prove that every PP/VPP/MTP stage supports logical CP.
+    """
+    if model_config is None:
+        return "model metadata is unavailable"
+
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
+
+    if type(model_config) is not GPTModelConfig:
+        return "the model is not a known full-attention GPT configuration"
+    if (
+        model_config.builder != "megatron.training.models.gpt.GPTModelBuilder"
+        or model_config.get_builder_cls() is not GPTModelBuilder
+        or model_config.transformer_layer_spec is not None
+        or model_config.restore_modelopt_state
+        or model_config.pre_wrap_hooks
+        or model_config.post_wrap_hooks
+    ):
+        return "custom builders/specs/hooks and ModelOpt need explicit CP support"
+    config = model_config.transformer
+    if type(config) is not TransformerConfig:
+        return "only the standard full-attention TransformerConfig is recognized"
+    if not config.dynamic_context_parallel or not args.dynamic_context_parallel:
+        return "dynamic CP is disabled"
+    if args.distributed_backend != "nccl" or getattr(args, "fake_process_group", False):
+        return "native CP requires a real NCCL parent"
+    if config.transformer_impl != "transformer_engine":
+        return "attention is not implemented by Transformer Engine"
+    if any(
+        getattr(config, name, None)
+        for name in (
+            "is_hybrid_model",
+            "multi_latent_attention",
+            "experimental_attention_variant",
+            "use_kitchen_attention",
+            "fallback_to_eager_attn",
+        )
+    ):
+        return "hybrid, experimental and custom attention are not auto-enabled"
+    if config.attention_backend not in (AttnBackend.auto, AttnBackend.flash, AttnBackend.fused):
+        return "native CP requires fused or flash TE attention"
+    cp_types = config.cp_comm_type
+    if not isinstance(cp_types, list):
+        cp_types = [cp_types]
+    if not cp_types or any(cp_type not in (None, "p2p") for cp_type in cp_types):
+        return "every attention layer must use P2P CP"
+    if (
+        config.params_dtype not in (torch.float16, torch.bfloat16)
+        or config.fp8
+        or config.fp8_dot_product_attention
+        or config.quant_recipe is not None
+    ):
+        return "automatic native CP requires FP16/BF16 attention without FP8"
+    if config.softmax_type != "vanilla" or config.qk_clip or config.log_max_attention_logit:
+        return "native CP requires vanilla softmax without max-logit output"
+    if config.cuda_graph_impl != "none":
+        return "automatic native CP currently supports eager execution only"
+    if config.max_seqlen_per_dp_cp_rank is None:
+        return "native CP requires max_seqlen_per_dp_cp_rank to size its arena"
+    return None
+
+
+def _native_cp_transport_checker(model_config, args):
+    """Build a non-allocating startup probe; parallel_state agrees on its result."""
+    model_reason = _native_cp_model_unavailable_reason(model_config, args)
+
+    def check(parent_group):
+        if model_reason is not None:
+            return model_reason
+        try:
+            from transformer_engine.pytorch.attention.native_cp_transport import (
+                get_native_cp_transport_unavailable_reason,
+            )
+        except ImportError:
+            return "Transformer Engine does not provide the native CP capability query"
+        return get_native_cp_transport_unavailable_reason(parent_group)
+
+    return check
+
+
 def initialize_megatron(
     allow_no_cuda=False,
     skip_mpu_initialization=False,
@@ -52,6 +138,7 @@ def initialize_megatron(
     seed_ep_group=None,
     seed_etp_group=None,
     skip_random_seed=False,
+    model_config=None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -106,6 +193,7 @@ def initialize_megatron(
             get_position_embedding_ranks,
             store,
             skip_model_parallel_init=skip_model_parallel_init,
+            model_config=model_config,
         )
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
@@ -263,8 +351,13 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+def _initialize_distributed(
+    get_embedding_ranks,
+    get_position_embedding_ranks,
+    store,
+    skip_model_parallel_init=False,
+    model_config=None,
+):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -370,7 +463,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 dynamic_context_parallel=args.dynamic_context_parallel,
                 min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
-                use_native_cp_transport=args.use_native_cp_transport,
+                native_cp_transport_checker=(
+                    _native_cp_transport_checker(model_config, args)
+                    if args.dynamic_context_parallel and not args.fake_process_group
+                    else None
+                ),
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -390,6 +487,30 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             print_rank_0(
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
+            )
+
+    # The same resolved state must reach model construction, MTP and the scheduler.
+    args.use_native_cp_transport = mpu.is_native_cp_transport_enabled()
+    if args.use_native_cp_transport:
+        reason = _native_cp_model_unavailable_reason(model_config, args)
+        if reason is not None:
+            raise ValueError(
+                f"Existing native CP groups are incompatible with this model: {reason}"
+            )
+    config = getattr(model_config, "transformer", None)
+    if config is not None:
+        config.use_native_cp_transport = args.use_native_cp_transport
+    if args.dynamic_context_parallel:
+        print_rank_0(
+            "> dynamic CP transport: "
+            + ("native (automatic)" if args.use_native_cp_transport else "legacy ProcessGroups")
+        )
+        if not args.use_native_cp_transport and (
+            getattr(args, "dynamic_cp_nvlink_domain_size", None) is not None
+            or getattr(config, "dynamic_cp_nvlink_domain_size", None) is not None
+        ):
+            raise ValueError(
+                "Topology-aware DCP scheduling requires an available native transport."
             )
 
 
@@ -422,11 +543,17 @@ def _set_random_seed(
     """
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+        pp_rank = (
+            get_pg_rank(pp_group)
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_rank()
+        )
         seed = seed_ + (100 * pp_rank)
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            dp_rank = (
+                get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            )
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)

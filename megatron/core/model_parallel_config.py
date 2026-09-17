@@ -94,7 +94,9 @@ class ModelParallelConfig:
     The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
 
     use_native_cp_transport: bool = False
-    """Use TE's NCCL Device API kernel instead of ProcessGroupNCCL for dynamic-CP rings."""
+    """Internal transport selection, resolved before dynamic CP groups are created.
+    Training automatically selects TE's native transport for supported full-attention models.
+    """
 
     dynamic_cp_nvlink_domain_size: Optional[int] = None
     """Enable topology-aware native DCP scheduling with this many consecutive global ranks
@@ -544,9 +546,9 @@ class ModelParallelConfig:
                 or self.dynamic_cp_nvlink_domain_size < 1
             ):
                 raise ValueError("dynamic_cp_nvlink_domain_size must be a positive integer.")
-            if not (self.dynamic_context_parallel and self.use_native_cp_transport):
+            if not self.dynamic_context_parallel:
                 raise ValueError(
-                    "dynamic_cp_nvlink_domain_size requires native dynamic context parallelism."
+                    "dynamic_cp_nvlink_domain_size requires dynamic context parallelism."
                 )
         if self.dynamic_cp_communication_cost is not None:
             cost = self.dynamic_cp_communication_cost

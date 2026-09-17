@@ -71,13 +71,27 @@ The baseline keeps the full fixed CP size for the packed workload. DCP can
 spread short samples over the DPxCP domain instead of making every sample occupy
 the full CP group.
 
+## Automatic native transport
+
+For the default GPT builder with TE full attention, eager FP16/BF16 and P2P CP,
+Megatron automatically uses native transport when the installed TE extension and
+the DP×CP parent communicator support it. No additional transport flag is needed.
+TE must be built with `NVTE_WITH_NCCL_DEVICE_CP=1` and matching NCCL headers/runtime.
+All ranks agree before dynamic CP groups are created. This enables arbitrary
+integer CP sizes and routes attention, MoE auxiliary reductions and MTP through
+one parent communicator. The log reports `dynamic CP transport: native (automatic)`.
+
+Old TE builds, custom/hybrid attention, unsupported precision or CUDA Graphs
+retain the legacy ProcessGroup path, with the reason logged at startup. Failures
+after native initialization begins are errors, not runtime transport fallbacks.
+
 ## NVLink-aware native DCP scheduling
 
 For a Cartesian rank layout with each consecutive eight global GPU ranks in
 one NVLink domain, add these arguments to a native DCP training command:
 
 ```text
---dynamic-context-parallel --use-native-cp-transport
+--dynamic-context-parallel
 --dynamic-cp-nvlink-domain-size 8
 --dynamic-cp-communication-cost 1024 2304
 ```
@@ -89,6 +103,8 @@ positions and takes the common boundaries across TP/PP planes so all stages
 choose the same schedule. Custom non-Cartesian process-group layouts are not
 supported by this option. Omitting the domain size preserves compute-only
 scheduling; legacy multi-ProcessGroup DCP is unchanged.
+Explicit topology-aware scheduling requires native transport; initialization
+reports an error if automatic selection cannot provide it.
 
 The lightweight score retains the padded compute proxy `Q = sum(L_i²) / CP`.
 For a group crossing a domain boundary, it adds only the extra exposed ring

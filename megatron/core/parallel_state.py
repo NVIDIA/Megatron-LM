@@ -586,8 +586,16 @@ def initialize_model_parallel(
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
     use_native_cp_transport: bool = False,
+    native_cp_transport_checker: Optional[
+        Callable[[Optional[torch.distributed.ProcessGroup]], Optional[str]]
+    ] = None,
 ) -> None:
     """Initialize model data parallel groups.
+
+    A ``native_cp_transport_checker`` may return a local unavailability reason
+    (or None). It is called first without a parent, then with the materialized
+    DP×CP parent; all WORLD ranks agree before creating dynamic CP groups.
+    Without a checker, ``use_native_cp_transport`` retains the explicit library behavior.
 
     Args:
         tensor_model_parallel_size (int, default = 1):
@@ -942,12 +950,20 @@ def initialize_model_parallel(
     if dynamic_context_parallel:
         # TODO: Are gloo groups needed for Dynamic CP?
         global _DYNAMIC_DP_CP_GROUPS
+        if native_cp_transport_checker is not None:
+            use_native_cp_transport = _agree_on_native_cp_transport(
+                native_cp_transport_checker(None)
+            )
         if use_native_cp_transport:
             # Materialize the parent before model construction can load optional native MoE DSOs.
             torch.distributed.barrier(
                 group=_DATA_PARALLEL_GROUP_WITH_CP, device_ids=[torch.cuda.current_device()]
             )
             torch.cuda.synchronize()
+            if native_cp_transport_checker is not None:
+                use_native_cp_transport = _agree_on_native_cp_transport(
+                    native_cp_transport_checker(_DATA_PARALLEL_GROUP_WITH_CP)
+                )
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
             _DYNAMIC_DP_CP_GROUPS.update(
                 create_dynamic_dp_cp_groups(
@@ -1378,6 +1394,21 @@ def initialize_model_parallel(
     # put this. If we end up with a more generic initialization of megatron-core
     # we could stick it there
     _set_global_memory_buffer()
+
+
+def _agree_on_native_cp_transport(unavailable_reason):
+    """Select one transport across all pipeline/tensor/data parallel ranks at startup."""
+    reasons = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(reasons, unavailable_reason)
+    reason = next((reason for reason in reasons if reason is not None), None)
+    if reason is not None and torch.distributed.get_rank() == 0:
+        logger.warning("Dynamic CP uses legacy ProcessGroups: %s", reason)
+    return reason is None
+
+
+def is_native_cp_transport_enabled() -> bool:
+    """Whether initialized dynamic CP groups use the native transport."""
+    return any(isinstance(group, LogicalCPGroup) for group in _DYNAMIC_DP_CP_GROUPS.values())
 
 
 def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):

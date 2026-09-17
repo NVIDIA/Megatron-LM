@@ -51,6 +51,8 @@ from megatron.training.global_vars import (
     set_args,
     set_global_variables,
 )
+from megatron.training.initialize import _native_cp_model_unavailable_reason
+from megatron.training.models.gpt import GPTModelConfig
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -253,14 +255,17 @@ def test_native_dynamic_cp_accepts_mtp(monkeypatch):
     args.mtp_num_layers = 1
     args.dynamic_context_parallel = True
     args.calculate_per_token_loss = True
-    args.use_native_cp_transport = True
     args.max_seqlen_per_dp_cp_rank = 256
     args.transformer_impl = "transformer_engine"
     args.distributed_backend = "nccl"
     args.cp_comm_type = ["p2p"]
     args.bf16 = True
     validate_args(args)
-    assert args.use_native_cp_transport and args.mtp_num_layers == 1
+    assert not args.use_native_cp_transport and args.mtp_num_layers == 1
+    model_config = GPTModelConfig(
+        transformer=core_transformer_config_from_args(args), vocab_size=1024
+    )
+    assert _native_cp_model_unavailable_reason(model_config, args) is None
 
 
 def test_gpt_forward_keeps_full_token_padding_mask_for_mtp():
