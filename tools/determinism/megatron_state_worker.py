@@ -61,7 +61,6 @@ def recipe_arguments(
     if optimizer_mode not in (
         "standard",
         "precision_aware_fp16",
-        "hybrid_fp32",
         "hybrid_precision_aware_fp32",
     ) or (optimizer_mode != "standard" and (pipeline_size != 1 or virtual_pipeline_size != 1)):
         raise ValueError("Precision-aware or hybrid optimizers require the PP=1 non-virtual recipe")
@@ -156,8 +155,9 @@ def recipe_arguments(
             "--exp-avg-sq-dtype",
             "fp16",
         ]
-    if optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32"):
+    if optimizer_mode == "hybrid_precision_aware_fp32":
         arguments += [
+            "--use-precision-aware-optimizer",
             "--optimizer-cpu-offload",
             "--optimizer-offload-fraction",
             "0.5",
@@ -171,8 +171,6 @@ def recipe_arguments(
             "--exp-avg-sq-dtype",
             "fp32",
         ]
-        if optimizer_mode == "hybrid_precision_aware_fp32":
-            arguments += ["--use-precision-aware-optimizer"]
     if stop_step is not None:
         # train-iters also controls data indexing and scheduler construction.
         arguments += ["--exit-interval", str(stop_step)]
@@ -225,7 +223,7 @@ class TrainingCapture:
             "optimizer_mode": self.args.optimizer_mode,
             "optimizer_capture_schema": (
                 "hybrid_adam_v1_implicit_false_default_and_constructor_membership"
-                if self.args.optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32")
+                if self.args.optimizer_mode == "hybrid_precision_aware_fp32"
                 else "native_adam"
             ),
             "capture": self.capture_config,
@@ -322,7 +320,7 @@ class TrainingCapture:
         ):
             if getattr(args, name, None):
                 raise UnverifiedState(f"State adapter does not cover {name}")
-        hybrid = self.args.optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32")
+        hybrid = self.args.optimizer_mode == "hybrid_precision_aware_fp32"
         precision_aware = self.args.optimizer_mode in (
             "precision_aware_fp16",
             "hybrid_precision_aware_fp32",
@@ -514,7 +512,7 @@ class TrainingCapture:
         """Snapshot live state after updates and consumed-sample bookkeeping."""
         if self.provenance is None:
             raise UnverifiedState("State capture occurred before training initialization")
-        if self.args.optimizer_mode in ("hybrid_fp32", "hybrid_precision_aware_fp32"):
+        if self.args.optimizer_mode == "hybrid_precision_aware_fp32":
             # Check the native boundary before the existing capture barrier.
             # A pending transfer is unsupported, not silently drained to pass.
             for child in optimizer.chained_optimizers:
@@ -707,7 +705,7 @@ def main() -> None:
     parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--optimizer-mode",
-        choices=("standard", "precision_aware_fp16", "hybrid_fp32", "hybrid_precision_aware_fp32"),
+        choices=("standard", "precision_aware_fp16", "hybrid_precision_aware_fp32"),
         default="standard",
     )
     parser.add_argument("--steps", type=int, default=4)

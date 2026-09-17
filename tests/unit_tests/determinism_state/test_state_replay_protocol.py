@@ -21,10 +21,11 @@ from tools.determinism.training_state import UnverifiedState, capture_configurat
         ("megatron_gpt", 2, 1, "precision_aware_fp16"),
         ("megatron_gpt", 2, 2, "precision_aware_fp16"),
         ("megatron_gpt", 1, 1, "unknown"),
-        ("cpu", 1, 1, "hybrid_fp32"),
+        ("cpu", 1, 1, "hybrid_precision_aware_fp32"),
         ("mcore_gpt", 1, 1, "hybrid_precision_aware_fp32"),
-        ("megatron_gpt", 2, 1, "hybrid_fp32"),
+        ("megatron_gpt", 2, 1, "hybrid_precision_aware_fp32"),
         ("megatron_gpt", 2, 2, "hybrid_precision_aware_fp32"),
+        ("megatron_gpt", 1, 1, "hybrid_fp32"),
     ],
 )
 def test_unsupported_optimizer_modes_fail_before_output(

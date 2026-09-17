@@ -63,7 +63,7 @@ selection path; actual scheduling still depends on the CI scope and protected
 runner approval. Each also adds seven stop-point jobs to nightly cadence (or an
 explicit cadence bypass): both original GPU adapters plus TP=2/PP=2 training
 with one or two virtual chunks, the precision-aware optimizer recipe below,
-and two hybrid CPU/GPU Adam modes,
+and the hybrid CPU/GPU Adam recipe below,
 using steps 3 and 5 of a five-step schedule. The normal
 PR selection retains its two existing jobs. A configured recipe is not GPU
 execution evidence.
@@ -217,17 +217,18 @@ with PP/VPP. Those require their own complete storage and boundary adapters.
 
 ### Hybrid CPU/GPU Adam storage
 
-The `hybrid_fp32` and `hybrid_precision_aware_fp32` modes use the actual
+The `hybrid_precision_aware_fp32` mode uses the actual
 Megatron distributed optimizer with 50% CPU offload, Torch AdamW on CPU,
-TE FusedAdam on GPU, pinned CPU copies and native D2H/H2D overlap. Both use
-FP32 moments and masters; the latter routes BF16 model shards through the
-precision-aware distributed interface. These modes require the native
+TE FusedAdam on GPU, pinned CPU copies and native D2H/H2D overlap. It uses
+FP32 moments and masters and routes BF16 model shards through the
+precision-aware distributed interface, as required by Megatron's CPU offload
+CLI. This mode requires the native
 correctness fixes in [#7449](https://github.com/NVIDIA/Megatron-LM/pull/7449),
 in addition to the early startup API in #7419.
 
 ```bash
 python -m tools.determinism.run_state_replay \
-  --backend megatron_gpt --world-size 4 --optimizer-mode hybrid_fp32 \
+  --backend megatron_gpt --world-size 4 --optimizer-mode hybrid_precision_aware_fp32 \
   --steps 5 --checkpoint-step 2 --stop-steps 3 5 \
   --output /tmp/state-hybrid-stop-points
 ```
@@ -251,7 +252,7 @@ membership; their stale option dictionaries are not live optimizer state.
 The active child groups, all outer options and child defaults are captured in
 full. No tensor or scalar numerical tolerance is introduced.
 
-These named TP=2/PP=1 recipes require actual partial CPU/GPU ownership on every
+This named TP=2/PP=1 recipe requires actual partial CPU/GPU ownership on every
 rank. Full offload, other backends, unpinned copies, low-precision moments,
 quantized parameters, additional overlap and PP/VPP combinations remain
 unverified until their own complete adapters and GPU protocols pass.

@@ -407,9 +407,8 @@ def test_hybrid_changes_break_complete_byte_comparison(monkeypatch, tmp_path, co
     assert result["status"] == "different"
 
 
-@pytest.mark.parametrize("mode", ["hybrid_fp32", "hybrid_precision_aware_fp32"])
-def test_hybrid_recipe_preserves_horizon_native_backends_and_overlap(mode):
-    command = recipe_arguments(8, 5, 3, optimizer_mode=mode)
+def test_hybrid_recipe_preserves_horizon_native_backends_and_overlap():
+    command = recipe_arguments(8, 5, 3, optimizer_mode="hybrid_precision_aware_fp32")
     for option, value in (
         ("--train-iters", "5"),
         ("--lr-decay-iters", "5"),
@@ -420,8 +419,13 @@ def test_hybrid_recipe_preserves_horizon_native_backends_and_overlap(mode):
     ):
         assert command[command.index(option) + 1] == value
     assert "--optimizer-cpu-offload" in command and "--overlap-cpu-optimizer-d2h-h2d" in command
-    assert ("--use-precision-aware-optimizer" in command) == (mode == "hybrid_precision_aware_fp32")
+    assert command.count("--use-precision-aware-optimizer") == 1
     assert "--use-torch-optimizer-for-cpu-offload" not in command
+
+
+def test_hybrid_recipe_rejects_non_precision_aware_offload():
+    with pytest.raises(ValueError, match="Precision-aware"):
+        recipe_arguments(8, 5, 3, optimizer_mode="hybrid_fp32")
 
 
 def test_restore_default_is_explicit_and_only_missing_false_is_equivalent(monkeypatch):

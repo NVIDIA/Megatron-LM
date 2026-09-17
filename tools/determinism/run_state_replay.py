@@ -64,7 +64,6 @@ def _validate_optimizer_mode(
     if optimizer_mode not in (
         "standard",
         "precision_aware_fp16",
-        "hybrid_fp32",
         "hybrid_precision_aware_fp32",
     ) or (
         optimizer_mode != "standard"
@@ -371,7 +370,7 @@ def main() -> int:
     parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--optimizer-mode",
-        choices=("standard", "precision_aware_fp16", "hybrid_fp32", "hybrid_precision_aware_fp32"),
+        choices=("standard", "precision_aware_fp16", "hybrid_precision_aware_fp32"),
         default="standard",
     )
     parser.add_argument("--steps", type=int, default=4)

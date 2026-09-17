@@ -635,11 +635,12 @@ def test_precision_aware_configuration_rejects_uncovered_storage(monkeypatch, tm
             capture.validate_configuration()
 
 
-@pytest.mark.parametrize("mode", ["hybrid_fp32", "hybrid_precision_aware_fp32"])
-@pytest.mark.parametrize("change", [None, "fraction", "overlap", "pin", "moments", "mode", "pp"])
-def test_hybrid_configuration_requires_declared_native_policy(monkeypatch, tmp_path, mode, change):
+@pytest.mark.parametrize(
+    "change", [None, "fraction", "overlap", "pin", "moments", "mode", "precision_aware", "pp"]
+)
+def test_hybrid_configuration_requires_declared_native_policy(monkeypatch, tmp_path, change):
     capture, args, _ = make_capture(monkeypatch, tmp_path)
-    capture.args.optimizer_mode = mode
+    capture.args.optimizer_mode = "hybrid_precision_aware_fp32"
     args.__dict__.update(
         bf16=True,
         use_distributed_optimizer=True,
@@ -651,7 +652,7 @@ def test_hybrid_configuration_requires_declared_native_policy(monkeypatch, tmp_p
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         virtual_pipeline_model_parallel_size=None,
-        use_precision_aware_optimizer=mode == "hybrid_precision_aware_fp32",
+        use_precision_aware_optimizer=True,
         optimizer_cpu_offload=True,
         optimizer_offload_fraction=0.5,
         overlap_cpu_optimizer_d2h_h2d=True,
@@ -672,6 +673,8 @@ def test_hybrid_configuration_requires_declared_native_policy(monkeypatch, tmp_p
         args.exp_avg_sq_dtype = torch.float16
     elif change == "mode":
         args.optimizer_cpu_offload = False
+    elif change == "precision_aware":
+        args.use_precision_aware_optimizer = False
     elif change == "pp":
         capture.args.pipeline_size = args.pipeline_model_parallel_size = 2
     if change is None:
@@ -685,7 +688,7 @@ def test_hybrid_pending_transfer_is_rejected_before_capture_barrier(monkeypatch,
     from tools.determinism import megatron_state_worker as worker
 
     capture, _, _ = make_capture(monkeypatch, tmp_path)
-    capture.args.optimizer_mode = "hybrid_fp32"
+    capture.args.optimizer_mode = "hybrid_precision_aware_fp32"
     capture.provenance = {"initialized": True}
     inner = SimpleNamespace()
     optimizer = SimpleNamespace(chained_optimizers=[SimpleNamespace(optimizer=inner)])
