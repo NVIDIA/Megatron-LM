@@ -233,6 +233,49 @@ log artifact's retention period alone does not provide permanent publication.
 CPU contract tests use explicitly synthetic GPU metadata and timings. They do
 not establish hardware latency, correctness, replay coverage or usable budgets.
 
+## Consume CI artifacts
+
+The shared GitHub test action stamps only the latest kernel replay bucket and
+kernel performance pilot. Their existing log artifacts retain the repository,
+actual checked-out revision, run ID, run attempt, platform, test case and raw
+producer outcome/exit code. Their names include the run and attempt so a rerun
+does not silently consume an earlier attempt. Other log names are unchanged.
+
+When the actual integration matrix selects `determinism_kernel_perf`, the CPU
+`cicd-determinism-baselines` job downloads those current-attempt artifacts into
+separate named directories. For each selected platform it requires exactly one
+successful replay producer and one successful timing producer, checks all source
+identities and the observed GPU, then invokes the baseline publisher above.
+Failed/missing producers, mismatched sources or duplicate uploads cannot pass.
+A lone upload retry is accepted; two available copies remain ambiguous and must
+be investigated instead of selecting the more favorable report. Data from a
+platform whose performance pilot was not selected receive no verification credit.
+The consumer executes the checked-out verifier, never code from log artifacts.
+
+The job retains `report.json`, `report.md` and each successfully verified scoped
+bundle in `determinism-baselines-<run>-a<attempt>`, including diagnostic reports on
+failure. The final CI gate waits for artifact verification. A complete artifact
+check does not turn `not_gated` timing into a performance pass. The consumer needs
+the measured coverage producer from the companion coverage change (#7317);
+registration-only reports cannot substitute for it.
+
+To reproduce the consumer after downloading the original named artifacts:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/ci_artifacts.py collect \
+  --artifacts /tmp/determinism-inputs --output /tmp/determinism-candidates \
+  --repository NVIDIA/Megatron-LM --revision <full-source-revision> \
+  --run-id <run-id> --attempt <run-attempt> --platform dgx_h100 --platform dgx_gb200
+```
+
+Pass only platforms selected by that run's actual performance matrix. The output
+directory must be empty and outside the downloaded inputs. A partial rerun that
+does not rerun both required producers cannot reuse older evidence and remains
+unverified. Run both producers in the new attempt to obtain a complete candidate.
+GitHub artifact retention is temporary; durable storage, reviewed promotion and
+calibrated performance budgets remain separate responsibilities. CPU transport
+tests do not establish successful protected CI execution or GPU acceptance.
+
 CPU tests:
 
 ```bash
