@@ -6,9 +6,9 @@ import json
 import sys
 from pathlib import Path
 
+import coverage
 import pytest
 
-import coverage
 from tools.determinism.branch_coverage import BranchRecorder
 from tools.determinism.coverage import aggregate, main
 

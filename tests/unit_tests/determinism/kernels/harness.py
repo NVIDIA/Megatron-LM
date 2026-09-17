@@ -92,6 +92,8 @@ def _recorded_replay(replay):
             options["inputs"], backward=options["backward"], configuration=options["configuration"]
         )
         protocol = {key: options[key] for key in ("replays", "contention", "restore_rng")}
+        if options.get("defer_comparison", False):
+            protocol["comparison_timing"] = "after_all_replays"
         protocol.update(
             scope="same_process_outputs_and_gradients",
             what=options["what"],
@@ -203,7 +205,14 @@ def run_once(
             (name, t) for name, t in outputs.items() if t.requires_grad and t.is_floating_point()
         ]
         if leaves and diff_outputs:
-            gos = [(grad_outputs or {}).get(name, torch.ones_like(t)) for name, t in diff_outputs]
+            gos = [
+                (
+                    _clone_preserving_layout(grad_outputs[name])
+                    if grad_outputs is not None and name in grad_outputs
+                    else torch.ones_like(t)
+                )
+                for name, t in diff_outputs
+            ]
             computed = torch.autograd.grad(
                 [t for _, t in diff_outputs],
                 list(leaves.values()),
@@ -229,6 +238,7 @@ def assert_replays_bit_exact(
     restore_rng: bool = False,
     what: str = "kernel",
     configuration: Optional[dict] = None,
+    defer_comparison: bool = False,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Assert that ``replays`` runs of ``fn`` on identical inputs are byte-identical.
 
@@ -250,6 +260,9 @@ def assert_replays_bit_exact(
         configuration: JSON dispatch options held outside the input arguments;
             included in evidence signatures so a recipe without an adapter cannot
             reuse a closure's or module's incomplete input signature.
+        defer_comparison: finish all replays before comparing local results. Multi-rank
+            callers use this so a mismatch cannot skip a collective on only one rank.
+            Runtime failures during a collective still require launcher-level cleanup.
 
     Returns:
         The reference outputs and gradients (for follow-up assertions).
@@ -260,6 +273,7 @@ def assert_replays_bit_exact(
     ref_out, ref_grad = run_once(fn, inputs, grad_outputs, backward)
     if not ref_out:
         raise AssertionError(f"{what} produced no tensor outputs; nothing to compare")
+    pending = []
     for i in range(1, replays):
         if rng is not None:
             torch.cuda.synchronize()
@@ -269,6 +283,11 @@ def assert_replays_bit_exact(
                 out, grad = run_once(fn, inputs, grad_outputs, backward)
         else:
             out, grad = run_once(fn, inputs, grad_outputs, backward)
+        if defer_comparison:
+            pending.append((i, out, grad))
+        else:
+            _assert_replay_matches(i, ref_out, ref_grad, out, grad, what)
+    for i, out, grad in pending:
         _assert_replay_matches(i, ref_out, ref_grad, out, grad, what)
     return ref_out, ref_grad
 

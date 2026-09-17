@@ -9,8 +9,9 @@ declared cases actually completed a replay protocol on a particular revision,
 software stack, GPU, and rank count.
 
 The producer annotates local fused activations, TE normalization and attention,
-single-rank embedding accumulation, the MoE router GEMM, and SSM decode. These
-selected cases cover eleven manifest families, not every variant within them.
+single-rank embedding accumulation, the MoE router GEMM, SSM decode, and explicit-group
+tensor/sequence-parallel collective mappings. These selected cases cover an
+incremental subset of manifest families, not every variant within them.
 The distributed cross-entropy test is not annotated: its process-group contract
 needs a separate adapter before its evidence can be reused by a recipe. Other kernel families
 remain visible in `inventory_without_declared_cases`; they are not included in
@@ -138,6 +139,40 @@ The companion performance
 driver joins this contract to separate forward/backward timings from the same
 clean source revision. A matched report still needs calibrated budgets and GPU
 validation before it can establish acceptable production overhead.
+
+## Tensor and sequence parallel collectives
+
+`test_collective_mappings.py` declares 48 cases: six public mappings, FP32/BF16,
+contiguous/strided tensors, and TP2/full-allocation groups. The cases exercise
+all-reduce in forward and backward, plus first/last-dimension all-gather and
+reduce-scatter with their backward counterparts. Explicit groups have at least
+two members. Their ordered global ranks, local group rank, NCCL version and
+configuration are recorded alongside input/upstream-gradient hashes and layouts.
+Rank-distinct random inputs include exact routing and cancellation sentinels.
+
+Each case completes three forward/backward executions before comparing results.
+This deferred comparison prevents a local mismatch from skipping a later
+collective and stranding peers. An operation/runtime failure can still require
+launcher cleanup. The harness clones explicit upstream gradients for every
+execution because all-reduce backward can mutate its gradient argument.
+
+Independent references use the materialized CPU input and upstream-gradient
+tensors from every rank, never the observed collective output. Copy/gather
+results must match bytes exactly. Reductions use CPU FP64 sums and the same
+componentwise-plus-L2 evaluation described above, with exact input terms (`E=0`)
+and `gamma` computed for the input dtype. The BF16 contract does not assume
+FP32 accumulation inside NCCL. The separate L2 guard uses
+`rtol=gamma_dtype(group_size-1)+eps(dtype)` and `atol=0`; these are declared
+test policies, not fitted tolerances. Every output/gradient also runs numerical
+and byte-comparator negative controls.
+
+The evidence establishes same-process replay for the tested allocation and
+explicit configuration. `NCCL_ALGO=Ring` does not pin physical reduction order
+across allocations. Multi-node, GTP, quantized and overlapped collectives remain
+separate requirements. The GTP manifest exemption is retained. These mapping
+checks have no paired timing adapter or calibrated performance budget, and are
+not added to the six activation `author_tests` that currently join replay,
+accuracy and performance evidence.
 
 ## Running and reporting
 

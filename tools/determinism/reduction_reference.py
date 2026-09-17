@@ -22,10 +22,19 @@ class ReductionReference:
     sum_absolute_terms: torch.Tensor
     terms: int
     rounding: str
+    accumulation_dtype: torch.dtype = torch.float32
+    exact_terms: bool = False
 
     @classmethod
     def from_terms(
-        cls, values: torch.Tensor, *, dim: int, keepdim: bool, rounding: str
+        cls,
+        values: torch.Tensor,
+        *,
+        dim: int,
+        keepdim: bool,
+        rounding: str,
+        accumulation_dtype: torch.dtype = torch.float32,
+        exact_terms: bool = False,
     ) -> ReductionReference:
         """Summarize independent terms in FP64, preserving the reduction shape."""
         if not values.is_floating_point() or not values.numel() or not rounding:
@@ -40,6 +49,8 @@ class ReductionReference:
             terms.abs().sum(dim=dim, keepdim=keepdim),
             values.shape[dim],
             rounding,
+            accumulation_dtype,
+            exact_terms,
         )
 
     def error_budget(
@@ -48,8 +59,10 @@ class ReductionReference:
         """Return a conservative component bound, not a proof of kernel accuracy.
 
         The term budget uses the existing pointwise tolerances. The accumulation
-        budget uses gamma(n-1) for FP32 and FP64, without assuming a particular
-        parallel reduction tree. Final rounding allows casts of both sums.
+        budget uses gamma(n-1) for the declared accumulation dtype and FP64,
+        without assuming a particular parallel reduction tree. Exact input terms
+        exclude pointwise term error, as in a collective over materialized inputs.
+        Final rounding allows casts of both sums.
         A separate L2 guard in the caller prevents this worst-case bound from
         admitting systematic drift. Intrinsic errors are not proven here.
         """
@@ -58,6 +71,9 @@ class ReductionReference:
             or type(self.terms) is not int
             or self.terms < 1
             or not self.rounding
+            or self.accumulation_dtype
+            not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+            or type(self.exact_terms) is not bool
             or self.total.dtype != torch.float64
             or self.sum_absolute_terms.dtype != torch.float64
             or self.total.shape != expected.shape
@@ -78,10 +94,13 @@ class ReductionReference:
             return nu / (1 - nu)
 
         gamma32, gamma64 = gamma(torch.float32), gamma(torch.float64)
+        gamma_accumulation = gamma(self.accumulation_dtype)
         # Inflate the FP64 sum-of-magnitudes for its own rounding uncertainty.
         scale = self.sum_absolute_terms / (1 - gamma64)
-        term_error = self.terms * atol + rtol * scale
-        accumulation = gamma32 * (scale + term_error) + gamma64 * scale
+        term_error = (
+            torch.zeros_like(scale) if self.exact_terms else self.terms * atol + rtol * scale
+        )
+        accumulation = gamma_accumulation * (scale + term_error) + gamma64 * scale
         before_cast = term_error + accumulation
         cast_error = torch.finfo(expected.dtype).eps * (self.total.abs() + before_cast)
         budget = before_cast + cast_error
@@ -94,14 +113,20 @@ class ReductionReference:
             else None
         )
         return budget, {
-            "policy": "fp32_sum_absolute_terms_and_l2:v1",
+            "policy": (
+                "fp32_sum_absolute_terms_and_l2:v1"
+                if self.accumulation_dtype == torch.float32 and not self.exact_terms
+                else "declared_dtype_sum_absolute_terms_and_l2:v1"
+            ),
             "term_count": self.terms,
-            "accumulation_dtype": "torch.float32",
+            "accumulation_dtype": str(self.accumulation_dtype),
+            "exact_terms": self.exact_terms,
             "reference_dtype": "torch.float64",
             "rounding": self.rounding,
             "term_rtol": rtol,
             "term_atol": atol,
             "gamma_fp32": gamma32,
+            "gamma_accumulation": gamma_accumulation,
             "gamma_fp64": gamma64,
             "max_sum_absolute_terms": float(scale.max()),
             "max_condition_number_nonzero": (

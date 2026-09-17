@@ -250,9 +250,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="tensor_parallel_mappings",
         sources=("megatron/core/tensor_parallel/mappings.py",),
-        tests=(C + "test_transformer_layer.py", C + "test_gpt_model.py"),
+        tests=(
+            K + "test_collective_mappings.py",
+            C + "test_transformer_layer.py",
+            C + "test_gpt_model.py",
+        ),
         kind="external-lib",
-        notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
+        notes="Explicit-group TP/SP mappings have same-allocation output/gradient replay, "
+        "independent CPU FP64 references and comparator controls for FP32/BF16, TP2/full-world "
+        "and contiguous/strided tensors. Model-level TP/EP/FSDP cells remain separate. "
+        "NCCL_ALGO=Ring does not establish cross-allocation reduction order; GTP, quantized, "
+        "overlapped and multi-node collectives are not certified by the local mapping cases.",
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
