@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -15,6 +16,10 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_indexer_loss,
     dsa_layout,
     dsa_masking,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+    FUSED_INDEXER_MAX_SAFE_ROWS,
+    warn_fused_indexer_row_limit_once,
 )
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
@@ -138,6 +143,23 @@ _DENSE_ATTN_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _FLASH_MLA_REQUIRED_VALUE_DIM = 512
 _CUDA_GRID_Y_MAX = 65535
 _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS = 32768
+
+
+def _indexer_forward_wrapper_with_warning(
+    index_q: Tensor, index_k: Tensor, weights: Tensor, **kwargs
+) -> dict:
+    """Call cuDNN indexer forward after the shared above-limit diagnostic."""
+    if index_q.ndim == 4:
+        total_q = int(index_q.shape[0] * index_q.shape[1])
+    elif index_q.ndim == 3:
+        total_q = int(index_q.shape[0])
+    else:
+        raise RuntimeError(
+            f"cuDNN DSA indexer expects 3-D THD or 4-D BSHD query input, got {index_q.shape}."
+        )
+    if total_q > FUSED_INDEXER_MAX_SAFE_ROWS:
+        warn_fused_indexer_row_limit_once(total_q, logger=logging.getLogger(__name__))
+    return _cudnn_dsa.indexer_forward_wrapper(index_q, index_k, weights, **kwargs)
 
 
 def _assert_supported_indexer_scoring(use_relu: bool) -> None:
@@ -612,11 +634,11 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+            scores_chunk = _indexer_forward_wrapper_with_warning(
                 q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
-            scores_chunk = _cudnn_dsa.indexer_forward_wrapper(
+            scores_chunk = _indexer_forward_wrapper_with_warning(
                 q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
             )["scores"]
         else:
@@ -738,7 +760,7 @@ def _indexer_topk_multi_packed_cp_thd(
     max_segment_q = packed_max_seqlen_q // segment_divisor
     max_k_half = packed_max_seqlen_k // segment_divisor
     max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
-    scores = _cudnn_dsa.indexer_forward_wrapper(
+    scores = _indexer_forward_wrapper_with_warning(
         q_bshd[0],
         segmented_k,
         w_bsh[0],
@@ -1148,7 +1170,7 @@ def _indexer_topk_bshd(
                 q_bshd, k_bshd, w_bsh, seq_lens, topk_k, return_topk_scores
             )
         else:
-            scores = _cudnn_dsa.indexer_forward_wrapper(
+            scores = _indexer_forward_wrapper_with_warning(
                 q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
             )[
                 "scores"

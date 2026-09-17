@@ -64,6 +64,25 @@ def test_get_num_microbatches():
     )
     assert mb_calculator.get_num_microbatches() == 1
 
+
+def test_get_global_batch_size_upper_bound_uses_maximum_schedule_entry():
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0,
+        global_batch_size=None,
+        micro_batch_size=1,
+        data_parallel_size=1,
+        step_batch_size_schedule="0:8 10:32 20:16",
+    )
+
+    assert mb_calculator.get_current_global_batch_size() == 8
+    assert mb_calculator.get_global_batch_size_upper_bound() == 32
+
+    # A checkpoint resumed after a historical peak should only consider entries
+    # that can still occur in the future, not reject the run because of the past.
+    mb_calculator.update_num_microbatches(20)
+    assert mb_calculator.get_current_global_batch_size() == 16
+    assert mb_calculator.get_global_batch_size_upper_bound() == 16
+
     mb_calculator.reconfigure_num_microbatches_calculator(
         rank=0,
         global_batch_size=16,
