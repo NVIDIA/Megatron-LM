@@ -3,6 +3,7 @@
 import torch
 
 from .global_vars import get_args
+from .global_vars import get_train_state
 from .global_vars import get_signal_handler
 from .global_vars import get_tokenizer
 from .global_vars import get_tensorboard_writer
