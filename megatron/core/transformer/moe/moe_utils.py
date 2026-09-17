@@ -30,7 +30,7 @@ from megatron.core.transformer.moe.batch_invariant import unpermute as batch_inv
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecated, internal_api, is_te_min_version
+from megatron.core.utils import deprecated, internal_api, is_te_min_version, is_torch_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -58,6 +58,11 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+
+
+# torch >= 2.9 runs scatter_add_ under torch.use_deterministic_algorithms(True) through the
+# sort-based index_put_ without materialising a [rows, hidden] index (pytorch#156744).
+_SCATTER_ADD_DETERMINISTIC_FAST_PATH = is_torch_min_version("2.9.0a0")
 
 
 def switch_load_balancing_loss_func(
@@ -597,21 +602,16 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    # Create an output tensor filled with zeros
+    # Accumulate the (possibly probability-weighted) rows back into a zeroed output.
+    # Under deterministic algorithms, scatter_add_ and index_add_ use sort-based index_put_.
+    # Prefer scatter_add_ to avoid index_add_'s source * alpha temporary. Before torch 2.9,
+    # deterministic scatter_add_ materialises a [rows, hidden] index, so keep index_add_ there.
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
-        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
-        # and is CUDA graph compatible unlike scatter_add
+    if torch.are_deterministic_algorithms_enabled() and not _SCATTER_ADD_DETERMINISTIC_FAST_PATH:
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
     else:
-        # Scatter add the permuted_input back to the original positions
         output_tokens.scatter_add_(
             0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
         )
