@@ -67,3 +67,4 @@ jobs:
       lts: false
       timeout-minutes: 120
       verify-cache: true
+      publish-target-cache: true
