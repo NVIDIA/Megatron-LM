@@ -2,6 +2,7 @@
 
 import signal
 import sys
+import types
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional, Union
@@ -12,14 +13,17 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
     core_transformer_config_from_args,
+    hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 
 
 @dataclass
@@ -193,6 +197,105 @@ class ConfigWithLiteral:
 
     precision: Literal[16, 32] = 32
     """Precision level"""
+
+
+class TestDsv4HybridCsaCompressRatioNormalization:
+    """Test the DSv4 HybridModel compression-ratio migration contract."""
+
+    @pytest.mark.parametrize(
+        ("provided", "expected_config_ratios"),
+        [
+            (None, [0, 0, 0, 4, 128, 0]),
+            ([0, 4, 128], [0, 0, 0, 4, 128, 0]),
+            ([0, 0, 0, 4, 128, 0], [0, 0, 0, 4, 128, 0]),
+        ],
+    )
+    def test_normalizes_default_compact_and_padded_ratios(self, provided, expected_config_ratios):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+        config_kwargs = {}
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, "-W|EC/H-")
+
+        assert args.csa_compress_ratios == expected_config_ratios
+        assert config_kwargs['csa_compress_ratios'] == expected_config_ratios
+
+    def test_normalizes_repeated_mtp_patterns(self):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=None)
+        config_kwargs = {}
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, "W|C/H-/H-")
+
+        assert args.csa_compress_ratios == [0, 4, 128, 0, 128, 0]
+        assert config_kwargs['csa_compress_ratios'] == [0, 4, 128, 0, 128, 0]
+
+    @pytest.mark.parametrize(
+        ("provided", "message"),
+        [
+            ([0, 8, 128], "ratio 8.*symbol 'C'.*expected 4"),
+            ([1, 0, 0, 4, 128, 0], "non-DSv4 hybrid symbol '-'.*non-zero ratio 1"),
+            ([0, 4], r"length \(2\).*W/C/H attention symbols \(3\)"),
+        ],
+    )
+    def test_rejects_invalid_ratios(self, provided, message):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+
+        with pytest.raises(AssertionError, match=message):
+            normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
+
+    def test_ordinary_d_does_not_consume_a_dsv4_ratio(self):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=[4])
+        config_kwargs = {}
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, "D-C/D")
+
+        assert args.csa_compress_ratios == [0, 0, 4, 0]
+        assert config_kwargs['csa_compress_ratios'] == [0, 0, 4, 0]
+
+
+class TestHybridConfigFromArgs:
+    """Test static and config-aware HybridStack spec resolution."""
+
+    @staticmethod
+    def _args():
+        return Namespace(
+            spec=["test_module", "test_spec"],
+            fp16_lm_cross_entropy=False,
+            hybrid_layer_pattern="M",
+            position_embedding_type="none",
+            rotary_percent=1.0,
+            rotary_base=10000,
+            make_vocab_size_divisible_by=128,
+            rotary_seq_len_interpolation_factor=None,
+            max_position_embeddings=1024,
+            untie_embeddings_and_output_weights=False,
+            padded_vocab_size=128,
+        )
+
+    @staticmethod
+    def _transformer_config():
+        return types.SimpleNamespace(
+            transformer_impl="transformer_engine", inference_fuse_tp_communication=False
+        )
+
+    @patch("megatron.training.argument_utils.import_module")
+    def test_preserves_static_module_spec(self, mock_import_module):
+        static_spec = ModuleSpec(module=object)
+        mock_import_module.return_value = static_spec
+
+        config = hybrid_config_from_args(self._args(), config=self._transformer_config())
+
+        assert config.hybrid_stack_spec is static_spec
+
+    @patch("megatron.training.argument_utils.import_module")
+    def test_rejects_config_aware_spec_factory(self, mock_import_module):
+        spec_factory = MagicMock()
+        mock_import_module.return_value = spec_factory
+        transformer_config = self._transformer_config()
+
+        with pytest.raises(TypeError, match="static ModuleSpec"):
+            hybrid_config_from_args(self._args(), config=transformer_config)
+
+        spec_factory.assert_not_called()
 
 
 class TestArgumentGroupFactoryBasic:
@@ -918,6 +1021,57 @@ class TestMegatronMLAArgumentGeneration:
         assert config.attention_latent_norm_epsilon == pytest.approx(1e-5)
         assert config.output_projection_groups == 4
         assert config.output_projection_lora_rank == 64
+
+    @pytest.mark.parametrize(
+        "variant,pattern,expected_ratios",
+        [
+            (None, "C", [4]),
+            ("dsv4_hybrid", "H", [128]),
+            (None, "W", [0]),
+            ("dsa", "W", None),
+            ("dsa", "M-/C-", None),
+        ],
+    )
+    def test_dsv4_symbols_validate_variant_and_ratios(self, variant, pattern, expected_ratios):
+        """C/H/W in either decoder or MTP require normalized DSv4 configuration."""
+        argv = [
+            'test_argument_utils.py',
+            '--hybrid-layer-pattern',
+            pattern,
+            '--disable-bias-linear',
+            '--position-embedding-type',
+            'rope',
+            '--q-lora-rank',
+            '32',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '32',
+        ]
+        if variant is not None:
+            argv.extend(['--experimental-attention-variant', variant])
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        if variant not in (None, 'dsv4_hybrid'):
+            with pytest.raises(ValueError, match="C/H/W attention requires.*dsv4_hybrid"):
+                core_transformer_config_from_args(args)
+            return
+
+        config = core_transformer_config_from_args(args)
+
+        assert args.multi_latent_attention is True
+        assert args.csa_compress_ratios == expected_ratios
+        assert config.experimental_attention_variant == 'dsv4_hybrid'
+        assert config.csa_compress_ratios == expected_ratios
+        assert config.qk_head_dim == config.v_head_dim - config.qk_pos_emb_head_dim
+        assert config.kv_lora_rank == config.qk_head_dim
 
 
 class TestMegatronMixedPrecisionArguments:
