@@ -17,12 +17,18 @@ must use the same operation and implementation contract as the replay tests:
 ```json
 [
   {
-    "target": "megatron.core.fusions.fused_bias_swiglu:bias_swiglu_impl",
-    "op_id": "fused_bias_swiglu",
-    "implementation": "torch.compile:bias_swiglu"
+    "target": "megatron.core.transformer.mlp:bias_gelu_impl",
+    "op_id": "fused_bias_gelu",
+    "implementation": "torch.compile:bias_gelu"
   }
 ]
 ```
+
+Bind the attribute looked up at the training call site. This example observes
+the dense GELU MLP. Core imports the MLP module before capture installs bindings,
+so wrapping the fusion module's original attribute does not replace the MLP's
+retained alias. Select the entrypoint actually used by your recipe; a gated
+activation needs its own binding and matching implementation contract.
 
 Run the original recipe through the wrapper, using the same launch environment:
 
@@ -39,6 +45,9 @@ records shapes, strides, dtypes, gradient requirements, mode, invocation counts,
 and source/environment provenance. It records successful forward calls and uses
 output-gradient hooks to record that backward traversed a call. It neither
 copies tensor contents nor adds CUDA synchronization.
+Check every rank's observed signatures and invocation counts against the recipe.
+A training run can finish with an empty inventory when a bound entrypoint is
+unused or calls bypass the binding.
 
 The capture entrypoint uses `megatron.determinism.bootstrap_training_determinism`
 before importing bound modules or initializing CUDA. It honors both
