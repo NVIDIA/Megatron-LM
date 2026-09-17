@@ -5,7 +5,6 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -64,8 +63,11 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    gdn2_layer: ModuleSpec | None = None
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    csa_layer: ModuleSpec | type | None = None
+    csa_qk_layernorm_layer: ModuleSpec | type | None = None
     mla_layer: Union[ModuleSpec, type] = IdentityOp
     mla_fused_down_proj_layer: ModuleSpec | None = None
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
@@ -239,6 +241,27 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif type(layer_config) is layer_utils.CSALayerConfig:
+                    csa_layer_spec = (
+                        submodules.csa_qk_layernorm_layer
+                        if layer_config.qk_layernorm
+                        else submodules.csa_layer
+                    )
+                    if csa_layer_spec is None:
+                        raise ValueError(
+                            "C/H/W layers require the hybrid stack spec to provide `csa_layer` "
+                            "or, with qk_layernorm enabled, `csa_qk_layernorm_layer`."
+                        )
+                    layer = build_module(
+                        csa_layer_spec,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
                     mla_layer_spec = (
                         submodules.mla_fused_down_proj_layer
@@ -282,12 +305,13 @@ class HybridStack(MegatronModule):
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec = submodules.gdn_layer
                     if layer_config.experimental_attention_variant == "gdn2":
-                        # 'G' layers build the GDN2 variant when the gdn2 experimental
-                        # attention variant is selected.
-                        from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
-
-                        gdn_layer_spec = copy.deepcopy(gdn_layer_spec)
-                        gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
+                        # Only error if we actually try to use the GDN2 layer spec.
+                        if submodules.gdn2_layer is None:
+                            raise ValueError(
+                                "`experimental_attention_variant='gdn2'` requires the hybrid "
+                                "stack spec to provide the GDN2 layer spec under `gdn2_layer`."
+                            )
+                        gdn_layer_spec = submodules.gdn2_layer
                     layer = build_module(
                         gdn_layer_spec,
                         config=layer_config,
