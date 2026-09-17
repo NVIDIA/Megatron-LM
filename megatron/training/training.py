@@ -40,9 +40,10 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -154,6 +155,12 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
+
+# Retain the training.py import path used by existing multimodal callers.
+from megatron.training.logging.packed_sequence_stats import (
+    consume_packed_sequence_stats_in_iteration,
+    update_packed_sequence_stats,
+)
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -264,12 +271,6 @@ _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 _seqlen_stats_are_global: bool = False
 
-# Optional per-iteration packed SFT statistics. Individual sample lengths are
-# retained so the median for the global batch is exact.
-_packed_sequence_lengths_in_iteration: list[torch.Tensor] = []
-_packed_sequence_trained_tokens_in_iteration: Optional[torch.Tensor] = None
-_packed_sequence_stats_active: bool = False
-
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
@@ -319,10 +320,10 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 try:
-    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
     from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
@@ -436,9 +437,10 @@ def _start_otel_job_spans(model_type, program_start):
     if not _otel_sg_enabled('job'):
         return
 
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
-    from opentelemetry.context import Context as _OtelContext
     from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
 
     _otel_ctx_module = _otel_ctx
     _otel_tracer = get_telemetry().tracer
@@ -592,7 +594,8 @@ def _reroot_otel_interval():
     global _otel_interval_span, _otel_interval_ctx_token
     if get_telemetry() is None or not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
     prev = _otel_interval_span
@@ -823,126 +826,6 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     _seqlen_stats_active = False
     _seqlen_stats_are_global = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
-
-
-def update_packed_sequence_stats(sample_lengths, loss_mask):
-    """Accumulate original-sample lengths and trained tokens for one microbatch."""
-    global _packed_sequence_lengths_in_iteration
-    global _packed_sequence_trained_tokens_in_iteration
-    global _packed_sequence_stats_active
-
-    if sample_lengths is None or loss_mask is None:
-        return
-
-    # Contribute once per data-parallel replica. All model-parallel peers still
-    # participate in the global collectives when the accumulator is consumed.
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
-        if (
-            not mpu.is_pipeline_last_stage(ignore_virtual=True)
-            or mpu.get_tensor_model_parallel_rank() != 0
-            or mpu.get_context_parallel_rank() != 0
-        ):
-            return
-
-    device = (
-        torch.device(f'cuda:{torch.cuda.current_device()}')
-        if torch.cuda.is_available()
-        else sample_lengths.device
-    )
-    lengths = sample_lengths.detach().reshape(-1)
-    lengths = lengths[lengths > 0]
-    if lengths.numel() == 0:
-        return
-
-    _packed_sequence_lengths_in_iteration.append(
-        lengths.to(device=device, dtype=torch.float64)
-    )
-    trained_tokens = loss_mask.detach().to(device=device, dtype=torch.float64).sum()
-    if _packed_sequence_trained_tokens_in_iteration is None:
-        _packed_sequence_trained_tokens_in_iteration = torch.zeros(
-            (), dtype=torch.float64, device=device
-        )
-    _packed_sequence_trained_tokens_in_iteration += trained_tokens
-    _packed_sequence_stats_active = True
-
-
-def _reset_packed_sequence_stats_in_iteration():
-    global _packed_sequence_lengths_in_iteration
-    global _packed_sequence_trained_tokens_in_iteration
-    global _packed_sequence_stats_active
-    _packed_sequence_lengths_in_iteration = []
-    _packed_sequence_trained_tokens_in_iteration = None
-    _packed_sequence_stats_active = False
-
-
-def consume_packed_sequence_stats_in_iteration() -> Optional[Dict[str, float]]:
-    """Read, reset, and globally gather packed SFT stats for this iteration."""
-    device = (
-        torch.device(f'cuda:{torch.cuda.current_device()}')
-        if torch.cuda.is_available()
-        else torch.device('cpu')
-    )
-    if _packed_sequence_lengths_in_iteration:
-        local_lengths = torch.cat(_packed_sequence_lengths_in_iteration).to(
-            device=device, dtype=torch.float64
-        )
-    else:
-        local_lengths = torch.empty(0, dtype=torch.float64, device=device)
-
-    if _packed_sequence_trained_tokens_in_iteration is None:
-        trained_tokens = torch.zeros((), dtype=torch.float64, device=device)
-    else:
-        trained_tokens = _packed_sequence_trained_tokens_in_iteration.to(
-            device=device, dtype=torch.float64
-        )
-
-    if torch.distributed.is_initialized():
-        local_count = torch.tensor([local_lengths.numel()], dtype=torch.int64, device=device)
-        counts = [torch.empty_like(local_count) for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather(counts, local_count)
-        counts = torch.cat(counts)
-        torch.distributed.all_reduce(trained_tokens, op=torch.distributed.ReduceOp.SUM)
-
-        if counts.sum().item() == 0:
-            _reset_packed_sequence_stats_in_iteration()
-            return None
-
-        padded_lengths = torch.zeros(
-            int(counts.max().item()), dtype=torch.float64, device=device
-        )
-        if local_lengths.numel() > 0:
-            padded_lengths[: local_lengths.numel()] = local_lengths
-        gathered_lengths = [torch.empty_like(padded_lengths) for _ in range(counts.numel())]
-        torch.distributed.all_gather(gathered_lengths, padded_lengths)
-        lengths = torch.cat(
-            [
-                gathered[: int(count.item())]
-                for gathered, count in zip(gathered_lengths, counts)
-                if count.item() > 0
-            ]
-        )
-    else:
-        if not _packed_sequence_stats_active:
-            _reset_packed_sequence_stats_in_iteration()
-            return None
-        lengths = local_lengths
-
-    if lengths.numel() == 0:
-        _reset_packed_sequence_stats_in_iteration()
-        return None
-
-    stats = {
-        'packed_sequence/total_tokens': lengths.sum().item(),
-        'packed_sequence/trained_tokens': trained_tokens.item(),
-        'packed_sequence/original_samples': float(lengths.numel()),
-        'packed_sequence/original_sample_length_min': lengths.min().item(),
-        'packed_sequence/original_sample_length_mean': lengths.mean().item(),
-        'packed_sequence/original_sample_length_max': lengths.max().item(),
-        'packed_sequence/original_sample_length_median': torch.quantile(lengths, 0.5).item(),
-        'packed_sequence/original_sample_length_stdv': lengths.std(unbiased=False).item(),
-    }
-    _reset_packed_sequence_stats_in_iteration()
-    return stats
 
 
 def num_floating_point_operations(
@@ -3343,7 +3226,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
-        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
@@ -4281,7 +4165,8 @@ def save_checkpoint_and_time(
     _exposed_save_span = None
     _exposed_save_token = None
     if _otel_sg_enabled('checkpoint'):
-        from opentelemetry import context as _octx, trace as _otr
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -5339,7 +5224,8 @@ def train(
         _report_span = None
         _report_token = None
         if _otel_sg_enabled('step'):
-            from opentelemetry import context as _octx, trace as _otr
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
