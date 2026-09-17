@@ -3991,9 +3991,8 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             # Packing stays inside the try: an unserializable preparer result must
             # fail this request, not exit rank 0 and hang the other MP ranks.
-            return _pack(
-                *self.prompt_preparer.prepare_prompt(prompt, offload_params=offload_params)
-            )
+            result = self.prompt_preparer.prepare_prompt(prompt, offload_params=offload_params)
+            return _pack(result.prompt, result.offload_params)
         except Exception as error:  # pylint: disable=broad-except
             logger.exception("prompt preparation failed for request %s", request_id)
             # The original prompt and params came off the wire, so they pack safely.

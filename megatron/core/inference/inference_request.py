@@ -1337,6 +1337,14 @@ PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
 PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
 
 
+@dataclass(frozen=True)
+class RequestPromptPreparationResult:
+    """The resolved engine prompt and opaque parameters that describe it."""
+
+    prompt: Union[str, List[int], torch.Tensor]
+    offload_params: Optional[Dict[str, Any]] = None
+
+
 class RequestPromptPreparer(Protocol):
     """Protocol for resolving an exact prompt before engine admission."""
 
@@ -1345,7 +1353,7 @@ class RequestPromptPreparer(Protocol):
         prompt: Union[str, List[int], torch.Tensor],
         *,
         offload_params: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Union[str, List[int], torch.Tensor], Optional[Dict[str, Any]]]:
+    ) -> RequestPromptPreparationResult:
         """Return the engine prompt and metadata that describe that prompt."""
         ...
 

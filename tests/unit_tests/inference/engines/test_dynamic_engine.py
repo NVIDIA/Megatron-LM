@@ -48,6 +48,7 @@ from megatron.core.inference.inference_request import (
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     RequestPayloadStageResult,
+    RequestPromptPreparationResult,
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
@@ -1680,7 +1681,7 @@ def test_engine_prepares_prompt_before_model_parallel_broadcast():
         def prepare_prompt(self, prompt, *, offload_params=None):
             metadata = dict(offload_params or {})
             metadata["prepared"] = True
-            return [1, 2, *prompt], metadata
+            return RequestPromptPreparationResult(prompt=[1, 2, *prompt], offload_params=metadata)
 
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.prompt_preparer = _Preparer()
@@ -1725,8 +1726,13 @@ def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_outpu
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):
             if bad_output == "numpy_prompt":
-                return [np.int64(1), *prompt], offload_params
-            return prompt, {**(offload_params or {}), "embedding": torch.tensor([1.0])}
+                return RequestPromptPreparationResult(
+                    prompt=[np.int64(1), *prompt], offload_params=offload_params
+                )
+            return RequestPromptPreparationResult(
+                prompt=prompt,
+                offload_params={**(offload_params or {}), "embedding": torch.tensor([1.0])},
+            )
 
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.prompt_preparer = _Preparer()
