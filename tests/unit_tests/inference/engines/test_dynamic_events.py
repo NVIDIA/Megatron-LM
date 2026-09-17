@@ -14,9 +14,12 @@ import torch
 
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
+    ContextErrorFactory,
     MaxSequenceLengthOverflowError,
     RequestOverflowError,
+    TensorStateDeallocatedError,
     TokenOverflowError,
+    get_mem_size_str,
 )
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -268,6 +271,28 @@ def test_error_event_serialization_with_context_error_factory():
         assert deserialized.payload.message == message
         assert deserialized.payload.is_transient == is_transient
         assert deserialized.timestamp == event.timestamp
+
+
+def test_tensor_state_deallocated_error_roundtrips():
+    """Tensor-state errors must remain deserializable across coordinator boundaries."""
+    error = TensorStateDeallocatedError(request_id=7)
+
+    serialized = ContextErrorFactory.serialize(error)
+    restored = ContextErrorFactory.deserialize(serialized)
+
+    assert isinstance(restored, TensorStateDeallocatedError)
+    assert restored.request_id == 7
+    assert restored.message is None
+    assert restored.is_transient is True
+
+
+@pytest.mark.parametrize(
+    "num_bytes, expected",
+    [(1024, "1 KB"), (1536, "1.5 KB"), (1024**2, "1 MB")],
+)
+def test_get_mem_size_str_uses_correct_kilobyte_unit(num_bytes, expected):
+    """Memory diagnostics should report values below 1 MiB in kilobytes."""
+    assert get_mem_size_str(num_bytes) == expected
 
 
 # ============================================================================
