@@ -35,9 +35,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant import dsa_fused_safety
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    csa_teacher_lse,
-)
+from megatron.core.transformer.experimental_attention_variant.csa_utils import csa_teacher_lse
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention as dk,
 )
