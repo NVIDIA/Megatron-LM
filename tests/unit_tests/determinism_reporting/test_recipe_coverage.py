@@ -11,6 +11,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 
 from tools.determinism import capture_recipe
 from tools.determinism.capture_recipe import Inventory, install_bindings
@@ -451,3 +452,73 @@ def test_capture_rejects_context_drift_after_successful_training(tmp_path, monke
     # the completion flag; a passing operation test cannot override it.
     captured["complete"] = True
     assert build_report([captured], [proof])["counts"][UNVERIFIED] == 1
+
+
+@pytest.mark.parametrize("override_apply", [False, True])
+def test_capture_module_alias_to_autograd_apply_preserves_gradients(monkeypatch, override_apply):
+    class Square(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            ctx.save_for_backward(value)
+            return value.square()
+
+        @staticmethod
+        def backward(ctx, gradient):
+            (value,) = ctx.saved_tensors
+            return gradient * 2 * value
+
+    class ExplicitApply(Square):
+        @classmethod
+        def apply(cls, *args, **kwargs):
+            return super().apply(*args, **kwargs)
+
+    implementation = ExplicitApply if override_apply else Square
+    module = ModuleType("autograd_alias_kernel")
+    original = module.activation = implementation.apply
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    recorder = Inventory(torch, 10)
+    binding = {
+        "target": "autograd_alias_kernel:activation",
+        "op_id": "square",
+        "implementation": "autograd:square",
+    }
+    with install_bindings(recorder, [binding]):
+        value = torch.tensor([2.0, -3.0], requires_grad=True)
+        result = module.activation(value)
+        torch.testing.assert_close(result, torch.tensor([4.0, 9.0]))
+        result.sum().backward()
+        torch.testing.assert_close(value.grad, torch.tensor([4.0, -6.0]))
+    assert module.activation is original
+    assert implementation.apply == original
+    assert {row["signature"]["phase"] for row in recorder.operations.values()} == {
+        "forward",
+        "forward_backward",
+    }
+
+
+@pytest.mark.parametrize("kind", ["instance_method", "builtin_method", "classmethod"])
+def test_capture_rejects_bound_callables_with_unrecorded_state(monkeypatch, kind):
+    class Stateful:
+        def operation(self, value):
+            return value
+
+        @classmethod
+        def class_operation(cls, value):
+            return value
+
+    module = ModuleType("stateful_bound_kernel")
+    original = module.activation = {
+        "instance_method": Stateful().operation,
+        "builtin_method": [].append,
+        "classmethod": Stateful.class_operation,
+    }[kind]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    binding = {
+        "target": "stateful_bound_kernel:activation",
+        "op_id": "stateful",
+        "implementation": "stateful",
+    }
+    with pytest.raises(ValueError, match="Binding must be"):
+        with install_bindings(Inventory(torch, 10), [binding]):
+            pass
+    assert module.activation is original

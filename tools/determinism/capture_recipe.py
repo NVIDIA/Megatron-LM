@@ -198,14 +198,28 @@ def install_bindings(inventory: Inventory, bindings: list[dict]):
                 raise ValueError(f"Duplicate binding: {target}")
             seen.add(target)
             module_name, attribute = target.split(":", 1)
-            # Module-level functions only: binding a descriptor or a class
-            # method changes call semantics and needs its own explicit adapter.
+            # Patch module attributes, never class descriptors. An exported
+            # autograd apply alias keeps its original bound Function class.
             if "." in attribute:
                 raise ValueError("Bindings must select module-level functions")
             module = importlib.import_module(module_name)
             function = getattr(module, attribute)
-            if not (inspect.isfunction(function) or inspect.isbuiltin(function)):
-                raise ValueError(f"Binding must be a module-level function: {target}")
+            owner = getattr(function, "__self__", None)
+            autograd_base = getattr(getattr(inventory.torch, "autograd", None), "Function", None)
+            autograd_alias = (
+                (inspect.ismethod(function) or inspect.isbuiltin(function))
+                and inspect.isclass(owner)
+                and getattr(function, "__name__", None) == "apply"
+                and autograd_base is not None
+                and issubclass(owner, autograd_base)
+            )
+            native_function = inspect.isbuiltin(function) and (
+                owner is None or inspect.ismodule(owner)
+            )
+            if not (inspect.isfunction(function) or native_function or autograd_alias):
+                raise ValueError(
+                    f"Binding must be a module-level function or autograd apply alias: {target}"
+                )
             originals.append((module, attribute, function))
             setattr(module, attribute, inventory.wrap(function, binding))
         yield
