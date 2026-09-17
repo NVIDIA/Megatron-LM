@@ -26,7 +26,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import get_wandb_writer
+from megatron.training import get_tokenizer, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
@@ -90,7 +90,9 @@ def get_model_for_inference() -> MegatronModule:
     else:
         builder = get_model_builder(args)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
+        model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
 
     # Load checkpoint.
     assert args.load is not None
@@ -315,7 +317,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         type=int,
         default=None,
         help="Maximum number of decode steps to trace (inference). Default is unlimited. "
-        "Training uses --moe-routing-trace-max-training-iters instead.",
+             "Training uses --moe-routing-trace-max-training-iters instead.",
     )
 
     return parser

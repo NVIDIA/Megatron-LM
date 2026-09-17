@@ -59,7 +59,6 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
-        mhc_recompute_manager=None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if isinstance(self.inner_layer, TransformerLayer):
             layer_kwargs = dict(

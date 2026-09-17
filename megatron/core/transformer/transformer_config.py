@@ -3021,6 +3021,8 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.num_moe_experts is not None
             ), "num_moe_experts must be set when moe_num_hash_layers > 0."
+            if not 1 <= self.moe_router_topk <= self.num_moe_experts:
+                raise ValueError("Hash MoE requires 1 <= moe_router_topk <= num_moe_experts.")
             if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
                 assert self.pipeline_model_parallel_layout is not None, (
                     "pipeline_model_parallel_layout must be set when using hash MoE "
@@ -3037,13 +3039,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm does not support hash MoE layers yet."
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "Hash MoE initialized with a placeholder round-robin token-to-expert table. "
-                "Load a trained table from a checkpoint or provide a workload-aware "
-                "initialization before training.",
-            )
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert

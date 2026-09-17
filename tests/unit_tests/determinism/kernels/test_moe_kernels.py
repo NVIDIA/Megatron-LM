@@ -310,8 +310,9 @@ class TestMoEModules:
             ("seq_aux_loss", "sigmoid", True, False),
             ("sinkhorn", "softmax", False, False),
             ("none", "sigmoid", False, True),
+            ("none", "softmax", False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid"],
+        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
     )
     def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
         self._init()
@@ -333,6 +334,9 @@ class TestMoEModules:
         router.set_layer_number(0)
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
+        if expert_bias:
+            padding_mask = torch.arange(8192, device="cuda").reshape(2048, 4) % 3 == 0
+            inputs = {"input": hidden, "padding_mask": padding_mask}
         grad_output = None
         if hash_routing:
             assert router.is_hash_layer

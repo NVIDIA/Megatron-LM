@@ -787,26 +787,29 @@ class TestHashRouting:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
-    def test_hash_routing_correctness(self, score_function):
-        config = _hash_routing_config(moe_router_score_function=score_function)
+    @pytest.mark.parametrize(
+        "score_function,pre_softmax",
+        [("softmax", False), ("softmax", True), ("sigmoid", False), ("sqrtsoftplus", False)],
+    )
+    def test_hash_routing_correctness(self, score_function, pre_softmax):
+        config = _hash_routing_config(
+            moe_router_score_function=score_function, moe_router_pre_softmax=pre_softmax
+        )
         router = _make_hash_router(config, layer_number=1).cuda()
 
-        logits = torch.randn(16, config.num_moe_experts, device="cuda")
+        logits = torch.randn(16, config.num_moe_experts, device="cuda", requires_grad=True)
         input_ids = torch.randint(0, config.hash_moe_vocab_size, (4, 4), device="cuda")
         routing_probs, routing_map = router._hash_routing(logits, input_ids)
 
-        if score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-        elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float()).type_as(logits)
-        else:
-            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
-
         top_indices = router.tid2eid[input_ids.T.reshape(-1)].long()
-        expected_probs = scores.gather(1, top_indices)
-        if score_function != "softmax":
-            expected_probs = expected_probs / (expected_probs.sum(dim=-1, keepdim=True) + 1e-20)
+        expected_probs, _ = topk_routing_with_score_function(
+            logits,
+            config.moe_router_topk,
+            use_pre_softmax=pre_softmax,
+            score_function=score_function,
+            precomputed_indices=top_indices,
+            dense_output=True,
+        )
 
         expected_map = torch.zeros_like(routing_map).scatter(1, top_indices, True)
         expected_routing_probs = torch.zeros_like(routing_probs).scatter(
@@ -815,30 +818,38 @@ class TestHashRouting:
         assert torch.equal(routing_map, expected_map)
         torch.testing.assert_close(routing_probs, expected_routing_probs)
 
+        grad_output = torch.randn_like(routing_probs)
+        actual_grad = torch.autograd.grad(routing_probs, logits, grad_output)[0]
+        expected_grad = torch.autograd.grad(expected_routing_probs, logits, grad_output)[0]
+        torch.testing.assert_close(actual_grad, expected_grad)
+
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
-    def test_hash_routing_replay_record_forward_and_backward(self, score_function):
+    @pytest.mark.parametrize(
+        "score_function,pre_softmax",
+        [("softmax", False), ("softmax", True), ("sigmoid", False), ("sqrtsoftplus", False)],
+    )
+    def test_hash_routing_replay_record_forward_and_backward(self, score_function, pre_softmax):
         config = _hash_routing_config(
-            moe_enable_routing_replay=True, moe_router_score_function=score_function
+            moe_enable_routing_replay=True,
+            moe_router_score_function=score_function,
+            moe_router_pre_softmax=pre_softmax,
         )
         router = _make_hash_router(config, layer_number=1).cuda()
         logits = torch.randn(16, config.num_moe_experts, device="cuda")
         input_ids = torch.randint(0, config.hash_moe_vocab_size, (4, 4), device="cuda")
 
         default_indices = router.tid2eid[input_ids.T.reshape(-1)].long()
-        if score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-        elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float()).type_as(logits)
-        else:
-            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
 
         def expected_probs(indices):
-            probs = scores.gather(1, indices)
-            if score_function != "softmax":
-                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
-            return probs
+            return topk_routing_with_score_function(
+                logits,
+                config.moe_router_topk,
+                use_pre_softmax=pre_softmax,
+                score_function=score_function,
+                precomputed_indices=indices,
+                dense_output=True,
+            )[0]
 
         router.router_replay.set_router_replay_action(RouterReplayAction.RECORD)
         probs, top_indices = router._hash_routing(logits, input_ids, dense_output=True)
@@ -1011,7 +1022,9 @@ class TestHashRouting:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_hash_layer_selection_uses_explicit_hybrid_threshold(self):
-        config = _hash_routing_config(num_layers=8, moe_num_hash_layers=3)
+        config = _hash_routing_config(num_layers=8, moe_num_hash_layers=3, is_hybrid_model=True)
+        with pytest.raises(ValueError, match="explicit global layer threshold"):
+            _make_hash_router(config, layer_number=2)
         routers = [
             _make_hash_router(config, layer_number, hash_moe_layer_threshold=6)
             for layer_number in (2, 4, 6, 8)

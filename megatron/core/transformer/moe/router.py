@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -29,6 +30,9 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import log_single_rank
+
+logger = logging.getLogger(__name__)
 
 
 class Router(ABC, MegatronModule):
@@ -281,6 +285,12 @@ class TopKRouter(Router):
         super().set_layer_number(layer_number)
         hash_moe_layer_threshold = self.hash_moe_layer_threshold
         if hash_moe_layer_threshold is None:
+            if (
+                self.config.is_hybrid_model
+                and self.config.moe_num_hash_layers > 0
+                and not self.is_mtp_layer
+            ):
+                raise ValueError("Hybrid hash routing requires an explicit global layer threshold.")
             hash_moe_layer_threshold = self.config.moe_num_hash_layers
         self.is_hash_layer = (
             not self.is_mtp_layer
@@ -293,6 +303,13 @@ class TopKRouter(Router):
     def _initialize_hash_routing(self) -> None:
         """Initialize the hash lookup table and disable learned-routing expert bias."""
         if self.tid2eid is None:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Hash MoE initialized with a placeholder round-robin token-to-expert table. "
+                "Load a trained table from a checkpoint or provide a workload-aware "
+                "initialization before training.",
+            )
             token_ids = torch.arange(self.config.hash_moe_vocab_size, device=self.weight.device)
             expert_offsets = torch.arange(self.topk, device=token_ids.device)
             self.tid2eid = ((token_ids[:, None] + expert_offsets) % self.num_experts).to(
@@ -807,11 +824,15 @@ class TopKRouter(Router):
         comes from ``tid2eid``.
         """
         if self.score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            scores = (
+                torch.softmax(logits, dim=-1, dtype=torch.float32)
+                if self.config.moe_router_pre_softmax
+                else logits
+            )
         elif self.score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float()).type_as(logits)
+            scores = torch.sigmoid(logits.float())
         elif self.score_function == "sqrtsoftplus":
-            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+            scores = torch.nn.functional.softplus(logits.float()).sqrt()
         else:
             raise ValueError(f"Invalid score_function: {self.score_function}")
 
@@ -822,7 +843,9 @@ class TopKRouter(Router):
             f"input_ids contains {flat_ids.numel()} tokens, but router logits contain "
             f"{logits.shape[0]}."
         )
-        default_top_indices = self.tid2eid[flat_ids].long()
+        # Token IDs address the real tokenizer vocabulary; reject out-of-range IDs,
+        # including negative IDs, without clamping them to another token's experts.
+        default_top_indices = self.tid2eid.index_select(0, flat_ids).long()
         if (
             self.config.moe_router_force_load_balancing
             or self.config.moe_router_force_biased is not None
@@ -841,10 +864,14 @@ class TopKRouter(Router):
             )
         else:
             probs, top_indices = _compute_hash_topk(scores, self.topk)
-        if self.score_function != "softmax" and self.topk > 1:
+        if self.score_function == "softmax" and not self.config.moe_router_pre_softmax:
+            probs = torch.softmax(probs, dim=-1, dtype=torch.float32)
+        elif self.score_function != "softmax" and self.topk > 1:
             probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
         if self.config.moe_router_topk_scaling_factor:
             probs = probs * self.config.moe_router_topk_scaling_factor
+
+        probs = probs.type_as(logits)
 
         if dense_output:
             return probs, top_indices

@@ -585,11 +585,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 .contiguous()
             )
 
+        # Later pipeline stages receive activations through set_input_tensor.
+        decoder_reference = decoder_input
+        if padding_mask is not None and self.config.sequence_parallel and decoder_reference is None:
+            decoder_reference = self.decoder.input_tensor
         if (
             padding_mask is not None
             and self.config.sequence_parallel
-            and decoder_input is not None
-            and padding_mask.shape[1] != decoder_input.shape[0]
+            and decoder_reference is not None
+            and padding_mask.shape[1] != decoder_reference.shape[0]
         ):
             padding_mask = (
                 tensor_parallel.scatter_to_sequence_parallel_region(

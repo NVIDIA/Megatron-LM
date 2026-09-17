@@ -496,11 +496,7 @@ def modelopt_gpt_hybrid_builder(
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
         teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
-        # Prefer teacher-specific metadata, then the student's resolved vocabulary.
-        # Config-only callers retain the raw vocab_size fallback in args conversion.
-        if getattr(teacher_config_raw, 'hash_moe_vocab_size', None) is None:
-            teacher_config_raw.hash_moe_vocab_size = config.hash_moe_vocab_size
-        teacher_config = core_transformer_config_from_args(teacher_config_raw)
+        teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
 
         distill_cfg = mtd_mcore.setup_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config

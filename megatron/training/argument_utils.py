@@ -437,9 +437,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
 
 
 def gpt_config_from_args(
-    args: Namespace,
-    config: TransformerConfig | None = None,
-    model_config_cls: type = GPTModelConfig,
+    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = GPTModelConfig
 ) -> Any:
     """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
 
@@ -492,9 +490,7 @@ def gpt_config_from_args(
 
 
 def hybrid_config_from_args(
-    args: Namespace,
-    config: TransformerConfig | None = None,
-    model_config_cls: type = HybridModelConfig,
+    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = HybridModelConfig
 ) -> Any:
     """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
 
@@ -606,7 +602,9 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
     return _default_config_from_args(InferenceSetupConfig, args)
 
 
-def inference_cfg_container_from_args(args: Namespace, model_cfg=None) -> InferenceConfigContainer:
+def inference_cfg_container_from_args(
+    args: Namespace, model_cfg=None
+) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that

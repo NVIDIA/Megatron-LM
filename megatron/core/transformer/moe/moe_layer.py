@@ -129,6 +129,7 @@ class RouterInterface(Protocol):
     def forward(
         self,
         input: torch.Tensor,
+        /,
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
