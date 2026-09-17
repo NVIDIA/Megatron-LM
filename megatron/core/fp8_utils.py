@@ -306,8 +306,16 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
     Calling `dequantize()` on a quantized `torch.nn.Parameter` (rather than on the
     underlying tensor subclass) recurses through `__torch_dispatch__` until the stack
     overflows, so the Parameter wrapper is stripped first.
+
+    `MXFP8Tensor.dequantize()` has a separate, unrelated recursion bug in TE: its
+    `_FromMXFP8Func.forward` calls `.to(device="cuda")` on `self`, which re-enters
+    `__torch_dispatch__` -> `maybe_unwrap` -> `dequantize()` on the same tensor,
+    recursing indefinitely. `.float()` goes through a different (safe) dispatch path,
+    so it is used instead for MXFP8Tensor.
     """
     fp8_tensor = _unwrap_parameter_data(fp8_tensor)
+    if is_mxfp8tensor(fp8_tensor):
+        return fp8_tensor.float()
     if is_te_min_version("2.0"):
         return fp8_tensor.dequantize()
     else:
