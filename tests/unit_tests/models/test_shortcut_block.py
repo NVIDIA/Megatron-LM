@@ -12,9 +12,12 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -23,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _shortcut_config(*, parallel: bool = False):
+def _shortcut_config(*, parallel: bool = False, wide_residual: WideResidualConfig | None = None):
     return TransformerConfig(
         num_layers=1,
         hidden_size=8,
@@ -38,6 +41,7 @@ def _shortcut_config(*, parallel: bool = False):
         moe_shortcut_post_norm=True,
         moe_shortcut_parallel=parallel,
         add_bias_linear=False,
+        wide_residual=wide_residual,
     )
 
 
@@ -97,6 +101,9 @@ class _FakeMoE(torch.nn.Module):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
+    def _get_mlp_residual_connection(self):
+        return getattr(self, "residual_connection_mlp", None)
+
 
 @pytest.mark.parametrize(
     ("compute_symbol", "parallel"),
@@ -142,6 +149,67 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     state_keys = set(grouped.state_dict())
     assert "1.shortcut_pre_mlp_layernorm.weight" in state_keys
     assert "1.shortcut_post_norm.weight" in state_keys
+
+
+def test_wide_shortcut_owns_independent_registered_read():
+    """The routed shortcut reads wide X_l through its own ordinary-width controller."""
+
+    config = _shortcut_config(wide_residual=WideResidualConfig(num_streams=3))
+    pg_collection = ProcessGroupCollection()
+    compute = _FakeCompute(config)
+    compute.residual_stream_hidden_size = config.wide_residual.num_streams * config.hidden_size
+    moe = _FakeMoE(config)
+    moe.residual_connection_mlp = StreamwiseSigmoidWideResidualConnection(
+        config=config, layer_number=moe.layer_number, branch_name="mlp", pg_collection=pg_collection
+    )
+    block = ShortcutMoEBlock(compute, moe, overlap_a2a=False).cuda()
+
+    state_keys = set(block.state_dict())
+    assert "shortcut_residual_read.read_map.logit" in state_keys
+    assert "moe_layer.residual_connection_mlp.read_map.logit" in state_keys
+    assert (
+        block.shortcut_residual_read.read_map.logit
+        is not block.moe_layer.residual_connection_mlp.read_map.logit
+    )
+
+    wide_hidden = torch.randn(
+        5, 3 * config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+    )
+    shortcut_hidden = block._read_shortcut_hidden(wide_hidden, recompute_context=None)
+
+    assert shortcut_hidden.shape == (5, config.hidden_size)
+    shortcut_hidden.square().mean().backward()
+    gradient = block.shortcut_residual_read.read_map.logit.grad
+    assert gradient is not None
+    assert torch.count_nonzero(gradient[: config.wide_residual.num_streams]) > 0
+    assert wide_hidden.grad is not None
+
+
+def test_wide_shortcut_mtp_pair_stays_ordinary_width():
+    """MTP auxiliary stacks do not inherit the decoder's wide residual stream."""
+
+    config = _shortcut_config(wide_residual=WideResidualConfig(num_streams=3))
+    compute = _FakeCompute(config)
+    compute.is_mtp_layer = True
+    moe = _FakeMoE(config)
+    moe.is_mtp_layer = True
+
+    block = ShortcutMoEBlock(compute, moe, overlap_a2a=False)
+    ordinary_hidden = torch.randn(3, config.hidden_size)
+
+    assert block.is_mtp_layer
+    assert block.shortcut_residual_read is None
+    assert block._read_shortcut_hidden(ordinary_hidden, recompute_context=None) is ordinary_hidden
+    assert not any("shortcut_residual_read" in key for key in block.state_dict())
+
+
+def test_shortcut_pair_rejects_mixed_mtp_ownership():
+    config = _shortcut_config()
+    compute = _FakeCompute(config)
+    compute.is_mtp_layer = True
+
+    with pytest.raises(ValueError, match="agree.*MTP"):
+        ShortcutMoEBlock(compute, _FakeMoE(config), overlap_a2a=False)
 
 
 def test_shortcut_owns_cp_layout_transitions(monkeypatch):

@@ -423,6 +423,35 @@ class TestResidualStreamRecomputePlan:
         assert contexts[2].manager is contexts[3].manager
         assert contexts[1].manager is not contexts[2].manager
 
+    def test_keeps_atomic_layer_pairs_in_one_replay_block(self):
+        contexts = build_residual_stream_recompute_plan(
+            num_layers=8, block_size=4, atomic_layer_pairs=[(3, 4), (5, 6)]
+        )
+
+        assert [context.is_block_end for context in contexts] == [
+            False,
+            False,
+            True,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]
+        assert contexts[3].manager is contexts[4].manager
+        assert contexts[5].manager is contexts[6].manager
+        assert contexts[2].manager is not contexts[3].manager
+        assert contexts[6].manager is not contexts[7].manager
+
+    @pytest.mark.parametrize(
+        "atomic_layer_pairs", [[(1, 1)], [(1, 3)], [(-1, 0)], [(2, 3)], [(0, 1), (1, 2)]]
+    )
+    def test_rejects_invalid_atomic_layer_pairs(self, atomic_layer_pairs):
+        with pytest.raises(ValueError, match="adjacent in-range|must not overlap"):
+            build_residual_stream_recompute_plan(
+                num_layers=3, block_size=2, atomic_layer_pairs=atomic_layer_pairs
+            )
+
     @pytest.mark.parametrize("invalid_block_size", [False, 0, -1, 1.5])
     def test_rejects_invalid_block_size(self, invalid_block_size):
         with pytest.raises(ValueError, match="positive integer"):

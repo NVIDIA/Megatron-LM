@@ -152,6 +152,45 @@ class StreamwiseSigmoidMap(nn.Module):
         return self.logit if return_logits else self.factors()
 
 
+class StreamwiseSigmoidWideResidualRead(nn.Module):
+    """Learn an independent ordinary-width read from a wide residual stream."""
+
+    def __init__(self, config: TransformerConfig, layer_number: int, branch_name: str) -> None:
+        super().__init__()
+        if config.wide_residual is None:
+            raise ValueError("StreamwiseSigmoidWideResidualRead requires wide_residual config.")
+        wr = config.wide_residual
+        self.layer_number = layer_number
+        self.branch_name = branch_name
+        self.num_streams = wr.num_streams
+        self.residual_stream_hidden_size = wr.num_streams * config.hidden_size
+        self.branch_hidden_size = config.hidden_size
+        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """Map the carried wide stream to one ordinary-width branch input."""
+
+        if hidden_states.shape[-1] != self.residual_stream_hidden_size:
+            raise ValueError(
+                "StreamwiseSigmoidWideResidualRead expected residual-stream hidden size "
+                f"{self.residual_stream_hidden_size}, got {hidden_states.shape[-1]}."
+            )
+        branch_input = streamwise_sigmoid_read(
+            hidden_states, self.read_map(return_logits=True), self.num_streams
+        )
+        if branch_input.shape[:-1] != hidden_states.shape[:-1]:
+            raise ValueError(
+                "StreamwiseSigmoidWideResidualRead changed non-hidden dimensions while "
+                f"reading: {tuple(hidden_states.shape)} -> {tuple(branch_input.shape)}."
+            )
+        if branch_input.shape[-1] != self.branch_hidden_size:
+            raise ValueError(
+                "StreamwiseSigmoidWideResidualRead expected branch hidden size "
+                f"{self.branch_hidden_size}, got {branch_input.shape[-1]}."
+            )
+        return branch_input
+
+
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
     """Positive streamwise maps around one ordinary-width residual branch."""
 
