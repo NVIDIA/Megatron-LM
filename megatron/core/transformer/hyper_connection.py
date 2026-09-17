@@ -133,6 +133,20 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
 
 
 @torch.compile
+def native_proj_rms_eps_inside_sqrt(
+    x: Tensor, weight: Tensor, eps: float = 1e-6
+) -> Tuple[Tensor, Tensor]:
+    """Projection + standard RMSNorm (``rsqrt(mean(x^2) + eps)``) reciprocal.
+
+    The variant of :func:`native_proj_rms` that places the epsilon inside the square root, as a
+    standard RMSNorm does. Selected by ``TransformerConfig.mhc_norm_eps_inside_sqrt``.
+    """
+    proj = torch.matmul(x, weight.t())
+    r = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    return proj, r
+
+
+@torch.compile
 def native_fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     """Native 3-way elementwise add (torch.compile fuses into single kernel)."""
     return a + b + c
@@ -239,7 +253,7 @@ class HyperConnectionModule(MegatronModule):
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        self.norm_eps = config.mhc_norm_eps
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.
@@ -251,7 +265,9 @@ class HyperConnectionModule(MegatronModule):
         # The fused path computes the projection and compute_h in one op, so
         # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
         # reached on the unfused path.
-        self._proj_rms_op = native_proj_rms
+        self._proj_rms_op = (
+            native_proj_rms_eps_inside_sqrt if config.mhc_norm_eps_inside_sqrt else native_proj_rms
+        )
 
         if config.use_fused_mhc:
             from megatron.core.fusions.fused_mhc_kernels import (

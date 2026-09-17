@@ -1236,6 +1236,18 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_norm_eps: float = 1e-6
+    """Epsilon of the mHC input normalization over the flattened residual streams."""
+
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Place ``mhc_norm_eps`` inside the square root of the mHC input normalization.
+
+    ``False`` (default) keeps the mHC paper's ``x / (rms(x) + eps)``. ``True`` selects a
+    standard RMSNorm, ``x * rsqrt(mean(x^2) + eps)``, which is what GLM-5.3-Flash's
+    checkpoints were trained with. The two agree for O(1) activations but not for small
+    residual streams -- with a per-token rms below ``sqrt(eps)`` the placement of the epsilon
+    changes the mixing weights materially. Not supported by the fused mHC kernels."""
+
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
@@ -2450,6 +2462,16 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mhc_init_gating_factor must be non-negative, got "
                     f"{self.mhc_init_gating_factor}."
+                )
+
+            if self.mhc_norm_eps <= 0:
+                raise ValueError(f"mhc_norm_eps must be positive, got {self.mhc_norm_eps}.")
+
+            # The fused kernels hard-code the 1/(rms+eps) form of the input normalization.
+            if self.use_fused_mhc and self.mhc_norm_eps_inside_sqrt:
+                raise ValueError(
+                    "use_fused_mhc is not compatible with mhc_norm_eps_inside_sqrt=True; the "
+                    "fused mHC kernels implement x / (rms(x) + eps) only."
                 )
 
         if self.fine_grained_activation_offloading:
