@@ -6,6 +6,12 @@ import time
 
 _PROGRAM_START_TIME = time.time()
 
+# Apply policy before Core/TE imports can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import warnings
 from copy import deepcopy
 from functools import partial
