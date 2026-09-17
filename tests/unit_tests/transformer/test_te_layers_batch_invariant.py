@@ -176,6 +176,111 @@ def test_te_column_parallel_linear_batch_invariant_randomized():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("output_size", [2048, 2560, 6144])
+def test_te_native_matmul_batch_invariant_qwen3_shapes(output_size):
+    """Native GEMM must preserve rows between decode and scoring token buckets."""
+    torch.manual_seed(123)
+    weight = torch.randn(output_size, 2048, device="cuda", dtype=torch.bfloat16)
+    inputs = torch.randn(128, 2048, device="cuda", dtype=torch.bfloat16)
+
+    with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+        decode = torch.matmul(inputs[:64], weight.t())
+        scoring = torch.matmul(inputs, weight.t())[:64]
+
+    assert torch.equal(decode, scoring)
+
+
+@pytest.mark.parametrize("output_size", [2048, 2560, 6144])
+def test_te_native_fp32_output_gemm_batch_invariant_qwen3_shapes(output_size):
+    """FP32 output GEMMs include the deferred logits projection used by NeMo RL."""
+    torch.manual_seed(321)
+    weight = torch.randn(output_size, 2048, device="cuda", dtype=torch.bfloat16)
+    inputs = torch.randn(128, 2048, device="cuda", dtype=torch.bfloat16)
+
+    with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+        decode = te_general_gemm(weight, inputs[:64], torch.float32, layout="TN", grad=False)[0]
+        scoring = te_general_gemm(weight, inputs, torch.float32, layout="TN", grad=False)[0][:64]
+
+    assert torch.equal(decode, scoring)
+
+
+def test_te_native_quantized_weight_bf16_compute_batch_invariant_qwen3_shape():
+    """The selective-precision policy stores dense weights in MXFP8 but computes in BF16."""
+    from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+
+    cfg = TransformerConfig(
+        num_layers=1,
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_query_groups=4,
+        use_cpu_initialization=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        flash_attention_version=_BIK_FA_VERSION,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-6,
+        attention_backend=AttnBackend.flash,
+    )
+    with get_fp8_context(cfg, 0, is_init=True):
+        layer = TELayerNormColumnParallelLinear(
+            input_size=cfg.hidden_size,
+            output_size=2560,
+            config=cfg,
+            init_method=init_method_normal(cfg.init_method_std),
+            gather_output=False,
+            bias=False,
+            skip_bias_add=False,
+            is_expert=False,
+        ).eval()
+    assert is_mxfp8tensor(layer.weight)
+
+    torch.manual_seed(456)
+    inputs = torch.randn(128, 2048, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+        decode = layer(inputs[:64])[0]
+        scoring = layer(inputs)[0][:64]
+
+    assert torch.equal(decode, scoring)
+
+
+@pytest.mark.parametrize("small_rows", [4, 8, 64])
+def test_te_native_qk_rmsnorm_batch_invariant_qwen3_shape(small_rows):
+    """Q/K head normalization must match decode and full-sequence row counts."""
+    cfg = TransformerConfig(
+        num_layers=1,
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_query_groups=4,
+        use_cpu_initialization=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        flash_attention_version=_BIK_FA_VERSION,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-6,
+        attention_backend=AttnBackend.flash,
+    )
+    norm = TENorm(config=cfg, hidden_size=64, eps=cfg.layernorm_epsilon).cuda().eval()
+    torch.manual_seed(789)
+    inputs = torch.randn(512, 64, device="cuda", dtype=torch.bfloat16)
+
+    with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+        decode = norm(inputs[:small_rows])
+        scoring = norm(inputs)[:small_rows]
+
+    assert torch.equal(decode, scoring)
+
+
 def test_te_row_parallel_linear_batch_invariant_randomized():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False

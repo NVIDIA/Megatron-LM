@@ -369,6 +369,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_disable_triton_nvls_kernels": False,
     "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "vllm",
+    "inference_mxfp8_include_parameters": None,
+    "inference_mxfp8_exclude_parameters": None,
     "inference_flashinfer_mxfp8_token_capacity": None,
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",

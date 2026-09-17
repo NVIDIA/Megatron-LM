@@ -358,6 +358,58 @@ class TestMoEModules:
             what="TEGroupedMLP",
         )
 
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    def test_te_mxfp8_device_metadata_grouped_mlp_replays(self, monkeypatch):
+        """The device-metadata path gets 256-aligned splits and replays bit-exactly."""
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("MXFP8 grouped GEMM needs Blackwell")
+
+        from megatron.core.fp8_utils import get_fp8_context
+
+        self._init()
+        seeded()
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "1")
+        config = _moe_config(
+            hidden_size=128,
+            ffn_hidden_size=256,
+            use_cpu_initialization=False,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+        with get_fp8_context(config, 0, is_init=True):
+            experts = (
+                get_submodules(spec.submodules.mlp)
+                .experts(
+                    num_local_experts=8,
+                    config=config,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
+                .cuda()
+            )
+
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts.quantization_padding.align_size == 256
+        tokens_per_expert = torch.tensor([17, 0, 1, 33, 255, 256, 257, 3], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(rows, device="cuda", requires_grad=True)
+
+        def forward(hidden, tokens_per_expert, probs):
+            with get_fp8_context(config, 0):
+                return experts(hidden, tokens_per_expert, probs)
+
+        assert_replays_bit_exact(
+            forward,
+            (hidden, tokens_per_expert, probs),
+            replays=3,
+            contention=True,
+            what="TEGroupedMLP[MXFP8, device metadata]",
+        )
+
     def test_sequential_mlp_replays_on_uneven_experts(self):
         self._init()
         seeded()

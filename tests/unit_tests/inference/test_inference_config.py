@@ -30,21 +30,64 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 class TestInferenceConfig:
     @pytest.mark.parametrize(
+        ("name", "include", "exclude", "expected"),
+        [
+            ("decoder.layers.2.mlp.experts.linear_fc1.weight0", None, None, True),
+            (
+                "decoder.layers.2.mlp.experts.linear_fc1.weight0",
+                r"\.mlp\.experts\.linear_fc[12]\.",
+                None,
+                True,
+            ),
+            ("decoder.layers.2.self_attention.linear_qkv.weight", r"\.mlp\.experts\.", None, False),
+            (
+                "decoder.layers.2.mlp.experts.linear_fc2.weight0",
+                r"\.mlp\.experts\.",
+                r"linear_fc2",
+                False,
+            ),
+        ],
+    )
+    def test_mxfp8_parameter_filter(self, name, include, exclude, expected):
+        from megatron.core.inference.quantization.utils import matches_mxfp8_parameter_filter
+
+        assert matches_mxfp8_parameter_filter(name, include, exclude) is expected
+
+    @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),
         [
             ("torch", "triton"),
             (InferenceGroupedGemmBackend.TORCH, "triton"),
+            ("te", "triton"),
+            (InferenceGroupedGemmBackend.TE, "triton"),
             ("flashinfer", "triton"),
             (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
+            ("vllm", "triton"),
+            (InferenceGroupedGemmBackend.VLLM, "triton"),
         ],
     )
     def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
         assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
 
-    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
-    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
-            resolve_mxfp8_backend(grouped_gemm_backend)
+            resolve_mxfp8_backend("unknown")
+
+    def test_te_grouped_moe_parameter_ids_exclude_only_expert_weights(self):
+        from megatron.core.inference.quantization.utils import get_te_grouped_moe_parameter_ids
+
+        root = torch.nn.Module()
+        root.dense = torch.nn.Linear(4, 4, bias=False)
+        root.experts = torch.nn.Module()
+        root.experts.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.TE
+        root.experts.linear_fc1 = torch.nn.Linear(4, 8, bias=False)
+        root.experts.linear_fc2 = torch.nn.Linear(8, 4, bias=False)
+
+        excluded = get_te_grouped_moe_parameter_ids(root)
+
+        assert id(root.dense.weight) not in excluded
+        assert id(root.experts.linear_fc1.weight) in excluded
+        assert id(root.experts.linear_fc2.weight) in excluded
 
     @staticmethod
     def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):

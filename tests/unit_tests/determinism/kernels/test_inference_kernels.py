@@ -207,6 +207,59 @@ def test_mxfp8_quantize_replays():
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
 
 
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs MXFP8 dtypes")
+def test_selective_mxfp8_parameter_conversion_replays():
+    """Routed experts remain MXFP8 while an unmatched parameter becomes exact BF16."""
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Transformer Engine MXFP8 parameter storage needs Blackwell")
+
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
+
+    seeded()
+    attention_weight = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    expert_weight = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+
+    def convert(attention_weight, expert_weight):
+        quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+        model = torch.nn.Module()
+        model.attention = torch.nn.Module()
+        model.attention.weight = torch.nn.Parameter(
+            quantizer(attention_weight), requires_grad=False
+        )
+        model.mlp = torch.nn.Module()
+        model.mlp.experts = torch.nn.Module()
+        model.mlp.experts.linear_fc1 = torch.nn.Module()
+        model.mlp.experts.linear_fc1.weight = torch.nn.Parameter(
+            quantizer(expert_weight), requires_grad=False
+        )
+
+        buffers = quantize_params_to_mxfp8(
+            model,
+            backend="triton",
+            include_pattern=r"(^|\.)mlp\.experts\.linear_fc[12]\.",
+            _filter_prefix="decoder.",
+        )
+        selected = buffers["mlp.experts.linear_fc1.weight"]
+        return (
+            model.attention.weight,
+            selected.data.view(torch.uint8),
+            selected.scale.view(torch.uint8),
+        )
+
+    assert_replays_bit_exact(
+        convert,
+        (attention_weight, expert_weight),
+        replays=3,
+        backward=False,
+        what="selective MXFP8 parameter conversion",
+    )
+
+
 # --- inference MoE permute / unpermute --------------------------------------------------------
 
 
