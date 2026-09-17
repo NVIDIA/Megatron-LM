@@ -4802,9 +4802,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         header, _ = msgpack.unpackb(frames[0], raw=False)
         wire = msgpack.unpackb(frames[1], raw=False)
         assert header == Headers.ENGINE_REPLY.value
-        assert wire["uid"] == merged.uid and wire["payload_offloaded"] is True
+        assert wire["uid"] == finished.uid and wire["payload_offloaded"] is True
         assert wire["generated_log_probs"] is None and wire["routing_indices"] is None
-        assert wire["generated_tokens"] == list(merged.generated_tokens)
+        assert wire["generated_tokens"] == list(finished.generated_tokens)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
