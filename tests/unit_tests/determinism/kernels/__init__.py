@@ -15,7 +15,7 @@ import torch
 from megatron.training.determinism import apply_determinism_env
 
 # The SSM Triton autotuners read the determinism policy when their modules are imported
-# (``megatron/core/ssm/ops/common/determinism.py``); pin it before any kernel module loads
+# (``megatron/core/ops/ssm/common/determinism.py``); pin it before any kernel module loads
 # so the tests measure the kernels, not Triton's timing-based config search.
 os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
 os.environ.setdefault("CAUSAL_CONV1D_DETERMINISTIC", "1")

@@ -76,7 +76,7 @@ class MambaInferenceStateConfig:
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        from megatron.core.ssm.ssm_inference import ssm_chunking
+        from megatron.core.ops.ssm.common.inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)

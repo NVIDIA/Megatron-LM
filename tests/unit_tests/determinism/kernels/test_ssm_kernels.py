@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Bit-exact replay of the in-repo SSM Triton kernels (``megatron/core/ssm/ops/``) and the
+"""Bit-exact replay of the in-repo SSM Triton kernels (``megatron/core/ops/ssm/``) and the
 gated-delta-net code paths.
 
 The Mamba training mixer is covered by ``correctness/test_ssm_conv1d.py``; this module drives
@@ -18,7 +18,7 @@ single config and a zero-initialised, ordered-sum workspace when ``MAMBA_DETERMI
 import pytest
 import torch
 
-from megatron.core.ssm.ops.common import determinism as ssm_determinism
+from megatron.core.ops.ssm.common import determinism as ssm_determinism
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 try:
@@ -45,7 +45,7 @@ def ssm_deterministic():
 
 
 def test_mamba_chunk_scan_combined_varlen_replays():
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ops.ssm.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     seeded()
     seqlen, nheads, headdim, ngroups, dstate, chunk = 4096, 32, 64, 1, 128, 256
@@ -95,7 +95,7 @@ def test_mamba_chunk_scan_combined_varlen_replays():
 
 
 def test_selective_state_update_replays():
-    from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+    from megatron.core.ops.ssm.mamba2.mamba_ssm import selective_state_update
 
     seeded()
     batch, nheads, headdim, dstate, ngroups = 256, 32, 64, 128, 1
@@ -134,7 +134,7 @@ def test_selective_state_update_replays():
 
 
 def test_causal_conv1d_update_replays():
-    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+    from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
 
     seeded()
     batch, dim, width = 256, 4096, 4
@@ -153,7 +153,7 @@ def test_causal_conv1d_update_replays():
 
 
 def test_causal_conv1d_varlen_replays():
-    from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+    from megatron.core.ops.ssm.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
     seeded()
     dim, width = 2048, 4
@@ -185,8 +185,8 @@ def test_causal_conv1d_varlen_replays():
     "model owners; not gated until root-caused.",
 )
 def test_chunk_gated_delta_product_varlen_replays():
-    from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
-    from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
+    from megatron.core.ops.ssm.gdp import chunk_h, chunk_o
+    from megatron.core.ops.ssm.gdp.chunk import chunk_gated_delta_product_varlen
 
     # The deterministic policy must have pinned the autotuners at import; otherwise the
     # replay would measure Triton's timing-based config search, not the kernels.
@@ -233,7 +233,7 @@ def test_chunk_gated_delta_product_varlen_replays():
 
 
 def test_fused_recurrent_gated_delta_rule_update_replays():
-    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+    from megatron.core.ops.ssm.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
     B, H, K, V = 128, 16, 128, 128
@@ -266,7 +266,7 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
 
 
 def test_gdp_decode_prepare_replays():
-    from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
+    from megatron.core.ops.ssm.gdp.decode_prepare import gdp_decode_prepare
 
     seeded()
     n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
@@ -284,8 +284,8 @@ def test_gdp_decode_prepare_replays():
 
 
 def test_gdp_l2norm_and_cumsum_replay():
-    from megatron.core.ssm.ops.gdp.common import l2norm_fwd
-    from megatron.core.ssm.ops.gdp.cumsum import chunk_local_cumsum
+    from megatron.core.ops.ssm.gdp.common import l2norm_fwd
+    from megatron.core.ops.ssm.gdp.cumsum import chunk_local_cumsum
 
     seeded()
     x = torch.randn(65536, 128, device="cuda", dtype=torch.bfloat16)
@@ -305,7 +305,7 @@ def test_gdp_l2norm_and_cumsum_replay():
 
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     """The path ``--deterministic-mode`` selects for GDN (FLA is not deterministic)."""
-    from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
+    from megatron.core.ops.ssm.gated_delta.gdn import torch_chunk_gated_delta_rule
 
     seeded()
     B, T, H, K = 2, 2048, 16, 128

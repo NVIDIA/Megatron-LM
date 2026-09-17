@@ -10,7 +10,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_experimental_attention_variant_module_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import (
+from megatron.core.ops.ssm.gated_delta import (
     HAVE_FLA,
     HAVE_FLA_GDN2,
     GatedDeltaNet,

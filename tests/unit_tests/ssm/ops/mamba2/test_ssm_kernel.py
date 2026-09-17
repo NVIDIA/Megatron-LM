@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 # Assume the provided class is in mamba_mixer.py
-from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer
 
 
 class MockContextParallel:
