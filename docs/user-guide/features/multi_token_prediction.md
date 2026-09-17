@@ -27,6 +27,16 @@ The following table summarizes MTP configuration fields:
 | --- | --- |
 | `mtp_num_layers` | Number of MTP layers. MTP extends prediction to multiple future tokens at each position. This stack uses `mtp_num_layers` sequential modules to predict that many additional tokens per position. Default: `None`. |
 | `mtp_loss_scaling_factor` | Weight for the MTP loss term. The implementation averages MTP losses across depths, multiplies by this factor, and adds the result to the training objective. Default: `0.1`. |
+| `mtp_loss_type` | MTP training objective: `cross_entropy` or `e2e_tv`. Default: `cross_entropy`. |
+
+## End-to-End TV Loss
+
+Set `mtp_loss_type: e2e_tv` and `mtp_detach_heads: true` to select the end-to-end
+TV objective when MTP is enabled. This mode uses `mtp_loss_scaling_factor` to scale
+the auxiliary loss. To train only MTP parameters, the optimizer must additionally
+freeze the base model or select only MTP parameters; `mtp_detach_heads` does not
+change the optimizer parameter set. See
+[Bebop](https://arxiv.org/abs/2606.12370) for the objective definition.
 
 ## Pipeline Parallel Layout for MTP
 
