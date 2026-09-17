@@ -159,6 +159,20 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
 
 
+@pytest.mark.determinism_case(op_id="fused_bias_gelu", implementation="torch.compile:bias_gelu")
+@pytest.mark.launch_on_gb200
+def test_bias_gelu_recipe_shape_replay_bit_exactly(monkeypatch):
+    """Cover the observed BF16 TP2 MLP signature from the four-step GPT pilot."""
+    # Match the recipe's early startup policy; restore it for unrelated cases.
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", True)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    seeded()
+    inputs = (_act((32, 1, 128)), _act((128,)))
+    assert_replays_bit_exact(
+        bias_gelu_impl, inputs, replays=3, contention=True, what="bias_gelu_recipe_shape"
+    )
+
+
 @pytest.mark.parametrize(
     "case,dtype",
     [
