@@ -111,7 +111,9 @@ class MimoModel(MegatronModule):
         components = []
         if self.language_model is not None:
             language = unwrap_model(self.language_model)
-            components.append(("language_model", language, language.pg_collection))
+            components.append(
+                ("language_model", language, getattr(language, "pg_collection", None))
+            )
         for modality, wrapped_tower in self.modality_submodules.items():
             tower = unwrap_model(wrapped_tower)
             if (
@@ -123,7 +125,7 @@ class MimoModel(MegatronModule):
             ):
                 raise ValueError("Refit requires one image encoder and at most one input projector")
             vision = unwrap_model(next(iter(tower.encoders.values())))
-            components.append(("vision_model", vision, vision.pg_collection))
+            components.append(("vision_model", vision, getattr(vision, "pg_collection", None)))
             for wrapped_projector in tower.input_projections:
                 projector = unwrap_model(wrapped_projector)
                 components.append(
@@ -147,10 +149,12 @@ class MimoModel(MegatronModule):
                 or getattr(config, "quant_recipe", None) is not None
             ):
                 raise ValueError("Quantized component refit is not supported")
+            # Check legacy TP-only constructors (notably projectors); encoders
+            # such as CLIP pass their full collection directly to the decoder.
             tp = getattr(module, "tp_group", None)
-            if tp is not None and torch.distributed.get_process_group_ranks(tp) != (
-                torch.distributed.get_process_group_ranks(pg.tp)
-            ):
+            if tp is not None and torch.distributed.get_process_group_ranks(
+                tp
+            ) != torch.distributed.get_process_group_ranks(pg.tp):
                 raise ValueError(
                     f"Refit component {label!r}: TP group disagrees with its declaration"
                 )

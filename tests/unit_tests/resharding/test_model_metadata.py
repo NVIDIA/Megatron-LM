@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.resharding import refit
 from megatron.core.resharding.planner import _extract_module_metadata, _find_source_metadata
 from megatron.core.resharding.refit import (
     _get_parallel_config,
@@ -219,6 +220,8 @@ def test_mimo_provider_uses_actual_component_groups_and_projector_fallback():
     [
         ("layout", "one image encoder"),
         ("groups", "requires explicit"),
+        ("language_groups", "language_model.*requires explicit"),
+        ("vision_groups", "vision_model.*requires explicit"),
         ("tp", "TP group disagrees"),
         ("fp8", "Quantized component"),
         ("fp4", "Quantized component"),
@@ -232,6 +235,10 @@ def test_mimo_rejects_unsupported_metadata(fault, match):
         tower.encoders["extra"] = linear()
     elif fault == "groups":
         model.language_model.pg_collection.dp = None
+    elif fault == "language_groups":
+        del model.language_model.pg_collection
+    elif fault == "vision_groups":
+        del tower.encoders["clip"].pg_collection
     elif fault == "tp":
         tower.input_projections[0].pg_collection = None
         tower.input_projections[0].tp_group = (9,)
@@ -241,18 +248,79 @@ def test_mimo_rejects_unsupported_metadata(fault, match):
         metadata(model)
 
 
-def test_provider_cache_identity_does_not_execute_hook_or_retain_models():
-    first, second = Composite(), Composite()
-    first.refit_modules = lambda: pytest.fail("Cache lookup must not enumerate modules")
+def test_provider_cache_reuses_equivalent_models_without_retaining_them(monkeypatch):
+    monkeypatch.setattr(refit, "_plan_cache", {})
+    builds = []
+
+    def build(*args, **kwargs):
+        builds.append(args)
+        return ReshardPlan([], [])
+
+    monkeypatch.setattr(refit, "build_local_reshard_plan", build)
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 4)
+    first = Composite()
+    plan = refit._build_or_get_plan(first, None, None, group, 0, 0)
     key = _get_parallel_config(first)
-    assert key == _get_parallel_config(first)
-    assert key != _get_parallel_config(second)
-    cached_plan = {key: object()}
+    first.refit_modules = lambda: pytest.fail("Cached lookup must not enumerate modules")
+    assert _get_parallel_config(first) == key
     reference = weakref.ref(first)
+    builds.clear()
     del first
     gc.collect()
     assert reference() is None
-    assert key in cached_plan
+    for _ in range(3):
+        rebuilt = Composite()
+        assert refit._build_or_get_plan(rebuilt, None, None, group, 0, 0) is plan
+    assert not builds
+    assert len(refit._plan_cache) == 1
+
+
+@pytest.mark.parametrize("change", ["ranks", "shape", "label", "path", "experts", "layer"])
+def test_provider_cache_distinguishes_metadata_changes(change):
+    original, changed = Composite(), Composite()
+    if change == "ranks":
+        changed.first.pg_collection = groups((2, 3))
+    elif change == "shape":
+        changed.first.weight = torch.nn.Parameter(torch.zeros(3, 2))
+    elif change == "label":
+        components = changed.refit_modules()
+        components[0] = ("renamed", *components[0][1:])
+        changed.refit_modules = lambda: components
+    elif change == "path":
+        changed.renamed = changed.first
+        del changed.first
+        changed.refit_modules = lambda: [
+            ("left", changed.renamed, changed.renamed.pg_collection),
+            ("right", changed.second, changed.second.pg_collection),
+        ]
+    elif change == "experts":
+        changed.first.config = SimpleNamespace(num_moe_experts=8)
+    else:
+        for model, number in ((original, 1), (changed, 2)):
+            model.first.layers = torch.nn.ModuleList([linear()])
+            model.first.layers[0].layer_number = number
+    assert _get_parallel_config(original) != _get_parallel_config(changed)
+
+
+def test_provider_cache_resolves_experts_in_the_native_rank_space(monkeypatch):
+    model = Composite()
+    model.first.pg_collection = groups((2, 3))
+    model.first.config = SimpleNamespace(num_moe_experts=4)
+    model.first.register_parameter("weight0", model.first._parameters.pop("weight"))
+    model.first.weight0.allreduce = False
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 3)
+    assert _get_parallel_config(model) == _get_parallel_config(model)
+
+
+def test_clearing_plans_refreshes_provider_fingerprints():
+    model = Composite()
+    original = _get_parallel_config(model)
+    model.first.weight.data = model.first.weight.data.double()
+    refit.clear_plan_cache()
+    rebuilt = Composite()
+    rebuilt.first.weight.data = rebuilt.first.weight.data.double()
+    assert _get_parallel_config(model) != original
+    assert _get_parallel_config(model) == _get_parallel_config(rebuilt)
 
 
 def test_tied_embedding_alias_stays_inside_its_component():
@@ -283,8 +351,8 @@ def test_buffer_dtypes_match_transfer_ids_across_different_storage_names(
 
     def gather(gathered, local, group=None):
         calls.append(local)
-        assert local == {7: torch.float32}
-        gathered[:] = [local, {9: torch.float16 if conflicting_shard else torch.float32}]
+        assert local == ({7: torch.float32}, {7: "inference.state", 9: "inference.state"})
+        gathered[:] = [local, ({9: torch.float16 if conflicting_shard else torch.float32}, {})]
 
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)

@@ -128,6 +128,10 @@ architectures and input preprocessing; matching tensor names and shapes alone
 do not establish equivalence.
 
 Plans are cached between optimizer steps; update tensor values in place.
+Models declaring `refit_modules()` use a memoized fingerprint of the planner's
+local metadata, including tensor paths, layouts and ordered group membership.
+Rebuilding an equivalent model reuses its plan without retaining model identities.
+Fingerprints are memoized only for live models and cleared with the plan cache.
 Initialize persistent buffers to their runtime dtypes before the first swap
 (for example, MoE routers promote their bias to FP32 on first forward).
 A buffer dtype change that preserves the tensor object requires
@@ -274,7 +278,8 @@ across refits.
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
 | `_service_cache` | Backend name + process-group identity + M2N execution limit | `CopyService` instance | Avoid re-creating backend communicators and buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts, execution limit) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP-remat sizes |
+| `_plan_cache` | Rank, source/destination config, offsets, world size, expert count, pool, execution limit | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; ordinary configs include dense/expert GTP-remat sizes; models declaring `refit_modules()` use a metadata fingerprint |
+| `_model_fingerprints` | Weak model key | Metadata fingerprint | Avoid re-extracting composite metadata on warm swaps; entries expire with models and are cleared by `clear_plan_cache()` |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.

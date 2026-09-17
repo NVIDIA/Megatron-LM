@@ -8,9 +8,10 @@ High-level refit/reshard orchestration:
 - reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
 """
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Optional, Union
-from weakref import ReferenceType, ref
+from weakref import WeakKeyDictionary
 
 import torch
 
@@ -30,6 +31,7 @@ from .copy_services.nccl_copy_service import NCCLCopyService
 from .copy_services.nccl_m2n_copy_service import NCCLM2NCopyService
 from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from .planner import _extract_module_metadata
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
@@ -56,8 +58,8 @@ class _PlanCacheKey:
     """
 
     rank: int
-    src_config: _ParallelConfig | ReferenceType | None
-    dst_config: _ParallelConfig | ReferenceType | None
+    src_config: _ParallelConfig | bytes | None
+    dst_config: _ParallelConfig | bytes | None
     num_experts: Optional[int]
     # Adding inference nodes leaves the configs and offsets unchanged, so without
     # world_size the stale pre-growth plan would be reused.
@@ -75,20 +77,25 @@ class _PlanCacheKey:
     execution_batch_bytes: int | None = None
 
 
-def _get_parallel_config(core) -> _ParallelConfig | ReferenceType | None:
-    """Return a composite model identity or memoized single-model group sizes.
+def _get_parallel_config(core) -> _ParallelConfig | bytes | None:
+    """Return memoized single-model group sizes or a composite metadata fingerprint.
 
-    Process-group sizes don't change after init, so ordinary models cache them
-    on the core to avoid repeated group queries on the hot path.
+    Equivalent composite models reuse plans without retaining model identities.
+    Metadata includes native/matching names, tensor layouts and ordered group ranks.
     """
     if core is None:
         return None
     if getattr(core, "refit_modules", None) is not None:
-        # Composite models have multiple meshes. A weak identity distinguishes
-        # their plans without retaining tensors or adding a second metadata cache.
-        # Rebuilding a layout requires new models and collective cache clearing.
-        return ref(core)
-    cached = getattr(core, '_refit_parallel_config', None)
+        fingerprint = _model_fingerprints.get(core)
+        if fingerprint is None:
+            # Reuse the planner's description, in the model's native rank space.
+            # Refit's rank offsets are already part of the outer cache key.
+            metadata = _extract_module_metadata(core, torch.distributed.get_rank(), None, 0, {})
+            metadata.sort(key=lambda entry: entry.name)
+            fingerprint = hashlib.sha256(repr(metadata).encode()).digest()
+            _model_fingerprints[core] = fingerprint
+        return fingerprint
+    cached = getattr(core, "_refit_parallel_config", None)
     if cached is not None:
         return cached
     pg = core.pg_collection
@@ -143,6 +150,8 @@ def _build_plan_cache_key(
 # address from being reused while the cache entry exists.
 _service_cache: dict[tuple[str, int | None, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
+# Memoize only live models; clearing plans also refreshes their structural keys.
+_model_fingerprints: WeakKeyDictionary[torch.nn.Module, bytes] = WeakKeyDictionary()
 
 
 def get_or_create_service(
@@ -201,6 +210,7 @@ def clear_plan_cache():
     """
     global _plan_cache
     _plan_cache.clear()
+    _model_fingerprints.clear()
 
 
 def clear_all_caches():
@@ -529,19 +539,41 @@ def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
             for op in plan.send_ops
             if op.param_name in source_buffers
         }
+        destination_buffers = (
+            {name for name, _, _, _ in named_persistent_buffers(tgt_core)}
+            if tgt_core is not None
+            else set()
+        )
+        local_dst_names = {
+            op.task_id: op.param_name
+            for op in plan.recv_ops
+            if op.param_name in destination_buffers
+        }
         world_size = group.size() if group is not None else torch.distributed.get_world_size()
         gathered: list = [None] * world_size
-        torch.distributed.all_gather_object(gathered, local_src_dtypes, group=group)
-        transfer_dtypes = {task_id: dtype for part in gathered for task_id, dtype in part.items()}
-        destination_dtypes = {}
-        for op in plan.recv_ops:
-            if op.task_id not in transfer_dtypes:
-                continue
-            dtype = transfer_dtypes[op.task_id]
-            previous = destination_dtypes.setdefault(op.param_name, dtype)
-            if previous != dtype:
-                raise ValueError(f"Source shards disagree on buffer dtype for {op.param_name}")
-        plan.buffer_dtypes = destination_dtypes
+        torch.distributed.all_gather_object(
+            gathered, (local_src_dtypes, local_dst_names), group=group
+        )
+        transfer_dtypes = {
+            task_id: dtype for src_dtypes, _ in gathered for task_id, dtype in src_dtypes.items()
+        }
+        # Every rank validates every destination before any rank enters transfers.
+        # Different task IDs may contribute shards to the same destination buffer.
+        destination_dtypes = []
+        for rank, (_, dst_names) in enumerate(gathered):
+            dtypes = {}
+            for task_id, name in dst_names.items():
+                if task_id not in transfer_dtypes:
+                    continue
+                dtype = transfer_dtypes[task_id]
+                previous = dtypes.setdefault(name, dtype)
+                if previous != dtype:
+                    raise ValueError(
+                        f"Source shards disagree on buffer dtype for {name} on rank {rank}"
+                    )
+            destination_dtypes.append(dtypes)
+        rank = group.rank() if group is not None else torch.distributed.get_rank()
+        plan.buffer_dtypes = destination_dtypes[rank]
 
     if tgt_core is None:
         return

@@ -16,10 +16,12 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.resharding.refit import (
+    _harmonize_buffer_dtypes,
     clear_all_caches,
     prepare_swap_model_weights,
     swap_model_weights,
 )
+from megatron.core.resharding.utils import ReshardPlan, TransferOp
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import Float16Module
@@ -64,7 +66,16 @@ def _config(tp):
     )
 
 
-def _models(language_tp, vision_tp, language_grid, image_grid, language_pg, image_pg, target_pg):
+def _models(
+    language_tp,
+    vision_tp,
+    language_grid,
+    image_grid,
+    language_pg,
+    image_pg,
+    target_pg,
+    wrapped=False,
+):
     rank = dist.get_rank()
     layer = get_gpt_layer_with_transformer_engine_spec()
     projection = MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear)
@@ -160,6 +171,16 @@ def _models(language_tp, vision_tp, language_grid, image_grid, language_pg, imag
             'vision_projection': tower.input_projections[0],
         }
         components['vision_model'].register_buffer('refit_counter', torch.zeros(1, device='cuda'))
+    if wrapped:
+        if source.language_model is not None:
+            source.language_model = Float16Module(_config(language_tp), source.language_model)
+        for name, tower in list(source.modality_submodules.items()):
+            source.modality_submodules[name] = Float16Module(_config(vision_tp), tower)
+        # Mimic training's FP32 persistent state after precision wrapping.
+        if 'vision_model' in components:
+            components['vision_model'].refit_counter = components[
+                'vision_model'
+            ].refit_counter.float()
     return source, None, components
 
 
@@ -239,20 +260,29 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
         torch.manual_seed(1234)
         model_parallel_cuda_manual_seed(1234, tp_rank=tp_rank, ep_rank=0, etp_rank=0)
         source, target, components = _models(
-            language_tp, vision_tp, language_grid, image_grid, language_pg, image_pg, target_pg
+            language_tp,
+            vision_tp,
+            language_grid,
+            image_grid,
+            language_pg,
+            image_pg,
+            target_pg,
+            wrapped,
         )
-        if wrapped and source is not None:
-            if source.language_model is not None:
-                source.language_model = Float16Module(_config(language_tp), source.language_model)
-            for name, tower in list(source.modality_submodules.items()):
-                source.modality_submodules[name] = Float16Module(_config(vision_tp), tower)
-            # Mimic training's FP32 persistent state after precision wrapping.
-            if 'vision_model' in components:
-                components['vision_model'].refit_counter = components[
-                    'vision_model'
-                ].refit_counter.float()
         prepare_swap_model_weights(source, target)
-        for update in range(2):
+        for update in range(3):
+            if update == 2 and source is not None:
+                # Rebuild only training models; inference keeps its cached plan.
+                source, _, components = _models(
+                    language_tp,
+                    vision_tp,
+                    language_grid,
+                    image_grid,
+                    language_pg,
+                    image_pg,
+                    None,
+                    wrapped,
+                )
             if update:
                 with torch.no_grad():
                     for module in components.values():
@@ -265,4 +295,55 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
         clear_all_caches()
         for grid in (language_grid, image_grid, target_grid):
             grid.destroy()
+        Utils.destroy_model_parallel()
+
+
+def test_buffer_dtype_conflicts_fail_on_every_rank():
+    Utils.initialize_model_parallel()
+    if dist.get_world_size() < 4:
+        Utils.destroy_model_parallel()
+        pytest.skip("Requires two source ranks, a destination and an idle rank")
+    try:
+        rank = dist.get_rank()
+        source, target = None, None
+        plan = ReshardPlan([], [])
+        if rank < 2:
+            source = torch.nn.Module()
+            source.register_buffer(
+                "source_state", torch.ones(1, dtype=(torch.float32, torch.float16)[rank])
+            )
+            plan.send_ops = [
+                TransferOp(
+                    "source_state", 2, True, (slice(None),), (slice(rank, rank + 1),), task_id=rank
+                )
+            ]
+        elif rank == 2:
+            target = torch.nn.Module()
+            target.register_buffer("target_state", torch.zeros(2, dtype=torch.bfloat16))
+            plan.recv_ops = [
+                TransferOp(
+                    "target_state",
+                    peer,
+                    False,
+                    (slice(peer, peer + 1),),
+                    (slice(None),),
+                    task_id=peer,
+                )
+                for peer in range(2)
+            ]
+        error = None
+        try:
+            _harmonize_buffer_dtypes(plan, source, target)
+        except ValueError as exc:
+            error = str(exc)
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, error)
+        assert all(
+            message and "Source shards disagree on buffer dtype" in message for message in errors
+        ), errors
+        assert len(set(errors)) == 1
+        assert plan.buffer_dtypes is None
+        if target is not None:
+            assert target.target_state.dtype == torch.bfloat16
+    finally:
         Utils.destroy_model_parallel()
