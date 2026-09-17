@@ -4,20 +4,15 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stac
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
-from megatron.training import get_tokenizer, print_rank_0
+from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import count_parameters_in_layer
+
 
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building Hybrid model ...')
     if config is None:
-        config = core_transformer_config_from_args(
-            args,
-            TransformerConfig,
-            tokenizer_vocab_size=(
-                get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-            ),
-        )
+        config = core_transformer_config_from_args(args, TransformerConfig)
 
     if config.transformer_impl == "inference_optimized":
         hybrid_stack_spec = hybrid_inference_stack_spec

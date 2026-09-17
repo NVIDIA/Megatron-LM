@@ -27,7 +27,7 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
-from megatron.training import get_args, get_tokenizer, print_rank_0
+from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
@@ -292,12 +292,7 @@ def modelopt_gpt_hybrid_builder(
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    config = core_transformer_config_from_args(
-        args,
-        tokenizer_vocab_size=(
-            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-        ),
-    )
+    config = core_transformer_config_from_args(args)
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
@@ -501,20 +496,11 @@ def modelopt_gpt_hybrid_builder(
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
         teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
-        # The teacher owns its vocabulary metadata; it need not match the student's tokenizer.
-        teacher_vocab_size = getattr(teacher_config_raw, 'hash_moe_vocab_size', None)
-        if teacher_vocab_size is None:
-            # Compatibility with checkpoints saved before tokenizer metadata was passed explicitly.
-            teacher_vocab_size = getattr(teacher_config_raw, 'tokenizer_vocab_size', None)
-        if teacher_vocab_size is None:
-            teacher_vocab_size = teacher_config_raw.vocab_size
-        if teacher_vocab_size is None:
-            # Without teacher-specific metadata, _load_teacher_model_config defaults to
-            # the student's architecture. Reuse its already resolved vocabulary as well.
-            teacher_vocab_size = config.hash_moe_vocab_size
-        teacher_config = core_transformer_config_from_args(
-            teacher_config_raw, tokenizer_vocab_size=teacher_vocab_size
-        )
+        # Prefer teacher-specific metadata, then the student's resolved vocabulary.
+        # Config-only callers retain the raw vocab_size fallback in args conversion.
+        if getattr(teacher_config_raw, 'hash_moe_vocab_size', None) is None:
+            teacher_config_raw.hash_moe_vocab_size = config.hash_moe_vocab_size
+        teacher_config = core_transformer_config_from_args(teacher_config_raw)
 
         distill_cfg = mtd_mcore.setup_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config

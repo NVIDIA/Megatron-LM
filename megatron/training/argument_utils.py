@@ -274,15 +274,8 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
-def core_transformer_config_from_args(
-    args, config_class=None, *, tokenizer_vocab_size: int | None = None
-):
-    """Build a transformer config with an explicitly supplied tokenizer vocabulary.
-
-    Hash routing needs the vocabulary including added tokens, before TP-dependent
-    padding. Callers that own a tokenizer should pass its ``vocab_size`` here.
-    Config-only callers may instead provide ``hash_moe_vocab_size`` or ``vocab_size``.
-    """
+def core_transformer_config_from_args(args, config_class=None):
+    """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
     from megatron.core.quantization.utils import (
@@ -314,9 +307,7 @@ def core_transformer_config_from_args(
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
-    if tokenizer_vocab_size is not None:
-        kw_args['hash_moe_vocab_size'] = tokenizer_vocab_size
-    elif kw_args.get('hash_moe_vocab_size') is None:
+    if kw_args.get('hash_moe_vocab_size') is None:
         kw_args['hash_moe_vocab_size'] = args.vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
@@ -449,8 +440,6 @@ def gpt_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
     model_config_cls: type = GPTModelConfig,
-    *,
-    tokenizer_vocab_size: int | None = None,
 ) -> Any:
     """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
 
@@ -465,13 +454,9 @@ def gpt_config_from_args(
         if args.yaml_cfg is not None:
             from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
-            transformer_cfg = core_transformer_config_from_yaml(
-                args, "language_model", tokenizer_vocab_size=tokenizer_vocab_size
-            )
+            transformer_cfg = core_transformer_config_from_yaml(args, "language_model")
         else:
-            transformer_cfg = core_transformer_config_from_args(
-                args, tokenizer_vocab_size=tokenizer_vocab_size
-            )
+            transformer_cfg = core_transformer_config_from_args(args)
     else:
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
@@ -510,8 +495,6 @@ def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
     model_config_cls: type = HybridModelConfig,
-    *,
-    tokenizer_vocab_size: int | None = None,
 ) -> Any:
     """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
 
@@ -523,9 +506,7 @@ def hybrid_config_from_args(
 
     kwargs = {}
     if config is None:
-        transformer_cfg = core_transformer_config_from_args(
-            args, tokenizer_vocab_size=tokenizer_vocab_size
-        )
+        transformer_cfg = core_transformer_config_from_args(args)
     else:
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
@@ -625,9 +606,7 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
     return _default_config_from_args(InferenceSetupConfig, args)
 
 
-def inference_cfg_container_from_args(
-    args: Namespace, model_cfg=None, *, tokenizer_vocab_size: int | None = None
-) -> InferenceConfigContainer:
+def inference_cfg_container_from_args(args: Namespace, model_cfg=None) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
@@ -639,14 +618,12 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
-        tokenizer_vocab_size: Actual tokenizer vocabulary, including added tokens and before
-            TP-dependent padding. Used when constructing the model config for hash routing.
     """
     if model_cfg is None:
         if getattr(args, "hybrid_layer_pattern", None) is not None:
-            model_cfg = hybrid_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+            model_cfg = hybrid_config_from_args(args)
         else:
-            model_cfg = gpt_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+            model_cfg = gpt_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     ckpt_kwargs["save_optim"] = not args.no_save_optim

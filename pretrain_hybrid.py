@@ -113,12 +113,7 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(
-        args,
-        tokenizer_vocab_size=(
-            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-        ),
-    )
+    config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
         (
@@ -381,12 +376,7 @@ def forward_step(data_iterator, model: HybridModel):
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = core_transformer_config_from_args(
-        args,
-        tokenizer_vocab_size=(
-            get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-        ),
-    )
+    config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
@@ -536,8 +526,8 @@ if __name__ == "__main__":
     # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
     _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
     _IS_NVRX_RESTART = (
-        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
-    )
+        _NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()
+    ) or _NVRX_CYCLE_START is not None
     if _NVRX_LAUNCH_TIME is not None:
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
         if _IS_NVRX_RESTART:
@@ -583,17 +573,10 @@ if __name__ == "__main__":
     )
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
-    tokenizer_vocab_size = (
-        get_tokenizer().vocab_size if getattr(args, 'moe_num_hash_layers', 0) else None
-    )
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = hybrid_config_from_args(
-            args,
-            model_config_cls=ModelOptHybridModelConfig,
-            tokenizer_vocab_size=tokenizer_vocab_size,
-        )
+        model_cfg = hybrid_config_from_args(args, model_config_cls=ModelOptHybridModelConfig)
     else:
-        model_cfg = hybrid_config_from_args(args, tokenizer_vocab_size=tokenizer_vocab_size)
+        model_cfg = hybrid_config_from_args(args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,

@@ -4,6 +4,7 @@ import signal
 import sys
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
 from unittest.mock import MagicMock, patch
 
@@ -50,6 +51,7 @@ class CapturingTransformerConfig:
     """Minimal config that records kwargs produced by core_transformer_config_from_args."""
 
     moe_use_norm_before_up_proj: bool = False
+    hash_moe_vocab_size: int | None = None
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -89,23 +91,32 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
-@pytest.mark.parametrize('input_vocab_size', [None, 100000])
-def test_hash_moe_uses_explicit_tokenizer_vocab_size(input_vocab_size):
+@pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
+def test_hash_moe_vocab_is_initialized_before_config_conversion(
+    monkeypatch, explicit_hash_vocab_size
+):
+    from megatron.training import global_vars
+
     parser = ArgumentParser()
     add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.params_dtype = torch.float32
-    # The actual vocabulary includes added tokens and does not follow TP padding.
-    args.vocab_size = input_vocab_size
+    args.moe_num_hash_layers = 1
+    args.hash_moe_vocab_size = explicit_hash_vocab_size
+    args.vocab_size = 100000
     args.padded_vocab_size = 100352
+    tokenizer = SimpleNamespace(vocab_size=100003)
+    monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
+    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
 
-    config = core_transformer_config_from_args(
-        args, config_class=CapturingTransformerConfig, tokenizer_vocab_size=100003
-    )
+    global_vars._build_tokenizer(args)
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
 
-    assert config.hash_moe_vocab_size == 100003
-    assert args.vocab_size == input_vocab_size
-    assert not hasattr(args, 'tokenizer_vocab_size')
+    expected = 100003 if explicit_hash_vocab_size is None else explicit_hash_vocab_size
+    assert config.hash_moe_vocab_size == expected
+    assert args.hash_moe_vocab_size == expected
+    assert args.vocab_size == 100000
+    assert args.padded_vocab_size == 100352
 
 
 def test_moe_norm_flag_requires_latent_size(monkeypatch):
