@@ -832,10 +832,11 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
 
     The caller only has the batch aggregates ``sum_i(L_i)`` and
     ``sum_i(L_i ** 2)``, not the individual sequence lengths, so the ratio is
-    evaluated at the length-weighted mean ``sum(L^2) / sum(L)``. That is exact
-    when every sequence in the batch has the same length (the usual packed-THD
-    benchmark case) and, for ragged batches, weights toward the long sequences
-    that dominate attention cost. Collapses to ``1.0`` when the sequences are
+    evaluated at the length-weighted mean ``sum(L^2) / sum(L)``. For equal-length
+    sequences, this aggregation introduces no additional approximation, but
+    the pair counts still use the continuous approximation described below.
+    For ragged batches, it weights toward the long sequences that dominate
+    attention cost. Collapses to ``1.0`` when the sequences are
     no longer than ``topk``, where top-k selects everything and attention is
     dense.
     """
@@ -870,10 +871,8 @@ def _dsa_indexer_flops(
     residual, the ``linear_wk`` key path, and the per-head ``weights_proj``)
     plus its dense scoring pass of every query against every past token under
     a causal mask. Scoring is ``O(L^2)`` even though the attention consuming
-    it is sparse. The indexer KL loss (``dsa_indexer_loss_coeff``) and the
-    top-k selection itself are NOT counted: like everywhere else in this file
-    only the model's defining GEMMs enter the estimate, not auxiliary-loss or
-    sorting work.
+    it is sparse. The indexer KL-loss computation and top-k selection are
+    excluded from this estimate.
 
     Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
     (``dsa_indexer_topk_freq``) the layers in between reuse the most recent

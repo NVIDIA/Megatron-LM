@@ -956,7 +956,7 @@ class TestDSA:
 
 
 class TestDSAHelperEdgeCases:
-    """Direct coverage of the helper guards and the hybrid rejection."""
+    """Direct coverage of the helper guards and hybrid variant handling."""
 
     def test_indexer_flops_zero_layers(self):
         """No indexer layers contribute nothing."""
