@@ -1096,8 +1096,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         packed_seq_params=None,
-        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         input_ids: Optional[Tensor] = None,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
         pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(

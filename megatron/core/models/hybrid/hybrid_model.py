@@ -585,6 +585,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 .contiguous()
             )
 
+        # TODO: Apply the same later-stage SP mask alignment in GPTModel.
         # Later pipeline stages receive activations through set_input_tensor.
         decoder_reference = decoder_input
         if padding_mask is not None and self.config.sequence_parallel and decoder_reference is None:

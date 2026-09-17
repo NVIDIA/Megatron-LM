@@ -98,8 +98,8 @@ class HyperConnectionHybridLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
-        mhc_recompute_manager=None,
         input_ids: Optional[Tensor] = None,
+        mhc_recompute_manager=None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw branch output for split Hybrid TransformerLayer instances.
 
@@ -182,8 +182,8 @@ class HyperConnectionHybridLayer(MegatronModule):
             sequence_len_offset,
             packed_seq_params,
             padding_mask,
-            mhc_recompute_manager=mhc_recompute_manager,
-            input_ids=input_ids,
+            input_ids,
+            mhc_recompute_manager,
         )
 
         if fast_path_result is None:
