@@ -36,8 +36,8 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
     "NCCL_ALGO": "Ring",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-    # TRITON_CACHE_AUTOTUNING is deliberately absent: unset is already deterministic, so
-    # turning caching on is the operator's call. See apply_determinism_env().
+    # The legacy helper leaves caching unset. The complete startup API pins 0
+    # before backend imports; enabling caching remains the operator's choice.
 }
 
 # Accepted NCCL_ALGO tokens under --deterministic-mode. Comma-separated lists
@@ -263,6 +263,9 @@ def configure_determinism(config: object) -> dict:
     # Pin external SSM libraries before they can cache an environment lookup.
     for name in ("MAMBA_DETERMINISTIC", "CAUSAL_CONV1D_DETERMINISTIC"):
         proposed.setdefault(name, "1")
+    # An optional backend import (e.g. vLLM) may setdefault cached autotuning
+    # to 1. Pin our non-cached fallback before imports can change that choice.
+    proposed.setdefault("TRITON_CACHE_AUTOTUNING", "0")
     environment = _environment_signature(proposed)
     initialized = torch.cuda.is_initialized() or (
         torch.distributed.is_available() and torch.distributed.is_initialized()
