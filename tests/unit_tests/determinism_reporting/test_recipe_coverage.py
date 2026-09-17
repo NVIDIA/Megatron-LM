@@ -404,3 +404,50 @@ def test_capture_bootstraps_effective_policy_before_binding_import(tmp_path, mod
     assert all(
         item["signature"]["deterministic_algorithms"] is enabled for item in capture["operations"]
     )
+
+
+@pytest.mark.parametrize("change", ["revision", "dirty", "environment"])
+def test_capture_rejects_context_drift_after_successful_training(tmp_path, monkeypatch, change):
+    before = inventory()["context"] | {"environment": {"NCCL_ALGO": "Ring"}}
+    after = copy.deepcopy(before)
+    after[change] = {"revision": "b" * 40, "dirty": True, "environment": {"NCCL_ALGO": "Tree"}}[
+        change
+    ]
+    contexts = iter((before, after))
+    monkeypatch.setattr(capture_recipe, "source_context", lambda torch: next(contexts))
+    monkeypatch.setenv("RANK", "0")
+    bindings = tmp_path / "bindings.json"
+    bindings.write_text("[]")
+    script = tmp_path / "train.py"
+    script.write_text("completed = True\n")
+    output = tmp_path / "capture"
+    previous_argv, previous_path = sys.argv[:], sys.path[:]
+    with pytest.raises(RuntimeError, match="context changed"):
+        capture_recipe.main(
+            [
+                "--bindings",
+                str(bindings),
+                "--output",
+                str(output),
+                "--recipe-id",
+                "drift",
+                "--",
+                str(script),
+            ]
+        )
+    assert sys.argv == previous_argv and sys.path == previous_path
+    captured = json.loads((output / "rank-0.json").read_text())
+    assert not captured["complete"]
+    assert captured["context"] == before and captured["context_after"] == after
+    # Even an otherwise matching operation cannot be certified by this capture.
+    captured["operations"] = inventory()["operations"]
+    proof = evidence()
+    proof["context"] = before
+    report = build_report([captured], [proof])
+    assert report["counts"][DETERMINISTIC] == 0
+    assert report["counts"][UNVERIFIED] == 1
+    assert report["capture_issues"]
+    # The consumer also rejects recorded drift if a producer incorrectly sets
+    # the completion flag; a passing operation test cannot override it.
+    captured["complete"] = True
+    assert build_report([captured], [proof])["counts"][UNVERIFIED] == 1

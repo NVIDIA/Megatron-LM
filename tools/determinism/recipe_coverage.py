@@ -115,6 +115,8 @@ def build_report(inventories: list[dict], evidence: list[dict]) -> dict:
         by_rank[rank] = inventory
         if not inventory["complete"]:
             issues.append(f"Rank {rank}: capture did not complete")
+        if inventory.get("context_after", context) != context:
+            issues.append(f"Rank {rank}: source or environment context changed during capture")
         if inventory.get("truncated", False):
             issues.append(f"Rank {rank}: signature limit reached")
         for operation in inventory["operations"]:
