@@ -248,6 +248,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
             chunk_size=impl_cfg.magi_chunk_size,
             high_precision_reduce=impl_cfg.magi_high_precision_reduce,
             dense_kernel_backend=impl_cfg.magi_dense_kernel_backend,
+            deterministic=impl_cfg.deterministic,
         )
         magi_msa_config = magi_msa.build_msa_config(magi_settings, head_dim=model_cfg.head_dim, index_head_dim=model_cfg.index_head_dim)
         import os
