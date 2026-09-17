@@ -344,6 +344,19 @@ class _ParamAndGradBucketGroup:
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
+        # Inference packing may redirect plain parameters into serving buffers.
+        # Copy only after all-gather: each optimizer rank updates just a shard.
+        for bucket in self.buckets:
+            if bucket.param_data is None:
+                continue
+            for param in bucket.params:
+                if _param_uses_quantized_storage(param) or is_grouped_tensor(param):
+                    continue
+                start, end = bucket.param_to_index[param]
+                gathered_param = bucket.param_data[start:end].view_as(param)
+                if param.data_ptr() != gathered_param.data_ptr():
+                    param.data.copy_(gathered_param)
+
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
                 if bucket.param_data is None:
