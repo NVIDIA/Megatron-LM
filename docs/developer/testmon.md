@@ -9,9 +9,10 @@ and coverage path. PRs never record or publish Testmon databases.
 
 `.github/workflows/populate-build-cache.yml` builds the dev containers and then
 records all unit-test buckets using the same source SHA and platform matrix.
-It runs at 00:17, 06:17, 12:17, and 18:17 UTC, on relevant main-branch pushes,
-and on manual dispatch. GitHub schedules can be delayed. Concurrent refreshes
-are serialized without cancelling the active producer.
+It records Testmon baselines at 00:17, 06:17, 12:17, and 18:17 UTC and on manual
+dispatch. Relevant main-branch pushes refresh only the build caches. GitHub
+schedules can be delayed. Concurrent refreshes are serialized without cancelling
+the active producer.
 
 After merging the workflow into `main`, establish the first generation:
 
