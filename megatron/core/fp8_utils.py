@@ -301,29 +301,7 @@ def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: tor
 
 
 def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
-    """Dequantize a fp8 tensor to a higher precision tensor.
-
-    Calling `dequantize()` on a quantized `torch.nn.Parameter` (rather than on the
-    underlying tensor subclass) recurses through `__torch_dispatch__` until the stack
-    overflows, so the Parameter wrapper is stripped first.
-
-    Non-Float8Tensor quantized tensors (e.g. MXFP8, which on the live model param
-    may be exposed as TE's `MXFP8TensorStorage` rather than the `MXFP8Tensor` class
-    itself, so `is_mxfp8tensor` alone is not enough to catch it) have a separate,
-    unrelated recursion bug in TE: `dequantize()`'s internal `.to(device="cuda")`
-    call re-enters `__torch_dispatch__` -> `maybe_unwrap` -> `dequantize()` on the
-    same tensor, recursing indefinitely. `.float()` goes through a different (safe)
-    dispatch path, so it is used instead for any quantized tensor that isn't a
-    plain `Float8Tensor`.
-    """
-    fp8_tensor = _unwrap_parameter_data(fp8_tensor)
-    if is_float8tensor(fp8_tensor):
-        from transformer_engine.pytorch.tensor.float8_tensor import (  # Avoid circular import
-            Float8Tensor,
-        )
-
-        if not isinstance(fp8_tensor, Float8Tensor):
-            return fp8_tensor.float()
+    """Dequantize a fp8 tensor to a higher precision tensor."""
     if is_te_min_version("2.0"):
         return fp8_tensor.dequantize()
     else:

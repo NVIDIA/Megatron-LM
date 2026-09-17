@@ -496,7 +496,6 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
         self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
         self._intermediate_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
-        self._mxfp8_scratch_read_items: set = set()
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -558,34 +557,8 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         Note that this requires tracking the original tensor
         (as `self._intermediate_read_item_and_target` attribute)
         and restoring it in `commit_tensor` method.
-
-        Non-Float8Tensor quantized tensors (e.g. MXFP8, exposed as TE's
-        `MXFP8TensorStorage` on the live model param, not the `MXFP8Tensor` class)
-        are handled differently: TE's `dequantize()` recurses indefinitely in
-        `__torch_dispatch__` in some TE builds, and FileSystemReader's
-        `target_tensor.copy_(tensor)` triggers exactly that dispatch path when the
-        target is a live quantized tensor. Quantized weights are stored dequantized
-        to BF16 with no block scales (see checkpointing.py), and the model's
-        quantized params are re-derived from the optimizer's main params after load
-        (`quantize_and_sync_model_params_from_main_params`), so the raw bytes read
-        here are never meant to be copied directly into the live quantized param.
-        Substitute a plain scratch tensor as the copy target so the read succeeds
-        without ever dispatching through the quantized tensor, and drop it in
-        `commit_tensor` instead of copying it back. Detected via the general
-        `is_float8tensor` (which matches any `QuantizedTensor` subclass on TE2.x,
-        not just `Float8Tensor`) so it also covers quantized tensor classes other
-        than `MXFP8Tensor` itself.
         """
         target_tensor = super().resolve_tensor(read_item)
-        from ...fp8_utils import _unwrap_parameter_data, is_float8tensor  # Avoid circular import
-
-        if is_float8tensor(target_tensor) and not isinstance(
-            _unwrap_parameter_data(target_tensor), Float8Tensor
-        ):
-            self._mxfp8_scratch_read_items.add(id(read_item))
-            return torch.empty(
-                target_tensor.shape, dtype=torch.bfloat16, device=target_tensor.device
-            )
         if (
             not target_tensor.is_contiguous()
             and HAVE_TE
@@ -599,9 +572,6 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
         """Restores the original FP8 tensor saved in `resolve_tensor`."""
-        if id(read_item) in self._mxfp8_scratch_read_items:
-            self._mxfp8_scratch_read_items.discard(id(read_item))
-            return
         if self._intermediate_read_item_and_target is not None:
             interm_read_item, target_tensor = self._intermediate_read_item_and_target
             assert (
