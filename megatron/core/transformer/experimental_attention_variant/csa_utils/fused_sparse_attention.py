@@ -3067,6 +3067,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         # Preserve the fixed window suffix for the dense teacher before
         # compacting the complete attention index set.
+        if q_padding_mask is not None:
+            # Padding queries attend only to the sink, as in raw THD lowering.
+            topk_idxs.masked_fill_(q_padding_mask.unsqueeze(-1), -1)
         if logical_window_width is None:
             logical_window_width = topk_idxs.shape[-1] - indexer_topk
         window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]

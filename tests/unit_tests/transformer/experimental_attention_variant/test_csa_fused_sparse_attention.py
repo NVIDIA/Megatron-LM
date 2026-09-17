@@ -2791,7 +2791,6 @@ class TestFusedIndexerSparseAttnFromTopk:
 
     def test_backward_reuses_compact_indices_and_length(self, monkeypatch):
         inputs = self._inputs()
-        inputs['topk_idxs'][1] = -1
         for name in ('query', 'kv_full', 'attn_sink', 'q_indexer', 'k_indexer', 'weights'):
             inputs[name].requires_grad_(True)
 
@@ -2799,8 +2798,10 @@ class TestFusedIndexerSparseAttnFromTopk:
         q_padding_mask = torch.tensor([False, True, False, False])
         seen = {}
 
-        def fake_flash(query, *args, **kwargs):
-            del args, kwargs
+        def fake_flash(query, kv_full, topk_idxs, softmax_scale, **kwargs):
+            del kv_full, softmax_scale
+            seen['forward_topk'] = topk_idxs.detach().clone()
+            seen['forward_topk_length'] = kwargs['topk_length'].detach().clone()
             return torch.zeros_like(query), torch.full((total_q, num_heads), 3.0), None
 
         class FakeDSA:
@@ -2851,6 +2852,13 @@ class TestFusedIndexerSparseAttnFromTopk:
         )
         (output.sum() + loss).backward()
 
+        torch.testing.assert_close(
+            seen['forward_topk'],
+            torch.tensor([[4, 0], [-1, -1], [5, 2], [5, 3]], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            seen['forward_topk_length'], torch.tensor([2, 0, 2, 2], dtype=torch.int32)
+        )
         torch.testing.assert_close(
             seen['topk'], torch.tensor([[4, 0], [0, 0], [5, 2], [5, 3]], dtype=torch.int32)
         )
