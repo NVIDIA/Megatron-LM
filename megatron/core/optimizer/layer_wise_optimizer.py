@@ -30,6 +30,7 @@ from .param_layout import (
     bucket_end_divisor,
     pad_param_start,
     pad_to_divisor,
+    resolve_buffer_dp_world_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -463,6 +464,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         data_parallel_world_size: int,
         ddp_config,
         expert_data_parallel_world_size: Optional[int] = None,
+        context_parallel_size: int = 1,
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
@@ -478,6 +480,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ddp_config: :class:`DistributedDataParallelConfig`.
             expert_data_parallel_world_size: Expert DP group size (defaults to
                 ``data_parallel_world_size``).
+            context_parallel_size: CP degree; must match DDP's own group_params_for_buffers call.
 
         Returns:
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
@@ -485,17 +488,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Avoid a circular import: DistributedOptimizer imports LayerWise indirectly.
         from .distrib_optimizer import DistributedOptimizer
 
-        buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
+        buffer_groups = group_params_for_buffers(
+            params, ddp_config.grad_reduce_in_fp32, context_parallel_size=context_parallel_size
+        )
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
-                dp_world_size = (
-                    expert_data_parallel_world_size
-                    if expert_data_parallel_world_size is not None
-                    else data_parallel_world_size
-                )
-            else:
-                dp_world_size = data_parallel_world_size
+            dp_world_size = resolve_buffer_dp_world_size(
+                buffer_key,
+                data_parallel_world_size,
+                expert_data_parallel_world_size,
+                context_parallel_size,
+            )
 
             # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
