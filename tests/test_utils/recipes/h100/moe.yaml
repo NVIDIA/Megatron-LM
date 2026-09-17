@@ -228,6 +228,26 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  # Gradient accumulation over two microbatches, with and without an outer DP axis.
+  # All three must produce the same loss curve: splitting the data-parallel domain into
+  # optimizer instances is a sharding decision and must not change the math. MFSDP keeps
+  # the DP-outer axis Partial between microbatches and reduces it on the last backward,
+  # so this only has teeth with more than one microbatch.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mb2]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hsdp_mb2]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_hfsdp_mb2]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   #######################################################################
   # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
   #######################################################################

@@ -253,9 +253,7 @@ class TestGPTModelBatchInvariant:
                 engine.add_request(request_id, prompt, sampling_params)
             while engine.has_unfinished_requests():
                 result = engine.step_modern()
-                finished_requests.extend(
-                    r.merge(engine.controller.tokenizer) for r in result["finished_request_records"]
-                )
+                finished_requests.extend(result["finished_requests"])
 
             assert finished_requests, "Dynamic engine did not produce any completed requests."
 
@@ -329,8 +327,7 @@ class TestGPTModelBatchInvariant:
                     engine.add_request(request_id, prompts[request_id - 1], sampling_params)
                 while engine.has_unfinished_requests():
                     result = engine.step_modern()
-                    for r in result["finished_request_records"]:
-                        req = r.merge(engine.controller.tokenizer)
+                    for req in result["finished_requests"]:
                         finished_by_id[req.request_id] = req
 
             return finished_by_id
@@ -447,8 +444,7 @@ class TestGPTModelBatchInvariant:
                     # Sampled at a step boundary, after the pause/resume/evict
                     # lifecycle for this step has settled.
                     max_paused_blocks = max(max_paused_blocks, allocator.get_paused_used())
-                    for record in result["finished_request_records"]:
-                        req = record.merge(engine.controller.tokenizer)
+                    for req in result["finished_requests"]:
                         finished_by_id[req.request_id] = req
 
             assert not engine.has_unfinished_requests(), "engine did not drain"

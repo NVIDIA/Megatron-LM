@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import random
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
@@ -55,6 +56,10 @@ try:
         SchedulePolicy,
         fully_shard,
         fully_shard_context,
+        microbatch,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
+        copy_parameter_attributes,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
@@ -92,8 +97,19 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
             "reset_parameters method."
         )
 
+    # Both _apply() and TE reset_parameters() may replace Parameter objects.
+    parameter_states = [
+        (name, parameter, parameter.requires_grad)
+        for name, parameter in module.named_parameters(recurse=False)
+    ]
+
     module._apply(materialize_tensor, recurse=False)
     reset_parameters()
+
+    for name, original_parameter, requires_grad in parameter_states:
+        parameter = module.get_parameter(name)
+        parameter.requires_grad_(requires_grad)
+        copy_parameter_attributes(original_parameter, parameter)
 
 
 def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:
@@ -714,11 +730,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # silently inflated norm.
             raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
 
-        unsupported_parallelisms = [
-            "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
-            "context_parallel_size",
-        ]
+        # Context parallelism is absent on purpose: the mesh is built from dp_cp, which
+        # already folds CP ranks into the axis this shards and reduces gradients over.
+        unsupported_parallelisms = ["tensor_model_parallel_size", "pipeline_model_parallel_size"]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
                 "MFSDP v2 does not currently support: "
@@ -730,7 +744,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp"):
+        for group_name in ("tp", "pp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
@@ -768,14 +782,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
-        if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
-            config.expert_model_parallel_size <= 1
-            or ddp_config.num_distributed_optimizer_instances <= 1
+        if (
+            ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
+            and ddp_config.num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
-                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires an outer expert-DP "
-                "axis, i.e. expert parallelism and num_distributed_optimizer_instances > 1."
+                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
+                "num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
@@ -805,6 +819,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.megatron_fsdp_max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
+
+    @contextlib.contextmanager
+    def no_sync(self):
+        """Suppress gradient finalization for a non-final microbatch.
+
+        HSDP/HFSDP leave the DP-outer axis Partial across microbatches and reduce it
+        on the last backward of a step, so MFSDP has to be told which backward that
+        is. Without it every backward finalizes that axis and marks the accumulation
+        buffer stale, so the next microbatch zeroes it and only the last microbatch's
+        gradient reaches the optimizer.
+
+        MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
+        """
+        with microbatch(self.module.context, is_last=False):
+            yield
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""

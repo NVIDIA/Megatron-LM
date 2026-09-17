@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -33,11 +33,9 @@ class MimoModelConfig:
             Default is "sbhd".
     """
 
-    warnings.warn(
+    warn_single_rank(
         "MimoModelConfig is experimental and still under active development. "
-        "The API may change without notice in future releases.",
-        category=UserWarning,
-        stacklevel=2,
+        "The API may change without notice in future releases."
     )
 
     language_model_spec: ModuleSpec = field(default_factory=ModuleSpec)
