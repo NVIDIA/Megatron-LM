@@ -61,6 +61,13 @@ def test_parse_only_prepares_args(monkeypatch, isolated_globals, experimental):
     else:
         experimental_flag.assert_not_called()
 
+    replacement_args = deepcopy(args)
+    monkeypatch.setattr(arguments, "parse_args", Mock(return_value=replacement_args))
+    with pytest.raises(AssertionError, match="args is already initialized"):
+        arguments.parse_and_validate_args()
+    assert global_vars.get_args() is args
+    services.assert_not_called()
+
 
 def test_args_only_bootstrap_registers_args_and_constructs_services(monkeypatch, isolated_globals):
     args = _runtime_args()

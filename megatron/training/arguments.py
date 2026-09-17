@@ -31,11 +31,11 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training import global_vars
 from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
     ArgumentGroupFactory,
     core_transformer_config_from_args,
 )
-from megatron.training.global_vars import set_args
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -113,7 +113,8 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
     else:
         validate_args(args, args_defaults)
 
-    set_args(args)
+    global_vars._ensure_var_is_not_initialized(global_vars._GLOBAL_ARGS, 'args')
+    global_vars.set_args(args)
     # Model config construction can use experimental features. Enabling the
     # feature gate does not construct any runtime services.
     if args.enable_experimental:
