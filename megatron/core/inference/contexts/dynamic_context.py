@@ -46,7 +46,6 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -63,7 +62,6 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .mtp_context_mixin import MTPContextMixin
-from .mtp_metadata import MTPMetadata
 from .routing_metadata import RoutingMetadata
 
 # These callbacks are currently consumed only by the Dynamo frontend.
@@ -529,20 +527,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
-        # Reserve one extra attention-layer plane in the shared KV `memory_buffer` for the
-        # repeated MTP draft attention. Draft position i is aligned with main position i;
-        # lookahead blocks cover the positions beyond the main forward. `append_key_value_cache` and
-        # `key_value_cache` route to this slot on `mtp_metadata.forward_active`.
-        self.enable_mtp_kv_cache = self.should_enable_mtp_kv_cache(
-            model_config=model_config,
-            mtp_layer_type_list=inference_config.mtp_layer_type_list,
-            num_speculative_tokens=self.num_speculative_tokens,
-        )
-        if self.enable_mtp_kv_cache:
-            self.mtp_kv_layer_slot = self.num_attention_layers
-            self.num_attention_layers += 1
-        else:
-            self.mtp_kv_layer_slot = None
+        self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
 
         if self.num_attention_layers == 0:
             raise NotImplementedError(
@@ -787,20 +772,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             max_seqlen=self.max_sequence_length,
         )
 
-        # MTP draft-loop metadata. Inert unless `enable_mtp_kv_cache`; its buffers are reserved
-        # by `initialize_all_tensors` so no tensor is allocated during construction.
-        self.mtp_metadata = MTPMetadata(
-            enabled=self.enable_mtp_kv_cache,
-            max_requests=self.max_requests,
-            max_kv_block_count=self.max_kv_block_count,
-            block_size_tokens=self.block_size_tokens,
-            dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
-            # Matches the `mha_block_table` view in ContextGPUView.
-            block_table_dtype=torch.int32,
-            # Sizes the chunked-prefill boundary carry, which holds one main hidden state.
-            hidden_size=model_config.hidden_size,
-            hidden_dtype=self.params_dtype,
-        )
+        self._mtp_initialize_metadata()
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
         if self.moe_enable_routing_replay:
@@ -1640,25 +1612,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.config.prefix_caching_mamba_gb,
             )
 
-        # MTP speculative decoding: persistent buffer for decoder hidden states.
-        # Only needed for block-scope CUDA graphs, where the Python assignment in
-        # forward() runs only during graph capture. Using copy_() into a fixed
-        # buffer ensures every batch-size graph replay writes to the same GPU
-        # address. Sized to max_tokens; only [:actual_tokens] is valid each step.
-        if (
-            self.num_speculative_tokens > 0
-            and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
-        ):
-            self.mtp_decoder_hidden_states = torch.empty(
-                self.max_tokens,
-                1,
-                self.hidden_size,
-                device=torch.cuda.current_device(),
-                dtype=self.params_dtype,
-            )
-
-        # MTP draft-loop scratch: fixed-address buffers updated in place by every MTP forward.
-        self.mtp_metadata.allocate(device=torch.cuda.current_device())
+        self._mtp_allocate_buffers()
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -3234,27 +3188,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         overall_required_blocks = (
             finished + prefill_chunk_length + self.block_size_tokens - 1
         ) // self.block_size_tokens
-        # The draft loop runs in the SAME step as the prefill that completes a prompt, writing
-        # up to `num_speculative_tokens - 1` positions past the prompt's last. Conservatively
-        # reserve through the first verification's end too, before decode scheduling has run.
-        # Reserve it here, and only on the completing chunk: a mid-prompt chunked request is
-        # excluded from drafting, and `already_allocated_blocks` is token-derived, so reserving
-        # per chunk would re-reserve and leak the previous chunk's block.
-        #
-        # Kept out of `overall_required_blocks`, which means "blocks this prompt occupies" and
-        # also bounds the hash-match range, names the last token-bearing block, and drives the
-        # Mamba boundary store.
-        #
-        # Gated on `enable_mtp_kv_cache`, not just on `num_speculative_tokens`: a head that
-        # drafts without writing KV (per-depth, recurrent, multi-attention -- see
-        # `should_enable_mtp_kv_cache`) has nothing to write past the prompt, and the ordinary
-        # step-5 pause grants the block a step later as usual. Reserving there would pin one
-        # extra block per boundary-adjacent prompt for the request's whole lifetime.
-        speculative_reserve_blocks = 0
-        if self.enable_mtp_kv_cache and (finished + prefill_chunk_length >= len(req.prompt_tokens)):
-            last_block_offset = (finished + prefill_chunk_length - 1) % self.block_size_tokens
-            if last_block_offset >= self.block_size_tokens - 1 - self.num_speculative_tokens:
-                speculative_reserve_blocks = 1
+        speculative_reserve_blocks = self._mtp_prefill_reserve_blocks(req, prefill_chunk_length)
         # Fast path: skip all prefix matching when disabled.
         if not self.enable_prefix_caching:
             return PrefixMatch(
@@ -3274,50 +3208,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             req, already_allocated_blocks, overall_required_blocks
         )
 
-        # MTP draft KV: give up matched blocks we cannot inherit correctly. A block's FINAL draft
-        # slot consumes one token past the block, so it is not determined by the block's hash and
-        # the block is ref-counted, meaning it cannot be corrected in place. Keep a block only
-        # while the token its producer paired into that slot is the token we continue with;
-        # truncate at the first disagreement, since everything after it is unreachable anyway.
-        # This covers both the last matched block (whose successor is past the match, so the
-        # producer's choice rarely agrees) and a branch point mid-chain, where an earlier block
-        # was registered by a request that continued differently. A continuation chunk still
-        # holding a boundary carry gives up the WHOLE match instead: the carry is only consumable
-        # at `finished - 1`, and any skip (block granular) moves past it, orphaning that entry
-        # permanently. A request with a private suffix also declines later matches: it cannot
-        # inherit descendants without owning their canonical ancestors. Trim the list rather
-        # than the skip so the two stay consistent. Named `mtp_backed_off_blocks` because the Mamba
-        # branch below binds `backed_off_blocks` for an unrelated purpose.
-        mtp_backed_off_blocks = 0
-        if self.enable_mtp_kv_cache and matched_block_ids:
-            if (
-                self.mtp_metadata.chunk_boundary_req_id == req.request_id
-                or req.mtp_private_suffix_start is not None
-            ):
-                mtp_backed_off_blocks = len(matched_block_ids)
-                matched_block_ids = []
-            else:
-                keep = len(matched_block_ids)
-                for k, block_id in enumerate(matched_block_ids):
-                    # Matching starts at `already_allocated_blocks`, so k is an offset into the
-                    # match, not an absolute block index -- a continuation chunk's first matched
-                    # block is not the prompt's block 0.
-                    absolute_block = already_allocated_blocks + k
-                    next_token_idx = (absolute_block + 1) * self.block_size_tokens
-                    our_next = (
-                        int(req.prompt_tokens[next_token_idx])
-                        if next_token_idx < len(req.prompt_tokens)
-                        else -1
-                    )
-                    producer_next = int(self.kv_block_allocator.block_mtp_next_token[block_id])
-                    # -1 on either side means the slot holds no draft KV (the producer's
-                    # successor had not arrived) or that we have no successor to match it
-                    # against, so equality there is not agreement -- neither is inheritable.
-                    if producer_next < 0 or producer_next != our_next:
-                        keep = k
-                        break
-                mtp_backed_off_blocks = len(matched_block_ids) - keep
-                matched_block_ids = matched_block_ids[:keep]
+        matched_block_ids, mtp_backed_off_blocks = self._mtp_trim_prefix_match(
+            req, matched_block_ids, already_allocated_blocks
+        )
 
         num_matched = len(matched_block_ids)
 
@@ -4262,70 +4155,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         return evict_request_ids
 
-    @property
-    def _decode_kv_lookahead_tokens(self) -> int:
-        """Tokens to reserve beyond the committed prefix for the next step.
-
-        Verification writes D+1 tokens. With full acceptance, the following D draft
-        forwards write through offset 2D-1 relative to the next main input. Reserve
-        both before scheduling that main forward, so pausing precedes either write.
-        """
-        depth = self.num_speculative_tokens
-        return max(depth + 1, 2 * depth if self.enable_mtp_kv_cache else 0)
-
     def _next_decode_block_counts(self, request_slice: slice) -> Tensor:
         """Additional owned blocks required before the next verification/draft step."""
-        if not self.enable_mtp_kv_cache:
-            return (
-                (
-                    self.request_last_kv_block_offset[request_slice]
-                    >= self.block_size_tokens - 1 - self.num_speculative_tokens
-                )
-                & ~self._rows_with_spare_block(request_slice)
-            ).to(self.request_kv_block_counts.dtype)
-        committed_length = (
-            self.request_kv_length_offsets[request_slice]
-            + self.request_query_lengths[request_slice]
-        )
-        required = (
-            committed_length + self._decode_kv_lookahead_tokens + self.block_size_tokens - 1
-        ) // self.block_size_tokens
-        return (required - self.request_kv_block_counts[request_slice]).clamp(min=0)
-
-    def _allocate_mtp_decode_blocks(self, request_slice: slice) -> None:
-        """Grant budgeted lookahead without advancing the main write pointer."""
-        counts = self._next_decode_block_counts(request_slice)
-        total = int(counts.sum().item())
-        if total == 0:
-            return
-        block_ids = self.kv_block_allocator.allocate_memory_blocks(total)
-        assert block_ids is not None and block_ids.numel() == total
-        rows = torch.repeat_interleave(
-            torch.arange(request_slice.start, request_slice.stop), counts
-        )
-        within = torch.arange(total) - torch.repeat_interleave(counts.cumsum(0) - counts, counts)
-        columns = self.request_kv_block_counts[rows] + within
-        self.request_to_kv_block_ids[rows, columns] = block_ids
-        self.request_kv_block_counts[request_slice] += counts
-
-    def _mtp_map_next_decode_tokens(self, request_slice: slice) -> None:
-        """Map main inputs by position, leaving draft-only blocks as spare capacity."""
-        active_tokens = slice(0, self.active_token_count)
-        rows = self.token_to_request_idx[active_tokens].long()
-        columns = (self.token_to_pos_ids[active_tokens] // self.block_size_tokens).long()
-        self.token_to_block_idx[active_tokens] = self.request_to_kv_block_ids[rows, columns]
-        last_columns = (
-            self.request_kv_length_offsets[request_slice]
-            + self.request_query_lengths[request_slice]
-            - 1
-        ) // self.block_size_tokens
-        request_rows = torch.arange(request_slice.start, request_slice.stop)
-        self.request_last_kv_block_id[request_slice] = self.request_to_kv_block_ids[
-            request_rows, last_columns.long()
-        ]
-        self.request_has_spare_block[request_slice] = (
-            self.request_kv_block_counts[request_slice] > last_columns + 1
-        )
+        if self.enable_mtp_kv_cache:
+            return self._mtp_next_decode_block_counts(request_slice)
+        return (
+            (
+                self.request_last_kv_block_offset[request_slice]
+                >= self.block_size_tokens - 1 - self.num_speculative_tokens
+            )
+            & ~self._rows_with_spare_block(request_slice)
+        ).to(self.request_kv_block_counts.dtype)
 
     def _rows_with_spare_block(self, request_slice: slice) -> Tensor:
         """Rows that already own an empty block beyond the ones their tokens fill.
