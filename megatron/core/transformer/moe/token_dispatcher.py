@@ -1456,10 +1456,18 @@ class _DeepepManager(_DispatchManager):
             )
         else:
             if scope is not None and scope[1]:
-                raise RuntimeError(
-                    "moe_cached_recompute_dispatch: a MoE layer re-runs without its forward's"
-                    " dispatch bookkeeping (the forward ran outside the checkpoint?)"
-                )
+                # a re-run whose forward left no bookkeeping under this checkpoint key (a layer
+                # whose forward ran outside the checkpoint that re-runs it, or under another
+                # one): the full dispatch is still correct, only uncached -- say so once per layer
+                if not getattr(self, "_cached_recompute_fallback", False):
+                    self._cached_recompute_fallback = True
+                    logger.warning(
+                        "moe_cached_recompute_dispatch: a MoE layer re-runs without its forward's"
+                        " dispatch bookkeeping (manager %x, %d stashed); falling back to the full"
+                        " dispatch for this layer",
+                        id(self),
+                        cached_recompute.stashed_count(),
+                    )
             hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
                 fused_dispatch(
                     hidden_states,
@@ -1471,7 +1479,7 @@ class _DeepepManager(_DispatchManager):
                     allocate_on_comm_stream=allocate_on_comm_stream,
                 )
             )
-            if scope is not None:
+            if scope is not None and not scope[1]:
                 cached_recompute.stash(
                     scope[0],
                     self,
