@@ -258,7 +258,9 @@ class TextGenerationController(MTPControllerMixin):
                 )
             if language_model.config.multi_latent_attention:
                 # MLA constructs its own RoPE/YaRN, independently of the model's position type.
-                raise ValueError("MTP KV caching does not support MLA's rotary position embeddings.")
+                raise ValueError(
+                    "MTP KV caching does not support MLA's rotary position embeddings."
+                )
 
         # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
         # unique generation seed (avoids identical samples when the same prompt is
