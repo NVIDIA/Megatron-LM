@@ -29,6 +29,7 @@ spec:
     rm -f "${{HOME}}/.netrc"
     unset RO_API_TOKEN
     set -euo pipefail
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
     cd /opt/megatron-lm
     uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/kernel_leaderboard.py \
       --output "{assets_dir}/logs/kernel-leaderboard"

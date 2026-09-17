@@ -131,8 +131,8 @@ uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/ben
 `--tokens`, `--hidden-size`, and `--dtype` select another case configuration.
 Keep H100 and GB200 baselines separate. The GB200 recipe uses
 `CUDA_DEVICE_MAX_CONNECTIONS=32`, matching its replay bucket; H100 uses 1.
-Publishing historical baselines and enforcing calibrated changed-kernel budgets
-remain follow-up work after GPU validation.
+Historical baseline bundles are described below. Enforcing calibrated
+changed-kernel budgets remains separate from publishing measurements.
 
 ## Join author checks and phase timings
 
@@ -176,8 +176,59 @@ The CLI writes JSON and Markdown plus hashes of its input artifacts before
 returning. Exit 0 means complete, nonfailing evidence; exit 1 means a numerical or
 performance failure; exit 2 means missing/incompatible/uncertain evidence. Add
 `--require-performance-pass` to also return 2 for an unbudgeted bundle. Existing
-reports are not overwritten. Automatic transport of coverage artifacts between
-CI jobs and calibrated PR-wide enforcement still need the combined GPU workflow.
+reports are not overwritten. Combining compatible coverage/performance CI jobs
+and calibrated PR-wide enforcement still needs the combined GPU workflow.
+
+## Publish and verify a historical baseline
+
+The existing CI log uploader already includes the kernel leaderboard, separate
+benchmark reports, raw timing files and launcher logs. Download the coverage and
+performance artifacts from the same clean source revision and compatible runtime
+context. Keep one attempt per directory; do not combine retries or allocations.
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/baseline.py publish \
+  --coverage /tmp/coverage-logs/determinism-coverage.json \
+  --leaderboard /tmp/perf-logs/kernel-leaderboard/leaderboard.json \
+  --revision <full-source-revision> \
+  --origin <CI-run-or-execution-reference> \
+  --store /shared/determinism-baselines
+```
+
+Publication recomputes the author/timing join for every declared requirement and
+requires a matching forward and backward report. It checks every separate
+`benchmark.json` against the leaderboard and every raw `kernel.json` against its
+embedded measurements. All rows must share the source, measurement protocol and
+timing GPU. Missing files, duplicate attempts, extra rows, incomplete evidence
+and failed numerical or performance checks prevent publication. No missing phase
+is filled from a nearby configuration or a different run.
+
+The store must be outside the downloaded artifact directory. Each baseline lives
+under the SHA-256 of its `baseline.json` manifest. It contains the original
+coverage aggregate, full performance reports, raw timing files and logs, with
+relative file names, sizes and hashes. Original runner paths inside reports are
+retained as provenance; verification does not require those paths to exist.
+The manifest also retains the recomputed author evidence. Identical publication
+reuses a verified bundle; existing baselines are never refreshed in place.
+
+After copying or archiving a bundle, verify it against the saved identifier:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/baseline.py verify \
+  /downloaded/baseline --expected-id <saved-manifest-sha256>
+```
+
+Verification checks the complete file inventory and recomputes the numerical
+evidence/timing join again. Hashes check integrity, not execution authenticity;
+the origin is supplied by the publisher and should reference the actual CI run.
+The coverage aggregate retains observations and checks; this tool does not
+reconstruct it from pytest shards or independently rerun GPU comparisons.
+
+Unbudgeted bundles remain `not_gated`. Publication never assigns limits, promotes
+historical timings into a performance pass, or makes cross-allocation timings
+equivalent to paired base/head measurements. H100 and GB200 remain separate
+contexts. Retain the content-addressed store in durable storage; the ordinary CI
+log artifact's retention period alone does not provide permanent publication.
 
 CPU contract tests use explicitly synthetic GPU metadata and timings. They do
 not establish hardware latency, correctness, replay coverage or usable budgets.
