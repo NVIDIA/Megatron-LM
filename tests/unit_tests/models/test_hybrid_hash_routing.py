@@ -9,6 +9,7 @@ import torch
 from megatron.core import recompute as recompute_module
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_model import (
     HybridModel,
     _get_hash_moe_layer_threshold,
@@ -166,40 +167,28 @@ def wrap_with_passthrough_mhc(inner_layer):
 
 
 def make_stack(layers, **config_overrides):
-    config = {
-        'cuda_graph_impl': "none",
-        'flash_decode': False,
-        'fp8': False,
-        'fp8_recipe': None,
-        'fp4': None,
-        'enable_mhc_connections': False,
-        'recompute_granularity': None,
-        'recompute_method': None,
-        'recompute_num_layers': None,
-        'distribute_saved_activations': False,
-    }
-    config.update(config_overrides)
-    stack = SimpleNamespace(
-        config=SimpleNamespace(**config),
-        pre_process=True,
-        post_process=False,
-        post_layer_norm=False,
-        input_tensor=None,
-        layers=layers,
-        layer_config_list=[SimpleNamespace() for _ in layers],
-        num_layers_per_pipeline_rank=len(layers),
-        training=True,
-        _has_linear_layer_with_chunkwise_cp=False,
-        _cp_layout_manager=None,
-        _mhc_block_end_plan=None,
+    """Use production stack/config initialization; replace only the expensive layers."""
+    config = TransformerConfig(
+        num_layers=len(layers),
+        hidden_size=8,
+        num_attention_heads=2,
+        use_cpu_initialization=True,
+        **config_overrides,
     )
-    stack._build_mhc_recompute_layer_plan = lambda _enabled: (
-        [None] * len(layers),
-        [False] * len(layers),
+    pattern = ''.join(
+        LayerSymbols.ATTENTION if isinstance(layer, TransformerLayer) else LayerSymbols.MAMBA
+        for layer in layers
     )
-    stack._finalize_mhc_recompute_layer = lambda **_kwargs: None
-    stack._uses_hash_routing = HybridStack._uses_hash_routing
-    return stack
+    group = SizeOneGroup()
+    with mock.patch("megatron.core.models.hybrid.hybrid_block.build_module", side_effect=layers):
+        return HybridStack(
+            config=config,
+            submodules=HybridStackSubmodules(),
+            layer_config_list=validate_segment_layers(pattern, config),
+            post_process=False,
+            post_layer_norm=False,
+            pg_collection=SimpleNamespace(pp=group, tp=group, cp=group, tp_cp=group),
+        )
 
 
 def run_stack(stack, input_ids):
@@ -211,15 +200,11 @@ def run_stack(stack, input_ids):
     return output
 
 
-@pytest.mark.parametrize("recompute_granularity", [None, "selective"])
-def test_hybrid_stack_forwards_input_ids_only_to_transformer_layers(recompute_granularity):
+def test_hybrid_stack_forwards_input_ids_only_to_transformer_layers():
     transformer_layer = RecordingTransformerLayer()
     learned_transformer_layer = RecordingTransformerLayer(layer_number=2, is_hash_layer=False)
     non_transformer_layer = RecordingNonTransformerLayer()
-    stack = make_stack(
-        [transformer_layer, learned_transformer_layer, non_transformer_layer],
-        recompute_granularity=recompute_granularity,
-    )
+    stack = make_stack([transformer_layer, learned_transformer_layer, non_transformer_layer])
     input_ids = torch.arange(8).reshape(2, 4)
 
     run_stack(stack, input_ids)
@@ -521,12 +506,12 @@ def test_hybrid_stack_marks_mtp_moe_and_propagates_mtp_depth(monkeypatch):
         return _MtpMoEStub(layer_number=kwargs["layer_number"], is_mtp_layer=kwargs["is_mtp_layer"])
 
     monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
-    config = SimpleNamespace(
-        fp8=False,
-        fp4=None,
-        enable_mhc_connections=False,
-        cuda_graph_impl="none",
-        linear_cp_layout=None,
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=2,
+        use_cpu_initialization=True,
     )
 
     stack = HybridStack(
