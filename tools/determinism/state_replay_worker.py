@@ -19,7 +19,6 @@ import random
 import subprocess
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -115,14 +114,11 @@ def _initialize(backend: str, world_size: int):
         )
         return model, device
 
-    # Compatible with the existing training adapter and the shared MCore
-    # startup API. Apply before this worker initializes CUDA or a communicator.
+    # Configure before importing training/Core, which can initialize CUDA.
     os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
-    from megatron.training.determinism import apply_determinism_to_args
+    from megatron.determinism import configure_determinism
 
-    apply_determinism_to_args(
-        SimpleNamespace(cross_entropy_loss_fusion=False, tp_comm_overlap=False)
-    )
+    configure_determinism({"deterministic_mode": True})
     from megatron.core import parallel_state
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.models.gpt.gpt_model import GPTModel

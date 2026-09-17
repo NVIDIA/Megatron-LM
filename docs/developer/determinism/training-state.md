@@ -35,6 +35,12 @@ saves a checkpoint at step 2, and performs four separate process launches:
 3. A new process that loads the reference checkpoint and executes steps 3–4.
 4. A resume that omits RNG restore, which must produce an observed mismatch.
 
+Both GPU adapters require the early `megatron.determinism` API from
+[MCore #7419](https://github.com/NVIDIA/Megatron-LM/pull/7419). Each worker configures
+the shared policy before importing training or Core, whose optional GPU backends
+can initialize CUDA during import. The training entrypoint validates the resolved
+recipe again. The CPU harness does not require the GPU startup package.
+
 For `cpu` and `mcore_gpt`, `--control optimizer`, `--control scheduler` and
 `--control dataloader` select other deliberately omitted restores. The real
 `megatron_gpt` training adapter currently supports the RNG control, using the

@@ -19,7 +19,6 @@ import runpy
 import sys
 from contextlib import ExitStack
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -362,14 +361,9 @@ class TrainingCapture:
 def run_worker(args: argparse.Namespace) -> None:
     """Run pretrain_gpt with diagnostic hooks and retain its real artifacts."""
     os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
-    from megatron.training.determinism import apply_determinism_to_args
+    from megatron.determinism import configure_determinism
 
-    apply_determinism_to_args(
-        SimpleNamespace(cross_entropy_loss_fusion=False, tp_comm_overlap=False)
-    )
-    torch.use_deterministic_algorithms(True, warn_only=False)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    configure_determinism({"deterministic_mode": True})
     from megatron.core.datasets.gpt_dataset import MockGPTLowLevelDataset
     from megatron.training import checkpointing, training
 
