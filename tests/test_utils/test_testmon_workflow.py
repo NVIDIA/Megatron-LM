@@ -160,14 +160,36 @@ def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> N
     assert (result.returncode == 0) == (source_ref == "refs/heads/main")
 
 
-@pytest.mark.parametrize("force_label", [False, True])
-def test_synthetic_pr_force_label_overrides_selective_testing(
-    tmp_path: Path, shell_environment: dict[str, str], force_label: bool
+@pytest.mark.parametrize(
+    "source_ref,event,labels,expected_mode",
+    [
+        ("refs/heads/pull-request/6934", "push", [], "full"),
+        ("refs/heads/pull-request/6934", "push", ["Run selective unit tests"], "enforce"),
+        (
+            "refs/heads/pull-request/6934",
+            "push",
+            ["Run selective unit tests", "force-run-all"],
+            "full",
+        ),
+        ("refs/heads/pull-request/7454", "push", [], "baseline"),
+        ("refs/heads/pull-request/7454", "push", ["Run selective unit tests"], "baseline"),
+        ("refs/heads/pull-request/7454", "push", ["force-run-all"], "baseline"),
+        ("refs/heads/pull-request/7454", "workflow_dispatch", [], "full"),
+        ("refs/heads/gh-readonly-queue/main/pr-7454-example", "merge_group", [], "full"),
+        ("refs/heads/main", "schedule", [], "full"),
+    ],
+)
+def test_testmon_mode_only_forces_baseline_for_pr_7454(
+    tmp_path: Path,
+    shell_environment: dict[str, str],
+    source_ref: str,
+    event: str,
+    labels: list[str],
+    expected_mode: str,
 ) -> None:
     gh = tmp_path / "bin/gh"
     gh.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_PR_LABELS"\n')
     gh.chmod(0o755)
-    labels = ["Run selective unit tests"] + (["force-run-all"] if force_label else [])
     script = _step("cicd-main.yml", "configure", "configure")["run"]
     script = script.replace(
         "${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}", "6934"
@@ -180,11 +202,11 @@ def test_synthetic_pr_force_label_overrides_selective_testing(
             **shell_environment,
             "TEST_PR_LABELS": json.dumps(labels),
             "IS_CI_WORKLOAD": "false",
-            "IS_MERGE_GROUP": "false",
-            "EVENT_NAME": "push",
-            "REF": "refs/heads/pull-request/6934",
+            "IS_MERGE_GROUP": str(event == "merge_group").lower(),
+            "EVENT_NAME": event,
+            "REF": source_ref,
             "FORCE_RUN_ALL": "false",
         },
     )
     assert result.returncode == 0, result.stderr
-    assert outputs["unit_testmon_eligible"] == ("false" if force_label else "true")
+    assert outputs["unit_testmon_mode"] == expected_mode
