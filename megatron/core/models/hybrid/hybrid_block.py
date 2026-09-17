@@ -609,7 +609,7 @@ class HybridStack(MegatronModule):
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                                 physical_layer_idx, hidden_states
                             )
-                        # Compare residuals in the layer's layout, before any CP conversion.
+                        # Keep both residuals in the layer's layout, inside the CP conversions.
                         residual_accumulator = hidden_states
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(

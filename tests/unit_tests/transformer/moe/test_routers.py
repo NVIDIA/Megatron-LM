@@ -114,13 +114,16 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("aux_loss_fusion", [False, True])
     def test_router_forward_observes_compact_diagnostics_when_aux_loss_is_disabled(
-        self, monkeypatch
+        self, monkeypatch, aux_loss_fusion
     ):
         self.router = self.router.cuda()
         # A complete sequence may still be marked sequence-parallel when TP has only one rank.
         # The compact diagnostics have batch as dimension zero and therefore remain replicated.
         self.router.config.sequence_parallel = True
+        self.router.config.moe_router_fusion = False
+        self.router.config.moe_router_aux_loss_fusion = aux_loss_fusion
         self.router.tp_group = _ProcessGroup(1)
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
         observed = []
@@ -129,6 +132,9 @@ class TestTop2Router:
 
         def record_score_grad_mode(*args, **kwargs):
             score_grad_modes.append(torch.is_grad_enabled())
+            assert kwargs["fused"] is aux_loss_fusion
+            # Check flag selection independently of whether TE's fused kernel is installed.
+            kwargs["fused"] = False
             return compute_scores(*args, **kwargs)
 
         monkeypatch.setattr(

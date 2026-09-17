@@ -87,7 +87,7 @@ def checkpointed_forward(
                     hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                         index, hidden_states
                     )
-                # Compare residuals in the layer's layout, before any CP conversion.
+                # Keep both residuals in the layer's layout, inside the CP conversions.
                 residual_accumulator = hidden_states
 
                 # Get appropriate inner quantization context

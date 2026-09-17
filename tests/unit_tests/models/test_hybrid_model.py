@@ -356,11 +356,45 @@ class TestHybridModel:
         assert self.model.decoder.input_tensor.shape[1] == micro_batch_size
         assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
 
-    def test_forward(self):
+    @pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
+    @pytest.mark.parametrize("convert_cp_layout", [False, True])
+    def test_forward(self, monkeypatch, recompute_method, convert_cp_layout):
         sequence_length = self.model.max_sequence_length
         micro_batch_size = 2
 
         self.model.cuda()
+        decoder = self.model.decoder
+        if recompute_method is not None:
+            decoder.config.recompute_granularity = "full"
+            decoder.config.recompute_method = recompute_method
+            decoder.config.recompute_num_layers = 2
+        if convert_cp_layout:
+            # Exercise both layout boundaries without requiring a multi-rank CP group.
+            layout_state = SimpleNamespace(
+                prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
+                finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
+            )
+            monkeypatch.setattr(
+                decoder,
+                "_cp_layout_manager",
+                SimpleNamespace(build_forward_state=lambda *args, **kwargs: layout_state),
+            )
+
+        expected_residuals = {}
+
+        def record_layer_residuals(layer, args, kwargs, output):
+            accumulator = kwargs["hidden_states"].detach().clone()
+            output = output[0] if isinstance(output, tuple) else output
+            # Keep the original forward values; backward recomputation must not be observed.
+            expected_residuals.setdefault((layer, "residual_accumulator"), accumulator)
+            expected_residuals.setdefault(
+                (layer, "residual_contribution"), output.detach() - accumulator
+            )
+
+        hooks = [
+            layer.register_forward_hook(record_layer_residuals, with_kwargs=True)
+            for layer in decoder.layers
+        ]
 
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
@@ -377,6 +411,10 @@ class TestHybridModel:
             logits = self.model.forward(
                 input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
             )
+            logits.sum().backward()
+
+        for hook in hooks:
+            hook.remove()
 
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
@@ -388,6 +426,8 @@ class TestHybridModel:
         assert observed[-1][0] is self.model.output_layer
         assert observed[-1][4:] == (-1, 0, 1)
         torch.testing.assert_close(observed[-1][3].transpose(0, 1), logits)
+        for owner, _, kind, tensor, *_ in observed[:-1]:
+            torch.testing.assert_close(tensor, expected_residuals[(owner, kind)])
 
     def test_forward_packed_sequence(self):
         os.environ.pop('NVTE_FUSED_ATTN', None)
