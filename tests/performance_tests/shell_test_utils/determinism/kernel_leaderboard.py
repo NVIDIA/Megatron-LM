@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import statistics
 from pathlib import Path
@@ -20,8 +21,8 @@ def markdown_report(reports: list[dict]) -> str:
         "CUDA-event operator latency; forward and backward are timed separately.",
         "Report only until hardware-specific budgets are calibrated. Replay/correctness is separate.",
         "",
-        "| Case | Phase | Default us | Deterministic us | Det/default | 95% interval | Status |",
-        "| --- | --- | ---: | ---: | ---: | --- | --- |",
+        "| Case | Dtype | Phase | Default us | Deterministic us | Det/default | 95% interval | Status |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- | --- |",
     ]
     ordered = sorted(
         reports,
@@ -48,7 +49,8 @@ def markdown_report(reports: list[dict]) -> str:
             else "n/a"
         )
         lines.append(
-            f"| {measurement['kernel_case']} | {measurement['phase']} | {values[0]} | {values[1]} | "
+            f"| {measurement['kernel_case']} | {measurement['dtype']} | {measurement['phase']} | "
+            f"{values[0]} | {values[1]} | "
             f"{ratio} | {interval} | {report['status']} |"
         )
     return "\n".join(lines) + "\n"
@@ -69,8 +71,8 @@ def main(argv: list[str] | None = None) -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     reports, codes = [], []
     for case in ("bias_swiglu", "weighted_swiglu", "weighted_squared_relu"):
-        for phase in ("forward", "backward"):
-            output = args.output / f"{case}-{phase}"
+        for dtype, phase in itertools.product(("bfloat16", "float32"), ("forward", "backward")):
+            output = args.output / f"{case}-{dtype}-{phase}"
             codes.append(
                 benchmark.main(
                     [
@@ -80,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
                         case,
                         "--phase",
                         phase,
+                        "--dtype",
+                        dtype,
                         "--gpus",
                         "1",
                         "--pairs",

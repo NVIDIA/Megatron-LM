@@ -84,8 +84,9 @@ budgets require runtime validation before treating their reports as baselines.
 
 The operator pilot covers `bias_swiglu`, `weighted_swiglu`, and
 `weighted_squared_relu` from the production fusion modules. It produces six
-rows: separate forward and backward measurements for each case. The initial
-shape is 4096 tokens, hidden size 8192, BF16 activations and FP32 token weights.
+rows per precision: separate forward and backward measurements for each case.
+BF16 and FP32 activations produce twelve rows in total, with 4096 tokens,
+hidden size 8192 and FP32 token weights.
 This small selection is not a leaderboard of every registered kernel.
 
 ```bash
@@ -105,7 +106,12 @@ excluded; backward also excludes forward/graph construction and upstream-gradien
 allocation. `autograd.grad` avoids accumulating leaf gradients. The interval can
 include launch gaps; it is operator latency, not a sum of individual device-kernel
 durations. The report records input shapes/strides/dtypes, CUDA/driver/GPU/package
-versions, source revisions and the uninitialized-memory-fill setting.
+versions, source revisions and the uninitialized-memory-fill setting. The shared
+`kernel_case.py` adapter generates native-dtype inputs with seed 1234 for both
+timing and author replay; backward uses an all-ones upstream gradient in both.
+SHA-256 fingerprints include every input's exact bytes, shape, stride, dtype
+and gradient requirement, retaining positional `None` arguments. Input hashing
+and context capture happen before timing. UUIDs identify the actual timing GPU.
 
 Kernel comparisons default to **report only** (`reported`, exit 0), with no
 performance pass claim. Missing/invalid timings fail; insufficient pairs, dirty
@@ -123,10 +129,58 @@ uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/ben
 ```
 
 `--tokens`, `--hidden-size`, and `--dtype` select another case configuration.
-Keep H100 and GB200 baselines separate. Pair timing results with scoped replay
-and independent-reference correctness evidence; a fast kernel can still be wrong.
-Publishing historical baselines and enforcing changed-kernel budgets remain
-follow-up work after GPU calibration.
+Keep H100 and GB200 baselines separate. The GB200 recipe uses
+`CUDA_DEVICE_MAX_CONNECTIONS=32`, matching its replay bucket; H100 uses 1.
+Publishing historical baselines and enforcing calibrated changed-kernel budgets
+remain follow-up work after GPU validation.
+
+## Join author checks and phase timings
+
+Run the coverage producer and performance driver from the **same clean source
+revision**, containing both features. Reports from separate PR heads cannot be
+joined. The shared adapter records its own source hash, input fingerprints,
+strict Torch policy (including warn-only and memory-fill settings), autocast/TF32/
+cuDNN settings, CUDA/driver/GPU details, package versions and environment overrides.
+Default and deterministic timing arms must differ only in the declared policy;
+old reports lacking this contract remain ineligible for author evidence.
+
+After collecting the coverage report and the twelve-row leaderboard:
+
+```bash
+uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/author_evidence.py \
+  --coverage /tmp/replay/coverage.json \
+  --performance /tmp/kernel-leaderboard/leaderboard.json \
+  --revision "$(git rev-parse HEAD)" \
+  --output /tmp/author-evidence.json
+```
+
+Repeat `--performance` to supply separate `benchmark.json` files. Use one attempt
+and one hardware/configuration context per bundle. The join retains every
+manifest-required case, requires passing reference/sensitivity/replay evidence
+on every replay rank, and requires one matching forward and one backward report.
+It rejects duplicates instead of selecting a favorable retry. Raw samples,
+medians and paired comparisons are checked again, and every arm of a phase must
+use the same GPU UUID. Local activation replay may be replicated across multiple
+ranks while timing uses one GPU; this adapter contains no collectives and makes
+no inference about distributed performance. Other operators need explicit adapters.
+
+`evidence_complete` and performance status answer different questions. Complete
+head-only or unbudgeted timings are `not_gated`, even if det/default overhead met
+a configured limit. A performance pass also requires a common base revision for
+both phases, complete base/head arms, and passing explicit overhead and revision
+limits. This catches slowdowns shared by default and deterministic modes. The
+limits still need independently reviewed calibration; their presence is not proof
+that the budgets were calibrated.
+
+The CLI writes JSON and Markdown plus hashes of its input artifacts before
+returning. Exit 0 means complete, nonfailing evidence; exit 1 means a numerical or
+performance failure; exit 2 means missing/incompatible/uncertain evidence. Add
+`--require-performance-pass` to also return 2 for an unbudgeted bundle. Existing
+reports are not overwritten. Automatic transport of coverage artifacts between
+CI jobs and calibrated PR-wide enforcement still need the combined GPU workflow.
+
+CPU contract tests use explicitly synthetic GPU metadata and timings. They do
+not establish hardware latency, correctness, replay coverage or usable budgets.
 
 CPU tests:
 

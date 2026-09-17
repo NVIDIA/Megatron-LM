@@ -14,6 +14,12 @@ from pathlib import Path
 def read_result(path: Path, measurement: dict, mode: str) -> dict:
     """Reject partial, nonfinite, or differently configured timing results."""
     result = json.loads(path.read_text())
+    validate_result(result, measurement, mode)
+    return result
+
+
+def validate_result(result: dict, measurement: dict, mode: str) -> None:
+    """Apply the same timing contract to embedded and separately saved results."""
     keys = ("kernel_case", "phase", "tokens", "hidden_size", "dtype", "warmup", "steps")
     if (
         not isinstance(result, dict)
@@ -32,38 +38,6 @@ def read_result(path: Path, measurement: dict, mode: str) -> dict:
         )
     ):
         raise ValueError("Kernel timings must contain every requested finite, positive sample")
-    return result
-
-
-def make_case(torch, name: str, tokens: int, hidden: int, dtype):
-    """Create fixed inputs and the production operator; imports follow mode setup."""
-    if name in ("bias_swiglu", "weighted_swiglu"):
-        from megatron.core.fusions.fused_bias_swiglu import (
-            bias_swiglu_impl,
-            weighted_bias_swiglu_impl,
-        )
-
-        x = torch.randn(tokens, 2 * hidden, device="cuda", dtype=dtype, requires_grad=True)
-        if name == "bias_swiglu":
-            bias = torch.randn(2 * hidden, device="cuda", dtype=dtype, requires_grad=True)
-            return lambda: bias_swiglu_impl(x, bias), (x, bias), "fused_bias_swiglu"
-        weights = torch.rand(tokens, 1, device="cuda", dtype=torch.float32, requires_grad=True)
-        return (
-            lambda: weighted_bias_swiglu_impl(x, None, weights),
-            (x, weights),
-            "fused_bias_swiglu",
-        )
-    if name == "weighted_squared_relu":
-        from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-
-        x = torch.randn(tokens, hidden, device="cuda", dtype=dtype, requires_grad=True)
-        weights = torch.rand(tokens, 1, device="cuda", dtype=torch.float32, requires_grad=True)
-        return (
-            lambda: weighted_squared_relu_impl(x, weights),
-            (x, weights),
-            "fused_weighted_squared_relu",
-        )
-    raise ValueError(f"Unknown kernel case: {name}")
 
 
 def measure(torch, forward, inputs, phase: str, warmup: int, steps: int) -> list[float]:
@@ -76,7 +50,7 @@ def measure(torch, forward, inputs, phase: str, warmup: int, steps: int) -> list
     """
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     samples = []
-    gradient = torch.randn_like(forward()) if phase == "backward" else None
+    gradient = torch.ones_like(forward()) if phase == "backward" else None
     for index in range(warmup + steps):
         output = forward() if phase == "backward" else None
         torch.cuda.synchronize()
@@ -117,30 +91,43 @@ def main(argv: list[str] | None = None) -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("Kernel timing requires a CUDA GPU")
     torch.cuda.set_device(0)
-    torch.use_deterministic_algorithms(mode == "det", warn_only=False)
-    torch.backends.cudnn.benchmark = False
-    torch.manual_seed(1234)
-    forward, inputs, op_id = make_case(
-        torch, args.kernel_case, args.tokens, args.hidden_size, getattr(torch, args.dtype)
-    )
-    result = {
-        "measurement": vars(args),
-        "mode": mode,
-        "op_id": op_id,
-        "implementation": "torch.compile:" + args.kernel_case,
-        "inputs": [
-            {"shape": list(value.shape), "stride": list(value.stride()), "dtype": str(value.dtype)}
-            for value in inputs
-        ],
-        "device": torch.cuda.get_device_name(0),
-        "capability": list(torch.cuda.get_device_capability(0)),
-        "cuda": torch.version.cuda,
-        "torch": torch.__version__,
-        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
-        "fill_uninitialized_memory": torch.utils.deterministic.fill_uninitialized_memory,
-        "seed": 1234,
-        "samples_ms": measure(torch, forward, inputs, args.phase, args.warmup, args.steps),
-    }
+    from kernel_case import case_signature, kernel_policy, make_case
+
+    with kernel_policy(torch, mode == "det"):
+        function, arguments, op_id = make_case(
+            torch, args.kernel_case, args.tokens, args.hidden_size, getattr(torch, args.dtype)
+        )
+        inputs = tuple(
+            value for value in arguments if isinstance(value, torch.Tensor) and value.requires_grad
+        )
+        signature = case_signature(torch, args.kernel_case, arguments)
+        device_uuid = getattr(torch.cuda.get_device_properties(0), "uuid", None)
+        result = {
+            "measurement": vars(args),
+            "mode": mode,
+            "op_id": op_id,
+            "implementation": "torch.compile:" + args.kernel_case,
+            "inputs": [
+                {
+                    "shape": list(value.shape),
+                    "stride": list(value.stride()),
+                    "dtype": str(value.dtype),
+                }
+                for value in inputs
+            ],
+            "case_signature": signature,
+            "device_uuid": str(device_uuid) if device_uuid else None,
+            "device": torch.cuda.get_device_name(0),
+            "capability": list(torch.cuda.get_device_capability(0)),
+            "cuda": torch.version.cuda,
+            "torch": torch.__version__,
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "fill_uninitialized_memory": torch.utils.deterministic.fill_uninitialized_memory,
+            "seed": signature["input_seed"],
+            "samples_ms": measure(
+                torch, lambda: function(*arguments), inputs, args.phase, args.warmup, args.steps
+            ),
+        }
     path = Path(os.environ["DETERMINISM_PERF_LOG_DIR"]) / "kernel.json"
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")

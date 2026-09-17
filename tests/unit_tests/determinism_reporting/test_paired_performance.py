@@ -246,7 +246,7 @@ def test_kernel_phase_timing_excludes_setup_and_warmup(phase):
 
     torch = SimpleNamespace(
         cuda=SimpleNamespace(Event=Event, synchronize=lambda: calls.append("setup_sync")),
-        randn_like=lambda output: "gradient",
+        ones_like=lambda output: "gradient",
         autograd=SimpleNamespace(grad=backward),
     )
     assert kernel.measure(torch, forward, ("input",), phase, warmup=2, steps=3) == [3, 4, 5]
@@ -356,7 +356,11 @@ def test_leaderboard_keeps_failed_rows_and_runs_remaining_cases(tmp_path, monkey
         output = Path(options["--output"])
         output.mkdir()
         report = {
-            "measurement": {"kernel_case": options["--kernel-case"], "phase": options["--phase"]},
+            "measurement": {
+                "kernel_case": options["--kernel-case"],
+                "phase": options["--phase"],
+                "dtype": options["--dtype"],
+            },
             "status": "error" if len(calls) == 1 else "reported",
             "runs": [],
         }
@@ -366,8 +370,8 @@ def test_leaderboard_keeps_failed_rows_and_runs_remaining_cases(tmp_path, monkey
     monkeypatch.setattr(benchmark, "main", run)
     output = tmp_path / "leaderboard"
     assert leaderboard.main(["--output", str(output)]) == 1
-    assert len(calls) == 6
-    assert len(json.loads((output / "leaderboard.json").read_text())) == 6
+    assert len(calls) == 12
+    assert len(json.loads((output / "leaderboard.json").read_text())) == 12
     text = (output / "leaderboard.md").read_text()
     assert "error" in text and "weighted_squared_relu" in text
     with pytest.raises(SystemExit):
