@@ -4047,6 +4047,8 @@ def save_checkpoint_and_time(
         tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
         pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
         dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+        # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
+        dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
         # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
         dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
         expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
@@ -4058,7 +4060,8 @@ def save_checkpoint_and_time(
 
         if should_report_memory:
             # Track memory before checkpoint save.
-            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
+            # Gate on the full data-distribution group so gtp_remat peers do not each report.
+            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
 
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
@@ -4076,6 +4079,7 @@ def save_checkpoint_and_time(
                 pp_group=pp_group,
                 dp_cp_group=dp_cp_group,
                 dp_group=dp_group,
+                dp_gtp_remat_group=dp_gtp_remat_group,
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
             )
@@ -4087,7 +4091,7 @@ def save_checkpoint_and_time(
         if should_report_memory:
             # Track memory after checkpoint save.
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True):
-                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
+                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
 
         if args.fp8:
