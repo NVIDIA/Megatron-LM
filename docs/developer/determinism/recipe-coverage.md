@@ -72,6 +72,11 @@ and cuDNN settings are part of that match. Triton cache policy/directory and all
 including changes made after capture starts. Older evidence without these fields
 does not match a new capture. A cache directory is provenance, not proof that
 cache contents or selected configurations are unchanged.
+New captures retain source/environment context before and after training. A
+changed revision, dirty-tree status, or recorded environment prevents completion
+and leaves the inventory unverified. The consumer independently rejects recorded
+context drift, even if a capture claims completion. These boundary checks do not
+detect a change that is reverted before the final check.
 A passing signature must have matching
 protocol evidence from every required rank. A passing forward+backward replay can supply
 forward evidence. A backward mismatch is not projected into a forward failure.

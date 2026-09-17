@@ -270,6 +270,9 @@ def main(argv: list[str] | None = None) -> int:
             except SystemExit as error:
                 if error.code not in (None, 0):
                     raise
+            report["context_after"] = source_context(torch)
+            if report["context_after"] != report["context"]:
+                raise RuntimeError("Source or environment context changed during recipe capture")
             report["complete"] = True
     finally:
         sys.argv = previous_argv
