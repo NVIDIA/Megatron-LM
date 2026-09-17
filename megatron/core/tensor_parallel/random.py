@@ -26,7 +26,11 @@ from megatron.core.parallel_state import (
     get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
-from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
+from megatron.core.utils import (
+    is_te_min_version,
+    is_torch_min_version,
+    safely_set_viewless_tensor_data,
+)
 
 # ---------------------------------------------------------------------------
 # C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
@@ -441,6 +445,18 @@ def get_all_rng_states():
     # no valid tracker, return an empty dict
     else:
         return {}
+
+
+def cudagraph_needs_generator_registration() -> bool:
+    """Whether generators must be registered with a `torch.cuda.CUDAGraph` before capture.
+
+    PyTorch >= 2.14 (pytorch/pytorch#176753) lazily registers every generator whose Philox
+    state is consumed during capture, and `CUDAGraph.register_generator_state()` became a
+    deprecated no-op that prints a warning on *every* call. Skip the explicit registration
+    there: it does nothing, and with one call per layer, per graph and per generator it floods
+    stderr (tens of thousands of lines per rank for dynamic inference with CUDA graphs).
+    """
+    return not is_torch_min_version("2.14.0a0")
 
 
 def model_parallel_cuda_manual_seed(
