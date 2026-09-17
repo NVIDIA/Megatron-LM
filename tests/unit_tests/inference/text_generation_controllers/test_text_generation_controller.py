@@ -297,11 +297,13 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         max_tokens=32,
         request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
         kv_block_allocator=SimpleNamespace(enable_handoff_pinning=False),
-        # No reserved speculative block by default; the handoff collector reads this to decide
-        # whether the row's final block is prompt KV or draft-only.
-        request_has_spare_block=torch.zeros(metadata_len, dtype=torch.bool),
+        block_size_tokens=2,
+        request_kv_length_offsets=torch.full((metadata_len,), 2, dtype=torch.int32),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    context.get_committed_kv_block_counts = lambda rows: (
+        DynamicInferenceContext.get_committed_kv_block_counts(context, rows)
+    )
     # Bind the real flags so the fake exercises the production no-op-filter gate.
     context.active_sampling_filter_flags = lambda count=None: (
         DynamicInferenceContext.active_sampling_filter_flags(context, count)
@@ -1111,47 +1113,39 @@ def test_finished_hybrid_handoff_detaches_live_ssm_slot():
     context.mamba_metadata.detach_state_slot.assert_called_once_with(1)
 
 
-def test_finished_handoff_drops_the_speculative_reserve_block():
-    """The reserve carries draft KV only, so it is not part of the prompt state handed off.
-
-    This runs before `update_requests`, so a row that just prefilled still holds its unentered
-    reserve in the final column. The decode side requires exactly `ceil(len(prompt)/block_size)`
-    blocks, so shipping the reserve both fails that check and pins the block until RELEASE_KV.
-    """
+@pytest.mark.parametrize(
+    "committed_blocks,reserve_blocks",
+    [(2, 0), (1, 1), (1, 2)],
+    ids=["no-reserve", "one-reserve", "two-reserves"],
+)
+def test_finished_handoff_keeps_only_committed_blocks(committed_blocks, reserve_blocks):
+    """Handoff pins the committed main KV span, excluding all draft-only lookahead."""
     context = _make_async_sched_context(total_request_count=2)
     context.kv_block_allocator = SimpleNamespace(
         enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
     )
-    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
-    context.request_has_spare_block = torch.tensor([False, True])
+    context.request_to_kv_block_ids = torch.tensor(
+        [
+            [10, 11, -1],
+            list(range(12, 12 + committed_blocks + reserve_blocks))
+            + [-1] * (3 - committed_blocks - reserve_blocks),
+        ],
+        dtype=torch.int32,
+    )
+    context.request_kv_length_offsets[1] = (committed_blocks - 1) * context.block_size_tokens
     controller = _make_async_sched_controller(context)
 
     blocks, _, _ = controller._collect_finished_handoff_state(
         torch.tensor([1]), torch.tensor([91, 92]), None
     )
 
-    assert blocks == {11: [12]}, "block 13 is the reserve and must not be handed off"
-    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([12])
+    expected = list(range(12, 12 + committed_blocks))
+    assert blocks == {11: expected}
+    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with(expected)
 
 
-def test_finished_handoff_keeps_every_block_without_a_reserve():
-    """Control: the trim must not fire on an ordinary row."""
-    context = _make_async_sched_context(total_request_count=2)
-    context.kv_block_allocator = SimpleNamespace(
-        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
-    )
-    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
-    controller = _make_async_sched_controller(context)
-
-    blocks, _, _ = controller._collect_finished_handoff_state(
-        torch.tensor([1]), torch.tensor([91, 92]), None
-    )
-
-    assert blocks == {11: [12, 13]}
-    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([12, 13])
-
-
-def test_finished_routing_blocks_drop_the_speculative_reserve():
+@pytest.mark.parametrize("reserve_blocks", [1, 2])
+def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
     """Routing reconstruction aborts on any block without stored routing.
 
     The main model never writes into the reserve, so it has no routing, and
@@ -1161,8 +1155,11 @@ def test_finished_routing_blocks_drop_the_speculative_reserve():
     """
     context = _make_async_sched_context(total_request_count=2)
     context.kv_block_allocator = SimpleNamespace(block_routing=True, enable_handoff_pinning=False)
-    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
-    context.request_has_spare_block = torch.tensor([False, True])
+    context.request_to_kv_block_ids = torch.tensor(
+        [[10, 11] + [-1] * (reserve_blocks - 1), list(range(12, 13 + reserve_blocks))],
+        dtype=torch.int32,
+    )
+    context.request_kv_length_offsets[1] = 0
     context.get_max_sequence_lengths.return_value = torch.tensor([3, 3])
     # No chunked request in flight, so no finished row is filtered back out.
     context.get_index_of_chunked_prefill_request = mock.Mock(return_value=-1)

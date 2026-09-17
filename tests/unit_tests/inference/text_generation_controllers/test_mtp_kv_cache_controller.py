@@ -861,29 +861,13 @@ class TestSerialMtpDraftLoop:
         args, _ = context._mtp_begin_decode.call_args
         assert args[0] == 2
 
-    def test_graphed_step_replays_the_kv_aware_graph_key(self):
-        """KV-aware graphs are captured under a distinct key from the cache-free ones."""
-        context = _make_context(num_decode_requests=2)
-        controller, model, context = _make_draft_loop_controller(
-            context, num_mtp_depths=2, graphed=True
-        )
-        context.using_cuda_graph_this_step = lambda: True
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        assert context._mtp_begin_decode.call_args.kwargs["graphed"] is True
-        for call in model.mtp_step_calls:
-            assert call["cache_key"] is not None
-            assert call["cache_key"][0] == "mtp_kv"
-        assert model.mtp_step_calls[-1]["eager"] is False
-
-    def test_cache_free_graph_key_when_the_kv_cache_is_off(self):
+    @pytest.mark.parametrize("repeated_head", [True, False], ids=["repeated", "per-depth"])
+    def test_cache_free_graph_keys_when_the_kv_cache_is_off(self, repeated_head):
         context = _make_context(num_decode_requests=2)
         controller, model, context = _make_draft_loop_controller(
             context, num_mtp_depths=2, graphed=True, mtp_kv_cache_on=False
         )
+        model.mtp.mtp_use_repeated_layer = repeated_head
         context.using_cuda_graph_this_step = lambda: True
 
         controller._compute_serial_mtp_and_sample(
@@ -891,8 +875,9 @@ class TestSerialMtpDraftLoop:
         )
 
         assert len(model.mtp_step_calls) == 2
-        for call in model.mtp_step_calls:
-            assert call["cache_key"][0] == "mtp"
+        for depth, call in enumerate(model.mtp_step_calls):
+            assert call["cache_key"] == ("mtp", 2, None if repeated_head else depth)
+            assert call["eager"] is False
             # The kwarg must be ABSENT, not None: the cache-free ("mtp", ...) graph is captured
             # without it and replay requires the exact captured kwarg set, so an explicit
             # `mtp_inference_context=None` fails with "argument mismatch: Unexpected kwargs".
@@ -934,28 +919,6 @@ class TestSerialMtpDraftLoop:
 
         assert seen == [[10, 12], [11, 13]]
 
-    def test_commit_pass_falls_back_to_a_dummy_slot(self):
-        """Every rank runs exactly one commit-pass forward per step, real or dummy."""
-        context = _make_context(num_decode_requests=2)
-        controller, _, context = _make_draft_loop_controller(context, num_mtp_depths=2)
-        controller._mtp_commit_pass = mock.Mock(return_value=False)
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        controller._mtp_dummy_prefill_forward.assert_called_once()
-
-    def test_no_dummy_slot_when_the_commit_pass_issued_a_forward(self):
-        context = _make_context(num_decode_requests=2)
-        controller, _, context = _make_draft_loop_controller(context, num_mtp_depths=2)
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        controller._mtp_dummy_prefill_forward.assert_not_called()
-
     def test_legacy_scheduling_derives_base_position_from_post_rewind_cpu_state(self):
         """With no `base_position` the loop reads the ADJUSTED offsets, not the GPU snapshot."""
         context = _make_context(num_decode_requests=2)
@@ -971,58 +934,33 @@ class TestSerialMtpDraftLoop:
         assert args[2].dtype == torch.int64, "CUDA graph capture expects int64 positions"
 
 
-def _captured_graph_keys(batch_sizes, num_mtp_depths, mtp_use_repeated_layer=True):
-    """Reproduce the key set `DynamicEngine` captures during MTP CUDA-graph warmup.
-
-    Mirrors `dynamic_engine.py`: for each graphed batch size `n` it captures the cache-free
-    family under `("mtp", n, depth)` and, when the MTP KV cache is on, the KV-aware family
-    under `("mtp_kv", n, depth)`. `depth` is `None` for a repeated layer (the only shape the
-    KV cache supports) and `0..D-1` otherwise.
-    """
-    depths = [None] if mtp_use_repeated_layer else list(range(num_mtp_depths))
-    return {
-        (prefix, n, depth) for prefix in ("mtp", "mtp_kv") for n in batch_sizes for depth in depths
-    }
-
-
 class TestMtpCudaGraphs:
-    """Capture/replay agreement for the KV-aware MTP graphs."""
+    """Graph-key selection and hidden-buffer ownership in the controller."""
 
-    def test_every_replayed_key_was_captured_at_warmup(self):
-        """A key the draft loop replays but warmup never captured is an illegal runtime capture."""
+    @pytest.mark.parametrize("padded_count", [2, 4, 8])
+    def test_kv_graph_keys_use_the_resolved_batch_size(self, padded_count):
+        """Use the EP-resolved bucket, including when it exceeds the live request count.
+
+        These are controller key-selection checks; engine tests exercise actual capture/replay.
+        """
         context = _make_context(num_decode_requests=2)
         controller, model, context = _make_draft_loop_controller(
             context, num_mtp_depths=2, active_request_count=2, graphed=True
         )
-        context.using_cuda_graph_this_step = lambda: True
-        captured = _captured_graph_keys(batch_sizes=[2], num_mtp_depths=2)
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        replayed = [call["cache_key"] for call in model.mtp_step_calls]
-        assert all(key is not None for key in replayed)
-        assert set(replayed) <= captured, f"uncaptured keys: {set(replayed) - captured}"
-
-    def test_graph_keys_use_the_ep_synced_padded_count(self):
-        """The replayed batch size must be the padded/EP-synced one, not the live active count."""
-        context = _make_context(num_decode_requests=2)
-        controller, model, context = _make_draft_loop_controller(
-            context, num_mtp_depths=2, active_request_count=2, graphed=True
-        )
-        controller._mtp_resolved_padded_count = 4  # graph bucket is larger than the batch
+        controller._mtp_resolved_padded_count = padded_count
         context.using_cuda_graph_this_step = lambda: True
 
         controller._compute_serial_mtp_and_sample(
             base_position=torch.tensor([10, 12], device=DEVICE)
         )
 
-        assert all(call["cache_key"][1] == 4 for call in model.mtp_step_calls)
-        assert context._mtp_begin_decode.call_args.args[1] == 4
-        assert set(call["cache_key"] for call in model.mtp_step_calls) <= _captured_graph_keys(
-            batch_sizes=[4], num_mtp_depths=2
-        )
+        assert context._mtp_begin_decode.call_args.args[:2] == (2, padded_count)
+        assert context._mtp_begin_decode.call_args.kwargs["graphed"] is True
+        assert len(model.mtp_step_calls) == 2
+        for call in model.mtp_step_calls:
+            assert call["cache_key"] == ("mtp_kv", padded_count, None)
+            assert call["eager"] is False
+            assert call["mtp_inference_context"] is context
 
     def test_graphed_decision_mirrors_the_main_step_not_the_live_flag(self):
         """`_mtp_resolved_padded_count` is the EP-synced signal; the live flag is clobbered.
@@ -1061,44 +999,21 @@ class TestMtpCudaGraphs:
             assert call["cache_key"] is None
             assert call["eager"] is True
 
-    def test_dummy_rank_replays_only_captured_cache_free_keys(self):
-        """The idle rank's keys must also exist in the warmup set."""
+    def test_dummy_rank_replays_cache_free_keys(self):
+        """An idle rank has no live block table, even when its peers use draft KV."""
         context = _make_context(num_decode_requests=2)
         controller, model, context = _make_draft_loop_controller(
             context, num_mtp_depths=2, active_request_count=2, graphed=True
         )
         controller.model_config.expert_model_parallel_size = 2
-        controller._mtp_resolved_padded_count = 2
-        captured = _captured_graph_keys(batch_sizes=[2], num_mtp_depths=2)
 
         controller._run_dummy_serial_mtp_forward()
 
-        replayed = [call["cache_key"] for call in model.mtp_step_calls]
-        assert set(replayed) <= captured
-        assert all(key[0] == "mtp" for key in replayed)
-
-    def test_per_depth_head_is_not_eligible_for_the_kv_cache(self):
-        """The KV-aware capture only exists for a repeated layer; guard the assumption.
-
-        `enable_mtp_kv_cache` is gated on `mtp_use_repeated_layer`, so a per-depth head must
-        never reach the `mtp_kv` keys -- warmup would not have captured them at `depth=None`.
-        """
-        context = _make_context(num_decode_requests=2)
-        controller, model, context = _make_draft_loop_controller(
-            context, num_mtp_depths=2, active_request_count=2, graphed=True, mtp_kv_cache_on=False
-        )
-        model.mtp.mtp_use_repeated_layer = False
-        context.using_cuda_graph_this_step = lambda: True
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        replayed = [call["cache_key"] for call in model.mtp_step_calls]
-        assert [key[2] for key in replayed] == [0, 1], "per-depth head must pass a real depth"
-        assert set(replayed) <= _captured_graph_keys(
-            batch_sizes=[2], num_mtp_depths=2, mtp_use_repeated_layer=False
-        )
+        assert len(model.mtp_step_calls) == 2
+        for call in model.mtp_step_calls:
+            assert call["cache_key"] == ("mtp", 2, None)
+            assert call["eager"] is False
+            assert "mtp_inference_context" not in call
 
     def test_block_scope_slices_the_persistent_hidden_buffer(self):
         """Block-scope graphs write a max_tokens-sized buffer; only this step's prefix is valid."""
@@ -1110,6 +1025,7 @@ class TestMtpCudaGraphs:
         context.padded_active_token_count = 3
         # An oversized persistent buffer whose tail holds stale values from a previous step.
         context.mtp_decoder_hidden_states = _hidden(16)
+        original_hidden = context.mtp_decoder_hidden_states
 
         controller._compute_serial_mtp_and_sample(
             base_position=torch.tensor([10, 12], device=DEVICE)
@@ -1118,22 +1034,7 @@ class TestMtpCudaGraphs:
         passed_hidden = controller._mtp_commit_pass.call_args.args[2]
         assert passed_hidden.shape[0] == 3, "the stale tail of the graph buffer was not sliced off"
         assert _row_ids(passed_hidden) == [0, 1, 2]
-
-    def test_block_scope_keeps_the_persistent_hidden_buffer_alive(self):
-        """The block-scope buffer is pre-allocated at a fixed address and must persist."""
-        context = _make_context(num_decode_requests=2)
-        controller, _, context = _make_draft_loop_controller(
-            context, num_mtp_depths=2, active_request_count=2
-        )
-        context.inference_cuda_graph_scope = InferenceCudaGraphScope.block
-        context.padded_active_token_count = 2
-        context.mtp_decoder_hidden_states = _hidden(8)
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        assert context.mtp_decoder_hidden_states is not None
+        assert context.mtp_decoder_hidden_states is original_hidden
 
     def test_non_block_scope_releases_the_hidden_states(self):
         """In eager/layer scope the attribute holds a live tensor that should be freed."""
@@ -1148,53 +1049,6 @@ class TestMtpCudaGraphs:
         )
 
         assert context.mtp_decoder_hidden_states is None
-
-    @pytest.mark.parametrize("padded_count", [2, 4, 8])
-    def test_graph_bucket_sizes_round_trip(self, padded_count):
-        """Every graph bucket the engine captures must be replayable by the draft loop.
-
-        `padded_count` is always >= the active request count; the buckets here are the padded
-        sizes an EP-synced step would resolve to.
-        """
-        context = _make_context(num_decode_requests=2)
-        controller, model, context = _make_draft_loop_controller(
-            context, num_mtp_depths=2, active_request_count=2, graphed=True
-        )
-        controller._mtp_resolved_padded_count = padded_count
-        context.using_cuda_graph_this_step = lambda: True
-
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-
-        captured = _captured_graph_keys(batch_sizes=[padded_count], num_mtp_depths=2)
-        assert set(call["cache_key"] for call in model.mtp_step_calls) <= captured
-        assert context._mtp_begin_decode.call_args.args[1] == padded_count
-
-
-class TestDummySerialMtpForward:
-    """Which GRAPH KEY the idle EP rank replays.
-
-    Forward COUNT and graph/eager MODE are covered by `TestExpertParallelForwardParity`, which
-    runs both paths and compares them -- a strictly stronger check than asserting the dummy's
-    count in isolation, since a hard-coded number cannot drift with the real path. The graph KEY
-    is the one property that comparison does not cover.
-    """
-
-    def test_dummy_always_replays_the_cache_free_graph(self):
-        """Replaying the KV-aware graph here would append with no valid block table."""
-        context = _make_context(num_decode_requests=2)
-        controller, model, context = _make_draft_loop_controller(
-            context, num_mtp_depths=2, graphed=True, mtp_kv_cache_on=True
-        )
-        controller.model_config.expert_model_parallel_size = 2
-        controller._mtp_resolved_padded_count = 2
-
-        controller._run_dummy_serial_mtp_forward()
-
-        for call in model.mtp_step_calls:
-            assert call["cache_key"][0] == "mtp", "the dummy rank replayed the KV-aware graph"
-            assert call["eager"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1305,7 +1159,10 @@ def _build_step(
     def advance_decode_step():
         state["offsets"] = state["offsets"] + 1
 
-    context._using_cuda_graph_this_step = False
+    # Match the main forward's graph decision, from which production derives
+    # `_mtp_resolved_padded_count`. Cache-free drafting reuses this flag directly;
+    # only KV-aware drafting updates it through `setup_decode_step`.
+    context._using_cuda_graph_this_step = graphed
     context.using_cuda_graph_this_step = lambda: context._using_cuda_graph_this_step
     context._mtp_begin_decode = mock.Mock(side_effect=begin_decode)
     context._mtp_setup_decode_step = mock.Mock(side_effect=setup_decode_step)
@@ -1434,10 +1291,10 @@ class TestExpertParallelForwardParity:
     @pytest.mark.parametrize("num_mtp_depths", [1, 2, 3])
     @pytest.mark.parametrize("graphed", [False, True])
     @pytest.mark.parametrize("kv_cache_on", [False, True])
-    def test_real_and_dummy_ranks_issue_the_same_forward_count(
+    def test_real_and_dummy_ranks_match_forward_count_and_graph_mode(
         self, num_mtp_depths, graphed, kv_cache_on
     ):
-        """The headline EP invariant: forward COUNT must match across ranks, every config."""
+        """Real and idle ranks must match both forward count and eager/graph mode."""
         controller, model, context, _ = _build_step(
             num_decode_requests=2,
             accepted=(2, 1),
@@ -1458,22 +1315,9 @@ class TestExpertParallelForwardParity:
             f"EP mismatch: real rank issued {len(real_forwards)} MTP forwards, "
             f"idle rank issued {len(dummy_forwards)}"
         )
-
-    @pytest.mark.parametrize("graphed", [False, True])
-    def test_real_and_dummy_ranks_agree_on_graph_mode(self, graphed):
-        """Mode must match too: a graphed replay and an eager launch are different collectives."""
-        controller, model, context, _ = _build_step(
-            num_decode_requests=2, accepted=(2, 1), num_mtp_depths=2, graphed=graphed
-        )
-        controller._compute_serial_mtp_and_sample(
-            base_position=torch.tensor([10, 12], device=DEVICE)
-        )
-        real_modes = [kw["eager"] for tag, kw in model.all_forwards if tag == "mtp_step"]
-
-        dummy = self._dummy_rank_forwards(2, graphed, kv_cache_on=True)
-        dummy_modes = [kw["eager"] for tag, kw in dummy if tag == "mtp_step"]
-
-        assert real_modes == [not graphed] * len(real_modes)
+        real_modes = [kw["eager"] for tag, kw in real_forwards if tag == "mtp_step"]
+        dummy_modes = [kw["eager"] for tag, kw in dummy_forwards if tag == "mtp_step"]
+        assert real_modes == [not graphed] * num_mtp_depths
         assert dummy_modes == real_modes
 
     def test_dummy_rank_matches_a_real_rank_whose_commit_pass_was_empty(self):
@@ -1656,15 +1500,13 @@ class TestMtpKvCacheCombinations:
         assert len(slots) == 1
         assert len(steps) == num_mtp_depths
 
-        # 2. CUDA graphs: keys are all-or-nothing, and every replayed key was captured.
+        # 2. CUDA graphs: every draft uses the resolved KV-aware key, or stays eager.
         padded = controller._mtp_resolved_padded_count or active
         if sp_enabled:
             padded = ((active + tp_size - 1) // tp_size) * tp_size
         keys = [kw["cache_key"] for kw in steps]
         if graphed:
-            captured = _captured_graph_keys([padded], num_mtp_depths)
-            assert all(k is not None for k in keys)
-            assert set(keys) <= captured, f"uncaptured: {set(keys) - captured}"
+            assert keys == [("mtp_kv", padded, None)] * num_mtp_depths
             assert all(kw["eager"] is False for kw in steps)
         else:
             assert all(k is None for k in keys)
@@ -1700,28 +1542,13 @@ class TestMtpKvCacheCombinations:
             assert not context.mtp_metadata.chunk_boundary_valid
             assert context.mtp_metadata.chunk_boundary_req_id == -1
 
-    @pytest.mark.parametrize("scenario_name", sorted(SCENARIOS))
-    def test_dummy_rank_matches_every_scenario(self, scenario_name):
-        """Whatever the real rank does in a scenario, an idle EP rank must match its count."""
-        kwargs = dict(self.SCENARIOS[scenario_name])
-        base = kwargs.pop("base")
-        num_mtp_depths = kwargs.pop("num_mtp_depths", 2)
-
-        controller, model, context, _ = _build_step(num_mtp_depths=num_mtp_depths, **kwargs)
-        patches = _identity_sp_patches()
-        with patches[0], patches[1]:
-            controller._compute_serial_mtp_and_sample(
-                base_position=torch.tensor(base, device=DEVICE)
-            )
-
         dummy = TestExpertParallelForwardParity._dummy_rank_forwards(
             num_mtp_depths,
-            graphed=kwargs.get("graphed", False),
+            graphed=graphed,
             kv_cache_on=True,
-            sp_enabled=kwargs.get("sp_enabled", False),
-            tp_size=kwargs.get("tp_size", 1),
+            sp_enabled=sp_enabled,
+            tp_size=tp_size,
         )
-
         assert len(dummy) == len(model.all_forwards), (
             f"{scenario_name}: real rank issued {len(model.all_forwards)} MTP forwards, "
             f"idle rank issued {len(dummy)}"

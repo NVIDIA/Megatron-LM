@@ -1426,39 +1426,6 @@ class TestMtpKvCacheIdleExpertParallelRank:
 
     # ---- tests ------------------------------------------------------------ #
 
-    @pytest.mark.parametrize(
-        "peer_state", [DECODE, PREFILL, MIXED], ids=[f"peer={s}" for s in [DECODE, PREFILL, MIXED]]
-    )
-    @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
-    @pytest.mark.internal
-    @torch.inference_mode()
-    def test_idle_rank_matches_active_rank(self, peer_state, model_type):
-        """Even EP ranks idle, odd ranks run the real MTP KV cache path.
-
-        The idle rank runs `_run_dummy_serial_mtp_forward`; the active rank runs the commit
-        pass and the draft loop. Their MoE all-to-alls must line up.
-        """
-        ep_rank = parallel_state.get_expert_model_parallel_rank()
-        is_idle = ep_rank % 2 == 0
-
-        model = self._build_model(model_type=model_type)
-        controller, context = self._build_controller(model)
-
-        if is_idle:
-            self._prepare_idle_rank(controller, context)
-            controller._run_dummy_serial_mtp_forward()
-        else:
-            self._prepare_active_rank(controller, context, peer_state)
-            # base_position=None exercises the legacy derivation from post-rewind CPU state.
-            controller._compute_serial_mtp_and_sample()
-            active = context.total_request_count - context.paused_request_count
-            sampled = controller._sampled_mtp_tokens_cuda[:, :active]
-            assert sampled.shape == (controller.num_mtp_depths, active)
-            assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
-
-        torch.cuda.synchronize()
-        dist.barrier()
-
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("rank_states", _STATE_COMBOS, ids=[",".join(s) for s in _STATE_COMBOS])
     @pytest.mark.internal
@@ -1495,6 +1462,10 @@ class TestMtpKvCacheIdleExpertParallelRank:
             controller._run_dummy_serial_mtp_forward()
         else:
             controller._compute_serial_mtp_and_sample()
+            active = context.total_request_count - context.paused_request_count
+            sampled = controller._sampled_mtp_tokens_cuda[:, :active]
+            assert sampled.shape == (controller.num_mtp_depths, active)
+            assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
 
         torch.cuda.synchronize()
         dist.barrier()

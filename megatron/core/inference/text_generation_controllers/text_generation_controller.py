@@ -886,16 +886,6 @@ class TextGenerationController(MTPControllerMixin):
             num_active_requests=active_request_count,
             keep_extra_blocks=context.enable_mtp_kv_cache,
         )
-        if context.enable_mtp_kv_cache:
-            committed_blocks = (
-                context.request_kv_length_offsets[active_request_slice]
-                + context.request_query_lengths[active_request_slice]
-                + context.block_size_tokens
-                - 1
-            ) // context.block_size_tokens
-            context.request_has_spare_block[active_request_slice] = (
-                context.request_kv_block_counts[active_request_slice] > committed_blocks
-            )
 
         # Mamba speculative rewind stays on GPU because it mutates GPU-resident
         # SSM/conv state that the next forward pass reads directly.
@@ -1653,15 +1643,11 @@ class TextGenerationController(MTPControllerMixin):
 
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
-            blocks = context.request_to_kv_block_ids[finished_idx]
+            # Only token-bearing blocks belong to the transferred prompt. Draft lookahead
+            # stays owned by this context until normal request cleanup releases it.
+            committed_blocks = int(context.get_committed_kv_block_counts(finished_idx).item())
+            blocks = context.request_to_kv_block_ids[finished_idx, :committed_blocks]
             valid_blocks = [int(block) for block in blocks.tolist() if block != -1]
-            # Drop the speculative reserve. This runs BEFORE `update_requests`, so a row that
-            # just prefilled still holds an unentered block: it carries draft KV only, not
-            # prompt KV. The decode side requires exactly `ceil(len(prompt)/block_size)` blocks
-            # (`inference_state_handoff` and `decode_admission`), so shipping it both fails that
-            # check and pins the block until RELEASE_KV. It is always the final column.
-            if valid_blocks and bool(context.request_has_spare_block[finished_idx]):
-                valid_blocks.pop()
             if valid_blocks:
                 finished_block_ids[request_id] = valid_blocks
                 # Retain across context cleanup. For an exclusively owned block:
@@ -1751,15 +1737,10 @@ class TextGenerationController(MTPControllerMixin):
         if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
-                blocks = context.request_to_kv_block_ids[fidx]
+                # Draft-only lookahead has no main-model routing to reconstruct.
+                committed_blocks = int(context.get_committed_kv_block_counts(fidx).item())
+                blocks = context.request_to_kv_block_ids[fidx, :committed_blocks]
                 valid = blocks[blocks >= 0].tolist()
-                # Drop the speculative reserve, same as the handoff collector below. The main
-                # model never wrote into it, so it has no stored routing, and
-                # `reconstruct_routing_from_blocks` tests `routing is None` BEFORE its
-                # `remaining <= 0` break -- a trailing routing-less block aborts the whole
-                # reconstruction and silently drops `moe_topk_indices` from the response.
-                if valid and bool(context.request_has_spare_block[fidx]):
-                    valid.pop()
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 

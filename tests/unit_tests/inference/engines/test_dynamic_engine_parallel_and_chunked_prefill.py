@@ -17,6 +17,7 @@ from megatron.core.inference.config import (
     MambaInferenceStateConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -284,7 +285,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     # ---- MTP draft-KV cache under expert parallelism ---------------------- #
     #
     # The MTP KV cache changes the per-step MTP forward COUNT: a rank with work runs one
-    # commit-pass forward before the draft loop and one extra append after it (D+2 total),
+    # commit-pass forward before the D draft forwards (D+1 total),
     # and an idle EP rank must mirror both the count and the graph/eager mode via
     # `_run_dummy_serial_mtp_forward`. A mismatch does not raise -- the MoE all-to-all simply
     # blocks -- so these tests assert by COMPLETING every request.
@@ -332,8 +333,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     def test_mtp_kv_cache_expert_parallel(self, num_cuda_graphs):
         """MTP draft KV cache with EP=2, in both eager and CUDA-graphed modes.
 
-        Requests are spread unevenly across steps, so EP ranks naturally alternate between
-        having work (real commit pass + draft loop) and being idle (dummy MTP forwards).
+        All ranks process the same workload. Explicit idle/active rank combinations are
+        covered by TestMtpKvCacheIdleExpertParallelRank in test_mtp_cuda_graph_inference.py.
         """
         if int(os.environ.get("WORLD_SIZE", "1")) < 2:
             pytest.skip("Test requires at least 2 GPUs")
@@ -380,7 +381,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         """Pin base and MTP logits to token 0 so every speculative token is accepted.
 
         Wraps the REAL forwards instead of replacing them, so the entire MTP KV cache path --
-        commit pass, per-depth draft appends, extra append, and the read-back through
+        commit pass, per-depth draft appends, and the read-back through
         attention -- still executes for real; only the token choice becomes deterministic.
         Mirrors the `all_accepted` arm of
         `test_dynamic_engine.py::test_speculative_sequence_length_double_counting`.
@@ -478,38 +479,58 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        "transformer_impl,ep_size,dispatcher",
+        [
+            ("local", 2, "nccl"),
+            ("inference_optimized", 1, "nccl"),
+            ("inference_optimized", 2, "nccl"),
+            ("inference_optimized", 2, "nvls"),
+        ],
+        ids=["local-ep", "optimized-dense", "optimized-nccl-ep", "optimized-nvls-ep"],
+    )
     @torch.inference_mode()
-    def test_mtp_kv_cache_expert_parallel_with_chunked_prefill(self):
-        """Chunked prefill splits a prompt across steps.
-
-        The commit pass then has to seed a continuation chunk (count `q`, starting at
-        `off-1`, using the carried boundary hidden) instead of a fresh prompt, and the
-        still-prefilling request must be excluded from drafting without changing the MTP
-        forward count that the idle EP ranks are matched against.
-        """
-        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-            pytest.skip("Test requires at least 2 GPUs")
-
+    def test_mtp_kv_cache_chunked_prefill(self, transformer_impl, ep_size, dispatcher, monkeypatch):
+        """Every backend must consume a carried hidden when a prompt spans multiple steps."""
+        if not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        if torch.distributed.get_world_size() < ep_size:
+            pytest.skip(f"Test requires at least {ep_size} GPUs")
         skip_if_mamba_sequence_packing_not_available("hybrid")
 
+        carried_requests = set()
+        original_take = MTPMetadata.take_chunk_boundary
+
+        def record_take(metadata, req_id, seam_position):
+            hidden = original_take(metadata, req_id, seam_position)
+            carried_requests.add(req_id)
+            return hidden
+
+        monkeypatch.setattr(MTPMetadata, "take_chunk_boundary", record_take)
         env = self._run_test(
             model_provider="hybrid",
-            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            transformer_impl=transformer_impl,
             mtp_layer_pattern="*-",
-            expert_model_parallel_size=2,
+            expert_model_parallel_size=ep_size,
+            inference_moe_token_dispatcher_type=dispatcher,
+            moe_router_dtype="fp32" if transformer_impl == "inference_optimized" else None,
+            enable_chunked_prefill=True,
             num_speculative_tokens=2,
             mtp_use_repeated_layer=True,
-            enable_chunked_prefill=True,
             num_requests=4,
             min_prompt_length=32,
             max_prompt_length=64,
             num_tokens_to_generate=6,
             num_gap_steps=0,
+            # Every prompt exceeds the budget, guaranteeing a continuation commit pass.
+            context_max_tokens=24,
             context_max_requests=8,
+            offset_sampling_seed_by_dp_rank=False,
             materialize_only_last_token_logits=False,
         )
 
         self._assert_mtp_kv_cache_active(env)
+        assert carried_requests == {request.request_id for request in env.requests}
         for request in env.requests:
             assert (
                 request.status == Status.COMPLETED
@@ -811,9 +832,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
 
         # No MTP write -- commit pass or draft loop -- may target an unallocated block table
         # column. `-1` is the table's empty fill, so it means the request reached past what the
-        # main path allocated for it. The draft loop writes D+1 speculative positions past the
-        # committed range, which the coverage check above does not reach, so this is the only
-        # guard on that tail.
+        # main path allocated for it. The draft loop reaches beyond the committed range,
+        # which the coverage check above does not reach, so check that tail separately.
         unallocated = sorted({(b, sl) for b, sl in written if b < 0})
         assert not unallocated, (
             f"MTP draft KV written to unallocated block column(s) {unallocated[:8]}; the draft "
@@ -842,7 +862,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
 
     @staticmethod
     def _branching_prompts(block_size, vocab_size):
-        """Three prompts forming the branching-prefix case that the back-off does not cover.
+        """Three prompts that require successor-token checks and a private suffix.
 
         A and B share block 0 exactly but diverge at the FIRST token of block 1, so B matches
         A's block 0 by hash. C repeats B. All three are two full blocks, so every block is
@@ -867,9 +887,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     ):
         """A block's final draft entry is only reusable by a consumer with the same next token.
 
-        The back-off drops the LAST matched block because its final draft slot consumes one
-        token past the block. That assumes the rest of the matched chain came from a producer
-        with the same continuation, which branching breaks:
+        Dropping only the LAST matched block, while registering private descendants, used to
+        permit this incorrect inheritance across branching prompts:
 
           A = [shared | tail_a]  registers A0, A1.
           B = [shared | tail_b]  matches [A0]; the back-off drops it, so B recomputes block 0
@@ -1048,10 +1067,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         recomputes tokens that live inside blocks it inherited. That is the widest possible
         overlap between "blocks I share" and "positions I write".
 
-        The MAIN KV path redirects exactly these writes to the dummy block (the
-        `overlap_start_token` span in `add_request`, whose comment names this mode as one of its
-        three triggers). The MTP draft-KV path builds its own write map and has no such
-        redirect, so this is the configuration that decides whether it needs one.
+        Both the main KV path and the MTP commit pass must redirect these writes to the
+        dummy block. MTP builds a separate write map, so its inherited-block guard needs its
+        own coverage.
 
         `test_mtp_kv_coverage_is_feature_invariant` cannot reach this: it sets a Mamba budget,
         which makes the skip cover the matched blocks and leaves the overlap empty.
@@ -1131,7 +1149,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             f"MTP draft KV written into {len(shared_writes)} slot(s) of ref-counted SHARED "
             f"blocks (first few, as (block, slot, ref_count)): {shared_writes[:8]}. The "
             f"`inherited_blocks` redirect in `_mtp_setup_prefill_step` should have sent these to "
-            f"the dummy block -- check `request_matched_prefix_blocks` for these rows."
+            f"the dummy block -- check `mtp_metadata.request_matched_prefix_blocks` for these rows."
         )
 
     # ---- MTP draft-KV cache on inference-optimized layers ------------------ #
@@ -1141,9 +1159,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     # tests above use. The MTP draft KV is appended and read back through that same attention
     # path, so it needs its own coverage.
     #
-    # Note the harness constraints, both asserted by `test_parallel_inference` above:
-    # MoE/EP is not supported with this transformer, and tp_size > 1 requires sequence
-    # parallelism. So these are dense, and EP coverage stays on the local spec.
+    # TP > 1 requires sequence parallelism. Dense cases below cover TP=1 and TP=2/SP;
+    # the subsequent EP matrix covers the NCCL and NVLS dispatchers.
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1212,42 +1229,6 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             max_prompt_length=16,
             num_tokens_to_generate=6,
             num_gap_steps=1,
-            context_max_requests=8,
-            materialize_only_last_token_logits=False,
-        )
-
-        self._assert_mtp_kv_cache_active(env)
-        for request in env.requests:
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Request {request.request_id}: status={request.status}"
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @torch.inference_mode()
-    def test_mtp_kv_cache_inference_optimized_chunked_prefill(self):
-        """Continuation-chunk seeding on the inference-optimized attention path."""
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
-
-        skip_if_mamba_sequence_packing_not_available("hybrid")
-
-        env = self._run_test(
-            model_provider="hybrid",
-            # An attention (not recurrent) MTP head is what enables the draft KV cache.
-            mtp_layer_pattern="*-",
-            transformer_impl="inference_optimized",
-            tensor_model_parallel_size=1,
-            enable_chunked_prefill=True,
-            num_speculative_tokens=2,
-            mtp_use_repeated_layer=True,
-            num_requests=4,
-            min_prompt_length=32,
-            max_prompt_length=64,
-            num_tokens_to_generate=6,
-            num_gap_steps=0,
             context_max_requests=8,
             materialize_only_last_token_logits=False,
         )
@@ -1344,43 +1325,6 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 not context.use_cuda_graphs_for_non_decode_steps
             ), "nccl EP dispatcher is expected to force-disable non-decode graphs"
 
-        for request in env.requests:
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Request {request.request_id}: status={request.status}"
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
-    @torch.inference_mode()
-    def test_mtp_kv_cache_inference_optimized_expert_parallel_chunked_prefill(self, dispatcher):
-        """Same, with chunked prefill so the commit pass seeds continuation chunks under EP."""
-        skip_if_mamba_sequence_packing_not_available("hybrid")
-        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-            pytest.skip("Test requires at least 2 GPUs")
-
-        env = self._run_test(
-            model_provider="hybrid",
-            transformer_impl="inference_optimized",
-            mtp_layer_pattern="*-",
-            expert_model_parallel_size=2,
-            inference_moe_token_dispatcher_type=dispatcher,
-            moe_router_dtype="fp32",
-            enable_chunked_prefill=True,
-            num_speculative_tokens=2,
-            mtp_use_repeated_layer=True,
-            num_requests=4,
-            min_prompt_length=32,
-            max_prompt_length=64,
-            num_tokens_to_generate=6,
-            num_gap_steps=0,
-            context_max_requests=8,
-            materialize_only_last_token_logits=False,
-        )
-
-        self._assert_mtp_kv_cache_active(env)
         for request in env.requests:
             assert (
                 request.status == Status.COMPLETED

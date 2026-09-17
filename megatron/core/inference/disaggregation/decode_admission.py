@@ -110,10 +110,9 @@ def admit_prefilled_decode(
     )
     context.request_in_prefill_status_tensor[current_id] = 0
     context.request_kv_block_counts[current_id] = len(all_block_ids)
+    context.mtp_metadata.reset_request_rows(current_id)
     last_main_block = (prompt_length + input_token_count - 1) // context.block_size_tokens
     context.request_last_kv_block_id[current_id] = all_block_ids[last_main_block]
-    # Any draft-only continuation remains spare; recycled rows must not keep a stale flag.
-    context.request_has_spare_block[current_id] = len(all_block_ids) > last_main_block + 1
     context.request_last_kv_block_offset[current_id] = (
         prompt_length - 1 + input_token_count
     ) % context.block_size_tokens

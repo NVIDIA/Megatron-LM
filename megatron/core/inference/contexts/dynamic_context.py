@@ -1170,21 +1170,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.request_kv_block_counts = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
         )
-        # Leading blocks each request INHERITED rather than computed -- a context-side mirror of
-        # `DynamicInferenceRequest.num_matched_prefix_blocks`, because the MTP commit pass sees
-        # only the context. Used to keep draft-KV writes out of blocks this request did not
-        # compute, mirroring the main path's `overlap_start_token` redirect in `add_request`.
-        self.request_matched_prefix_blocks = torch.zeros(
-            self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
-        )
         self.request_last_kv_block_id = torch.empty(
             self.max_requests, dtype=torch.int32, device='cpu', pin_memory=True
-        )
-        # Whether the row owns lookahead beyond its main token-bearing blocks. MTP prefill,
-        # decode scheduling, and rewind maintain this flag. Reserved blocks are counted in
-        # request_kv_block_counts, while request_last_kv_block_id names the main write block.
-        self.request_has_spare_block = torch.zeros(
-            self.max_requests, dtype=torch.bool, device='cpu', pin_memory=True
         )
         # request_last_kv_block_offset represents number of tokens in the last kv block
         self.request_last_kv_block_offset = torch.empty(
@@ -2253,10 +2240,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.request_in_prefill_status_tensor[request_slice] = 1
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
-        self.request_matched_prefix_blocks[request_slice] = 0
+        self.mtp_metadata.reset_request_rows(request_slice)
         self.request_kv_block_counts[request_slice] = block_counts
-        # Dummy rows hold no real blocks, so there is nothing to cross into.
-        self.request_has_spare_block[request_slice] = False
         for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
                 metadata_cols[i], dtype=dtype, device='cpu'
@@ -2428,7 +2413,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.request_query_lengths[N_decode : N_decode + rem_prefill_tokens] += 1
 
         self.request_kv_length_offsets[0:N].fill_(0)
-        self.request_matched_prefix_blocks[0:N].fill_(0)
+        self.mtp_metadata.reset_request_rows(slice(0, N))
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
         # 3. Token-level state consumed by the triton KV append kernel.
@@ -2925,7 +2910,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.request_kv_length_offsets.fill_(0)
         self.request_kv_block_counts.fill_(0)
         self.request_last_kv_block_id.fill_(-1)
-        self.request_has_spare_block.fill_(False)
+        self.mtp_metadata.reset_request_rows()
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
         self.request_in_prefill_status_tensor.fill_(-1)
@@ -3526,11 +3511,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         # The reserve is counted above but NOT pointed at: the pointer names the last
         # token-bearing block, and the row crosses into the reserve only when its main tokens
-        # actually reach the boundary. See `request_has_spare_block`.
+        # actually reach the boundary. Owned capacity is tracked by the block count.
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
             overall_required_blocks - 1
         ]
-        self.request_has_spare_block[current_id] = match.speculative_reserve_blocks > 0
         self.request_last_kv_block_offset[current_id] = (
             prefill_chunk_length + req.finished_chunk_token_count - 1
         ) % self.block_size_tokens
@@ -3739,7 +3723,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if num_matched_blocks > 0 and req.num_matched_prefix_blocks >= already_allocated_blocks:
             req.num_matched_prefix_blocks = already_allocated_blocks + num_matched_blocks
         # Mirror onto the context for the MTP commit pass, which cannot reach `req`.
-        self.request_matched_prefix_blocks[current_id] = req.num_matched_prefix_blocks
+        if self.enable_mtp_kv_cache:
+            self.mtp_metadata.request_matched_prefix_blocks[current_id] = (
+                req.num_matched_prefix_blocks
+            )
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
@@ -3756,7 +3743,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         Move all the relevent booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
-        self.request_matched_prefix_blocks[dst_idxs] = self.request_matched_prefix_blocks[src_idxs]
+        self.mtp_metadata.move_request_rows(src_idxs, dst_idxs)
         self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
             src_idxs
         ]
@@ -3769,7 +3756,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
         self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
         self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
-        self.request_has_spare_block[dst_idxs] = self.request_has_spare_block[src_idxs]
         self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[src_idxs]
 
         for metadata_tensor in self.request_metadata.values():
@@ -3787,7 +3773,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
-        tensor_swap(self.request_matched_prefix_blocks, src_idxs, dst_idxs)
+        self.mtp_metadata.swap_request_rows(src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
@@ -3795,7 +3781,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
-        tensor_swap(self.request_has_spare_block, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_offset, src_idxs, dst_idxs)
 
         if next_tokens is not None:
@@ -3855,8 +3840,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # fill_()/add_() creates a clone and updates it instead of the original
         # tensor.
         self.request_to_kv_block_ids[request_indexes] = -1
-        # The spare went back to the allocator along with everything else this row held.
-        self.request_has_spare_block[request_indexes] = False
+        self.mtp_metadata.reset_request_rows(request_indexes)
 
         # Free Mamba slots.
         if self.is_hybrid_model:
@@ -3996,15 +3980,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             else:
                 # Check which resumed requests actually need a new block.
                 offsets = self.request_last_kv_block_offset[resume_slice]
-                crosses = offsets >= (self.block_size_tokens - 1 - self.num_speculative_tokens)
-                has_spare = self._rows_with_spare_block(resume_slice)
-                # Same split as the pause path: a row that already owns the block it is about to
-                # cross into advances into it, and must NOT also be granted one. Granting would
-                # strand the reserve in the middle of the block table and leave
-                # `request_last_kv_block_id` naming a block whose column does not match the next
-                # main token's position, sending that token's KV to the wrong block.
-                needs_new_block = crosses & ~has_spare
-                self._advance_into_spare_block(resume_slice, crosses & has_spare)
+                needs_new_block = offsets >= (
+                    self.block_size_tokens - 1 - self.num_speculative_tokens
+                )
                 num_new_blocks = needs_new_block.sum().item()
 
                 if num_new_blocks > 0:
@@ -4149,61 +4127,32 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.total_request_count, self.total_request_count + evict_request_count
         )
         self.request_to_kv_block_ids[evict_slice] = -1
-        self.request_has_spare_block[evict_slice] = False
+        self.mtp_metadata.reset_request_rows(evict_slice)
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
 
         return evict_request_ids
+
+    def get_committed_kv_block_counts(self, request_indexes) -> Tensor:
+        """Count token-bearing blocks, excluding reserved lookahead capacity.
+
+        Call after admission, preparation, or rewind has established the main token
+        span. Owned block counts may exceed this value because MTP retains lookahead.
+        """
+        token_counts = (
+            self.request_kv_length_offsets[request_indexes]
+            + self.request_query_lengths[request_indexes]
+        )
+        return (token_counts + self.block_size_tokens - 1) // self.block_size_tokens
 
     def _next_decode_block_counts(self, request_slice: slice) -> Tensor:
         """Additional owned blocks required before the next verification/draft step."""
         if self.enable_mtp_kv_cache:
             return self._mtp_next_decode_block_counts(request_slice)
         return (
-            (
-                self.request_last_kv_block_offset[request_slice]
-                >= self.block_size_tokens - 1 - self.num_speculative_tokens
-            )
-            & ~self._rows_with_spare_block(request_slice)
+            self.request_last_kv_block_offset[request_slice]
+            >= self.block_size_tokens - 1 - self.num_speculative_tokens
         ).to(self.request_kv_block_counts.dtype)
-
-    def _rows_with_spare_block(self, request_slice: slice) -> Tensor:
-        """Rows that already own an empty block beyond the ones their tokens fill.
-
-        Reads the `request_has_spare_block` flag maintained during admission, decode
-        preparation, and rewind. Without speculative decoding it is never set.
-
-        Args:
-            request_slice (slice): Rows to test. Paused rows are fine: the flag tracks
-                ownership, which pausing does not change.
-
-        Returns:
-            Tensor: Boolean mask over `request_slice`.
-        """
-        return self.request_has_spare_block[request_slice]
-
-    def _advance_into_spare_block(self, request_slice: slice, rows: Tensor) -> None:
-        """Point `request_last_kv_block_id` at the spare block `rows` already own.
-
-        The decode write path follows that pointer, so a block sitting unreferenced in the next
-        column would otherwise be skipped and a fresh one allocated past it. This is the
-        already-owned counterpart of the pointer update the allocating paths perform, and it
-        consumes the spare, so the flag is cleared here.
-
-        Args:
-            request_slice (slice): Rows the mask indexes into.
-            rows (Tensor): Boolean mask selecting rows to advance.
-        """
-        idx = torch.nonzero(rows, as_tuple=True)[0]
-        if idx.numel() == 0:
-            return
-        base = request_slice.start or 0
-        row_idx = base + idx
-        # The reserve is allocated after the prompt's blocks, so it is always the final column.
-        counts = self.request_kv_block_counts[row_idx]
-        last_col = (counts - 1).clamp(min=0).to(torch.long)
-        self.request_last_kv_block_id[row_idx] = self.request_to_kv_block_ids[row_idx, last_col]
-        self.request_has_spare_block[row_idx] = False
 
     def _get_async_sched_rows_requiring_new_block(self) -> Tensor:
         """Return active request rows that need a block during the next prepare.
@@ -4274,43 +4223,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                         "Async scheduling cannot evict requests to allocate new blocks."
                     )
 
-            # Rows that cross a boundary but already own the block to cross into: point at it
-            # before the token map is built, so the copy below picks it up like any other advance.
-            #
-            # Defensive: a spare cannot currently reach here. `can_prepare_requests` demands
-            # `num_prefill_requests == 0` and `paused_request_count == 0`, while a spare survives a
-            # step only on a force-paused row. Kept because the cost when there is none is a single
-            # CPU `.any()`, and the failure mode if the scheduler ever changes is silent KV
-            # corruption. The clone is taken only on the path that mutates the pointer.
-            spare_rows = (
-                self.request_last_kv_block_offset[active_slice] + tokens_per_request
-                >= self.block_size_tokens
-            ) & self._rows_with_spare_block(active_slice)
-            has_spare_rows = bool(spare_rows.any())
-            if has_spare_rows:
-                prev_block_ids = self.request_last_kv_block_id[active_slice].clone()
-                self._advance_into_spare_block(active_slice, spare_rows)
-            else:
-                prev_block_ids = self.request_last_kv_block_id[active_slice]
-
             self.active_token_count = active_request_count * tokens_per_request
             active_token_slice = slice(0, self.active_token_count)
             grouped_token_block_ids = self.token_to_block_idx[active_token_slice].view(
                 active_request_count, tokens_per_request
             )
-            grouped_token_block_ids.copy_(prev_block_ids[:, None])
-
-            if has_spare_rows:
-                # Same split as the allocating branch below: tokens past the boundary go to the
-                # advanced-into block, the rest stay in the one they were already filling.
-                spare_idx = torch.nonzero(spare_rows, as_tuple=True)[0]
-                advanced = self.request_last_kv_block_id[active_slice][spare_idx]
-                grouped_token_block_ids[spare_idx] = torch.where(
-                    last_block_offsets[spare_idx, None] + 1 + token_offsets[None, :]
-                    >= self.block_size_tokens,
-                    advanced[:, None],
-                    grouped_token_block_ids[spare_idx],
-                )
+            grouped_token_block_ids.copy_(self.request_last_kv_block_id[active_slice, None])
 
             if block_ids is not None:
                 row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
@@ -4467,16 +4385,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         dst_idxs = torch.arange(active_request_count, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
-            self.request_matched_prefix_blocks[dst_idxs] = self.request_matched_prefix_blocks[
-                survivor_idxs
-            ]
+            self.mtp_metadata.move_request_rows(survivor_idxs, dst_idxs)
             self.request_query_lengths[dst_idxs] = self.request_query_lengths[survivor_idxs]
             self.request_output_lengths[dst_idxs] = self.request_output_lengths[survivor_idxs]
             self.request_ids[dst_idxs] = self.request_ids[survivor_idxs]
             self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[survivor_idxs]
             self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[survivor_idxs]
             self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[survivor_idxs]
-            self.request_has_spare_block[dst_idxs] = self.request_has_spare_block[survivor_idxs]
             self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[
                 survivor_idxs
             ]
@@ -4488,9 +4403,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
-        # Same reasoning as the finished-request move in `update_requests`: a vacated slot must
-        # not advertise a spare it no longer holds.
-        self.request_has_spare_block[stale_slice] = False
+        self.mtp_metadata.reset_request_rows(stale_slice)
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[stale_slice] = -1
         self.total_request_count = active_request_count
@@ -4646,10 +4559,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
                 # Reset chunk ids for recently moved requests.
                 self.request_to_kv_block_ids[active_idxs_on_right] = -1
-                # The row that owned the spare moved left; leaving the flag behind would hand a
-                # phantom spare to whatever lands in this slot next, which would then cross a
-                # block boundary without being granted a block.
-                self.request_has_spare_block[active_idxs_on_right] = False
+                self.mtp_metadata.reset_request_rows(active_idxs_on_right)
                 if self.is_hybrid_model:
                     self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
 
@@ -4745,18 +4655,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # (assigns new block IDs), but we need the old values later to determine
             # which block tokens should go to when they don't cross a block boundary.
             prev_last_block_ids = self.request_last_kv_block_id.clone()
-            # Rows that cross into a block they already own. Done here, alongside the resume
-            # path that grants blocks to the rows that do not, and after the clone above so
-            # pre-boundary tokens still route to the block they were filling.
-            spare_slice = slice(self.paused_request_count, self.total_request_count)
-            self._advance_into_spare_block(
-                spare_slice,
-                (
-                    self.request_last_kv_block_offset[spare_slice] + self.num_speculative_tokens + 1
-                    >= self.block_size_tokens
-                )
-                & self._rows_with_spare_block(spare_slice),
-            )
 
         # 6.a. First, resume temporarily paused requests.
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
@@ -4905,78 +4803,81 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._mtp_map_next_decode_tokens(
                 slice(self.paused_request_count, self.total_request_count)
             )
-        else:
-            current_block_ids = self.request_last_kv_block_id[
+            return {
+                "newly_paused_request_ids": newly_paused_request_ids,
+                "evict_request_ids": evict_request_ids,
+            }
+
+        current_block_ids = self.request_last_kv_block_id[
+            self.paused_request_count : self.total_request_count
+        ]
+
+        # raw positions shape : [active_request_count, num_generated_tokens]
+        # e.g block size 6, old_offsets = [1,5,2] , num_generated_tokens = 3
+        # raw_positions = [[1, 2, 3], [5, 6, 7], [2, 3, 4]]
+        # crosses_boundary = [[False, False, False], [False, True, True], [False, False, False]]
+        raw_positions = (
+            old_offsets[:, None]
+            + 1  # Offset by 1 because old_offsets points to the LAST token
+            + torch.arange(num_generated_tokens, device='cpu')[None, :]
+        )
+        #
+        # A token crosses to the next block if its raw_position >= block_size
+        crosses_boundary = raw_positions >= self.block_size_tokens
+
+        if not crosses_boundary.any() or self.num_speculative_tokens == 0:
+            # Fast path: no tokens cross block boundary, all use current block
+            self.token_to_block_idx[: self.active_token_count] = self.request_last_kv_block_id[
                 self.paused_request_count : self.total_request_count
-            ]
+            ].repeat_interleave(num_generated_tokens)
+        else:
 
-            # raw positions shape : [active_request_count, num_generated_tokens]
-            # e.g block size 6, old_offsets = [1,5,2] , num_generated_tokens = 3
-            # raw_positions = [[1, 2, 3], [5, 6, 7], [2, 3, 4]]
-            # crosses_boundary = [[False, False, False], [False, True, True], [False, False, False]]
-            raw_positions = (
-                old_offsets[:, None]
-                + 1  # Offset by 1 because old_offsets points to the LAST token
-                + torch.arange(num_generated_tokens, device='cpu')[None, :]
-            )
+            # Some tokens cross to the next block (this happens for resumed requests)
             #
-            # A token crosses to the next block if its raw_position >= block_size
-            crosses_boundary = raw_positions >= self.block_size_tokens
+            # When a request is paused and resumed:
+            # 1. It was paused because remaining_space < num_tokens_per_step
+            # 2. A NEW block is allocated in resume_paused_requests
+            # 3. request_last_kv_block_id is updated to the NEW block
+            # 4. The old offset is preserved (wasn't reset)
+            #
+            # So for resumed requests:
+            # - Tokens before the boundary (raw_pos < block_size): go to PREVIOUS block
+            # - Tokens at/after the boundary (raw_pos >= block_size): go to CURRENT (new) block
+            #
+            # For non-resumed requests (no boundary crossing): all go to current block
+            #
+            # We use prev_last_block_ids which was stored BEFORE resume_paused_requests
+            # was called, so it contains the OLD block IDs before new blocks were allocated.
 
-            if not crosses_boundary.any() or self.num_speculative_tokens == 0:
-                # Fast path: no tokens cross block boundary, all use current block
-                self.token_to_block_idx[: self.active_token_count] = self.request_last_kv_block_id[
-                    self.paused_request_count : self.total_request_count
-                ].repeat_interleave(num_generated_tokens)
-            else:
+            # Get previous block IDs (stored before resume_paused_requests)
+            prev_block_ids = prev_last_block_ids[
+                self.paused_request_count : self.total_request_count
+            ]  # [active_count]
 
-                # Some tokens cross to the next block (this happens for resumed requests)
-                #
-                # When a request is paused and resumed:
-                # 1. It was paused because remaining_space < num_tokens_per_step
-                # 2. A NEW block is allocated in resume_paused_requests
-                # 3. request_last_kv_block_id is updated to the NEW block
-                # 4. The old offset is preserved (wasn't reset)
-                #
-                # So for resumed requests:
-                # - Tokens before the boundary (raw_pos < block_size): go to PREVIOUS block
-                # - Tokens at/after the boundary (raw_pos >= block_size): go to CURRENT (new) block
-                #
-                # For non-resumed requests (no boundary crossing): all go to current block
-                #
-                # We use prev_last_block_ids which was stored BEFORE resume_paused_requests
-                # was called, so it contains the OLD block IDs before new blocks were allocated.
+            # For each request, check if ANY token crosses (i.e., request was resumed)
+            request_has_crossing = crosses_boundary.any(dim=1)  # [active_count]
 
-                # Get previous block IDs (stored before resume_paused_requests)
-                prev_block_ids = prev_last_block_ids[
-                    self.paused_request_count : self.total_request_count
-                ]  # [active_count]
+            # Build block_idx: [active_count, N]
+            # Start with current (new) block for all
+            # Lets say current block ids is [a1, a2 , a3] and num generated_tokens is 3
+            # This will be [[a1, a1, a1], [a2, a2, a2], [a3, a3, a3]]
+            # No clone needed: expand() returns a read-only view, and downstream
+            # torch.where() and .flatten() both return new tensors without in-place mutation.
+            block_idx = current_block_ids[:, None].expand(
+                -1, num_generated_tokens
+            )  # [active_count, N]
 
-                # For each request, check if ANY token crosses (i.e., request was resumed)
-                request_has_crossing = crosses_boundary.any(dim=1)  # [active_count]
+            # For requests that have crossing, tokens BEFORE boundary use prev block
+            # crosses_boundary is False for tokens before boundary
+            # So: where request_has_crossing AND NOT crosses_boundary, use prev_block
+            use_prev_block = request_has_crossing[:, None] & ~crosses_boundary  # [active_count, N]
 
-                # Build block_idx: [active_count, N]
-                # Start with current (new) block for all
-                # Lets say current block ids is [a1, a2 , a3] and num generated_tokens is 3
-                # This will be [[a1, a1, a1], [a2, a2, a2], [a3, a3, a3]]
-                # No clone needed: expand() returns a read-only view, and downstream
-                # torch.where() and .flatten() both return new tensors without in-place mutation.
-                block_idx = current_block_ids[:, None].expand(
-                    -1, num_generated_tokens
-                )  # [active_count, N]
+            # Apply previous block IDs where needed
+            prev_block_ids_expanded = prev_block_ids[:, None].expand(-1, num_generated_tokens)
+            block_idx = torch.where(use_prev_block, prev_block_ids_expanded, block_idx)
 
-                # For requests that have crossing, tokens BEFORE boundary use prev block
-                # crosses_boundary is False for tokens before boundary
-                # So: where request_has_crossing AND NOT crosses_boundary, use prev_block
-                # [active_count, N]
-                use_prev_block = request_has_crossing[:, None] & ~crosses_boundary
-
-                # Apply previous block IDs where needed
-                prev_block_ids_expanded = prev_block_ids[:, None].expand(-1, num_generated_tokens)
-                block_idx = torch.where(use_prev_block, prev_block_ids_expanded, block_idx)
-
-                # Convert back to 1d tensor
-                self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
+            # Convert back to 1d tensor
+            self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,

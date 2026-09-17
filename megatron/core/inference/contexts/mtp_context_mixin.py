@@ -252,9 +252,6 @@ class MTPContextMixin:
         self.request_last_kv_block_id[request_slice] = self.request_to_kv_block_ids[
             request_rows, last_columns.long()
         ]
-        self.request_has_spare_block[request_slice] = (
-            self.request_kv_block_counts[request_slice] > last_columns + 1
-        )
 
     # ------------------------------------------------------------------
     # MTP draft-KV bookkeeping.
@@ -455,7 +452,9 @@ class MTPContextMixin:
         # non-block-aligned resume, the `>= 2` clamp, a short Mamba match, or memory-only mode.
         active_slice = slice(self.paused_request_count, self.total_request_count)
         inherited = (
-            self.request_matched_prefix_blocks[active_slice][: block_table_prefill.shape[0]]
+            self.mtp_metadata.request_matched_prefix_blocks[active_slice][
+                : block_table_prefill.shape[0]
+            ]
             .to(block_table_prefill.device, non_blocking=True)
             .to(torch.long)
         )

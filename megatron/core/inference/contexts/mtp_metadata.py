@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.inference.utils import tensor_swap
+
 from .gpu_view import ContextGPUView
 
 
@@ -26,7 +28,7 @@ class MTPForwardMode(Enum):
 
 @dataclass
 class MTPMetadata:
-    """Persistent metadata for the MTP (multi-token prediction) KV-cache forwards.
+    """MTP request annotations, chunk carry, and KV-cache forward buffers.
 
     A speculative step runs several MTP forwards back to back -- one per draft depth, plus a
     varlen "commit pass" -- and every one of them rewrites the same small set of per-request
@@ -34,7 +36,8 @@ class MTPMetadata:
     buffers sized for the worst case and updates them in place. That keeps the draft loop
     allocation-free and CUDA-graph safe (a captured MTP graph replays against the same
     addresses each step). Construction is cheap and unconditional; `allocate` is what reserves
-    GPU memory, and only when `enabled`.
+    GPU memory, and only when `enabled`. CPU request annotations follow the context's
+    row lifecycle through `move_request_rows`, `swap_request_rows`, and `reset_request_rows`.
 
     Args:
         enabled (bool): Whether MTP KV caching is active for this context. When False the
@@ -58,6 +61,11 @@ class MTPMetadata:
     block_table_dtype: torch.dtype
     hidden_size: int
     hidden_dtype: torch.dtype
+
+    # CPU row metadata, indexed by the context's request rows (including paused rows).
+    # Mirrors DynamicInferenceRequest.num_matched_prefix_blocks so the commit pass can
+    # protect inherited KV without holding request objects. Allocated with the GPU buffers.
+    request_matched_prefix_blocks: Optional[Tensor] = field(default=None, repr=False)
 
     # ---- Draft-loop state (valid between begin_decode() and end_decode()). ----
     # Which MTP forward owns the attention metadata right now. The KV append/read paths key off
@@ -116,6 +124,9 @@ class MTPMetadata:
         """
         if not self.enabled:
             return
+        self.request_matched_prefix_blocks = torch.zeros(
+            self.max_requests, dtype=torch.int32, device="cpu", pin_memory=True
+        )
         self.offsets = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
         self.block_table = torch.full(
             (self.max_requests, self.max_kv_block_count),
@@ -137,6 +148,7 @@ class MTPMetadata:
         Used by the context's suspend path, which drops its tensors and rebuilds them from
         `initialize_all_tensors` on resume.
         """
+        self.request_matched_prefix_blocks = None
         self.offsets = None
         self.block_table = None
         self.query_lengths = None
@@ -147,6 +159,31 @@ class MTPMetadata:
         self.forward_mode = MTPForwardMode.NONE
         self.chunk_boundary_hidden = None
         self.invalidate_chunk_boundary()
+
+    def reset_request_rows(self, request_indexes=slice(None)) -> None:
+        """Clear MTP annotations when request rows are released, reused, or reset.
+
+        The chunk carry is keyed by request ID, so moving or clearing physical rows
+        does not change it. Its owner invalidates it when that logical request ends.
+        """
+        if self.enabled:
+            self.request_matched_prefix_blocks[request_indexes] = 0
+
+    def move_request_rows(self, src_idxs: Tensor, dst_idxs: Tensor) -> None:
+        """Copy MTP annotations alongside the scheduler's request-row movement.
+
+        Sources remain intact until the scheduler identifies and clears vacated rows.
+        Advanced indexing snapshots the source values even when the ranges overlap.
+        """
+        if self.enabled:
+            self.request_matched_prefix_blocks[dst_idxs] = self.request_matched_prefix_blocks[
+                src_idxs
+            ]
+
+    def swap_request_rows(self, src_idxs: Tensor, dst_idxs: Tensor) -> None:
+        """Swap MTP annotations alongside the scheduler's paused/active row swap."""
+        if self.enabled:
+            tensor_swap(self.request_matched_prefix_blocks, src_idxs, dst_idxs)
 
     # ------------------------------------------------------------------
     # Chunked-prefill boundary carry.

@@ -3258,8 +3258,9 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
 
     The draft KV shares blocks with the main KV, but its entry at a block's final slot is
     f(h_p, emb(t_{p+1})) -- it consumes one token PAST the block, so that slot is not determined
-    by the block's hash. `_compute_prefix_match` therefore declines to inherit the last matched
-    block, and the request recomputes it into a block it owns.
+    by the block's hash. `_compute_prefix_match` truncates at the first incompatible successor
+    token. The request recomputes that suffix privately, keeping its descendants unregistered
+    so the canonical cache retains chained ancestry.
 
     Nothing here is stubbed: real `add_request`, real block tables, real hash registration and
     ref counts. These contexts are non-hybrid, which is what makes `enable_mtp_kv_cache` true
@@ -3304,7 +3305,8 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         alloc = ctx.kv_block_allocator
         p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
 
-        ctx.add_request(self._req(ctx, p_prompt))
+        producer = self._req(ctx, p_prompt)
+        ctx.add_request(producer)
         p_blocks = self._block_ids(ctx, 0, 4)
         ctx.add_request(self._req(ctx, s_prompt, request_id=2))
         s_blocks = self._block_ids(ctx, 1, 4)
@@ -3316,22 +3318,8 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert alloc.block_ref_counts[p_blocks[1]].item() == 2
         assert alloc.block_ref_counts[p_blocks[2]].item() == 1  # producer only
         assert alloc.block_ref_counts[s_blocks[2]].item() == 1  # sibling only
-
-    @pytest.mark.internal
-    def test_given_up_block_stays_out_of_the_hash_registry(self):
-        """The producer keeps ownership of the hash; our recomputed copy stays private."""
-        ctx = self._mtp_ctx()
-        alloc = ctx.kv_block_allocator
-        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
-
-        producer = self._req(ctx, p_prompt)
-        ctx.add_request(producer)
-        p_blocks = self._block_ids(ctx, 0, 4)
-        ctx.add_request(self._req(ctx, s_prompt, request_id=2))
-        s_blocks = self._block_ids(ctx, 1, 4)
-
-        h2 = producer.precomputed_block_hashes[2]
-        assert alloc.kv_hash_to_block_id[h2] == p_blocks[2]
+        # The producer keeps the canonical hash; the recomputed copy stays private.
+        assert alloc.kv_hash_to_block_id[producer.precomputed_block_hashes[2]] == p_blocks[2]
         assert alloc.block_hashes[s_blocks[2]].item() == -1
         self._assert_hash_registry_is_injective(alloc)
 
@@ -3363,26 +3351,6 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
-    def test_releasing_the_producer_leaves_the_siblings_blocks_intact(self):
-        """The aliasing hazard: releasing the hash owner must not disturb a private copy."""
-        ctx = self._mtp_ctx()
-        alloc = ctx.kv_block_allocator
-        p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
-
-        ctx.add_request(self._req(ctx, p_prompt))
-        p_blocks = self._block_ids(ctx, 0, 4)
-        ctx.add_request(self._req(ctx, s_prompt, request_id=2))
-        s_blocks = self._block_ids(ctx, 1, 4)
-
-        alloc.release_memory_blocks(torch.tensor(p_blocks, device=alloc.block_hashes.device))
-
-        # The sibling still owns its inherited and its private blocks.
-        assert alloc.block_ref_counts[s_blocks[0]].item() >= 1
-        assert alloc.block_ref_counts[s_blocks[2]].item() == 1
-        assert alloc.block_hashes[s_blocks[2]].item() == -1
-        self._assert_hash_registry_is_injective(alloc)
-
-    @pytest.mark.internal
     def test_no_back_off_without_the_mtp_kv_cache(self):
         """Regression guard: the cost is paid only when the draft plane actually exists."""
         ctx = self._ctx()
@@ -3401,18 +3369,16 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         self._assert_hash_registry_is_injective(alloc)
 
     @pytest.mark.internal
-    def test_back_off_costs_exactly_one_extra_block_from_the_pool(self):
+    def test_back_off_draws_a_private_block_and_a_speculative_reserve(self):
         """The back-off gives up the last matched block and recomputes it privately.
 
         MTP draws two extra blocks here, and only two: the private recomputed copy, plus the
         speculative reserve that the draft loop writes into on the prefill step. These prompts
         are block-aligned, so the reserve always applies.
         """
-        bs = None
         drawn = {}
         for mtp_on in (False, True):
             ctx = self._mtp_ctx() if mtp_on else self._ctx()
-            bs = ctx.block_size_tokens
             alloc = ctx.kv_block_allocator
             p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
             ctx.add_request(self._req(ctx, p_prompt))
@@ -3525,6 +3491,9 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[2:])
 
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.int32))
+        assert all(alloc.block_ref_counts[b].item() == 1 for b in sibling_blocks)
+        assert all(alloc.block_hashes[b].item() == -1 for b in sibling_blocks[2:])
+        self._assert_hash_registry_is_injective(alloc)
         self._assert_chained_ancestry(alloc, producer, sibling)
         # Lookup must never discover a descendant above a missing canonical parent.
         matched, _ = ctx._find_kv_match_count(sibling, 0, 5)
@@ -3622,6 +3591,8 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         ctx = self._mtp_ctx()
         alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
+        # Registration paths that do not record a successor token must fail closed.
+        assert (alloc.block_mtp_next_token == -1).all()
 
         ctx.add_request(self._req(ctx, self._prompt(bs * 3)))
         blocks = self._block_ids(ctx, 0, 3)
@@ -3672,22 +3643,6 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
         assert alloc.block_mtp_next_token[block0].item() == int(prompt[bs]), (
             "after the chunk that pairs it, block 0's slot is real and must advertise the "
             "token it was computed against."
-        )
-
-    @pytest.mark.internal
-    def test_only_registration_opts_a_block_into_being_inherited(self):
-        """Every block starts at -1, so any path that does not record a token fails closed.
-
-        Blocks reach registration from the free pool, where entries are either never used or
-        were reset by `_deregister_blocks`. A registration path that does not record the
-        producer's next token -- the disaggregation import in `inference_state_handoff.py`
-        does not -- therefore leaves the block uninheritable rather than wrongly inheritable.
-        """
-        ctx = self._mtp_ctx()
-        alloc = ctx.kv_block_allocator
-        assert (alloc.block_mtp_next_token == -1).all(), (
-            "a freshly built allocator must start with every block uninheritable; the default "
-            "is what makes non-recording registration paths safe."
         )
 
     @pytest.mark.internal
