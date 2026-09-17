@@ -232,7 +232,7 @@ class InferenceClient:
         Shared by the blocking and streaming submit paths so the wire format is
         defined once.
 
-        Four frames, each with a different contract:
+        Five frames, each with a different contract:
 
         0 metadata
             Decoded and repacked by the coordinator on every request, so
@@ -253,10 +253,17 @@ class InferenceClient:
             Never decoded by the coordinator, forwarded to the engine verbatim.
             Same reasoning as the prompt but a larger payload: raw image or
             video bytes, or serialized preprocessed tensors.
+        4 offload params
+            Never decoded by the coordinator, forwarded to the engine verbatim.
+            Opaque client-supplied metadata for the engine's prompt preparer and
+            payload stager, so it is unbounded and cannot share frame 0. Decoded
+            on MP rank 0 by the prompt preparer before the broadcast, and by every
+            rank at admission.
 
-        The frame count is fixed rather than varying with media, so a malformed
-        submission is caught by an arity check at the coordinator; a text-only
-        request pays one byte for a None media frame.
+        The frame count is fixed rather than varying with media or offload
+        params, so a malformed submission is caught by an arity check at the
+        coordinator; a text-only request without params pays one byte each for
+        a None media frame and a None offload frame.
 
         Returns:
             list: The frames to send, in wire order.
@@ -266,13 +273,7 @@ class InferenceClient:
         )
         return [
             msgpack.packb(
-                [
-                    Headers.SUBMIT_REQUEST.value,
-                    request_id,
-                    sampling_params.serialize(),
-                    media_meta,
-                    offload_params,
-                ],
+                [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize(), media_meta],
                 use_bin_type=True,
             ),
             self._pack_prompt(prompt),
@@ -282,6 +283,7 @@ class InferenceClient:
             # prompt was shorter than one block.
             msgpack.packb(self._block_hashes(prompt, media_meta), use_bin_type=True),
             msgpack.packb(media_payload, use_bin_type=True),
+            msgpack.packb(offload_params, use_bin_type=True),
         ]
 
     @staticmethod

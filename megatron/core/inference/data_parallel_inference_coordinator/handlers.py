@@ -88,14 +88,13 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     Sent by ``InferenceClient.add_request`` / ``add_request_streaming``.
 
-    ``metadata``: ``[header, client_request_id, sampling_params, media_meta,
-        offload_params]``,
+    ``metadata``: ``[header, client_request_id, sampling_params, media_meta]``,
         where ``sampling_params`` is the serialized dict and ``media_meta`` is the
         bounded media descriptor -- a content key plus modality and token-expansion
         flags -- carrying the identity the routing policy keys on. Both are small
         by construction, which is why they are decoded and repacked here on every
         request.
-    ``bodies``: ``[prompt, block_hashes, media]``.
+    ``bodies``: ``[prompt, block_hashes, media, offload_params]``.
 
         ``prompt`` is a string or token id list. It is forwarded to the engine
         verbatim and never decoded here, which is the point of the split.
@@ -113,6 +112,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         wire, and decoding it per request would cost this one serial loop far more
         than the prompt decode the split already removed.
 
+        ``offload_params`` is opaque client metadata for the engine's prompt
+        preparer and payload stager, None when the client sent none. It is
+        unbounded, so it is forwarded verbatim and never decoded here.
+
     Returns True (stopping the loop) if no engines are reachable.
     """
     # Message from a known client
@@ -124,18 +127,19 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # rank and every client, so an IndexError raised out of it takes the whole
     # coordinator down; a client that framed its request wrongly should only cost
     # itself that request.
-    if len(metadata) not in (4, 5) or len(bodies) != 3:
+    if len(metadata) != 4 or len(bodies) != 4:
         logging.error(
-            "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies",
+            "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies "
+            "(expected 3 fields after the header and 4 bodies)",
             len(metadata) - 1,
             len(bodies),
         )
         return
 
-    _, client_request_id, sampling_params, media_meta = metadata[:4]
-    offload_params = metadata[4] if len(metadata) == 5 else None
+    _, client_request_id, sampling_params, media_meta = metadata
     prompt_frame = bodies[0]
     media_frame = bodies[2]
+    offload_frame = bodies[3]
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -148,8 +152,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
     # media bytes, only the bounded media descriptor.
     engine_metadata = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta, offload_params],
-        use_bin_type=True,
+        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta], use_bin_type=True
     )
 
     # Media identity is read straight from the metadata frame; it salts the
@@ -199,7 +202,9 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         next_identity = coordinator.get_best_data_parallel_rank(
             request_hashes, media_cache_key=media_cache_key
         )
-        if coordinator._send_to_engine(next_identity, [engine_metadata, prompt_frame, media_frame]):
+        if coordinator._send_to_engine(
+            next_identity, [engine_metadata, prompt_frame, media_frame, offload_frame]
+        ):
             break
     else:
         # If all engines have died, we are in an abnormal state, and must exit cleanly.

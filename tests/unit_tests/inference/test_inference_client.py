@@ -72,8 +72,9 @@ async def test_inference_client_lifecycle():
     sent_connect = fake_socket.send.call_args.args[0]
     assert msgpack.unpackb(sent_connect, raw=False)[0] == Headers.CONNECT.value
 
-    # add_request frames the submission as [metadata, prompt, block_hashes, media]
-    # so the coordinator can route it without decoding the prompt or the media.
+    # add_request frames the submission as [metadata, prompt, block_hashes, media,
+    # offload_params] so the coordinator can route it without decoding the prompt,
+    # the media, or the offload params.
     offload_params = {"ng_capture": {"rollout_id": "r0", "model_call_id": "c1"}}
     fut = client.add_request(
         "hello", SamplingParams(temperature=0.5), offload_params=offload_params
@@ -81,14 +82,17 @@ async def test_inference_client_lifecycle():
     assert isinstance(fut, asyncio.Future)
     assert client.next_request_id == 1
     assert 0 in client.request_submission_times
-    submit_meta, submit_prompt, submit_hashes, submit_media = (
+    submit_meta, submit_prompt, submit_hashes, submit_media, submit_offload = (
         fake_socket.send_multipart.call_args.args[0]
     )
     submit_payload = msgpack.unpackb(submit_meta, raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[1] == 0
     assert submit_payload[2]["temperature"] == 0.5
-    assert submit_payload[4] == offload_params
+    # Offload params are unbounded client data, so they ride in their own frame
+    # rather than in the metadata frame the coordinator decodes per request.
+    assert len(submit_payload) == 4
+    assert msgpack.unpackb(submit_offload, raw=False) == offload_params
     assert msgpack.unpackb(submit_prompt, raw=False) == "hello"
     # This client was told no block size, so it reports None -- "I did not hash" --
     # and the coordinator hashes on its behalf.
@@ -262,7 +266,9 @@ async def test_media_bytes_travel_in_their_own_frame():
     image = b"jpeg-payload"
 
     client.add_request(list(range(8)), SamplingParams(), multi_modal_data={"image": image}).cancel()
-    meta_frame, _prompt, _hashes, media_frame = fake_socket.send_multipart.call_args.args[0]
+    meta_frame, _prompt, _hashes, media_frame, _offload = fake_socket.send_multipart.call_args.args[
+        0
+    ]
 
     media_meta = msgpack.unpackb(meta_frame, raw=False)[3]
     assert media_meta == {
@@ -285,7 +291,9 @@ async def test_media_frames_round_trip_back_to_serialized_form():
     multi_modal_data = {"image": [b"a", b"bb"], "media_tokens_preexpanded": True}
 
     client.add_request(list(range(8)), SamplingParams(), multi_modal_data=multi_modal_data).cancel()
-    meta_frame, _prompt, _hashes, media_frame = fake_socket.send_multipart.call_args.args[0]
+    meta_frame, _prompt, _hashes, media_frame, _offload = fake_socket.send_multipart.call_args.args[
+        0
+    ]
 
     reassembled = merge_multimodal_data(
         msgpack.unpackb(meta_frame, raw=False)[3], msgpack.unpackb(media_frame, raw=False)

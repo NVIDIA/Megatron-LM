@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import logging
 import math
 import os
 import random
@@ -1055,6 +1056,7 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
         dynamic_engine.msgpack.packb([submit, 42, params.serialize(), None], use_bin_type=True),
         dynamic_engine.msgpack.packb([3, 4], use_bin_type=True),
         dynamic_engine.msgpack.packb(None, use_bin_type=True),
+        dynamic_engine.msgpack.packb(None, use_bin_type=True),
     ]
     engine.add_request = lambda *_, **__: engine._handle_failed_request(42)
     socket = engine.socket_for_receiving_requests = mock.Mock()
@@ -1618,6 +1620,16 @@ def test_payload_offload_stages_only_eligible_completed_replies(
     assert completed.generated_log_probs == [-0.5, -0.25]
 
 
+def _submit_request_message(request_id, sampling_params, prompt, offload_params):
+    """A SUBMIT_REQUEST as the coordinator forwards it: metadata, prompt, media, offload."""
+    return [
+        msgpack.packb([Headers.SUBMIT_REQUEST.value, request_id, sampling_params, None]),
+        msgpack.packb(prompt, use_bin_type=True),
+        msgpack.packb(None, use_bin_type=True),
+        msgpack.packb(offload_params, use_bin_type=True),
+    ]
+
+
 def test_engine_prepares_prompt_before_model_parallel_broadcast():
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):
@@ -1628,27 +1640,36 @@ def test_engine_prepares_prompt_before_model_parallel_broadcast():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.prompt_preparer = _Preparer()
     sampling_params = SamplingParams(temperature=0.5).serialize()
-    message = [
-        msgpack.packb(
-            [
-                Headers.SUBMIT_REQUEST.value,
-                17,
-                sampling_params,
-                None,
-                {"ng_capture": {"rollout_id": "r0"}},
-            ],
-            use_bin_type=True,
-        ),
-        msgpack.packb([3, 4], use_bin_type=True),
-        msgpack.packb(None, use_bin_type=True),
-    ]
+    message = _submit_request_message(
+        17, sampling_params, [3, 4], {"ng_capture": {"rollout_id": "r0"}}
+    )
 
     prepared = engine._prepare_submit_request_message(message)
-    metadata = msgpack.unpackb(prepared[0], raw=False)
 
-    assert metadata[:4] == [Headers.SUBMIT_REQUEST.value, 17, sampling_params, None]
-    assert metadata[4] == {"ng_capture": {"rollout_id": "r0"}, "prepared": True}
+    # Only the prompt and offload frames are rewritten; the metadata frame is
+    # the very object that came off the wire, never repacked.
+    assert prepared[0] is message[0]
     assert msgpack.unpackb(prepared[1], raw=False) == [1, 2, 3, 4]
+    assert prepared[2] is message[2]
+    assert msgpack.unpackb(prepared[3], raw=False) == {
+        "ng_capture": {"rollout_id": "r0"},
+        "prepared": True,
+    }
+
+
+def test_engine_skips_prompt_preparation_without_offload_params():
+    """A None offload frame passes through with no frame decoded and no preparer call."""
+
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            raise AssertionError("preparer must not run without offload params")
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    undecodable = b"\xc1not-valid-msgpack"
+    message = [undecodable, undecodable, undecodable, msgpack.packb(None, use_bin_type=True)]
+
+    assert engine._prepare_submit_request_message(message) is message
 
 
 @pytest.mark.parametrize("bad_output", ["numpy_prompt", "tensor_in_params"])
@@ -1666,23 +1687,74 @@ def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_outpu
     engine.prompt_preparer = _Preparer()
     sampling_params = SamplingParams(temperature=0.5).serialize()
     original_params = {"ng_capture": {"rollout_id": "r0"}}
-    message = [
-        msgpack.packb(
-            [Headers.SUBMIT_REQUEST.value, 17, sampling_params, None, original_params],
-            use_bin_type=True,
-        ),
-        msgpack.packb([3, 4], use_bin_type=True),
-        msgpack.packb(None, use_bin_type=True),
-    ]
+    message = _submit_request_message(17, sampling_params, [3, 4], original_params)
 
     prepared = engine._prepare_submit_request_message(message)
-    metadata = msgpack.unpackb(prepared[0], raw=False)
+    offload_params = msgpack.unpackb(prepared[3], raw=False)
 
-    assert metadata[:4] == [Headers.SUBMIT_REQUEST.value, 17, sampling_params, None]
-    assert metadata[4]["ng_capture"] == {"rollout_id": "r0"}
-    assert metadata[4][dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
+    assert prepared[0] is message[0]
     assert msgpack.unpackb(prepared[1], raw=False) == [3, 4]
-    assert prepared[2] == message[2]
+    assert prepared[2] is message[2]
+    assert offload_params["ng_capture"] == {"rollout_id": "r0"}
+    assert offload_params[dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param(
+            [
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 41, {}, None, {"k": "v"}]),
+                msgpack.packb([1], use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+            ],
+            id="offload_params_in_metadata",
+        ),
+        pytest.param(
+            [
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 41, {}, None]),
+                msgpack.packb([1], use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+            ],
+            id="missing_offload_frame",
+        ),
+    ],
+)
+def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
+    """A malformed SUBMIT_REQUEST is dropped, and the next request in the batch still admits.
+
+    schedule_requests runs the same broadcast list on every MP rank, so raising
+    here would take the whole engine down for one version-skewed client, while a
+    drop is collective: every rank skips the same message.
+    """
+    params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
+    good = _submit_request_message(42, params.serialize(), [3, 4], {"ng_capture": {"r": "0"}})
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = None
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine.add_request = mock.Mock()
+    engine._fail_submission = mock.Mock()
+    socket = engine.socket_for_receiving_requests = mock.Mock()
+    socket.recv_multipart.side_effect = [malformed, good, dynamic_engine.zmq.Again]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        assert engine.schedule_requests() == 2
+
+    assert "dropping malformed SUBMIT_REQUEST" in caplog.text
+    engine._fail_submission.assert_not_called()
+    engine.add_request.assert_called_once()
+    args, kwargs = engine.add_request.call_args
+    assert args[0] == 42 and args[1] == [3, 4]
+    assert kwargs == {"offload_params": {"ng_capture": {"r": "0"}}}
+    # Both messages, dropped or not, were still broadcast to the other MP ranks.
+    broadcast = engine.model_parallel_publisher_socket.send_multipart.call_args.args[0]
+    assert msgpack.unpackb(broadcast[1], raw=False) == [len(malformed), len(good)]
 
 
 def test_handle_failed_request_releases_vlm_request_data():

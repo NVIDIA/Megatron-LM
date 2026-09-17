@@ -85,6 +85,17 @@ from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
 
 _PROMPT_PREPARATION_ERROR_FIELD = "_request_prompt_preparation_error"
 
+# Wire encoding of a None offload frame: msgpack nil is the single byte 0xc0,
+# i.e. ``msgpack.packb(None, use_bin_type=True)``. Spelled as a literal because
+# msgpack is an optional import below. Compared against the frame bytes so a
+# request without offload params is recognised without decoding anything.
+_PACKED_NONE = b"\xc0"
+
+# Frames the coordinator forwards for a SUBMIT_REQUEST: metadata, prompt,
+# media, offload params. The block-hash frame the client sent is consumed there.
+_SUBMIT_REQUEST_FRAMES = 4
+_SUBMIT_REQUEST_METADATA_FIELDS = 4
+
 try:
     from tqdm import tqdm
 
@@ -3744,20 +3755,34 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                if len(data) not in (4, 5):
-                    raise ValueError(
-                        "SUBMIT_REQUEST must carry 4 or 5 metadata fields, " f"received {len(data)}"
+                # Drop rather than raise: this loop runs on every MP rank over
+                # the same broadcast list, so a raise here takes the whole
+                # engine down for one version-skewed client, while `continue`
+                # stays collective because every rank skips the same message.
+                if (
+                    len(data) != _SUBMIT_REQUEST_METADATA_FIELDS
+                    or len(message) != _SUBMIT_REQUEST_FRAMES
+                ):
+                    logger.warning(
+                        "dropping malformed SUBMIT_REQUEST: %d metadata fields, %d frames "
+                        "(expected %d and %d)",
+                        len(data),
+                        len(message),
+                        _SUBMIT_REQUEST_METADATA_FIELDS,
+                        _SUBMIT_REQUEST_FRAMES,
                     )
-                request_id, sampling_params, media_meta = data[1:4]
-                offload_params = data[4] if len(data) == 5 else None
-                # The prompt and the media each ride in their own frame; the
-                # engine is their first consumer, so this is where they finally
-                # get decoded. The coordinator forwarded both untouched, and
-                # only the bounded media descriptor travelled in the metadata.
+                    continue
+                request_id, sampling_params, media_meta = data[1:]
+                # The prompt, the media, and the offload params each ride in
+                # their own frame; the engine is their first consumer, so this
+                # is where they finally get decoded. The coordinator forwarded
+                # all three untouched, and only the bounded media descriptor
+                # travelled in the metadata.
                 prompt = msgpack.unpackb(message[1], raw=False)
                 multi_modal_data = merge_multimodal_data(
                     media_meta, msgpack.unpackb(message[2], raw=False)
                 )
+                offload_params = msgpack.unpackb(message[3], raw=False)
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
                 # TODO(perf): media preprocessing (decode / resize / normalize /
@@ -3923,24 +3948,35 @@ class DynamicInferenceEngine(AbstractEngine):
         return len(all_messages)
 
     def _prepare_submit_request_message(self, message: List[bytes]) -> List[bytes]:
-        """Resolve a prompt once on MP rank zero before broadcasting the request."""
-        if self.prompt_preparer is None or len(message) < 2:
+        """Resolve a prompt once on MP rank zero before broadcasting the request.
+
+        The preparer only has work when the client sent offload params, so a
+        request whose offload frame is None passes through untouched without
+        any frame being decoded. When it runs, only the prompt frame and the
+        offload frame are rewritten; the metadata frame is never repacked.
+        """
+        if (
+            self.prompt_preparer is None
+            or len(message) < _SUBMIT_REQUEST_FRAMES
+            or message[3] == _PACKED_NONE
+        ):
             return message
         data = msgpack.unpackb(message[0], raw=False)
-        if Headers(data[0]) != Headers.SUBMIT_REQUEST or len(data) not in (4, 5):
+        if data[0] != Headers.SUBMIT_REQUEST.value or len(data) != _SUBMIT_REQUEST_METADATA_FIELDS:
             return message
-        request_id, sampling_params, media_meta = data[1:4]
-        offload_params = data[4] if len(data) == 5 else None
+        request_id = data[1]
         prompt = msgpack.unpackb(message[1], raw=False)
+        offload_params = msgpack.unpackb(message[3], raw=False)
 
         def _pack(prompt, offload_params):
             if isinstance(prompt, torch.Tensor):
                 prompt = prompt.tolist()
-            header = [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta]
             return [
-                msgpack.packb([*header, offload_params], use_bin_type=True),
+                message[0],
                 msgpack.packb(prompt, use_bin_type=True),
-                *message[2:],
+                message[2],
+                msgpack.packb(offload_params, use_bin_type=True),
+                *message[4:],
             ]
 
         try:
