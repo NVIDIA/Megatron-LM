@@ -82,19 +82,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     def _set_sub_optimizer_grads(self):
         if self.param_update_in_fp32:
-            for param in self.param_to_fp32_param:
+            for param, inner_param in self.param_to_inner_param.items():
                 if param in self.gpu_params_map_cpu_copy:
                     # Skip if the param is offloaded to CPU, it should be handled
                     # in the following part.
                     continue
-                fp32_param = self.param_to_fp32_param[param]
                 grad = getattr(param, "decoupled_grad", param.grad)
-                if grad is not None:
-                    fp32_param.grad = grad.to(fp32_param.dtype)
-                    fp32_param.requires_grad = True
-                else:
-                    fp32_param.grad = None
-                    fp32_param.requires_grad = False
+                inner_param.grad = grad.to(inner_param.dtype) if grad is not None else None
+                if inner_param is not param:
+                    inner_param.requires_grad = grad is not None
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
@@ -324,6 +320,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
 
+        # FusedAdam keeps its counter in GPU parameter groups, whereas Torch
+        # AdamW keeps per-parameter counters in state. Preserve the GPU counters
+        # for checkpoints and the next outer-to-child group synchronization.
+        if self.gpu_optimizer is not None:
+            param_to_group = {p: group for group in self.param_groups for p in group["params"]}
+            for group in self.gpu_optimizer.param_groups:
+                if "step" in group:
+                    orig_param = self.inner_param_to_orig_param[group["params"][0]]
+                    param_to_group[orig_param]["step"] = group["step"]
+
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
             new_state = defaultdict(dict)
@@ -374,11 +380,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            # Native FP32 params do not need a separate master parameter and are
-            # intentionally absent from param_to_fp32_param.
-            fp32_param = self.param_to_fp32_param.get(param)
-            if fp32_param is not None:
-                fp32_param.data.copy_(v["master_param"])
+            # CPU-owned native FP32 parameters also have a separate inner copy.
+            # GPU-owned native FP32 parameters are restored with the model.
+            inner_param = self.param_to_inner_param[param]
+            if inner_param is not param:
+                inner_param.data.copy_(v["master_param"])
 
     @torch.no_grad()
     def update_fp32_param_by_new_param(self):
