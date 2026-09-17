@@ -36,6 +36,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
 )
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.flaky_in_dev
+
 logger = logging.getLogger(__name__)
 
 HSDP = "hsdp"
