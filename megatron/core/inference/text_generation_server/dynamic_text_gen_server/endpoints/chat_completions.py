@@ -585,14 +585,14 @@ def _prefix_replacement_start(
 
 
 def _build_prefix_splice_metadata(
-    eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids, request_metadata
+    eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids, offload_params
 ):
     """Describe the rendered boundary so an engine-side preparer can splice exact prior tokens."""
     start = _prefix_replacement_start(
         eos_token_id, retokenized_previous_turn_token_ids, current_turn_token_ids
     )
     return {
-        **request_metadata,
+        **offload_params,
         PREFIX_SPLICE_SUFFIX_FIELD: list(current_turn_token_ids[start:]),
         PREFIX_SPLICE_BOUNDARY_FIELD: eos_token_id,
     }
@@ -783,9 +783,9 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
-        request_metadata = req.get("request_metadata")
-        if request_metadata is not None and not isinstance(request_metadata, dict):
-            return Response("'request_metadata' must be an object", status=400)
+        offload_params = req.get("offload_params")
+        if offload_params is not None and not isinstance(offload_params, dict):
+            return Response("'offload_params' must be an object", status=400)
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
@@ -900,7 +900,7 @@ try:
                 if (
                     prevent_retokenization
                     or required_prefix_token_ids is not None
-                    or request_metadata is not None
+                    or offload_params is not None
                 ):
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
@@ -930,13 +930,13 @@ try:
                         and isinstance(last_assistant_message.get("generation_token_ids"), list)
                     )
                     # Splice here when the client supplied the prior turn's tokens. When it
-                    # only supplied request_metadata, the exact prior tokens live in a store
+                    # only supplied offload_params, the exact prior tokens live in a store
                     # the engine's RequestPromptPreparer can reach: ship the rendered
                     # boundary and let the engine splice before admission.
                     splice_here = required_prefix_token_ids is not None or has_previous_turn_tokens
                     splice_in_engine = (
                         not splice_here
-                        and request_metadata is not None
+                        and offload_params is not None
                         and last_assistant_message is not None
                     )
 
@@ -1001,11 +1001,11 @@ try:
                             )
 
                         if splice_in_engine:
-                            request_metadata = _build_prefix_splice_metadata(
+                            offload_params = _build_prefix_splice_metadata(
                                 eos_token_id,
                                 retokenized_previous_turn_token_ids,
                                 prompt_tokens,
-                                request_metadata,
+                                offload_params,
                             )
                         else:
                             if required_prefix_token_ids is not None:
@@ -1139,7 +1139,7 @@ try:
                     prompt_tokens,
                     sampling_params,
                     multi_modal_data=multi_modal_data,
-                    request_metadata=request_metadata,
+                    offload_params=offload_params,
                 )
                 for _ in range(n)
             ]
@@ -1210,7 +1210,7 @@ try:
                     prompt_tokens,
                     sampling_params,
                     multi_modal_data=multi_modal_data,
-                    request_metadata=request_metadata,
+                    offload_params=offload_params,
                 )
                 request_ids.append(request_id)
                 tasks.append(future)

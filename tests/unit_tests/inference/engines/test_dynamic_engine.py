@@ -1550,10 +1550,10 @@ class _RecordingStager:
     def __init__(self):
         self.staged = []
 
-    def stage(self, uid, payload, *, finished_metadata, request_metadata=None):
+    def stage(self, uid, payload, *, finished_metadata, offload_params=None):
         self.staged.append((uid, payload))
         self.finished_metadata = finished_metadata
-        self.request_metadata = request_metadata
+        self.offload_params = offload_params
         return RequestPayloadStageResult()
 
 
@@ -1621,8 +1621,8 @@ def test_payload_offload_stages_only_eligible_completed_replies(
 
 def test_engine_prepares_prompt_before_model_parallel_broadcast():
     class _Preparer:
-        def prepare_prompt(self, prompt, *, request_metadata=None):
-            metadata = dict(request_metadata or {})
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            metadata = dict(offload_params or {})
             metadata["prepared"] = True
             return [1, 2, *prompt], metadata
 

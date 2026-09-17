@@ -707,7 +707,7 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     compact_prompt_tokens: Optional[torch.Tensor] = None
     # Opaque JSON/msgpack-compatible metadata owned by an external payload stager.
-    request_metadata: Optional[Dict[str, Any]] = None
+    offload_params: Optional[Dict[str, Any]] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     policy_epoch: Optional[list[tuple[int, int]]] = None
@@ -887,7 +887,7 @@ class DynamicInferenceRequest(InferenceRequest):
         obj.pop("event_add_engine", None)
         # Request metadata is input-only. Only the stager's response metadata
         # crosses back to the REST endpoint.
-        obj.pop("request_metadata", None)
+        obj.pop("offload_params", None)
         obj["prompt_length"] = prompt_len
         obj["payload_offloaded"] = payload_offloaded
         obj["payload_stage_metadata"] = dict(payload_stage_metadata or {})
@@ -1106,7 +1106,7 @@ class DynamicInferenceRequestRecord:
             prompt_tokens=new_prompt_tokens,
             compact_prompt_tokens=old_request.compact_prompt_tokens,
             sampling_params=old_request.sampling_params,
-            request_metadata=copy.deepcopy(old_request.request_metadata),
+            offload_params=copy.deepcopy(old_request.offload_params),
             status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
@@ -1206,7 +1206,7 @@ class DynamicInferenceRequestRecord:
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             compact_prompt_tokens=first_request.compact_prompt_tokens,
-            request_metadata=copy.deepcopy(first_request.request_metadata),
+            offload_params=copy.deepcopy(first_request.offload_params),
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=None,
@@ -1315,7 +1315,7 @@ class RequestPayloadStager(Protocol):
         payload: OffloadedRequestPayload,
         *,
         finished_metadata: FinishedRequestRecord,
-        request_metadata: Optional[Dict[str, Any]] = None,
+        offload_params: Optional[Dict[str, Any]] = None,
     ) -> Optional[RequestPayloadStageResult]:
         """Stage a payload, or return ``None`` to keep it on the normal reply path."""
         ...
@@ -1336,7 +1336,7 @@ class RequestPromptPreparer(Protocol):
         self,
         prompt: Union[str, List[int], torch.Tensor],
         *,
-        request_metadata: Optional[Dict[str, Any]] = None,
+        offload_params: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Union[str, List[int], torch.Tensor], Optional[Dict[str, Any]]]:
         """Return the engine prompt and metadata that describe that prompt."""
         ...

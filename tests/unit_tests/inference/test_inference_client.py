@@ -74,9 +74,9 @@ async def test_inference_client_lifecycle():
 
     # add_request frames the submission as [metadata, prompt, block_hashes, media]
     # so the coordinator can route it without decoding the prompt or the media.
-    request_metadata = {"ng_capture": {"rollout_id": "r0", "model_call_id": "c1"}}
+    offload_params = {"ng_capture": {"rollout_id": "r0", "model_call_id": "c1"}}
     fut = client.add_request(
-        "hello", SamplingParams(temperature=0.5), request_metadata=request_metadata
+        "hello", SamplingParams(temperature=0.5), offload_params=offload_params
     )
     assert isinstance(fut, asyncio.Future)
     assert client.next_request_id == 1
@@ -88,7 +88,7 @@ async def test_inference_client_lifecycle():
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[1] == 0
     assert submit_payload[2]["temperature"] == 0.5
-    assert submit_payload[4] == request_metadata
+    assert submit_payload[4] == offload_params
     assert msgpack.unpackb(submit_prompt, raw=False) == "hello"
     # This client was told no block size, so it reports None -- "I did not hash" --
     # and the coordinator hashes on its behalf.

@@ -1441,7 +1441,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.uid,
                 OffloadedRequestPayload.from_request(request),
                 finished_metadata=FinishedRequestRecord.from_request(request),
-                request_metadata=request.request_metadata,
+                offload_params=request.offload_params,
             )
         return request.serialize(
             payload_offloaded=stage_result is not None,
@@ -1713,7 +1713,7 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
-        request_metadata: Optional[Dict] = None,
+        offload_params: Optional[Dict] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1746,7 +1746,7 @@ class DynamicInferenceEngine(AbstractEngine):
             num_frames (Optional[Tensor]): Number of frames per image/video item.
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
-            request_metadata (Optional[Dict]): Opaque metadata forwarded to the payload stager.
+            offload_params (Optional[Dict]): Opaque metadata forwarded to the payload stager.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1812,11 +1812,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 precomputed_block_hashes=precomputed_block_hashes,
                 num_frames=num_frames,
                 media_tokens_preexpanded=media_tokens_preexpanded,
-                request_metadata=request_metadata,
+                offload_params=offload_params,
             )
             prompt_preparation_error = (
-                request_metadata.get(_PROMPT_PREPARATION_ERROR_FIELD)
-                if isinstance(request_metadata, dict)
+                offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
+                if isinstance(offload_params, dict)
                 else None
             )
             if prompt_preparation_error is not None:
@@ -1840,7 +1840,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 prompt=prompt_str,
                 prompt_tokens=tokens,
                 sampling_params=sampling_params,
-                request_metadata=request_metadata,
+                offload_params=offload_params,
                 block_size_tokens=self.context.block_size_tokens,
                 enable_prefix_caching=self.context.enable_prefix_caching,
                 precomputed_block_hashes=precomputed_block_hashes or [],
@@ -1852,8 +1852,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
             prompt_preparation_error = (
-                request_metadata.get(_PROMPT_PREPARATION_ERROR_FIELD)
-                if isinstance(request_metadata, dict)
+                offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
+                if isinstance(offload_params, dict)
                 else None
             )
             if prompt_preparation_error is not None:
@@ -1878,7 +1878,7 @@ class DynamicInferenceEngine(AbstractEngine):
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
-        request_metadata: Optional[Dict] = None,
+        offload_params: Optional[Dict] = None,
     ) -> DynamicVLMInferenceRequest:
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
@@ -2045,7 +2045,7 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt_tokens=tokens,
             compact_prompt_tokens=compact_prompt_tokens,
             sampling_params=sampling_params,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
             # Recompute the block hashes for multimodal embeddings,
@@ -3747,7 +3747,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         "SUBMIT_REQUEST must carry 4 or 5 metadata fields, " f"received {len(data)}"
                     )
                 request_id, sampling_params, media_meta = data[1:4]
-                request_metadata = data[4] if len(data) == 5 else None
+                offload_params = data[4] if len(data) == 5 else None
                 # The prompt and the media each ride in their own frame; the
                 # engine is their first consumer, so this is where they finally
                 # get decoded. The coordinator forwarded both untouched, and
@@ -3787,12 +3787,12 @@ class DynamicInferenceEngine(AbstractEngine):
                             request_id,
                             prompt,
                             sampling_params,
-                            request_metadata=request_metadata,
+                            offload_params=offload_params,
                             **vlm_kwargs,
                         )
                     else:
                         self.add_request(
-                            request_id, prompt, sampling_params, request_metadata=request_metadata
+                            request_id, prompt, sampling_params, offload_params=offload_params
                         )
                 except Exception as error:  # pylint: disable=broad-except
                     self._fail_submission(request_id, sampling_params, error)
@@ -3928,27 +3928,21 @@ class DynamicInferenceEngine(AbstractEngine):
         if Headers(data[0]) != Headers.SUBMIT_REQUEST or len(data) not in (4, 5):
             return message
         request_id, sampling_params, media_meta = data[1:4]
-        request_metadata = data[4] if len(data) == 5 else None
+        offload_params = data[4] if len(data) == 5 else None
         prompt = msgpack.unpackb(message[1], raw=False)
         try:
-            prompt, request_metadata = self.prompt_preparer.prepare_prompt(
-                prompt, request_metadata=request_metadata
+            prompt, offload_params = self.prompt_preparer.prepare_prompt(
+                prompt, offload_params=offload_params
             )
         except Exception as error:  # pylint: disable=broad-except
             logging.exception("prompt preparation failed for request %s", request_id)
-            request_metadata = dict(request_metadata or {})
-            request_metadata[_PROMPT_PREPARATION_ERROR_FIELD] = f"{type(error).__name__}: {error}"
+            offload_params = dict(offload_params or {})
+            offload_params[_PROMPT_PREPARATION_ERROR_FIELD] = f"{type(error).__name__}: {error}"
         if isinstance(prompt, torch.Tensor):
             prompt = prompt.tolist()
         prepared = list(message)
         prepared[0] = msgpack.packb(
-            [
-                Headers.SUBMIT_REQUEST.value,
-                request_id,
-                sampling_params,
-                media_meta,
-                request_metadata,
-            ],
+            [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta, offload_params],
             use_bin_type=True,
         )
         prepared[1] = msgpack.packb(prompt, use_bin_type=True)

@@ -32,14 +32,14 @@ class _Tokenizer:
 class _CapturingClient:
     def __init__(self):
         self.sampling_params = []
-        self.request_metadata = []
+        self.offload_params = []
 
     def add_request_with_id(
-        self, prompt_tokens, sampling_params, *, multi_modal_data=None, request_metadata=None
+        self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
     ):
         del prompt_tokens, multi_modal_data
         self.sampling_params.append(sampling_params)
-        self.request_metadata.append(request_metadata)
+        self.offload_params.append(offload_params)
         raise RuntimeError("stop after request submission")
 
 
@@ -71,7 +71,7 @@ class _CapturingClient:
         (
             True,
             {
-                "request_metadata": {
+                "offload_params": {
                     "ng_capture": {
                         "mode": "text",
                         "rollout_id": "r0",
@@ -120,7 +120,7 @@ async def test_chat_request_uses_server_defaults(
     assert sampling_params.top_p == expected_top_p
     assert sampling_params.top_k == expected_top_k
     assert sampling_params.return_prompt_tokens is expected_prompt_tokens
-    assert inference_client.request_metadata == [request_overrides.get("request_metadata")]
+    assert inference_client.offload_params == [request_overrides.get("offload_params")]
 
 
 def test_sampling_config_reaches_frontend_process(monkeypatch):

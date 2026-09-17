@@ -50,16 +50,14 @@ def test_prefix_splice_metadata_carries_suffix_from_the_rendered_boundary():
     eos = 99
     previous_rendering = [1, 99, 2, 99]
     current_rendering = [1, 99, 2, 99, 3, 4]
-    request_metadata = {"ng_capture": {"staging_chain": ["k1"]}}
+    offload_params = {"ng_capture": {"staging_chain": ["k1"]}}
 
-    out = _build_prefix_splice_metadata(
-        eos, previous_rendering, current_rendering, request_metadata
-    )
+    out = _build_prefix_splice_metadata(eos, previous_rendering, current_rendering, offload_params)
 
     assert out[PREFIX_SPLICE_SUFFIX_FIELD] == [99, 3, 4]
     assert out[PREFIX_SPLICE_BOUNDARY_FIELD] == 99
     assert out["ng_capture"] == {"staging_chain": ["k1"]}
-    assert PREFIX_SPLICE_SUFFIX_FIELD not in request_metadata  # input not mutated
+    assert PREFIX_SPLICE_SUFFIX_FIELD not in offload_params  # input not mutated
 
 
 def test_media_slot_uses_tokenizer_id_when_model_id_is_unspecified():

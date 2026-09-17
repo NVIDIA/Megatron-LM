@@ -151,7 +151,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -176,7 +176,7 @@ class InferenceClient:
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
-            request_metadata: Opaque JSON/msgpack-compatible metadata forwarded
+            offload_params: Opaque JSON/msgpack-compatible metadata forwarded
                 to the engine's payload stager.
 
         Returns:
@@ -188,7 +188,7 @@ class InferenceClient:
             prompt,
             sampling_params,
             multi_modal_data=multi_modal_data,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
         )[1]
 
     def add_request_with_id(
@@ -197,7 +197,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> tuple[int, asyncio.Future]:
         """Submit a request and return its id alongside its completion future.
 
@@ -220,12 +220,12 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         frames = self._pack_submit_frames(
-            request_id, prompt, sampling_params, multi_modal_data, request_metadata=request_metadata
+            request_id, prompt, sampling_params, multi_modal_data, offload_params=offload_params
         )
         return request_id, self._submit_request(frames, request_id)
 
     def _pack_submit_frames(
-        self, request_id, prompt, sampling_params, multi_modal_data, *, request_metadata=None
+        self, request_id, prompt, sampling_params, multi_modal_data, *, offload_params=None
     ):
         """Build the multipart frames for a SUBMIT_REQUEST.
 
@@ -271,7 +271,7 @@ class InferenceClient:
                     request_id,
                     sampling_params.serialize(),
                     media_meta,
-                    request_metadata,
+                    offload_params,
                 ],
                 use_bin_type=True,
             ),
@@ -425,7 +425,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -456,7 +456,7 @@ class InferenceClient:
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
-            request_metadata: Opaque JSON/msgpack-compatible metadata forwarded
+            offload_params: Opaque JSON/msgpack-compatible metadata forwarded
                 to the engine's payload stager.
 
         Returns:
@@ -466,7 +466,7 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         frames = self._pack_submit_frames(
-            request_id, prompt, sampling_params, multi_modal_data, request_metadata=request_metadata
+            request_id, prompt, sampling_params, multi_modal_data, offload_params=offload_params
         )
         return self._submit_stream(frames, request_id)
 

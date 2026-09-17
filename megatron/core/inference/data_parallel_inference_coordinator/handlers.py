@@ -89,7 +89,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     Sent by ``InferenceClient.add_request`` / ``add_request_streaming``.
 
     ``metadata``: ``[header, client_request_id, sampling_params, media_meta,
-        request_metadata]``,
+        offload_params]``,
         where ``sampling_params`` is the serialized dict and ``media_meta`` is the
         bounded media descriptor -- a content key plus modality and token-expansion
         flags -- carrying the identity the routing policy keys on. Both are small
@@ -133,7 +133,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         return
 
     _, client_request_id, sampling_params, media_meta = metadata[:4]
-    request_metadata = metadata[4] if len(metadata) == 5 else None
+    offload_params = metadata[4] if len(metadata) == 5 else None
     prompt_frame = bodies[0]
     media_frame = bodies[2]
 
@@ -148,7 +148,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
     # media bytes, only the bounded media descriptor.
     engine_metadata = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta, request_metadata],
+        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta, offload_params],
         use_bin_type=True,
     )
 

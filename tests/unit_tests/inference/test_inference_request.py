@@ -725,7 +725,7 @@ def test_supplied_block_hashes_are_not_re_salted():
 def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
     admission = {"rollout_id": "r0", "model_call_id": "c1"}
     request = _make_dynamic_request(
-        uid="chatcmpl-fixed", request_metadata={"ng_capture": admission}, generated_tokens=[10]
+        uid="chatcmpl-fixed", offload_params={"ng_capture": admission}, generated_tokens=[10]
     )
     request.generated_log_probs = [-0.25]
     record = DynamicInferenceRequestRecord.from_request(request)
@@ -733,14 +733,14 @@ def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
     merged = record.merge()
 
     assert merged.uid == "chatcmpl-fixed"
-    assert merged.request_metadata == {"ng_capture": admission}
+    assert merged.offload_params == {"ng_capture": admission}
 
     serialized = merged.serialize(
         payload_offloaded=True,
         payload_stage_metadata={"ng_commit_coords": {"staging_key": "r0/c1"}},
     )
     assert serialized["uid"] == "chatcmpl-fixed"
-    assert "request_metadata" not in serialized
+    assert "offload_params" not in serialized
     assert serialized["generated_log_probs"] is None
     assert serialized["payload_offloaded"] is True
     assert serialized["payload_stage_metadata"] == {"ng_commit_coords": {"staging_key": "r0/c1"}}
