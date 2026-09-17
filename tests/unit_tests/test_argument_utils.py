@@ -298,6 +298,27 @@ class TestHybridConfigFromArgs:
         spec_factory.assert_not_called()
 
 
+@dataclass
+class ConfigWithPercentHelp:
+    """Config docs containing literal percentages and modulo expressions."""
+
+    interval: int = 2
+    """Recompute 50% of layers where layer_number % mhc_recompute_layer_num == 0."""
+
+    explicit: int = field(
+        default=17, metadata={"argparse_meta": {"help": "default %(default)s; 100%% literal"}}
+    )
+    """The explicit help overrides this docstring."""
+
+
+def test_generated_help_preserves_literal_percent_and_explicit_placeholders():
+    parser = ArgumentParser()
+    ArgumentGroupFactory(ConfigWithPercentHelp).build_group(parser)
+    help_text = " ".join(parser.format_help().split())
+    assert "50% of layers where layer_number % mhc_recompute_layer_num == 0" in help_text
+    assert "default 17; 100% literal" in help_text
+
+
 class TestArgumentGroupFactoryBasic:
     """Test basic functionality of ArgumentGroupFactory."""
 
