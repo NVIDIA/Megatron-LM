@@ -808,10 +808,13 @@ class TestMegatronNetworkArgumentGeneration:
 
     def test_train_full_dataset_flag(self):
         from megatron.training.arguments import _add_training_args
+        from megatron.training.config import TrainingConfig
 
+        # This remains a CLI option until dataset options get their own config.
+        assert "train_full_dataset" not in TrainingConfig.__dataclass_fields__
         parser = _add_training_args(ArgumentParser(exit_on_error=False))
         assert parser.parse_args([]).train_full_dataset is False
-        assert parser.parse_args(["--train-full-dataset"]).train_full_dataset
+        assert parser.parse_args(["--train-full-dataset"]).train_full_dataset is True
 
 
 def test_sft_loss_log_mode_argument():
