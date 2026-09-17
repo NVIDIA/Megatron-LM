@@ -21,6 +21,12 @@ SIZE_GUIDANCE = {event_accumulator.TENSORS: 0, event_accumulator.SCALARS: 0}
 logger = logging.getLogger(__name__)
 
 
+# Metrics a functional test validates against when its model_config.yaml does not
+# set an explicit METRICS list. This is the single source of truth consumed by the
+# pretraining pipelines and by tests/unit_tests/test_model_configs.py.
+DEFAULT_METRICS = ["lm loss", "num-zeros"]
+
+
 class TypeOfTestResult(enum.Enum):
     APPROXIMATE = 1
     DETERMINISTIC = 2
