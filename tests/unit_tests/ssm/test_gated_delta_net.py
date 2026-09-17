@@ -156,7 +156,7 @@ def test_gdn_config_rejects_nondeterministic_backend_in_deterministic_mode(backe
 def test_gdn_kernel_backend_validation(backend):
     """Direct config construction rejects unsupported GDN backend names."""
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=2)
-    assert config.gdn_kernel_backend == "fla"
+    assert config.gdn_kernel_backend is None
     torch_config = TransformerConfig(
         num_layers=1, hidden_size=128, num_attention_heads=2, gdn_kernel_backend="torch"
     )

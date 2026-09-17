@@ -92,6 +92,9 @@ class GatedDeltaNet2(_GDNBase):
         self.a_log_dim = self.num_k_heads_local_tp
 
         backend = self.config.gdn_kernel_backend
+        if backend is None:
+            # Unset: deterministic mode uses the torch-native kernel; FLA otherwise.
+            backend = "torch" if self.config.deterministic_mode else "fla"
         if self.config.deterministic_mode and backend != "torch":
             raise ValueError(
                 "deterministic_mode=True requires gdn_kernel_backend='torch' for GDN2."

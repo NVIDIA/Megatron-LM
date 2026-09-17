@@ -70,6 +70,10 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         self.chunk_size = 64
 
         backend = self.config.gdn_kernel_backend
+        if backend is None:
+            # Unset: follow the deterministic-mode contract, mirroring the default where
+            # deterministic mode uses the torch-native kernel and FLA otherwise.
+            backend = "torch" if self.config.deterministic_mode else "fla"
         if self.config.deterministic_mode and backend != "torch":
             raise ValueError(
                 "deterministic_mode=True requires gdn_kernel_backend='torch' for " "Gated DeltaNet."
