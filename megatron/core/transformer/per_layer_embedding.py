@@ -326,9 +326,19 @@ class PerLayerEmbedding(MegatronModule):
             token_ids: [b, s] raw token ids of the full (not sequence-parallel-sharded) batch.
             cu_seqlens: Packed-sequence boundaries for THD inputs (``[1, T]`` token ids).
         """
-        assert (
-            parallel_state.get_context_parallel_world_size() == 1
-        ), "PerLayerEmbedding does not support context parallelism."
+        from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp
+
+        if parallel_state.get_context_parallel_world_size() > 1:
+            if cu_seqlens is not None:
+                raise NotImplementedError(
+                    "PerLayerEmbedding context parallelism currently supports sbhd only; "
+                    "THD (packed) CP is not yet wired (needs a PackedSeqParams-aware "
+                    "reconstruct_tensor_cp path)."
+                )
+            # Reconstruct the global token stream so n-gram hashing — which looks back
+            # ``ngram_size`` tokens — is correct across CP-rank boundaries, rather than being
+            # fed a CP-local slice whose first tokens have no left context.
+            token_ids = reconstruct_tensor_cp(token_ids, None, dim=1)
         with torch.no_grad():
             self._ngram_ids = self.ple_embedding.compute_ngram_ids(token_ids, cu_seqlens)
             # Conv taps must not read across packed-sequence boundaries.
@@ -391,6 +401,14 @@ class PerLayerEmbedding(MegatronModule):
         """[s_local, b, n*C] streams -> [s_local, b, n*C] PLE update (to be added by the layer)."""
         if self._ngram_ids is None:
             raise RuntimeError("PerLayerEmbedding.prepare() must be called before forward().")
+        from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp, split_tensor_cp
+
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size > 1:
+            # Gather the full sequence (true causal order) so the causal dilated conv reads
+            # across CP-rank boundaries; every rank redundantly computes the full layer, then
+            # the output is split back to this rank's CP-local slice. No-op when CP size is 1.
+            hidden_states = reconstruct_tensor_cp(hidden_states, None, dim=0)
         s_local, batch_size, hc_hidden_size = hidden_states.shape
         n, C = self.n, self.hidden_size
         dtype = hidden_states.dtype
@@ -419,4 +437,7 @@ class PerLayerEmbedding(MegatronModule):
         )
         positions = self._local_positions(s_local)
         conv_out = self._causal_dilated_conv(gated_value_normed, positions)
-        return gated_value + F.silu(conv_out.float()).to(dtype)
+        out = gated_value + F.silu(conv_out.float()).to(dtype)
+        if cp_size > 1:
+            out = split_tensor_cp(out, None, dim=0)
+        return out

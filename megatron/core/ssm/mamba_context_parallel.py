@@ -432,3 +432,78 @@ def _redo_attention_load_balancing(
                 cu_seqlens, total_tokens, cp_size, cp_rank
             )
         return input_.index_select(0, index)
+
+
+def reconstruct_tensor_cp(
+    tensor: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None, dim: int = 0
+) -> torch.Tensor:
+    """All-gather a context-parallel-sharded tensor and undo the zigzag load balancing.
+
+    Every CP rank ends up with the full sequence in true causal (sequential) order, so
+    modules that need global context — the QSA indexer block selection and the PLE n-gram
+    hashing plus its causal dilated conv — can run on the gathered tensor exactly as in the
+    CP=1 case. The local rank's own slice is re-pinned into the gathered buffer so the local
+    autograd graph is preserved; under the replicate-then-split pattern each rank redundantly
+    computes the full layer, so every rank's own rows receive their gradient from its own
+    backward (cross-rank gradients land on detached slots and are correctly recomputed on the
+    owning rank), with no backward collective and therefore no deadlock.
+    """
+    from megatron.core import parallel_state
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return tensor
+
+    cp_group = parallel_state.get_context_parallel_group()
+    cp_rank = parallel_state.get_context_parallel_rank()
+
+    need_transpose = dim != 0
+    if need_transpose:
+        tensor = tensor.transpose(0, dim).contiguous()
+
+    tensor = tensor.contiguous()
+    output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+    torch.distributed.all_gather(output_list, tensor, group=cp_group)
+    # Re-pin the local slot with the original tensor so the local autograd graph survives.
+    output_list[cp_rank] = tensor
+    gathered = torch.cat(output_list, dim=0)
+
+    gathered = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
+
+    if need_transpose:
+        gathered = gathered.transpose(0, dim).contiguous()
+    return gathered
+
+
+def split_tensor_cp(
+    tensor: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None, dim: int = 0
+) -> torch.Tensor:
+    """Inverse of :func:`reconstruct_tensor_cp`: redo the zigzag load balancing and return
+    this CP rank's local slice.
+
+    Used to split a full-sequence output — produced on the gathered tensor — back into the
+    CP-local zigzag form the rest of the model expects. No collective is needed: every rank
+    already holds the full tensor from a preceding ``reconstruct_tensor_cp``, so this is a
+    local reorder followed by a slice. The slice preserves the autograd graph for the local
+    rows, routing their gradient back through the sequential full tensor to the local slot.
+    """
+    from megatron.core import parallel_state
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return tensor
+
+    cp_rank = parallel_state.get_context_parallel_rank()
+
+    need_transpose = dim != 0
+    if need_transpose:
+        tensor = tensor.transpose(0, dim).contiguous()
+
+    redone = _redo_attention_load_balancing(tensor, cp_size, packed_seq_params)
+    s_full = redone.shape[0]
+    s_local = s_full // cp_size
+    out = redone[cp_rank * s_local : (cp_rank + 1) * s_local]
+
+    if need_transpose:
+        out = out.transpose(0, dim).contiguous()
+    return out

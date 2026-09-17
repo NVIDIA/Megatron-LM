@@ -160,7 +160,10 @@ class QSAIndexer(MegatronModule):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
-        assert get_pg_size(pg_collection.cp) == 1, "QSA does not support context parallelism."
+        # Context parallelism is supported via an all-gather of the hidden (and rotary)
+        # tensors in ``forward`` (see ``reconstruct_tensor_cp``): every CP rank rebuilds the
+        # full sequence so the block selection sees every key, mirroring the CP=1 path. Only
+        # the all-gather CP comm type is supported; ring/p2p cannot expose every key.
 
         self.index_qk_proj = build_module(
             submodules.linear_qk,
@@ -331,6 +334,20 @@ class QSAIndexer(MegatronModule):
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, group=self.pg_collection.tp
             )
+        cp_size = get_pg_size(self.pg_collection.cp)
+        if cp_size > 1:
+            # Rebuild the full sequence (true causal order) so the block selection sees every
+            # key of the sequence, exactly as in the CP=1 case. The owning
+            # ``QwenSparseSelfAttention`` runs the standard CP attention (all-gather q/k/v ->
+            # attention over the full sequence -> split), which aligns with this gathered
+            # selection; only the all-gather CP comm type is supported.
+            from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp
+
+            hidden_states = reconstruct_tensor_cp(hidden_states, packed_seq_params, dim=0)
+        # Under CP the hidden (and thus q) is the full gathered sequence, so apply rotary as
+        # in the CP=1 case; the owning attention's own CP all-gather produces the same
+        # full-sequence rotary, keeping the selection aligned with q/k/v.
+        rope_cp_group = None if cp_size > 1 else self.pg_collection.cp
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         s, b, _ = hidden_states.shape
         with torch.no_grad():
@@ -351,13 +368,11 @@ class QSAIndexer(MegatronModule):
                 rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=packed_seq_params.cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
+                cp_group=rope_cp_group,
                 max_seqlen=packed_seq_params.max_seqlen_q,
             ).unsqueeze(1)
         else:
-            q = apply_rotary_pos_emb(
-                q, rotary_pos_emb, config=self.config, cp_group=self.pg_collection.cp
-            )
+            q = apply_rotary_pos_emb(q, rotary_pos_emb, config=self.config, cp_group=rope_cp_group)
         # Flatten [s, b] -> [b*s] token order (batch-major) to match doc_ids/positions [b, s].
         q_flat = q.transpose(0, 1).reshape(b * s, self.n_heads, self.head_dim)
         keys_flat = raw_keys.transpose(0, 1).reshape(b * s, self.head_dim)
