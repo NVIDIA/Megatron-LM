@@ -320,12 +320,15 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+        Literal['gdn', 'gdn2', 'kda', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
     ] = None
-    """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
+    """Type of attention variant to use. Supports gdn, gdn2, kda, dsa, and dsv4_hybrid.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
     channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
     Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
+    kda selects Kimi Delta Attention (Kimi Linear, arXiv:2510.26692), a gated delta rule with
+    a per-channel forget gate and separate (unfused) projections; like gdn it is a linear
+    attention variant driven by linear_attention_freq.
     'gated_delta_net' is a deprecated alias of 'gdn': it is normalized to 'gdn' in
     __post_init__ and emits a DeprecationWarning."""
 
@@ -421,6 +424,14 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    kda_gate_lower_bound: Optional[float] = None
+    """Lower bound of the Kimi Delta Attention log-decay gate.
+
+    When set, the forget gate is ``lower_bound * sigmoid(exp(A_log) * (f + dt_bias))``, which
+    keeps the log-decay in ``[lower_bound, 0)`` (GLM-5.3-Flash uses -5.0). ``None`` selects the
+    unbounded ``-exp(A_log) * softplus(f + dt_bias)`` gate of the original Kimi Linear. Only
+    read when ``experimental_attention_variant='kda'``."""
 
     ####################
     # initialization
@@ -1726,6 +1737,33 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
+        elif self.experimental_attention_variant == "kda":
+            assert (
+                self.linear_attention_freq is not None
+            ), "linear_attention_freq must be set for kda."
+            assert (
+                self.linear_conv_kernel_dim is not None
+            ), "linear_conv_kernel_dim must be set for kda."
+            assert (
+                self.linear_key_head_dim is not None and self.linear_value_head_dim is not None
+            ), "linear_key_head_dim and linear_value_head_dim must be set for kda."
+            assert self.linear_key_head_dim == self.linear_value_head_dim, (
+                f"kda uses the same head dimension for q/k and v, got "
+                f"{self.linear_key_head_dim=} and {self.linear_value_head_dim=}."
+            )
+            assert (
+                self.linear_num_key_heads is not None and self.linear_num_value_heads is not None
+            ), "linear_num_key_heads and linear_num_value_heads must be set for kda."
+            assert self.linear_num_key_heads == self.linear_num_value_heads, (
+                f"kda uses the same number of q/k and v heads, got "
+                f"{self.linear_num_key_heads=} and {self.linear_num_value_heads=}."
+            )
+            assert self.linear_num_value_heads % self.tensor_model_parallel_size == 0, (
+                f"{self.linear_num_value_heads=} must be a multiple of "
+                f"({self.tensor_model_parallel_size=})."
+            )
+            if self.context_parallel_size > 1:
+                raise ValueError("kda does not support context parallelism.")
         elif self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
             if self.add_bias_linear:

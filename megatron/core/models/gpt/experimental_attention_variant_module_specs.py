@@ -6,6 +6,7 @@ from typing import List, Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, get_backend_from_config
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
+from megatron.core.ssm.kda import KimiDeltaAttention, KimiDeltaAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
@@ -46,6 +47,9 @@ from megatron.core.typed_torch import not_none
 # Canonical ``experimental_attention_variant`` names served by the gated delta net family.
 GDN_ATTENTION_VARIANTS = ("gdn", "gdn2")
 
+# Canonical ``experimental_attention_variant`` names served by the Kimi Delta Attention layer.
+KDA_ATTENTION_VARIANTS = ("kda",)
+
 # Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
 _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 
@@ -78,6 +82,36 @@ def get_gated_delta_net_module_spec(
         metainfo={"fuse_input_layernorm": True},
     )
     return attention
+
+
+def get_kda_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for Kimi Delta Attention (KDA).
+
+    Unlike GDN, KDA keeps its projections separate (that is the layout its reference
+    checkpoints ship in), so the input layernorm cannot be fused into the first linear.
+    """
+
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    column = backend.column_parallel_linear()
+    return ModuleSpec(
+        module=KimiDeltaAttention,
+        submodules=KimiDeltaAttentionSubmodules(
+            q_proj=column,
+            k_proj=column,
+            v_proj=column,
+            f_a_proj=backend.linear(),
+            f_b_proj=column,
+            g_a_proj=backend.linear(),
+            g_b_proj=column,
+            b_proj=column,
+            o_proj=backend.row_parallel_linear(),
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
 
 
 def get_dsa_module_spec_for_backend(
@@ -142,6 +176,8 @@ def get_experimental_attention_variant_module_spec(
 
     if is_gated_delta_net_variant(config.experimental_attention_variant):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif is_kda_variant(config.experimental_attention_variant):
+        return get_kda_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsv4_hybrid":
@@ -382,9 +418,16 @@ def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) ->
     return canonical in GDN_ATTENTION_VARIANTS
 
 
+def is_kda_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """Check if the experimental attention variant is served by a Kimi Delta Attention layer."""
+    return experimental_attention_variant in KDA_ATTENTION_VARIANTS
+
+
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    return is_gated_delta_net_variant(experimental_attention_variant)
+    return is_gated_delta_net_variant(experimental_attention_variant) or is_kda_variant(
+        experimental_attention_variant
+    )
 
 
 def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
