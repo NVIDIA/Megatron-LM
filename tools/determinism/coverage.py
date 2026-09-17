@@ -19,6 +19,8 @@ from typing import Callable, Iterator
 
 from tools.determinism.branch_coverage import branch_report
 from tools.determinism.checks import KINDS, PASSED, author_requirements, check_statuses
+from tools.determinism.configuration import configured_signature
+from tools.determinism.configuration import replay_configuration as replay_configuration
 from tools.determinism.parallelism import parallelism_report
 
 SCHEMA_VERSION = 1
@@ -28,9 +30,6 @@ UNVERIFIED = "not_verified"
 STATUSES = (DETERMINISTIC, NONDETERMINISTIC, UNVERIFIED)
 _OBSERVER: contextvars.ContextVar[Callable[[dict], None] | None] = contextvars.ContextVar(
     "determinism_observer", default=None
-)
-_CONFIGURATION: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "determinism_replay_configuration", default=None
 )
 
 
@@ -75,16 +74,6 @@ def collect_observations(sink: Callable[[dict], None]) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def replay_configuration(configuration: dict) -> Iterator[None]:
-    """Attach runtime configuration observed by the replay adapter, not its plan."""
-    token = _CONFIGURATION.set({**(_CONFIGURATION.get() or {}), **configuration})
-    try:
-        yield
-    finally:
-        _CONFIGURATION.reset(token)
-
-
-@contextlib.contextmanager
 def observe_replay(signature: dict, protocol: dict) -> Iterator[dict]:
     """Record completed comparisons; preserve the original exception on failure.
 
@@ -92,7 +81,7 @@ def observe_replay(signature: dict, protocol: dict) -> Iterator[dict]:
     An unrelated assertion, unsupported operation, or infrastructure error remains
     unverified, even if pytest marks it as an expected failure.
     """
-    signature = {**signature, **(_CONFIGURATION.get() or {})}
+    signature = configured_signature(signature)
     observation: dict = {"signature": signature, "protocol": protocol, "status": UNVERIFIED}
     try:
         yield observation

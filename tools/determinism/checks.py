@@ -8,6 +8,8 @@ import contextlib
 import contextvars
 from typing import Callable, Iterator
 
+from tools.determinism.configuration import configured_signature
+
 PASSED = "passed"
 FAILED = "failed"
 UNVERIFIED = "not_verified"
@@ -62,7 +64,12 @@ def observe_check(kind: str, signature: dict, protocol: dict) -> Iterator[dict]:
     """Keep a failed reference assertion distinct from an observed replay mismatch."""
     if kind not in KINDS:
         raise ValueError(f"Unknown kernel check: {kind}")
-    check = {"kind": kind, "signature": signature, "protocol": protocol, "status": UNVERIFIED}
+    check = {
+        "kind": kind,
+        "signature": configured_signature(signature),
+        "protocol": protocol,
+        "status": UNVERIFIED,
+    }
     try:
         yield check
     except AssertionError as error:

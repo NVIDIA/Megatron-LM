@@ -14,7 +14,7 @@ from tests.performance_tests.shell_test_utils.determinism.kernel_case import ker
 from tests.unit_tests.determinism.comparison import _as_bytes, bytes_equal
 from tests.unit_tests.determinism_reporting.test_coverage_evidence import shard
 from tools.check_kernel_determinism_coverage import load_manifest
-from tools.determinism.checks import FAILED, PASSED, collect_checks, observe_check
+from tools.determinism.checks import FAILED, PASSED, check_statuses, collect_checks, observe_check
 from tools.determinism.coverage import (
     DETERMINISTIC,
     NONDETERMINISTIC,
@@ -23,6 +23,8 @@ from tools.determinism.coverage import (
     aggregate,
     collect_observations,
     main,
+    observe_replay,
+    replay_configuration,
 )
 from tools.determinism.reference import assert_reference_close, assert_replay_sensitivity
 
@@ -156,6 +158,62 @@ def kernel_comparator():
     }
     exec(compile(tree, str(path), "exec"), namespace)
     return namespace["_assert_replay_matches"]
+
+
+@pytest.mark.parametrize("different_build", [False, True])
+def test_runtime_build_metadata_matches_replay_reference_and_sensitivity(different_build):
+    """A real diagnostic build context must survive each evidence producer."""
+    actual = ({"out": torch.tensor([1.0, 2.0])}, {"x": torch.tensor([3.0, 4.0])})
+    compare = kernel_comparator()
+    replays, checks = [], []
+    configuration = {"te_extension_sha256": "a" * 64, "diagnostic_dependency_variant": "tested"}
+    with collect_observations(replays.append), collect_checks(checks.append):
+        with replay_configuration(configuration):
+            with observe_replay(SIGNATURE, {"replays": 2}) as observation:
+                compare(1, *actual, *copy.deepcopy(actual), "configured replay")
+                observation.update(compared_outputs=1, compared_gradients=1)
+        reference_configuration = {
+            **configuration,
+            "te_extension_sha256": ("b" if different_build else "a") * 64,
+        }
+        with replay_configuration(reference_configuration):
+            reference_check(actual, copy.deepcopy(actual), rtol=0, atol=0)
+            assert_replay_sensitivity(
+                actual,
+                lambda candidate: compare(1, *actual, *candidate, "configured control"),
+                signature=SIGNATURE,
+            )
+    assert len(checks) == 2 and all(check["status"] == PASSED for check in checks)
+    assert replays[0]["status"] == DETERMINISTIC
+    expected = UNVERIFIED if different_build else PASSED
+    assert check_statuses(
+        [{**check, "rank": 0} for check in checks],
+        [{**observation, "rank": 0} for observation in replays],
+        complete=True,
+        fresh=True,
+    ) == {"reference": expected, "sensitivity": expected}
+    assert "te_extension_sha256" not in SIGNATURE
+
+
+@pytest.mark.parametrize("kind", ["reference", "sensitivity"])
+def test_nested_runtime_configuration_restores_after_check_failure(kind):
+    checks = []
+    with collect_checks(checks.append):
+        with replay_configuration({"backend_build": "outer", "parallelism": {"TP": 2}}):
+            with pytest.raises(RuntimeError, match="unavailable"):
+                with replay_configuration({"backend_build": "inner"}):
+                    with observe_check(kind, SIGNATURE, {}):
+                        raise RuntimeError("unavailable")
+            with observe_check(kind, SIGNATURE, {}):
+                pass
+        with observe_check(kind, SIGNATURE, {}):
+            pass
+    assert checks[0]["signature"]["backend_build"] == "inner"
+    assert checks[0]["signature"]["parallelism"] == {"TP": 2}
+    assert checks[1]["signature"]["backend_build"] == "outer"
+    assert "backend_build" not in checks[2]["signature"]
+    assert "parallelism" not in checks[2]["signature"]
+    assert all(check["status"] == UNVERIFIED for check in checks)
 
 
 def test_sensitivity_exercises_actual_kernel_comparator_without_polluting_replay():

@@ -78,6 +78,14 @@ observed, matching accuracy failure remains a failed reference check, even when
 pytest xfails; it never becomes a replay mismatch. Raw replay observations remain
 available, but a failed test phase makes the overall replay case unverified.
 
+Adapters can attach observed runtime fields with
+`tools.determinism.coverage.replay_configuration`. The active fields are included
+in replay, reference and sensitivity signatures, including nested scopes and
+failed checks. For example, an adapter that verifies the actual loaded backend
+binary can record its build identity once around all three checks. Different
+build identities still fail the exact-signature match; the context does not
+infer a dependency identity or make older incomplete evidence eligible.
+
 `author_requirements` lists the exact cases required by the manifest, including
 missing cases. `--require-author-checks` fails for any missing, failed or unverified
 requirement, and for an empty requirement set. Both GPU kernel recipes enable
