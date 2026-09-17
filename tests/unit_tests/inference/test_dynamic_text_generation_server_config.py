@@ -33,7 +33,7 @@ class _CapturingClient:
     def __init__(self):
         self.sampling_params = []
 
-    async def add_request(self, prompt_tokens, sampling_params, *, multi_modal_data=None):
+    def add_request_with_id(self, prompt_tokens, sampling_params, *, multi_modal_data=None):
         del prompt_tokens, multi_modal_data
         self.sampling_params.append(sampling_params)
         raise RuntimeError("stop after request submission")
@@ -172,6 +172,10 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         0.8,
         5,
         True,
+        # block_size_tokens / prefix_caching_coordinator_policy: unset here, so the
+        # frontend does not hash and the coordinator keeps doing it.
+        None,
+        None,
     )
     assert captured["socket_closed"] is True
     assert server._SERVER_PROCESSES[0].daemon is True
@@ -187,8 +191,15 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     captured = {}
 
     class FakeInferenceClient:
-        def __init__(self, coordinator_addr, deserialize):
+        def __init__(
+            self,
+            coordinator_addr,
+            deserialize,
+            block_size_tokens=None,
+            prefix_caching_coordinator_policy=None,
+        ):
             captured["client_init"] = (coordinator_addr, deserialize)
+            captured["client_hashing"] = (block_size_tokens, prefix_caching_coordinator_policy)
 
         def start(self):
             captured["client_started"] = True
@@ -234,6 +245,8 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
 
     app_config = captured["app"].config
     assert captured["client_init"] == ("tcp://coord:5555", False)
+    # Unset here, so this client does not hash and the coordinator keeps doing it.
+    assert captured["client_hashing"] == (None, None)
     assert captured["client_started"] is True
     assert captured["client_stopped"] is True
     assert app_config["tokenizer"] is tokenizer
@@ -291,7 +304,7 @@ async def test_completions_request_uses_sampling_defaults_and_overrides(
     response = await app.test_client().post("/v1/completions", json=payload)
 
     assert response.status_code == 500
-    assert len(inference_client.sampling_params) == 1
+    assert not inference_client.sampling_params[0].detokenize_generations
     sampling_params = inference_client.sampling_params[0]
     assert sampling_params.temperature == expected_temperature
     assert sampling_params.top_p == expected_top_p

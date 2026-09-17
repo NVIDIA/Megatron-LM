@@ -17,10 +17,16 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incr
     HuggingFaceFastIncrementalDetokenizer,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
+    JSON_SAFE_LOGPROB_FLOOR,
     StreamingChatParser,
+    json_safe_logprob,
+    json_safe_logprobs,
+    json_safe_top_n_logprobs,
     openai_stream,
 )
 from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import Qwen3CoderToolParser
+
+NEG_INF = float("-inf")
 
 
 class _Tokenizer:
@@ -60,13 +66,15 @@ def _make_byte_level_fast_tokenizer():
 @pytest.mark.asyncio
 async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     stream = AsyncStream(request_id=1, cancel=lambda: None)
+    # The -inf logprobs ride the real wire path: formatters must clamp them to the
+    # JSON-safe floor before json.dumps.
     stream.put(
         {
             "partial": {
                 "request_id": 1,
                 "new_tokens": [1, 2],
-                "new_log_probs": [-0.1, -0.2],
-                "new_top_n_logprobs": [{"a": -0.01}, {"b": -0.02}],
+                "new_log_probs": [-0.1, NEG_INF],
+                "new_top_n_logprobs": [{"a": -0.01}, {"b": NEG_INF}],
             }
         }
     )
@@ -77,7 +85,7 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
             "final": {
                 "prompt_tokens": [9, 9],
                 "generated_tokens": [1, 2, 3],
-                "generated_log_probs": [-0.1, -0.2, -0.3],
+                "generated_log_probs": [-0.1, NEG_INF, -0.3],
                 "generated_top_n_logprobs": [{"a": -0.01}, {"b": -0.02}, {"c": -0.03}],
                 "num_cached_tokens": 2,
                 "sampling_params": {"num_tokens_to_generate": 3},
@@ -105,8 +113,11 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     assert "generation_log_probs" not in first["choices"][0]
     assert "generated_text" not in first["choices"][0]
     assert "generated_length" not in first["choices"][0]
-    assert first["choices"][0]["logprobs"]["token_logprobs"] == [-0.1, -0.2]
-    assert first["choices"][0]["logprobs"]["top_logprobs"] == [{"a": -0.01}, {"b": -0.02}]
+    assert first["choices"][0]["logprobs"]["token_logprobs"] == [-0.1, JSON_SAFE_LOGPROB_FLOOR]
+    assert first["choices"][0]["logprobs"]["top_logprobs"] == [
+        {"a": -0.01},
+        {"b": JSON_SAFE_LOGPROB_FLOOR},
+    ]
     assert first["choices"][0]["logprobs"]["text_offset"] == [0, 1]
     assert reconciled["choices"][0]["text"] == "c"
     assert reconciled["choices"][0]["logprobs"]["top_logprobs"] == [{"c": -0.03}]
@@ -116,7 +127,7 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     assert "generated_length" not in reconciled["choices"][0]
     assert finished["choices"][0]["finish_reason"] == "length"
     assert finished["choices"][0]["generation_token_ids"] == [1, 2, 3]
-    assert finished["choices"][0]["generation_log_probs"] == [-0.1, -0.2, -0.3]
+    assert finished["choices"][0]["generation_log_probs"] == [-0.1, JSON_SAFE_LOGPROB_FLOOR, -0.3]
     assert finished["choices"][0]["generated_text"] == "abc"
     assert finished["choices"][0]["generated_length"] == 3
     assert usage["usage"] == {
@@ -152,7 +163,7 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
                 "new_tokens": [1],
                 "new_log_probs": [-0.1],
                 "new_top_n_logprobs": [{"a": -0.01}],
-                "prompt_log_probs": [-0.4],
+                "prompt_log_probs": [NEG_INF],
                 "prompt_top_n_logprobs": [{"z": -0.04}],
             }
         }
@@ -188,7 +199,7 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
     assert echoed["choices"][0]["text"] == "zz"
     assert echoed["choices"][0]["logprobs"] == {
         "tokens": ["z", "z"],
-        "token_logprobs": [None, -0.4],
+        "token_logprobs": [None, JSON_SAFE_LOGPROB_FLOOR],
         "top_logprobs": [None, {"z": -0.04}],
         "text_offset": [0, 1],
     }
@@ -230,7 +241,7 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
                 "request_id": 1,
                 "new_tokens": [1],
                 "new_log_probs": [-0.1],
-                "new_top_n_logprobs": [{"a": -0.01}],
+                "new_top_n_logprobs": [{"a": NEG_INF}],
             }
         }
     )
@@ -240,7 +251,7 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
                 "prompt_tokens": [9],
                 "generated_tokens": [1],
                 "generated_log_probs": [-0.1],
-                "generated_top_n_logprobs": [{"a": -0.01}],
+                "generated_top_n_logprobs": [{"a": NEG_INF}],
                 "sampling_params": {"num_tokens_to_generate": 2},
             }
         }
@@ -265,7 +276,7 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
     assert role["choices"][0]["delta"] == {"role": "assistant", "content": ""}
     assert content["choices"][0]["delta"] == {"content": "a"}
     assert content["choices"][0]["logprobs"]["content"][0]["top_logprobs"] == [
-        {"token": "a", "logprob": -0.01, "bytes": [97]}
+        {"token": "a", "logprob": JSON_SAFE_LOGPROB_FLOOR, "bytes": [97]}
     ]
     assert finished["choices"][0]["finish_reason"] == "stop"
     assert records[-1] == "data: [DONE]\n\n"
@@ -491,3 +502,26 @@ def test_sanitize_chat_template_kwargs_does_not_mutate_caller_payload():
 
     assert sanitized == {"enable_thinking": False}
     assert raw_kwargs["chat_template"] == "{{ 'x' }}"
+
+
+def test_json_safe_helpers_clamp_only_non_finite():
+    floor = JSON_SAFE_LOGPROB_FLOOR
+    for value, expected in [
+        (NEG_INF, floor),
+        (float("inf"), floor),
+        (float("nan"), floor),
+        (0.0, 0.0),
+        (-0.25, -0.25),
+        # Values below the floor are already finite; they are not clamped.
+        (floor - 1.0, floor - 1.0),
+    ]:
+        assert json_safe_logprob(value) == expected
+    assert json_safe_logprobs([-0.5, NEG_INF]) == [-0.5, floor]
+    assert json_safe_top_n_logprobs([{"a": -0.5, "b": NEG_INF}, None]) == [
+        {"a": -0.5, "b": floor},
+        None,
+    ]
+    # The hazard being guarded against: orjson encodes non-finite floats as null.
+    orjson = pytest.importorskip("orjson")
+    assert orjson.dumps(NEG_INF) == b"null"
+    assert orjson.loads(orjson.dumps(json_safe_logprob(NEG_INF))) == floor

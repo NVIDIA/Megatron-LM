@@ -142,8 +142,11 @@ class _ToyInferenceService:
         self.engine.vision_embedding_cache_max_bytes = 1 << 20
         self.engine._vision_embedding_cache = OrderedDict()
         self.engine._vision_embedding_cache_bytes = 0
+        # alpha is the load penalty, not a blend weight: at 1.0 a single request
+        # of imbalance across two ranks exactly cancels the media hit and the
+        # vision encoder would re-run. The default keeps the hit decisive.
         self.coordinator = make_coordinator_direct(
-            enable_prefix_caching=False, prefix_caching_routing_alpha=1.0
+            enable_prefix_caching=False, prefix_caching_routing_alpha=0.5
         )
         self.selected_ranks = []
         self._request_id = 0
@@ -180,7 +183,17 @@ class _ToyInferenceService:
         assert torch.all(decoder_output[~image_positions] == 0)
 
     def add_request(self, prompt, sampling_params, *, multi_modal_data=None):
+        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
+            1
+        ]
+
+    def add_request_with_id(self, prompt, sampling_params, *, multi_modal_data=None):
+        """Mirror InferenceClient: the endpoints submit through the id-returning form."""
         future = asyncio.get_running_loop().create_future()
+        # Claimed before the work, as the real client claims next_request_id
+        # before its send, so a failed submission still names an id to abort.
+        self._request_id += 1
+        request_id = self._request_id
         try:
             self.last_wire_data = serialize_multimodal_data(multi_modal_data)
             media_cache_key = self.last_wire_data["media_cache_key"]
@@ -202,9 +215,8 @@ class _ToyInferenceService:
             )
             media_tokens_preexpanded = engine_kwargs.pop("media_tokens_preexpanded", False)
             engine_kwargs.setdefault("num_tiles", None)
-            self._request_id += 1
             request = self.engine._build_vlm_request(
-                request_id=self._request_id,
+                request_id=request_id,
                 prompt_str=None,
                 tokens=torch.tensor(prompt, dtype=torch.int64),
                 sampling_params=sampling_params,
@@ -214,7 +226,7 @@ class _ToyInferenceService:
                 **engine_kwargs,
             )
             request.generated_text = "toy output"
-            request.generated_tokens = [7]
+            request.generated_tokens = [7] if self.deserialize else [7, 8]
             self._run_toy_decoder(request)
             self.last_request = request
             if self.deserialize:
@@ -226,13 +238,13 @@ class _ToyInferenceService:
                     "generated_text": request.generated_text,
                     "generated_tokens": request.generated_tokens,
                     "prompt_tokens": request.prompt_tokens.tolist(),
-                    "sampling_params": {"num_tokens_to_generate": 1},
+                    "sampling_params": {"num_tokens_to_generate": 2},
                     "routing_indices": None,
                 }
             future.set_result(result)
         except Exception as error:
             future.set_exception(error)
-        return future
+        return request_id, future
 
 
 @pytest.fixture
@@ -340,14 +352,14 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
         "/v1/completions",
         json={
             "prompt": _PROMPT_TOKENS,
-            "max_tokens": 1,
+            "max_tokens": 2,
             "multi_modal_data": {modality: encoded_media},
         },
     )
 
     assert response.status_code == 200
     payload = await response.get_json()
-    assert payload["choices"][0]["text"] == "toy output"
+    assert payload["choices"][0]["text"] == "7 8"
     assert service.last_request.compact_prompt_tokens.tolist() == _PROMPT_TOKENS
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1

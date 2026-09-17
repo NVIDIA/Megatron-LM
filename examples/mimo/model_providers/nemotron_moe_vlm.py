@@ -31,6 +31,7 @@ from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import ColumnParallelLinear
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -65,6 +66,28 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider.add_argument("--freeze-lm", action="store_true")
     provider.add_argument("--freeze-vit", action="store_true")
     provider.add_argument("--freeze-projection", action="store_true")
+    provider.add_argument(
+        "--mimo-vision-encoder-attention-backend",
+        type=lambda value: AttnBackend[value],
+        choices=list(AttnBackend),
+        default=None,
+        help=(
+            "Vision encoder attention backend. Defaults to --attention-backend. Transformer "
+            "Engine backend selection is process-wide, so colocated encoder and language "
+            "modules must use compatible settings."
+        ),
+    )
+    provider.add_argument(
+        "--mimo-vision-encoder-flash-attention-version",
+        type=int,
+        choices=(2, 3, 4),
+        default=None,
+        help=(
+            "FlashAttention version requested by the vision encoder. Defaults to "
+            "--flash-attention-version. Transformer Engine version selection is process-wide, "
+            "so colocated encoder and language modules must use compatible settings."
+        ),
+    )
     provider.add_argument(
         "--vision-projection-type",
         type=str,
@@ -153,6 +176,7 @@ def nemotron_projection_config(
     config.hidden_size = int(args.hidden_size)
     config.num_attention_heads = 1
     config.ffn_hidden_size = 4 * projection_input_size
+    config.gated_linear_unit = False
     config.bias_activation_fusion = False
     config.bias_dropout_fusion = False
     config.add_bias_linear = False
@@ -236,6 +260,10 @@ def vision_submodules_spec(
         pp_size = get_pg_size(pp_pg)
 
     vision_config = radio_vision_config(args, tp_size, pp_size)
+    if args.mimo_vision_encoder_attention_backend is not None:
+        vision_config.attention_backend = args.mimo_vision_encoder_attention_backend
+    if args.mimo_vision_encoder_flash_attention_version is not None:
+        vision_config.flash_attention_version = args.mimo_vision_encoder_flash_attention_version
     vision_encoder_spec = radio_vision_encoder_spec(args, vision_config, pg_collection)
     projection_input_size = _vision_projection_input_size(args, vision_config)
     # affine -> single linear_fc1; mlp -> fc1+act+fc2 (core MultimodalProjector

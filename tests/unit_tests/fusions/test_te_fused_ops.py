@@ -177,6 +177,131 @@ def test_fused_mlp_wrapper_hooks_execute_once():
     assert events == ["forward-pre", "forward-post", "backward-pre", "backward-post"]
 
 
+def test_fused_mlp_partitions_hooks_across_execution_boundaries():
+    module = _make_fused_mlp_shell()
+    module.linear_fc1.inner = torch.nn.Identity()
+    events = []
+
+    class RecordingIdentity(torch.nn.Module):
+
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def forward(self, inputs):
+            events.append(self.name)
+            return inputs
+
+    norm_impl = RecordingIdentity("norm")
+    fused_impl = RecordingIdentity("fused")
+    fc1_submodules = tuple(module.linear_fc1.modules())
+    fc1_submodule_ids = {id(submodule) for submodule in fc1_submodules}
+    remaining_submodules = tuple(
+        submodule
+        for submodule in module.modules()
+        if submodule is not module and id(submodule) not in fc1_submodule_ids
+    )
+
+    def post_hook(name):
+        return lambda _module, _inputs, _output: events.append(name)
+
+    module.linear_fc1.register_forward_hook(post_hook("fc1-post"))
+    module.linear_fc1.inner.register_forward_hook(post_hook("fc1-inner-post"))
+    module.linear_fc2.register_forward_hook(post_hook("fc2-post"))
+
+    with pytest.warns(UserWarning, match="post-forward hook"):
+        module._register_hooks_on_fused_impl(
+            fused_impl, pre_forward_submodules=remaining_submodules
+        )
+    module._register_forward_pre_hooks_on_fused_impl(norm_impl, fc1_submodules)
+
+    def pre_hook(name):
+        return lambda _module, _inputs: events.append(name)
+
+    pre_hook_handles = [
+        module.linear_fc1.register_forward_pre_hook(pre_hook("fc1-pre")),
+        module.linear_fc1.inner.register_forward_pre_hook(pre_hook("fc1-inner-pre")),
+        module.linear_fc2.register_forward_pre_hook(pre_hook("fc2-pre")),
+    ]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        norm_impl(torch.ones(1, 2))
+        fused_impl(torch.ones(1, 2))
+
+    assert events == [
+        "fc1-pre",
+        "fc1-inner-pre",
+        "norm",
+        "fc2-pre",
+        "fused",
+        "fc1-post",
+        "fc1-inner-post",
+        "fc2-post",
+    ]
+
+    for handle in pre_hook_handles:
+        handle.remove()
+    events.clear()
+
+    def replacement_hook(name):
+        return lambda _module, _inputs, kwargs: events.append((name, kwargs))
+
+    module.linear_fc1.register_forward_pre_hook(
+        replacement_hook("fc1-replacement"), with_kwargs=True
+    )
+    module.linear_fc2.register_forward_pre_hook(
+        replacement_hook("fc2-replacement"), with_kwargs=True
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        norm_impl(torch.ones(1, 2))
+        fused_impl(torch.ones(1, 2))
+
+    assert events == [
+        ("fc1-replacement", {}),
+        "norm",
+        ("fc2-replacement", {}),
+        "fused",
+        "fc1-post",
+        "fc1-inner-post",
+        "fc2-post",
+    ]
+
+
+@pytest.mark.parametrize("invalid_source", ["duplicate", "non-descendant"])
+def test_fused_mlp_pre_hook_sources_are_validated(invalid_source):
+    module = _make_fused_mlp_shell()
+    if invalid_source == "duplicate":
+        source_submodules = (module.linear_fc1, module.linear_fc1)
+        error_match = "must not contain duplicates"
+    else:
+        source_submodules = (torch.nn.Linear(2, 2),)
+        error_match = "must be descendants"
+
+    with pytest.raises(ValueError, match=error_match):
+        module._register_forward_pre_hooks_on_fused_impl(torch.nn.Identity(), source_submodules)
+
+
+@pytest.mark.parametrize("hook_kind", ["pre", "post"])
+def test_fused_mlp_partition_still_rejects_fc1_backward_hooks(hook_kind):
+    module = _make_fused_mlp_shell()
+    if hook_kind == "pre":
+        module.linear_fc1.register_full_backward_pre_hook(lambda _module, _grad_output: None)
+        error_match = "pre-backward hooks"
+    else:
+        module.linear_fc1.register_full_backward_hook(
+            lambda _module, _grad_input, _grad_output: None
+        )
+        error_match = "post-backward hooks"
+
+    with pytest.raises(RuntimeError, match=error_match):
+        module._register_hooks_on_fused_impl(
+            torch.nn.Identity(), pre_forward_submodules=(module.linear_fc2,)
+        )
+
+
 def test_fused_mlp_rejects_input_modifying_submodule_hook_added_after_construction():
     module = _make_fused_mlp_shell()
     fused_impl = torch.nn.Identity()

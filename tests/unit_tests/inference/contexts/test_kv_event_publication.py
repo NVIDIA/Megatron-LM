@@ -107,6 +107,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
     engine.context = context
+    engine.controller = SimpleNamespace(_async_sched_logits=Mock())
     engine.unified_memory_level = 0
     engine.requests = {}
     engine.waiting_request_ids = deque()
@@ -123,6 +124,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
 
     expected_order = ["deallocate", "cleared"] if expect_clear else ["deallocate"]
     assert order == expected_order
+    assert engine.controller._async_sched_logits.clear.call_count == int(expect_clear)
 
 
 def test_reset_metadata_can_preserve_prefix_allocator():
