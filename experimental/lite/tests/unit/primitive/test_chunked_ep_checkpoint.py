@@ -11,6 +11,34 @@ import torch
 import megatron.core  # noqa: F401
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_head_publishes_weight_before_cast(dtype):
+    from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
+    from megatron.lite.model.qwen3_moe.lite.model import Qwen3MoEModel
+
+    weight = torch.nn.Parameter(torch.zeros(3, 4))
+    calls = []
+
+    def publish():
+        calls.append(True)
+        with torch.no_grad():
+            weight.fill_(2)
+
+    setattr(weight, PARAM_READY_CALLBACK_ATTR, publish)
+    model = SimpleNamespace(
+        head=SimpleNamespace(col=SimpleNamespace(linear=SimpleNamespace(weight=weight)))
+    )
+    hidden = torch.zeros(1, 4, dtype=dtype)
+    actual = Qwen3MoEModel._head_weight_for_fused_ce(model, hidden)
+    assert calls == [True]
+    assert actual.dtype == dtype
+    assert torch.equal(actual, torch.full_like(actual, 2))
+    actual.sum().backward()
+    assert torch.equal(weight.grad, torch.ones_like(weight))
+    delattr(weight, PARAM_READY_CALLBACK_ATTR)
+    assert torch.equal(Qwen3MoEModel._head_weight_for_fused_ce(model, hidden), actual)
+
+
 @pytest.mark.parametrize("shape", [(3, 2), (3, 1, 2), (3, 2, 2), (0, 1, 2)])
 def test_saved_bridge_preserves_input_gradient_shape(transformer_engine_import_stub, shape):
     transformer_engine_import_stub()
@@ -42,8 +70,8 @@ def test_checkpoint_publishes_main_grad_to_outer_ddp_hook(
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        checkpoint_ep_chunk,
         _SavedContextEPChunkFunction,
+        checkpoint_ep_chunk,
     )
 
     experts = torch.nn.Linear(2, 2, bias=False)
@@ -100,8 +128,8 @@ def test_checkpoint_matches_native_across_microbatches(
 ):
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules.moe_ep_chunk_overlap import (
-        checkpoint_ep_chunk,
         EPChunkForwardOp,
+        checkpoint_ep_chunk,
     )
 
     torch.manual_seed(314)

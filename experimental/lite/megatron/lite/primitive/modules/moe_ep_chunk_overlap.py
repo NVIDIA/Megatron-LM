@@ -279,9 +279,7 @@ class _EPChunkExpertActivationArenaCoordinator:
         previous.update(current)
 
     def park(self, *, stream: Any | None) -> None:
-        """Wait by event, then return eager backing to the caching allocator.
-        Frozen capacity persists; graph-owned backing persists until close.
-        """
+        """Event-wait and park eager backing; retain capacity and graph backing until close."""
         if self.claimed_op is not None:
             raise RuntimeError("Cannot park a leased EP chunk expert activation arena")
         self._wait_for_consumer(stream)
@@ -414,9 +412,7 @@ class _EPChunkExpertActivationLease:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> torch.Tensor:
-        """Return stable storage; keep the lease through all delayed TE consumers.
-        FC1 input reuse requires the wgrad completion event passed to release.
-        """
+        """Lease stable storage through delayed TE wgrad; release with its completion event."""
         self.check_active()
         # Acquire already waited for the previous consumer; grow only to observed demand.
         op = self.workspace.key.op
@@ -548,9 +544,7 @@ class EPChunkWorkspace:
         expert_intermediate_size: int | None = None,
         device: torch.device | str | None = None,
     ) -> None:
-        """Opt into frozen capacity instead of lazy growth, for capture/measurement.
-        Eager reset keeps capacity; only graphs keep backing. Close drops both.
-        """
+        """Freeze capacity: eager reset keeps sizes, graphs keep backing, close drops both."""
         self.prepare_scratch(device=device)
         intermediate = expert_intermediate_size
         if intermediate is None:
@@ -605,9 +599,7 @@ class EPChunkWorkspace:
         self._prepare_slots_for_reset(stream=stream, operation="reset tensors")
 
     def park_expert_activations(self, *, stream: Any | None = None) -> None:
-        """Park the arena after fused backward materializes caller-visible outputs.
-        Preserve slots, DeepEP dispatchers and slot scratch.
-        """
+        """Park after fused outputs are ready; preserve slots, DeepEP dispatchers and scratch."""
         if not self._materialized:
             return
         self._activation_arena.park(stream=stream)
@@ -1234,9 +1226,7 @@ class _EPChunkOperationBase:
             return metadata, expert_input, expert_probs, expert_out, expert_activation_lease
 
         def retire_pending_dispatch_bwd() -> None:
-            """Retire prior dispatch-backward leases and delayed-wgrad aliases before
-            the next FC1/SwiGLU activation; the next DeepEP receive may be in flight.
-            """
+            """Retire wgrad/dispatch leases before FC1/SwiGLU; allow an in-flight DeepEP receive."""
             if len(pending_dispatch_bwd) > 1:
                 raise RuntimeError("EP chunk fused backward retained more than one pending chunk")
             if not pending_dispatch_bwd:
@@ -1785,9 +1775,7 @@ def _materialize(params: tuple[torch.Tensor, ...], accum: list[Any]) -> list[tor
 
 
 class EPChunkExecution:
-    """Policy-free composition with caller-owned parameters and lazy shared workspaces.
-    retain_backward selects saved fwd+bwd; otherwise expose graph-free fwd+fused.
-    """
+    """Compose lazy workspaces: retain_backward selects saved fwd+bwd, otherwise fwd+fused."""
 
     def __init__(
         self,
@@ -1884,9 +1872,7 @@ class ChunkedMoE(nn.Module):
 
 
 class _EPChunkCheckpoint(torch.autograd.Function):
-    """Checkpoint prefix -> (MoE input, residual), then residual + ChunkedEP.
-    Architecture/recompute policy belongs to the caller; no model/config inspection.
-    """
+    """Checkpoint a caller-owned prefix and residual; model/recompute policy stays outside."""
 
     @staticmethod
     def forward(ctx, x, prefix, execution, finish_backward, prefix_count, *params):
