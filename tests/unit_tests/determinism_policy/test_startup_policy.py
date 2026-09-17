@@ -71,7 +71,7 @@ def test_strict_policy_reports_effective_settings_without_seeding(policy, caplog
     assert report["environment"]["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
     assert report["environment"]["MAMBA_DETERMINISTIC"] == "1"
     assert report["environment"]["CAUSAL_CONV1D_DETERMINISTIC"] == "1"
-    assert report["environment"]["TRITON_CACHE_AUTOTUNING"] is None
+    assert report["environment"]["TRITON_CACHE_AUTOTUNING"] == "0"
     assert json.loads(json.dumps(report)) == report
     assert "Determinism policy:" in caplog.text
     assert torch.equal(state, torch.get_rng_state())
@@ -163,6 +163,20 @@ def test_same_policy_can_be_rechecked_after_initialization(policy, monkeypatch):
     assert policy.configure_determinism(config) == before
     before["environment"]["NCCL_ALGO"] = "Tree"
     assert policy.configure_determinism(config)["environment"]["NCCL_ALGO"] == "Ring"
+
+
+def test_backend_default_cannot_enable_autotuning_after_bootstrap(policy, monkeypatch):
+    config = {"deterministic_mode": True}
+    before = policy.configure_determinism(config)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    # vLLM uses this default during import, after other backends can initialize CUDA.
+    os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")
+    assert os.environ["TRITON_CACHE_AUTOTUNING"] == "0"
+    assert policy.configure_determinism(config) == before
+    os.environ["TRITON_CACHE_AUTOTUNING"] = "1"
+    os.environ["TRITON_CACHE_DIR"] = "/shared/cache"
+    with pytest.raises(RuntimeError, match="fresh process"):
+        policy.configure_determinism(config)
 
 
 @pytest.mark.parametrize(
