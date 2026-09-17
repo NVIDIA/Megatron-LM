@@ -36,7 +36,7 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--mimo-llm-cp",
         type=int,
         default=1,
-        help="Language context-parallel size (CP=1 only for now).",
+        help="Language context-parallel size; encoder CP remains 1.",
     )
     grid.add_argument(
         "--mimo-llm-pp", type=int, default=1, help="Language pipeline-model-parallel size."
@@ -83,8 +83,8 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
     gtp_weight_remat_size, _ = resolve_hetero_gtp_degrees(args)
-    if args.mimo_llm_cp != 1:
-        raise ValueError("hetero MIMO training currently supports CP=1 only")
+    if args.mimo_llm_cp < 1:
+        raise ValueError("--mimo-llm-cp must be positive")
 
     if getattr(args, "mimo_encoder_ddp_overlap", False) and not getattr(
         args, "overlap_grad_reduce", False

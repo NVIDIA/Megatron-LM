@@ -128,3 +128,32 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         RADIO_ENCODER_MODULE_NAME
     ]
     assert encoder_inputs["x"].shape == (4, 3, 4, 4)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("gtp_size", [1, 2])
+def test_cp_replicas_share_batches_without_merging_data_lanes(adapter, cp_size, gtp_size):
+    args = _args()
+    args.gtp_weight_remat_size = gtp_size
+    lane_seeds = []
+    for lane in range(args.mimo_llm_dp * gtp_size):
+        replicas = []
+        for cp_rank in range(cp_size):
+            topology = _topology(language_rank=True)
+            pg = topology.module_pgs["language"]
+            pg.cp = _group(rank=cp_rank, size=cp_size)
+            pg.dp_cp_gtp_remat = _group(
+                rank=lane * cp_size + cp_rank,
+                size=args.mimo_llm_dp * gtp_size * cp_size,
+            )
+            loaders = adapter.build_train_valid_test_data_loaders(args, topology)
+            assert all(loader.batch_size == args.micro_batch_size for loader in loaders)
+            replicas.append(loaders)
+        lane_seeds.append(replicas[0][0].dataset.seed)
+        for split in range(3):
+            reference = next(iter(replicas[0][split]))
+            for replica in replicas[1:]:
+                batch = next(iter(replica[split]))
+                for key in ("input_ids", "labels", "loss_mask", "position_ids"):
+                    assert torch.equal(batch[key], reference[key]), key
+    assert len(set(lane_seeds)) == args.mimo_llm_dp * gtp_size

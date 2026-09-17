@@ -125,6 +125,7 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.bf16 = bf16
     config.tensor_model_parallel_size = tp_size
     config.pipeline_model_parallel_size = pp_size
+    config.context_parallel_size = 1
     _disable_gtp(config)
     config.sequence_parallel = False
     return config
