@@ -13,7 +13,7 @@ Contributed in collaboration with RedNote.
 
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
-Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, and `"fused_group_mlp"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, and `"shortcut_post_norm"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`.
 
 ## User Guide
 
@@ -24,7 +24,7 @@ Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `
 --fine-grained-activation-offloading
 
 # Modules whose inputs are offloaded (refer to your training script for list or delimiter syntax).
-# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp".
+# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm".
 --offload-modules core_attn attn_proj expert_fc1
 ```
 
@@ -42,6 +42,7 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `expert_fc1` | First FC layer in MoE experts | MoE models only |
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
+| `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
 
 ### Tuning Parameters
 

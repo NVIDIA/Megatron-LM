@@ -5,6 +5,7 @@ import functools
 import logging
 import warnings
 from abc import ABC
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
@@ -23,6 +24,7 @@ except ImportError:
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -30,7 +32,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -315,7 +317,7 @@ class BaseTransformerLayer(ABC):
         pass
 
 
-class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAttentionLayer):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -564,6 +566,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self._legacy_forward_post_mlp = klass._forward_post_mlp
                 break
 
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained layer execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+
+            return get_fp8_context(self.config, self.layer_number - 1)
+        if self.config.fp4:
+            from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+
+            return get_fp4_context(self.config, self.layer_number - 1)
+        return nullcontext()
+
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
 
@@ -673,6 +687,37 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return attention_output_with_bias, self.attn_norm_manager, residual
 
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this is an attention-only layer that supports two-stage execution."""
+        return (
+            isinstance(self.self_attention, TwoStageAttentionLayer)
+            and self.self_attention.supports_two_stage_attention()
+            and isinstance(self.cross_attention, IdentityOp)
+            and isinstance(self.mlp, IdentityOp)
+        )
+
+    def attention_bda_and_cross_attention(
+        self,
+        attention_output_with_bias,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        attn_state=(),
+    ):
+        """Apply checkpoint bookkeeping, self-attention BDA, and cross-attention."""
+        if self._input_layernorm_checkpoint_active:
+            # discard the output of the input layernorm and register the recompute
+            # as a gradient hook of attention_output_with_bias[0]
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        hidden_states = self._apply_self_attn_bda_step(
+            attention_output_with_bias, residual, attn_state
+        )
+        return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
+
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -745,17 +790,67 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="self_attention")
 
-        if self._input_layernorm_checkpoint_active:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
-
-        hidden_states = self._apply_self_attn_bda_step(
-            attention_output_with_bias, residual, attn_state
+        return self.attention_bda_and_cross_attention(
+            attention_output_with_bias,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            inference_context=inference_context,
+            attn_state=attn_state,
         )
-        return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
+
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        packed_sequence_cp_metadata=None,
+    ):
+        """Run the training path through pre-attention and core attention."""
+        assert self.supports_two_stage_attention()
+
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+
+        nvtx_range_push(suffix="self_attention")
+        with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            attention_intermediate = self.self_attention.forward_pre_attn_and_core_attn(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            )
+        nvtx_range_pop(suffix="self_attention")
+
+        return attention_intermediate, residual, context, attn_state
+
+    def forward_post_core_attn(
+        self,
+        attention_intermediate: Tensor,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        attn_state=(),
+        context_mask: Optional[Tensor] = None,
+    ):
+        """Run the training path after core attention."""
+        assert self.supports_two_stage_attention()
+
+        attention_output_with_bias = self.self_attention.forward_post_core_attn(
+            attention_intermediate
+        )
+        return self.attention_bda_and_cross_attention(
+            attention_output_with_bias,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            attn_state=attn_state,
+        )
 
     def _run_input_layernorm(self, hidden_states):
         """Run input layernorm with optional output-discarding checkpoint and
@@ -1769,16 +1864,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             "Use TransformerLayer instead if hyper connections are not needed."
         )
 
-        # mHC over a single MoE-MLP layer is not supported in this implementation;
-        # compose mHC with MoE by wrapping MoE inside a HyperConnectionHybridLayer
-        # (HybridStack path) instead. This guard fires at setup so misconfigured
-        # specs fail fast rather than producing silently-wrong shapes at runtime.
-        if self.is_moe_layer:
+        unsupported_moe_cuda_graph_modules = {
+            CudaGraphModule.moe,
+            CudaGraphModule.moe_router,
+            CudaGraphModule.moe_preprocess,
+        }
+        if self.is_moe_layer and unsupported_moe_cuda_graph_modules.intersection(
+            self.config.cuda_graph_modules
+        ):
             raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE MLP submodules. "
-                "To combine mHC with MoE, wrap the MoE block as a HybridStack layer "
-                "via HyperConnectionHybridLayer instead."
+                "HyperConnectionTransformerLayer does not support MoE CUDA graph "
+                "scopes. Disable the moe, moe_router, and moe_preprocess CUDA graph modules "
+                "when combining mHC with a MoE MLP submodule."
             )
+
+        # GraphableMegatronModule calls create_mcore_cudagraph_manager before the MLP is
+        # built, so repeat the local-graph decision now that self.is_moe_layer is authoritative.
+        if self.config.cuda_graph_impl == "local":
+            self.create_mcore_cudagraph_manager(self.config)
 
         self.self_attention_hyper_connection = build_module(
             submodules.self_attention_hyper_connection,
@@ -1827,6 +1930,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return static_inputs
 
+    def create_mcore_cudagraph_manager(self, config):
+        """Create only CUDA graph managers compatible with this mHC layer."""
+        # The first call comes from GraphableMegatronModule before TransformerLayer has
+        # constructed self.mlp and set self.is_moe_layer.
+        if not hasattr(self, "mlp"):
+            return
+
+        if self.is_moe_layer:
+            # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
+            # models may still request MLP graphs globally, so leave only this MoE layer eager.
+            if not config.cuda_graph_modules or (
+                CudaGraphModule.mlp in config.cuda_graph_modules
+                and CudaGraphModule.attn not in config.cuda_graph_modules
+            ):
+                return
+
+        super().create_mcore_cudagraph_manager(config)
+
     def _get_submodules_under_cudagraphs(self):
         """Override to include hyper connection modules.
 
@@ -1842,8 +1963,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
-        # HC layer rejects MoE MLPs in __init__, so only the dense (mlp) scope applies.
-        if CudaGraphModule.mlp in self.config.cuda_graph_modules:
+        if CudaGraphModule.mlp in self.config.cuda_graph_modules and not self.is_moe_layer:
             submodules.append(self.mlp_hyper_connection)
         return submodules
 
