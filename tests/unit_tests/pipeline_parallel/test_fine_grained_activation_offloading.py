@@ -1145,6 +1145,7 @@ def test_local_graph_backward_prepare_finish_wait_pipeline(monkeypatch):
     assert runner.local_graph_reload_state == "reload_pending"
     assert mgr.local_graph_backward_finish_prepare(runner)
     assert runner.local_graph_reload_state == "reload_pending"
+    expected_reload_event = runner.local_graph_reload_event
     assert mgr.local_graph_backward_wait_ready(runner, compute_stream)
 
     reverse_names = list(reversed(names))
@@ -1159,12 +1160,9 @@ def test_local_graph_backward_prepare_finish_wait_pipeline(monkeypatch):
     assert [e[1] for e in log if e[0] == "group.prepare_remap"] == reverse_names
     assert [e[1] for e in log if e[0] == "group.adopt_reload_submission"] == reverse_names
     assert [e for e in log if e[0] == "runner.wait_remap_copy_on_stream"] == [
-        # Synchronous remap: prepare blocks on the h2d stream first, then the
-        # consumer wait installs the compute-stream dependency on the
-        # already-completed context.
         ("runner.wait_remap_copy_on_stream", "h2d"),
-        ("runner.wait_remap_copy_on_stream", "compute"),
     ]
+    assert ("compute.wait_event", expected_reload_event) in log
     assert runner.local_graph_reload_state is None
     assert mgr._local_graph_h2d_bytes == sum(g.logical_bytes for g in groups)
 
@@ -1189,11 +1187,12 @@ def test_local_graph_backward_wait_ready_primes_unprefetched_runner(monkeypatch)
 
     assert mgr.local_graph_backward_wait_ready(runner, compute_stream)
 
-    assert [entry[0] for entry in log] == [
+    assert [e[0] for e in log] == [
         "runner.remap_and_copy_after",
         "runner.wait_remap_copy_on_stream",
+        "reload_ready.record",
         "group.prepare_remap",
-        "runner.wait_remap_copy_on_stream",
+        "compute.wait_event",
         "group.adopt_reload_submission",
     ]
 
@@ -1246,6 +1245,8 @@ def test_local_graph_forward_replay_primes_first_backward_runner(monkeypatch):
         "group.enqueue_d2h",
         "group.try_release",
         "runner.wait_remap_copy_on_stream",
+        "reload_ready.record",
+        "compute.wait_event",
         "group.adopt_reload_submission",
     ]
 
