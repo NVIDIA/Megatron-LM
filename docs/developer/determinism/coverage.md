@@ -55,6 +55,49 @@ not certify fresh-process dispatch, checkpoint restart, arbitrary shapes,
 unobserved internal kernels, or complete mutable training state. Correctness
 against an independent reference is a separate check.
 
+## Independent accuracy and sensitivity
+
+Kernel cases can emit `checks` alongside their replay `observations`. A reference
+check compares every output and input gradient against an independent graph.
+Its per-tensor diagnostics retain maximum absolute/relative error, the mixed
+`atol + rtol * abs(reference)` tolerance, violating/nonfinite counts, and a sample
+location. Zero references participate in the absolute tolerance; relative error
+excludes them and is null when there is no nonzero finite reference. Nonfinite
+values fail, even when they match. Failed checks retain their diagnostics.
+
+A sensitivity check first accepts the unchanged baseline, then requires the
+actual replay comparator to reject one bit flip separately in every output and
+gradient. This measures comparator wiring, not exposure to a real scheduling
+race. It does not emit synthetic `verified_nondeterministic` observations.
+
+`check_status` summarizes `reference` and `sensitivity` separately as `passed`,
+`failed`, or `not_verified`. A pass requires complete, clean, current replay
+evidence and checks for every replay signature on every required rank, with
+matching output/gradient counts. Unmatched checks cannot provide a pass. An
+observed, matching accuracy failure remains a failed reference check, even when
+pytest xfails; it never becomes a replay mismatch. Raw replay observations remain
+available, but a failed test phase makes the overall replay case unverified.
+
+`author_requirements` lists the exact cases required by the manifest, including
+missing cases. `--require-author-checks` fails for any missing, failed or unverified
+requirement, and for an empty requirement set. Both GPU kernel recipes enable
+this gate. Legacy families with no `author_tests` remain replay-only; this is
+incremental onboarding, not an accuracy percentage for the repository.
+
+The first six required cases cover biased SwiGLU, weighted SwiGLU and weighted
+squared ReLU in BF16/FP32 with FP32 token weights, 4,096 tokens and FFN width
+8,192. They compare independent eager autograd outputs and every input gradient,
+including BF16-path weight gradients, and inject comparator errors. Replays run
+with side-stream contention. Candidate tolerances are `rtol=0.02, atol=0.001`
+for BF16 and `rtol=atol=1e-6` for FP32, taken from existing weighted-fusion tests.
+The FP32 eager reference rounds outputs back to the input dtype; intermediate
+BF16 rounding can differ from the fused implementation. A failed comparison
+therefore calls for an accuracy-contract review, not an automatic kernel-bug
+conclusion or tolerance increase. The first H100/GB200 run must validate these
+reference semantics, tolerances and runtime before landing the gate. CPU reporting
+checks establish none of those hardware results. Performance evidence joining
+and calibrated budgets remain separate follow-ups.
+
 ## Running and reporting
 
 The dedicated H100 and GB200 kernel/model recipes enable collection and write reports beside

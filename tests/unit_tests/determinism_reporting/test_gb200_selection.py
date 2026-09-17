@@ -37,6 +37,7 @@ def test_gb200_replay_buckets_are_scheduled_and_excluded_from_catch_all(tmp_path
         script = spec["script"].format(**{**spec, "assets_dir": str(tmp_path)})
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
         assert "--require-verified" in script
+        assert "REQUIRED_CASES=(--require-author-checks)" in script
         assert "--determinism-branch-coverage" in script
         assert "--require-branches" in script
         assert "--require-parallelism" in script
@@ -65,3 +66,4 @@ def test_h100_branch_reports_share_the_latest_ci_coverage_mode(tmp_path, monkeyp
         assert "--require-branches" in script
         assert "--require-parallelism" in script
         assert "--determinism-evidence-scope=$EVIDENCE_SCOPE" in script
+        assert "REQUIRED_VIEWS=(--require-author-checks)" in script

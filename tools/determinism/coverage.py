@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from tools.determinism.branch_coverage import branch_report
+from tools.determinism.checks import KINDS, PASSED, author_requirements, check_statuses
 from tools.determinism.parallelism import parallelism_report
 
 SCHEMA_VERSION = 1
@@ -174,6 +175,11 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
             for rank, shard in sorted(by_rank.items())
             for observation in shard["cases"].get(case_id, {}).get("observations", [])
         ]
+        checks = [
+            {**check, "rank": rank}
+            for rank, shard in sorted(by_rank.items())
+            for check in shard["cases"].get(case_id, {}).get("checks", [])
+        ]
         for observation in observations:
             if observation["status"] not in STATUSES:
                 raise ValueError(f"Unknown observation status in {case_id}")
@@ -202,6 +208,10 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
                 "status": status,
                 "reasons": reasons,
                 "observations": observations,
+                "checks": checks,
+                "check_status": check_statuses(
+                    checks, observations, complete=bool(complete), fresh=not (stale or dirty)
+                ),
                 **({"parallelism_plan": plan} if plan is not None else {}),
             }
         )
@@ -241,6 +251,8 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
         report["branches"] = branches
     if scope == "model":
         report["parallelism"] = parallelism_report(cases)
+    else:
+        report["author_requirements"] = author_requirements(inventory, cases)
     return report
 
 
@@ -303,6 +315,30 @@ def markdown_report(report: dict) -> str:
             lines.append(f"| `{pair['model_id']}` | {values} | {pair['status']} |")
     if report["kind"] == "model_determinism_replay":
         return "\n".join(lines) + "\n"
+    requirements = report.get("author_requirements", [])
+    if requirements:
+        lines.extend(
+            [
+                "",
+                "## Kernel author checks",
+                "",
+                "Independent reference accuracy and injected byte-error sensitivity are separate "
+                "from replay. The JSON retains per-tensor absolute/relative errors and tolerances. "
+                "These checks do not establish performance, race exposure "
+                "or full-model correctness.",
+                "",
+                "| Required test | Reference | Sensitivity | Status |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        by_id = {case["case_id"]: case for case in report["cases"]}
+        for required in requirements:
+            case = by_id.get(required["test"], {})
+            check_values = [case.get("check_status", {}).get(kind, UNVERIFIED) for kind in KINDS]
+            lines.append(
+                f"| `{required['test']}` | {check_values[0]} | {check_values[1]} "
+                f"| {required['status']} |"
+            )
     lines.extend(
         [
             "",
@@ -339,6 +375,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Require at least one model case with matching runtime parallelism and passing replay",
     )
     parser.add_argument(
+        "--require-author-checks",
+        action="store_true",
+        help="Require all manifest-declared author cases to pass reference and sensitivity checks",
+    )
+    parser.add_argument(
         "--require-case",
         action="append",
         default=[],
@@ -353,6 +394,11 @@ def main(argv: list[str] | None = None) -> int:
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     args.output.with_suffix(".md").write_text(markdown_report(report))
     print(markdown_report(report))
+    if args.require_author_checks:
+        required = report.get("author_requirements", [])
+        if not required or any(row["status"] != PASSED for row in required):
+            print("Required author reference/sensitivity checks are missing, failed or unverified")
+            return 1
     if args.require_branches:
         branches = report.get("branches", {})
         if not branches.get("complete") or not branches["counts"]["passing_replay"]:

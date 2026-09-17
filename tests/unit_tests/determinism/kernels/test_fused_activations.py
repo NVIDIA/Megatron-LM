@@ -28,11 +28,15 @@ from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
+    _assert_replay_matches,
     assert_replays_bit_exact,
     deterministic_algorithms,
+    replay_signature,
+    run_once,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
+from tools.determinism.reference import assert_reference_close, assert_replay_sensitivity
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -145,6 +149,73 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     seeded()
     fn, inputs = GATED_CASES[case]()
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
+
+
+@pytest.mark.parametrize(
+    "case,dtype",
+    [
+        pytest.param(
+            case,
+            dtype,
+            id=f"{case}-{name}",
+            marks=pytest.mark.determinism_case(
+                op_id=GATED_OP_IDS[case], implementation="torch.compile:" + case
+            ),
+        )
+        for case in ("bias_swiglu", "weighted_swiglu", "weighted_squared_relu")
+        for name, dtype in (("bf16", torch.bfloat16), ("fp32", torch.float32))
+    ],
+)
+@pytest.mark.launch_on_gb200
+def test_mlp_activation_author_evidence(case, dtype):
+    """Check a wide reduction against eager autograd, including BF16 weight grads."""
+    seeded()
+    fn, inputs = GATED_CASES[case]()
+    # Weights intentionally remain FP32, matching the training and timing adapters.
+    inputs = tuple(
+        (
+            value.detach().to(dtype).requires_grad_(value.requires_grad)
+            if isinstance(value, torch.Tensor) and value.dtype == torch.bfloat16
+            else value
+        )
+        for value in inputs
+    )
+    actual = assert_replays_bit_exact(fn, inputs, replays=3, contention=True, what=case)
+    signature = replay_signature(inputs, backward=True)
+    assert_replay_sensitivity(
+        actual,
+        lambda perturbed: _assert_replay_matches(2, *actual, *perturbed, what=case),
+        signature=signature,
+    )
+
+    def reference(*values):
+        # Independent eager graph: do not reuse the fused autograd.Function or
+        # compiled activation helpers, including for the weight-gradient reduction.
+        x = values[0].float()
+        if case == "weighted_squared_relu":
+            output = torch.relu(x).square() * values[1].float()
+        else:
+            if case == "bias_swiglu":
+                x = x + values[1].float()
+            gate, linear = x.chunk(2, dim=-1)
+            output = torch.nn.functional.silu(gate) * linear
+            if case == "weighted_swiglu":
+                output = output * values[2].float()
+        return output.to(values[0].dtype)
+
+    expected = run_once(reference, inputs)
+    # Candidate tolerances from the existing weighted-fusion tests. The all-FP32
+    # reference uses different BF16 rounding boundaries; validate the accuracy
+    # contract on both GPU platforms before adopting this gate for landing.
+    rtol, atol = (2e-2, 1e-3) if dtype == torch.bfloat16 else (1e-6, 1e-6)
+    assert_reference_close(
+        actual,
+        expected,
+        signature=signature,
+        reference_id="eager_fp32_autograd:v1:" + case,
+        rtol=rtol,
+        atol=atol,
+    )
 
 
 # --- plain compiled activations -----------------------------------------------------------

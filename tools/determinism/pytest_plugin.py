@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from tools.determinism.branch_coverage import BranchRecorder
+from tools.determinism.checks import collect_checks
 from tools.determinism.coverage import SCHEMA_VERSION, collect_observations, triton_signature
 from tools.determinism.parallelism import normalize_parallelism
 
@@ -152,6 +153,7 @@ class EvidencePlugin:
             cases[item.nodeid] = {
                 "declaration": declaration,
                 "observations": [],
+                "checks": [],
                 "test_complete": False,
                 **({"parallelism_plan": plan} if plan is not None else {}),
             }
@@ -196,7 +198,11 @@ class EvidencePlugin:
         sys.modules[spec.name] = manifest
         spec.loader.exec_module(manifest)
         return {
-            entry.name: {"sources": entry.sources, "exempt_reason": entry.exempt_reason}
+            entry.name: {
+                "sources": entry.sources,
+                "exempt_reason": entry.exempt_reason,
+                "author_tests": list(entry.author_tests),
+            }
             for entry in manifest.KERNELS
         }
 
@@ -211,10 +217,15 @@ class EvidencePlugin:
             case["observations"].append(observation)
             self._write()
 
+        def record_check(check):
+            check["signature"].update(case["declaration"])
+            case["checks"].append(check)
+            self._write()
+
         branch_context = (
             self.branches.case(item.nodeid) if self.branches else contextlib.nullcontext()
         )
-        with branch_context, collect_observations(record):
+        with branch_context, collect_observations(record), collect_checks(record_check):
             return (yield)
 
     @pytest.hookimpl(wrapper=True)

@@ -247,7 +247,8 @@ def test_real_pytest_lifecycle_uses_replay_evidence(pytester, monkeypatch):
     manifest = pytester.path / "tests/unit_tests/determinism/kernels/manifest.py"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(
-        "from types import SimpleNamespace\nKERNELS = [SimpleNamespace(name='op', sources=(), exempt_reason='')]\n"
+        "from types import SimpleNamespace\n"
+        "KERNELS = [SimpleNamespace(name='op', sources=(), exempt_reason='', author_tests=())]\n"
     )
     pytester.makeconftest("""
 from tools.determinism import pytest_plugin

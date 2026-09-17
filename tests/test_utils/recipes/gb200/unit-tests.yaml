@@ -59,7 +59,7 @@ spec:
         export MAMBA_DETERMINISTIC=1 CAUSAL_CONV1D_DETERMINISTIC=1
         export DETERMINISM_EVIDENCE_RUN_ID="{environment}-{platforms}-{tag}"
         EVIDENCE_SCOPE=kernel
-        REQUIRED_CASES=()
+        REQUIRED_CASES=(--require-author-checks)
         if [[ "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ]]; then
             EVIDENCE_SCOPE=model
             REQUIRED_CASES=(--require-parallelism --require-case '*fp8-mxfp8*' --require-case '*fp4-nvfp4*')

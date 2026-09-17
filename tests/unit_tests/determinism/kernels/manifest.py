@@ -96,6 +96,9 @@ class KernelEntry:
     # Set (with a reason) only when a bit-exact test is impossible in CI, e.g. the kernel
     # needs hardware or a dependency the CI container lacks. Visible coverage debt.
     exempt_reason: str = ""
+    # Exact pytest node IDs requiring independent reference and sensitivity checks.
+    # Adopt per family; an empty tuple leaves the existing replay-only contract visible.
+    author_tests: Tuple[str, ...] = ()
 
 
 # Test-file prefixes used below.
@@ -110,6 +113,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="Elementwise; weighted variants reduce the per-token weight grad over ffn (Inductor tree reduction).",
+        author_tests=tuple(
+            K + f"test_fused_activations.py::test_mlp_activation_author_evidence[{case}-{dtype}]"
+            for case in ("bias_swiglu", "weighted_swiglu")
+            for dtype in ("bf16", "fp32")
+        ),
     ),
     KernelEntry(
         name="fused_bias_geglu",
@@ -128,6 +136,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_weighted_squared_relu.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
+        author_tests=tuple(
+            K
+            + f"test_fused_activations.py::test_mlp_activation_author_evidence[weighted_squared_relu-{dtype}]"
+            for dtype in ("bf16", "fp32")
+        ),
     ),
     KernelEntry(
         name="fused_bias_dropout_add",

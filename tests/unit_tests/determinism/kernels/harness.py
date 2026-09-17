@@ -63,6 +63,21 @@ def _input_signature(value):
     return {"type": type(value).__qualname__}
 
 
+def replay_signature(inputs: Any, *, backward: bool, configuration: Optional[dict] = None) -> dict:
+    """Share the actual dispatch signature with checks of the same outputs/gradients."""
+    signature = {
+        "inputs": _input_signature(inputs),
+        "phase": "forward_backward" if backward else "forward",
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "runtime": runtime_signature(torch),
+    }
+    if configuration is not None:
+        # Require explicit JSON values, not a lossy type-only encoding of
+        # opaque objects (e.g. two different torch.dtype settings).
+        signature["configuration"] = json.loads(json.dumps(configuration, allow_nan=False))
+    return signature
+
+
 def _recorded_replay(replay):
     """Observe the existing protocol only inside explicitly annotated pytest cases."""
 
@@ -73,18 +88,9 @@ def _recorded_replay(replay):
         bound = inspect.signature(replay).bind(*args, **kwargs)
         bound.apply_defaults()
         options = bound.arguments
-        signature = {
-            "inputs": _input_signature(options["inputs"]),
-            "phase": "forward_backward" if options["backward"] else "forward",
-            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
-            "runtime": runtime_signature(torch),
-        }
-        if options["configuration"] is not None:
-            # Require explicit JSON values, not a lossy type-only encoding of
-            # opaque objects (e.g. two different torch.dtype settings).
-            signature["configuration"] = json.loads(
-                json.dumps(options["configuration"], allow_nan=False)
-            )
+        signature = replay_signature(
+            options["inputs"], backward=options["backward"], configuration=options["configuration"]
+        )
         protocol = {key: options[key] for key in ("replays", "contention", "restore_rng")}
         protocol.update(
             scope="same_process_outputs_and_gradients",

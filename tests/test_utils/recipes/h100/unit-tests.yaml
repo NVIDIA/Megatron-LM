@@ -55,7 +55,7 @@ spec:
     if [[ "$TAG" == "latest" && ( "$BUCKET" == "tests/unit_tests/determinism/kernels/**/*.py" || "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ) ]]; then
         export DETERMINISM_EVIDENCE_RUN_ID="{environment}-{platforms}-{tag}"
         EVIDENCE_SCOPE=kernel
-        REQUIRED_VIEWS=()
+        REQUIRED_VIEWS=(--require-author-checks)
         if [[ "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ]]; then
             EVIDENCE_SCOPE=model
             REQUIRED_VIEWS=(--require-parallelism)
