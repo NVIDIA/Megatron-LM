@@ -2987,10 +2987,21 @@ class TransformerConfig(ModelParallelConfig):
             elif detected_vpp_size > 1:
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
+            # ModelParallelConfig validates explicit VPP during super().__post_init__(), but a
+            # flexible layout derives VPP only here. Re-run the schedule check after derivation so
+            # the fixed-shape optimization cannot enter the interleaved schedule with the wrong
+            # receive-buffer shape.
+            self._validate_pipeline_p2p_fixed_shape_schedule()
+
             # Check whether the layout is valid.
+            mtp_was_standalone = self.mtp_standalone
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
+            if self.mtp_standalone and not mtp_was_standalone:
+                # The base config cannot see layout-derived standalone MTP. Warn once when this
+                # post-layout transition makes the fixed-shape flag a no-op.
+                self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
 
         # Uneven PP
         elif (
