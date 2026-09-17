@@ -401,6 +401,16 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _quantization_autocast_active() -> bool:
+    """Whether a quantization autocast surrounds the current call.
+
+    TE keeps a single autocast state for fp8 and fp4 and exposes it under the fp8 name, so
+    this covers both. Read it before entering a module's own quantization context: it is the
+    ambient state that a per-module ``quant_recipe`` overrides.
+    """
+    return FP8GlobalStateManager.is_fp8_enabled()
+
+
 def _resolve_is_first_microbatch(module) -> Optional[bool]:
     """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
 
@@ -409,7 +419,7 @@ def _resolve_is_first_microbatch(module) -> Optional[bool]:
     """
     if (
         module.disable_parameter_transpose_cache
-        or not is_first_microbatch_tracked(module.config)
+        or not is_first_microbatch_tracked(module.config, module, _quantization_autocast_active())
         or getattr(module, 'is_repeated_layer', False)
     ):
         return None
