@@ -267,6 +267,47 @@ equivalent to paired base/head measurements. H100 and GB200 remain separate
 contexts. Retain the content-addressed store in durable storage; the ordinary CI
 log artifact's retention period alone does not provide permanent publication.
 
+### Compare retained calibration runs
+
+Use pinned, verified, unbudgeted bundles to review variation across runs:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/calibration.py \
+  --baseline /store/first-run <first-manifest-sha256> \
+  --baseline /store/second-run <second-manifest-sha256> \
+  --output /reports/calibration.json
+```
+
+The command rechecks every bundle's files and author/timing join. It rejects
+duplicate identifiers, identical measurements republished with different metadata,
+and budgeted results whose selection could hide failed measurements. Invalid input
+fails the report instead of silently selecting the remaining passing records.
+
+Comparison groups retain exact source revisions, cases, shapes, inputs, precision,
+adapter, runtime settings and measurement protocol. H100/GB200, changed drivers,
+software versions, base revisions and phase protocols remain separate. Host names,
+GPU UUIDs and checkout locations remain in each run's provenance; they do not
+split a group. Counts of distinct timing GPUs do not establish statistical
+independence or prove separate scheduler allocations.
+
+Cache paths match by default. For runs using different explicit cache directories,
+`--compare-cache-locations` groups those locations while preserving the actual
+paths in every run. Unset and explicit cache locations still remain separate.
+This option does not establish equal cache contents, generated code or dispatch.
+Other runtime settings continue to require exact equality.
+
+Each bundle contributes one median paired ratio. JSON retains each run's paired
+ratios and within-run intervals; Markdown shows the minimum, median, maximum and
+observed range across runs. Default/deterministic overhead stays separate from
+paired head/base regression. Raw event samples are never pooled to manufacture
+more independent observations, and the observed range is not a confidence or
+prediction bound. One-run groups are explicitly marked in JSON.
+
+The result remains `report_only` / `not_gated`. The tool does not choose budgets,
+approve promotion or replace production-recipe measurements. Inputs are selected
+published bundles, not a complete survey of executions. Preserve unsuccessful
+attempts alongside them when reviewing calibration and unexplained variation.
+
 CPU contract tests use explicitly synthetic GPU metadata and timings. They do
 not establish hardware latency, correctness, replay coverage or usable budgets.
 
