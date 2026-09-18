@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 import warnings
@@ -270,7 +270,8 @@ class OptimizerConfig:
     """The mode to use for the scale factor. Defaults to "spectral"."""
 
     muon_fp32_matmul_prec: str = "medium"
-    """The precision to use for the fp32 matmul. Defaults to "medium"."""
+    """PyTorch FP32 matmul precision for Newton-Schulz: "medium", "high", or "highest".
+    Use "highest" to retain full FP32 arithmetic. Defaults to "medium"."""
 
     muon_coefficient_type: str = "quintic"
     """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered
