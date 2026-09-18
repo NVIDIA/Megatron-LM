@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 from collections.abc import Callable, Iterable
@@ -185,6 +186,24 @@ class GroupedMLPSubmodules:
     """
 
 
+@functools.lru_cache(maxsize=1)
+def _te_grouped_tensor_supports_sharded_weights() -> bool:
+    """Whether TE threads the sharded parameters through its grouped-tensor path.
+
+    Added by https://github.com/NVIDIA/TransformerEngine/pull/3517.
+
+    TODO: replace with ``is_te_min_version`` once that fix ships in a bumped TE release. Fixed
+    and unfixed builds both report 2.20.0.dev0 today, so no version can distinguish them yet.
+    """
+    try:
+        from transformer_engine.pytorch.module.grouped_linear import _GroupedLinear
+
+        signature = inspect.signature(_GroupedLinear._forward_grouped_tensor)
+    except (ImportError, AttributeError, ValueError):
+        return False
+    return "is_dist_weight" in signature.parameters
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -316,6 +335,34 @@ class TEGroupedMLP(MegatronModule):
             )
 
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
+
+        # Imported lazily: a module-scope import can silently flip HAVE_GTP to False
+        from megatron.core.tensor_parallel import gtp_api
+
+        # GTP wraps a grouped module's weight0..N as a set, so weight0 is representative -- the
+        # same assumption TE makes when it gates on weights[0].
+        fc1_weight0 = getattr(self.linear_fc1, "weight0", None)
+        has_gtp_sharded_weights = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(fc1_weight0)
+        # Two independent blockers keep a sharded layer off the grouped-tensor path:
+        #   1. Older TE mishandles sharded weights there. Probed rather than version-gated:
+        #      fixed and unfixed builds currently share a version.
+        #   2. GTP's fp8 gather materializes row-wise data only, but that path needs column-wise
+        #      in forward for a trainable weight. Independent of the TE version.
+        blocked_by_te = not _te_grouped_tensor_supports_sharded_weights()
+        blocked_by_fp8_gather = getattr(fc1_weight0, "_gtp_native_fp8", False)
+        if (
+            self._use_grouped_tensor
+            and not self._with_fused_impl
+            and has_gtp_sharded_weights
+            and (blocked_by_te or blocked_by_fp8_gather)
+        ):
+            # Fall back to the split-quantize path, which handles sharded weights.
+            # Both sides of the boundary have to agree, so flip both.
+            # mcore: selects the tokens_per_expert form below (CUDA tensor vs host list).
+            self._use_grouped_tensor = False
+            # TE: selects the path inside GroupedLinear.forward, which reads this per-forward.
+            self.linear_fc1.use_grouped_tensor = False
+            self.linear_fc2.use_grouped_tensor = False
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
             align_size = (

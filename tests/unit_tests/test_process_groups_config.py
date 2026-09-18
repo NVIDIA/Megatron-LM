@@ -53,6 +53,24 @@ class TestProcessGroupsConfig:
         assert hasattr(grad_pgs, 'dp')
         assert grad_pgs.dp_cp is None  # Not set yet
 
+    def test_dp_fields_split_replicate_and_data_distribution_axes(self, mocker):
+        """``dp`` is the replicate group; ``dp_gtp_remat`` spans the gtp_remat data axis."""
+        replicate_pg = mocker.Mock(spec=dist.ProcessGroup)
+        data_pg = mocker.Mock(spec=dist.ProcessGroup)
+
+        def fake_get_data_parallel_group(*args, with_gtp_remat=True, **kwargs):
+            return data_pg if with_gtp_remat else replicate_pg
+
+        mocker.patch(
+            'megatron.core.process_groups_config.parallel_state.get_data_parallel_group',
+            side_effect=fake_get_data_parallel_group,
+        )
+
+        pgs = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['dp', 'dp_gtp_remat'])
+
+        assert pgs.dp is replicate_pg
+        assert pgs.dp_gtp_remat is data_pg
+
     def test_hierarchical_context_parallel_groups(self, mocker):
         """Test setting and accessing the hierarchical context parallel list."""
         # Create mock process groups

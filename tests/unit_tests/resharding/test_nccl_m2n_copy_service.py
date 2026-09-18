@@ -60,19 +60,26 @@ def test_validate_nccl_version():
         _validate_nccl_version(_nccl_with_version(2, 30, 4))
 
 
-def test_hybrid_group_uses_registered_nccl_cuda_backend(monkeypatch):
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("use_default_group", [False, True])
+@pytest.mark.parametrize("backend_name", ["gloo", "undefined"])
+def test_hybrid_group_uses_registered_nccl_cuda_backend(
+    monkeypatch, use_default_group, backend_name
+):
     cuda_backend = SimpleNamespace(_get_backend_name=lambda: "nccl")
     group = SimpleNamespace(_get_backend=lambda device: cuda_backend)
-    monkeypatch.setattr(dist, "get_backend", lambda _group: "gloo")
+    monkeypatch.setattr(dist, "get_backend", lambda _group: backend_name)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(dist, "group", SimpleNamespace(WORLD=group))
 
-    assert _has_nccl_cuda_backend(group)
+    assert _has_nccl_cuda_backend(None if use_default_group else group)
 
     def get_missing_backend(_device):
         raise RuntimeError("no CUDA backend")
 
     gloo_only_group = SimpleNamespace(_get_backend=get_missing_backend)
-    assert not _has_nccl_cuda_backend(gloo_only_group)
+    monkeypatch.setattr(dist, "group", SimpleNamespace(WORLD=gloo_only_group))
+    assert not _has_nccl_cuda_backend(None if use_default_group else gloo_only_group)
 
 
 def test_validate_role_roster_accepts_source_first_disjoint_meshes():
