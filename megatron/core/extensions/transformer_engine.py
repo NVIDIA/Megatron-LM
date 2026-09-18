@@ -3213,9 +3213,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             input_size: int | None = None,
             ffn_hidden_size: int | None = None,
             name: str | None = None,
+            hash_moe_layer_threshold: int | None = None,
         ) -> MLP:
             """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
             del is_mtp_layer
+            if hash_moe_layer_threshold is not None and hash_moe_layer_threshold > 0:
+                raise ValueError("Dense MLP does not support hash MoE routing.")
             assert hasattr(
                 pg_collection, 'tp'
             ), 'TP process group is required for TEFusedMLP in TransformerLayer'
