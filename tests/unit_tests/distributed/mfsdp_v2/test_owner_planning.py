@@ -141,7 +141,7 @@ def test_from_group_is_shape_agnostic():
     assert list(layouts) == [0]
     assert layouts[0].flat_counts == (24, 0)
 
-    layouts = ParameterLayout.from_group(group, eligible_fn=lambda param: True)
+    layouts = ParameterLayout.from_group(group, eligible_fn=lambda _param: True)
     assert list(layouts) == [0, 1]
     assert layouts[0].flat_counts == (24, 0)
     assert layouts[1].flat_counts == (0, 24)
