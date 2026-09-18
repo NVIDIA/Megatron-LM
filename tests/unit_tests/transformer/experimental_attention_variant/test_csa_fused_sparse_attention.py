@@ -16,6 +16,10 @@ Coverage:
   ``cudnn.DSA`` kernels so the data-marshalling logic (shape conversions,
   TopK padding, predict/target/KL composition, autograd plumbing) is
   validated without requiring the real CUDA kernels.
+* Autograd-boundary TopK width alignment so cuDNN sparse-attention backward
+  inherits a stable compile key from the forward save.
+* Triton JIT compile-key stability for sparse-loss preparation and fused
+  teacher-LSE under packed-THD geometries.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant import dsa_fused_safety
+from megatron.core.transformer.experimental_attention_variant.csa_utils import csa_teacher_lse
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention as dk,
 )
@@ -866,6 +871,100 @@ class TestGetTopkAlignment:
 
 
 # ---------------------------------------------------------------------------
+# CSASparseAttnFunc TopK width alignment (forward save → backward compile key)
+# ---------------------------------------------------------------------------
+#
+# FlashMLA pads TopK only inside ``_csa_fwd_flash_mla`` for the forward call.
+# Without aligning before ``save_for_backward``, cuDNN sparse-attention bwd still
+# sees the raw data-dependent width and recompiles. ``_align_topk_width`` runs at
+# the autograd boundary so the saved tensor (and therefore backward) inherits a
+# stable 64-bucket width. Backward itself is unchanged.
+
+
+def _aligned_topk_make_inputs(width: int, n: int = 64, h: int = 8, d: int = 64):
+    """Build synthetic CSASparseAttnFunc inputs with ``width`` topk slots per row."""
+    torch.manual_seed(width)
+    q = torch.randn(n, h, d, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(n + 16, d, dtype=torch.bfloat16, requires_grad=True)
+    sink = torch.full((h,), float("-inf"), dtype=torch.float32)
+    topk_idxs = torch.randint(0, n + 16, (n, width), dtype=torch.int32)
+    return q, kv, sink, topk_idxs
+
+
+class _RecordingDSATopkWidth:
+    """Stub DSA namespace that records the topk tensor handed to backward."""
+
+    def __init__(self):
+        self.calls = []
+
+    def sparse_attention_backward_wrapper(
+        self, q, kv, out, dout, lse, attn_sink, topk_idxs, softmax_scale, topk_length
+    ):
+        self.calls.append(topk_idxs.clone())
+        return {
+            "dq": torch.zeros_like(q),
+            "dkv": torch.zeros_like(kv),
+            "d_sink": torch.zeros_like(attn_sink),
+        }
+
+
+def _aligned_topk_fake_fwd(
+    q, kv, topk_idxs, softmax_scale, attn_sink=None, topk_length=None, indexer_topk=0
+):
+    """Stub FlashMLA forward; these tests only care about saved topk width."""
+    out = torch.zeros_like(q)
+    lse = torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32)
+    return out, lse, None
+
+
+def _run_aligned_topk_fwd_bwd(recorder, topk_length, width):
+    q, kv, sink, topk_idxs = _aligned_topk_make_inputs(width)
+    with (
+        patch.object(dk, "_csa_fwd_flash_mla", _aligned_topk_fake_fwd),
+        patch.object(dk, "_ensure_dsa_namespace", lambda: setattr(dk, "_DSA", recorder)),
+        patch.object(dk, "_DSA", recorder),
+    ):
+        out, _, _ = CSASparseAttnFunc.apply(q, kv, sink, topk_idxs, topk_length, 1.0 / 8.0, 0)
+        out.backward(torch.ones_like(out))
+    return q, topk_idxs
+
+
+@pytest.mark.parametrize("topk_length", [None, torch.full((64,), 100, dtype=torch.int32)])
+def test_backward_topk_widths_collapse_to_64_buckets(topk_length):
+    """Widths 130 and 189 both reach backward as 192 (stable compile key)."""
+    recorder = _RecordingDSATopkWidth()
+    for width in (130, 189, 130):
+        _run_aligned_topk_fwd_bwd(recorder, topk_length, width)
+    assert len(recorder.calls) == 3
+    seen_widths = [t.shape[-1] for t in recorder.calls]
+    assert seen_widths == [
+        192,
+        192,
+        192,
+    ], f"backward topk widths must be 64-aligned stable buckets, got {seen_widths}"
+
+
+def test_backward_topk_aligned_width_unchanged():
+    """Already-64-aligned widths are passed through untouched."""
+    recorder = _RecordingDSATopkWidth()
+    _, topk_idxs = _run_aligned_topk_fwd_bwd(recorder, None, 256)
+    (seen,) = recorder.calls
+    assert seen.shape[-1] == 256
+    assert torch.equal(seen, topk_idxs)
+
+
+@pytest.mark.parametrize("topk_length", [None, torch.full((64,), 100, dtype=torch.int32)])
+def test_backward_topk_padding_values(topk_length):
+    """Original entries are preserved; padded suffix is the -1 invalid sentinel."""
+    recorder = _RecordingDSATopkWidth()
+    _, topk_idxs = _run_aligned_topk_fwd_bwd(recorder, topk_length, 130)
+    (seen,) = recorder.calls
+    assert seen.shape[-1] == 192
+    assert torch.equal(seen[:, :130], topk_idxs)
+    assert (seen[:, 130:] == -1).all()
+
+
+# ---------------------------------------------------------------------------
 # Sparse-loss preparation
 # ---------------------------------------------------------------------------
 
@@ -927,6 +1026,103 @@ def test_sparse_loss_preparation_triton_matches_eager():
     assert torch.equal(actual[2], expected[2])
     assert actual[0][0, 1].item() == 0.0
     torch.testing.assert_close(actual[0][2], torch.full((5,), 0.2, device="cuda"))
+
+
+def _compiled_triton_variants(kernel) -> int:
+    """Count in-memory compiled variants of a ``triton.jit`` function."""
+    return sum(len(entry[0]) for entry in kernel.device_caches.values())
+
+
+def _reset_triton_kernels(*kernels):
+    for kernel in kernels:
+        kernel.device_caches.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_prepare_sparse_loss_compiles_once_across_score_widths():
+    """Packed-THD score widths must stay off the Triton JIT key."""
+    if not dk.csa_indexer_loss_kernels._TRITON_AVAILABLE:
+        pytest.skip("Triton is not available")
+    kernel = dk.csa_indexer_loss_kernels._prepare_sparse_loss_kernel
+    _reset_triton_kernels(kernel)
+
+    topk_width = 33
+    for rows, score_width in ((104, 50), (124, 54), (200, 58)):
+        scores = torch.randn(rows, score_width, dtype=torch.float32, device="cuda")
+        topk = torch.randint(-1, score_width, (rows, topk_width), dtype=torch.int32, device="cuda")
+        physical = torch.where(topk >= 0, topk + 1000, topk)
+        padding = torch.zeros(rows, dtype=torch.bool, device="cuda")
+        padding[::7] = True
+
+        predict, sanitized_topk, sanitized_physical = (
+            dk.csa_indexer_loss_kernels.prepare_sparse_loss(scores, topk, padding, physical)
+        )
+        expected = dk.csa_indexer_loss_kernels._prepare_sparse_loss_fallback(
+            scores, topk, padding, physical
+        )
+        torch.testing.assert_close(predict, expected[0])
+        assert torch.equal(sanitized_topk, expected[1])
+        assert torch.equal(sanitized_physical, expected[2])
+
+    assert _compiled_triton_variants(kernel) == 1
+
+
+# Segment layouts with distinct segment counts / maxima at ratio 4. No derived
+# value is 1 or a multiple of 16, so Triton divisibility specialization cannot
+# collapse distinct keys and mask a JIT-key regression.
+_TEACHER_LSE_SEGMENT_LAYOUTS = ([68, 36], [52, 52, 20], [100, 44, 36, 20])
+_TEACHER_LSE_RATIO = 4
+
+
+def _teacher_lse_cu_seqlens(lengths):
+    cumulative = [0]
+    for length in lengths:
+        cumulative.append(cumulative[-1] + length)
+    return torch.tensor(cumulative, dtype=torch.int32, device="cuda")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_teacher_lse_compiles_once_across_packed_geometries():
+    """Packed segment count and maxima must stay runtime scalars for teacher LSE."""
+    if not hasattr(csa_teacher_lse, "_csa_window_lse_kernel"):
+        pytest.skip("Triton CSA teacher-LSE kernels are unavailable")
+    window_kernel = csa_teacher_lse._csa_window_lse_kernel
+    compressed_kernel = csa_teacher_lse._csa_compressed_lse_thd_kernel
+    _reset_triton_kernels(window_kernel, compressed_kernel)
+
+    num_heads, head_dim, window_width = 8, 64, 16
+    for lengths in _TEACHER_LSE_SEGMENT_LAYOUTS:
+        total_q = sum(lengths)
+        compressed_lengths = [length // _TEACHER_LSE_RATIO for length in lengths]
+        total_compressed = sum(compressed_lengths)
+        total_kv = total_q + total_compressed
+
+        query = torch.randn(total_q, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        full_kv = torch.randn(total_kv, head_dim, dtype=torch.bfloat16, device="cuda")
+        compressed_kv = full_kv[total_q:]
+        attn_sink = torch.zeros(num_heads, dtype=torch.float32, device="cuda")
+        window_indices = torch.randint(
+            -1, total_q, (total_q, window_width), dtype=torch.int32, device="cuda"
+        )
+
+        lse = fused_csa_teacher_lse(
+            query,
+            full_kv,
+            compressed_kv,
+            attn_sink,
+            window_indices,
+            softmax_scale=head_dim**-0.5,
+            ratio=_TEACHER_LSE_RATIO,
+            cu_seqlens_q=_teacher_lse_cu_seqlens(lengths),
+            cu_seqlens_k=_teacher_lse_cu_seqlens(compressed_lengths),
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=max(compressed_lengths),
+        )
+        assert lse.shape == (total_q, num_heads)
+        assert torch.isfinite(lse).all()
+
+    assert _compiled_triton_variants(window_kernel) == 1
+    assert _compiled_triton_variants(compressed_kernel) == 1
 
 
 # ---------------------------------------------------------------------------
