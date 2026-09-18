@@ -268,6 +268,111 @@ def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mo
     torch.testing.assert_close(result, expected)
 
 
+@pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
+def test_muon_optimizer_gtp_distributed_padding_uses_logical_scale_shape(monkeypatch, scale_mode):
+    """Distributed NS keeps aligned rows, but Muon scaling uses the logical matrix shape."""
+    from types import SimpleNamespace
+
+    from emerging_optimizers.orthogonalized_optimizers import get_muon_scale_factor
+
+    gtp_group = object()
+    pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+
+    # GTP2: local [4, 7] reconstructs physical [8, 7], with 2 padded rows -> logical [6, 7].
+    # Padding crosses the square boundary so spectral and shape_scaling change too;
+    # logical shape_scaling is clamped to 1 while the padded value is sqrt(8 / 7).
+    local_grad = torch.ones((4, 7), dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = 2
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        num_ns_steps=1,
+        scale_mode=scale_mode,
+        pg_collection=pg_collection,
+        tp_mode="distributed",
+    )
+
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2)
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.newton_schulz_tp",
+        lambda grad, **_kwargs: torch.ones_like(grad),
+    )
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(param, local_grad, None, None)
+
+    expected_scale = get_muon_scale_factor(6, 7, mode=scale_mode)
+    padded_scale = get_muon_scale_factor(8, 7, mode=scale_mode)
+    assert expected_scale != padded_scale
+    torch.testing.assert_close(result, torch.full_like(local_grad, expected_scale))
+
+
+@pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
+@pytest.mark.parametrize(
+    "partition_dim,tp_size,gtp_size,local_shape,pad_length,logical_shape",
+    [
+        pytest.param(1, 2, 4, (4, 4), 3, (13, 8), id="row-parallel"),
+        pytest.param(0, 4, 2, (4, 8), 3, (20, 8), id="column-parallel"),
+    ],
+)
+def test_muon_optimizer_tp_gtp_distributed_padding_uses_logical_scale_shape(
+    monkeypatch,
+    scale_mode,
+    partition_dim,
+    tp_size,
+    gtp_size,
+    local_shape,
+    pad_length,
+    logical_shape,
+):
+    """TP x GTP scaling removes padding once from each TP-local dim-0 slice."""
+    from types import SimpleNamespace
+
+    from emerging_optimizers.orthogonalized_optimizers import get_muon_scale_factor
+
+    tp_group, gtp_group = object(), object()
+    group_sizes = {tp_group: tp_size, gtp_group: gtp_size}
+    pg_collection = SimpleNamespace(
+        tp=tp_group, expt_tp=tp_group, gtp_remat=gtp_group, expt_gtp_remat=gtp_group
+    )
+
+    local_grad = torch.ones(local_shape, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = pad_length
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        num_ns_steps=1,
+        scale_mode=scale_mode,
+        pg_collection=pg_collection,
+        tp_mode="distributed",
+    )
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: group_sizes[group]
+    )
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(
+        optimizer,
+        "_all_gather_tensor",
+        lambda tensor, group, dim: torch.cat([tensor] * group_sizes[group], dim=dim),
+    )
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.newton_schulz_tp",
+        lambda grad, **_kwargs: torch.ones_like(grad),
+    )
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(
+        param, local_grad, tp_group, partition_dim
+    )
+
+    expected_scale = get_muon_scale_factor(*logical_shape, mode=scale_mode)
+    torch.testing.assert_close(result, torch.full_like(local_grad, expected_scale))
+
+
 @pytest.mark.parametrize("gtp_rank,expected_local_pad_length", [(0, 0), (1, 1), (2, 2), (3, 2)])
 def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
     monkeypatch, gtp_rank, expected_local_pad_length
