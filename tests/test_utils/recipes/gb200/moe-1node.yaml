@@ -139,3 +139,12 @@ products:
       - environment: [dev]
         scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
+
+  #######################################################################
+  # MFSDP v2 + EP2 bf16, full-iteration CUDA graph incl. optimizer.step #
+  #######################################################################
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_bf16_cg_optim_1node]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
