@@ -37,9 +37,12 @@ def signature_key(signature: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _evidence_index(reports: list[dict], context: dict) -> tuple[dict, list[str]]:
+def _evidence_index(
+    reports: list[dict], context: dict, observed_by_rank: dict[int, set[str]]
+) -> tuple[dict, list[str]]:
     index: dict[str, list[dict]] = {}
     rejected = []
+    expected = set(range(context["world_size"]))
     for report in reports:
         if report.get("schema_version") != 1 or report.get("kind") != "determinism_coverage":
             raise ValueError("Unsupported coverage report schema")
@@ -52,12 +55,16 @@ def _evidence_index(reports: list[dict], context: dict) -> tuple[dict, list[str]
                 raise ValueError(f"Unknown case status: {status}")
             if status == UNVERIFIED:
                 continue
-            candidates_by_protocol: dict[tuple[str, str], list[dict]] = {}
+            candidates_by_protocol: dict[tuple[str, str, str], list[dict]] = {}
+            assignments: dict[tuple[str, str], dict[int, set[str]]] = {}
             for observation in case["observations"]:
                 # A failed aggregate case cannot lend passing observations to
                 # other operations. For N, retain only the actual mismatches.
                 if observation["status"] != status:
                     continue
+                rank = observation["rank"]
+                if type(rank) is not int or rank not in expected:
+                    raise ValueError("Evidence contains an invalid rank")
                 signature = observation["signature"]
                 signatures = [signature]
                 # A forward+backward replay also compared its forward outputs.
@@ -68,19 +75,35 @@ def _evidence_index(reports: list[dict], context: dict) -> tuple[dict, list[str]
                     protocol_key = json.dumps(
                         observation["protocol"], sort_keys=True, allow_nan=False
                     )
-                    group = candidates_by_protocol.setdefault((key, protocol_key), [])
+                    group = candidates_by_protocol.setdefault(
+                        (key, protocol_key, candidate["phase"]), []
+                    )
                     group.append(observation)
-            for (key, _), observations in candidates_by_protocol.items():
+                    assignment = assignments.setdefault((candidate["phase"], protocol_key), {})
+                    assignment.setdefault(rank, set()).add(key)
+            for (key, protocol_key, phase), observations in candidates_by_protocol.items():
                 ranks = {observation["rank"] for observation in observations}
-                expected = set(range(context["world_size"]))
-                if not ranks <= expected:
-                    raise ValueError("Evidence contains an invalid rank")
-                if status == DETERMINISTIC and (
-                    ranks != expected or set(report["ranks_present"]) != expected
-                ):
-                    # A passing case with rank-dependent inputs does not prove
-                    # any one signature on every rank of a different recipe.
-                    continue
+                rank_assignment = None
+                if status == DETERMINISTIC:
+                    if set(report["ranks_present"]) != expected:
+                        continue
+                    if ranks != expected:
+                        # A rank-dependent signature is eligible only as part
+                        # of one complete case/protocol assignment. Never fill
+                        # missing peers from a different case or replay run.
+                        assignment = assignments[(phase, protocol_key)]
+                        if not (
+                            set(assignment) == expected
+                            and all(len(keys) == 1 for keys in assignment.values())
+                            and all(
+                                keys <= observed_by_rank.get(rank, set())
+                                for rank, keys in assignment.items()
+                            )
+                        ):
+                            continue
+                        rank_assignment = {
+                            str(rank): next(iter(keys)) for rank, keys in sorted(assignment.items())
+                        }
                 index.setdefault(key, []).append(
                     {
                         "status": status,
@@ -88,6 +111,11 @@ def _evidence_index(reports: list[dict], context: dict) -> tuple[dict, list[str]
                         "case_id": case["case_id"],
                         "ranks": sorted(ranks),
                         "protocol": observations[0]["protocol"],
+                        **(
+                            {"rank_assignment": rank_assignment}
+                            if rank_assignment is not None
+                            else {}
+                        ),
                     }
                 )
     return index, rejected
@@ -102,6 +130,7 @@ def build_report(inventories: list[dict], evidence: list[dict]) -> dict:
     if not isinstance(context.get("world_size"), int) or context["world_size"] < 1:
         raise ValueError("world_size must be a positive integer")
     by_rank = {}
+    observed_by_rank: dict[int, set[str]] = {}
     operations: dict[str, dict] = {}
     issues = []
     for inventory in inventories:
@@ -122,6 +151,7 @@ def build_report(inventories: list[dict], evidence: list[dict]) -> dict:
         for operation in inventory["operations"]:
             signature = operation["signature"]
             key = signature_key(signature)
+            observed_by_rank.setdefault(rank, set()).add(key)
             row = operations.setdefault(
                 key, {"signature": signature, "calls": 0, "ranks": set(), "sites": set()}
             )
@@ -135,10 +165,14 @@ def build_report(inventories: list[dict], evidence: list[dict]) -> dict:
         issues.append(f"Missing ranks: {sorted(missing)}")
     if context.get("dirty", True):
         issues.append("Source tree has uncommitted changes")
-    index, rejected = _evidence_index(evidence, context)
+    index, rejected = _evidence_index(evidence, context, observed_by_rank)
     cases = []
     for key, operation in sorted(operations.items()):
-        matches = index.get(key, [])
+        matches = [
+            match
+            for match in index.get(key, [])
+            if match["status"] != DETERMINISTIC or operation["ranks"] <= set(match["ranks"])
+        ]
         statuses = {match["status"] for match in matches}
         if NONDETERMINISTIC in statuses:
             status = NONDETERMINISTIC

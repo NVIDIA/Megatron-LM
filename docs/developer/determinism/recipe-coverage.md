@@ -91,9 +91,22 @@ changed revision, dirty-tree status, or recorded environment prevents completion
 and leaves the inventory unverified. The consumer independently rejects recorded
 context drift, even if a capture claims completion. These boundary checks do not
 detect a change that is reverted before the final check.
-A passing signature must have matching
-protocol evidence from every required rank. A passing forward+backward replay can supply
-forward evidence. A backward mismatch is not projected into a forward failure.
+A passing signature shared across ranks requires matching protocol evidence from
+every required rank. Rank-dependent signatures can also match when **one case in
+one replay run, using one protocol and phase**, contains exactly one signature per
+required rank and the inventory contains every signature on that same rank.
+The JSON retains the complete `rank_assignment` with each match. Group membership,
+local rank, input hashes and other recorded configuration fields remain part of
+the exact signature; none are dropped to make a collective match.
+
+Missing peers, changed rank assignments, ambiguous variants on a rank, or evidence
+split across cases, protocols or runs cannot supply this match. A signature used
+on an additional recipe rank needs evidence for that rank as well. Repeated calls
+do not prove that their order or interactions match the test; independent recipe
+replay remains required.
+
+A passing forward+backward replay can supply forward evidence. A backward mismatch
+is not projected into a forward failure.
 Matching negative evidence takes precedence over intermittent passing evidence.
 
 JSON and Markdown reports list matching case/run IDs, unknown configurations,
@@ -115,10 +128,13 @@ replays can bypass these wrappers. The inventory is therefore partial by
 construction. Wrappers/hooks can also affect compilation and scheduling: use
 the original uninstrumented recipe for final replay and performance validation.
 
-The current coverage producer initially annotates fused activations. New model
-shapes, backends, or environment settings will often be unverified until a
-corresponding test is added. This exposes the work needed without extrapolating
-from a nearby passing configuration.
+New model shapes, backends, or environment settings will often be unverified until
+a corresponding test is added. Rank-aware matching does not add a collective
+capture adapter: a generic wrapper cannot recover an explicit process group's
+semantics or reproduce a test's input hashes from opaque argument types. Those
+signatures remain unverified until an adapter records the complete matching
+contract. This exposes the work needed without extrapolating from a nearby
+passing configuration.
 
 Full automatic operation discovery, first-divergence tensor comparison, and
 checkpoint-state certification are separate extensions; this PR provides the
