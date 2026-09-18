@@ -1330,6 +1330,8 @@ class LLaVAModel(MegatronModule):
                 dummy_image_size = self.vision_model.patch_dim
                 if self._pixel_shuffle:
                     dummy_image_size *= 2
+                if self._conv_merging:
+                    dummy_image_size *= 2
                 (
                     vision_images,
                     imgs_sizes,
@@ -1522,6 +1524,8 @@ class LLaVAModel(MegatronModule):
                         frame_token_counts = frame_token_counts + class_token_len
                     if self._pixel_shuffle:
                         frame_token_counts = frame_token_counts // 4
+                    if self._conv_merging:
+                        frame_token_counts = frame_token_counts // 4
                     media_token_counts = _align_temporal_token_counts_to_placeholders(
                         frame_token_counts, num_frames, input_ids, self.image_token_index
                     )
@@ -1601,6 +1605,8 @@ class LLaVAModel(MegatronModule):
                                 getattr(self.vision_model, "class_token_len", 0)
                             )
                         if self._pixel_shuffle:
+                            frame_token_counts = frame_token_counts // 4
+                        if self._conv_merging:
                             frame_token_counts = frame_token_counts // 4
                         media_token_counts = _align_temporal_token_counts_to_placeholders(
                             frame_token_counts, global_num_frames, input_ids, self.image_token_index

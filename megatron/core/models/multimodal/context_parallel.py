@@ -442,7 +442,7 @@ def split_to_context_parallel_ranks_dynamic_res(
             empty CP shards, which the current vision path does not support.
             Their outputs are discarded during gathering. Defaults to one patch;
             use a larger grid when required by downstream compression, such as
-            2x2 patches for pixel shuffle.
+            2x2 patches for pixel shuffle or a native spatial merger.
         fp8_enabled: If True, pad each rank's local sequence to the FP8 multiple
             (16 by default; 32 for ``mxfp8``).
         fp8_recipe: Forwarded to :func:`get_padding` so the FP8 padding multiple
@@ -493,8 +493,8 @@ def split_to_context_parallel_ranks_dynamic_res(
     )
 
     # Dummy images must form a valid patch grid for downstream processing.
-    # One patch suffices by default; pixel shuffle requires a 2x2 grid,
-    # so its caller supplies dummy_image_size=2 * patch_dim.
+    # One patch suffices by default; pixel shuffle and native spatial mergers
+    # each require a 2x2 grid, so the caller increases dummy_image_size accordingly.
     if dummy_image_size is None:
         dummy_image_size = patch_dim
     dummy_image_size = int(dummy_image_size)
