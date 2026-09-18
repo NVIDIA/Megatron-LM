@@ -20,6 +20,7 @@ Telemetry exports to any OTLP-compatible backend (Jaeger, Grafana Tempo, W&B Wea
 - [Metrics](metrics.md)
 - [Pipeline-Parallel Trace Correlation](pipeline-parallel.md)
 - [Extending Instrumentation](extending.md)
+- [Trace Lifecycle](trace-lifecycle.md)
 
 ## Scope
 

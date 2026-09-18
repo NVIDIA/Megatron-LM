@@ -9,12 +9,15 @@ are best effort: an attribute failure must not interrupt Megatron execution.
 """
 
 import logging
+import math
+import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 _ACTIVE_TRAINER_HANDLE = None
+_PYTHON_STARTUP_RECORDED = False
 
 NAMESPACE = "megatron"
 
@@ -73,7 +76,23 @@ SPAN_LAYER_SELF_ATTENTION = "nv.mcore.layer.self_attention"
 SPAN_LAYER_MLP = "nv.mcore.layer.mlp"
 SPAN_LAYER_MAMBA = "nv.mcore.layer.mamba"
 
+SPAN_CHECKPOINT_EXIT_FINALIZE = "nv.mlm.checkpoint.exit_finalize"
+SPAN_TRAINING_ITER_BLOCK = "nv.dl.training.iter_block"
+SPAN_TRAINING_STARTUP = "nv.dl.training.startup"
+SPAN_TRAINING_STARTUP_PYTHON = "nv.dl.training.startup.python"
+SPAN_TRAINING_STARTUP_IMPORTS = "nv.dl.training.startup.imports"
+SPAN_TRAINING_STARTUP_ARG_PARSE = "nv.dl.training.startup.arg_parse"
+SPAN_TRAINING_STARTUP_IN_JOB_SETUP = "nv.dl.training.startup.in_job_setup"
+SPAN_TRAINING_STARTUP_INITIALIZE_MEGATRON = "nv.dl.training.startup.initialize_megatron"
+SPAN_TRAINING_STARTUP_JIT_FUSION_OPTIONS = "nv.dl.training.startup.jit_fusion_options"
+SPAN_TRAINING_STARTUP_MODEL_INIT = "nv.dl.training.startup.model_init"
+SPAN_TRAINING_STARTUP_DATALOADER = "nv.dl.training.startup.dataloader"
+SPAN_TRAINING_STARTUP_WEIGHT_HASH_CHECK = "nv.dl.training.startup.weight_hash_check"
+SPAN_GPU_SNIFF_STARTUP = "nv.dl.resiliency.gpu_sniff.startup"
+
 # Canonical span attribute names.
+MODEL_CONFIG_MODEL_TYPE = "nv.mcore.model.config.model_type"
+
 TRAINING_STEP = "nv.dl.training.step"
 TRAINING_ITERATION_IS_FIRST = "nv.dl.training.iteration.is_first"
 TRAINING_ITERATION_SKIPPED = "nv.dl.training.iteration.skipped"
@@ -131,6 +150,7 @@ class _ManagedTrainerTelemetry:
         self._handle = handle
         self._publication = ExitStack()
         self._closed = False
+        self._lifecycle = _TrainerLifecycle(handle)
 
     def _adopt_publication(self, publication: ExitStack) -> None:
         self._publication = publication.pop_all()
@@ -145,6 +165,7 @@ class _ManagedTrainerTelemetry:
             return
         self._closed = True
         try:
+            self._lifecycle.close()
             self._handle.shutdown()
         finally:
             try:
@@ -254,6 +275,456 @@ def checkpoint_save_span(step: int) -> Any:
         return
     with managed_span(CKPT, SPAN_CHECKPOINT_SAVE, **{TRAINING_STEP: step}) as span:
         yield span
+
+
+def run_checkpoint_exit_finalize(
+    callback: Any, tracer: Any | None, *args: Any, **kwargs: Any
+) -> Any:
+    """Run the terminal queue drain in a fresh exit-finalize trace root."""
+    root_state = None
+    if tracer is not None:
+        root_state = start_root_span(JOB, SPAN_CHECKPOINT_EXIT_FINALIZE, tracer)
+    try:
+        with managed_span(CKPT, SPAN_CHECKPOINT_SAVE_FINALIZE):
+            return callback(*args, **kwargs)
+    finally:
+        if root_state is not None:
+            end_root_span(*root_state)
+
+
+class LoopPassSpanLifecycle:
+    """Own one active loop-pass root and its same-rank link chain."""
+
+    def __init__(self) -> None:
+        self._span = None
+        self._context_token = None
+        self._previous_span_context = None
+
+    def reset(self) -> None:
+        """End any active pass and clear the prior-invocation link chain."""
+        self.end()
+        self._previous_span_context = None
+
+    def start(
+        self, tracer: Any, training_step: int, *, initial_link_context: Any | None = None
+    ) -> None:
+        """End the prior pass and open the next linked, fresh-root pass."""
+        self.end()
+        root_state = start_root_span(
+            JOB,
+            SPAN_TRAINING_ITER_BLOCK,
+            tracer,
+            link_context=self._previous_span_context or initial_link_context,
+            training_step=training_step,
+        )
+        if root_state is not None:
+            self._span, self._context_token = root_state
+
+    def end(self) -> None:
+        """End the active pass, preserving its context for the next link."""
+        if self._span is not None:
+            self._previous_span_context = end_root_span(self._span, self._context_token)
+        self._span = None
+        self._context_token = None
+
+
+class _TrainerLifecycle:
+    """Own startup and loop spans, but not provider or carrier teardown."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self._startup_span = None
+        self._startup_span_context = None
+        self._startup_parent_context = None
+        self._startup_start_time = None
+        self._startup_open_time = None
+        self._startup_context_token = None
+        self._loop_passes = LoopPassSpanLifecycle()
+
+    def start_startup(self, model_type: Any, program_start: Any, main_entry: Any) -> None:
+        """Open the startup span and attach its context as the parent for later phases."""
+        global _PYTHON_STARTUP_RECORDED
+        if not is_enabled(JOB):
+            return
+        from opentelemetry import context
+
+        state = start_startup_span(
+            self._handle.tracer,
+            model_type,
+            program_start,
+            main_entry,
+            include_python_startup=not _PYTHON_STARTUP_RECORDED,
+        )
+        if state is None:
+            return
+        _PYTHON_STARTUP_RECORDED = True
+        (
+            self._startup_span,
+            self._startup_parent_context,
+            self._startup_start_time,
+            self._startup_open_time,
+        ) = state
+        try:
+            self._startup_span_context = self._startup_span.get_span_context()
+        except Exception:
+            self._startup_span_context = None
+        self._startup_context_token = context.attach(self._startup_parent_context)
+
+    def emit_startup_phase(self, name: str, start: Any, end: Any) -> None:
+        """Emit one startup phase under the startup parent, or nothing once startup has closed."""
+        if self._startup_span is None or self._startup_parent_context is None:
+            return
+        emit_startup_span(
+            self._handle.tracer,
+            name,
+            start,
+            end,
+            context=self._startup_parent_context,
+            root_start=self._startup_start_time,
+            root_open_time=self._startup_open_time,
+        )
+
+    def end_startup(self) -> None:
+        """Close the startup span and detach the context it attached."""
+        if self._startup_span is not None:
+            try:
+                from opentelemetry import context
+
+                if self._startup_context_token is not None:
+                    context.detach(self._startup_context_token)
+            except Exception:
+                pass
+            try:
+                self._startup_span.end()
+            except Exception:
+                pass
+            self._startup_span = None
+            self._startup_parent_context = None
+            self._startup_start_time = None
+            self._startup_open_time = None
+
+    def prepare_loop(self) -> None:
+        """Reset loop-pass tracking before the training loop runs."""
+        self._loop_passes.reset()
+
+    def start_loop_pass(self, training_step: int) -> None:
+        """Open a loop-pass span for this training step, linked to the startup span."""
+        if not is_enabled(JOB):
+            self._loop_passes.end()
+            return
+        self._loop_passes.start(
+            self._handle.tracer, training_step, initial_link_context=self._startup_span_context
+        )
+
+    def end_loop_pass(self) -> None:
+        """Close the open loop-pass span."""
+        self._loop_passes.end()
+
+    def close(self) -> None:
+        """Close the loop pass and then the startup span."""
+        self.end_loop_pass()
+        self.end_startup()
+
+
+def is_exporting() -> bool:
+    """Return whether the current trainer handle exports telemetry."""
+    return _ACTIVE_TRAINER_HANDLE is not None and bool(
+        getattr(_ACTIVE_TRAINER_HANDLE, "is_exporting", False)
+    )
+
+
+def start_training_startup(model_type: Any, program_start: Any, main_entry: Any) -> None:
+    """Open the trainer's fresh startup root."""
+    if _ACTIVE_TRAINER_HANDLE is not None:
+        _ACTIVE_TRAINER_HANDLE._lifecycle.start_startup(model_type, program_start, main_entry)
+
+
+def emit_training_startup_phase(name: str, start: Any, end: Any) -> None:
+    """Emit one elapsed phase under the live startup root."""
+    if _ACTIVE_TRAINER_HANDLE is not None:
+        _ACTIVE_TRAINER_HANDLE._lifecycle.emit_startup_phase(name, start, end)
+
+
+def end_training_startup() -> None:
+    """End startup while retaining its context for the first loop-pass link."""
+    if _ACTIVE_TRAINER_HANDLE is not None:
+        _ACTIVE_TRAINER_HANDLE._lifecycle.end_startup()
+
+
+def prepare_training_loop() -> None:
+    """Reset the loop-pass link chain for this training invocation."""
+    if _ACTIVE_TRAINER_HANDLE is not None:
+        _ACTIVE_TRAINER_HANDLE._lifecycle.prepare_loop()
+
+
+def start_training_loop_pass(training_step: int) -> None:
+    """Open the next fresh loop-pass root linked to its predecessor."""
+    if _ACTIVE_TRAINER_HANDLE is not None:
+        _ACTIVE_TRAINER_HANDLE._lifecycle.start_loop_pass(training_step)
+
+
+def end_training_loop_pass() -> None:
+    """End the active loop-pass root and retain its link context."""
+    if _ACTIVE_TRAINER_HANDLE is not None:
+        _ACTIVE_TRAINER_HANDLE._lifecycle.end_loop_pass()
+
+
+def finalize_training_exit(callback: Any, *, terminate: bool) -> Any:
+    """Close the last loop pass and run the application's terminal queue drain."""
+    end_training_loop_pass()
+    tracer = None
+    if is_enabled(JOB) and _ACTIVE_TRAINER_HANDLE is not None:
+        tracer = _ACTIVE_TRAINER_HANDLE.tracer
+    return run_checkpoint_exit_finalize(callback, tracer, blocking=True, terminate=terminate)
+
+
+def shutdown_training(handle: Any) -> None:
+    """Close trainer telemetry, preserving disabled-handle shutdown delegation."""
+    if handle is not None:
+        handle.shutdown()
+
+
+class _TrainerExitHooks:
+    """Keep telemetry-only process hooks separate from application exit policy."""
+
+    def __init__(self) -> None:
+        self._installed = False
+        self._previous_sigterm = None
+        self._graceful_drain = False
+        self._sigterm_fired = False
+
+    def install(self, *, get_graceful_drain: Any) -> None:
+        """Register the atexit and SIGTERM hooks once, and only while exporting."""
+        if not is_exporting() or self._installed:
+            return
+        self._installed = True
+        import atexit
+        import signal
+
+        atexit.register(self.shutdown)
+        self._previous_sigterm = signal.getsignal(signal.SIGTERM)
+        try:
+            self._graceful_drain = bool(get_graceful_drain())
+        except Exception:
+            pass
+        try:
+            signal.signal(signal.SIGTERM, self.handle_sigterm)
+        except (ValueError, OSError):
+            pass
+
+    def shutdown(self) -> None:
+        """Shut down the active trainer handle."""
+        shutdown_training(_ACTIVE_TRAINER_HANDLE)
+
+    def force_flush(self) -> None:
+        """Flush the tracer provider when the installed provider supports it."""
+        try:
+            from opentelemetry import trace
+
+            provider = trace.get_tracer_provider()
+            if hasattr(provider, "force_flush"):
+                provider.force_flush()
+        except Exception:
+            pass
+
+    def handle_sigterm(self, signum: int, frame: Any) -> None:
+        """Flush on the first SIGTERM, then defer to the handler that was installed before."""
+        import os
+        import signal
+
+        if not self._sigterm_fired:
+            self._sigterm_fired = True
+            try:
+                if self._graceful_drain:
+                    self.force_flush()
+                else:
+                    self.shutdown()
+            except Exception:
+                pass
+        if callable(self._previous_sigterm):
+            self._previous_sigterm(signum, frame)
+        elif self._previous_sigterm == signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+
+_TRAINER_EXIT_HOOKS = _TrainerExitHooks()
+
+
+def install_training_exit_hooks(*, get_graceful_drain: Any) -> None:
+    """Install telemetry exit hooks once, only while the trainer exports."""
+    _TRAINER_EXIT_HOOKS.install(get_graceful_drain=get_graceful_drain)
+
+
+def start_root_span(
+    group: str,
+    name: str,
+    tracer: Any,
+    *,
+    link_context: Any | None = None,
+    training_step: int | None = None,
+) -> tuple[Any, Any] | None:
+    """Start and attach a group-gated root span with an optional trace link."""
+    if not is_enabled(group):
+        return None
+
+    span = None
+    try:
+        from opentelemetry import context, trace
+        from opentelemetry.context import Context
+        from opentelemetry.trace import Link
+
+        links = [Link(link_context)] if link_context is not None else None
+        span = tracer.start_span(name, context=Context(), links=links)
+        if training_step is not None:
+            set_attributes(span, {TRAINING_STEP: training_step})
+        token = context.attach(trace.set_span_in_context(span, Context()))
+        return span, token
+    except Exception:
+        logger.debug("Could not start root span %r", name, exc_info=True)
+        try:
+            if span is not None:
+                span.end()
+        except Exception:
+            pass
+        return None
+
+
+def end_root_span(span: Any, token: Any) -> Any | None:
+    """Detach and end a root span, returning its context for a later link."""
+    if span is None:
+        return None
+
+    span_context = None
+    try:
+        span_context = span.get_span_context()
+    except Exception:
+        logger.debug("Could not read root span context", exc_info=True)
+    try:
+        from opentelemetry import context
+
+        if token is not None:
+            context.detach(token)
+    except Exception:
+        logger.debug("Could not detach root span context", exc_info=True)
+    try:
+        span.end()
+    except Exception:
+        logger.debug("Could not end root span", exc_info=True)
+    return span_context
+
+
+def select_process_start_time(
+    program_start: float | None, main_entry: float | None
+) -> float | None:
+    """Return a valid OS process-start estimate, never an entrypoint fallback."""
+    if not _is_valid_epoch(main_entry):
+        return None
+
+    from nemo.lens.span_utilities import linux_process_create_time
+
+    try:
+        process_start = linux_process_create_time()
+    except Exception:
+        process_start = None
+
+    latest_start = main_entry
+    if _is_valid_epoch(program_start) and program_start <= main_entry:
+        latest_start = program_start
+    if _is_valid_epoch(process_start) and process_start <= latest_start:
+        return float(process_start)
+    return None
+
+
+def start_startup_span(
+    tracer: Any,
+    model_type: Any,
+    program_start: float | None,
+    main_entry: float | None,
+    *,
+    include_python_startup: bool = True,
+) -> tuple[Any, Any, float, float] | None:
+    """Start the startup root and, once per process, its Python-start estimate.
+
+    The Python child ends at the early entrypoint timestamp, before heavy
+    imports. Process creation can precede exec, so this is not a measurement
+    of CPython initialization alone. A fallback root never fabricates this child.
+    """
+    if not is_enabled(JOB):
+        return None
+
+    from opentelemetry import trace
+    from opentelemetry.context import Context
+
+    process_start = select_process_start_time(program_start, main_entry)
+    root_open_time = time.time()
+    root_start_time = process_start
+    if root_start_time is None and (
+        _is_valid_epoch(program_start)
+        and _is_valid_epoch(main_entry)
+        and program_start <= main_entry <= root_open_time
+    ):
+        root_start_time = float(program_start)
+    start_kwargs = {}
+    if root_start_time is not None and root_start_time <= root_open_time:
+        start_kwargs["start_time"] = int(root_start_time * 1_000_000_000)
+    else:
+        root_start_time = root_open_time
+
+    span = tracer.start_span(SPAN_TRAINING_STARTUP, context=Context(), **start_kwargs)
+    set_attributes(span, {MODEL_CONFIG_MODEL_TYPE: str(model_type)})
+    parent_context = trace.set_span_in_context(span, Context())
+    if include_python_startup and (
+        _is_valid_epoch(program_start)
+        and _is_valid_epoch(main_entry)
+        and program_start <= main_entry <= root_open_time
+    ):
+        emit_startup_span(
+            tracer,
+            SPAN_TRAINING_STARTUP_PYTHON,
+            process_start,
+            program_start,
+            context=parent_context,
+            root_start=root_start_time,
+            root_open_time=root_open_time,
+        )
+    return span, parent_context, root_start_time, root_open_time
+
+
+def emit_startup_span(
+    tracer: Any,
+    name: str,
+    start: float | None,
+    end: float | None,
+    *,
+    context: Any,
+    root_start: float | None,
+    root_open_time: float | None,
+) -> Any | None:
+    """Emit one valid, already-elapsed child of the training startup root."""
+    if not is_enabled(JOB):
+        return None
+    if not all(_is_valid_epoch(value) for value in (start, end, root_start, root_open_time)):
+        return None
+    if start < root_start or end < start or end > root_open_time:
+        return None
+
+    from nemo.lens.span_utilities import emit_span
+
+    try:
+        return emit_span(tracer, name, start, end, context=context)
+    except Exception:
+        logger.debug("Could not emit explicit-timestamp startup span %r", name, exc_info=True)
+        return None
+
+
+def _is_valid_epoch(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
 
 
 class TrainingStepSpans:
