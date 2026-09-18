@@ -4,6 +4,7 @@
 
 import gc
 import logging
+import os
 
 import torch
 
@@ -207,6 +208,14 @@ class FullCudaGraphWrapper:
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
+            if os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1":
+                # Eager train-step warmups leave ordinary QKV allocations in
+                # PyTorch's cache. Raw VMM cuMemCreate calls cannot consume
+                # those reserved blocks, so return unused storage first.
+                FullCudaGraphWrapper.result[training_str] = None
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)
             else:
@@ -265,3 +274,16 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
         gc.collect()
+        if (
+            os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1"
+            and FullCudaGraphWrapper.cuda_graph['training'] is None
+            and FullCudaGraphWrapper.cuda_graph['validation'] is None
+        ):
+            torch.cuda.synchronize()
+            from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+                clear_mla_vmm_scratch_buffers,
+            )
+            from transformer_engine.pytorch.tensor.vmm import clear_captured_vmm_allocations
+
+            clear_mla_vmm_scratch_buffers()
+            clear_captured_vmm_allocations()
