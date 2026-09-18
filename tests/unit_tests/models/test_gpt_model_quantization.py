@@ -661,6 +661,7 @@ class TestGPTModelTEQuantizationConfig:
             ),
             vocab_size=256,
             max_sequence_length=32,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         quantized_names = []
         use_mxfp8_storage = transformer_impl == "inference_optimized" or recipe_storage.get(

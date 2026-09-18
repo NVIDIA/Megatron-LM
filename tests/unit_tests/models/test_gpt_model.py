@@ -95,6 +95,7 @@ class TestGPTModel:
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert config.mtp_hsm is True
@@ -115,6 +116,7 @@ class TestGPTModel:
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
     @pytest.mark.internal
