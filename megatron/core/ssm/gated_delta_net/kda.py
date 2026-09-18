@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -279,7 +278,11 @@ class KimiDeltaAttention(_GDNBase):
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the direct-projection KDA training path."""
+        """Run KDA on inputs already arranged in ``config.linear_cp_layout``.
+
+        HybridStack owns layout conversion through ContextParallelLayoutManager,
+        including the packed metadata and output conversion at stack boundaries.
+        """
 
         del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -305,19 +308,6 @@ class KimiDeltaAttention(_GDNBase):
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
         cp_size_runtime = cp_group.size()
-        back_to_input_converter = None
-        if self.config.linear_cp_mode == "chunkwise":
-            hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
-                hidden_states=hidden_states,
-                packed_seq_params=packed_seq_params,
-                cp_group=cp_group_chunkwise,
-                tp_group=self.tp_group,
-                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
-                target_partition_mode="contiguous",
-                sequence_parallel=self.config.sequence_parallel,
-                config=self.config,
-            )
-
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
         seq_len_global = seq_len_post_headwise * cp_size_chunkwise
@@ -329,17 +319,7 @@ class KimiDeltaAttention(_GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
 
-        if cp_size_headwise > 1 and (
-            (
-                packed_seq_params is not None
-                and packed_seq_params.qkv_format == "thd"
-                and packed_seq_params.cp_partition_mode != "zigzag"
-            )
-            or (
-                (packed_seq_params is None or packed_seq_params.qkv_format != "thd")
-                and self.config.cp_partition_mode != "zigzag"
-            )
-        ):
+        if cp_size_headwise > 1 and self.config.linear_cp_layout != "zigzag":
             raise ValueError(
                 "KimiDeltaAttention with headwise CP requires zigzag layout. CP partition "
                 "conversion must be handled before calling KimiDeltaAttention."
@@ -423,11 +403,6 @@ class KimiDeltaAttention(_GDNBase):
                 cu_seqlens_q,
                 packed_seq_params,
                 chunkwise_cp_context,
-            )
-
-        if back_to_input_converter is not None:
-            out = back_to_input_converter.convert(
-                out, seq_dim=0, sequence_parallel=self.config.sequence_parallel
             )
 
         return out, out_bias
