@@ -267,6 +267,10 @@ def csa_sparse_attn(
     """Run fused attention for flat packed Q/KV and physical indices."""
     if not is_thd or query.ndim != 3 or kv.ndim != 2:
         raise ValueError("Packed CSA requires query [tokens, heads, dim] and KV [tokens, dim].")
+    if topk_length is not None:
+        # Short windows can leave holes before valid compressed keys. The backend
+        # interprets topk_length as a valid prefix, so compact those holes first.
+        topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
     out, _, _ = CSASparseAttnFunc.apply(
         query,
         kv,

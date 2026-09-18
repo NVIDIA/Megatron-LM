@@ -102,7 +102,9 @@ def test_packed_cp_matches_full_attention_and_gradients(
             recompute_granularity="selective" if recompute else None,
             recompute_modules=["mla_up_proj"] if recompute else [],
         )
-        ref_cfg = replace(cfg, context_parallel_size=1)
+        ref_cfg = replace(
+            cfg, context_parallel_size=1, dsa_kernel_backend="none", apply_rope_fusion=False
+        )
         model = _build_attention(cfg, 1, pg).cuda()
         reference = _build_attention(ref_cfg, 1, ref_pg).cuda()
         reference.load_state_dict(model.state_dict())
@@ -125,7 +127,7 @@ def test_packed_cp_matches_full_attention_and_gradients(
         local = whole[rows].clone().requires_grad_()
         whole = whole.requires_grad_()
         # Exercise both chunked Top-K and dense loss, including rank/document seams,
-        # against an unchunked CP1 reference without adding another test matrix.
+        # against a native CP1 reference without adding another test matrix.
         with monkeypatch.context() as chunking:
             if backend == "cudnn" and ratio == 4 and not sparse and coeff > 0:
                 original = packed_layout.query_chunk_rows
