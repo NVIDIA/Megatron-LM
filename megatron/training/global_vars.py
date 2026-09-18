@@ -5,20 +5,25 @@
 import os
 import signal
 import sys
-import torch
-
 from datetime import timedelta
+
+import torch
 
 from megatron.core import Timers
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.jit import disable_jit_fuser
-from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
+from megatron.core.num_microbatches_calculator import (
+    init_num_microbatches_calculator,
+    unset_num_microbatches_calculator,
+)
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
 _GLOBAL_FULL_CONFIG = None
+_GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
@@ -39,6 +44,12 @@ def get_full_config():
     """Return the full pretrain config container. It can be None so no need
     to check if it is initialized."""
     return _GLOBAL_FULL_CONFIG
+
+
+def get_train_state():
+    """Return the mutable state for the current training run."""
+    _ensure_var_is_initialized(_GLOBAL_TRAIN_STATE, 'train state')
+    return _GLOBAL_TRAIN_STATE
 
 
 def get_tokenizer():
@@ -150,7 +161,10 @@ def set_global_variables(args, build_tokenizer=True):
     set_args(args)
 
     if args.step_batch_size_schedule is not None:
-        print(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+        # Imported here, as elsewhere in this module: megatron.training.utils imports back
+        # into megatron.training, which imports this module.
+        from megatron.training.utils import print_rank_0
+        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
         rank=args.rank,
@@ -171,6 +185,7 @@ def set_global_variables(args, build_tokenizer=True):
     _set_timers(args)
     _set_energy_monitor(args)
     _set_telemetry(args)
+    _set_train_state()
 
     if args.enable_experimental:
         set_experimental_flag(True)
@@ -194,6 +209,7 @@ def unset_global_variables():
 
     global _GLOBAL_ARGS
     global _GLOBAL_FULL_CONFIG
+    global _GLOBAL_TRAIN_STATE
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
     global _GLOBAL_TENSORBOARD_WRITER
@@ -207,6 +223,7 @@ def unset_global_variables():
 
     _GLOBAL_ARGS = None
     _GLOBAL_FULL_CONFIG = None
+    _GLOBAL_TRAIN_STATE = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
     _GLOBAL_TENSORBOARD_WRITER = None
@@ -229,6 +246,13 @@ def set_args(args):
 def set_full_config(cfg_container):
     global _GLOBAL_FULL_CONFIG
     _GLOBAL_FULL_CONFIG = cfg_container
+
+
+def _set_train_state():
+    """Create the train state for the current training run."""
+    global _GLOBAL_TRAIN_STATE
+    _ensure_var_is_not_initialized(_GLOBAL_TRAIN_STATE, 'train state')
+    _GLOBAL_TRAIN_STATE = TrainState()
 
 
 def _build_tokenizer(args):
@@ -551,6 +575,9 @@ def destroy_global_vars():
 
     global _GLOBAL_FULL_CONFIG
     _GLOBAL_FULL_CONFIG = None
+
+    global _GLOBAL_TRAIN_STATE
+    _GLOBAL_TRAIN_STATE = None
 
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
