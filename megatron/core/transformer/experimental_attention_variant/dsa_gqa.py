@@ -1093,6 +1093,9 @@ class DSGroupedSelfAttention(SelfAttention):
         pp_layer_offset: Optional[int] = None,
         # Upstream's TransformerLayer now passes a module instance name top-down.
         name: str | None = None,
+        # TransformerLayer sets this unconditionally in attention_optional_kwargs, so
+        # overriding __init__ without accepting it fails at model construction.
+        is_mtp_layer: bool = False,
     ):
         if config.experimental_attention_variant == "dsa":
             submodules = copy.copy(submodules)
@@ -1120,6 +1123,7 @@ class DSGroupedSelfAttention(SelfAttention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
     def _use_indexer_rope(
