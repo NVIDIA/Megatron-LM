@@ -378,6 +378,14 @@ class TestRunNsDispatch:
 
 
 class TestConstructorGuards:
+    def test_requires_emerging_optimizers_at_construction(self, monkeypatch):
+        """The module imports without emerging-optimizers (megatron.core is import-checked
+        in a bare install); constructing the optimizer is what needs the package."""
+        monkeypatch.setattr(lsm, "HAVE_EMERGING_OPTIMIZERS", False)
+        p = torch.nn.Parameter(torch.randn(4, 4))
+        with pytest.raises(ImportError, match="emerging-optimizers"):
+            LayerShardedMuon([p], lr=0.1, gtp_remat_group=None)
+
     def test_tp_mode_layer_sharded_is_rejected(self):
         """'layer_sharded' is the registry selector, not a class mode; direct-API
         misuse would otherwise fall silently into the parent's distributed
