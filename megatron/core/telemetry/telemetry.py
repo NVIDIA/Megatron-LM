@@ -126,6 +126,21 @@ TRAINING_NAN_ITERATIONS = "nv.dl.training.nan_iterations"
 TRAINING_LOSS_SCALE = "nv.dl.training.loss_scale"
 MEASUREMENT_DOMAIN_DP_MEAN = "dp_mean"
 
+EVENT_GPU_SNIFF_MEASUREMENT = "nv.dl.resiliency.gpu_sniff.measurement"
+GPU_SNIFF_BENCHMARK = "nv.dl.resiliency.gpu_sniff.benchmark"
+GPU_SNIFF_VALUE = "nv.dl.resiliency.gpu_sniff.value"
+GPU_SNIFF_UNIT = "nv.dl.resiliency.gpu_sniff.unit"
+GPU_SNIFF_GEMM_M = "nv.dl.resiliency.gpu_sniff.gemm.m"
+GPU_SNIFF_GEMM_N = "nv.dl.resiliency.gpu_sniff.gemm.n"
+GPU_SNIFF_GEMM_K = "nv.dl.resiliency.gpu_sniff.gemm.k"
+GPU_SNIFF_GEMM_DTYPE = "nv.dl.resiliency.gpu_sniff.gemm.dtype"
+GPU_SNIFF_GEMM_LABEL = "nv.dl.resiliency.gpu_sniff.gemm.label"
+GPU_SNIFF_MESSAGE_SIZE = "nv.dl.resiliency.gpu_sniff.message_size"
+GPU_SNIFF_GROUP_SIZE = "nv.dl.resiliency.gpu_sniff.group_size"
+GPU_SNIFF_PEER_STRIDE = "nv.dl.resiliency.gpu_sniff.peer_stride"
+GPU_SNIFF_PEER_RANK = "nv.dl.resiliency.gpu_sniff.peer_rank"
+MEASUREMENT_DOMAIN_LOCAL = "local"
+
 try:
     from nemo.lens import SpanRegistry as _SpanRegistry
     from nemo.lens import is_span_group_enabled as _is_span_group_enabled
@@ -1001,3 +1016,31 @@ def add_training_report_events(
         loss_scale=loss_scale,
         span=span,
     )
+
+
+def gpu_sniff_measurement_sink(training_step: int | None) -> Any:
+    """Map benchmark results to events on the span active when each result arrives."""
+
+    def emit_measurement(result: Any) -> None:
+        attributes = {
+            GPU_SNIFF_BENCHMARK: result.benchmark,
+            GPU_SNIFF_VALUE: result.value,
+            GPU_SNIFF_UNIT: result.unit,
+            MEASUREMENT_DOMAIN: MEASUREMENT_DOMAIN_LOCAL,
+            TRAINING_STEP: training_step,
+            GPU_SNIFF_GEMM_M: result.gemm_m,
+            GPU_SNIFF_GEMM_N: result.gemm_n,
+            GPU_SNIFF_GEMM_K: result.gemm_k,
+            GPU_SNIFF_GEMM_DTYPE: result.gemm_dtype,
+            GPU_SNIFF_GEMM_LABEL: result.gemm_label,
+            GPU_SNIFF_MESSAGE_SIZE: result.message_size,
+            GPU_SNIFF_GROUP_SIZE: result.group_size,
+            GPU_SNIFF_PEER_STRIDE: result.peer_stride,
+            GPU_SNIFF_PEER_RANK: result.peer_rank,
+        }
+        add_span_event(
+            EVENT_GPU_SNIFF_MEASUREMENT,
+            {key: value for key, value in attributes.items() if value is not None},
+        )
+
+    return emit_measurement
