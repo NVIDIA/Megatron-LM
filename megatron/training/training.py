@@ -2052,6 +2052,10 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
+        # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
+        # fallback below can skip when there was nothing left to train this invocation
+        # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
+        has_iterations_remaining = args.iteration < (args.train_iters or 0)
         if args.do_train and (args.train_iters or 0) > 0:
             try:
                 iteration, num_floating_point_operations_so_far = train(
@@ -2083,7 +2087,13 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
+        if (
+            not cfg_container.validation.skip_train
+            and cfg_container.checkpoint.save
+            and iteration != 0
+            and has_iterations_remaining
+            and iteration % cfg_container.checkpoint.save_interval != 0
+        ):
             save_checkpoint_and_time(
                 iteration,
                 model,
