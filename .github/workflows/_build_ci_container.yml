@@ -87,11 +87,18 @@ jobs:
           REGISTRY_AWS: ${{ inputs.registry-aws }}
           REGISTRY_GB_GPU: ${{ inputs.registry-gb200 }}
         run: |
-          AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
-            '{"cloud": "aws-h100", "platform": "linux/amd64", "registry": $registry, "runner": $runner}')
+          BUILD_RUNNER="$SELECTED_RUNNER"
+          if [ "$IS_MAINTAINER" = "true" ]; then
+            BUILD_RUNNER=nvidia-ci-aws-cpu
+          fi
+
+          AWS_H100=$(jq -nc --arg build_runner "$BUILD_RUNNER" --arg registry "$REGISTRY_AWS" \
+            --arg runner "$SELECTED_RUNNER" \
+            '{"build_runner": $build_runner, "cloud": "aws-h100", "platform": "linux/amd64", "registry": $registry, "runner": $runner}')
           if [ "$IS_MAINTAINER" = "true" ] && [ "$ENABLE_GB_TESTING" = "true" ]; then
-            GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
-              '{"cloud": "gb-gpu", "platform": "linux/arm64", "registry": $registry, "runner": $runner}')
+            GB_GPU=$(jq -nc --arg build_runner "$BUILD_RUNNER" --arg registry "$REGISTRY_GB_GPU" \
+              --arg runner "$SELECTED_RUNNER_GB_GPU" \
+              '{"build_runner": $build_runner, "cloud": "gb-gpu", "platform": "linux/arm64", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
               '{"include": [$aws, $gb_gpu]}')
           else
@@ -105,8 +112,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
-    # Keep matrix.runner for downstream GPU test jobs; container builds use the CPU pool.
-    runs-on: nvidia-ci-aws-cpu
+    # Keep matrix.runner for downstream GPU tests and isolate external Dockerfiles on ephemeral runners.
+    runs-on: ${{ matrix.build_runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
