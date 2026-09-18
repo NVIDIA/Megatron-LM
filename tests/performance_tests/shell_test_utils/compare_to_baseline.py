@@ -114,6 +114,7 @@ def main() -> int:
 
     all_ok = True
     metadata_failed = False
+    numeric_failed = False
     for batch_key, baseline_entry in baseline.items():
         if batch_key not in results:
             print(f"FAIL: {batch_key} present in baseline but missing from results")
@@ -122,7 +123,10 @@ def main() -> int:
         print(f"\n[{batch_key}]")
         measured_entry = results[batch_key]
         metadata_ok = True
-        for field in COMPARISON_METADATA:
+        metadata_fields: tuple[str, ...] = COMPARISON_METADATA
+        if baseline_entry.get("dataset") == "synthetic":
+            metadata_fields += ("num_input_tokens_avg",)
+        for field in metadata_fields:
             missing = [
                 name
                 for name, entry in (("results", measured_entry), ("baseline", baseline_entry))
@@ -154,11 +158,14 @@ def main() -> int:
                 upper_tol=upper_tol if higher_is_better else None,
             )
             all_ok = all_ok and ok
+            numeric_failed = numeric_failed or not ok
             print(line)
 
     print()
     if metadata_failed:
         print("INCOMPARABLE: results and baseline metadata differ — see above.")
+        if numeric_failed:
+            print("REGRESSION: one or more comparable metrics outside tolerance — see above.")
         return 1
     if all_ok:
         print("OK: all metrics within tolerance.")

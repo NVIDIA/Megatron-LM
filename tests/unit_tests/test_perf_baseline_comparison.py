@@ -51,7 +51,7 @@ def comparison(tmp_path, monkeypatch):
         )
         return compare_to_baseline.main()
 
-    return results["batch_1"], baseline["batch_1"], config, run
+    return results, baseline, config, run
 
 
 @pytest.mark.parametrize(
@@ -60,9 +60,9 @@ def comparison(tmp_path, monkeypatch):
 )
 def test_metadata_mismatch_blocks_numeric_comparison(comparison, capsys, field, value):
     results, _, _, run = comparison
-    results[field] = value
+    results["batch_1"][field] = value
     # Invalid numeric values prove that the mismatched batch never reaches the metric check.
-    results["throughput_tok_per_sec"] = None
+    results["batch_1"]["throughput_tok_per_sec"] = None
     assert run() == 1
     output = capsys.readouterr().out
     assert f"metadata {field!r} differs" in output
@@ -74,7 +74,7 @@ def test_metadata_mismatch_blocks_numeric_comparison(comparison, capsys, field, 
 @pytest.mark.parametrize("side", ["results", "baseline"])
 def test_missing_metadata_fails_clearly(comparison, capsys, field, side):
     results, baseline, _, run = comparison
-    del {"results": results, "baseline": baseline}[side][field]
+    del {"results": results, "baseline": baseline}[side]["batch_1"][field]
     assert run() == 1
     assert f"metadata {field!r} missing from {side}" in capsys.readouterr().out
 
@@ -92,7 +92,7 @@ def test_missing_metadata_fails_clearly(comparison, capsys, field, side):
 )
 def test_matching_metadata_preserves_performance_gates(comparison, capsys, metric, value, expected):
     results, _, _, run = comparison
-    results[metric] = value
+    results["batch_1"][metric] = value
     assert run() == expected
     assert "INCOMPARABLE" not in capsys.readouterr().out
 
@@ -100,13 +100,69 @@ def test_matching_metadata_preserves_performance_gates(comparison, capsys, metri
 def test_configured_tolerances_remain_effective(comparison):
     results, _, config, run = comparison
     config.update(TOLERANCE_PCT=5, UPPER_TOLERANCE_PCT=15)
-    results["throughput_tok_per_sec"] = 94.0
+    results["batch_1"]["throughput_tok_per_sec"] = 94.0
     assert run() == 1
-    results["throughput_tok_per_sec"] = 116.0
+    results["batch_1"]["throughput_tok_per_sec"] = 116.0
     assert run() == 1
 
 
-def test_average_input_length_is_not_an_equality_gate(comparison):
+def test_gsm8k_average_input_length_is_not_an_equality_gate(comparison):
     results, _, _, run = comparison
-    results["num_input_tokens_avg"] = 66.2
+    results["batch_1"]["num_input_tokens_avg"] = 66.2
     assert run() == 0
+
+
+def test_synthetic_input_length_mismatch_blocks_numeric_comparison(comparison, capsys):
+    results, baseline, _, run = comparison
+    for entries in (results, baseline):
+        entries["batch_1"].update(dataset="synthetic", num_input_tokens_avg=512.0)
+    results["batch_1"]["num_input_tokens_avg"] = 1024.0
+    results["batch_1"]["throughput_tok_per_sec"] = None
+    assert run() == 1
+    output = capsys.readouterr().out
+    assert "metadata 'num_input_tokens_avg' differs" in output
+    assert "INCOMPARABLE" in output
+    assert "measured=" not in output
+
+
+@pytest.mark.parametrize("side", ["results", "baseline"])
+def test_missing_synthetic_input_length_fails_clearly(comparison, capsys, side):
+    results, baseline, _, run = comparison
+    for entries in (results, baseline):
+        entries["batch_1"]["dataset"] = "synthetic"
+    del {"results": results, "baseline": baseline}[side]["batch_1"]["num_input_tokens_avg"]
+    results["batch_1"]["throughput_tok_per_sec"] = None
+    assert run() == 1
+    output = capsys.readouterr().out
+    assert f"metadata 'num_input_tokens_avg' missing from {side}" in output
+    assert "measured=" not in output
+
+
+@pytest.mark.parametrize("latency,expected", [(100.0, 0), (110.1, 1)])
+def test_matching_synthetic_input_length_preserves_numeric_gate(
+    comparison, capsys, latency, expected
+):
+    results, baseline, _, run = comparison
+    for entries in (results, baseline):
+        entries["batch_1"].update(dataset="synthetic", num_input_tokens_avg=512.0)
+    results["batch_1"]["avg_latency_ms"] = latency
+    assert run() == expected
+    assert "INCOMPARABLE" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("metadata_failed", [False, True])
+@pytest.mark.parametrize("numeric_failed", [False, True])
+def test_distinct_batches_report_both_failure_kinds(
+    comparison, capsys, metadata_failed, numeric_failed
+):
+    results, baseline, _, run = comparison
+    for entries in (results, baseline):
+        entries["batch_32"] = dict(entries["batch_1"], batch_size=32)
+    if metadata_failed:
+        results["batch_1"]["num_iters"] = 10
+    if numeric_failed:
+        results["batch_32"]["avg_latency_ms"] = 200.0
+    assert run() == int(metadata_failed or numeric_failed)
+    output = capsys.readouterr().out
+    assert ("INCOMPARABLE:" in output) == metadata_failed
+    assert ("REGRESSION:" in output) == numeric_failed
