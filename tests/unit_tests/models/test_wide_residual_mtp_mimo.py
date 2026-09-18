@@ -29,7 +29,12 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def _wide_config(
-    *, num_layers: int, hidden_size: int, mtp_num_layers: int | None = None, with_moe: bool = False
+    *,
+    num_layers: int,
+    hidden_size: int,
+    mtp_num_layers: int | None = None,
+    with_moe: bool = False,
+    fp32_residual_connection: bool = False,
 ):
     moe_config = {}
     if with_moe:
@@ -51,6 +56,9 @@ def _wide_config(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         use_cpu_initialization=True,
+        bf16=fp32_residual_connection,
+        params_dtype=torch.bfloat16 if fp32_residual_connection else torch.float32,
+        fp32_residual_connection=fp32_residual_connection,
         recompute_granularity="selective",
         recompute_modules=["residual_stream"],
         residual_stream_recompute_num_layers=1,
@@ -65,6 +73,12 @@ def _wide_config(
     )
 
 
+def _move_model_to_configured_dtype(model, config):
+    """Convert this test model to its configured parameter dtype."""
+
+    return model.cuda().to(dtype=config.params_dtype)
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestWideResidualMTPAndMIMO:
@@ -77,19 +91,30 @@ class TestWideResidualMTPAndMIMO:
         MTPLossLoggingHelper.tracker = {}
         Utils.destroy_model_parallel()
 
-    def test_gpt_mtp_keeps_auxiliary_layer_at_backbone_width(self):
-        config = _wide_config(num_layers=2, hidden_size=64, mtp_num_layers=2)
+    @pytest.mark.parametrize(
+        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
+    )
+    def test_gpt_mtp_keeps_auxiliary_layer_at_backbone_width(self, fp32_residual_connection):
+        config = _wide_config(
+            num_layers=2,
+            hidden_size=64,
+            mtp_num_layers=2,
+            fp32_residual_connection=fp32_residual_connection,
+        )
         layer_spec = get_gpt_wide_residual_layer_local_spec()
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=layer_spec,
-            mtp_block_spec=get_gpt_mtp_block_spec(
-                config=config, spec=layer_spec, use_transformer_engine=False
+        model = _move_model_to_configured_dtype(
+            GPTModel(
+                config=config,
+                transformer_layer_spec=layer_spec,
+                mtp_block_spec=get_gpt_mtp_block_spec(
+                    config=config, spec=layer_spec, use_transformer_engine=False
+                ),
+                vocab_size=128,
+                max_sequence_length=4,
+                position_embedding_type="none",
             ),
-            vocab_size=128,
-            max_sequence_length=4,
-            position_embedding_type="none",
-        ).cuda()
+            config,
+        )
         input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda")
         position_ids = torch.arange(4, device="cuda").unsqueeze(0).expand(2, -1)
         labels = input_ids.roll(-1, dims=1)
@@ -117,7 +142,12 @@ class TestWideResidualMTPAndMIMO:
         assert model.decoder.residual_stream_readout.exit_map.logit.grad is not None
         assert loss.shape == input_ids.shape
 
-    def test_hybrid_mtp_replays_only_the_main_wide_decoder(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
+    )
+    def test_hybrid_mtp_replays_only_the_main_wide_decoder(
+        self, monkeypatch, fp32_residual_connection
+    ):
         replay_plan_calls = []
         build_replay_plan = hybrid_block_module.build_residual_stream_recompute_plan
 
@@ -128,15 +158,24 @@ class TestWideResidualMTPAndMIMO:
         monkeypatch.setattr(
             hybrid_block_module, "build_residual_stream_recompute_plan", track_replay_plan
         )
-        config = _wide_config(num_layers=2, hidden_size=256, mtp_num_layers=2, with_moe=True)
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=wide_residual_hybrid_stack_spec,
-            vocab_size=128,
-            max_sequence_length=4,
-            hybrid_layer_pattern="ME/ME/ME",
-            position_embedding_type="none",
-        ).cuda()
+        config = _wide_config(
+            num_layers=2,
+            hidden_size=256,
+            mtp_num_layers=2,
+            with_moe=True,
+            fp32_residual_connection=fp32_residual_connection,
+        )
+        model = _move_model_to_configured_dtype(
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=wide_residual_hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=4,
+                hybrid_layer_pattern="ME/ME/ME",
+                position_embedding_type="none",
+            ),
+            config,
+        )
         input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda")
         position_ids = torch.arange(4, device="cuda").unsqueeze(0).expand(2, -1)
         labels = input_ids.roll(-1, dims=1)
@@ -172,8 +211,15 @@ class TestWideResidualMTPAndMIMO:
         assert model.embedding.word_embeddings.weight.grad is not None
         assert loss.shape == input_ids.shape
 
-    def test_mimo_composes_at_backbone_width_before_decoder_expansion(self):
-        config = _wide_config(num_layers=1, hidden_size=64)
+    @pytest.mark.parametrize(
+        "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
+    )
+    def test_mimo_composes_at_backbone_width_before_decoder_expansion(
+        self, fp32_residual_connection
+    ):
+        config = _wide_config(
+            num_layers=1, hidden_size=64, fp32_residual_connection=fp32_residual_connection
+        )
         layer_spec = get_gpt_wide_residual_layer_local_spec()
         language_spec = ModuleSpec(
             module=GPTModel,
@@ -185,11 +231,16 @@ class TestWideResidualMTPAndMIMO:
                 "position_embedding_type": "none",
             },
         )
-        model = MimoModel(
-            MimoModelConfig(
-                language_model_spec=language_spec, modality_submodules_spec={}, special_token_ids={}
-            )
-        ).cuda()
+        model = _move_model_to_configured_dtype(
+            MimoModel(
+                MimoModelConfig(
+                    language_model_spec=language_spec,
+                    modality_submodules_spec={},
+                    special_token_ids={},
+                )
+            ),
+            config,
+        )
         input_ids = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda")
         position_ids = torch.arange(4, device="cuda").unsqueeze(0).expand(2, -1)
         labels = input_ids.roll(-1, dims=1)
@@ -205,6 +256,10 @@ class TestWideResidualMTPAndMIMO:
 
         decoder_input = decoder_forward.call_args.kwargs["hidden_states"]
         assert decoder_input.shape == (4, 2, config.hidden_size)
+        expected_decoder_dtype = (
+            torch.float32 if config.fp32_residual_connection else config.params_dtype
+        )
+        assert decoder_input.dtype == expected_decoder_dtype
         assert model.language_model.decoder.residual_stream_readout is not None
         assert model.language_model.embedding.word_embeddings.weight.grad is not None
         assert model.language_model.decoder.residual_stream_readout.exit_map.logit.grad is not None
