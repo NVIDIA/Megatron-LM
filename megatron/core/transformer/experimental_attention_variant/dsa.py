@@ -670,9 +670,9 @@ def _compute_index_scores(
     k_fp32 = k.float()
 
     # Chunk over seqlen_q to avoid materializing the full [sq, batch, heads, sk]
-    # fp32 tensor.  Target ~1 GB per chunk.
+    # fp32 tensor. Target 256 MiB per chunk to leave room for the output.
     bytes_per_token = batch * n_heads * sk * 4
-    chunk_size = min(sq, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
+    chunk_size = min(sq, max(1, 256 * 1024 * 1024 // max(1, bytes_per_token)))
     index_scores = torch.empty(sq, batch, sk, dtype=torch.float32, device=q.device)
 
     for start in range(0, sq, chunk_size):
@@ -681,8 +681,14 @@ def _compute_index_scores(
         scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
         if use_relu:
             scores.relu_()
-        # Weight and sum over heads in one step: [chunk, batch, sk]
-        index_scores[start:end] = (scores * weights[start:end].unsqueeze(-1)).sum(dim=2)
+        # Top-k selection runs without gradients and can reuse the score buffer.
+        # Preserve the ReLU output when autograd needs it for the indexer loss.
+        head_weights = weights[start:end].unsqueeze(-1)
+        if torch.is_grad_enabled():
+            scores = scores * head_weights
+        else:
+            scores.mul_(head_weights)
+        index_scores[start:end] = scores.sum(dim=2)
         del scores
 
     # Transpose to [batch, seqlen_q, seqlen_k].
