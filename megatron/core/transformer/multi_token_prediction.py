@@ -1333,7 +1333,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
-        if config.keep_mtp_spec_in_bf16:
+        if config.keep_mtp_in_bf16:
             config = deepcopy(config)
             config.fp4 = None
             config.fp8 = None
