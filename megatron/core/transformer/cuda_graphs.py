@@ -3082,6 +3082,11 @@ def set_current_microbatch(model, microbatch_id):
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
     """
+    if os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") == "1":
+        from transformer_engine.pytorch.tensor.vmm import set_vmm_current_microbatch
+
+        set_vmm_current_microbatch(microbatch_id)
+
     decoder_exists = True
     model_with_decoder = None
     try:
