@@ -29,6 +29,8 @@ def test_policy_precedes_first_library_kernel(entrypoint, tmp_path):
             deterministic_mode=True, cross_entropy_loss_fusion=False, tp_comm_overlap=False
         )
         policy = configure_determinism(options)
+        assert policy['torch']['fill_uninitialized_memory'] is False
+        assert torch.utils.deterministic.fill_uninitialized_memory is False
         assert not torch.cuda.is_initialized()
         assert not torch.distributed.is_initialized()
         assert 'megatron.core' not in sys.modules
@@ -36,6 +38,7 @@ def test_policy_precedes_first_library_kernel(entrypoint, tmp_path):
         def checked_lazy_init(*args, **kwargs):
             assert is_determinism_configured()
             assert torch.are_deterministic_algorithms_enabled()
+            assert torch.utils.deterministic.fill_uninitialized_memory is False
             return original_lazy_init(*args, **kwargs)
         torch.cuda._lazy_init = checked_lazy_init
 
@@ -118,12 +121,14 @@ def test_late_import_rejected_and_checkpoint_safeguards_preserved():
         from megatron.core.safe_globals import SAFE_GLOBALS, safe_load_from_bytes
 
         torch.cuda.init()
+        torch.utils.deterministic.fill_uninitialized_memory = True
         try:
             configure_determinism({'deterministic_mode': True})
         except RuntimeError as error:
             assert 'before importing Core/Bridge' in str(error)
         else:
             raise AssertionError('Accepted a first call after CUDA initialization')
+        assert torch.utils.deterministic.fill_uninitialized_memory is True
         assert megatron.core.mpu is megatron.core.parallel_state
         assert torch.storage._load_from_bytes is safe_load_from_bytes
         assert all(cls in torch.serialization.get_safe_globals() for cls in SAFE_GLOBALS)
@@ -168,6 +173,7 @@ def test_training_entrypoint_configures_before_import_time_cuda(entrypoint, mode
         def checked_lazy_init(*args, **kwargs):
             assert is_determinism_configured(), 'CUDA initialized before early policy'
             assert torch.are_deterministic_algorithms_enabled()
+            assert torch.utils.deterministic.fill_uninitialized_memory is False
             return original_lazy_init(*args, **kwargs)
         torch.cuda._lazy_init = checked_lazy_init
         sys.argv = sys.argv[1:]

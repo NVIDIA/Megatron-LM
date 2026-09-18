@@ -59,6 +59,7 @@ def policy(monkeypatch):
 def test_strict_policy_reports_effective_settings_without_seeding(policy, caplog):
     state = torch.get_rng_state().clone()
     torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.utils.deterministic.fill_uninitialized_memory = True
     torch.backends.cudnn.benchmark = True
     config = {"deterministic_mode": True}
     with caplog.at_level(logging.INFO):
@@ -66,6 +67,7 @@ def test_strict_policy_reports_effective_settings_without_seeding(policy, caplog
     assert report["torch"]["deterministic_algorithms"] is True
     assert report["torch"]["warn_only"] is False
     assert report["torch"]["fill_uninitialized_memory"] is False
+    assert torch.utils.deterministic.fill_uninitialized_memory is False
     assert report["torch"]["cudnn_benchmark"] is False
     assert report["torch"]["cudnn_deterministic"] is True
     assert report["environment"]["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
@@ -92,10 +94,12 @@ def test_strict_policy_reports_effective_settings_without_seeding(policy, caplog
 def test_incompatible_config_rejected_before_mutation(policy, config):
     env = dict(os.environ)
     enabled = torch.are_deterministic_algorithms_enabled()
+    torch.utils.deterministic.fill_uninitialized_memory = True
     with pytest.raises(AssertionError):
         policy.configure_determinism(config)
     assert dict(os.environ) == env
     assert torch.are_deterministic_algorithms_enabled() == enabled
+    assert torch.utils.deterministic.fill_uninitialized_memory is True
 
 
 def test_fused_topk_with_explicit_unfused_aux_loss_is_supported(policy):
@@ -124,10 +128,12 @@ def test_fused_topk_with_explicit_unfused_aux_loss_is_supported(policy):
 def test_invalid_environment_is_atomic(policy, key, value):
     os.environ[key] = value
     env = dict(os.environ)
+    torch.utils.deterministic.fill_uninitialized_memory = True
     with pytest.raises(AssertionError):
         policy.configure_determinism({"deterministic_mode": True})
     assert dict(os.environ) == env
     assert policy._configured_pid is None
+    assert torch.utils.deterministic.fill_uninitialized_memory is True
 
 
 def test_valid_launch_overrides_are_preserved_and_reported(policy):
@@ -150,17 +156,24 @@ def test_late_first_call_cannot_claim_early_setup(policy, monkeypatch, backend):
     monkeypatch.setattr(getattr(torch, backend), "is_initialized", lambda: True)
     env = dict(os.environ)
     enabled = torch.are_deterministic_algorithms_enabled()
+    torch.utils.deterministic.fill_uninitialized_memory = True
     with pytest.raises(RuntimeError, match="before CUDA or process-group"):
         policy.configure_determinism({"deterministic_mode": True})
     assert dict(os.environ) == env
     assert torch.are_deterministic_algorithms_enabled() == enabled
+    assert torch.utils.deterministic.fill_uninitialized_memory is True
 
 
-def test_same_policy_can_be_rechecked_after_initialization(policy, monkeypatch):
+@pytest.mark.parametrize("backend", ["cuda", "distributed"])
+def test_same_policy_can_be_rechecked_after_initialization(policy, monkeypatch, backend):
     config = {"deterministic_mode": True}
     before = policy.configure_determinism(config)
-    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(getattr(torch, backend), "is_initialized", lambda: True)
+    # Diagnostic fill can be re-enabled after startup; another successful setup
+    # restores the training default, as the legacy training helper does.
+    torch.utils.deterministic.fill_uninitialized_memory = True
     assert policy.configure_determinism(config) == before
+    assert torch.utils.deterministic.fill_uninitialized_memory is False
     before["environment"]["NCCL_ALGO"] = "Tree"
     assert policy.configure_determinism(config)["environment"]["NCCL_ALGO"] == "Ring"
 
@@ -185,6 +198,7 @@ def test_backend_default_cannot_enable_autotuning_after_bootstrap(policy, monkey
 )
 def test_late_policy_drift_is_rejected(policy, monkeypatch, change):
     policy.configure_determinism({"deterministic_mode": True})
+    torch.utils.deterministic.fill_uninitialized_memory = True
     monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
     if change == "environment":
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
@@ -202,6 +216,7 @@ def test_late_policy_drift_is_rejected(policy, monkeypatch, change):
         policy._configured_pid -= 1
     with pytest.raises(RuntimeError, match="fresh process"):
         policy.configure_determinism({"deterministic_mode": True})
+    assert torch.utils.deterministic.fill_uninitialized_memory is True
 
 
 def test_actual_model_parallel_config_and_training_adapter_share_policy(policy):
@@ -281,12 +296,15 @@ def test_cli_bootstrap_only_applies_when_requested(policy):
 
     before = dict(os.environ)
     enabled = torch.are_deterministic_algorithms_enabled()
+    torch.utils.deterministic.fill_uninitialized_memory = True
     assert bootstrap_training_determinism(["--train-iters", "2"]) is None
     assert not policy.is_determinism_configured()
     assert dict(os.environ) == before
     assert torch.are_deterministic_algorithms_enabled() == enabled
+    assert torch.utils.deterministic.fill_uninitialized_memory is True
     argv = ["--deterministic-mode", "--train-iters", "2"]
     assert bootstrap_training_determinism(argv)["options"]["deterministic_mode"]
+    assert torch.utils.deterministic.fill_uninitialized_memory is False
     assert argv == ["--deterministic-mode", "--train-iters", "2"]
 
 
@@ -310,9 +328,11 @@ def test_yaml_bootstrap_replaces_cli_and_matches_config_precedence(
 
     path = tmp_path / "config.yaml"
     path.write_text(yaml_text)
+    torch.utils.deterministic.fill_uninitialized_memory = True
     report = bootstrap_training_determinism(["--deterministic-mode", "--yaml-cfg", str(path)])
     assert (report is not None) is enabled
     assert policy.is_determinism_configured() is enabled
+    assert torch.utils.deterministic.fill_uninitialized_memory is (not enabled)
 
 
 @pytest.mark.parametrize("module_mode", [False, True])
