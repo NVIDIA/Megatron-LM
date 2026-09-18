@@ -204,6 +204,176 @@ def test_signature_evidence_requires_every_rank():
     assert build_report(requests, [proof])["counts"][UNVERIFIED] == 1
 
 
+def ranked_case(phase="forward_backward"):
+    """Synthetic collective-shaped metadata, not an executed GPU recipe."""
+    requests = [inventory(rank, 4) for rank in range(4)]
+    proof = evidence()
+    proof["context"]["world_size"] = 4
+    proof["ranks_present"] = list(range(4))
+    prototype = proof["cases"][0]["observations"][0]
+    observations = []
+    for rank, request in enumerate(requests):
+        observation = copy.deepcopy(prototype)
+        observation["rank"] = rank
+        recorded = observation["signature"]
+        recorded.update(
+            op_id="tensor_parallel_mappings",
+            implementation="mcore:reduce_from_tensor_model_parallel_region",
+            configuration={
+                "collective": {
+                    "group_ranks": [2 * (rank // 2), 2 * (rank // 2) + 1],
+                    "group_rank": rank % 2,
+                    "input_sha256": f"{rank:064x}",
+                }
+            },
+        )
+        request["operations"][0]["signature"] = {**copy.deepcopy(recorded), "phase": phase}
+        observations.append(observation)
+    proof["cases"][0]["observations"] = observations
+    return requests, proof
+
+
+@pytest.mark.parametrize("phase", ["forward", "forward_backward"])
+def test_complete_rank_assignment_matches_without_generalizing_to_other_ranks(phase):
+    requests, proof = ranked_case(phase)
+    report = build_report(requests, [proof])
+    assert report["counts"] == {"total": 4, DETERMINISTIC: 4, NONDETERMINISTIC: 0, UNVERIFIED: 0}
+    assert report["recipe_status"] == "replay_required"
+    expected = {
+        str(request["rank"]): signature_key(request["operations"][0]["signature"])
+        for request in requests
+    }
+    for operation in report["operations"]:
+        match = operation["evidence"][0]
+        assert match["ranks"] == operation["ranks"]
+        assert match["rank_assignment"] == expected
+        assert match["case_id"] == proof["cases"][0]["case_id"]
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "swapped_ranks",
+        "changed_peer_shape",
+        "changed_group",
+        "missing_observation",
+        "missing_report_rank",
+        "changed_protocol",
+        "changed_phase",
+        "ambiguous_rank",
+    ],
+)
+def test_incomplete_or_different_rank_assignments_stay_unverified(problem):
+    requests, proof = ranked_case()
+    observations = proof["cases"][0]["observations"]
+    if problem == "swapped_ranks":
+        requests[0]["operations"], requests[1]["operations"] = (
+            requests[1]["operations"],
+            requests[0]["operations"],
+        )
+    elif problem == "changed_peer_shape":
+        requests[3]["operations"][0]["signature"]["inputs"][0]["shape"] = [4, 2]
+    elif problem == "changed_group":
+        requests[3]["operations"][0]["signature"]["configuration"]["collective"]["group_ranks"] = [
+            3,
+            2,
+        ]
+    elif problem == "missing_observation":
+        observations.pop()
+    elif problem == "missing_report_rank":
+        proof["ranks_present"].pop()
+    elif problem == "changed_protocol":
+        observations[3]["protocol"]["replays"] = 4
+    elif problem == "changed_phase":
+        observations[3]["signature"]["phase"] = "forward"
+    else:
+        additional = copy.deepcopy(observations[3])
+        additional["signature"]["inputs"][0]["shape"] = [4, 2]
+        observations.append(additional)
+    report = build_report(requests, [proof])
+    assert report["counts"][UNVERIFIED] == report["counts"]["total"] == 4
+
+
+@pytest.mark.parametrize("separation", ["case", "run"])
+def test_rank_assignments_cannot_be_assembled_from_separate_cases_or_runs(separation):
+    requests, proof = ranked_case()
+    other = copy.deepcopy(proof)
+    proof["cases"][0]["observations"] = proof["cases"][0]["observations"][:2]
+    other["cases"][0]["observations"] = other["cases"][0]["observations"][2:]
+    if separation == "case":
+        other["cases"][0]["case_id"] = "other-case"
+        proof["cases"].extend(other["cases"])
+        reports = [proof]
+    else:
+        other["run_id"] = "other-run"
+        reports = [proof, other]
+    assert build_report(requests, reports)["counts"][UNVERIFIED] == 4
+
+
+def test_complete_assignment_cannot_lend_its_peers_to_another_protocol():
+    requests, proof = ranked_case()
+    observations = proof["cases"][0]["observations"]
+    partial = copy.deepcopy(observations[0])
+    for observation in observations:
+        observation["protocol"]["replays"] = 4
+    observations.append(partial)
+    report = build_report(requests, [proof])
+    assert report["counts"][DETERMINISTIC] == 4
+    assert all(
+        match["protocol"] == {"replays": 4}
+        for operation in report["operations"]
+        for match in operation["evidence"]
+    )
+
+
+def test_signature_observed_on_an_additional_rank_cannot_borrow_peer_evidence():
+    requests, proof = ranked_case()
+    requests[1]["operations"].append(copy.deepcopy(requests[0]["operations"][0]))
+    report = build_report(requests, [proof])
+    assert report["counts"][DETERMINISTIC] == 3 and report["counts"][UNVERIFIED] == 1
+    unknown = next(row for row in report["operations"] if row["status"] == UNVERIFIED)
+    assert unknown["ranks"] == [0, 1] and not unknown["evidence"]
+
+
+def test_one_signature_can_match_a_subset_of_ranks_in_a_complete_assignment():
+    requests, proof = ranked_case()
+    for request, observation in zip(requests, proof["cases"][0]["observations"]):
+        configuration = {"variant": request["rank"] % 2}
+        request["operations"][0]["signature"]["configuration"] = configuration
+        observation["signature"]["configuration"] = configuration
+    report = build_report(requests, [proof])
+    assert report["counts"][DETERMINISTIC] == 2
+    assert {tuple(row["ranks"]) for row in report["operations"]} == {(0, 2), (1, 3)}
+
+
+def test_rank_assignment_does_not_erase_matching_negative_evidence():
+    requests, proof = ranked_case()
+    failed = copy.deepcopy(proof)
+    failed["run_id"] = "failing-run"
+    failed["cases"][0]["status"] = NONDETERMINISTIC
+    failed["cases"][0]["observations"][2]["status"] = NONDETERMINISTIC
+    report = build_report(requests, [proof, failed])
+    assert report["counts"][DETERMINISTIC] == 3 and report["counts"][NONDETERMINISTIC] == 1
+    assert report["recipe_status"] == "known_nondeterministic_operation"
+
+
+def test_rank_assignment_cli_writes_provenance_and_strict_unknown(tmp_path):
+    requests, proof = ranked_case()
+    directory = tmp_path / "inventory"
+    directory.mkdir()
+    for request in requests:
+        (directory / f"rank-{request['rank']}.json").write_text(json.dumps(request))
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps(proof))
+    output = tmp_path / "report.json"
+    args = [str(directory), "--evidence", str(evidence_path), "--output", str(output), "--strict"]
+    assert main(args) == 0
+    assert json.loads(output.read_text())["counts"][DETERMINISTIC] == 4
+    requests[2]["operations"][0]["signature"]["configuration"]["collective"]["group_rank"] = 1
+    (directory / "rank-2.json").write_text(json.dumps(requests[2]))
+    assert main(args) == 2
+
+
 def test_empty_inventory_has_no_percentage():
     request = inventory()
     request["operations"] = []
