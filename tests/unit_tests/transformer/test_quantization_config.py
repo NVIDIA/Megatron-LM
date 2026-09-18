@@ -1,10 +1,22 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from copy import deepcopy
 from typing import Any, Dict
 
 import pytest
 
-from megatron.core.quantization.quant_config import GlobMatcher, MatchContext, RecipeConfig
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TEQuantizationParams,
+    TEQuantizationRecipe,
+)
+from megatron.core.quantization.quant_config import (
+    GlobMatcher,
+    MatchContext,
+    QuantizationConfig,
+    RecipeConfig,
+)
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     from megatron.core.extensions.kitchen import (
@@ -47,6 +59,70 @@ def test_recipe_config_matching() -> None:
         recipe_config.match_to_config_key(MatchContext("decoder.1.linear_qkv", layer_number=1))
         == "default"
     )
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")
+@pytest.mark.parametrize(
+    ("model_overrides", "recipe_overrides", "inherits"),
+    [
+        ({}, {}, True),
+        ({}, {"fp8_param": False}, False),
+        ({}, {"fp8_param": True}, False),
+        ({}, {"inherit_model_init_context": False}, False),
+        ({}, {"inherit_model_init_context": True}, True),
+        ({}, {"fp4_param": False}, False),
+        ({}, {"fp8_quantization_recipe": None}, False),
+        ({"transformer_impl": "transformer_engine"}, {}, False),
+        ({"fp8_param": False}, {}, False),
+        ({"fp8_recipe": "tensorwise"}, {}, False),
+        ({"fp8": None, "fp8_param": False}, {}, False),
+    ],
+)
+def test_te_inference_storage_defaults(model_overrides, recipe_overrides, inherits) -> None:
+    """Resolve omission without changing bool defaults or mutating shared recipes."""
+    model_kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        transformer_impl="inference_optimized",
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+    )
+    model_kwargs.update(model_overrides)
+    recipe = {"fp8_quantization_recipe": "mxfp8", **recipe_overrides}
+    quant_config = QuantizationConfig(
+        {
+            "transformer_engine_config_type": "TEQuantizationParams",
+            "training_recipe": recipe,
+            "evaluation_recipe": recipe,
+        },
+        MatchContext("decoder.layers.0.mlp.experts.linear_fc1", 0),
+        "mxfp8",
+    )
+    original = deepcopy(quant_config.config)
+    parsed = TEQuantizationParams.parse_from_config(
+        quant_config, model_config=TransformerConfig(**model_kwargs)
+    )
+    for resolved in (parsed.training_recipe, parsed.evaluation_recipe):
+        assert resolved.inherit_model_init_context is inherits
+        assert resolved.fp8_param is recipe_overrides.get("fp8_param", False)
+    assert quant_config.config == original
+    # Parsing the same recipe without an inference config keeps the old defaults.
+    ordinary = TEQuantizationParams.parse_from_config(quant_config)
+    assert ordinary.training_recipe.inherit_model_init_context is recipe_overrides.get(
+        "inherit_model_init_context", False
+    )
+    assert TEQuantizationRecipe().fp8_param is False
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")
+@pytest.mark.parametrize("value", [None, "false", 0])
+def test_te_recipe_rejects_non_boolean_fp8_param(value) -> None:
+    with pytest.raises(ValueError, match="fp8_param must be a bool"):
+        TEQuantizationRecipe.parse_from_config({"fp8_param": value})
 
 
 @pytest.mark.skipif(not HAVE_KITCHEN, reason="Kitchen required for using kitchen backend.")

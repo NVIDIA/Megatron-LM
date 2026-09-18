@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
@@ -206,10 +207,44 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        if self.mtp_num_depths > 0:
+            if self.config.mtp_num_layers is None:
+                self.config.mtp_num_layers = self.mtp_num_depths
+            elif self.config.mtp_num_layers != self.mtp_num_depths:
+                raise ValueError(
+                    f"hybrid_layer_pattern defines {self.mtp_num_depths} MTP depths, "
+                    f"but mtp_num_layers is {self.config.mtp_num_layers}"
+                )
+        if (
+            self.config.mtp_num_layers
+            and self.mtp_num_depths == 0
+            and self.config.mtp_hybrid_override_pattern is None
+        ):
+            raise ValueError(
+                "HybridModel has mtp_num_layers set but no MTP template. "
+                "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM')."
+            )
+
+        # Validate the full architecture, including MTP heads on other pipeline stages.
         if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
             raise ValueError(
                 "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
                 "overlap scheduler does not expand the nested HybridStack."
+            )
+        if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
+            raise ValueError(
+                "freeze_base_model_for_mtp requires the HybridModel architecture "
+                "to define at least one MTP head"
+            )
+        if self.mtp_num_depths > 0 and self.position_embedding_type not in ('rope', 'none'):
+            raise ValueError(
+                "Multi-Token Prediction (MTP) is not supported with "
+                f"{self.position_embedding_type} position embedding type. "
+                "The supported position embedding types are rope and none."
+            )
+        if self.config.mtp_hsm and self.mtp_num_depths < 2:
+            raise ValueError(
+                "mtp_hsm=True requires at least two MTP heads in the HybridModel architecture."
             )
 
         # Determine if MTP is needed (based on pattern parsing)
@@ -700,6 +735,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         logits = self._scale_logits(logits)
+        gather_output = (
+            self.output_layer.gather_output
+            if runtime_gather_output is None
+            else runtime_gather_output
+        )
+        observe_tensor(
+            self.output_layer,
+            "output_logits",
+            "output_logits",
+            logits,
+            tp_shard_dim=None if gather_output else -1,
+            sequence_dim=0,
+            batch_dim=1,
+        )
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
