@@ -33,8 +33,12 @@ def test_swiglu_replay():
 
 Parametrized tests declare separate cases. The harness records tensor shapes,
 strides, dtypes, gradient requirements, deterministic-algorithm mode, and the
-actual comparison protocol. Autocast, TF32, and cuDNN dispatch settings are
-recorded at each call, and the run context includes GPU driver versions.
+actual comparison protocol. Memory-fill policy
+(`torch.utils.deterministic.fill_uninitialized_memory`), autocast, TF32, and
+cuDNN settings are recorded at each call, and the run context includes GPU driver
+versions. Recording observes the fill flag without changing it. Older reports
+retain their original observations but do not establish the missing fill setting
+and cannot supply recipe matches that require it.
 Triton cache policy, cache directory, and all `TRITON_AUTOTUNE_BLOCK_*` overrides
 are recorded both at collection and at the replay call. A different policy or
 block override cannot reuse passing evidence. A cache path alone does not prove

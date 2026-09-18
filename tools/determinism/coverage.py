@@ -51,7 +51,10 @@ def triton_signature() -> dict:
 
 def runtime_signature(torch) -> dict:
     """Record dispatch-affecting settings at the call, after test setup."""
+    from torch.utils import deterministic
+
     return {
+        "fill_uninitialized_memory": deterministic.fill_uninitialized_memory,
         "autocast": torch.is_autocast_enabled(),
         "autocast_dtype": str(torch.get_autocast_dtype("cuda")),
         "float32_matmul_precision": torch.get_float32_matmul_precision(),

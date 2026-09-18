@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
+import torch.utils.deterministic
 
 from tools.determinism.coverage import (
     DETERMINISTIC,
@@ -16,10 +18,27 @@ from tools.determinism.coverage import (
     collect_observations,
     main,
     observe_replay,
+    runtime_signature,
     triton_signature,
 )
 
 pytest_plugins = ["pytester"]
+
+
+@pytest.mark.parametrize("fill", [False, True])
+def test_runtime_signature_records_memory_fill_without_mutation(fill):
+    previous = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        torch.utils.deterministic.fill_uninitialized_memory = fill
+        before = runtime_signature(torch)
+        assert before["fill_uninitialized_memory"] is fill
+        assert torch.utils.deterministic.fill_uninitialized_memory is fill
+        torch.utils.deterministic.fill_uninitialized_memory = not fill
+        after = runtime_signature(torch)
+        assert after["fill_uninitialized_memory"] is (not fill)
+        assert before != after
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = previous
 
 
 def shard(rank=0, world_size=1, status=DETERMINISTIC):
