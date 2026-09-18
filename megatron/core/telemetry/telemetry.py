@@ -9,7 +9,7 @@ are best effort: an attribute failure must not interrupt Megatron execution.
 """
 
 import logging
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,43 @@ PRESETS = {
     "per_step": frozenset([JOB, TRAIN, CKPT, EVAL, INFERENCE]),
     "profiling": GROUPS,
 }
+
+# Megatron-owned canonical span names.
+SPAN_CHECKPOINT_SAVE_STATE_DICT = "nv.dl.training.checkpoint.save.state_dict"
+SPAN_CHECKPOINT_SAVE_IO_WRITE = "nv.dl.training.checkpoint.save.io_write"
+SPAN_CHECKPOINT_LOAD = "nv.dl.training.checkpoint.load"
+SPAN_CHECKPOINT_LOAD_IO_READ = "nv.dl.training.checkpoint.load.io_read"
+SPAN_CHECKPOINT_REPORT_MEMORY = "nv.mlm.checkpoint.report_memory"
+SPAN_CHECKPOINT_TIMERS_LOG = "nv.mlm.checkpoint.timers_log"
+SPAN_CHECKPOINT_FT_HEARTBEAT = "nv.mlm.checkpoint.ft_heartbeat"
+SPAN_CHECKPOINT_EXPOSED_SAVE = "nv.dl.training.checkpoint.exposed_save"
+SPAN_CHECKPOINT_SAVE = "nv.dl.training.checkpoint.save"
+SPAN_CHECKPOINT_SAVE_FINALIZE = "nv.dl.training.checkpoint.save.finalize"
+SPAN_TRAINING_ITERATION = "nv.dl.training.iteration"
+SPAN_TRAINING_FORWARD_BACKWARD = "nv.dl.training.iteration.forward_backward"
+SPAN_TRAINING_OPTIMIZER_STEP = "nv.dl.training.iteration.optimizer_step"
+SPAN_GPU_SNIFF_PERIODIC = "nv.dl.resiliency.gpu_sniff.periodic"
+SPAN_CUDA_GRAPH_CAPTURE = "nv.mcore.cuda_graph.capture"
+SPAN_MEMORY_RECLAIM = "nv.mcore.memory.reclaim"
+SPAN_TRAINING_ITERATION_REPORT = "nv.mlm.train.iteration_report"
+SPAN_TRAINING_PARAMS_NORM = "nv.mlm.train.params_norm"
+SPAN_TRAINING_LOG = "nv.mlm.train.log"
+SPAN_TRAINING_FORWARD_PRE_HOOK = "nv.mlm.train.forward_pre_hook"
+SPAN_TRAINING_EVALUATE = "nv.dl.training.evaluate"
+SPAN_TRAINING_EVALUATE_STEP = "nv.dl.training.evaluate.step"
+
+# Canonical span attribute names.
+TRAINING_STEP = "nv.dl.training.step"
+TRAINING_ITERATION_IS_FIRST = "nv.dl.training.iteration.is_first"
+TRAINING_ITERATION_SKIPPED = "nv.dl.training.iteration.skipped"
+TRAINING_OPTIMIZER_UPDATE_SUCCESSFUL = "nv.dl.training.optimizer.update_successful"
+TRAINING_EVALUATE_ITERATION = "nv.dl.training.evaluate.iteration"
+TRAINING_EVALUATE_ITERATION_COUNT = "nv.dl.training.evaluate.iteration_count"
+GPU_SNIFF_TAG = "nv.dl.resiliency.gpu_sniff.tag"
+MEMORY_RECLAIM_OPERATION = "nv.mcore.memory.reclaim.operation"
+
+MEMORY_RECLAIM_GC_COLLECT = "gc_collect"
+MEMORY_RECLAIM_FREE_OVERLAP_BUFFERS = "free_overlap_buffers"
 
 try:
     from nemo.lens import SpanRegistry as _SpanRegistry
@@ -175,6 +212,106 @@ def is_enabled(group: str) -> bool:
 def managed_span(group: str, name: str, tracer=None, **attributes: Any):
     """Create a Lens managed span, or a no-op when Lens is unavailable."""
     return _managed_span(group, name, tracer=tracer, **attributes)
+
+
+@contextmanager
+def checkpoint_exposed_save_span(step: int) -> Any:
+    """Create the complete trainer-visible checkpoint save span."""
+    if not is_enabled(CKPT):
+        yield None
+        return
+    with managed_span(CKPT, SPAN_CHECKPOINT_EXPOSED_SAVE, **{TRAINING_STEP: step}) as span:
+        yield span
+
+
+@contextmanager
+def checkpoint_save_span(step: int) -> Any:
+    """Create the inner trainer save span without off-group attribute work."""
+    if not is_enabled(CKPT):
+        yield None
+        return
+    with managed_span(CKPT, SPAN_CHECKPOINT_SAVE, **{TRAINING_STEP: step}) as span:
+        yield span
+
+
+class TrainingStepSpans:
+    """Capture one training step's tracer without owning application execution."""
+
+    def __init__(self, handle: Any) -> None:
+        self._tracer = handle.tracer if is_enabled(TRAIN) else None
+
+    def forward_backward(self, get_num_microbatches: Any) -> Any:
+        """Create the forward/backward context, reading its attribute only if enabled."""
+        if is_enabled(TRAIN) and self._tracer is not None:
+            return span_cm(
+                SPAN_TRAINING_FORWARD_BACKWARD,
+                tracer=self._tracer,
+                num_microbatches=get_num_microbatches(),
+            )
+        return nullcontext()
+
+    def optimizer(self) -> Any:
+        """Create the optimizer context with the captured step tracer."""
+        if is_enabled(TRAIN) and self._tracer is not None:
+            return span_cm(SPAN_TRAINING_OPTIMIZER_STEP, tracer=self._tracer)
+        return nullcontext()
+
+
+@contextmanager
+def training_report_span(handle: Any) -> Any:
+    """Measure reporting without changing its exception events or status."""
+    span = None
+    token = None
+    if is_enabled(TRAIN):
+        from opentelemetry import context, trace
+
+        span = handle.tracer.start_span(SPAN_TRAINING_ITERATION_REPORT)
+        token = context.attach(trace.set_span_in_context(span))
+    try:
+        yield span
+    finally:
+        if span is not None:
+            from opentelemetry import context
+
+            context.detach(token)
+            span.end()
+
+
+def training_iteration_span(step: int, is_first: bool):
+    """Create one training-iteration span with its required identity attributes."""
+    return managed_span(
+        TRAIN,
+        SPAN_TRAINING_ITERATION,
+        **{TRAINING_STEP: step, TRAINING_ITERATION_IS_FIRST: is_first},
+    )
+
+
+def memory_reclaim_span(group: str, step: int, operation: str):
+    """Create a memory-reclaim span with its required discriminators."""
+    return managed_span(
+        group, SPAN_MEMORY_RECLAIM, **{TRAINING_STEP: step, MEMORY_RECLAIM_OPERATION: operation}
+    )
+
+
+def gpu_sniff_span(span_name: str, tag: str, training_step: int | None = None):
+    """Create a GPU-sniff span, attaching a step only for periodic execution."""
+    attributes: dict[str, Any] = {GPU_SNIFF_TAG: tag}
+    if training_step is not None:
+        attributes[TRAINING_STEP] = training_step
+    return managed_span(JOB, span_name, **attributes)
+
+
+def set_current_evaluation_span_attributes(
+    training_step: int, iteration_count: int | None = None
+) -> None:
+    """Attach the training step and evaluation length to the current span."""
+    if not is_enabled(EVAL):
+        return
+
+    attributes: dict[str, Any] = {TRAINING_STEP: training_step}
+    if iteration_count is not None:
+        attributes[TRAINING_EVALUATE_ITERATION_COUNT] = iteration_count
+    set_current_span_attributes(attributes)
 
 
 def trace_fn(group: str, name: str, tracer=None):
