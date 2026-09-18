@@ -26,3 +26,30 @@ At the normal training-log cadence, the global last rank emits these events:
 the active `nv.mlm.train.log` span when the `megatron.train` group is enabled.
 If that span is not recording, they fall back to the current recording
 loop-pass root. If neither is recording, event emission is a no-op.
+
+## Processed-token metric
+
+`nv.dl.training.tokens.processed` is the only retained OTel training metric.
+It is a monotonic counter with unit `{token}` and no metric attributes.
+
+The counter reports the global processed-token value on each exporting rank.
+Select one rank series per run rather than summing across ranks.
+
+- Unpacked training records global batch size multiplied by sequence length.
+- Packed training records the already-global real-token count from the existing
+  sequence-length statistics path. Non-finite, fractional, or negative values
+  are skipped with a warning.
+- Configured rejected-data dummy skips, inference-only execution, exceptions,
+  and exits before iteration commit do not increment the counter.
+
+## Adding custom metrics
+
+For a Megatron-specific metric, use a project-owned name such as
+`megatron.my_subsystem.requests` and follow the weak-reference instrument-cache
+and failure-isolation pattern in
+`megatron/core/telemetry/training_metrics.py`. Shared `nv.dl.*`, `nv.mcore.*`,
+and standard namespaces require a versioned schema definition; do not mint
+ad hoc names in call sites.
+
+See [lens: metrics](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/metrics.md)
+for general instrument guidance.

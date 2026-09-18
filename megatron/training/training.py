@@ -325,6 +325,7 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 from megatron.core.telemetry import telemetry as _otel
+from megatron.core.telemetry import training_metrics as _otel_training_metrics
 
 
 def destroy_global_state():
@@ -3690,6 +3691,18 @@ def _get_global_batch_size_for_iteration(args, num_microbatches=None) -> int:
     return args.micro_batch_size * get_batch_parallel_size(args) * num_microbatches
 
 
+def _record_processed_tokens_for_committed_iteration(args, packed_token_count=None) -> None:
+    """Record the token count after Megatron commits a model-work iteration."""
+    if args.skip_train:
+        return
+    _otel_training_metrics.record_processed_tokens_for_iteration(
+        get_telemetry(),
+        global_batch_size=_get_global_batch_size_for_iteration(args),
+        sequence_length=args.seq_length,
+        packed_token_count=packed_token_count,
+    )
+
+
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
     if args.save is None:
@@ -4868,6 +4881,10 @@ def train(
         packed_sequence_stats = None
         if getattr(args, 'log_packed_sequence_stats', False):
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
+        # The counter is replicated on every exporting rank. This point is
+        # reached only after a real iteration is committed: dummy skips continue
+        # above, inference-only passes are excluded, and pre-commit exits break.
+        _record_processed_tokens_for_committed_iteration(args, total_real_tokens_in_batch)
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
