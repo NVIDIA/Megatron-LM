@@ -22,6 +22,7 @@ PLATFORMS = ("dgx_h100", "dgx_gb200")
 CASES = {
     "tests/unit_tests/determinism/kernels/**/*.py": "coverage",
     "determinism_kernel_perf": "performance",
+    "determinism_collective_perf": "collective",
 }
 ERRORS = (OSError, AttributeError, IndexError, KeyError, TypeError, ValueError)
 
@@ -120,13 +121,30 @@ def _one(directory: Path, filename: str) -> Path:
 
 
 def _platform(leaderboard: Path, platform: str) -> None:
-    name, capability = {"dgx_h100": ("H100", [9, 0]), "dgx_gb200": ("GB200", [10, 0])}[platform]
     reports = json.loads(leaderboard.read_bytes())
     for report in reports:
         for run in report["runs"]:
             runtime = run["kernel"]["case_signature"]["runtime"]
-            if name not in runtime["gpu"] or runtime["capability"] != capability:
-                raise ValueError("Observed GPU does not match the selected CI platform")
+            _context_platform(runtime, platform)
+
+
+def _context_platform(context: dict, platform: str) -> None:
+    name, capability = {"dgx_h100": ("H100", [9, 0]), "dgx_gb200": ("GB200", [10, 0])}[platform]
+    if name not in context["gpu"] or context["capability"] != capability:
+        raise ValueError("Observed GPU does not match the selected CI platform")
+
+
+def _collective(directory: Path, platform: str, store: Path, revision: str, origin: str) -> dict:
+    import collective_baseline
+
+    timed = _one(directory, "benchmark.json")
+    root = timed.parent.parent
+    covered = _one(directory, "coverage.json")
+    if timed.parent.name != "timing" or covered != root / "coverage.json":
+        raise ValueError("Expected one capture/coverage/timing dataset in the collective artifact")
+    report = json.loads(timed.read_bytes())
+    _context_platform(report["capture"]["context"], platform)
+    return collective_baseline.publish(root / "capture", covered, timed, store, revision, origin)
 
 
 def collect(
@@ -137,13 +155,14 @@ def collect(
     run_id: int,
     attempt: int,
     platforms: list[str],
+    collective_platforms: list[str] | None = None,
 ) -> dict:
     """Verify every selected platform, retaining failures and source provenance."""
     expected = _identity(repository, revision, run_id, attempt)
-    if (
-        not platforms
-        or len(set(platforms)) != len(platforms)
-        or not set(platforms) <= set(PLATFORMS)
+    collective_platforms = collective_platforms or []
+    if not (platforms or collective_platforms) or any(
+        len(set(selected)) != len(selected) or not set(selected) <= set(PLATFORMS)
+        for selected in (platforms, collective_platforms)
     ):
         raise ValueError("Select each expected platform exactly once")
     if output.resolve().is_relative_to(artifacts.resolve()):
@@ -166,9 +185,12 @@ def collect(
         try:
             source = _input(directory, expected)
             record = source["provenance"]
-            if record["platform"] not in platforms:
+            selected = (
+                collective_platforms if CASES[record["test_case"]] == "collective" else platforms
+            )
+            if record["platform"] not in selected:
                 report["ignored_inputs"].append(
-                    {**source, "reason": "Platform was not selected for performance"}
+                    {**source, "reason": "Platform was not selected for this performance producer"}
                 )
                 continue
             if (
@@ -184,30 +206,51 @@ def collect(
         except ERRORS as error:
             report["errors"].append({"artifact": directory.name, "reason": str(error)})
     origin = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{attempt}"
-    for platform in platforms:
-        row: dict = {"platform": platform, "status": "not_verified"}
+    selection = [("activation", platform) for platform in platforms] + [
+        ("collective", platform) for platform in collective_platforms
+    ]
+    for kind, platform in selection:
+        row: dict = {"platform": platform, "kind": kind, "status": "not_verified"}
         report["platforms"].append(row)
         try:
             if report["errors"]:
                 raise ValueError("Input artifact validation failed; see errors")
-            candidates = [sources.get((platform, kind), []) for kind in ("coverage", "performance")]
-            if any(len(paths) != 1 for paths in candidates):
-                raise ValueError(
-                    "Expected one successful replay artifact and one timing artifact; missing or ambiguous uploads"
+            if kind == "collective":
+                collective_candidates = sources.get((platform, "collective"), [])
+                if len(collective_candidates) != 1:
+                    raise ValueError(
+                        "Expected one successful collective artifact; missing or ambiguous uploads"
+                    )
+                result = _collective(
+                    collective_candidates[0],
+                    platform,
+                    output / "collective-baselines" / platform,
+                    revision,
+                    origin,
                 )
-            covered, timed = (paths[0] for paths in candidates)
-            leaderboard = _one(timed, "leaderboard.json")
-            _platform(leaderboard, platform)
-            result = baseline.publish(
-                _one(covered, "determinism-coverage.json"),
-                leaderboard,
-                output / "baselines" / platform,
-                revision,
-                origin,
-            )
+                row["collective_artifact"] = collective_candidates[0].name
+            else:
+                candidates = [
+                    sources.get((platform, name), []) for name in ("coverage", "performance")
+                ]
+                if any(len(paths) != 1 for paths in candidates):
+                    raise ValueError(
+                        "Expected one successful replay artifact and one timing artifact; missing or ambiguous uploads"
+                    )
+                covered, timed = (paths[0] for paths in candidates)
+                leaderboard = _one(timed, "leaderboard.json")
+                _platform(leaderboard, platform)
+                result = baseline.publish(
+                    _one(covered, "determinism-coverage.json"),
+                    leaderboard,
+                    output / "baselines" / platform,
+                    revision,
+                    origin,
+                )
+                row.update(coverage_artifact=covered.name, performance_artifact=timed.name)
             # Save only relative paths so the derived artifact can itself move.
             result["path"] = Path(result["path"]).relative_to(output).as_posix()
-            row.update(result, coverage_artifact=covered.name, performance_artifact=timed.name)
+            row.update(result)
         except ERRORS as error:
             row["reason"] = str(error)
     if not report["errors"] and all(
@@ -230,12 +273,12 @@ def markdown_report(report: dict) -> str:
         "",
         f"Artifact verification: **{report['status']}**. Unbudgeted performance remains **not_gated**.",
         "",
-        "| Platform | Status | Baseline ID |",
-        "| --- | --- | --- |",
+        "| Platform | Evidence | Status | Baseline ID |",
+        "| --- | --- | --- | --- |",
     ]
     for row in report["platforms"]:
         lines.append(
-            f"| {row['platform']} | {row['status']} | {row.get('baseline_id', 'unavailable')} |"
+            f"| {row['platform']} | {row.get('kind', 'activation')} | {row['status']} | {row.get('baseline_id', 'unavailable')} |"
         )
     reasons = [
         f"{row['platform']}: {row['reason']}" for row in report["platforms"] if "reason" in row
@@ -264,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", type=int, required=True)
     parser.add_argument("--attempt", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--platform", action="append", choices=PLATFORMS, required=True)
+    parser.add_argument("--platform", action="append", choices=PLATFORMS, default=[])
+    parser.add_argument("--collective-platform", action="append", choices=PLATFORMS, default=[])
     parser.add_argument("--test-case", choices=CASES)
     parser.add_argument("--outcome", choices=("success", "failure", "cancelled", "skipped"))
     parser.add_argument("--exit-code", default="")
@@ -272,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "stamp":
-            if len(args.platform) != 1:
+            if len(args.platform) != 1 or args.collective_platform:
                 raise ValueError("A producer has exactly one platform")
             record = stamp(
                 args.output,
@@ -297,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             args.run_id,
             args.attempt,
             args.platform,
+            args.collective_platform,
         )
         print(markdown_report(report))
         return 0 if report["status"] == "complete" else 1

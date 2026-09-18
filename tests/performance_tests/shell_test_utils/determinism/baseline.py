@@ -15,6 +15,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 import author_evidence
 
@@ -142,8 +143,8 @@ def _encode(value: dict) -> bytes:
     return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
 
 
-def verify(directory: Path, expected_id: str | None = None) -> dict:
-    """Rehash the complete bundle and independently recompute its evidence join."""
+def verified_contents(directory: Path, expected_id: str | None = None) -> tuple[dict, str, int]:
+    """Rehash every regular file before a format-specific evidence verification."""
     if directory.is_symlink():
         raise ValueError("Baseline directory must not be a symlink")
     raw = _bytes(directory / MANIFEST)
@@ -151,11 +152,6 @@ def verify(directory: Path, expected_id: str | None = None) -> dict:
     if expected_id is not None and identity != expected_id:
         raise ValueError("Baseline identifier differs from the requested immutable reference")
     manifest = _json(raw)
-    if (
-        manifest.get("schema_version") != 1
-        or manifest.get("kind") != "determinism_performance_baseline"
-    ):
-        raise ValueError("Unsupported baseline schema")
     actual = {}
     for path in directory.rglob("*"):
         if path.is_symlink():
@@ -168,6 +164,21 @@ def verify(directory: Path, expected_id: str | None = None) -> dict:
             }
     if actual != manifest["files"]:
         raise ValueError("Baseline files are missing, changed or undeclared")
+    return manifest, identity, len(actual)
+
+
+def verify(directory: Path, expected_id: str | None = None) -> dict:
+    """Rehash the complete bundle and independently recompute its evidence join."""
+    if _json(_bytes(directory / MANIFEST)).get("kind") == "determinism_collective_baseline":
+        import collective_baseline
+
+        return collective_baseline.verify(directory, expected_id)
+    manifest, identity, count = verified_contents(directory, expected_id)
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("kind") != "determinism_performance_baseline"
+    ):
+        raise ValueError("Unsupported baseline schema")
     rebuilt, _ = snapshot(
         directory / "coverage.json",
         directory / "performance/leaderboard.json",
@@ -182,7 +193,7 @@ def verify(directory: Path, expected_id: str | None = None) -> dict:
         "origin": manifest["origin"],
         "status": rebuilt["author_evidence"]["status"],
         "author_cases": len(rebuilt["author_evidence"]["requirements"]),
-        "files_verified": len(actual),
+        "files_verified": count,
     }
 
 
@@ -191,12 +202,19 @@ def publish(coverage: Path, leaderboard: Path, store: Path, revision: str, origi
     if store.resolve().is_relative_to(leaderboard.parent.resolve()):
         raise ValueError("Baseline store must be outside the source artifact directory")
     manifest, files = snapshot(coverage, leaderboard, revision, origin)
+    return publish_snapshot(manifest, files, store, verify)
+
+
+def publish_snapshot(
+    manifest: dict, files: dict[str, bytes], store: Path, verifier: Callable
+) -> dict:
+    """Atomically publish verified immutable bytes for one explicit bundle format."""
     raw = _encode(manifest)
     identity = hashlib.sha256(raw).hexdigest()
     store.mkdir(parents=True, exist_ok=True)
     destination = store / identity
     if destination.exists():
-        return {**verify(destination, identity), "path": str(destination), "created": False}
+        return {**verifier(destination, identity), "path": str(destination), "created": False}
     temporary = Path(tempfile.mkdtemp(prefix=".publishing-", dir=store))
     try:
         for name, content in files.items():
@@ -204,13 +222,13 @@ def publish(coverage: Path, leaderboard: Path, store: Path, revision: str, origi
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
         (temporary / MANIFEST).write_bytes(raw)
-        verified = verify(temporary, identity)
+        verified = verifier(temporary, identity)
         try:
             temporary.rename(destination)
         except OSError as error:
             if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                 raise
-            verified = verify(destination, identity)
+            verified = verifier(destination, identity)
             return {**verified, "path": str(destination), "created": False}
         return {**verified, "path": str(destination), "created": True}
     finally:
@@ -230,6 +248,13 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument(
         "--origin", required=True, help="Caller-supplied CI run or execution reference"
     )
+    collective = commands.add_parser("publish-collectives")
+    collective.add_argument("--capture", type=Path, required=True)
+    collective.add_argument("--coverage", type=Path, required=True)
+    collective.add_argument("--benchmark", type=Path, required=True)
+    collective.add_argument("--store", type=Path, required=True)
+    collective.add_argument("--revision", required=True)
+    collective.add_argument("--origin", required=True)
     check = commands.add_parser("verify")
     check.add_argument("directory", type=Path)
     check.add_argument("--expected-id")
@@ -238,6 +263,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "publish":
             result = publish(
                 args.coverage, args.leaderboard, args.store, args.revision, args.origin
+            )
+        elif args.command == "publish-collectives":
+            import collective_baseline
+
+            result = collective_baseline.publish(
+                args.capture, args.coverage, args.benchmark, args.store, args.revision, args.origin
             )
         else:
             result = verify(args.directory, args.expected_id)
