@@ -409,9 +409,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", C + "test_hybrid_model.py"),
+        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
+    ),
+    KernelEntry(
+        name="gdn_pre_gated_delta_rule_fusion",
+        sources=("megatron/core/fusions/fused_pre_gated_delta_rule.py",),
+        kind="triton",
+        exempt_reason="Pre-GDR fusion is explicitly rejected with deterministic_mode=True. "
+        "Its backward uses atomic parameter-gradient reductions and timing-based autotuning; "
+        "numerical parity and the rejection guard are covered by the GDN fusion unit tests.",
+    ),
+    KernelEntry(
+        name="gdn_gated_output_norm_fusion",
+        sources=("megatron/core/fusions/fused_gated_norm.py",),
+        tests=(K + "test_gated_norm.py",),
+        kind="triton",
+        notes="GatedDeltaNet._apply_gated_norm dispatches fused RMSNorm/SiLU forward/backward "
+        "with fixed launch configurations and ordered weight-gradient reduction; first-order replay.",
     ),
     KernelEntry(
         name="ssm_triton_cache_manager",

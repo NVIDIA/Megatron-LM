@@ -125,8 +125,20 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         beta = beta.float().sigmoid()
         return g, {"beta": beta.contiguous()}
 
+    def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Normalize and gate the recurrence output, validating every fused call."""
+        if self.config.gdn_gated_output_norm_fusion:
+            from megatron.core.fusions.fused_gated_norm import fused_gated_norm, validate_gated_norm
+
+            validate_gated_norm(self, x, gate)
+            return fused_gated_norm(
+                x, gate, self.out_norm.weight, self.out_norm.eps, self.out_norm.zero_centered_gamma
+            )
+        return self._apply_gated_norm_unfused(x, gate)
+
     @jit_fuser
-    def _apply_gated_norm(self, x, gate):
+    def _apply_gated_norm_unfused(self, x, gate):
+        """Preserve the projection-backed gate view in the unfused output path."""
         # Output norm. X is contiguous, so flattening it preserves a view.
         x_dtype = x.dtype
         original_shape = x.shape
