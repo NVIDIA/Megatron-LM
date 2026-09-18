@@ -24,6 +24,7 @@ from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
+    prepare_multimodal_data,
     unwrap_serialized_tensors,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -1084,15 +1085,11 @@ try:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
-        # TODO(perf): with n > 1, the same ``image_bytes_list`` is forwarded n
-        # times, and every admission independently re-preprocesses the bytes
-        # and runs the vision encoder. The engine has an
-        # ``ImageProcessingConfig`` that could preprocess once here if it were
-        # plumbed to the HTTP layer; embedding-level reuse across the n
-        # requests would need a wider change (compute embeddings once, ship
-        # them as a serialized tensor dict on the wire, skip the encoder for
-        # admissions 2..n). Kept as a known limitation for a follow-up so this
-        # PR stays scoped.
+        # Hash and serialize shared media once before fanning one prompt out to
+        # multiple independently sampled choices. Each request still carries
+        # its own media payload, while coordinator affinity keeps equivalent
+        # requests on the engine that owns the cached vision embedding.
+        prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -1108,7 +1105,7 @@ try:
                 client.add_request_streaming(
                     prompt_tokens,
                     sampling_params,
-                    multi_modal_data=multi_modal_data,
+                    multi_modal_data=prepared_multimodal_data,
                     offload_params=offload_params,
                 )
                 for _ in range(n)
@@ -1179,7 +1176,7 @@ try:
                 request_id, future = client.add_request_with_id(
                     prompt_tokens,
                     sampling_params,
-                    multi_modal_data=multi_modal_data,
+                    multi_modal_data=prepared_multimodal_data,
                     offload_params=offload_params,
                 )
                 request_ids.append(request_id)
