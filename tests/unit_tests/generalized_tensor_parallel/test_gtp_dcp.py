@@ -205,17 +205,22 @@ def _worker_native_fp8_dcp_save(rank, world_size, port):
 
 
 def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
-    """Copying a BF16 checkpoint value back into a live native-FP8 GTP weight must go through
-    ``gtp_native_fp8_load_context`` (a55b load-crash guard: TE's exact-class MXFP8 check rejects
-    the dynamic ``GTP_<Fp8Tensor>`` subclass). Assert the raw copy raises but succeeds under the
-    context, and the reclassed weight dequantizes to the loaded values.
+    """A DCP load copies a BF16 payload into a live native-FP8 GTP weight. That copy must work
+    through ``gtp_native_fp8_load_context``, keep the GTP subclass, and leave the weight holding
+    the loaded values.
+
+    The context exists because TE's ``IsMXFP8Tensor`` compared the *exact* class and so rejected
+    GTP's dynamic ``GTP_<Fp8Tensor>`` subclass. TE #3393 made that check subclass-tolerant, so on
+    newer TE a bare copy succeeds as well — hence step (1) probes rather than requires a raise.
     """
     _requires_mxfp8()
 
-    # This test exercises a single-rank concern (the __class__ swap during copy_), so use the
-    # default WORLD group as the gtp_remat_group rather than dist.new_group subgroups — the
-    # latter's secondary NCCL socket bootstrap is flaky on some multi-node allocations and would
-    # mask the fp8 copy behavior under test.
+    def is_gtp_fp8(param):
+        return is_float8tensor(param) and type(param).__name__.startswith("GTP_")
+
+    # Single-rank concern (the __class__ swap during copy_), so use the default WORLD group as the
+    # gtp_remat_group rather than dist.new_group subgroups — the latter's secondary NCCL socket
+    # bootstrap is flaky on some multi-node allocations and would mask the fp8 copy behavior.
     gtp_remat_group = dist.group.WORLD
     per_tp_out, in_f = 128, 128  # MXFP8 needs dims % 32; shard = 128/world(4) = 32
     recipe = MXFP8BlockScaling()
@@ -228,30 +233,29 @@ def _worker_native_fp8_dcp_load_copy(rank, world_size, port):
     with fp8_autocast(enabled=True, fp8_recipe=recipe):
         _ = lin(torch.randn(32, in_f, dtype=torch.bfloat16, device="cuda"))
 
-    assert is_float8tensor(lin.weight) and type(lin.weight).__name__.startswith("GTP_")
+    assert is_gtp_fp8(lin.weight), f"setup gave {type(lin.weight).__name__}, not a GTP FP8 weight"
 
     # The dequantized BF16 payload a DCP load would hand back for this shard.
     target_bf16 = torch.randn(shard_out, in_f, dtype=torch.bfloat16, device="cuda")
 
-    # (1) Without the context, copy_ into the subclass raises in TE's C++ quantizer.
-    # Mirror production's _load_from_state_dict, which copies under no_grad.
-    raised = False
+    # (1) Bare copy_, the way production's _load_from_state_dict does it. Raises on pre-#3393 TE
+    # and succeeds after, so accept either — but copy a DISTINCT value, or a copy that lands would
+    # pre-seed the target and make (2) pass trivially.
+    probe_bf16 = torch.randn(shard_out, in_f, dtype=torch.bfloat16, device="cuda")
     try:
         with torch.no_grad():
-            lin.weight.copy_(target_bf16)
+            lin.weight.copy_(probe_bf16)
     except Exception as e:  # noqa: BLE001
-        raised = True
         assert "MXFP8" in str(e) or "IsMXFP8Tensor" in str(e), str(e)
-    assert raised, "copy_ into GTP_<Fp8Tensor> unexpectedly succeeded without the load context"
+    assert is_gtp_fp8(lin.weight), "bare copy_ must leave the GTP subclass intact"
 
-    # (2) Under the context the copy succeeds; the reclassed weight holds the loaded values.
+    # (2) Under the context the copy always lands, on every TE version.
     with torch.no_grad(), gtp_native_fp8_load_context(lin):
         lin.weight.copy_(target_bf16)
-    assert is_float8tensor(lin.weight) and type(lin.weight).__name__.startswith(
-        "GTP_"
-    ), "load context must reclass back to the GTP subclass"
+    assert is_gtp_fp8(lin.weight), "load context must reclass back to the GTP subclass"
+
+    # MXFP8 round-trip is lossy; check the weight tracks the target, not the pre-copy values.
     loaded = dequantize_gtp_native_fp8(lin.weight)
-    # MXFP8 round-trip is lossy; check it tracks the target (not the pre-copy garbage).
     rel = (loaded - target_bf16).abs().max() / target_bf16.abs().max().clamp_min(1e-6)
     assert rel < 0.2, f"loaded weight does not match checkpoint values (max rel {rel:.3f})"
 
