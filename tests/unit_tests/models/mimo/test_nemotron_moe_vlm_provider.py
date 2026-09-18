@@ -418,8 +418,12 @@ def test_modality_configs_do_not_inherit_language_fp32_residuals():
     language_config = nemotron_language_config(
         args, tp_size=1, pp_size=1, ep_size=1, expt_tp_size=1
     )
+    # Cover projector placement on both encoder and language ranks.
     modality_configs = [
         nemotron_projection_config(args, tp_size=1, projection_input_size=5120),
+        nemotron_projection_config(
+            args, tp_size=1, projection_input_size=5120, base_config=language_config
+        ),
         vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
         .submodules["encoders"][RADIO_ENCODER_MODULE_NAME]
         .params["transformer_config"],

@@ -12,6 +12,7 @@ from packaging import version
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
     _avg_params,
@@ -22,6 +23,20 @@ from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
     get_transformer_block_and_grid,
 )
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_unknown_bridge_comm_dtype_source_is_rejected():
+    """Dtype overrides must name a module present in the module-grid mapping."""
+
+    with pytest.raises(
+        ValueError, match="bridge_comm_dtypes contains modules absent from module_to_grid_map"
+    ):
+        MultiModulePipelineCommunicator(
+            module_to_grid_map={'llm': object()},
+            topology={'llm': []},
+            config=ModelParallelConfig(pipeline_dtype=torch.float32),
+            bridge_comm_dtypes={'unknown_encoder': torch.bfloat16},
+        )
 
 
 class TestMultiModulePipelineCommunicator:
@@ -94,6 +109,79 @@ class TestMultiModulePipelineCommunicator:
             assert mllm_comm.is_module_pp_first_stage(module_name) == (
                 rank_module_info.pp_rank == 0
             )
+
+    def test_bf16_bridge_to_fp32_mimo_merge_forward_backward(self):
+        """Keep bridge traffic BF16 and promote only at the FP32 language merge."""
+
+        encoder_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        llm_grid = create_hypercomm_grid(offset=4, tp=1, cp=1, pp=1, dp=4)
+        communicator = MultiModulePipelineCommunicator(
+            module_to_grid_map={'image_encoder': encoder_grid, 'llm': llm_grid},
+            topology={'image_encoder': ['llm'], 'llm': []},
+            config=ModelParallelConfig(bf16=True, pipeline_dtype=torch.float32),
+            module_output_ndim={'image_encoder': 2},
+            bridge_comm_dtypes={'image_encoder': torch.bfloat16},
+        )
+
+        hidden_size = 8
+        source_activation = None
+        source_gradient = None
+        received_activation = None
+        combined_embeddings = None
+        merge_gradient = None
+
+        if communicator.is_current_rank_in_grid(encoder_grid):
+            source_activation = torch.full(
+                (1, hidden_size),
+                float(dist.get_rank() + 1),
+                device='cuda',
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            communicator.send_forward({'image_encoder': source_activation})
+            source_gradient = communicator.recv_backward()['image_encoder']
+            source_activation.backward(source_gradient)
+        else:
+            # Pipeline communication is an explicit autograd boundary; the schedule sends the
+            # locally computed input gradient backward through the communicator.
+            received_activation = (
+                communicator.recv_forward()['image_encoder'].detach().requires_grad_(True)
+            )
+            mimo_model = MimoModel.__new__(MimoModel)
+            text_embeddings = torch.full(
+                (2, hidden_size), 0.25, device='cuda', dtype=torch.float32, requires_grad=True
+            )
+            input_ids = torch.tensor([[100, 50, 101]], device='cuda')
+            combined_embeddings = mimo_model.align_embeddings_by_token_positions(
+                modality_embeddings={'text': text_embeddings, 'image_encoder': received_activation},
+                input_ids=input_ids,
+                special_token_ids={'image_encoder': 50},
+                modality_token_indices={
+                    'text': torch.tensor([0, 2], device='cuda'),
+                    'image_encoder': torch.tensor([1], device='cuda'),
+                },
+            )
+            (merge_gradient,) = torch.autograd.grad(
+                combined_embeddings.square().sum(), received_activation
+            )
+            communicator.send_backward({'image_encoder': merge_gradient})
+
+        dist.barrier()
+
+        if source_activation is not None:
+            assert source_gradient is not None
+            assert source_gradient.dtype is torch.bfloat16
+            assert source_activation.grad is not None
+            assert source_activation.grad.dtype is torch.bfloat16
+            torch.testing.assert_close(source_activation.grad, 2 * source_activation.detach())
+        else:
+            assert received_activation is not None
+            assert received_activation.dtype is torch.bfloat16
+            assert combined_embeddings is not None
+            assert combined_embeddings.dtype is torch.float32
+            assert merge_gradient is not None
+            assert merge_gradient.dtype is torch.bfloat16
+            torch.testing.assert_close(merge_gradient, 2 * received_activation.detach())
 
     def test_compute_total_pipeline_stages(self):
         """Test compute_total_pipeline_stages for overall chain and until specific ranks."""
