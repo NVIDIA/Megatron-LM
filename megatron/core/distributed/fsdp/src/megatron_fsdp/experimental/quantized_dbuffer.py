@@ -182,15 +182,15 @@ class QuantizedDBuffer:
 
     def get_tensor_view(self, index: int) -> MXFP8Tensor:
         """Return a compact, unswizzled MXFP8 view that aliases all local planes."""
-        rowwise_data = self.rowwise_data.get_local_tensor(index)
-        rowwise_scale = self.rowwise_scale.get_local_tensor(index)
-        columnwise_scale = self.columnwise_scale.get_local_tensor(index)
+        rowwise_data = self.rowwise_data.get_tensor_view(index)
+        rowwise_scale = self.rowwise_scale.get_tensor_view(index)
+        columnwise_scale = self.columnwise_scale.get_tensor_view(index)
         return MXFP8Tensor(
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
             rowwise_scale_inv=rowwise_scale,
-            columnwise_data=self.columnwise_data.get_local_tensor(index),
+            columnwise_data=self.columnwise_data.get_tensor_view(index),
             columnwise_scale_inv=columnwise_scale,
             fp8_dtype=_MXFP8_DTYPE,
             quantizer=_MXFP8_QUANTIZER,
@@ -220,7 +220,7 @@ class QuantizedDBuffer:
             if actual != expected:
                 raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            self.get_tensor_view(index).quantize_(main_weight.get_local_tensor(index))
+            self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
 
     @property
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:
