@@ -800,7 +800,15 @@ def _get_megatron_emerging_optimizer(
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 if qkv_split_shapes is None:
                     qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                if param.shape[0] % sum(qkv_split_shapes) == 0:
+                # MUST be pre-GTP-sharding rows, not param.shape[0] (this rank's shard):
+                # a shard-local test flips as the GTP degree changes, giving the SAME
+                # weight two different Muon update rules depending on parallel layout.
+                rows_before_gtp_sharding = (
+                    param._unsharded_shape[0]
+                    if getattr(param, 'is_gtp_weight_remat', False)
+                    else param.shape[0]
+                )
+                if rows_before_gtp_sharding % sum(qkv_split_shapes) == 0:
                     param.is_qkv = True
                     param.qkv_split_shapes = qkv_split_shapes
                 else:
@@ -1112,11 +1120,15 @@ def get_megatron_optimizer(
     if ddp_config.use_megatron_fsdp:
         # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
         # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
-        effective_intra_dist_opt_group = (
-            mp_group
-            if ddp_config.data_parallel_sharding_strategy == 'no_shard'
-            else intra_dist_opt_group
-        )
+        if ddp_config.data_parallel_sharding_strategy == 'no_shard':
+            effective_intra_dist_opt_group = mp_group
+        elif ddp_config.outer_dp_sharding_strategy != 'no_shard':
+            # Hybrid FSDP that shards the optimizer state over DP-Outer leaves each optimizer
+            # instance with a distinct slice of the gradient instead of a replica of it, so the
+            # stats have to be reduced over every instance to cover the whole gradient.
+            effective_intra_dist_opt_group = dp_cp_group
+        else:
+            effective_intra_dist_opt_group = intra_dist_opt_group
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
@@ -1124,6 +1136,19 @@ def get_megatron_optimizer(
                 param_groups = _get_param_groups(
                     model_chunk, config, config_overrides, param_group_process_group
                 )
+                if not is_te_min_version("2.18.0"):
+                    # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
+                    # https://github.com/NVIDIA/TransformerEngine/issues/3207.
+                    # Empty local shards have no optimizer state or data to update, so omit them.
+                    for param_group in param_groups:
+                        param_group['params'] = [
+                            parameter
+                            for parameter in param_group['params']
+                            if parameter.to_local().numel() > 0
+                        ]
+                    param_groups = [
+                        param_group for param_group in param_groups if param_group['params']
+                    ]
                 # MFSDP v2 owns its sharded parameter and gradient storage, so
                 # FullyShardedOptimizer does not need DDP param-and-grad buffers.
                 buffers = None
