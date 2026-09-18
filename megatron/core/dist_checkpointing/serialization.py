@@ -36,7 +36,11 @@ from .strategies.torch import (
     TorchDistSaveShardedStrategy,
     _get_filesystem_reader,
 )
-from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
+from .utils import (
+    extract_sharded_base,
+    force_all_tensors_to_non_fp8,
+    prepare_quantized_tensors_for_streaming_load,
+)
 from .validation import (
     StrictHandling,
     determine_global_metadata,
@@ -132,7 +136,19 @@ def load(
     #      params with a high-precision state dict;
     #   2. When using delayed scaling, this loading process writes an extra value into the global
     #      amax_history buffer of Transformer Engine, which is undesirable.
-    force_all_tensors_to_non_fp8(sharded_state_dict)
+    #
+    # Dequantizing everything up front allocates a high-precision copy of every quantized param
+    # at once. When the strategy streams the dequantization (`stream_ckpt_dequant`, a load path
+    # for inference), quantized tensors stay in the state dict and the load planner quantizes
+    # each destination in place from a per-tensor high-precision scratch (see
+    # `MCoreLoadPlanner.resolve_tensor`). Case 1 above is then unsupported by construction,
+    # delayed scaling (case 2: its scale is only known once `load_state_dict` restores the fp8
+    # metadata) is rejected, and the few tensors that cannot be quantized in place (see
+    # `prepare_quantized_tensors_for_streaming_load`) are still dequantized up front.
+    if getattr(sharded_strategy, "stream_ckpt_dequant", False):
+        prepare_quantized_tensors_for_streaming_load(sharded_state_dict)
+    else:
+        force_all_tensors_to_non_fp8(sharded_state_dict)
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict

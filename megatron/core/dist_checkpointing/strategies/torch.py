@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Un
 import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
+from torch.distributed._shard._utils import narrow_tensor_by_index
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard
 from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
@@ -350,9 +351,12 @@ def _unwrap_pyt_sharded_tensor(
     ret_tensors = []
     for sh in sh_ten.local_shards():
         ten = sh.tensor
-        for _ in range(mcore_sh_ten.prepend_axis_num):
-            assert ten.size(0) == 1
-            ten = ten[0]  # NOTE: ten.squeeze(0) uses more memory for FP8 tensors
+        if mcore_sh_ten.prepend_axis_num > 0:
+            # NOTE: strip the prepended singleton axes with `view` rather than `ten[0]` or
+            # `squeeze`: TE quantized tensor classes implement `view` natively, while `select`
+            # and `squeeze` fall back to a full dequantize (a high-precision copy per shard).
+            assert all(ten.size(i) == 1 for i in range(mcore_sh_ten.prepend_axis_num))
+            ten = ten.view(ten.shape[mcore_sh_ten.prepend_axis_num :])
         ret_tensors.append(ten)
     return ret_tensors
 
@@ -492,12 +496,20 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         *args,
         shapes_validation_sharded_tensors: Iterable[ShardedTensor] = (),
         allow_shape_mismatch_sharded_tensors: Optional[Dict[str, ShardedTensor]] = None,
+        stream_ckpt_dequant: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
         self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
         self._intermediate_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
+        self.stream_ckpt_dequant = stream_ckpt_dequant
+        # Streaming dequantize state, keyed by `read_item.dest_index`, i.e. one entry per
+        # destination tensor shared by every read item targeting it:
+        # (quantized destination, high-precision scratch holding the loaded values).
+        self._stream_dequant_buffers: Dict[Any, Tuple[torch.Tensor, torch.Tensor]] = {}
+        # Read items still to be committed per destination, counted in `finish_plan`.
+        self._stream_dequant_pending: Dict[Any, int] = {}
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -550,16 +562,51 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
         return local_plan
 
+    def finish_plan(self, new_plan: LoadPlan) -> LoadPlan:
+        """Counts the read items per destination of the plan this rank will execute.
+
+        `commit_tensor` needs to know when the last read item of a destination has been
+        committed (DCP gives no such signal). The final plan is counted rather than the one
+        returned by `create_local_plan`, which may still be rewritten by the coordinator.
+        """
+        final_plan = super().finish_plan(new_plan)
+        if self.stream_ckpt_dequant:
+            self._stream_dequant_pending = {}
+            for read_item in final_plan.items:
+                key = read_item.dest_index
+                self._stream_dequant_pending[key] = self._stream_dequant_pending.get(key, 0) + 1
+        return final_plan
+
     def resolve_tensor(self, read_item: ReadItem):
         """Override to add FP8 support.
 
-        Narrowing the Float8Tensor can create incontiguous tensors and there are
-        no `copy` kernels for such cases. This method creates a contiguous FP8
+        With `stream_ckpt_dequant`, a quantized destination (TE `QuantizedTensor`: FP8 current
+        scaling, MXFP8, blockwise FP8, NVFP4) is never handed to DCP. One high-precision scratch
+        per *destination tensor* receives the checkpoint bytes (DCP gets a view of the scratch,
+        narrowed exactly like it would have narrowed the destination), and `commit_tensor`
+        quantizes the whole scratch into the destination once the last read item targeting it
+        has been committed. The granularity has to be the destination rather than the read item:
+        a resharding load feeds one destination from several read items, and quantizing them one
+        by one would re-derive the data-dependent (per-tensor or per-block) scales from a partial
+        view and corrupt the regions written earlier. Moreover TE quantized tensors do not
+        support being narrowed: `MXFP8Tensor` and blockwise FP8 only implement the no-op slice
+        and otherwise fall back to a dequantized temporary that does not alias the parameter,
+        and a partial `Float8Tensor` slice is a non-contiguous view without a `copy_` kernel.
+
+        Without streaming, narrowing the Float8Tensor can create incontiguous tensors and there
+        are no `copy` kernels for such cases. This method creates a contiguous FP8
         tensors so that the subsequent `copy_` in FileSystemReader succeeds.
         Note that this requires tracking the original tensor
         (as `self._intermediate_read_item_and_target` attribute)
         and restoring it in `commit_tensor` method.
         """
+        if self.stream_ckpt_dequant and HAVE_TE:
+            from ...fp8_utils import is_float8tensor  # Avoid circular import
+
+            dest = self.lookup_tensor(read_item.dest_index)
+            if is_float8tensor(dest) and dest.is_cuda:
+                return self._resolve_streamed_tensor(read_item, dest)
+
         target_tensor = super().resolve_tensor(read_item)
         if (
             not target_tensor.is_contiguous()
@@ -572,8 +619,43 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
             )
         return target_tensor
 
+    @torch.no_grad()
+    def _resolve_streamed_tensor(self, read_item: ReadItem, dest: torch.Tensor) -> torch.Tensor:
+        """Returns the view of the destination's high-precision scratch for `read_item`."""
+        key = read_item.dest_index
+        entry = self._stream_dequant_buffers.get(key)
+        if entry is None:
+            covers_whole_dest = (
+                self._stream_dequant_pending.get(key, 0) == 1
+                and all(offset == 0 for offset in read_item.dest_offsets)
+                and tuple(read_item.lengths) == tuple(dest.shape)
+            )
+            if covers_whole_dest:
+                scratch = torch.empty(dest.shape, dtype=dest.dtype, device=dest.device)
+            else:
+                # Several read items, or a partial one (e.g. `allow_shape_mismatch`): seed the
+                # scratch with the current values so that uncovered regions keep them.
+                scratch = dest.dequantize()
+            entry = (dest, scratch)
+            self._stream_dequant_buffers[key] = entry
+        return narrow_tensor_by_index(entry[1], read_item.dest_offsets, read_item.lengths)
+
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
         """Restores the original FP8 tensor saved in `resolve_tensor`."""
+        key = read_item.dest_index
+        entry = self._stream_dequant_buffers.get(key)
+        if entry is not None:
+            dest, scratch = entry
+            remaining = self._stream_dequant_pending.get(key, 1) - 1
+            self._stream_dequant_pending[key] = remaining
+            if remaining <= 0:
+                # Quantize the complete destination in one shot, exactly like the
+                # `load_state_dict` copy of the upfront-dequantize path, and drop the scratch.
+                with torch.no_grad():
+                    dest.copy_(scratch)
+                del self._stream_dequant_buffers[key]
+            return super().commit_tensor(read_item, dest)
+
         if self._intermediate_read_item_and_target is not None:
             interm_read_item, target_tensor = self._intermediate_read_item_and_target
             assert (
@@ -852,10 +934,22 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False, checkpoint_name: str = None):
+    def __init__(
+        self,
+        cache_metadata: bool = False,
+        checkpoint_name: str = None,
+        stream_ckpt_dequant: bool = False,
+    ):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
         self.checkpoint_name = checkpoint_name
+        # When True, quantized destinations (TE QuantizedTensor) are quantized in place, one at a
+        # time, from a per-tensor high-precision scratch, instead of the whole state dict being
+        # dequantized before the load (see `serialization.load` and `MCoreLoadPlanner`). The
+        # loaded state dict then holds the quantized tensors themselves, so callers that need the
+        # loaded values in high precision (e.g. to initialize optimizer main params) must not
+        # enable it.
+        self.stream_ckpt_dequant = stream_ckpt_dequant
 
     def load(
         self,
@@ -899,6 +993,7 @@ class TorchDistLoadShardedStrategy:
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                stream_ckpt_dequant=self.stream_ckpt_dequant,
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
             ),

@@ -549,6 +549,98 @@ class TestFP4Param:
             mismatches
         )
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="NVFP4 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
+    @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_nvfp4_weights_only_load_stream_ckpt_dequant_is_bitwise_exact(
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size
+    ):
+        """A weights-only load (optimizer=None, as inference does) must produce the same NVFP4
+        params with --stream-ckpt-dequant as with the upfront dequantize path.
+
+        The streaming path quantizes each param in place during the distributed checkpoint
+        load instead of dequantizing the whole state dict first. Compared bitwise on the
+        element codes and on the dequantized values.
+        """
+        # TE refuses to load a pickled extra state by default. This checkpoint is created
+        # by the test and is therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
+        kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
+        Utils.initialize_distributed()
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_nvfp4_ckpt_stream_dequant", sync=True
+        ) as ckpt_dir:
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, str(ckpt_dir), **kwargs
+            )
+            self.run_train_steps(args, model, optimizer, num_steps=2)
+            force_param_sync(model, optimizer=optimizer)
+            save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
+            torch.distributed.barrier()
+
+            loaded_states = {}
+            for stream_ckpt_dequant in (False, True):
+                self.cleanup_between_runs()
+                # Build the model without loading (load=None), then load weights-only like
+                # `megatron.inference.utils.get_model_for_inference` does.
+                args = self.create_test_args(
+                    tp_size,
+                    self.seq_length,
+                    self.micro_batch_size,
+                    inference=False,
+                    fp4_param_gather=True,
+                    save=None,
+                    load=None,
+                    ckpt_format="torch_dist",
+                    async_save=False,
+                    save_tokenizer_assets=False,
+                    no_load_optim=True,
+                    stream_ckpt_dequant=stream_ckpt_dequant,
+                    **kwargs,
+                )
+                set_args(args)
+                torch.manual_seed(_SEED)
+                Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+                model_parallel_cuda_manual_seed(_SEED)
+                model, _, _ = setup_model_and_optimizer(
+                    ModelType.encoder_or_decoder, self.model_provider
+                )
+                args.load = str(ckpt_dir)
+                try:
+                    iteration, _ = load_checkpoint(model, None, None, strict=True)
+                except Exception as e:
+                    # A failure on one rank only leaves the other rank waiting in a collective
+                    # and pytest's report is never reached: print it right away.
+                    print(
+                        f"[rank {Utils.rank}] load_checkpoint(stream_ckpt_dequant="
+                        f"{stream_ckpt_dequant}) failed: {e!r}",
+                        flush=True,
+                    )
+                    raise
+                assert iteration == 2
+                loaded_states[stream_ckpt_dequant] = self.quantized_param_state(model[0])
+
+        assert len(loaded_states[True]) == 4 * args.num_layers, sorted(loaded_states[True])
+        upfront_state, stream_state = loaded_states[False], loaded_states[True]
+        assert upfront_state.keys() == stream_state.keys()
+        mismatches = []
+        for name, upfront_tensors in upfront_state.items():
+            for attr, upfront_tensor in upfront_tensors.items():
+                stream_tensor = stream_state[name][attr]
+                num_differing = int((upfront_tensor != stream_tensor).sum())
+                if num_differing:
+                    mismatches.append(
+                        f"{name}{attr}: streaming differs from upfront in "
+                        f"{num_differing}/{upfront_tensor.numel()}"
+                    )
+        if mismatches:
+            print(f"[rank {Utils.rank}] " + "\n".join(mismatches), flush=True)
+        assert not mismatches, "\n".join(mismatches)
+
 
 if __name__ == "__main__":
     # Run tests directly without pytest

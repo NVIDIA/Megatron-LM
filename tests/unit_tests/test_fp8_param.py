@@ -4,6 +4,7 @@ import contextlib
 import gc
 import os
 import sys
+import traceback
 
 import pytest
 import torch
@@ -864,3 +865,95 @@ class TestFP8Param:
         assert (
             not mismatches
         ), "quantized params changed across a checkpoint round trip:\n" + "\n".join(mismatches)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    @pytest.mark.parametrize("recipe", ["mxfp8", "tensorwise", "blockwise"])
+    def test_fp8_param_weights_only_load_stream_ckpt_dequant_is_bitwise_exact(
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe
+    ):
+        """A weights-only load (optimizer=None, as inference does) must produce the same
+        quantized params with --stream-ckpt-dequant as with the upfront dequantize path.
+
+        The streaming path quantizes each param in place during the distributed checkpoint
+        load instead of dequantizing the whole state dict first, and hands `load_state_dict`
+        the quantized param itself. Compared bitwise on the element codes and on the
+        dequantized values, which must also match the values the saving run held.
+        """
+        if recipe == "mxfp8" and get_device_arch_version() < 10:
+            pytest.skip("MXFP8 is supported since Blackwell architecture")
+        if recipe == "blockwise" and get_device_arch_version() != 9:
+            pytest.skip("blockwise is only supported on Hopper architecture")
+        # TE refuses to load a pickled extra state by default. This checkpoint is created by
+        # the test and is therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
+        kwargs = {
+            "overlap_param_gather": True,
+            "overlap_grad_reduce": True,
+            "reuse_grad_buf_for_mxfp8_param_ag": recipe == "mxfp8",
+        }
+        Utils.initialize_distributed()
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_fp8_ckpt_stream_dequant", sync=True
+        ) as ckpt_dir:
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, recipe, str(ckpt_dir), **kwargs
+            )
+            self.run_train_steps(args, model, optimizer, num_steps=2)
+            force_param_sync(model, optimizer=optimizer)
+            saved_state = self.quantized_param_state(model[0])
+            save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
+            torch.distributed.barrier()
+
+            loaded_states = {}
+            for stream_ckpt_dequant in (False, True):
+                self.cleanup_between_runs()
+                # Build the model without loading (load=None), then load weights-only like
+                # `megatron.inference.utils.get_model_for_inference` does.
+                args, model, _, _ = self.setup_checkpoint_case(
+                    tp_size,
+                    recipe,
+                    None,
+                    no_load_optim=True,
+                    stream_ckpt_dequant=stream_ckpt_dequant,
+                    **kwargs,
+                )
+                args.load = str(ckpt_dir)
+                try:
+                    iteration, _ = load_checkpoint(model, None, None, strict=True)
+                except Exception:
+                    # A failure on one rank only leaves the other rank waiting in a collective
+                    # and pytest's report is never reached: print the traceback right away.
+                    print(
+                        f"[rank {Utils.rank}] load_checkpoint(stream_ckpt_dequant="
+                        f"{stream_ckpt_dequant}) failed:\n{traceback.format_exc()}",
+                        flush=True,
+                    )
+                    raise
+                assert iteration == 2
+                loaded_states[stream_ckpt_dequant] = self.quantized_param_state(model[0])
+
+        assert len(saved_state) == 4 * args.num_layers, sorted(saved_state)
+        upfront_state, stream_state = loaded_states[False], loaded_states[True]
+        assert saved_state.keys() == upfront_state.keys() == stream_state.keys()
+        mismatches = []
+        for name, upfront_tensors in upfront_state.items():
+            for attr, upfront_tensor in upfront_tensors.items():
+                stream_tensor = stream_state[name][attr]
+                num_differing = int((upfront_tensor != stream_tensor).sum())
+                if num_differing:
+                    mismatches.append(
+                        f"{name}{attr}: streaming differs from upfront in "
+                        f"{num_differing}/{upfront_tensor.numel()}"
+                    )
+            # The BF16 checkpoint round trip preserves the values (block scales may re-encode).
+            num_differing = int(
+                (stream_state[name]["dequantized"] != saved_state[name]["dequantized"]).sum()
+            )
+            if num_differing:
+                mismatches.append(f"{name}: values differ from the saved ones in {num_differing}")
+        if mismatches:
+            print(f"[rank {Utils.rank}] " + "\n".join(mismatches), flush=True)
+        assert not mismatches, "\n".join(mismatches)
