@@ -1594,10 +1594,10 @@ def apply_dsa_param_freezing(model):
     optimizer capture ``requires_grad`` when they take the parameters, so freezing
     afterwards silently does nothing.
 
-    Called from two places, because the two model-building paths do not share code:
-    ``megatron.training.training.get_model`` (legacy) and
-    ``megatron.training.models.dist_utils.unimodal_build_distributed_models`` (the
-    GPT/Hybrid builders). Omitting the second is a silent correctness bug -- training
+    Reached from two paths, because the two model-building paths do not share code:
+    directly from ``megatron.training.training.get_model`` (legacy), and via
+    ``_dsa_param_freezing_pre_wrap_hook`` on ``model_config.pre_wrap_hooks`` for the
+    GPT/Hybrid builders. Omitting the second is a silent correctness bug -- training
     proceeds with every parameter trainable and only the loss curve reveals it.
     """
     args = get_args()
@@ -3029,6 +3029,15 @@ def _freeze_base_model_for_mtp(model_list):
     return model_list
 
 
+def _dsa_param_freezing_pre_wrap_hook(model_list):
+    """Pre-wrap hook wrapper around apply_dsa_param_freezing.
+
+    Returns the chunk list because dist_utils treats a None return as "no hook ran".
+    """
+    apply_dsa_param_freezing(model_list)
+    return model_list
+
+
 def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
     """Install the requested freeze hook before a config-built model is wrapped."""
     freeze_hook = None
@@ -3039,6 +3048,13 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
 
     if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
         model_config.pre_wrap_hooks.append(freeze_hook)
+
+    # --dsa-train-indexer-only freezing has the same ordering requirement: requires_grad
+    # is captured when DDP/the optimizer take the parameters, so it must land before the
+    # wrap. Registering it here rather than inside the builder keeps the mechanism in one
+    # place and avoids a lazy import to dodge a circular dependency.
+    if _dsa_param_freezing_pre_wrap_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(_dsa_param_freezing_pre_wrap_hook)
 
 
 def _forward_backward_grad_context(args):
