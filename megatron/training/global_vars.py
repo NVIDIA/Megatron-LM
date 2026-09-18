@@ -5,6 +5,7 @@
 import os
 import signal
 import sys
+import time
 from argparse import Namespace
 from datetime import timedelta
 
@@ -35,6 +36,7 @@ _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_TELEMETRY_HANDLE = None
+_GLOBAL_TELEMETRY_SETUP_TIMESTAMPS = (None, None)
 
 def get_args():
     """Return arguments."""
@@ -113,6 +115,11 @@ def get_telemetry():
     return _GLOBAL_TELEMETRY_HANDLE
 
 
+def get_telemetry_setup_timestamps():
+    """Return the start and end timestamps for the latest telemetry setup call."""
+    return _GLOBAL_TELEMETRY_SETUP_TIMESTAMPS
+
+
 def _shutdown_telemetry():
     """Shut down telemetry and release its published child Resource carrier."""
     global _GLOBAL_TELEMETRY_HANDLE
@@ -123,7 +130,6 @@ def _shutdown_telemetry():
             telemetry_handle.shutdown()
         except Exception:
             pass
-
 
 def _set_signal_handler(exit_signal):
 
@@ -196,7 +202,7 @@ def initialize_runtime_services(
     if build_tokenizer:
         _build_tokenizer(args)
     _set_wandb_writer(args)
-    _set_telemetry(args, include_training=training)
+    _set_telemetry_with_timestamps(args, include_training=training)
 
     if args.enable_experimental:
         set_experimental_flag(True)
@@ -438,12 +444,24 @@ def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
 
-def _set_telemetry(args, *, include_training: bool = True):
+
+def _set_telemetry(args, *, include_training: bool = False):
     """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
     global _GLOBAL_TELEMETRY_HANDLE
     from megatron.core.telemetry import telemetry as _otel
 
     _GLOBAL_TELEMETRY_HANDLE = _otel.setup(args, include_training=include_training)
+
+
+def _set_telemetry_with_timestamps(args, *, include_training: bool = False):
+    """Capture the full telemetry setup interval without emitting a separate signal."""
+    global _GLOBAL_TELEMETRY_SETUP_TIMESTAMPS
+    setup_start = time.time()
+    try:
+        _set_telemetry(args, include_training=include_training)
+    finally:
+        _GLOBAL_TELEMETRY_SETUP_TIMESTAMPS = (setup_start, time.time())
+
 
 def destroy_global_vars():
     global _GLOBAL_ARGS
