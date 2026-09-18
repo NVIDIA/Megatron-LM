@@ -10,7 +10,12 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
+from ..openai_streaming import (
+    detokenize_top_n_keys,
+    json_safe_logprobs,
+    json_safe_top_n_logprobs,
+    openai_stream,
+)
 from .common import abort_requests
 
 logger = logging.getLogger(__name__)
@@ -320,13 +325,13 @@ try:
 
                 prompt_log_probs = json_safe_logprobs(result.get('prompt_log_probs') or [])
                 prompt_top_n_logprobs = json_safe_top_n_logprobs(
-                    result.get('prompt_top_n_logprobs') or []
+                    detokenize_top_n_keys(result.get('prompt_top_n_logprobs') or [], tokenizer)
                 )
 
                 # Get generated tokens and logprobs
                 generated_tokens_list = result["generated_tokens"] or []
                 generated_top_n_logprobs = json_safe_top_n_logprobs(
-                    result.get('generated_top_n_logprobs') or []
+                    detokenize_top_n_keys(result.get('generated_top_n_logprobs') or [], tokenizer)
                 )
 
                 if echo:
