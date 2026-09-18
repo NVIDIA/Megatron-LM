@@ -921,6 +921,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
+        fp32_residual = None
         connection_state = ()
         if residual_connection is not None:
             if recompute_context is None:
@@ -938,6 +939,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     fp32_residual_connection=self.config.fp32_residual_connection,
                     branch_input_dtype=self.config.params_dtype,
                 )
+        elif self.config.fp32_residual_connection:
+            fp32_residual = hidden_states.float()
+            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
 
         self.attn_norm_manager = self.off_interface(
             self.offload_attn_norm and recompute_context is None, hidden_states, "attn_norm"
@@ -978,8 +982,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 else residual_connection.residual_stream(connection_state)
             )
 
-        if residual_connection is None and self.config.fp32_residual_connection:
-            residual = residual.float()
+        if fp32_residual is not None:
+            residual = fp32_residual
         return input_layernorm_output, residual, connection_state
 
     def _apply_self_attn_bda_step(
@@ -1210,6 +1214,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
+        fp32_residual = None
         connection_state = ()
         if residual_connection is not None:
             if recompute_context is None:
@@ -1227,6 +1232,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     fp32_residual_connection=self.config.fp32_residual_connection,
                     branch_input_dtype=self.config.params_dtype,
                 )
+        elif self.config.fp32_residual_connection:
+            fp32_residual = hidden_states.float()
+            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
 
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
             hidden_states, residual_stream_recompute_context=recompute_context
@@ -1241,8 +1249,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 else residual_connection.residual_stream(connection_state)
             )
 
-        if residual_connection is None and self.config.fp32_residual_connection:
-            residual = residual.float()
+        if fp32_residual is not None:
+            residual = fp32_residual
 
         return pre_mlp_layernorm_output, residual, connection_state
 
