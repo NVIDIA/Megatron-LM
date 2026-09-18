@@ -30,7 +30,10 @@ import numpy
 import torch
 
 from megatron.core import config
-from megatron.core._rank_utils import log_single_rank
+from megatron.core._rank_utils import (  # pylint: disable=unused-import
+    log_single_rank,
+    set_default_log_ranks,
+)
 from megatron.core.package_info import __version__ as mcore_version
 
 try:
