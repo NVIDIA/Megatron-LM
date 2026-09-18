@@ -697,6 +697,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
     ),
+    KernelEntry(
+        name="muon_newton_schulz_dispatch",
+        sources=("megatron/core/optimizer/layer_sharded_muon.py",),
+        tests=(
+            "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
+            "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
+        ),
+        kind="dispatch",
+        notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
+        "full matrices; use_syrk selects its Triton SYRK kernels (tsyrk_ex, and batched_tsyrk_ex "
+        "for 3-D chunks when ns_batch_size > 1, emerging-optimizers >= 0.5.0a0), otherwise the "
+        "GEMM / baddbmm path. The kernels live outside this repository. Bitwise coverage: "
+        "test_layer_sharded_muon.py (test_step_matches_duplicated_mode, "
+        "test_batched_matches_unbatched, test_concurrent_groups_match_serial_bitwise, "
+        "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
+        "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
+        "GEMM path; the SYRK paths are exercised only where the stack supports them.",
+    ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
         name="csa_teacher_lse",

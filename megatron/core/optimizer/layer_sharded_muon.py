@@ -274,7 +274,7 @@ class _GroupExchangePlan:
     homed: list[int]  # k -> n: routed params whose g_home is this rank, in stage-1 order
     tp_exchanges: dict[int, tuple[list[int], dict[int, int]]]  # tp_dim -> (k's, j -> t_home)
     tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
-    # a2a routing metadata per stage ('s1f', 's1b', ('s2f', pd), ('s2b', pd)), filled by
+    # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
     # the route_* helpers on the first step.
     route_plans: dict = dataclasses.field(default_factory=dict)
 
@@ -780,7 +780,7 @@ class LayerShardedMuon(TensorParallelMuon):
                         plan.g_home,
                         gtp_remat_group,
                         0,
-                        plan=route_plans.setdefault('s1f', {}),
+                        plan=route_plans.setdefault("s1f", {}),
                     )
                     # Strip the GTP alignment padding at the stage-1 seam: the stage-1
                     # output is the gtp-gathered TP-LOCAL tensor, where the pad is a
@@ -803,7 +803,7 @@ class LayerShardedMuon(TensorParallelMuon):
                             t_home,
                             tp_group,
                             pd,
-                            plan=route_plans.setdefault(('s2f', pd), {}),
+                            plan=route_plans.setdefault(("s2f", pd), {}),
                         )
                         tp_selected[pd] = (templates, my_sel)
                         for n_sel, full in zip(my_sel, fulls):
@@ -840,7 +840,7 @@ class LayerShardedMuon(TensorParallelMuon):
                         t_home,
                         tp_group,
                         pd,
-                        plan=route_plans.setdefault(('s2b', pd), {}),
+                        plan=route_plans.setdefault(("s2b", pd), {}),
                     )
                     for n, part in enumerate(parts):
                         col_updates[positions[n]] = part
@@ -864,7 +864,7 @@ class LayerShardedMuon(TensorParallelMuon):
                     plan.g_home,
                     gtp_remat_group,
                     0,
-                    plan=route_plans.setdefault('s1b', {}),
+                    plan=route_plans.setdefault("s1b", {}),
                 )
 
             # 8. Weight update on the local shard.
