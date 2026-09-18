@@ -29,7 +29,12 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
+from megatron.core.utils import (
+    deprecate_inference_params,
+    get_pg_rank,
+    is_te_min_version,
+    log_single_rank,
+)
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -1298,11 +1303,7 @@ class LLaVAModel(MegatronModule):
                     num_frames = [int(value) for value in num_frames]
                 if any(value <= 0 for value in num_frames):
                     raise ValueError("num_frames entries must be positive.")
-                expected_frames = (
-                    len(imgs_sizes) - int(dataset_has_pad_img)
-                    if imgs_sizes is not None
-                    else len(num_image_tiles)
-                )
+                expected_frames = len(imgs_sizes) - int(dataset_has_pad_img)
                 if sum(num_frames) != expected_frames:
                     raise ValueError(
                         "num_frames must partition imgs_sizes exactly: "
@@ -1350,7 +1351,10 @@ class LLaVAModel(MegatronModule):
                     num_frames=num_frames,
                     temporal_patch_size=self.temporal_patch_dim,
                     balance_by_tokens=self._balance_vision_context_parallel_by_tokens,
-                    profile_partition=self._profile_vision_context_parallel_partition,
+                    profile_partition=(
+                        self._profile_vision_context_parallel_partition
+                        and get_pg_rank(self.pg_collection.tp) == 0
+                    ),
                 )
                 if local_num_frames is not None:
                     num_frames = local_num_frames.tolist()

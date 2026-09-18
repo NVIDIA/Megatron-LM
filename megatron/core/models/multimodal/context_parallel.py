@@ -1,17 +1,20 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Multimodal Sequence Parallel (SP) and Context Parallel (CP) functionality."""
 
+import logging
 import math
 
 import torch
 
+from megatron.core._rank_utils import log_single_rank
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
-    get_tensor_model_parallel_rank,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_padding(
@@ -450,7 +453,8 @@ def split_to_context_parallel_ranks_dynamic_res(
         num_frames: Per-media frame count, required when ``temporal_patch_size > 1``.
         temporal_patch_size: Tubelet size for temporal compression.
         balance_by_tokens: Balance contiguous shards by post-compression vision tokens.
-        profile_partition: Log the selected per-rank token loads from TP=0/CP=0.
+        profile_partition: Log the selected per-rank token loads from CP=0.
+            The caller selects which TP ranks enable profiling.
 
     Returns:
         (local_t, local_imgs_sizes, local_packed_seq_params, has_padding,
@@ -607,7 +611,7 @@ def split_to_context_parallel_ranks_dynamic_res(
             split_points = [rank * seq_per_rank for rank in range(cp_size)] + [total_frames]
         local_num_frames = None
 
-    if profile_partition and cp_rank == 0 and get_tensor_model_parallel_rank() == 0:
+    if profile_partition and cp_rank == 0:
         partition_loads = _vision_cp_partition_loads(
             seqlens,
             split_points,
@@ -615,17 +619,20 @@ def split_to_context_parallel_ranks_dynamic_res(
             temporal_patch_size=temporal_patch_size,
         )
         mean_load = sum(partition_loads) / len(partition_loads)
-        # Keep this opt-in profile output visible independently of logging configuration.
-        print(  # pylint: disable=bad-builtin
+        # Preserve diagnostics for each selected DP replica, not just global rank 0.
+        global_rank = torch.distributed.get_rank()
+        log_single_rank(
+            logger,
+            logging.INFO,
             "VISION_CP_PARTITION_PROFILE "
             f"mode={'token_balanced' if balance_by_tokens else 'legacy'} "
-            f"global_rank={torch.distributed.get_rank()} "
+            f"global_rank={global_rank} "
             f"min_tokens={min(partition_loads)} "
             f"max_tokens={max(partition_loads)} "
             f"mean_tokens={mean_load:.3f} "
             f"max_over_mean={max(partition_loads) / mean_load:.6f} "
             f"loads={','.join(str(load) for load in partition_loads)}",
-            flush=True,
+            rank=global_rank,
         )
 
     seqlens_local = torch.cat([torch.tensor([0], device=seqlens.device), seqlens[lb:ub]])
