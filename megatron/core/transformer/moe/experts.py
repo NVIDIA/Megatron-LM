@@ -510,12 +510,9 @@ class TEGroupedMLP(MegatronModule):
         else:
             return False
 
-        # Check TE CuTe DSL fused kernel conditions (must match TE's
-        # fuse_grouped_mlp_ops matching logic).
-        import os
-
-        if use_glu_fusion and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-            return False
+        # TE can execute GroupedLinear -> activation -> GroupedLinear without a fused kernel.
+        # Leave CuTeDSL enablement and layout checks to TE's fusion matcher so disabling
+        # NVTE_CUTEDSL_FUSED_GROUPED_MLP does not disable the basic op-fuser path.
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
