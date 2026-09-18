@@ -331,8 +331,7 @@ def test_dispatch_gating_and_fallback():
 def _attach_late_fsdp_overwrite(compressor, *, strategy, fine_grained):
     """Mark FSDP wrapping without setting overwrite_main_grad until linear.forward."""
     fsdp = SimpleNamespace(
-        data_parallel_sharding_strategy=strategy,
-        enable_fine_grained_param_gather_hook=fine_grained,
+        data_parallel_sharding_strategy=strategy, enable_fine_grained_param_gather_hook=fine_grained
     )
     for linear in (compressor.linear_wkv, compressor.linear_wgate):
         linear.weight._megatron_fsdp_model = fsdp
@@ -532,12 +531,7 @@ class TestCompressorFusedIntegration:
 
     @pytest.mark.parametrize(
         "fallback",
-        [
-            "delay_wgrad_compute",
-            "overwrite_main_grad",
-            "fsdp_optim_grads",
-            "fsdp_fine_grained",
-        ],
+        ["delay_wgrad_compute", "overwrite_main_grad", "fsdp_optim_grads", "fsdp_fine_grained"],
     )
     @pytest.mark.parametrize("shared_input", [False, True])
     def test_cp_preserves_single_projection_contract(self, fallback, shared_input):
@@ -601,16 +595,14 @@ class TestCompressorFusedIntegration:
         """no_shard never overwrites main_grad, even with fine-grained hooks enabled."""
         compressor = self._make_compressor()
         fsdp = SimpleNamespace(
-            data_parallel_sharding_strategy="no_shard",
-            enable_fine_grained_param_gather_hook=True,
+            data_parallel_sharding_strategy="no_shard", enable_fine_grained_param_gather_hook=True
         )
         for linear in (compressor.linear_wkv, compressor.linear_wgate):
             linear.weight._megatron_fsdp_model = fsdp
         assert not compressor._cp_requires_single_projection()
 
     @pytest.mark.parametrize(
-        "strategy,fine_grained",
-        [("optim_grads", False), ("optim_grads_params", True)],
+        "strategy,fine_grained", [("optim_grads", False), ("optim_grads_params", True)]
     )
     def test_cp_fsdp_late_overwrite_first_microbatch_wgrad(self, strategy, fine_grained):
         """First FSDP fwd/bwd keeps halo wgrad when overwrite_main_grad is late."""
@@ -656,9 +648,7 @@ class TestCompressorFusedIntegration:
                     out, _ = module._forward_thd_cp(x, boundary, cu, layout, 2048)
                 else:
                     compact, group_ids, positions, local_cu, local_cuc, _, _ = (
-                        cp_utils.prepare_cp_compressor_input(
-                            x, boundary, cu, start, cp_size, ratio
-                        )
+                        cp_utils.prepare_cp_compressor_input(x, boundary, cu, start, cp_size, ratio)
                     )
                     out, _ = module._forward_thd(
                         compact,
