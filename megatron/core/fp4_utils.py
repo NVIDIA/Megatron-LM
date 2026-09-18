@@ -8,9 +8,11 @@ import torch
 
 from megatron.core.enums import Fp4Recipe
 from megatron.core.fp8_utils import (
+    _fp8_autocast_with_calibration_config,
     _get_custom_recipe,
     _get_grouped_quantized_recipe,
     _unwrap_parameter_data,
+    get_te_calibration_config,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -238,10 +240,8 @@ if HAVE_TE:
                     "Please make sure you are using a compatible TE version >= 2.7.0.dev0."
                 )
         else:
-            raise ValueError(
-                """FP4 support requires TransformerEngine version >= 2.7.0.dev0 
-                for NVFP4BlockScaling."""
-            )
+            raise ValueError("""FP4 support requires TransformerEngine version >= 2.7.0.dev0 
+                for NVFP4BlockScaling.""")
         return fp4_recipe
 
     def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
@@ -263,6 +263,7 @@ if HAVE_TE:
             fp4_context = nullcontext()
         else:
             fp4_recipe = get_fp4_recipe(config)
+            calibration_config = None if is_init else get_te_calibration_config(config)
             fp4_group = None
             if parallel_state.model_parallel_is_initialized():
                 fp4_group = parallel_state.get_amax_reduction_group(
@@ -271,8 +272,11 @@ if HAVE_TE:
 
             if not is_init:
                 # TE currently uses fp8_autocast for fp8 and fp4 quantization.
-                fp4_context = transformer_engine.pytorch.fp8_autocast(
-                    enabled=True, fp8_recipe=fp4_recipe, fp8_group=fp4_group
+                context_args = {"enabled": True, "fp8_recipe": fp4_recipe, "fp8_group": fp4_group}
+                fp4_context = _fp8_autocast_with_calibration_config(
+                    transformer_engine.pytorch.fp8_autocast,
+                    calibration_config=calibration_config,
+                    **context_args,
                 )
             else:
                 import inspect
