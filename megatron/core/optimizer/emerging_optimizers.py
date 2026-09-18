@@ -768,10 +768,10 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     kwargs.update(_kwargs_from_config(cls, "muon", config))
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
     # delegated (empty-homes fallback) path runs the bitwise reference mode instead.
-    kwargs['tp_mode'] = 'duplicated'
+    kwargs["tp_mode"] = "duplicated"
     # No config attr for these: the (gtp_remat, tp) axes come from the collection.
-    kwargs['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None)
-    kwargs['tp_group'] = getattr(pg_collection, 'tp', None)
+    kwargs["gtp_remat_group"] = getattr(pg_collection, "gtp_remat", None)
+    kwargs["tp_group"] = getattr(pg_collection, "tp", None)
     return kwargs
 
 

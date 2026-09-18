@@ -115,10 +115,10 @@ def route_to_ns_home(
             output_split_sizes=[my_param_numel] * size,
             param_offsets=param_offsets,
         )
-    send_idx = plan['send_idx']
-    my_param_indices = plan['my_param_indices']
-    my_param_numel = plan['my_param_numel']
-    param_offsets = plan['param_offsets']
+    send_idx = plan["send_idx"]
+    my_param_indices = plan["my_param_indices"]
+    my_param_numel = plan["my_param_numel"]
+    param_offsets = plan["param_offsets"]
 
     # Build flat send buffer: [data_for_rank_0 | data_for_rank_1 | ...]
     # For each destination r', send my momentum shards for params assigned to r'
@@ -135,8 +135,8 @@ def route_to_ns_home(
     torch.distributed.all_to_all_single(
         recv_buf,
         send_buf,
-        output_split_sizes=plan['output_split_sizes'],
-        input_split_sizes=plan['input_split_sizes'],
+        output_split_sizes=plan["output_split_sizes"],
+        input_split_sizes=plan["input_split_sizes"],
         group=group,
     )
 
@@ -232,8 +232,8 @@ def route_from_ns_home(
                 sum(momentum_list[i].numel() for i in send_idx[r]) for r in range(size)
             ],
         )
-    send_idx = plan['send_idx']
-    output_split_sizes = plan['output_split_sizes']
+    send_idx = plan["send_idx"]
+    output_split_sizes = plan["output_split_sizes"]
 
     # Build send buffer: for each destination r', send that rank's shard of
     # each of MY ns_results. Shard size is per-param (heterogeneous shapes).
@@ -263,7 +263,7 @@ def route_from_ns_home(
         recv_buf,
         send_buf,
         output_split_sizes=output_split_sizes,
-        input_split_sizes=plan['input_split_sizes'],
+        input_split_sizes=plan["input_split_sizes"],
         group=group,
     )
 
