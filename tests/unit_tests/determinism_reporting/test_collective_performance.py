@@ -180,11 +180,25 @@ def rank_results(adapter, captures, settings, mode="det", revision="a" * 40):
             "context_after": adapter.mode_context(report["context"], mode, revision),
             "capture_manifest_sha256": settings["manifest_sha256"][rank],
             "tooling": settings["tooling"],
+            "communicators": {
+                adapter.group_key(event["signature"]["configuration"]["collective"]): {
+                    "requested": copy.deepcopy(
+                        event["signature"]["configuration"]["collective"]["group_options"]
+                    ),
+                    "before_initialize": copy.deepcopy(
+                        event["signature"]["configuration"]["collective"]["group_options"]
+                    ),
+                    "after_initialize": adapter.resolved_options(
+                        event["signature"]["configuration"]["collective"]
+                    ),
+                }
+                for event in report["events"]
+            },
             "rows": {
                 str(index): {
                     "capture_signature": copy.deepcopy(event["signature"]),
-                    "actual_signature": adapter.mode_signature(event["signature"], mode),
-                    "signature_after": adapter.mode_signature(event["signature"], mode),
+                    "actual_signature": adapter.timing_signature(event["signature"], mode),
+                    "signature_after": adapter.timing_signature(event["signature"], mode),
                     "phase": "backward" if index else "forward",
                     "samples_ms": [10, 1, 1] if rank == 0 else [1, 10, 1],
                 }
@@ -216,6 +230,79 @@ def test_group_samples_use_aligned_maxima_not_rank_medians(adapter):
     )
     with pytest.raises(ValueError):
         adapter.comparisons(runs[:-1], settings, True, None, None)
+
+
+@pytest.mark.parametrize("nonblocking,effective", [(None, 1), ("0", 1), ("1", 0)])
+def test_lazy_blocking_resolution_keeps_requested_and_effective_options(
+    adapter, nonblocking, effective
+):
+    captures, settings = capture_records(), measurement()
+    for capture in captures:
+        for event in capture["events"]:
+            collective = event["signature"]["configuration"]["collective"]
+            collective["group_options"]["config"]["blocking"] = -(2**31)
+            collective["nccl_environment"]["TORCH_NCCL_USE_COMM_NONBLOCKING"] = nonblocking
+    original = copy.deepcopy(captures)
+    results = rank_results(adapter, captures, settings)
+    adapter.aggregate_arm(results, captures, settings, "det", "a" * 40)
+    assert captures == original
+    for result in results:
+        for record in result["communicators"].values():
+            assert record["requested"]["config"]["blocking"] == -(2**31)
+            assert record["after_initialize"]["config"]["blocking"] == effective
+            assert record["after_initialize"]["config"]["min_ctas"] == 2
+        assert (
+            result["rows"]["0"]["actual_signature"]["configuration"]["collective"]["group_options"][
+                "config"
+            ]["blocking"]
+            == effective
+        )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "priority",
+        "cta",
+        "blocking",
+        "flags",
+        "before",
+        "requested",
+        "unknown_environment",
+    ],
+)
+def test_communicator_initialization_cannot_hide_option_drift(adapter, fault):
+    captures, settings = capture_records(), measurement()
+    for capture in captures:
+        for event in capture["events"]:
+            collective = event["signature"]["configuration"]["collective"]
+            collective["group_options"]["config"]["blocking"] = -(2**31)
+    if fault == "unknown_environment":
+        captures[0]["events"][0]["signature"]["configuration"]["collective"]["nccl_environment"][
+            "TORCH_NCCL_USE_COMM_NONBLOCKING"
+        ] = "unknown"
+        with pytest.raises(ValueError):
+            rank_results(adapter, captures, settings)
+        return
+    results = rank_results(adapter, captures, settings)
+    record = next(iter(results[0]["communicators"].values()))
+    if fault == "missing":
+        results[0]["communicators"] = {}
+    elif fault == "priority":
+        record["after_initialize"]["is_high_priority_stream"] = False
+    elif fault == "cta":
+        record["after_initialize"]["config"]["min_ctas"] = 3
+    elif fault == "blocking":
+        record["after_initialize"]["config"]["blocking"] = 0
+    elif fault == "flags":
+        record["after_initialize"]["flags"] = {"changed": True}
+    elif fault == "before":
+        record["before_initialize"]["config"]["min_ctas"] = 3
+    elif fault == "requested":
+        record["requested"]["config"]["blocking"] = 1
+    with pytest.raises(ValueError):
+        adapter.aggregate_arm(results, captures, settings, "det", "a" * 40)
 
 
 @pytest.mark.parametrize(

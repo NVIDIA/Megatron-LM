@@ -352,6 +352,14 @@ helpers run both sources; production mapping imports are checked against the
 selected checkout. Matching correctness evidence applies to deterministic head
 execution, not to default or baseline accuracy.
 
+Each communicator is initialized with a group barrier before operator warmup.
+The report retains requested options and the actual settings before and after
+initialization. PyTorch resolves NCCL's undefined `blocking` field to `0` or `1`
+according to the explicit configuration/environment; only that declared
+resolution is accepted. Stream priority, CTA limits and every other option stay
+exact. Measured signatures record the resolved settings alongside the original
+capture signature. See [ProcessGroupNCCL initialization](https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp).
+
 Rank alignment barriers, input restoration, graph setup and warmup are excluded
 from CUDA-event intervals. These direct synchronous c10d mappings join NCCL
 completion to the calling stream, so its end event includes completion; see

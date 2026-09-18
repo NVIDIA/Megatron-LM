@@ -144,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_bytes": args.max_bytes,
             "timing": "cuda_event_ms",
             "aggregation": "per_sample_group_max",
+            "communicator_initialization": "group_barrier_before_operator_warmup",
             "manifest_sha256": [
                 digest(capture_root / f"rank-{rank}/manifest.json") for rank in range(len(captures))
             ],

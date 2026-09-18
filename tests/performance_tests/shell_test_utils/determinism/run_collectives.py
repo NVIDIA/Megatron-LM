@@ -16,9 +16,10 @@ from collective_case import (
     ADAPTER,
     configure_policy,
     digest,
+    group_key,
     install_head_helpers,
     mode_context,
-    mode_signature,
+    timing_signature,
 )
 
 
@@ -106,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     from tools.determinism.collective_capture import (
         load_captures,
         prepare_replay,
+        process_group_options,
         restore_group_options,
     )
 
@@ -120,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
     first = captures[rank]["events"][measurement["event_indices"][0]]["signature"]
     configure_policy(head, first["runtime"], mode)
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    mappings = importlib.import_module("megatron.core.tensor_parallel.mappings")
+    if (
+        not mappings.__file__
+        or Path(mappings.__file__).resolve()
+        != Path.cwd() / "megatron/core/tensor_parallel/mappings.py"
+    ):
+        raise ValueError("Mapping was imported from a different production checkout")
     torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=5))
     groups = {}
     try:
@@ -132,9 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         for capture in captures:
             for index in measurement["event_indices"]:
                 collective = capture["events"][index]["signature"]["configuration"]["collective"]
-                key = json.dumps(
-                    [collective["group_ranks"], collective["group_options"]], sort_keys=True
-                )
+                key = group_key(collective)
                 specifications[key] = collective
         for key, collective in sorted(specifications.items()):
             group = torch.distributed.new_group(
@@ -145,6 +152,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             if rank in collective["group_ranks"]:
                 groups[key] = group
+        communicators = {}
+        for key, group in groups.items():
+            requested = specifications[key]["group_options"]
+            before = process_group_options(group, torch.device("cuda", torch.cuda.current_device()))
+            # Resolve lazy communicator initialization outside operator warmup
+            # and timing. The captured requested options remain unchanged.
+            torch.distributed.barrier(group=group)
+            torch.cuda.synchronize()
+            communicators[key] = {
+                "requested": requested,
+                "before_initialize": before,
+                "after_initialize": process_group_options(
+                    group, torch.device("cuda", torch.cuda.current_device())
+                ),
+            }
+        torch.distributed.barrier()
         result: dict = {
             "adapter": ADAPTER,
             "rank": rank,
@@ -153,15 +176,14 @@ def main(argv: list[str] | None = None) -> int:
             "context": context,
             "rows": {},
             "tooling": measurement["tooling"],
+            "communicators": communicators,
             "capture_manifest_sha256": digest(capture_root / f"rank-{rank}" / "manifest.json"),
         }
         for index in measurement["event_indices"]:
             event = captures[rank]["events"][index]
-            signature = mode_signature(event["signature"], mode)
+            signature = timing_signature(event["signature"], mode)
             collective = signature["configuration"]["collective"]
-            key = json.dumps(
-                [collective["group_ranks"], collective["group_options"]], sort_keys=True
-            )
+            key = group_key(event["signature"]["configuration"]["collective"])
             group = groups[key]
             prepared, error = None, None
             try:
@@ -171,13 +193,6 @@ def main(argv: list[str] | None = None) -> int:
                     group,
                     max_bytes=measurement["max_bytes"],
                 )
-                mappings = importlib.import_module("megatron.core.tensor_parallel.mappings")
-                if (
-                    not mappings.__file__
-                    or Path(mappings.__file__).resolve()
-                    != Path.cwd() / "megatron/core/tensor_parallel/mappings.py"
-                ):
-                    raise ValueError("Mapping was imported from a different production checkout")
             except (ValueError, RuntimeError, OSError) as caught:
                 error = f"{type(caught).__name__}: {caught}"
             _exchange_error(torch, error, world)

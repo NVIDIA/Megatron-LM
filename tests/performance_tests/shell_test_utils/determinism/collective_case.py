@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import json
 import math
 import statistics
 import sys
@@ -16,6 +17,28 @@ from benchmark import DEFAULT_ENV, MODE_ENV, summarize
 
 ADAPTER = "captured_collective_v1"
 VERIFIED = "verified_deterministic"
+NCCL_UNDEFINED_INT = -(2**31)
+
+
+def group_key(collective: dict) -> str:
+    """Retain the captured requested options as the communicator identity."""
+    return json.dumps([collective["group_ranks"], collective["group_options"]], sort_keys=True)
+
+
+def resolved_options(collective: dict) -> dict:
+    """Account for c10d's explicit lazy resolution of NCCL config.blocking.
+
+    ProcessGroupNCCL::initNCCLComm writes 0/1 into this previously undefined
+    field. Keep all other fields exact; both requested and observed options
+    are retained in each rank report. Unknown environment spellings fail.
+    """
+    options = copy.deepcopy(collective["group_options"])
+    if options["config"].get("blocking") == NCCL_UNDEFINED_INT:
+        nonblocking = collective["nccl_environment"].get("TORCH_NCCL_USE_COMM_NONBLOCKING")
+        if nonblocking not in (None, "0", "1"):
+            raise ValueError("Unsupported NCCL nonblocking environment setting")
+        options["config"]["blocking"] = 0 if nonblocking == "1" else 1
+    return options
 
 
 def digest(path: Path) -> str:
@@ -90,6 +113,14 @@ def mode_context(context: dict, mode: str, revision: str) -> dict:
         for key in MODE_ENV:
             if key != "TRITON_CACHE_AUTOTUNING" and key in result["environment"]:
                 result["environment"][key] = DEFAULT_ENV.get(key)
+    return result
+
+
+def timing_signature(signature: dict, mode: str) -> dict:
+    """Describe the steady-state communicator after explicit initialization."""
+    result = mode_signature(signature, mode)
+    collective = result["configuration"]["collective"]
+    collective["group_options"] = resolved_options(collective)
     return result
 
 
@@ -223,10 +254,26 @@ def validate_rank(
         or set(result.get("rows", {})) != {str(index) for index in measurement["event_indices"]}
     ):
         raise ValueError("Timing rank has different measurement/source/environment/tooling")
+    communicators = {}
+    for index in measurement["event_indices"]:
+        collective = capture["events"][index]["signature"]["configuration"]["collective"]
+        requested = collective["group_options"]
+        effective = resolved_options(collective)
+        communicators[group_key(collective)] = (requested, effective)
+    if set(result.get("communicators", {})) != set(communicators):
+        raise ValueError("Missing communicator initialization records")
+    for key, (requested, effective) in communicators.items():
+        observed = result["communicators"][key]
+        if (
+            observed.get("requested") != requested
+            or observed.get("before_initialize") not in (requested, effective)
+            or observed.get("after_initialize") != effective
+        ):
+            raise ValueError("NCCL options changed beyond declared blocking resolution")
     for index in measurement["event_indices"]:
         row = result["rows"][str(index)]
         signature = capture["events"][index]["signature"]
-        expected = mode_signature(signature, mode)
+        expected = timing_signature(signature, mode)
         samples = row.get("samples_ms")
         if (
             row.get("capture_signature") != signature
