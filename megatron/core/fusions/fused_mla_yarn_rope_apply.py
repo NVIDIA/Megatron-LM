@@ -28,8 +28,13 @@ if not HAVE_TRITON:
     tl = MagicMock()
 
 
-def _capture_vmm_output(reference: torch.Tensor, shape) -> Optional[torch.Tensor]:
-    """Allocate a two-domain VMM output only while capturing the MLPerf graph."""
+_VMM_SCRATCH_BUFFERS = {}
+
+
+def _capture_vmm_output(
+    reference: torch.Tensor, shape, slot: str = "default"
+) -> Optional[torch.Tensor]:
+    """Return reusable VMM scratch storage for serialized MLA layer graphs."""
     if (
         os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") != "1"
         or len(shape) != 4
@@ -37,20 +42,44 @@ def _capture_vmm_output(reference: torch.Tensor, shape) -> Optional[torch.Tensor
         or shape[0] % 256 != 0
     ):
         return None
-    # Build green contexts during eager warmup. Context creation is not part of
-    # stream capture, while the VMM buffers themselves must have graph-stable VAs.
     from transformer_engine.pytorch.tensor.localized_mxfp8 import _get_localization_context
 
     device_index = reference.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
     _get_localization_context(device_index)
-    if not torch.cuda.is_current_stream_capturing():
-        return None
+    if hasattr(reference, "_nvte_vmm_allocator") and tuple(reference.shape) == tuple(shape):
+        return reference
+
     from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
 
-    allocator = VMMRowSplitAllocator(reference.device)
-    return allocator.allocate(tuple(shape), reference.dtype)
+    key = (device_index, slot, tuple(shape), reference.dtype)
+    root = _VMM_SCRATCH_BUFFERS.get(key)
+    if root is None:
+        allocator = VMMRowSplitAllocator(reference.device)
+        root = allocator.allocate(tuple(shape), reference.dtype)
+        _VMM_SCRATCH_BUFFERS[key] = root
+    if not torch.cuda.is_current_stream_capturing():
+        return None
+
+    # Each invocation gets independent autograd metadata while all serialized
+    # layer graphs use one graph-stable physical allocation for this role.
+    output = torch.empty(0, dtype=root.dtype, device=root.device)
+    output.set_(root.untyped_storage(), 0, tuple(shape), root.stride())
+    output = output.detach()
+    output._nvte_vmm_allocator = root._nvte_vmm_allocator
+    return output
+
+
+def clear_mla_vmm_scratch_buffers() -> None:
+    """Release scratch storage after every CUDA graph using it is reset."""
+    allocators = {
+        id(tensor._nvte_vmm_allocator): tensor._nvte_vmm_allocator
+        for tensor in _VMM_SCRATCH_BUFFERS.values()
+    }
+    for allocator in allocators.values():
+        allocator.close()
+    _VMM_SCRATCH_BUFFERS.clear()
 
 
 def _localization_streams(tensor: torch.Tensor):
@@ -508,9 +537,10 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         localization_streams = None
         if ctx.cu_seqlens_q is None:
             max_seqlen, batch_size, nheads, headdim = grad.shape
-            grad_root = _capture_vmm_output(grad, grad.shape)
+            grad_root = _capture_vmm_output(grad, grad.shape, "q_backward")
             if grad_root is not None:
-                grad_root.copy_(grad)
+                if grad_root.data_ptr() != grad.data_ptr():
+                    grad_root.copy_(grad)
                 grad = grad_root
                 if batch_size == 1:
                     localization_streams = _localization_streams(grad_root)
@@ -1203,6 +1233,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
                     nheads,
                     ctx.k_dim + ctx.v_dim,
                 ),
+                "kv_backward",
             )
             dk = dk.contiguous().view(-1, nheads, ctx.emb_dim + ctx.k_dim)
             dv = dv.contiguous().view(-1, nheads, ctx.v_dim)
@@ -1398,12 +1429,13 @@ def fused_apply_mla_rope_for_q(
     :func:`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
     its original mutation behavior and does not add a clone to the hot path.
     """
-    localized_q = _capture_vmm_output(t, t.shape)
+    localized_q = _capture_vmm_output(t, t.shape, "q_forward")
     if localized_q is not None:
         # The profiled Q kernel is in-place. Preserve its API while moving the
         # producer output into VMM; replacing this copy with Q-up GEMM out=
         # support is the next optimization step.
-        localized_q.copy_(t)
+        if localized_q.data_ptr() != t.data_ptr():
+            localized_q.copy_(t)
         t = localized_q
     return fused_mla_rope_inplace(
         t,
@@ -1437,12 +1469,11 @@ def fused_apply_mla_rope_for_kv(
     if out_key is None and out_value is None and cu_seqlens_kv is None and kv.ndim == 4:
         seqlen, batch_size, nheads, _ = kv.shape
         out_key = _capture_vmm_output(
-            kv, (seqlen, batch_size, nheads, emb_dim + k_dim)
+            kv, (seqlen, batch_size, nheads, emb_dim + k_dim), "key_forward"
         )
-        if out_key is not None:
-            out_value = _capture_vmm_output(
-                kv, (seqlen, batch_size, nheads, v_dim)
-            )
+        out_value = _capture_vmm_output(
+            kv, (seqlen, batch_size, nheads, v_dim), "value_forward"
+        )
     return fused_mla_rope_kv_split(
         kv,
         k_pos_emb,

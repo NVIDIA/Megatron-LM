@@ -523,6 +523,39 @@ class TestFusedMLARope:
 @pytest.mark.experimental
 @pytest.mark.internal
 @pytest.mark.skipif(not _localization_available(), reason="CUDA localization is unavailable")
+def test_mla_vmm_scratch_reused_across_graph_captures():
+    """Serialized graph captures reuse one physical VMM buffer per role."""
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        _VMM_SCRATCH_BUFFERS,
+        _capture_vmm_output,
+        clear_mla_vmm_scratch_buffers,
+    )
+
+    reference = torch.empty((256, 1, 32, 256), dtype=torch.bfloat16, device="cuda")
+    captured = []
+
+    def use_scratch():
+        output = _capture_vmm_output(reference, reference.shape, "reuse_test")
+        if output is not None:
+            captured.append(output)
+            output.zero_()
+
+    graphs = []
+    try:
+        graphs.append(_capture_cuda_graph(use_scratch))
+        graphs.append(_capture_cuda_graph(use_scratch))
+        assert len(_VMM_SCRATCH_BUFFERS) == 1
+        assert len(captured) == 2
+        assert captured[0].data_ptr() == captured[1].data_ptr()
+    finally:
+        for graph in graphs:
+            graph.reset()
+        clear_mla_vmm_scratch_buffers()
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not _localization_available(), reason="CUDA localization is unavailable")
 @pytest.mark.skipif(
     os.getenv("RUN_BENCHMARK_TESTS") != "1",
     reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
