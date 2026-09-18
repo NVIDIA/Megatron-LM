@@ -75,6 +75,7 @@ def test_parser_uses_mimo_prefixed_destinations():
         "mimo_llm_only": True,
         "mimo_encoder_ddp_overlap": True,
         "mimo_run_input_projections_on_llm_ranks": False,
+        "mimo_bridge_skip_shape_exchange": False,
     }
 
 
@@ -172,6 +173,11 @@ def test_parser_does_not_expose_unsupported_grid_knobs():
 def test_parser_exposes_llm_rank_input_projection_flag():
     args = _parse(["--mimo-run-input-projections-on-llm-ranks"])
     assert args.mimo_run_input_projections_on_llm_ranks
+
+
+def test_parser_exposes_bridge_shape_exchange_opt_in():
+    assert not _parse([]).mimo_bridge_skip_shape_exchange
+    assert _parse(["--mimo-bridge-skip-shape-exchange"]).mimo_bridge_skip_shape_exchange
 
 
 def test_llm_cp_must_be_one():
