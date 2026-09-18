@@ -191,6 +191,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             combined_embeddings[image_positions] = flat_image_embeddings[image_indices]
 
         decoder_input = combined_embeddings.transpose(0, 1).contiguous()
+
         if model.sequence_parallel_lm:
             decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
                 decoder_input, group=model.pg_collection.tp

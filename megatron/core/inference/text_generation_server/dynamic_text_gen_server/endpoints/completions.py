@@ -389,6 +389,14 @@ try:
                 "generation_log_probs": generated_log_probs,
             }
 
+            # Speculative decoding (e.g. MTP): per-engine-step emitted token counts, summing to
+            # the generated token count. Empty/None when spec decoding is off. `ttft` is the real
+            # time-to-first-token in seconds; `tpot` is a SPARSE per-token step-time sample (only
+            # populated on logging steps), so a dense TPOT must come from ttft + total latency.
+            choice_data["acceptance_step_lengths"] = result.get("acceptance_step_lengths")
+            choice_data["ttft"] = result.get("ttft")
+            choice_data["tpot"] = result.get("tpot")
+
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (

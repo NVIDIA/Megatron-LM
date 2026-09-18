@@ -16,19 +16,12 @@ metadata:
 For PR-label or trigger questions, lead with the exact values:
 
 - No label: `scope=mr-github-slim`, `n_repeat=2`, `lightweight=false`.
-- `Run tests`: `scope=mr-github`, `n_repeat=1`, `lightweight=true`.
-- `Run functional tests`: `scope=mr-github`, `n_repeat=5`, `lightweight=false`.
 - `container::lts` only switches the container image path to LTS and combines
   with any scope label. **Opt-in only — attach it solely when the user
   explicitly asks for LTS validation; never add it on your own initiative, even
   for a container or dependency change.**
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
 - `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite.
-- `Run selective unit tests` requests Testmon-based unit-test selection for an
-  eligible synthetic PR push. It restores a compatible shared baseline from
-  `main`; PRs never record or save Testmon databases. A missing or invalid cache
-  or selection failure runs the full bucket. `populate-build-cache.yml` records
-  fresh baselines every six hours and supports manual dispatch from `main`.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
   `pull-request/<branch>`. Always run with `--dry-run` first and confirm the
@@ -74,8 +67,6 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | Condition | `scope` | `n_repeat` | `lightweight` | Notes |
 |-----------|---------|-----------|---------------|-------|
 | Merge group | `mr-github` | 1 | false | Automatic, no label needed |
-| Label: **`Run tests`** | `mr-github` | 1 | **true** | Trains 4 steps, no golden-value compare |
-| Label: **`Run functional tests`** | `mr-github` | 5 | **false** | Trains 100 steps, golden-value compare |
 | _(no label)_ | `mr-github-slim` | 2 | false | Slim subset only |
 
 **Orthogonal image label:**
@@ -85,7 +76,6 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
 | **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite |
-| **`Run selective unit tests`** | Restore a compatible shared main baseline and select unit tests. Missing/incompatible caches, full-test labels, forced runs, LTS, and merge queue validation use the full unit-test path. PRs never generate or save a baseline. |
 
 Adding a label does not itself start `cicd-main.yml`; apply it before the next
 synthetic PR push or rerun the workflow after applying it.
@@ -96,12 +86,6 @@ synthetic PR push or rerun the workflow after applying it.
 |----------------------------------|-----------------|
 | Docs only (`docs/`, `*.md`, docstrings) | _(none)_ |
 | CI/tooling only (`.github/`, `tools/`, `Makefile`) | _(none)_ |
-| Test files only (`tests/`) — existing tests, no new golden values | `Run tests` |
-| **New test cases added** (no golden values exist yet) | `Run functional tests` |
-| **Re-enabling a disabled test** (scope `-broken` → active) | `Run functional tests` |
-| Non-numerical library code (logging, error handling, CLI flags, refactors) | `Run tests` |
-| Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
-| Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` (add `container::lts` **only if the user explicitly asks** to validate LTS) |
 | Touches MBridge integration | add `Run MBridge tests` |
 | Could affect NeMo RL's Megatron integration | add `Run NeMoRL tests` |
 

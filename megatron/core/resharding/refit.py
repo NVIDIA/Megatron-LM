@@ -15,7 +15,6 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
-    _should_quantize_param,
     quantize_params_to_mxfp8,
     resolve_mxfp8_backend,
 )
@@ -298,11 +297,11 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
 
     If the *target_model* uses an inference-optimized layer spec with MXFP8,
     this function:
-      1. Computes which params are eligible for MXFP8 conversion.
-      2. Quantizes the target model's decoder weights to MXFP8Tensor
+      1. Quantizes eligible target decoder weights to MXFP8Tensor
          (creating persistent buffers whose addresses are later captured by
          CUDA graphs).
-      3. Builds an ``MXFP8ReshardTransform`` and attaches it to ``plan.transform``.
+      2. Derives the converted parameter set from those buffers.
+      3. Attaches an ``MXFP8ReshardTransform`` to ``plan.transform``.
 
     Idempotent: skips re-setup if ``plan.transform`` is already populated.
     """
@@ -316,19 +315,15 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     core = unwrap_model(lm)
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
-    # 1. Compute which parameters are eligible for MXFP8 conversion.
-    #    Must be done while params are still visible as nn.Parameter (BF16).
-    convertible: set[str] = set()
-    for name, param in decoder.named_parameters():
-        if _should_quantize_param(param):
-            convertible.add(f"decoder.{name}")
-
-    # 2. Quantize decoder weights -> persistent MXFP8Tensor buffers.
+    # 1. Quantize selected decoder weights -> persistent MXFP8Tensor buffers.
     # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
     # representation. The reshard transform updates those canonical buffers, then
     # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
     backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
     persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
+
+    # 2. Derive the transform set from the buffers that were actually quantized.
+    convertible = {f"decoder.{name}" for name in persistent_buffers}
 
     # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(
@@ -357,9 +352,9 @@ def prepare_swap_model_weights(
     If the target_model uses an inference-optimized layer spec with MXFP8
     (config.transformer_impl == 'inference_optimized' and
     config.fp8 is not None and config.fp8_recipe == 'mxfp8'), this function also:
-      - computes which parameters are eligible for MXFP8 conversion,
-      - quantizes the target decoder weights to persistent MXFP8Tensor buffers
+      - quantizes eligible target decoder weights to persistent MXFP8Tensor buffers
         (whose addresses are later baked into CUDA graphs),
+      - derives the converted parameter set from those buffers,
       - creates an MXFP8ReshardTransform that subsequent
         swap_model_weights calls use automatically.
 
