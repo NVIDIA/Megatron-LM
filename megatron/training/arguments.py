@@ -2850,7 +2850,7 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the symmetric-output '
                        'Newton-Schulz GEMMs in Muon (~1/3 off '
-                       'NS FLOPs for near-square matrices). Requires '
+                       'NS FLOPs for near-square matrices). Takes effect only with '
                        '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
                        'layer_sharded, unmet Triton/SM/emerging-optimizers '
                        'requirements are rejected at startup.')
