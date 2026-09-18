@@ -154,6 +154,7 @@ def _build_grid(
         create_pg(["pp"], "pp")
         create_pg(["dp"], "dp")
         create_pg(["dp", "cp"], "dp_cp")
+        create_pg(["gtp_remat", "dp"], "gtp_remat_dp")
         create_pg(["cp", "gtp_remat", "dp"], "gtp_remat_dp_cp")
         create_pg(["tp", "cp"], "tp_cp")
         create_pg(["tp", "gtp_remat", "pp"], "mp")
@@ -234,6 +235,7 @@ def pg_collection_from_grid(
     pgc.cp = grid.get_pg("cp")
     pgc.pp = grid.get_pg("pp")
     pgc.dp = grid.get_pg("dp")
+    pgc.dp_gtp_remat = grid.get_pg(["gtp_remat", "dp"])
     pgc.dp_cp = grid.get_pg(["dp", "cp"])
     pgc.dp_cp_gtp_remat = grid.get_pg(["cp", "gtp_remat", "dp"])
     pgc.intra_dp_cp = pgc.dp_cp

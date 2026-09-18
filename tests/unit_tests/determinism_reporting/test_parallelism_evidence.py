@@ -212,6 +212,68 @@ def definitions(path, names, namespace):
     return namespace
 
 
+def test_quantized_model_declaration_does_not_include_parameter_update_replay(
+    pytester, monkeypatch
+):
+    """Collect the real decorators; CPU placeholders do not validate GPU execution."""
+    path = ROOT / "tests/unit_tests/determinism/correctness/test_fp8_determinism.py"
+    tree = ast.parse(path.read_text())
+    nodes = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_QUANT_RECIPES"
+                for target in node.targets
+            )
+        )
+        or isinstance(node, ast.ClassDef)
+        and node.name == "TestQuantizationDeterminism"
+    ]
+    for node in nodes:
+        if isinstance(node, ast.ClassDef):
+            for method in node.body:
+                if isinstance(method, ast.FunctionDef):
+                    method.body = [ast.Pass()]
+    source = "import pytest\n_IS_BLACKWELL = True\n" + ast.unparse(
+        ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
+    )
+    monkeypatch.setenv("PYTHONPATH", str(ROOT))
+    monkeypatch.setenv("RANK", "0")
+    pytester.makeini("[pytest]\nmarkers =\n    internal\n    launch_on_gb200\n")
+    pytester.makeconftest("""
+from tools.determinism import pytest_plugin
+pytest_plugin._context = lambda root: {'revision': 'a' * 40, 'dirty': False, 'world_size': 1}
+""")
+    pytester.makepyfile(test_quantized_declarations=source)
+    output = pytester.path / "evidence"
+    result = pytester.runpytest_subprocess(
+        "-p",
+        "tools.determinism.pytest_plugin",
+        "--determinism-evidence-dir",
+        str(output),
+        "--determinism-evidence-scope=model",
+    )
+    # The independent parameter-update test still executes, outside the GPT metric.
+    result.assert_outcomes(passed=5)
+    shards = [json.loads(path.read_text()) for path in output.glob("rank-*.json")]
+    assert len(shards) == 1
+    cases = shards[0]["cases"]
+    assert len(cases) == 4
+    assert {name.split("[")[-1].removesuffix("]") for name in cases} == {
+        "fp8-tensorwise",
+        "fp8-delayed",
+        "fp8-mxfp8",
+        "fp4-nvfp4",
+    }
+    assert all(
+        case["parallelism_plan"] == normalize_parallelism({"TP": 2}) for case in cases.values()
+    )
+    assert all(case["declaration"]["op_id"] == "gpt-quantized" for case in cases.values())
+    assert aggregate(shards)["counts"][UNVERIFIED] == 4  # No numerical comparisons ran.
+
+
 @pytest.mark.parametrize(
     "plan,runtime_changes",
     [

@@ -14,10 +14,13 @@ modes don't depend on parallelism degree):
 * ``fp4-nvfp4``      — Blackwell-only NVFP4 block scaling; capability-skipped on Hopper.
 """
 
+import inspect
+
 import pytest
 import torch
 
 from tests.unit_tests.determinism.correctness.test_gpt_model import make_gpt_runner
+from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
 # Hopper = SM 9.0, Blackwell = SM 10.0+. mxfp8 + nvfp4 need Blackwell.
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
@@ -41,7 +44,6 @@ _QUANT_RECIPES = [
 
 
 @pytest.mark.launch_on_gb200
-@pytest.mark.determinism_model(model_id="gpt-quantized", parallelism={"TP": 2})
 class TestQuantizationDeterminism:
 
     def setup_method(self, method):
@@ -51,6 +53,51 @@ class TestQuantizationDeterminism:
         RUNNER.teardown()
 
     @pytest.mark.internal
+    @pytest.mark.determinism_model(model_id="gpt-quantized", parallelism={"TP": 2})
     @pytest.mark.parametrize("quant_overrides", _QUANT_RECIPES)
     def test_bit_exact_under_quantization(self, quant_overrides):
         RUNNER.run(quant_overrides, {"TP": 2})
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="grouped MXFP8 storage needs Blackwell")
+    def test_grouped_mxfp8_parameter_updates_replay_bit_exact(self, monkeypatch):
+        """Refit-style writes must update cached grouped members deterministically."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.fp8_utils import (
+            copy_tensor_to_quantized_param,
+            get_grouped_quantized_members,
+        )
+
+        if "single_grouped_weight" not in inspect.signature(te.GroupedLinear).parameters:
+            pytest.skip("Transformer Engine lacks single grouped parameters")
+
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            linear = te.GroupedLinear(
+                2,
+                128,
+                64,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=True,
+            )
+
+        members = get_grouped_quantized_members(linear.weight, create_if_missing=True)
+        source = torch.randn(2, 64, 128, device="cuda", dtype=torch.bfloat16)
+
+        def update(source):
+            copy_tensor_to_quantized_param(linear.weight, source)
+            return tuple((member._rowwise_data, member._rowwise_scale_inv) for member in members)
+
+        assert_replays_bit_exact(
+            update,
+            (source,),
+            replays=3,
+            contention=True,
+            backward=False,
+            what="grouped MXFP8 parameter update",
+        )

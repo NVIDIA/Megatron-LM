@@ -7,6 +7,7 @@ import tomllib
 from pathlib import Path
 
 from tests.test_utils.python_scripts.recipe_parser import load_and_flatten
+from tests.unit_tests import find_test_cases
 from tests.unit_tests.find_test_cases import expand_pattern, file_has_marker, is_child_of_bucket
 
 
@@ -67,3 +68,39 @@ def test_h100_branch_reports_share_the_latest_ci_coverage_mode(tmp_path, monkeyp
         assert "--require-parallelism" in script
         assert "--determinism-evidence-scope=$EVIDENCE_SCOPE" in script
         assert "REQUIRED_VIEWS=(--require-author-checks)" in script
+
+
+def test_gb200_replay_and_m2n_buckets_keep_each_marked_test_in_one_process(monkeypatch, capsys):
+    root = Path(__file__).resolve().parents[3]
+    monkeypatch.chdir(root)
+    rows = load_and_flatten("tests/test_utils/recipes/gb200/unit-tests.yaml")
+    buckets = sorted({row.spec["test_case"] for row in rows})
+    general = "tests/unit_tests/**/*.py"
+    m2n = "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py"
+    assert {
+        general,
+        m2n,
+        "tests/unit_tests/determinism/kernels/**/*.py",
+        "tests/unit_tests/determinism/correctness/**/*.py",
+    } <= set(buckets)
+    # Replace only the yq extraction; execute the actual selector for each recipe.
+    monkeypatch.setattr(find_test_cases, "get_test_cases", lambda path: buckets)
+    selections = []
+    for bucket in buckets:
+        monkeypatch.setattr(find_test_cases.sys, "argv", ["find_test_cases.py", bucket, "gb200"])
+        find_test_cases.main()
+        ignored = {line.removeprefix("--ignore=") for line in capsys.readouterr().out.splitlines()}
+        selected = {
+            file
+            for file in expand_pattern(bucket)
+            if Path(file).name.startswith("test_") and file not in ignored
+        }
+        if bucket == m2n:
+            assert selected == {m2n}
+        assert all(selected.isdisjoint(previous) for previous in selections)
+        selections.append(selected)
+    assert set().union(*selections) == {
+        file
+        for file in expand_pattern(general)
+        if Path(file).name.startswith("test_") and file_has_marker(file, "launch_on_gb200")
+    }

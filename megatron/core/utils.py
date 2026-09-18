@@ -30,7 +30,10 @@ import numpy
 import torch
 
 from megatron.core import config
-from megatron.core._rank_utils import log_single_rank
+from megatron.core._rank_utils import (  # pylint: disable=unused-import
+    log_single_rank,
+    set_default_log_ranks,
+)
 from megatron.core.package_info import __version__ as mcore_version
 
 try:
@@ -857,6 +860,22 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
         % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape),
     )
     tensor.data = new_data_tensor
+
+
+def copy_parameter_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy dynamically attached Megatron metadata between parameters.
+
+    Megatron records sharding and refit metadata as public Python attributes.
+    Tensor subclasses use private attributes for their storage and quantization
+    implementation details; those must not leak into a replacement tensor.
+
+    Args:
+        destination: Tensor receiving the metadata.
+        source: Tensor whose metadata should be copied.
+    """
+    for name, value in vars(source).items():
+        if not name.startswith("_"):
+            setattr(destination, name, value)
 
 
 def init_method_normal(sigma):

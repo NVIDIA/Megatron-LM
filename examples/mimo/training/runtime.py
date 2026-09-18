@@ -48,6 +48,9 @@ def configure_module_rng(
     _set_random_seed(
         args.seed + role_seed_offset,
         data_parallel_random_init,
+        te_rng_tracker=getattr(args, "te_rng_tracker", False),
+        inference_rng_tracker=getattr(args, "inference_rng_tracker", False),
+        use_cudagraphable_rng=getattr(args, "cuda_graph_impl", "none") != "none",
         pp_group=pg_collection.pp,
         dp_group=pg_collection.dp,
         tp_group=pg_collection.tp,
@@ -101,8 +104,15 @@ def wrap_active_modules_with_ddp(
 ) -> None:
     """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
     if mimo_model.language_model is not None:
+        freeze_projection = bool(getattr(args, "freeze_projection", False))
+        input_projections = mimo_model.language_model_input_projections
+        assert input_projections is not None
         if getattr(args, "freeze_lm", False):
             mimo_model.language_model.requires_grad_(False)
+            if not freeze_projection:
+                input_projections.requires_grad_(True)
+        elif freeze_projection:
+            input_projections.requires_grad_(False)
         lm_config = _module_config(mimo_model.language_model)
         print_rank_0("wrapping language model in DDP")
         mimo_model.language_model = prepare_existing_model_chunks_for_distributed_training(
