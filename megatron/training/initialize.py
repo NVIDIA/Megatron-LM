@@ -33,6 +33,7 @@ from megatron.core.utils import (
     get_te_version,
     is_te_min_version,
     is_torch_min_version,
+    set_default_log_ranks,
 )
 from megatron.training import (
     get_adlr_autoresume,
@@ -128,6 +129,15 @@ def initialize_megatron(
             store,
             skip_model_parallel_init=skip_model_parallel_init,
         )
+
+        # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
+        # vision encoder on rank 0 and the language model at --mimo-llm-offset, so that
+        # alone would describe only the encoder; add the first LLM rank.
+        log_ranks = {0}
+        mimo_llm_offset = getattr(args, "mimo_llm_offset", None)
+        if mimo_llm_offset:
+            log_ranks.add(mimo_llm_offset)
+        set_default_log_ranks(log_ranks)
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
@@ -688,6 +698,7 @@ def setup_logging() -> None:
             'GroupedGemmDsreluSm100',
             'GroupedGemmSreluSm100',
             'GroupedGemmWgradSm100',
+            'GroupedGemmWgradBlockScaledAPI',
             'absl',
         ]:
             logging.getLogger(noisy_logger_name).setLevel(logging.ERROR)
