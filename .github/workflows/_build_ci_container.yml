@@ -242,14 +242,15 @@ jobs:
           BASE_PR_KEY: ${{ steps.cache_keys.outputs.base-pr }}
           BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
           EVENT_NAME: ${{ github.event_name }}
+          LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
           RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
         run: |
           if [ "$EVENT_NAME" = "merge_group" ]; then
-            CANDIDATES=("$BASELINE_CACHE" "$RUN_CACHE")
+            CANDIDATES=("$BASELINE_CACHE" "$RUN_CACHE" "$LEGACY_CACHE")
           elif [ -n "$BASE_PR_KEY" ]; then
-            CANDIDATES=("$RUN_CACHE" "$BASE_PR_CACHE" "$BASELINE_CACHE")
+            CANDIDATES=("$RUN_CACHE" "$BASE_PR_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
           else
-            CANDIDATES=("$RUN_CACHE" "$BASELINE_CACHE")
+            CANDIDATES=("$RUN_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
           fi
 
           # An older PR cache can exist but miss layers present in the main
