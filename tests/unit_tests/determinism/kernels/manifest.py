@@ -488,6 +488,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/custom_layers/batch_invariant_kernels.py",),
         tests=(
             K + "test_inference_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
         ),
         kind="triton",
