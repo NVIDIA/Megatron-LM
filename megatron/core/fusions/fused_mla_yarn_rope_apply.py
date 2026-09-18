@@ -42,7 +42,10 @@ def _capture_vmm_output(
         or shape[0] % 256 != 0
     ):
         return None
-    from transformer_engine.pytorch.tensor.localized_mxfp8 import _get_localization_context
+    from transformer_engine.pytorch.tensor.localized_mxfp8 import (
+        _get_localization_context,
+        is_mxfp8_vmm_workspace_iteration_active,
+    )
 
     device_index = reference.device.index
     if device_index is None:
@@ -59,7 +62,10 @@ def _capture_vmm_output(
         allocator = VMMRowSplitAllocator(reference.device)
         root = allocator.allocate(tuple(shape), reference.dtype)
         _VMM_SCRATCH_BUFFERS[key] = root
-    if not torch.cuda.is_current_stream_capturing():
+    if (
+        not torch.cuda.is_current_stream_capturing()
+        and not is_mxfp8_vmm_workspace_iteration_active()
+    ):
         return None
 
     # Each invocation gets independent autograd metadata while all serialized
