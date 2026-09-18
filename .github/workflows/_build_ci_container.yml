@@ -88,10 +88,10 @@ jobs:
           REGISTRY_GB_GPU: ${{ inputs.registry-gb200 }}
         run: |
           AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
-            '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+            '{"cloud": "aws-h100", "platform": "linux/amd64", "registry": $registry, "runner": $runner}')
           if [ "$IS_MAINTAINER" = "true" ] && [ "$ENABLE_GB_TESTING" = "true" ]; then
             GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
-              '{"cloud": "gb-gpu", "registry": $registry, "runner": $runner}')
+              '{"cloud": "gb-gpu", "platform": "linux/arm64", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
               '{"include": [$aws, $gb_gpu]}')
           else
@@ -105,7 +105,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
-    runs-on: ${{ matrix.runner }}
+    # Keep matrix.runner for downstream GPU test jobs; container builds use the CPU pool.
+    runs-on: nvidia-ci-aws-cpu
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
@@ -222,6 +223,7 @@ jobs:
           PR_NUMBER: ${{ steps.cache_keys.outputs.pr-number }}
           DEFAULT_CACHE_KEY: ${{ steps.cache_keys.outputs.key }}
           PUBLISH_TARGET_CACHE: ${{ inputs.publish-target-cache }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
         run: |
           # These inputs can invalidate the expensive dependency and native-extension layers.
           # README and downloaded assets remain BuildKit-validated late layers, but do not
@@ -252,10 +254,10 @@ jobs:
             )
           fi
 
-          case "$(uname -m)" in
-            x86_64) TARGET_ARCH=amd64 ;;
-            aarch64 | arm64) TARGET_ARCH=arm64 ;;
-            *) echo "Unsupported build architecture: $(uname -m)" >&2; exit 1 ;;
+          case "$TARGET_PLATFORM" in
+            linux/amd64) TARGET_ARCH=amd64 ;;
+            linux/arm64) TARGET_ARCH=arm64 ;;
+            *) echo "Unsupported build platform: $TARGET_PLATFORM" >&2; exit 1 ;;
           esac
 
           BUILD_HASH=$(
@@ -290,6 +292,12 @@ jobs:
           echo "key=$CACHE_KEY" | tee -a "$GITHUB_OUTPUT"
           echo "target-build-hash=$TARGET_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        if: matrix.platform == 'linux/arm64'
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
@@ -327,6 +335,7 @@ jobs:
           sbom: false
           push: true
           context: .
+          platforms: ${{ matrix.platform }}
           target: main
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
