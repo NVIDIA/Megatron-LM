@@ -247,6 +247,84 @@ def _round_values(values: List[Union[int, float, str]]) -> List[Union[int, float
     return [round(value, 5) if not isinstance(value, str) else value for value in values]
 
 
+def _log_comparison_errors(
+    metric_name: str,
+    test: Union[ApproximateTest, DeterministicTest],
+    steps: List[Union[int, str]],
+    actual: np.ndarray,
+    golden: np.ndarray,
+    is_close: np.ndarray,
+    precision: ValuePrecision,
+    passing: bool,
+) -> None:
+    """Report the largest errors at the precision and aggregation used by the check."""
+    if np.array_equal(actual, golden):
+        return
+
+    finite = np.isfinite(actual) & np.isfinite(golden)
+    absolute_error = np.full(actual.shape, np.nan)
+    relative_error = np.full(actual.shape, np.nan)
+    # Cast before subtracting so integer metrics cannot wrap. Invalid/missing samples
+    # retain undefined errors; they must not contaminate finite-sample extrema.
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        absolute_error[finite] = np.abs(
+            actual[finite].astype(np.float64) - golden[finite].astype(np.float64)
+        )
+        np.divide(
+            absolute_error, np.abs(golden.astype(np.float64)), out=relative_error, where=golden != 0
+        )
+    relative_error[finite & (absolute_error == 0)] = 0
+
+    outside_tolerance = np.flatnonzero(~is_close)
+    logger.info(
+        "Golden comparison for %s [%s]: %s; %d/%d samples outside tolerance; "
+        "atol=%.9g, rtol=%.9g, precision=%s",
+        metric_name,
+        test.type_of_test_result.name,
+        "PASSED" if passing else "FAILED",
+        len(outside_tolerance),
+        len(actual),
+        test.atol,
+        test.rtol,
+        precision.value,
+    )
+
+    samples = {}
+    finite_indices = np.flatnonzero(finite)
+    if len(finite_indices):
+        samples["max_absolute_error"] = int(finite_indices[np.argmax(absolute_error[finite])])
+    relative_indices = np.flatnonzero(finite & ~np.isnan(relative_error))
+    if len(relative_indices):
+        samples["max_relative_error"] = int(
+            relative_indices[np.argmax(relative_error[relative_indices])]
+        )
+    if len(outside_tolerance) and outside_tolerance[0] not in samples.values():
+        samples["first_outside_tolerance"] = int(outside_tolerance[0])
+
+    for label, index in samples.items():
+        if not finite[index]:
+            abs_text = rel_text = allowed_text = "n/a (non-finite or missing)"
+        else:
+            abs_text = f"{absolute_error[index]:.9g}"
+            rel_text = (
+                "n/a (zero golden)"
+                if np.isnan(relative_error[index])
+                else f"{relative_error[index]:.9g} ({relative_error[index] * 100:.9g}%)"
+            )
+            allowed_text = f"{test.atol + test.rtol * abs(float(golden[index])):.9g}"
+        logger.info(
+            "  %s at %s: golden=%.17g, actual=%.17g, absolute_error=%s, "
+            "relative_error=%s, allowed_absolute_error=%s",
+            label,
+            steps[index],
+            golden[index],
+            actual[index],
+            abs_text,
+            rel_text,
+            allowed_text,
+        )
+
+
 def pipeline(
     compare_approximate_results: bool,
     golden_values: Dict[str, GoldenValueMetric],
@@ -276,6 +354,7 @@ def pipeline(
                         f"Metric {metric_name} has no values in the golden file."
                     )
 
+                sample_labels: List[Union[int, str]] = list(golden_value.values)
                 golden_value_list = list(golden_value.values.values())
                 actual_value_list = [
                     actual_values[metric_name].values.get(value_step, "nan")
@@ -333,6 +412,8 @@ def pipeline(
                     actual_value_list = [
                         np.median([np.inf if isinstance(v, str) else v for v in actual_value_list])
                     ]
+                    sample_labels = [f"median over steps {', '.join(map(str, comparison_steps))}"]
+                    comparison_precision = ValuePrecision.FULL
                     total_steps_evaluated = 1
                 else:
                     total_steps_evaluated = len(golden_value.values)
@@ -361,13 +442,17 @@ def pipeline(
                         num_failing_steps_allowed / total_steps_evaluated
                     )
 
+                _log_comparison_errors(
+                    metric_name,
+                    test,
+                    sample_labels,
+                    actual,
+                    golden,
+                    is_close,
+                    comparison_precision,
+                    passing,
+                )
                 if not passing:
-                    logger.info(
-                        "Actual values: %s", ", ".join([str(v) for v in (*actual_value_list,)])
-                    )
-                    logger.info(
-                        "Golden values: %s", ", ".join([str(v) for v in (*golden_value_list,)])
-                    )
                     raise test.error_message(metric_name)
 
                 result = f"{test.type_of_test_result.name} test for metric {metric_name}: PASSED"
