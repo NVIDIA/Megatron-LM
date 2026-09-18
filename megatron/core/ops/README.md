@@ -10,7 +10,6 @@ owns concrete operation modules, kernels, backend adapters, operation-local
 parameters and checkpoint mappings, state updates, and operation-specific
 communication. Model assembly and global runtime management stay outside.
 
-
 Three rules hold everywhere in this package:
 
 1. **Choose once, call directly.** An operation binds its kernels in `__init__`
@@ -19,12 +18,14 @@ Three rules hold everywhere in this package:
 2. **A named backend is supported or fails early.** Missing optional libraries
    are reported at construction, naming the operation, with the original error
    chained. Nothing falls back silently to another implementation.
-3. **Selection is configured once, from the existing settings.** Operation modules
-   ask the `BackendSpecProvider` for their kernels; the provider was configured
-   from `TransformerConfig` when it was built. No new CLI flags for choosing
-   kernels.
+3. **Selection uses the existing settings.** Operation constructors pass the
+   relevant `TransformerConfig` values to a family-local selector and store the
+   returned callables. Reuse an existing backend choice when one is available.
 
 ## Layout
+
+The shared helpers live at the package root. The family paths below describe
+where to place implementations as operations are added or moved:
 
 ```
 megatron/core/ops/
@@ -89,15 +90,15 @@ The following remain outside:
   (`transformer/`, `models/`).
 - Inference contexts, global cache allocation and request scheduling (`inference/`).
 
-This move retains `SSMChunking` and `ssm_chunking` in `ops.ssm.common.inference`,
-and indexer-loss tracking in `ops.attention.dsa.modules`. Extracting that stack-wide
-state into inference/transformer infrastructure is separate work.
+When relocating an operation, preserve its existing state ownership and
+checkpoint behavior. Extracting shared state into inference or transformer
+infrastructure is a separate change from moving the implementation.
 
 Operations may use shared infrastructure such as embeddings, `MegatronModule`,
 checkpoint utilities, inference contexts and explicit process groups. They must
-not import concrete model assembly or the deprecated SSM/attention module paths.
-The provider API is used only at construction; no reverse dependency on model
-spec builders is introduced.
+not import concrete model assembly or paths that have been replaced by
+deprecated forwarders. Model spec builders may select operation classes; the
+operation implementation must not depend on those builders.
 
 Moving a kernel does not certify its determinism or change its supported dtypes,
 layouts or numerical tolerances. Existing determinism guards and backend-specific
@@ -129,8 +130,12 @@ Say you are adding a gated linear recurrence called `foo`.
        return chunk_foo(q, k, v, cu_seqlens=cu_seqlens)
    ```
 
+   Add the matching PyTorch implementation, `torch_chunk_foo`, in
+   `foo/reference.py`. Use the same tensor contract and verify its determinism
+   before selecting it for deterministic mode.
+
 4. **Add the selector** in `foo/backends.py`. It takes the *values* of existing
-   config fields, not the config object, so a provider can be configured once:
+   config fields, so its choices can be tested independently of model assembly:
 
    ```python
    # megatron/core/ops/ssm/foo/backends.py
@@ -145,61 +150,48 @@ Say you are adding a gated linear recurrence called `foo`.
    ```
 
 5. **Write the operation module** in `foo/mixer.py`. Bind in `__init__`, before
-   any parameter is allocated, through the provider; call directly in `forward`:
+   any parameter is allocated; call directly in `forward`:
 
    ```python
-   from megatron.core.models.backends import backend_slot, resolve_kernel_backend
-   from megatron.core.ops._backends import require
    from megatron.core.ops.ssm.foo.backends import select_foo_recurrence
+   from megatron.core.transformer.module import MegatronModule
 
    class FooMixer(MegatronModule):
-       def __init__(self, config, submodules, d_model, *, pg_collection=None,
-                    kernel_backend=None):
+       def __init__(self, config):
            super().__init__(config)
-           provider = resolve_kernel_backend(kernel_backend, config)
-           self.recurrence = backend_slot(
-               backend=provider, name="foo_recurrence",
-               default=lambda: select_foo_recurrence(config.deterministic_mode),
+           self.recurrence = select_foo_recurrence(
+               deterministic=config.deterministic_mode,
            )
-           # auxiliary kernels the operation owns, independent of the recurrence
-           self.causal_conv1d = require(
-               "causal_conv1d", "causal_conv1d_fn", needed_by="Foo convolution"
-           ).causal_conv1d_fn
-           ...  # parameters are created after the checks above
+           # Allocate any operation parameters after dependency checks.
 
-       def forward(self, hidden_states, ...):
-           x = self.causal_conv1d(...)
-           return self.recurrence(q, k, v, ...)   # no selection, no checks here
+       def forward(self, q, k, v):
+           return self.recurrence(q, k, v)
    ```
 
-   `backend_slot` asks the provider for `foo_recurrence()` and, if the provider
-   predates the slot, falls back to `default()`. `resolve_kernel_backend` uses a
-   spec-injected provider when there is one and otherwise derives one from
-   `config`. Where a family has not adopted the provider slots yet, its module calls its
-   selector directly.
+6. **Reuse existing settings.** Read relevant fields, such as
+   `config.deterministic_mode`, in the operation constructor. Pass their values
+   to the selector. A new config field or CLI flag needs a design review.
 
-6. **Add the provider slot** only if a different provider could reasonably answer
-   it (an existing callable or builder already owns that boundary). Add a typed,
-   argument-free method to `BackendSpecProvider` and implement it in
-   `KernelSelectionMixin` in `megatron/core/models/backends.py`, reading its
-   settings from `KernelSelection`. If only one implementation will ever exist,
-   skip the slot and call the selector directly.
+7. **Wire the spec** in the model's spec builder, using the existing `ModuleSpec`
+   interface. The caller supplies `config` when it builds the module:
 
-7. **Reuse existing settings.** Deterministic mode, memory-efficient paths and
-   backend names are already `TransformerConfig` fields; read them through
-   `KernelSelection.from_config`. A new field or CLI flag needs a design review.
+   ```python
+   from megatron.core.ops.ssm.foo.mixer import FooMixer
+   from megatron.core.transformer.spec_utils import ModuleSpec
 
-8. **Wire the spec.** The module spec builder passes the provider into the module
-   (`params={"kernel_backend": backend}`) so a user-supplied provider is honored.
-   Module-level specs assembled without a config leave it out; the module then
-   derives the provider from `config`.
+   foo_spec = ModuleSpec(module=FooMixer)
+   ```
 
-9. **Tests** (`tests/unit_tests/ops/` and the family's test directory):
+   The `foo` files and external `fla.ops.foo` in these examples are illustrative:
+   implement them with the operation's real tensor contract before wiring it
+   into a model. No extension of `BackendSpecProvider` is needed for this recipe.
+
+8. **Tests** (`tests/unit_tests/ops/` and the family's test directory):
    - the selector imports only the selected library (monkeypatch
      `megatron.core.ops._backends.import_module` and assert what was asked for);
    - a missing library fails at construction with a message naming the operation,
      before any parameter is allocated;
-   - a custom provider's answer is bound without the default being imported;
+   - deterministic and fused choices bind the expected callable once;
    - numerical parity between the fused kernel and `reference.py`, and the
      determinism guard if the operation has one;
    - the canonical-ownership test (`test_deprecated_imports.py`) passes.
@@ -220,24 +212,15 @@ Say DSA gains a third fused backend, `flashinfer`, next to `tilelang` and `cudnn
    reference path — that is the only permitted fallback, and it is per call, not
    per installation.
 
-2. **Extend the selector**, not the module. Add the backend name to the existing
-   config value's accepted set and to the selector in `attention/dsa/backends.py`:
-
-   ```python
-   _NATIVE_REQUIREMENTS["flashinfer"] = (("flashinfer", ("sparse_attention",)),)
-
-   def select_dsa_kernels(backend: str, *, fused: bool = True) -> DSAKernels:
-       ...
-       for module, symbols in _NATIVE_REQUIREMENTS[backend]:
-           require(module, *symbols, needed_by=f"DSA kernel backend {backend!r}")
-       adapter = require(backend_module_name(backend), needed_by=...)
-       return DSAKernels(backend=backend, run_fused_qk_topk=getattr(adapter, ...), ...)
-   ```
-
-   The module (`DSAttention`) does not change: it already binds whatever
-   `dsa_kernels()` returns. If the backend needs a minimum version, say so with
-   `require(..., min_version="x.y")`; `require` reads `__version__` first so
-   source checkouts work.
+2. **Extend the family selector.** Add the backend name to the existing config
+   value's accepted set. If the operation still selects kernels inline, extract
+   that construction-time logic into `backends.py` while preserving its behavior.
+   Check the selected adapter with `require`, then return its callables using the
+   same interface as the existing backends. Bind that result in the constructor,
+   as in the `FooMixer` example above. If the backend needs a minimum version,
+   use `require(..., min_version="x.y")`; `require` reads `__version__` first so
+   source checkouts work. The family selector and its return type belong to the
+   operation being implemented; the shared package does not supply them.
 
 3. **Do not** add a `HAVE_FLASHINFER` flag, a `try/except ImportError` in the
    module, an `if backend == ...` branch in `forward`, or a new CLI option when an
@@ -248,7 +231,7 @@ Say DSA gains a third fused backend, `flashinfer`, next to `tilelang` and `cudnn
    existing adapter module or `kernels/`; the selector picks them by the existing
    backend name, and the operation still binds once.
 
-5. **Tests:** extend the selector tests (`select_dsa_kernels("flashinfer")` binds
+5. **Tests:** extend the selector tests (the new backend binds
    the hook set once; a missing library is an `ImportError` naming the backend;
    `"none"`/`unfused` never import it), add numerical parity against
    `reference.py` for the new hooks, and run the existing DSA suites with the new
@@ -278,79 +261,47 @@ Rules:
 
 - `require` is construction-time only. A capability that depends on
   execution-time input — packed sequences under CP, say — is decided once
-  (`is_available`, `has_min_version`, `packed_cp_conv_supported`) and a bool is
+  (`is_available`, `has_min_version`) and a bool is
   checked per call.
 - Selectors import only what was selected.
 - Operation constructors `require` the auxiliary kernels they own (convolution,
-  normalization, fused RoPE) separately from the provider-owned kernel, before
+  normalization, fused RoPE) separately from the selected recurrence, before
   parameters are allocated.
-- Inference-only kernels are bound by `bind_dynamic_inference_kernels`, which
-  dynamic-inference setup calls on every pipeline-local mixer, so a missing
-  library fails there rather than in the first decode step.
+- Bind inference-only kernels during inference setup, before the first decode
+  step, using the operation's existing initialization lifecycle.
 - When a module's own imports already fail clearly (the GDP chunkwise-CP adapters
   do), `require(module, needed_by=...)` is the whole check.
 - Determinism is not declared per kernel. The existing guards
   (`assert_causal_conv1d_deterministic`, the Torch reference recurrences selected
-  by `deterministic_mode`, `CSA_OPERATION_DETERMINISM`) stay with their owners;
+  by `deterministic_mode`) stay with their owners;
   `docs/developer/determinism` describes what has been audited.
 
 ## Selection
 
-`BackendSpecProvider` is the only construction API. A provider is configured once,
-when it is built, from the existing config fields collected in
-`megatron.core.models.backends.KernelSelection` (`deterministic_mode`,
-`use_mamba_mem_eff_path`, `gdp_cutedsl_kernel`, `gdp_num_chunk_states_to_recompute`,
-`dsa_kernel_backend`, `attention_backend`). The kernel slots take no
-implementation-selection arguments:
+An operation constructor calls its family selector with the relevant config
+values and stores the returned callables. `forward` calls those functions
+directly. This is the pattern used by the new-operation recipe above.
 
-| Slot | Returns | Bound by |
-| --- | --- | --- |
-| `mamba_kernels()` | `MambaKernels` (scan, optional fused conv+scan, conv) | `MambaMixer` |
-| `gated_delta_rule(variant)` | GDN or GDN2 recurrence; `variant` names the operation, not the backend | `GatedDeltaNet`, `GatedDeltaNet2` |
-| `gated_delta_product()` | FLA or CuTeDSL chunked gated delta product | `GatedDeltaProductMixer` |
-| `gated_delta_product_cp_backend()` | chunkwise-CP adapter matching the GDP kernel | `GatedDeltaProductMixer` when CP > 1 |
-| `dsa_kernels()` | immutable `DSAKernels` hook set (or none) | `DSAttention` |
+`BackendSpecProvider` in `megatron/core/models/backends.py` supplies the existing
+model-spec components, such as parallel linear layers, normalization, attention,
+and cross entropy. It does not currently provide SSM or sparse-attention kernel
+slots. Keep operation-local kernel selection in the family until an extension
+to that provider interface and its callers is implemented together.
 
-Local and TE providers share one implementation of these slots
-(`KernelSelectionMixin`): TE has no SSM or sparse-attention kernels of its own,
-and sharing the body keeps every slot overridable by a partial provider that does.
-`backend_slot` supplies the family default for providers written before a slot
-existed. There is no registry and no new CLI option.
-
-Every operation module accepts a `kernel_backend` provider from its module spec
-(`params={"kernel_backend": provider}`) and resolves it with
-`resolve_kernel_backend(kernel_backend, config)`:
-
-- A provider built with a selection (`get_backend_from_config`, or
-  `kernels=KernelSelection(...)`) is used as is; the explicit selection wins even
-  where it disagrees with `config`.
-- A bare provider (`TESpecProvider()`) is configured from `config` at bind time, on
-  a shallow copy, so the existing per-operation settings still decide the kernels
-  and a provider shared across a spec is never mutated. Asking a bare provider for
-  a kernel slot directly is an error, never a silent default.
-- A wrapper or custom provider without the mixin is used untouched; `backend_slot`
-  supplies the family default for slots it does not implement. Build wrappers
-  through `get_backend`/`get_backend_from_config` so the fallback they delegate to
-  is configured; a wrapper around a bare fallback fails loudly on a kernel slot.
-- Specs assembled without a config — the module-level hybrid stack specs — cannot
-  inject a provider, so those modules derive one from `config` through the same
-  `get_backend_from_config` path the spec builders use; both routes select
-  identically.
-
-Kernels are bound once, in `__init__`, and called directly from `forward`. No
-selection, availability check or optional import happens in the forward path.
-DSAttention's hooks may still return `None` for unsupported runtime inputs, in
-which case the caller runs the reference implementation. GDN dynamic inference uses
-FLA's fused decode/prefill family (which takes `A_log`/`dt_bias` and fuses the
-gates, so it is not interchangeable with the training recurrence); it is bound once
-through `bind_dynamic_inference_kernels`.
+Runtime dispatch for input-dependent behavior remains inside the operation. For
+example, an adapter hook may return `None` for an unsupported tensor layout if
+the operation explicitly supports a reference path for that case. Missing
+optional libraries are construction-time errors, not a reason to choose a
+reference path silently.
 
 ## Deprecated import paths
 
-The former `megatron.core.ssm` and
-`megatron.core.transformer.experimental_attention_variant` module paths are
-deprecated, not removed. Every pre-move module still exists as a two-line
-forwarder built on `megatron.core.ops._compat.deprecated_module`:
+When moving a module, keep its old path as a forwarder built on
+`megatron.core.ops._compat.deprecated_module` and register the mapping in
+`tests/unit_tests/ops/deprecated_paths.py`. Paths absent from that table retain
+their existing ownership; the table is empty until modules are moved.
+
+A forwarder provides the following compatibility behavior:
 
 - Importing an old path emits one `DeprecationWarning` naming the replacement.
 - Attributes resolve lazily through PEP 562 module `__getattr__`, so importing the
@@ -367,29 +318,18 @@ globals. Patches must target the canonical path. Module `__file__` also names th
 forwarder; use the canonical module when inspecting implementation source.
 
 Ordinary state-dict keys and checkpoint tensor mappings do not depend on the
-source directory and are unchanged. The full old-to-new table is
-`tests/unit_tests/ops/deprecated_paths.py`. The main entries, relative to
-`megatron.core`:
-
-| Former owner | Canonical owner |
-| --- | --- |
-| `ssm.mamba_mixer`, `ssm.gated_delta_product`, `ssm.gated_delta_net` | `ops.ssm.mamba2.mixer`, `ops.ssm.gdp.mixer`, `ops.ssm.gated_delta` |
-| `ssm.ops.{common,mamba2,gdp}` | `ops.ssm.{common,mamba2,gdp}` |
-| SSM CP, packing and checkpoint helpers | `ops.ssm` operation families and `ops.ssm.common` |
-| Experimental DSA/CSA, absorbed MLA and DeepSeek-v4 attention | `ops.attention.{dsa,csa}.modules`, `ops.attention.mla`, `ops.attention.dsv4` |
-| Experimental DSA kernel adapters and helpers | `ops.attention.dsa` and `ops.attention.dsa.kernels` |
-| `ssm.mamba_layer`, `ssm.mlp_layer` and their layer-config classes | `transformer.mamba_layer`, `transformer.mlp_layer` and `transformer.*_layer_config` |
-| Experimental `dsa_layer_config` | `transformer.dsa_layer_config` |
-| Experimental `deepseek_v4_hybrid_attention_module_specs` | `models.gpt.deepseek_v4_hybrid_attention_module_specs` |
-| `ssm.ssm_inference.SSMChunking` and `ssm_chunking` | `ops.ssm.common.inference` |
-| `ssm.ssm_inference.SSMDynamicInferenceMixin` | `ops.ssm.common.inference` |
-| `ssm.mamba_block`, `ssm.mamba_hybrid_layer_allocation` | `models.hybrid.hybrid_block`, `models.hybrid.hybrid_layer_allocation` |
+source directory. Preserve them when moving an operation, and use the
+old-to-new table to drive the migration-specific regression tests.
 
 ## Tests
 
-`tests/unit_tests/ops/` holds the package-level tests. In this PR:
-`test_deprecated_imports.py` (canonical module/class ownership and pickle round
-trips, import-path validation, the deprecated-path forwarders, and the absence
-of deprecated imports in the tree). Selector, provider and `require` tests join it as families adopt the
-selection pattern. Family behaviour tests live with their family
-under `tests/unit_tests/ssm/` and `tests/unit_tests/transformer/`.
+`tests/unit_tests/ops/test_deprecated_imports.py` tests the compatibility helper
+with synthetic modules, independently of any migration entries. It covers
+warnings, lazy imports, private and wildcard exports, multiple targets, and
+package child imports. The same file checks registered deprecated paths,
+canonical class identity and pickle round trips, import-path resolution, and
+in-tree use of canonical paths as operations move.
+
+Add selector and dependency-check tests alongside the family that uses them.
+Family behavior tests live under `tests/unit_tests/ssm/` and
+`tests/unit_tests/transformer/`.

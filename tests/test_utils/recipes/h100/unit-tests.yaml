@@ -68,7 +68,7 @@ spec:
 products:
   - test_case: [tests/unit_tests/ops/**/*.py]
     products:
-      - environment: [dev]
+      - environment: [lts, dev]
         tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]

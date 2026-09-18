@@ -24,6 +24,108 @@ def _module_file(name):
     return path.with_suffix('.py') if path.with_suffix('.py').is_file() else path / '__init__.py'
 
 
+@pytest.fixture(params=[('first',), ('first', 'second')], ids=['one-target', 'two-targets'])
+def synthetic_forwarder(request, tmp_path, monkeypatch):
+    """Create importable forwarders without depending on any migrated operation family."""
+    package = '_ops_compat_fixture'
+    root = tmp_path / package
+    root.mkdir()
+    targets = tuple(f'{package}.{name}' for name in request.param)
+    forwarder = (
+        'from megatron.core.ops._compat import deprecated_module\n'
+        f'__getattr__, __dir__ = deprecated_module(__name__, *{targets!r}, '
+        'removal_version="99.0")\n'
+    )
+    sources = {
+        '__init__.py': '',
+        'first.py': '__all__ = ["public"]\npublic = object()\n_private = object()\nshared = object()\n',
+        'second.py': 'other = object()\n_other_private = object()\nshared = object()\n',
+        'legacy.py': forwarder,
+        'legacy_package/__init__.py': forwarder,
+        'legacy_package/child.py': 'value = object()\n',
+    }
+    for filename, source in sources.items():
+        path = root / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        yield package, targets
+    finally:
+        for name in list(sys.modules):
+            if name == package or name.startswith(package + '.'):
+                del sys.modules[name]
+
+
+def test_synthetic_forwarder_import_is_lazy(synthetic_forwarder):
+    """Import and dunder probes warn once without loading optional implementations."""
+    package, targets = synthetic_forwarder
+    old = f'{package}.legacy'
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always', DeprecationWarning)
+        module = importlib.import_module(old)
+        assert importlib.import_module(old) is module
+        assert not hasattr(module, '__wrapped__')
+        assert not hasattr(module, '__path__')
+    assert len(caught) == 1
+    assert caught[0].category is DeprecationWarning
+    message = str(caught[0].message)
+    assert old in message and targets[0] in message and '99.0' in message
+    assert all(target not in sys.modules for target in targets)
+
+
+def test_synthetic_forwarder_attribute_resolution(synthetic_forwarder):
+    """Attributes retain canonical identity, including private names and target precedence."""
+    package, targets = synthetic_forwarder
+    with pytest.warns(DeprecationWarning):
+        module = importlib.import_module(f'{package}.legacy')
+    public = module.public
+    first = sys.modules[targets[0]]
+    assert public is first.public
+    assert module._private is first._private
+    assert module.shared is first.shared
+    if len(targets) == 2:
+        assert targets[1] not in sys.modules
+        other = module.other
+        second = sys.modules[targets[1]]
+        assert other is second.other
+        assert module._other_private is second._other_private
+    with pytest.raises(AttributeError, match='missing_export'):
+        getattr(module, 'missing_export')
+
+
+def test_synthetic_forwarder_wildcard_exports(synthetic_forwarder):
+    """Wildcard imports honor explicit exports and discover public names on other targets."""
+    package, targets = synthetic_forwarder
+    old = f'{package}.legacy'
+    with pytest.warns(DeprecationWarning):
+        module = importlib.import_module(old)
+    expected = {'public'}
+    if len(targets) == 2:
+        expected.update(('other', 'shared'))
+    assert set(module.__all__) == expected
+    namespace = {}
+    exec(f'from {old} import *', namespace)
+    assert set(namespace) - {'__builtins__'} == expected
+    for name in expected:
+        assert namespace[name] is getattr(module, name)
+    expected_dir = {name for target in targets for name in dir(sys.modules[target])}
+    assert dir(module) == sorted(expected_dir)
+
+
+def test_synthetic_forwarder_package_child_is_lazy(synthetic_forwarder):
+    """A real child import must not load the parent package's implementation targets."""
+    package, targets = synthetic_forwarder
+    old = f'{package}.legacy_package'
+    with pytest.warns(DeprecationWarning):
+        parent = importlib.import_module(old)
+    namespace = {}
+    exec(f'from {old} import child', namespace)
+    assert namespace['child'] is importlib.import_module(f'{old}.child')
+    assert parent.child is namespace['child']
+    assert all(target not in sys.modules for target in targets)
+
+
 @pytest.mark.parametrize('old,targets', FORWARDED.items())
 def test_forwarder_targets_exist(old, targets):
     """Every compatibility path must resolve to an implementation in this PR."""
