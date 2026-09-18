@@ -1857,6 +1857,26 @@ class GTPShardedParam(torch.nn.Parameter):
                     "either aborted between the wgrad GEMM and its reduce-scatter, or a "
                     "deferred-wgrad schedule skipped the reduce-scatter for this weight."
                 )
+            # An RS still in flight here means this weight gets more than one backward per
+            # iteration (MTP's repeated block is the case we hit), so its previous send buffer
+            # is still busy. Allocating a second raises this bucket's high-water mark for good --
+            # the pool never shrinks, so every buffer in it is live at the peak. Drain our own RS
+            # so the alloc below recycles that buffer, trading one overlap for the permanent
+            # bytes. Capture-guarded: the branch is host-side.
+            if (
+                GTP_CONFIG.async_reduction
+                and self._wgrad_rs_handle is not None
+                and not torch.cuda.is_current_stream_capturing()
+                and not symmetric_wgrad_pool.has_free(
+                    self._unsharded_shape_padded, self.main_grad.dtype, self.group
+                )
+            ):
+                self._wait_reduce_scatter(finalize_grad=True)
+                self._already_finalized = False  # cascade must not skip the next one
+                # The drain orders only rs_stream; the wgrad GEMM writes this buffer on the
+                # compute stream, so fence it or the GEMM clobbers an in-flight send.
+                self.rs_event.wait()
+
             buf = _alloc_symmetric_wgrad_buffer(self, self.main_grad.dtype, self.device)
             self._wgrad_symm_slot = buf
             return buf[: self._unsharded_shape[0]]
@@ -2248,11 +2268,9 @@ class GTPShardedParam(torch.nn.Parameter):
                 pass  # next_w has not reduce-scattered yet, or something already finalized it
             elif getattr(self.next_w, "_already_finalized", False):
                 self.next_w._already_finalized = False
-                # No compute-stream fence needed: only MTP's double-RS weights
-                # (embedding/output) reach the force-finalize path, no other weight
-                # shares their vocab-sized LIFO bucket, and their next pop is behind
-                # the end-of-backward flush fence -- the buffers freed there cannot
-                # be re-popped within this backward.
+                # No fence needed here: nothing else shares these weights' vocab-sized
+                # bucket, and the one path that does re-pop them within this backward
+                # (get_wgrad_tensor's high-water guard) fences on rs_event itself.
             else:
                 self.next_w.rs_event.wait()
                 cache = get_global_GTP_cache()
