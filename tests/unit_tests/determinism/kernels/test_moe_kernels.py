@@ -334,10 +334,15 @@ class TestMoEModules:
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    def test_te_grouped_mlp_replays_on_uneven_experts(self):
+    @pytest.mark.parametrize(
+        "use_grouped_tensor", [False, True], ids=["multi-stream", "device-initiated"]
+    )
+    def test_te_grouped_mlp_replays_on_uneven_experts(self, use_grouped_tensor):
         self._init()
         seeded()
-        config = _moe_config(hidden_size=2048, ffn_hidden_size=4096)
+        config = _moe_config(
+            hidden_size=2048, ffn_hidden_size=4096, moe_use_grouped_tensor=use_grouped_tensor
+        )
         spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
         experts = get_submodules(spec.submodules.mlp).experts(
             num_local_experts=8,
@@ -355,7 +360,7 @@ class TestMoEModules:
             (hidden, tokens_per_expert, probs),
             replays=3,
             contention=True,
-            what="TEGroupedMLP",
+            what=f"TEGroupedMLP[grouped_tensor={use_grouped_tensor}]",
         )
 
     def test_sequential_mlp_replays_on_uneven_experts(self):

@@ -15,7 +15,8 @@ import os
 import pytest
 import torch
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
+import megatron.core.extensions.transformer_engine as te_ext
+from megatron.core.extensions.transformer_engine import HAVE_TE, mark_grouped_tensor
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -70,6 +71,21 @@ class TestTEWrappers:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_mark_grouped_tensor_is_numerically_transparent(self):
+        """The paged-stash marker must not change activation values or gradients."""
+        if te_ext._te_mark_grouped_tensor is None:
+            pytest.skip("Transformer Engine does not provide mark_grouped_tensor")
+
+        seeded()
+        x = torch.randn(TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def fn(x):
+            mark_grouped_tensor(x)
+            assert x.grouped_tensor_scale_inv is False
+            return x.square()
+
+        assert_replays_bit_exact(fn, (x,), replays=3, what="mark_grouped_tensor")
 
     def test_te_column_parallel_linear_replays(self):
         seeded()
