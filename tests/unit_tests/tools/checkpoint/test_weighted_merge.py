@@ -18,6 +18,7 @@ from megatron.core.dist_checkpointing import ShardedObject, ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tools.checkpoint import weighted_merge as weighted_merge_module
@@ -173,6 +174,7 @@ def _generated_gpt_model_state(value):
         max_sequence_length=8,
         pre_process=True,
         post_process=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     with torch.no_grad():
         for parameter in model.parameters():
@@ -206,6 +208,7 @@ def _generated_moe_gpt_model_state(value):
         max_sequence_length=8,
         pre_process=True,
         post_process=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     with torch.no_grad():
         for parameter in model.parameters():

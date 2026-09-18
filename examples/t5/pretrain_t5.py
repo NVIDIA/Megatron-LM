@@ -90,6 +90,8 @@ def model_provider(
     Returns:
         T5Model: The returned T5 model
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     args = get_args()
 
@@ -137,9 +139,7 @@ def model_provider(
         relative_attention_max_distance=args.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp', 'pp', 'embd']
-        ),
+        pg_collection=pg_collection,
     )
 
     return model

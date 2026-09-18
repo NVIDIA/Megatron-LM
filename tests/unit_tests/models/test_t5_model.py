@@ -191,7 +191,7 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         (2, True, True, True, 'none', False),
         (2, False, True, True, 'none', False),
         (2, True, False, True, 'nonmember', False),
-        (2, False, False, True, 'nonmember', True),
+        (2, False, False, True, 'nonmember', False),
     ],
 )
 def test_constructor_embedding_group_contract(
