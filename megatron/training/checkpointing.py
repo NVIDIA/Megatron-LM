@@ -637,6 +637,7 @@ def save_checkpoint(
     pp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -657,7 +658,10 @@ def save_checkpoint(
 
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
-        dp_group: Data parallel group (default: None, falls back to mpu API)
+        dp_group: Data parallel replicate group, for RNG state and checkpoint replicas
+            (default: None, falls back to mpu API)
+        dp_gtp_remat_group: Full data-distribution group (dp x gtp_remat), for indexing the
+            per-rank dataloader state (default: None, falls back to mpu API)
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
         cp_group: Context-parallel group for dataloader saving. Falls back to the MPU group
             when available. Callers using CP without global MPU initialization must pass it.
@@ -744,17 +748,6 @@ def save_checkpoint(
         expert_parallel=expert_parallel,
         expert_rank=expert_rank,
         return_base_dir=return_base_dir,
-    )
-
-    # Save dataloader state if the external dataloader supports it.
-    maybe_save_dataloader_state(
-        train_data_iterator,
-        iteration,
-        getattr(args, 'dataloader_save', None),
-        tp_group=tp_group,
-        pp_group=pp_group,
-        dp_group=dp_group,
-        cp_group=cp_group,
     )
 
     # Save distributed optimizer's custom parameter state.
@@ -1034,6 +1027,22 @@ def save_checkpoint(
                 # Save.
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
+
+    # Save dataloader state if the external dataloader supports it. This runs after the
+    # checkpoint write: the dataloader state lands in the same iteration directory, and
+    # dist_checkpointing.save treats a non-empty directory as a partial checkpoint left by a
+    # crash. The dataloader shards on the full data-distribution axis, so gtp_remat peers hold
+    # distinct micro-batches and need distinct state files: pass dp x gtp_remat here, not the
+    # replicate dp_group.
+    maybe_save_dataloader_state(
+        train_data_iterator,
+        iteration,
+        getattr(args, 'dataloader_save', None),
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_group=dp_gtp_remat_group,
+        cp_group=cp_group,
+    )
 
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
@@ -1517,13 +1526,21 @@ def maybe_save_dataloader_state(
     If the provided dataloader has `save_state` method, then it is called to save the state.
     Otherwise, no state is saved.
 
+    State is written once per data-parallel rank, as `train_dataloader_dprank{rank}.pt`. A
+    dataloader whose `save_state` returns the same state on every data-parallel rank can set
+    `is_save_state_rank_independent = True` on the iterable; then only data rank 0 writes,
+    to `train_dataloader_dprank000.pt`, and every rank restores from that file. `save_state`
+    is then called on data rank 0 only, so it must not be collective.
+
     Args:
         train_iterator (iterable): Train dataloader.
         iteration (int): Current iteration.
         dataloader_save_path (str): Path where the dataloader state is saved.
         tp_group (ProcessGroup): Tensor-parallel group, or MPU fallback when unset.
         pp_group (ProcessGroup): Pipeline-parallel group, or MPU fallback when unset.
-        dp_group (ProcessGroup): Data-parallel group, or MPU fallback when unset.
+        dp_group (ProcessGroup): Full data-distribution group (dp x gtp_remat), matching the
+            axis the dataloader shards on, or MPU fallback when unset. Passing the replicate
+            data-parallel group instead makes gtp_remat peers write the same file.
         cp_group (ProcessGroup): Context-parallel group, or the MPU group when available.
             No group preserves the TP0/PP0 writer behavior without requiring MPU initialization.
     """
@@ -1557,7 +1574,18 @@ def maybe_save_dataloader_state(
         return
 
     dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
-    train_dataloader_state_dict = train_iterator.iterable.save_state()
+    # A loader that advances a global cursor and slices it by rank returns the same state on
+    # every data-parallel rank. It can say so to collapse the per-rank files into a single
+    # dprank000 file that every rank restores from.
+    is_save_state_rank_independent = getattr(
+        train_iterator.iterable, 'is_save_state_rank_independent', False
+    )
+    # Ranks that will not write anything skip building the state at all.
+    writes_state_file = dp_rank == 0 or not is_save_state_rank_independent
+    train_dataloader_state_dict = (
+        train_iterator.iterable.save_state() if writes_state_file else None
+    )
+    state_file_rank = 0 if is_save_state_rank_independent else dp_rank
     if dp_rank == 0:
         print(f'saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}')
     data_state_save_path = get_checkpoint_name(
@@ -1573,7 +1601,7 @@ def maybe_save_dataloader_state(
         pipeline_rank=0,
         expert_parallel=False,
         expert_rank=0,
-        basename=f'train_dataloader_dprank{dp_rank:03d}.pt',
+        basename=f'train_dataloader_dprank{state_file_rank:03d}.pt',
     )
 
     data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
