@@ -129,6 +129,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
         super().__init__(config=config, pg_collection=pg_collection)
+        # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
+        if self.config.freeze_base_model_for_mtp and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 1
+        ):
+            raise ValueError("freeze_base_model_for_mtp requires mtp_num_layers >= 1.")
+        if self.config.mtp_hsm and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 2
+        ):
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
+        if self.config.mtp_hybrid_override_pattern is not None:
+            raise ValueError(
+                "mtp_hybrid_override_pattern is not supported by GPTModel. "
+                "For GPT models, define MTP layers through mtp_block_spec."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

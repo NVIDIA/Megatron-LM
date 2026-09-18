@@ -261,6 +261,100 @@ class TestHybridModel:
 
         assert model_config.tp_comm_overlap is True
 
+    def test_mtp_requires_template(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+        )
+        with pytest.raises(
+            ValueError, match="HybridModel has mtp_num_layers set but no MTP template"
+        ):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-",
+            )
+
+    @pytest.mark.parametrize("mtp_num_layers", [0, 1, 3])
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True])
+    def test_mtp_rejects_pattern_depth_mismatch(
+        self, mocker, mtp_num_layers, mtp_use_repeated_layer
+    ):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        )
+        build = mocker.patch("megatron.core.models.hybrid.hybrid_model.build_module")
+        with pytest.raises(
+            ValueError,
+            match=f"hybrid_layer_pattern defines 2 MTP depths, but mtp_num_layers is {mtp_num_layers}",
+        ):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-/-/-",
+            )
+
+        assert config.mtp_num_layers == mtp_num_layers
+        build.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("pattern", "mtp_num_layers"), [("-", None), ("-/-", None), ("-/-", 1)]
+    )
+    def test_hsm_requires_two_architecture_heads(self, pattern, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        with pytest.raises(ValueError, match="mtp_hsm=True requires at least two MTP heads"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern=pattern,
+            )
+
+        assert config.mtp_hsm is True
+
+    @pytest.mark.parametrize("mtp_num_layers", [None, 2])
+    def test_hsm_accepts_inferred_or_matching_mtp_depth(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="-/-/-",
+        )
+
+        assert config.mtp_num_layers == 2
+        assert config.mtp_hsm is True
+        assert model.mtp_process is True
+        assert len(model.mtp.layers) == 2
+
     def test_mtp_placement_uses_model_pipeline_group(self, mocker):
         placement = mocker.patch(
             "megatron.core.models.hybrid.hybrid_model.mtp_on_this_rank", return_value=False
