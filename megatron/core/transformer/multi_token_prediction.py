@@ -21,6 +21,7 @@ from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -1129,6 +1130,21 @@ def process_mtp_loss(
         )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
+        if is_observing_tensor("mtp_logits"):
+            gather_output = (
+                getattr(output_layer, "gather_output")
+                if runtime_gather_output is None
+                else runtime_gather_output
+            )
+            observe_tensor(
+                output_layer,
+                f"mtp_logits.{mtp_layer_number}",
+                "mtp_logits",
+                mtp_logits,
+                tp_shard_dim=None if gather_output else -1,
+                sequence_dim=0,
+                batch_dim=1,
+            )
         mtp_labels, _ = roll_tensor(
             mtp_labels,
             shifts=-1,
@@ -1342,6 +1358,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 "skip_bias_add": False,
                 "is_expert": False,
                 "tp_group": pg_collection.tp if pg_collection is not None else None,
+                # Pass the collection, not just tp: the linear reads its GTP axis from it.
+                # With only tp_group it falls back to the MPU globals, which a MIMO run
+                # never creates, and the projection is then silently built unsharded.
+                "pg_collection": pg_collection,
             }
             self.e_proj = build_module(
                 self.submodules.e_proj,
@@ -1374,6 +1394,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_expert=False,
                 tp_comm_buffer_name="mtp_eh_proj",
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                # Same reason as projection_kwargs above: the GTP axis comes from the
+                # collection, and tp_group alone leaves it to the MPU fallback.
+                pg_collection=pg_collection,
                 name=(name + ".eh_proj") if name is not None else None,
             )
             self.e_proj = None
@@ -2164,6 +2187,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
+        if self.config.mtp_hsm and (
+            self.config.mtp_num_layers is None
+            or self.config.mtp_num_layers < 2
+            or 0 < mtp_num_depths < 2
+        ):
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
                 raise ValueError(

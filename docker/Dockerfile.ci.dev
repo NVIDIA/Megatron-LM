@@ -65,7 +65,7 @@ RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_n
     esac
 EOF
 
-COPY README.md pyproject.toml uv.lock /workspace/
+COPY pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
@@ -94,6 +94,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
     UV_CONCURRENT_INSTALLS=1 uv sync -v \
         --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+        --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -186,6 +187,11 @@ RUN bash -ex <<"EOF"
     popd
     rm -rf DeepEP
 EOF
+
+# Install the local project after expensive dependency builds so README-only
+# changes do not invalidate those layers.
+COPY README.md /workspace/
+RUN uv pip install --no-build-isolation --no-deps -e /workspace
 
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python

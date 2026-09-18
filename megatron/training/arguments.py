@@ -903,47 +903,13 @@ def validate_args(args, defaults={}):
         )
 
     if args.freeze_base_model_for_mtp:
-        assert args.mtp_num_layers, (
-            "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
-        )
         assert not args.freeze_all_layers, (
             "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
         )
 
-    if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
-        warn_rank_0(
-            "--mtp-hsm needs at least two MTP layers to mix anything, but "
-            f"--mtp-num-layers is {args.mtp_num_layers}. Disabling Hidden State Mixing.",
-            args.rank,
-        )
-        args.mtp_hsm = False
-
-    # Validate MTP args for hybrid vs non-hybrid models
-    if args.hybrid_layer_pattern is not None:
-        # Mamba/hybrid model MTP validation
-        if args.mtp_num_layers and not (args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern):
-            # Hybrid model wants MTP but no unified pattern - check for legacy args
-            if args.mtp_hybrid_override_pattern is None:
-                warn_rank_0(
-                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
-                    "Use unified --hybrid-layer-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
-                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
-                    args.rank
-                )
-    else:
-        # Non-hybrid (GPT) model MTP validation
-        if args.mtp_hybrid_override_pattern is not None:
-            warn_rank_0(
-                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
-                "For GPT models, MTP replicates the main transformer layer structure. "
-                "This argument will be ignored.",
-                args.rank
-            )
-
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and (
-            Symbols.MLA in args.hybrid_layer_pattern
-            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    # All MLA-based hybrid attention symbols use MLA projections.
+    if args.hybrid_layer_pattern and any(
+        symbol in args.hybrid_layer_pattern for symbol in Symbols.MLA_ATTENTION
     ):
         args.multi_latent_attention = True
 
@@ -3380,10 +3346,11 @@ def _add_distributed_args(parser):
                             'The "optim" option is only supported when --data-parallel-sharding-strategy is "optim_grads_params". '
                             'This option is only effective when Hybrid FSDP is enabled (i.e., when dp_outer_dim is not None). '
                             'Default: "no_shard".')
-    group.add_argument('--expert-outer-dp-sharding-strategy', type=str, default='no_shard',
+    group.add_argument('--expert-outer-dp-sharding-strategy', type=str, default=None,
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for the outer expert data-parallel group in MFSDP v2. '
-                            'Valid values are "no_shard" (HSDP) and "optim" (HFSDP).')
+                            'Valid values are "no_shard" (HSDP) and "optim" (HFSDP). '
+                            'Defaults to --outer-dp-sharding-strategy when omitted.')
     group.add_argument('--hfsdp-param-gather-overlap', action='store_true',
                        help='Pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner. '
                             'DP-Outer is prefetched one FSDP unit beyond the existing '
