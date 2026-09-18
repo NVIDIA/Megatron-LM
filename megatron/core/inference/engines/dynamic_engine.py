@@ -149,6 +149,19 @@ class EngineSuspendedError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class _VisionCacheEntry:
+    """Projected embedding and the preprocessed media needed to reuse it."""
+
+    embedding: Tensor
+    modality: str
+    imgs: Tensor
+    num_tiles: Optional[Tensor]
+    num_img_embeddings_per_tile: int
+    imgs_sizes: Optional[Tensor]
+    num_frames: Optional[Tensor]
+
+
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
     if mem_bytes < 0:
@@ -386,7 +399,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         if self.vision_embedding_cache_max_bytes < 0:
             raise ValueError("vision_embedding_cache_max_bytes must be non-negative.")
-        self._vision_embedding_cache: OrderedDict[str, Tensor] = OrderedDict()
+        self._vision_embedding_cache: OrderedDict[str, _VisionCacheEntry] = OrderedDict()
         self._vision_embedding_cache_bytes = 0
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
@@ -612,10 +625,30 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @staticmethod
     def _tensor_nbytes(tensor: Tensor) -> int:
-        return tensor.numel() * tensor.element_size()
+        return tensor.untyped_storage().nbytes()
+
+    def _vision_cache_entry_nbytes(self, entry: _VisionCacheEntry) -> int:
+        total_bytes = 0
+        seen_storages = set()
+        for tensor in (
+            entry.embedding,
+            entry.imgs,
+            entry.num_tiles,
+            entry.imgs_sizes,
+            entry.num_frames,
+        ):
+            if tensor is None or not tensor.is_cuda:
+                continue
+            storage = tensor.untyped_storage()
+            storage_key = (tensor.device, storage.data_ptr())
+            if storage_key in seen_storages:
+                continue
+            seen_storages.add(storage_key)
+            total_bytes += self._tensor_nbytes(tensor)
+        return total_bytes
 
     def clear_vision_embedding_cache(self) -> None:
-        """Release all projected-media embeddings retained by this engine."""
+        """Release all projected embeddings and reusable media retained by this engine."""
         self._vision_embedding_cache.clear()
         self._vision_embedding_cache_bytes = 0
 
@@ -702,37 +735,78 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request.image_embeddings = embeddings
         request.image_token_mask = mask
-        self._cache_vision_embedding(request.block_hash_salt, embeddings)
+        self._cache_vision_embedding(
+            request.media_cache_key,
+            embeddings,
+            modality=modality,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            num_img_embeddings_per_tile=request.num_img_embeddings_per_tile,
+            imgs_sizes=imgs_sizes,
+            num_frames=num_frames,
+        )
         self.context.add_vlm_request_data(
             request.request_id, image_embeddings=embeddings, image_token_mask=mask
         )
 
-    def _get_cached_vision_embedding(self, cache_key: Optional[str]) -> Optional[Tensor]:
-        if not cache_key or self.vision_embedding_cache_max_bytes == 0:
+    def _get_cached_vision_entry(
+        self, cache_key: Optional[str], modality: Optional[str] = None
+    ) -> Optional[_VisionCacheEntry]:
+        """Return and promote a complete reusable vision-cache entry."""
+        if (
+            not cache_key
+            or self.vision_embedding_cache_max_bytes == 0
+            or cache_key not in self._vision_embedding_cache
+        ):
             return None
-        embedding = self._vision_embedding_cache.pop(cache_key, None)
-        if embedding is not None:
-            self._vision_embedding_cache[cache_key] = embedding
-        return embedding
+        entry = self._vision_embedding_cache[cache_key]
+        if modality is not None and entry.modality != modality:
+            return None
+        self._vision_embedding_cache.move_to_end(cache_key)
+        return entry
 
-    def _cache_vision_embedding(self, cache_key: Optional[str], embedding: Tensor) -> None:
+    def _get_cached_vision_embedding(self, cache_key: Optional[str]) -> Optional[Tensor]:
+        entry = self._get_cached_vision_entry(cache_key)
+        return entry.embedding if entry is not None else None
+
+    def _cache_vision_embedding(
+        self,
+        cache_key: Optional[str],
+        embedding: Tensor,
+        *,
+        modality: str,
+        imgs: Tensor,
+        num_tiles: Optional[Tensor] = None,
+        num_img_embeddings_per_tile: int = 0,
+        imgs_sizes: Optional[Tensor] = None,
+        num_frames: Optional[Tensor] = None,
+    ) -> None:
         if not cache_key or self.vision_embedding_cache_max_bytes == 0:
             return
-        embedding_bytes = self._tensor_nbytes(embedding)
-        if embedding_bytes > self.vision_embedding_cache_max_bytes:
+        entry = _VisionCacheEntry(
+            embedding=embedding,
+            modality=modality,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+            imgs_sizes=imgs_sizes,
+            num_frames=num_frames,
+        )
+        cache_entry_bytes = self._vision_cache_entry_nbytes(entry)
+        if cache_entry_bytes > self.vision_embedding_cache_max_bytes:
             return
         previous = self._vision_embedding_cache.pop(cache_key, None)
         if previous is not None:
-            self._vision_embedding_cache_bytes -= self._tensor_nbytes(previous)
+            self._vision_embedding_cache_bytes -= self._vision_cache_entry_nbytes(previous)
         while (
             self._vision_embedding_cache
-            and self._vision_embedding_cache_bytes + embedding_bytes
+            and self._vision_embedding_cache_bytes + cache_entry_bytes
             > self.vision_embedding_cache_max_bytes
         ):
             _, evicted = self._vision_embedding_cache.popitem(last=False)
-            self._vision_embedding_cache_bytes -= self._tensor_nbytes(evicted)
-        self._vision_embedding_cache[cache_key] = embedding
-        self._vision_embedding_cache_bytes += embedding_bytes
+            self._vision_embedding_cache_bytes -= self._vision_cache_entry_nbytes(evicted)
+        self._vision_embedding_cache[cache_key] = entry
+        self._vision_embedding_cache_bytes += cache_entry_bytes
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -1709,6 +1783,7 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
+        media_cache_key: Optional[str] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1741,6 +1816,9 @@ class DynamicInferenceEngine(AbstractEngine):
             num_frames (Optional[Tensor]): Number of frames per image/video item.
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
+            media_cache_key (Optional[str]): Media identity computed by the submitting
+                inference client. Direct callers may omit it and let the engine derive
+                an identity from the resolved media tensors.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1751,7 +1829,10 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params = SamplingParams()
 
         input_modalities = ["text"]
-        if num_frames is not None:
+        cached_vision_entry = self._get_cached_vision_entry(media_cache_key)
+        if cached_vision_entry is not None:
+            input_modalities.append(cached_vision_entry.modality)
+        elif num_frames is not None:
             input_modalities.append("video")
         elif imgs is not None:
             input_modalities.append("image")
@@ -1793,20 +1874,27 @@ class DynamicInferenceEngine(AbstractEngine):
             or num_img_embeddings_per_tile != 0
             or imgs_sizes is not None
             or num_frames is not None
+            or media_cache_key is not None
         ):
-            request = self._build_vlm_request(
-                request_id=request_id,
-                prompt_str=prompt_str,
-                tokens=tokens,
-                sampling_params=sampling_params,
-                imgs=imgs,
-                num_tiles=num_tiles,
-                num_img_embeddings_per_tile=num_img_embeddings_per_tile,
-                imgs_sizes=imgs_sizes,
-                precomputed_block_hashes=precomputed_block_hashes,
-                num_frames=num_frames,
-                media_tokens_preexpanded=media_tokens_preexpanded,
-            )
+            nvtx_range = "megatron.inference.multimodal.build_vlm_request"
+            nvtx_range_push(nvtx_range)
+            try:
+                request = self._build_vlm_request(
+                    request_id=request_id,
+                    prompt_str=prompt_str,
+                    tokens=tokens,
+                    sampling_params=sampling_params,
+                    imgs=imgs,
+                    num_tiles=num_tiles,
+                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                    imgs_sizes=imgs_sizes,
+                    precomputed_block_hashes=precomputed_block_hashes,
+                    num_frames=num_frames,
+                    media_tokens_preexpanded=media_tokens_preexpanded,
+                    media_cache_key=media_cache_key,
+                )
+            finally:
+                nvtx_range_pop(nvtx_range)
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
             # _add_request now rejects the request (oversized prompt, cache
@@ -1850,11 +1938,21 @@ class DynamicInferenceEngine(AbstractEngine):
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
+        media_cache_key: Optional[str] = None,
     ) -> DynamicVLMInferenceRequest:
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
         """
-        if num_frames is not None:
+        cached_vision_entry = self._get_cached_vision_entry(media_cache_key)
+        if cached_vision_entry is not None:
+            modality = cached_vision_entry.modality
+            imgs = cached_vision_entry.imgs
+            num_tiles = cached_vision_entry.num_tiles
+            num_img_embeddings_per_tile = cached_vision_entry.num_img_embeddings_per_tile
+            imgs_sizes = cached_vision_entry.imgs_sizes
+            num_frames = cached_vision_entry.num_frames
+        elif num_frames is not None:
+            modality = "video"
             missing = [
                 name
                 for name, value in (("imgs", imgs), ("imgs_sizes", imgs_sizes))
@@ -1865,13 +1963,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     "Video input requires imgs, imgs_sizes, and num_frames; " f"missing {missing}."
                 )
         elif imgs_sizes is not None:
+            modality = "image"
             if imgs is None:
                 raise ValueError("Dynamic-resolution image input requires imgs and imgs_sizes.")
-        elif imgs is None or num_tiles is None or num_img_embeddings_per_tile <= 0:
-            raise ValueError(
-                "Static-tiling image input requires imgs, num_tiles, and "
-                "num_img_embeddings_per_tile > 0."
-            )
+        else:
+            modality = "image"
+            if imgs is None or num_tiles is None or num_img_embeddings_per_tile <= 0:
+                raise ValueError(
+                    "Static-tiling image input requires imgs, num_tiles, and "
+                    "num_img_embeddings_per_tile > 0."
+                )
 
         # PP>1 needs a non-first-stage embedding recv path (the wrapper's
         # _recv_only_vision_embeds TODO). Until that lands, only PP=1 is
@@ -1889,14 +1990,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 "which is not yet available upstream."
             )
 
-        # Compute multimodal media cache key, which is used by generators to
-        # skip re-computing multimodal embeddings if the cache is hit.
-        modality = "video" if num_frames is not None else "image"
-        media_cache_key = None
+        # Multimodal request preparation.
         needs_media_identity = self.context.enable_prefix_caching or (
-            getattr(self, "vision_embedding_cache_max_bytes", 0) > 0
+            self.vision_embedding_cache_max_bytes > 0
         )
-        if imgs is not None and needs_media_identity:
+        if media_cache_key is None and imgs is not None and needs_media_identity:
+            # Compute multimodal media cache key, which is used by generators to
+            # skip re-computing multimodal embeddings if the cache is hit.
+            # Strongly recommend generating this hash upstream, such as via
+            # the InferenceClient or providing this argument in add_request().
             media_inputs = {"imgs": imgs}
             for name, value in (
                 ("num_tiles", num_tiles),
@@ -1918,7 +2020,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # imgs_sizes downstream and don't need num_tiles.sum() at admission.
         # Static-tiling requests do; only pay the D2H sync on that path so
         # dynamic-res admissions stay sync-free here.
-        has_images = imgs_sizes is not None and imgs is not None
+        has_images = imgs_sizes is not None and (
+            imgs is not None or cached_vision_entry is not None
+        )
         if not has_images:
             total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
             num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
@@ -1995,7 +2099,16 @@ class DynamicInferenceEngine(AbstractEngine):
                         f"position(s), but the vision encoder produced "
                         f"{actual_embedding_count} embedding(s)."
                     )
-                self._cache_vision_embedding(media_cache_key, image_embeddings)
+                self._cache_vision_embedding(
+                    media_cache_key,
+                    image_embeddings,
+                    modality=modality,
+                    imgs=imgs,
+                    num_tiles=num_tiles,
+                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                    imgs_sizes=imgs_sizes,
+                    num_frames=num_frames,
+                )
 
         self.context.add_vlm_request_data(
             request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor
@@ -2030,6 +2143,7 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
             media_tokens_preexpanded=media_tokens_preexpanded,
+            media_cache_key=media_cache_key,
             decoder_seq_length=0,
             image_embeddings=image_embeddings,
             image_token_mask=mask_tensor,
@@ -3742,40 +3856,69 @@ class DynamicInferenceEngine(AbstractEngine):
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
                 request_id, sampling_params, media_meta = data[1:]
-                # The prompt and the media each ride in their own frame; the
-                # engine is their first consumer, so this is where they finally
-                # get decoded. The coordinator forwarded both untouched, and
-                # only the bounded media descriptor travelled in the metadata.
-                prompt = msgpack.unpackb(message[1], raw=False)
-                multi_modal_data = merge_multimodal_data(
-                    media_meta, msgpack.unpackb(message[2], raw=False)
-                )
-                sampling_params = SamplingParams.deserialize(sampling_params)
+                # The prompt and the media each ride in their own frame. The
+                # coordinator forwarded both untouched, while the bounded media
+                # descriptor lets a cache hit avoid decoding the payload frame.
+                nvtx_range = "megatron.inference.multimodal.message_unpack"
+                nvtx_range_push(nvtx_range)
+                try:
+                    prompt = msgpack.unpackb(message[1], raw=False)
+                    media_cache_key = (
+                        media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
+                    )
+                    media_modality = (
+                        media_meta.get("modality") if isinstance(media_meta, dict) else None
+                    )
+                    cached_vision_entry = self._get_cached_vision_entry(
+                        media_cache_key, media_modality
+                    )
+                    if cached_vision_entry is None:
+                        media_payload = msgpack.unpackb(message[2], raw=False)
+                        multi_modal_data = merge_multimodal_data(media_meta, media_payload)
+                    else:
+                        multi_modal_data = None
+                    sampling_params = SamplingParams.deserialize(sampling_params)
+                finally:
+                    nvtx_range_pop(nvtx_range)
                 nvtx_range_push("add_request")
-                # TODO(perf): media preprocessing (decode / resize / normalize /
-                # patchify) runs synchronously on the engine step
+                # TODO(perf): uncached media preprocessing (decode / resize /
+                # normalize / patchify) runs synchronously on the engine step
                 # loop, adding directly to inter-token latency for every
                 # in-flight request. Move off the engine thread — either via a
                 # bounded ThreadPoolExecutor here or, better, on the
                 # server/coordinator side before the ZMQ hop so the engine
                 # receives ready tensors.
                 try:
-                    if multi_modal_data is None:
+                    if cached_vision_entry is not None:
+                        vlm_kwargs = {
+                            "media_cache_key": media_cache_key,
+                            "media_tokens_preexpanded": bool(
+                                media_meta.get("media_tokens_preexpanded", False)
+                            ),
+                        }
+                    elif multi_modal_data is None:
                         # Skip the config-attribute lookup for text-only
                         # requests so test fixtures (DummyContext) without an
                         # image_preprocessing_config don't AttributeError on
                         # every SUBMIT_REQUEST and desync the ranks.
                         vlm_kwargs = {}
                     else:
-                        vlm_kwargs = resolve_multimodal_data_for_engine(
-                            multi_modal_data,
-                            image_preprocessing_config=(
-                                self.context.config.image_preprocessing_config
-                            ),
-                            video_preprocessing_config=(
-                                self.context.config.video_preprocessing_config
-                            ),
+                        nvtx_range = (
+                            "megatron.inference.multimodal.resolve_multimodal_data_for_engine"
                         )
+                        nvtx_range_push(nvtx_range)
+                        try:
+                            vlm_kwargs = resolve_multimodal_data_for_engine(
+                                multi_modal_data,
+                                image_preprocessing_config=(
+                                    self.context.config.image_preprocessing_config
+                                ),
+                                video_preprocessing_config=(
+                                    self.context.config.video_preprocessing_config
+                                ),
+                            )
+                        finally:
+                            nvtx_range_pop(nvtx_range)
                     if vlm_kwargs:
                         self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
                     else:
