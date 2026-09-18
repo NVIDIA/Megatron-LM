@@ -115,10 +115,15 @@ def main() -> int:
     all_ok = True
     metadata_failed = False
     numeric_failed = False
+    for batch_key in sorted(results.keys() - baseline.keys()):
+        print(f"FAIL: {batch_key} present in results but missing from baseline")
+        all_ok = False
+        metadata_failed = True
     for batch_key, baseline_entry in baseline.items():
         if batch_key not in results:
             print(f"FAIL: {batch_key} present in baseline but missing from results")
             all_ok = False
+            metadata_failed = True
             continue
         print(f"\n[{batch_key}]")
         measured_entry = results[batch_key]

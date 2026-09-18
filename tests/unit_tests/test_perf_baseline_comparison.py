@@ -106,6 +106,26 @@ def test_configured_tolerances_remain_effective(comparison):
     assert run() == 1
 
 
+@pytest.mark.parametrize("side", ["results", "baseline"])
+@pytest.mark.parametrize("numeric_failed", [False, True])
+def test_unmatched_batch_fails_without_hiding_comparable_metrics(
+    comparison, capsys, side, numeric_failed
+):
+    results, baseline, _, run = comparison
+    entries = {"results": results, "baseline": baseline}[side]
+    entries["batch_32"] = dict(entries["batch_1"], batch_size=32)
+    if numeric_failed:
+        results["batch_1"]["avg_latency_ms"] = 200.0
+    assert run() == 1
+    output = capsys.readouterr().out
+    missing_side = "baseline" if side == "results" else "results"
+    assert f"batch_32 present in {side} but missing from {missing_side}" in output
+    assert "INCOMPARABLE:" in output
+    assert ("REGRESSION:" in output) == numeric_failed
+    assert "measured=" in output
+    assert "OK: all metrics" not in output
+
+
 def test_gsm8k_average_input_length_is_not_an_equality_gate(comparison):
     results, _, _, run = comparison
     results["batch_1"]["num_input_tokens_avg"] = 66.2
