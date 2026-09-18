@@ -94,11 +94,11 @@ jobs:
 
           AWS_H100=$(jq -nc --arg build_runner "$BUILD_RUNNER" --arg registry "$REGISTRY_AWS" \
             --arg runner "$SELECTED_RUNNER" \
-            '{"build_runner": $build_runner, "cloud": "aws-h100", "platform": "linux/amd64", "registry": $registry, "runner": $runner}')
+            '{"build_runner": $build_runner, "cloud": "aws-h100", "platform": "linux/amd64", "region": "us-east-1", "registry": $registry, "runner": $runner}')
           if [ "$IS_MAINTAINER" = "true" ] && [ "$ENABLE_GB_TESTING" = "true" ]; then
             GB_GPU=$(jq -nc --arg build_runner "$BUILD_RUNNER" --arg registry "$REGISTRY_GB_GPU" \
               --arg runner "$SELECTED_RUNNER_GB_GPU" \
-              '{"build_runner": $build_runner, "cloud": "gb-gpu", "platform": "linux/arm64", "registry": $registry, "runner": $runner}')
+              '{"build_runner": $build_runner, "cloud": "gb-gpu", "platform": "linux/arm64", "region": "us-east-2", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
               '{"include": [$aws, $gb_gpu]}')
           else
@@ -299,6 +299,12 @@ jobs:
           echo "key=$CACHE_KEY" | tee -a "$GITHUB_OUTPUT"
           echo "target-build-hash=$TARGET_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Login to ECR
+        if: matrix.build_runner == 'nvidia-ci-aws-cpu'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        env:
+          AWS_REGION: ${{ matrix.region }}
 
       - name: Set up QEMU
         if: matrix.platform == 'linux/arm64'
