@@ -3912,13 +3912,18 @@ def _run_gpu_sniff_test(
     # The startup and periodic call sites use distinct span names. The tag
     # additionally records which invocation this is.
     with _otel.gpu_sniff_span(span_name, tag, training_step):
+        measurement_sink = _otel.gpu_sniff_measurement_sink(training_step)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=['ep', 'dp', 'tp'],
         )
         print_datetime(f'running GPU sniff test ({tag})')
         timers = get_timers()
         timers('gpu-sniff-test', log_level=0).start(barrier=True)
-        run_gpu_sniff_test(tag, pg_collection=pg_collection)
+        run_gpu_sniff_test(
+            tag,
+            pg_collection=pg_collection,
+            measurement_sink=measurement_sink,
+        )
         timers('gpu-sniff-test').stop(barrier=True)
     timers.log(['gpu-sniff-test'])
     print_datetime(f'finished GPU sniff test ({tag})')

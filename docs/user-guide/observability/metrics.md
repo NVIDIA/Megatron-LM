@@ -53,3 +53,23 @@ ad hoc names in call sites.
 
 See [lens: metrics](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/metrics.md)
 for general instrument guidance.
+
+## GPU-sniff measurement events
+
+Each finite local benchmark result emits an
+`nv.dl.resiliency.gpu_sniff.measurement` event before the existing gather and
+outlier logging path. Every participating rank reports its own event with
+`nv.dl.measurement.domain=local`.
+
+The event identifies the benchmark (`gemm`, `all_reduce`, `reduce_scatter`,
+`all_to_all`, or `send_recv`), its value, and an exact unit: `TFLOP/s` for GEMM
+or `GB/s` for communication. GEMM events also carry dimensions, dtype, and an
+optional configured label. Communication events carry message and group size;
+send/receive events additionally carry peer stride and global peer rank. A
+non-participating send/receive rank emits no measurement event.
+
+Startup measurements attach to `nv.dl.resiliency.gpu_sniff.startup` and omit
+the training step. Periodic measurements attach to
+`nv.dl.resiliency.gpu_sniff.periodic` and include the one-based training step.
+If the explicit GPU-sniff span is unavailable, the event helper falls back to
+the current recording span; with no recording span it safely does nothing.
