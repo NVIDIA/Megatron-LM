@@ -38,6 +38,7 @@ def _config(**overrides):
         gradient_accumulation_fusion=False,
         experimental_attention_variant="gdn",
         linear_attention_freq=[1],
+        linear_cp_mode="headwise",
         transformer_impl="transformer_engine",
     )
     kwargs.update(overrides)
@@ -99,7 +100,7 @@ def _model(pre_fusion, recompute=False, **overrides):
         cp=parallel_state.get_context_parallel_group(),
     )
     model = spec.module(config, submodules=spec.submodules, layer_number=1, pg_collection=groups)
-    return model.cuda().bfloat16()
+    return model.cuda().to(config.params_dtype)
 
 
 def _inputs(packed):
@@ -154,8 +155,9 @@ def test_post_fusion_module_parity(model_parallel, packed, recompute, pre_fusion
     _assert_close(actual, expected, grads, reference_grads)
 
 
-def test_post_fusion_revalidates_each_forward(model_parallel):
-    model = _model(False)
+@pytest.mark.parametrize("pre_fusion", [False, True])
+def test_post_fusion_revalidates_each_forward(model_parallel, pre_fusion):
+    model = _model(pre_fusion)
     model.config.gdn_gated_output_norm_fusion = True
     hidden = torch.randn(17, 1, 256, device="cuda", dtype=torch.bfloat16)
     with (
@@ -164,11 +166,90 @@ def test_post_fusion_revalidates_each_forward(model_parallel):
     ):
         model(hidden, None)
         assert norm.call_count == 1
-        with pytest.raises(ValueError, match="gate shape"):
-            model(hidden.expand(-1, 2, -1).contiguous(), None)
-        assert norm.call_count == 1
+        model(hidden.expand(-1, 2, -1).contiguous(), None)
+        assert norm.call_count == 2
+        model.out_norm = torch.nn.Identity()
+        with pytest.raises(ValueError, match="RMSNorm output"):
+            model(hidden, None)
+        assert norm.call_count == 2
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("batch,heads,dim", [(2, 8, 64), (3, 4, 256)])
+@pytest.mark.parametrize("pre_fusion", [False, True])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_dense_batch_and_head_layout_parity(
+    model_parallel, batch, heads, dim, pre_fusion, recompute, dtype
+):
+    model = _model(
+        pre_fusion,
+        recompute,
+        linear_num_value_heads=heads,
+        linear_key_head_dim=dim,
+        linear_value_head_dim=dim,
+        bf16=dtype == torch.bfloat16,
+        fp16=dtype == torch.float16,
+        params_dtype=dtype,
+    )
+    hidden = torch.randn(129, batch, 256, device="cuda", dtype=dtype)
+    dy = torch.randn_like(hidden)
+    expected, reference_grads = _run(model, hidden, dy, None)
+    model.config.gdn_gated_output_norm_fusion = True
+    with patch.object(gated_norm, "fused_gated_norm", wraps=gated_norm.fused_gated_norm) as norm:
+        actual, grads = _run(model, hidden, dy, None)
+        assert norm.call_count == (2 if recompute else 1)
+    _assert_close(actual, expected, grads, reference_grads)
 
 
 def test_pre_fusion_rejects_deterministic_mode(model_parallel):
     with pytest.raises(ValueError, match="Pre-GDR fusion is non-deterministic"):
         _model(True, deterministic_mode=True)
+
+
+@pytest.mark.parametrize("value_heads", [16, 64])
+@pytest.mark.parametrize(
+    "tp,cp,sequence_parallel", [(1, 2, False), (1, 4, False), (2, 2, True), (4, 1, True)]
+)
+@pytest.mark.parametrize("batch,packed", [(1, False), (2, False), (1, True)])
+@pytest.mark.parametrize("pre_fusion", [False, True])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_post_fusion_distributed_layout(
+    tp, cp, sequence_parallel, batch, packed, pre_fusion, recompute, value_heads
+):
+    """Enable the post fusion through CP redistribution and the complete backward."""
+    if torch.distributed.get_world_size() < tp * cp:
+        pytest.skip("This layout requires four distributed GPU ranks")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
+    )
+    try:
+        torch.manual_seed(321)
+        model_parallel_cuda_manual_seed(321)
+        model = _model(
+            pre_fusion,
+            recompute,
+            tensor_model_parallel_size=tp,
+            context_parallel_size=cp,
+            sequence_parallel=sequence_parallel,
+            linear_num_key_heads=value_heads // 4,
+            linear_num_value_heads=value_heads,
+            num_attention_heads=value_heads // 4,
+        )
+        length = 512
+        local_length = length // cp // (tp if sequence_parallel else 1)
+        hidden = torch.randn(local_length, batch, 256, device="cuda", dtype=torch.bfloat16)
+        dy = torch.randn_like(hidden)
+        cu = torch.tensor([0, 256, length], device="cuda", dtype=torch.int32)
+        metadata = (
+            PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu) if packed else None
+        )
+        expected, reference_grads = _run(model, hidden, dy, metadata)
+        model.config.gdn_gated_output_norm_fusion = True
+        with patch.object(
+            gated_norm, "fused_gated_norm", wraps=gated_norm.fused_gated_norm
+        ) as norm:
+            actual, grads = _run(model, hidden, dy, metadata)
+            assert norm.call_count == (2 if recompute else 1)
+        _assert_close(actual, expected, grads, reference_grads)
+    finally:
+        Utils.destroy_model_parallel()

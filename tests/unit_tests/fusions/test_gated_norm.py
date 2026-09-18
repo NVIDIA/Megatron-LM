@@ -85,36 +85,115 @@ def test_validate_supported_layout(norm_inputs, contiguous_gate):
     gated_norm.validate_gated_norm(module, x, gate)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("zero_centered", [False, True])
+@pytest.mark.parametrize(
+    "shape,layout",
+    [
+        ((1, 37, 16, 128), "sequence_projection"),
+        ((2, 37, 16, 128), "sequence_projection"),
+        ((3, 17, 8, 64), "sequence_projection"),
+        ((2, 13, 4, 256), "sequence_projection"),
+        ((3, 1, 3, 32), "sequence_projection"),
+        ((2, 37, 8, 128), "batch_projection"),
+        ((3, 17, 4, 64), "contiguous"),
+        ((2, 13, 1, 256), "contiguous"),
+        ((2, 17, 8, 128), "strided_elements"),
+        ((2, 13, 4, 64), "strided_heads"),
+        ((2, 17, 8, 128), "strided_x"),
+        ((3, 13, 4, 64), "broadcast_gate"),
+    ],
+)
+def test_generalized_layout_forward_backward(shape, layout, dtype, zero_centered):
+    """Compare values and source-tensor gradients, including projection-backed batches."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    te = pytest.importorskip("transformer_engine.pytorch")
+    torch.manual_seed(1234)
+    batch, length, heads, dim = shape
+    norm = te.RMSNorm(
+        dim, eps=1e-6, params_dtype=dtype, zero_centered_gamma=zero_centered, device="cuda"
+    )
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn_like(norm.weight) * 0.1 + (0 if zero_centered else 1))
+    scale = 1e-5 if zero_centered else 1.0
+    x_shape = (length, batch, heads, dim * 2) if layout == "strided_x" else shape
+    x_source = (torch.randn(x_shape, device="cuda", dtype=dtype) * scale).requires_grad_()
+    x = x_source.permute(1, 0, 2, 3)[..., ::2] if layout == "strided_x" else x_source
+    channels = heads * dim * 2 + 32
+    if layout in ("sequence_projection", "strided_x"):
+        source_shape = (length, batch, channels)
+    elif layout == "batch_projection":
+        source_shape = (batch, length, channels)
+    elif layout == "strided_elements":
+        source_shape = (batch, length, heads, dim * 2)
+    elif layout == "strided_heads":
+        source_shape = (batch, length, heads * 2, dim)
+    elif layout == "broadcast_gate":
+        source_shape = (1, length, heads, dim)
+    else:
+        source_shape = shape
+    gate_source = torch.randn(source_shape, device="cuda", dtype=dtype).requires_grad_()
+    if layout in ("sequence_projection", "strided_x"):
+        gate = gate_source[..., 17 : 17 + heads * dim].view(length, batch, heads, dim)
+        gate = gate.permute(1, 0, 2, 3)
+    elif layout == "batch_projection":
+        gate = gate_source[..., 17 : 17 + heads * dim].view(shape)
+    elif layout == "strided_elements":
+        gate = gate_source[..., ::2]
+    elif layout == "strided_heads":
+        gate = gate_source[:, :, ::2]
+    elif layout == "broadcast_gate":
+        gate = gate_source.expand(shape)
+    else:
+        gate = gate_source
+    module = SimpleNamespace(
+        config=SimpleNamespace(deterministic_mode=False),
+        cp_size=4,
+        activation="silu",
+        out_norm=norm,
+    )
+    gated_norm.validate_gated_norm(module, x, gate)
+    expected = (norm(x.reshape(-1, dim)).reshape(shape) * F.silu(gate.float())).to(dtype)
+    actual = gated_norm.fused_gated_norm(x, gate, norm.weight, norm.eps, zero_centered)
+    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+    # Noncontiguous upstream gradients also need to be read in logical order.
+    dy = torch.randn((*shape[:-1], dim * 2), device="cuda", dtype=dtype)[..., ::2]
+    inputs = (x_source, gate_source, norm.weight)
+    gradients = torch.autograd.grad(actual, inputs, dy)
+    _assert_gradients_close(gradients, torch.autograd.grad(expected, inputs, dy), atol=0.05)
+    replay = gated_norm.fused_gated_norm(x, gate, norm.weight, norm.eps, zero_centered)
+    replay_gradients = torch.autograd.grad(replay, inputs, dy)
+    torch.testing.assert_close(replay, actual, atol=0, rtol=0)
+    for got, ref in zip(replay_gradients, gradients):
+        torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "case,match",
     [
         ("deterministic", "deterministic_mode=False"),
-        ("cp", "context_parallel_size=1"),
         ("activation", "SiLU/Swish"),
         ("norm", "RMSNorm output"),
         ("cpu", "CUDA BF16"),
         ("dtype", "CUDA BF16"),
-        ("x_stride", "contiguous core attention"),
-        ("head_dim", "head dimension 128"),
-        ("gate_rank", "gate shape"),
-        ("batch", "gate shape"),
-        ("heads", "gate shape"),
+        ("head_dim", "power-of-two head dimension"),
+        ("gate_rank", "matching output and gate shapes"),
+        ("batch", "matching output and gate shapes"),
+        ("heads", "matching output and gate shapes"),
         ("empty", "nonempty"),
-        ("size", "equal element counts"),
-        ("gate_element_stride", "strides 1 and 128"),
-        ("gate_head_stride", "strides 1 and 128"),
+        ("size", "matching output and gate shapes"),
+        ("gate_dtype", "gate in the activation dtype or FP32"),
         ("gate_device", "same CUDA device"),
         ("weight_device", "RMSNorm weight"),
-        ("weight_shape", "128-element"),
-        ("weight_stride", "contiguous 128-element"),
+        ("weight_shape", "contiguous RMSNorm weight"),
+        ("weight_stride", "contiguous RMSNorm weight"),
     ],
 )
 def test_validate_rejects_unsupported_inputs(norm_inputs, case, match):
     module, x, gate = norm_inputs
     if case == "deterministic":
         module.config.deterministic_mode = True
-    elif case == "cp":
-        module.cp_size = 2
     elif case == "activation":
         module.activation = "gelu"
     elif case == "norm":
@@ -123,10 +202,8 @@ def test_validate_rejects_unsupported_inputs(norm_inputs, case, match):
         x = x.cpu()
     elif case == "dtype":
         x = x.float()
-    elif case == "x_stride":
-        x = torch.empty((1, 3, 16, 256), device=x.device, dtype=x.dtype)[..., ::2]
     elif case == "head_dim":
-        x = x[..., :64].contiguous()
+        x, gate = x[..., :63], gate[..., :63]
     elif case == "gate_rank":
         gate = gate.squeeze(0)
     elif case == "batch":
@@ -137,10 +214,8 @@ def test_validate_rejects_unsupported_inputs(norm_inputs, case, match):
         x, gate = x[:, :0], gate[:, :0]
     elif case == "size":
         gate = gate[:, :2]
-    elif case == "gate_element_stride":
-        gate = torch.empty((1, 3, 16, 256), device=x.device, dtype=x.dtype)[..., ::2]
-    elif case == "gate_head_stride":
-        gate = torch.empty((1, 3, 32, 128), device=x.device, dtype=x.dtype)[:, :, ::2]
+    elif case == "gate_dtype":
+        gate = gate.to(torch.int32)
     elif case == "gate_device":
         gate = gate.cpu()
     elif case == "weight_device":
