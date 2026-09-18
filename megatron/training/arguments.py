@@ -2991,9 +2991,7 @@ def _add_rl_args(parser):
                         help='Directory to write RL profiling data. Defaults to {save}/profiles.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
-                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool). '
-                            'qwen3-coder-tool-combined additionally treats <tool_call> as the end of '
-                            'an unterminated reasoning block, like vLLM\'s combined qwen3 parser.')
+                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
     return parser
 
 def _add_training_args(parser):
