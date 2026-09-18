@@ -398,7 +398,7 @@ def _collect_dsa_split_grads(model, optimizer) -> tuple[list[torch.Tensor], list
     indexer_grads = []
     non_indexer_grads = []
 
-    param_to_optim_param = _get_model_to_optimizer_param_map(optimizer)
+    param_to_optim_param = get_model_to_optimizer_param_map(optimizer)
     seen_param_ids = set()
 
     for model_chunk in model:
@@ -513,7 +513,7 @@ def calc_dsa_split_grad_num_zeros(model, optimizer) -> tuple[float, float]:
     return indexer_num_zeros, non_indexer_num_zeros
 
 
-def _get_model_to_optimizer_param_map(optimizer) -> dict:
+def get_model_to_optimizer_param_map(optimizer) -> dict:
     """Map model params to the optimizer params that own their gradients."""
     param_map = {}
 
@@ -542,10 +542,6 @@ def _get_model_to_optimizer_param_map(optimizer) -> dict:
 
     return param_map
 
-
-def get_model_to_optimizer_param_map(optimizer) -> dict:
-    """Public wrapper for mapping model params to optimizer-owned params."""
-    return _get_model_to_optimizer_param_map(optimizer)
 
 
 def _add_param_group_mapping(param_map: dict, model_groups: list, optim_groups: list):
