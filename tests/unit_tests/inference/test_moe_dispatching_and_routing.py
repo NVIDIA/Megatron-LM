@@ -80,6 +80,14 @@ def _make_base_config(**overrides):
     return TransformerConfig(**params)
 
 
+def test_config_accepts_vllm_mxfp8():
+    config = _make_base_config(
+        inference_grouped_gemm_backend="vllm", fp8="hybrid", fp8_recipe="mxfp8", fp8_param=True
+    )
+
+    assert config.inference_grouped_gemm_backend.value == "vllm"
+
+
 # ──────────────────────────────────────────────────────────────────────
 # InferenceTopKRouter
 # ──────────────────────────────────────────────────────────────────────
