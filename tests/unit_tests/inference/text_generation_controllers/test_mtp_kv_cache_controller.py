@@ -820,6 +820,67 @@ class TestSerialMtpDraftLoop:
         # The graph size and forward count are unchanged, so EP parity is preserved.
         assert args[1] == 2
 
+    def test_excluded_chunked_row_logits_never_reach_sampling(self):
+        """Dropping the row from the draft count is only half of it: its logits are NaN.
+
+        Being dropped makes the mid-prompt request a padding row for the draft attention, and
+        `write_mha_metadata` gives every slot past the draft count kv_length 0 and a -1 block
+        table. Attention over an empty KV range returns NaN, so that row's logits come back NaN.
+        Trailing SP / CUDA-graph padding is harmless because `mtp_logits[:active_request_count]`
+        removes it, but the excluded chunked row is the LAST ACTIVE row -- inside that slice --
+        so it survives and reaches `torch.multinomial`, which asserts device-side on a
+        non-finite probability tensor.
+
+        The tests around this one assert only the count handed to `_mtp_begin_decode`. The fake
+        model returns all-zero logits, so no unit test here can observe what that count means for
+        the dropped row; this one models the NaN explicitly.
+        """
+        real_logit = 3.0
+        context = _make_context(
+            num_decode_requests=1,
+            prefill_query_lengths=(4,),
+            prefill_kv_offsets=(0,),
+            chunked_prefill_request_id=101,
+        )
+        controller, model, context = _make_draft_loop_controller(
+            context, num_mtp_depths=2, active_request_count=2
+        )
+        # Row 0 is the decode request and drafts; row 1 is the excluded chunked request.
+        num_drafting = 1
+
+        def nan_padding_step(**kwargs):
+            """Stand in for the real draft attention: padding rows attend over nothing."""
+            model.mtp_step_calls.append(kwargs)
+            hidden = kwargs["hidden_states"]
+            logits = torch.full((hidden.shape[0], 1, VOCAB_SIZE), real_logit, device=DEVICE)
+            logits[num_drafting:] = float("nan")
+            return hidden, logits
+
+        model.compute_mtp_single_step = nan_padding_step
+
+        sampled = []
+
+        def record_sampled_logits(logits_2d):
+            sampled.append(logits_2d.clone())
+            return torch.zeros(logits_2d.shape[0], dtype=torch.int64, device=DEVICE)
+
+        controller._sample_from_logits_2d = record_sampled_logits
+
+        controller._compute_serial_mtp_and_sample(
+            base_position=torch.tensor([10, 4], device=DEVICE)
+        )
+
+        assert len(sampled) == 2, "expected one sampling call per draft depth"
+        for depth, logits in enumerate(sampled):
+            assert torch.isfinite(logits).all(), (
+                f"depth {depth}: the excluded chunked row's NaN logits reached sampling, where "
+                "torch.multinomial asserts device-side on a non-finite probability tensor"
+            )
+            assert torch.equal(
+                logits[:num_drafting],
+                torch.full((num_drafting, VOCAB_SIZE), real_logit, device=DEVICE),
+            ), f"depth {depth}: masking the dropped row overwrote a drafting request's logits"
+
     def test_hidden_chunked_request_does_not_cost_a_real_request_its_drafts(self):
         """A chunked id with no active row must not shrink the draft count.
 

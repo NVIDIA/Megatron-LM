@@ -642,7 +642,17 @@ class MTPControllerMixin:
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/pp-broadcast")
 
             # Sample speculative token using the same sampling parameters.
+            #
+            # A dropped row is a padding row for the draft attention -- `write_mha_metadata` gives
+            # it kv_length 0 -- so its logits come back NaN. Unlike trailing padding, the dropped
+            # chunked-prefill row is the last ACTIVE row, so the slice above keeps it and its NaN
+            # would trip `torch.multinomial`'s device-side assert. Mask it to a uniform
+            # distribution; a mid-prompt request's drafts are discarded. Masked out of place
+            # because under CUDA graphs these logits are a captured output buffer.
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}/sample")
+            if mtp_kv_cache_on and num_mtp_draft_requests < active_request_count:
+                mtp_logits_2d = mtp_logits_2d.clone()
+                mtp_logits_2d[num_mtp_draft_requests:] = 0
             spec_tokens = self._sample_from_logits_2d(mtp_logits_2d)
             self._sampled_mtp_tokens_cuda[depth, :active_request_count] = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/sample")
