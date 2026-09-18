@@ -2,6 +2,7 @@
 
 import contextlib
 from functools import partial
+from itertools import chain
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
 import torch
@@ -2144,6 +2145,18 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+def _prepare_forward_data_iterator(data_iterator, p2p_communicator, *, is_multimodule: bool):
+    """Prepare a batch-derived bridge shape without advancing the logical batch."""
+    if not is_multimodule or not p2p_communicator.has_receiver_derived_bridge_shapes:
+        return data_iterator
+    if data_iterator is None:
+        raise RuntimeError("batch-derived bridge shapes require a data iterator")
+
+    batch = next(data_iterator)
+    p2p_communicator.prepare_bridge_recv_shapes(batch)
+    return chain((batch,), data_iterator)
+
+
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -2176,7 +2189,6 @@ def forward_backward_pipelining_without_interleaving(
             len(data_iterator) == 1
         ), "non-interleaved pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
-
     config = get_model_config(model)
     if config.overlap_p2p_comm:
         raise ValueError(
@@ -2231,6 +2243,9 @@ def forward_backward_pipelining_without_interleaving(
             )
     else:
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
+
+    if is_multimodule:
+        p2p_communicator.set_forward_only(forward_only)
 
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2341,12 +2356,15 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        forward_data_iterator = _prepare_forward_data_iterator(
+            data_iterator, p2p_communicator, is_multimodule=is_multimodule
+        )
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
-            data_iterator,
+            forward_data_iterator,
             model,
             num_microbatches,
             input_tensor,
@@ -2371,6 +2389,9 @@ def forward_backward_pipelining_without_interleaving(
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
+        forward_data_iterator = _prepare_forward_data_iterator(
+            data_iterator, p2p_communicator, is_multimodule=is_multimodule
+        )
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
@@ -2389,7 +2410,7 @@ def forward_backward_pipelining_without_interleaving(
 
         output_tensor, num_tokens = forward_step(
             forward_step_func,
-            data_iterator,
+            forward_data_iterator,
             model,
             num_microbatches,
             input_tensor,
@@ -2409,6 +2430,9 @@ def forward_backward_pipelining_without_interleaving(
         if forward_only:
             p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
+                forward_data_iterator = _prepare_forward_data_iterator(
+                    data_iterator, p2p_communicator, is_multimodule=is_multimodule
+                )
                 input_tensor = p2p_communicator.recv_forward(
                     recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
@@ -2443,6 +2467,9 @@ def forward_backward_pipelining_without_interleaving(
                     input_tensor_grad, p2p_communicator.is_pp_first_stage
                 )
             else:
+                forward_data_iterator = _prepare_forward_data_iterator(
+                    data_iterator, p2p_communicator, is_multimodule=is_multimodule
+                )
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
