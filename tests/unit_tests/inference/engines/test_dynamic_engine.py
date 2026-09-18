@@ -52,6 +52,7 @@ from megatron.core.inference.inference_request import (
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
+    unwrap_serialized_tensors,
 )
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -546,6 +547,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
         msgpack.packb([submit, 17, params.serialize(), media_meta], use_bin_type=True),
         msgpack.packb([10, 99], use_bin_type=True),
         b"not-a-msgpack-payload",
+        msgpack.packb(None, use_bin_type=True),
     ]
     engine.socket_for_receiving_requests = mock.Mock()
     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
@@ -562,7 +564,11 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.add_request.assert_called_once()
     args, kwargs = engine.add_request.call_args
     assert args[:2] == (17, [10, 99])
-    assert kwargs == {"media_cache_key": "shared-image", "media_tokens_preexpanded": True}
+    assert kwargs == {
+        "offload_params": None,
+        "media_cache_key": "shared-image",
+        "media_tokens_preexpanded": True,
+    }
 
 
 def teardown_module(module):
@@ -1927,8 +1933,9 @@ def test_payload_offload_stages_only_eligible_completed_replies(
         assert not getattr(engine.payload_stager, "staged", [])
         assert ok_wire["generated_log_probs"] == [-0.5, -0.25]
         assert ok_wire["payload_stage_metadata"] == {}
-        assert ok_wire["prompt_tokens"] == ["tensor", [1, 2, 3]]
-        assert ok_wire["remaining_prompt_tokens"] == ["tensor", [1, 2, 3]]
+        unwrapped = unwrap_serialized_tensors(ok_wire)
+        assert unwrapped["prompt_tokens"] == [1, 2, 3]
+        assert unwrapped["remaining_prompt_tokens"] == [1, 2, 3]
     # prompt_length is always reported; generated token ids stay on the wire, and the drop is
     # wire-only: the request keeps its prompt and log probs.
     assert ok_wire["prompt_length"] == 3
