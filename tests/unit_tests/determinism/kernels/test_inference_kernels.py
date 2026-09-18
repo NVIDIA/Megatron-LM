@@ -207,6 +207,45 @@ def test_mxfp8_quantize_replays():
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
 
 
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 parameter storage needs Blackwell",
+)
+def test_mixed_precision_parameter_conversion_replays():
+    """Converting MXFP8 storage replays exactly while BF16 parameters remain unchanged."""
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+    seeded()
+    attention = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    expert = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+
+    def convert(attention, expert):
+        root = torch.nn.Module()
+        root.attention = torch.nn.Module()
+        root.attention.weight = torch.nn.Parameter(attention.clone(), requires_grad=False)
+        root.mlp = torch.nn.Module()
+        root.mlp.experts = torch.nn.Module()
+        root.mlp.experts.linear_fc1 = torch.nn.Module()
+        root.mlp.experts.linear_fc1.weight = torch.nn.Parameter(
+            quantizer(expert), requires_grad=False
+        )
+        quantize_model_to_mxfp8(root, backend="triton")
+        selected = root.mlp.experts.linear_fc1.weight
+        return (
+            root.attention.weight,
+            selected.data.view(torch.uint8),
+            selected.scale.view(torch.uint8),
+        )
+
+    assert_replays_bit_exact(
+        convert, (attention, expert), backward=False, what="selective MXFP8 parameter conversion"
+    )
+
+
 # --- inference MoE permute / unpermute --------------------------------------------------------
 
 
@@ -422,3 +461,42 @@ def test_mask_routing_padding_replays():
         return routing_map
 
     assert_replays_bit_exact(fn, (routing_map,), backward=False, what="mask_routing_padding")
+
+
+@pytest.mark.launch_on_gb200
+def test_mxfp8_swiglu_moe_replays():
+    """SwiGLU must select separate MXFP8 quantization without a caller override."""
+    from megatron.core.inference.moe.fused_moe import (
+        HAVE_SCALED_GMM,
+        ActivationType,
+        mcore_fused_moe,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_SCALED_GMM or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 scaled_grouped_mm requires PyTorch 2.10+ and Blackwell")
+    seeded()
+    tokens, hidden = 72, 128
+
+    def weight(rows):
+        q = MXFP8Tensor.from_bf16(
+            torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+        return MXFP8Tensor(
+            data=q.data.unsqueeze(0),
+            scale=q.scale.unsqueeze(0),
+            dtype=torch.bfloat16,
+            backend="triton",
+        )
+
+    fc1, fc2 = weight(2 * hidden), weight(hidden)
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.ones(tokens, 1, device="cuda")
+    routes = torch.zeros(tokens, 1, device="cuda", dtype=torch.int64)
+    valid = _dev_scalar(tokens)
+
+    def run(x):
+        return mcore_fused_moe(x, probs, fc1, fc2, ActivationType.SWIGLU, 1, 0, valid, routes)
+
+    # One route per token also makes the non-batch-invariant atomic combine exact.
+    assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="MXFP8 SwiGLU MoE")
