@@ -70,19 +70,10 @@ def cleanup():
 
 @pytest.fixture(scope="session")
 def cpu_default_process_group():
-    """Provide an opt-in session default group for CPU checkpoint tests.
+    """Reuse WORLD for CPU tests, creating Gloo once per session to avoid stale peers.
 
-    This shared fixture is available across unit-test directories but runs only
-    when requested. Reusing one default group avoids stale Gloo peers when
-    module teardown and setup reuse the torchrun rendezvous store.
-
-    Create Gloo only when WORLD is uninitialized; otherwise borrow the existing
-    group, whose backend may be NCCL. Consumers must use explicit Gloo subgroups
-    for CPU tensor collectives when borrowing NCCL, and keep WORLD collectives
-    compatible with its backend. Module fixtures own and release their subgroups.
-
-    Release WORLD only if this fixture created it and it is still the same
-    group. Borrowed or replaced groups remain with their owner or suite cleanup.
+    Borrow existing groups (including NCCL); consumers own explicit Gloo subgroups
+    for CPU tensors. Destroy WORLD only if we created it and it was not replaced.
     """
     created_default = not torch.distributed.is_initialized()
     if created_default:
