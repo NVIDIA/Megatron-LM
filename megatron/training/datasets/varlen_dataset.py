@@ -198,6 +198,14 @@ def _raw_text_loader(sample: Dict[str, Any]) -> str:
     return text
 
 
+_PACKED_BIN_COLUMNS = ("input_ids", "loss_mask", "seq_start_id")
+
+
+def _packed_bin_passthrough(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one pre-tokenised sequence (``input_ids`` + ``loss_mask``) unchanged."""
+    return sample
+
+
 def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]], Any], str]:
     """Pick a sample converter based on dataset column names.
 
@@ -208,6 +216,8 @@ def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]
     as SFT.
     """
     cols = set(column_names)
+    if all(c in cols for c in _PACKED_BIN_COLUMNS):
+        return _packed_bin_passthrough, "packed-bins"
     if "messages" in cols:
         return _messages_passthrough, "openai-messages"
     if "conversations" in cols:
@@ -252,7 +262,18 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
     string instead.
     """
 
-    def __init__(self, dataset_path: str) -> None:
+    def __init__(self, dataset_path: str, bins_as_samples: bool = False) -> None:
+        self._bins = None
+        if dataset_path.endswith(".parquet") and _is_packed_bins_parquet(dataset_path):
+            # Pre-tokenised, pre-packed bins (``input_ids`` / ``loss_mask`` / ``seq_start_id``
+            # per row, e.g. the DeepSeek-V4 128K SFT packs). By default every constituent
+            # sequence becomes one sample (the global batch counts sequences); with
+            # ``bins_as_samples`` one sample is a whole bin (the global batch counts bins, the
+            # scheduler re-packs the bin's adjacent sequences and keeps its fill). The loss mask
+            # is kept per token either way.
+            self._bins = _PackedBins(dataset_path, whole_bins=bins_as_samples)
+            self._converter, self._schema_name = _packed_bin_passthrough, "packed-bins"
+            return
         try:
             from datasets import Dataset, load_dataset
         except ImportError as exc:
@@ -284,10 +305,160 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         return self._schema_name
 
     def __len__(self) -> int:
+        if self._bins is not None:
+            return len(self._bins)
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> List[Dict[str, str]]:
+    def __getitem__(self, idx: int) -> Any:
+        if self._bins is not None:
+            return self._bins[idx]
         return self._converter(self.dataset[idx])
+
+
+def _is_packed_bins_parquet(path: str) -> bool:
+    import pyarrow.parquet as pq
+
+    names = set(pq.ParquetFile(path).schema_arrow.names)
+    return all(c in names for c in _PACKED_BIN_COLUMNS)
+
+
+class _PackedBins:
+    """Sequences of a pre-packed parquet, addressed as ``(row, start, end)`` triples.
+
+    ``seq_start_id`` gives the start offset of every sequence inside a row; a sequence ends at
+    the next start (or at the row end). Rows are read on demand and the last row is cached, so
+    consecutive sequences of one bin cost a single parquet read.
+    """
+
+    def __init__(self, path: str, whole_bins: bool = False) -> None:
+        import pyarrow.parquet as pq
+
+        self._file = pq.ParquetFile(path)
+        starts_col = self._file.read(columns=["seq_start_id"]).column("seq_start_id")
+        self._index: List[Tuple[int, int, int]] = []
+        self._starts: List[List[int]] = []  # per row: start offset of every sequence
+        self._row_groups: List[Tuple[int, int]] = []  # (first row, num rows) per row group
+        first = 0
+        for g in range(self._file.num_row_groups):
+            n = self._file.metadata.row_group(g).num_rows
+            self._row_groups.append((first, n))
+            first += n
+        for row in range(len(starts_col)):
+            starts = [int(s) for s in starts_col[row].as_py()]
+            self._starts.append(starts)
+            for k, start in enumerate(starts):
+                end = starts[k + 1] if k + 1 < len(starts) else -1
+                self._index.append((row, start, end))
+        # whole_bins: one item per parquet row (the pre-packed bin with all its sequences and
+        # their boundaries) instead of one item per sequence. Keeps the packer's fill and makes
+        # the global batch size count bins, as the NeMo packed-sequence loader does.
+        self._whole_bins = whole_bins
+        self._cached_row = -1
+        self._cached: Optional[Tuple[np.ndarray, np.ndarray]] = None
+
+    def __len__(self) -> int:
+        return len(self._starts) if self._whole_bins else len(self._index)
+
+    def _row(self, row: int) -> Tuple[np.ndarray, np.ndarray]:
+        if row != self._cached_row:
+            for g, (first, n) in enumerate(self._row_groups):
+                if first <= row < first + n:
+                    table = self._file.read_row_group(g, columns=["input_ids", "loss_mask"])
+                    local = row - first
+                    ids = np.asarray(table.column("input_ids")[local].as_py(), dtype=np.int64)
+                    mask = np.asarray(table.column("loss_mask")[local].as_py(), dtype=np.int8)
+                    self._cached_row, self._cached = row, (ids, mask)
+                    break
+            else:
+                raise IndexError(row)
+        return self._cached
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self._whole_bins:
+            ids, mask = self._row(idx)
+            return {"input_ids": ids, "loss_mask": mask, "seq_start_id": list(self._starts[idx])}
+        row, start, end = self._index[idx]
+        ids, mask = self._row(row)
+        if end < 0:
+            end = len(ids)
+        return {"input_ids": ids[start:end], "loss_mask": mask[start:end]}
+
+
+def _shift_and_pad_sequence(
+    tokens_list: List[int],
+    targets_list: List[int],
+    eod: int,
+    pad: int,
+    max_len: int,
+    pad_granularity: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Right-truncate to ``max_len + 1``, terminate with EOD, pad to ``pad_granularity`` and
+    apply the next-token shift. Returns ``(tokens, labels, loss_mask, position_ids,
+    original_seq_len, padded_seq_len)``; the THD single-sequence path and the whole-bin path
+    share this so both produce identical per-sequence tensors."""
+    if len(tokens_list) == 0:
+        tokens_list = [eod, eod]
+        targets_list = [eod, eod]
+    if len(tokens_list) > max_len + 1:
+        tokens_list = tokens_list[: max_len + 1]
+        targets_list = targets_list[: max_len + 1]
+        if tokens_list[-1] != eod:
+            tokens_list[-1] = eod
+            targets_list[-1] = eod
+    if tokens_list[-1] != eod:
+        tokens_list = tokens_list + [eod]
+        targets_list = targets_list + [eod]
+    valid_len = len(tokens_list) - 1
+    original_seq_len = valid_len
+    mod = original_seq_len % pad_granularity
+    if mod != 0:
+        pad_len = pad_granularity - mod
+        tokens_list = tokens_list + [pad] * pad_len
+        targets_list = targets_list + [pad] * pad_len
+    padded_seq_len = len(tokens_list) - 1
+    input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
+    labels = torch.tensor(targets_list[1:], dtype=torch.int64)
+    position_ids = torch.arange(padded_seq_len, dtype=torch.int64)
+    loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
+    loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
+    loss_mask[labels == IGNORE_INDEX] = 0.0
+    return input_ids, labels, loss_mask, position_ids, original_seq_len, padded_seq_len
+
+
+def build_packed_bin_sample(
+    sequences: List[Tuple[List[int], List[int]]],
+    eod: int,
+    pad: int,
+    max_len: int,
+    pad_granularity: int,
+) -> Dict[str, torch.Tensor]:
+    """One pre-packed sample from the sequences of a bin (``(input_ids, loss_mask)`` per
+    sequence): every sequence is shifted and padded on its own (position ids restart at 0),
+    then concatenated; ``cu_seqlens`` marks the boundaries. This is the pre-packed format the
+    packing scheduler's ``_unpack_batch`` splits by ``cu_seqlens`` before re-packing, so the
+    bin's sequences stay adjacent and the original fill is preserved."""
+    parts = []
+    for ids, mask in sequences:
+        tokens_list = [int(t) for t in ids]
+        targets_list = [int(t) if m else IGNORE_INDEX for t, m in zip(ids, mask)]
+        parts.append(
+            _shift_and_pad_sequence(tokens_list, targets_list, eod, pad, max_len, pad_granularity)
+        )
+    if not parts:
+        parts.append(_shift_and_pad_sequence([], [], eod, pad, max_len, pad_granularity))
+    lengths = [p[5] for p in parts]
+    cu_seqlens = torch.tensor([0] + list(np.cumsum(lengths)), dtype=torch.int32)
+    return {
+        'tokens': torch.cat([p[0] for p in parts]),
+        'labels': torch.cat([p[1] for p in parts]),
+        'loss_mask': torch.cat([p[2] for p in parts]),
+        'position_ids': torch.cat([p[3] for p in parts]),
+        'cu_seqlens': cu_seqlens,
+        'max_seqlen': torch.tensor(max(lengths), dtype=torch.int32),
+        # Real (pre-padding) length of every sequence; the packing scheduler's unpack step
+        # keeps it apart from the padded length so padding never counts as real tokens.
+        'original_seq_lens': torch.tensor([p[4] for p in parts], dtype=torch.int32),
+    }
 
 
 class VarlenDataset(SFTDataset):
@@ -327,7 +498,9 @@ class VarlenDataset(SFTDataset):
 
     @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
-        return VarlenLowLevelDataset(dataset_path)
+        return VarlenLowLevelDataset(
+            dataset_path, bins_as_samples=bool(getattr(config, "varlen_bins_as_samples", False))
+        )
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         tokenizer = self.config.tokenizer
@@ -350,11 +523,36 @@ class VarlenDataset(SFTDataset):
         assert not self.config.reset_position_ids
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
 
+        if isinstance(item, dict) and "seq_start_id" in item:
+            # Whole pre-packed bin (``varlen_bins_as_samples``): emit the pre-packed format.
+            assert not self.config.varlen_sbhd_validation, (
+                "--varlen-bins-as-samples is a packed-sequence (THD) mode; it cannot be "
+                "combined with --varlen-sbhd-validation"
+            )
+            ids, mask, starts = item["input_ids"], item["loss_mask"], list(item["seq_start_id"])
+            bounds = starts + [len(ids)]
+            sequences = [
+                (ids[bounds[k] : bounds[k + 1]], mask[bounds[k] : bounds[k + 1]])
+                for k in range(len(starts))
+                if bounds[k + 1] > bounds[k]
+            ]
+            return build_packed_bin_sample(
+                sequences, eod, pad, max_len, self._calculate_padding_divisor()
+            )
+
         # 2. Tokenize. SFT schemas go through tokenize_conversation (chat
         #    template + role-aware target masking); pretrain-text bypasses
         #    chat templating and uses the plain ``tokenize`` interface,
         #    treating every token as a target (no prompt masking).
-        if isinstance(item, str):
+        if isinstance(item, dict) and "input_ids" in item:
+            # Pre-tokenised sequence with a per-token supervision mask: a masked-out token
+            # becomes IGNORE_INDEX in the targets, so after the next-token shift below the
+            # label mask equals loss_mask[1:] (the packed-SFT convention).
+            tokens_list = [int(t) for t in item["input_ids"]]
+            targets_list = [
+                int(t) if m else IGNORE_INDEX for t, m in zip(item["input_ids"], item["loss_mask"])
+            ]
+        elif isinstance(item, str):
             ids = list(tokenizer.tokenize(item))
             tokens_list = ids
             targets_list = list(ids)

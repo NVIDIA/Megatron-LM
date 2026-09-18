@@ -640,7 +640,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Pass input_ids to decoder for hash-based MoE routing.
         decoder_extra_block_kwargs = {}
-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+        needs_input_ids = self.config.moe_n_hash_layers > 0 or bool(
+            getattr(self.config, "engram_layer_ids", None)
+        )
+        if needs_input_ids and input_ids is not None:
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
         # Run decoder.

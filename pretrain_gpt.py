@@ -464,6 +464,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
         "varlen_sbhd_validation": args.varlen_sbhd_validation,
+        "varlen_bins_as_samples": getattr(args, "varlen_bins_as_samples", False),
     }
 
     # add FIM args to the config

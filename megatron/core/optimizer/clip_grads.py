@@ -108,6 +108,14 @@ def get_grad_norm_fp32(
         total_norm = torch.zeros(1, dtype=torch.float, device='cuda')
         if not grads_for_norm:
             pass
+        elif norm_type == 2.0 and any(grad.dtype != torch.float32 for grad in grads_for_norm):
+            # Non-fp32 gradients (precision-aware optimizer with bf16 main grads): the TE
+            # multi_tensor_l2norm kernel faulted with an illegal memory access on the
+            # DeepSeek-V4.1 128K runs. torch's foreach norm needs no extra buffers; the
+            # per-tensor norms are produced in fp32 so a large fp16 / bf16 gradient cannot
+            # overflow before the reduction.
+            norms = torch._foreach_norm(grads_for_norm, norm_type, dtype=torch.float32)
+            total_norm = torch.stack(norms).pow(norm_type).sum().view(1)
         elif norm_type == 2.0:
             dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
             # Use apex's multi-tensor applier for efficiency reasons.
