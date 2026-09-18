@@ -94,6 +94,8 @@ class TextGenerationControllerTestBase:
         sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
         transformer_impl: str = None,
+        position_embedding_type: str = None,
+        mtp_use_repeated_layer: bool = False,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -130,6 +132,7 @@ class TextGenerationControllerTestBase:
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             pipeline_dtype=dtype,
             mtp_num_layers=mtp_num_layers if mtp_num_layers > 0 else None,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
             sequence_parallel=sequence_parallel,
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
@@ -177,6 +180,8 @@ class TextGenerationControllerTestBase:
                     config=transformer_config, spec=layer_spec, use_transformer_engine=False
                 )
 
+            if position_embedding_type is None:
+                position_embedding_type = "none" if num_speculative_tokens else "learned_absolute"
             model = GPTModel(
                 config=transformer_config,
                 transformer_layer_spec=layer_spec,
@@ -186,6 +191,7 @@ class TextGenerationControllerTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
+                position_embedding_type=position_embedding_type,
             ).cuda()
 
         model.eval()
@@ -293,8 +299,13 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         max_tokens=32,
         request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
         kv_block_allocator=SimpleNamespace(enable_handoff_pinning=False),
+        block_size_tokens=2,
+        request_kv_length_offsets=torch.full((metadata_len,), 2, dtype=torch.int32),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    context.get_committed_kv_block_counts = lambda rows: (
+        DynamicInferenceContext.get_committed_kv_block_counts(context, rows)
+    )
     # Bind the real flags so the fake exercises the production no-op-filter gate.
     context.active_sampling_filter_flags = lambda count=None: (
         DynamicInferenceContext.active_sampling_filter_flags(context, count)
@@ -1105,6 +1116,64 @@ def test_finished_hybrid_handoff_detaches_live_ssm_slot():
 
 
 @pytest.mark.parametrize(
+    "committed_blocks,reserve_blocks",
+    [(2, 0), (1, 1), (1, 2)],
+    ids=["no-reserve", "one-reserve", "two-reserves"],
+)
+def test_finished_handoff_keeps_only_committed_blocks(committed_blocks, reserve_blocks):
+    """Handoff pins the committed main KV span, excluding all draft-only lookahead."""
+    context = _make_async_sched_context(total_request_count=2)
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor(
+        [
+            [10, 11, -1],
+            list(range(12, 12 + committed_blocks + reserve_blocks))
+            + [-1] * (3 - committed_blocks - reserve_blocks),
+        ],
+        dtype=torch.int32,
+    )
+    context.request_kv_length_offsets[1] = (committed_blocks - 1) * context.block_size_tokens
+    controller = _make_async_sched_controller(context)
+
+    blocks, _, _ = controller._collect_finished_handoff_state(
+        torch.tensor([1]), torch.tensor([91, 92]), None
+    )
+
+    expected = list(range(12, 12 + committed_blocks))
+    assert blocks == {11: expected}
+    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with(expected)
+
+
+@pytest.mark.parametrize("reserve_blocks", [1, 2])
+def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
+    """Routing reconstruction aborts on any block without stored routing.
+
+    The main model never writes into the reserve, so it has no routing, and
+    `reconstruct_routing_from_blocks` tests `routing is None` before its `remaining <= 0`
+    break. Shipping the reserve therefore turns the whole reconstruction into None and silently
+    drops `moe_topk_indices` from the response.
+    """
+    context = _make_async_sched_context(total_request_count=2)
+    context.kv_block_allocator = SimpleNamespace(block_routing=True, enable_handoff_pinning=False)
+    context.request_to_kv_block_ids = torch.tensor(
+        [[10, 11] + [-1] * (reserve_blocks - 1), list(range(12, 13 + reserve_blocks))],
+        dtype=torch.int32,
+    )
+    context.request_kv_length_offsets[1] = 0
+    context.get_max_sequence_lengths.return_value = torch.tensor([3, 3])
+    # No chunked request in flight, so no finished row is filtered back out.
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=-1)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda[:2] = torch.tensor([99, 99])
+
+    result = controller._dynamic_step_context_bookkeeping()
+
+    assert result["finished_routing_block_ids"] == {10: [10, 11], 11: [12]}
+
+
+@pytest.mark.parametrize(
     "termination_ids, stop_word_finished_ids",
     [([99, 99, 99], set()), ([99, 2, 99], set()), ([99, 99, 99], {11})],
 )
@@ -1819,6 +1888,61 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
     def teardown_method(self, method):
         InferenceMode.unset_active()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
+    def test_mtp_kv_cache_rejects_positional_embeddings(self, position_embedding_type):
+        with pytest.raises(
+            ValueError, match="MTP KV caching requires position_embedding_type='none'"
+        ):
+            self.setup_model(
+                torch.float32,
+                static=False,
+                num_speculative_tokens=2,
+                mtp_num_layers=1,
+                mtp_use_repeated_layer=True,
+                position_embedding_type=position_embedding_type,
+            )
+
+    @pytest.mark.internal
+    def test_mtp_kv_cache_rejects_mla_rotary_embeddings(self):
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=2,
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=True,
+            position_embedding_type="none",
+        )
+        controller = self.text_generation_controller
+        assert controller.inference_wrapped_model.inference_context.enable_mtp_kv_cache
+        # MLA's position type is internal: the top-level "none" must not bypass the guard.
+        with mock.patch.object(controller.model_config, "multi_latent_attention", True):
+            with pytest.raises(ValueError, match="MTP KV caching does not support MLA"):
+                TextGenerationController(
+                    inference_wrapped_model=controller.inference_wrapped_model,
+                    tokenizer=self.mock_tokenizer,
+                )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "num_speculative_tokens,position_embedding_type",
+        [(2, "none"), (0, "none"), (0, "learned_absolute"), (0, "rope")],
+    )
+    def test_supported_mtp_and_position_embedding_combinations(
+        self, num_speculative_tokens, position_embedding_type
+    ):
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_speculative_tokens,
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=num_speculative_tokens > 0,
+            position_embedding_type=position_embedding_type,
+        )
+        assert self.text_generation_controller.num_speculative_tokens == num_speculative_tokens
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        assert context.enable_mtp_kv_cache == (num_speculative_tokens > 0)
 
     @pytest.mark.internal
     def test_async_sched_no_overlap_pauses_boundary_request(self):
@@ -3349,7 +3473,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # The serial MTP path lives in the MTP mixin, so patch the SP collectives there.
-        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
+        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_controller_mixin"
         with (
             mock.patch(f"{mtp_module}.gather_from_sequence_parallel_region", mock_gather),
             mock.patch(
