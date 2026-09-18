@@ -22,6 +22,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import inspect
 import logging
 import warnings
 from dataclasses import dataclass
@@ -1489,6 +1490,273 @@ def _validate_kv_reconstruction_parts(
         )
 
 
+# ---------------------------------------------------------------------------------------------
+# Deterministic-mode helpers (``TransformerConfig.deterministic_mode`` / ``--deterministic-mode``).
+#
+# Two cuDNN DSA kernels are not bit-reproducible on their own:
+#   * the compact indexer Top-K returns the selected ids in a run-dependent slot order and
+#     accumulates the compact softmax in that order (its ``deterministic`` flag only fixes *which*
+#     ids are selected at the K-th boundary);
+#   * the default sparse-attention backward accumulates dK/dV with atomics.
+# ``_canonicalize_compact_topk`` and ``_deterministic_sparse_bwd_kwargs`` remove both. Neither is
+# used unless deterministic execution was requested, so the default path is unchanged.
+# ---------------------------------------------------------------------------------------------
+
+# Query-head counts supported by cuDNN's deterministic sparse-attention backward.
+_DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS = frozenset((16, 32, 64, 96, 128))
+# Retained per-(device, size) scratch buffers for that kernel; grow-only and never freed so a
+# pointer captured into an earlier CUDA graph stays valid.
+_DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict = {}
+
+
+def _deterministic_requested(flag: bool = False) -> bool:
+    """Deterministic execution was asked for, via the config flag or torch's global switch."""
+    return bool(flag) or torch.are_deterministic_algorithms_enabled()
+
+
+def _canonicalize_compact_topk(
+    topk_indices: Tensor, compact_logits: Tensor, compact_softmax: Optional[Tensor]
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Put each row's selected ids in ascending order (``-1`` padding last) and recompute the
+    compact softmax over them in that fixed order.
+
+    FlashMLA's online softmax and the indexer backward consume the ids in slot order, so with
+    the kernel's run-dependent order the attention output and the indexer gradients change from
+    run to run even though the selected set does not. After this the outputs are a pure function
+    of the selected set. The recomputed softmax equals the kernel's up to fp32 rounding order.
+    """
+    order_key = topk_indices.masked_fill(topk_indices < 0, torch.iinfo(topk_indices.dtype).max)
+    _, perm = torch.sort(order_key, dim=-1, stable=True)
+    topk_indices = torch.gather(topk_indices, -1, perm)
+    if compact_softmax is not None:
+        valid = topk_indices >= 0
+        logits = torch.gather(compact_logits.float(), -1, perm)
+        logits = logits.masked_fill(~valid, float("-inf"))
+        softmax = torch.softmax(logits, dim=-1)
+        # Rows without any valid id (padding rows) have an all -inf input; keep them at 0.
+        softmax = torch.where(valid.any(dim=-1, keepdim=True), softmax, torch.zeros_like(softmax))
+        compact_softmax = softmax.to(compact_softmax.dtype)
+    return topk_indices, compact_softmax
+
+
+def _get_deterministic_sparse_attention_workspace(
+    q_flat: Tensor,
+    kv_flat: Tensor,
+    out_flat: Tensor,
+    lse: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    topk_length: Optional[Tensor],
+    softmax_scale: float,
+) -> Tensor:
+    """Scratch buffer for cuDNN's deterministic sparse-attention backward (sized by cuDNN)."""
+    backward_api = _DSA.SparseAttentionBackward(
+        sample_q=q_flat,
+        sample_kv=kv_flat,
+        sample_out=out_flat,
+        sample_dout=out_flat,
+        sample_lse=lse,
+        sample_attn_sink=attn_sink,
+        sample_topk_idxs=topk_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        deterministic=True,
+    )
+    if not backward_api.check_support():
+        raise RuntimeError(
+            "deterministic mode: cuDNN rejected the deterministic DSA sparse-attention backward "
+            "for this problem shape."
+        )
+    required_bytes = int(backward_api.scratch_workspace_bytes())
+    device = q_flat.device
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (device, required_bytes)
+    workspace = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(key)
+    if workspace is None:
+        workspace = torch.empty(required_bytes, dtype=torch.uint8, device=device)
+        _DETERMINISTIC_SPARSE_BWD_WORKSPACES[key] = workspace
+    return workspace
+
+
+def _deterministic_sparse_bwd_kwargs(
+    q_flat: Tensor,
+    kv_flat: Tensor,
+    out_flat: Tensor,
+    lse: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    topk_length: Optional[Tensor],
+    softmax_scale: float,
+    requested: bool = False,
+) -> dict:
+    """Extra kwargs that switch ``sparse_attention_backward_wrapper`` to its deterministic kernel.
+
+    Returns ``{}`` unless deterministic execution was requested. When it was requested but the
+    installed cuDNN frontend / GPU / head count cannot provide the kernel, raise instead of
+    silently running the atomic version, so a deterministic run never degrades unnoticed.
+    """
+    if not _deterministic_requested(requested):
+        return {}
+    _ensure_dsa_namespace()
+    wrapper = getattr(_DSA, "sparse_attention_backward_wrapper", None)
+    try:
+        parameters = inspect.signature(wrapper).parameters if wrapper is not None else {}
+    except (TypeError, ValueError):
+        parameters = {}
+    if (
+        "deterministic" not in parameters
+        or "workspace" not in parameters
+        or getattr(_DSA, "SparseAttentionBackward", None) is None
+    ):
+        raise RuntimeError(
+            "deterministic mode: the installed cudnn-frontend has no deterministic DSA "
+            "sparse-attention backward (needs nvidia-cudnn-frontend >= 1.28)."
+        )
+    num_heads = q_flat.shape[-2]
+    capability = torch.cuda.get_device_capability(q_flat.device)[0] if q_flat.is_cuda else None
+    if capability != 10 or num_heads not in _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS:
+        raise RuntimeError(
+            "deterministic mode: cuDNN's deterministic DSA sparse-attention backward needs an "
+            f"SM100 GPU and a query-head count in {sorted(_DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS)}; "
+            f"got sm{capability}0 with {num_heads} heads."
+        )
+    return {
+        "deterministic": True,
+        "workspace": _get_deterministic_sparse_attention_workspace(
+            q_flat, kv_flat, out_flat, lse, attn_sink, topk_idxs, topk_length, softmax_scale
+        ),
+    }
+
+
+# cuDNN's sparse-indexer backward accumulates dK with atomics (and dW on SM90). In deterministic
+# mode the contributions are recomputed here without atomics: stable-sort by key id, prefix-sum
+# in the original row-major order and gather at fixed boundaries, then a dense fixed-order add.
+_DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def _requires_native_deterministic_indexer_grad_w(q_idx_bshd: Tensor) -> bool:
+    """cuDNN's sparse-indexer dW merges per-thread partials with shared-memory atomics on SM90 only."""
+    if not q_idx_bshd.is_cuda:
+        return False
+    return torch.cuda.get_device_capability(q_idx_bshd.device) == (9, 0)
+
+
+def _deterministic_indexer_dk_chunk_rows(indexer_heads: int, indexer_dim: int, topk: int) -> int:
+    """Query rows per chunk so the fp32 intermediates stay under the byte budget."""
+    f32 = 4
+    per_row = (
+        2 * topk * indexer_dim * f32  # gathered keys + per-slot contributions
+        + 2 * indexer_heads * topk * f32  # scores + head coefficients
+        + indexer_heads * indexer_dim * f32  # fp32 copy of the query row
+    )
+    return max(1, _DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES // per_row)
+
+
+def _deterministic_sparse_indexer_grads_wk(
+    q_idx_bshd: Tensor,
+    w_bsh: Tensor,
+    k_idx_bsd: Tensor,
+    attn_score: Tensor,
+    index_score: Tensor,
+    topk_indices: Tensor,
+    *,
+    loss_coeff: float,
+    grad_loss: Tensor,
+    sm_scale: float,
+    compute_grad_w: bool,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """Recompute the sparse-indexer dK (and optionally dW) without floating-point atomics.
+
+    Same math as ``cudnn.DSA.indexer_backward_wrapper`` (KL backward normalised by ``B * S_q``;
+    ``topk_indices`` are flattened ``(B, S_k)`` ids, negatives are padding). The per-key reduction
+    over the (query, slot) contributions uses torch's deterministic ``index_add_`` when
+    ``torch.use_deterministic_algorithms(True)`` is active (sort-based, fixed order) and otherwise a
+    stable sort + prefix sum with gathers at fixed boundaries; both give a fixed summation order.
+    Padding slots are spread over distinct dummy rows: the deterministic ``index_add_`` processes
+    duplicates of one id serially, and causal Top-K leaves a large fraction of the slots padded.
+    """
+    batch, sq, indexer_heads, indexer_dim = q_idx_bshd.shape
+    total_keys = k_idx_bsd.size(0) * k_idx_bsd.size(1)
+    topk = topk_indices.size(2)
+    if total_keys == 0 or batch * sq == 0 or topk == 0:
+        grad_w = torch.zeros_like(w_bsh) if compute_grad_w else None
+        return grad_w, torch.zeros_like(k_idx_bsd)
+    rows = batch * sq
+    device = k_idx_bsd.device
+    q_flat = q_idx_bshd.reshape(rows, indexer_heads, indexer_dim)
+    w_flat = w_bsh.reshape(rows, indexer_heads)
+    k_flat = k_idx_bsd.reshape(total_keys, indexer_dim)
+    attn_flat = attn_score.reshape(rows, topk)
+    index_flat = index_score.reshape(rows, topk)
+    topk_flat = topk_indices.reshape(rows, topk)
+    grad_scale = grad_loss.to(dtype=torch.float32) * (loss_coeff / rows) * sm_scale
+    use_index_add = torch.are_deterministic_algorithms_enabled()
+    chunk_rows = _deterministic_indexer_dk_chunk_rows(indexer_heads, indexer_dim, topk)
+    # Dummy rows that absorb the (zero) contributions of padding slots.
+    pad_rows = min(4096, chunk_rows * topk)
+    grad_k_ext = torch.zeros((total_keys + pad_rows, indexer_dim), device=device, dtype=torch.float32)
+    grad_w_flat = (
+        torch.empty(w_flat.shape, device=w_flat.device, dtype=torch.float32)
+        if compute_grad_w
+        else None
+    )
+    pad_ids = total_keys + torch.arange(chunk_rows * topk, device=device, dtype=torch.int64) % pad_rows
+    key_ids = None
+    for row_start in range(0, rows, chunk_rows):
+        row_end = min(row_start + chunk_rows, rows)
+        n_rows = row_end - row_start
+        q_chunk = q_flat[row_start:row_end].float()
+        w_chunk = w_flat[row_start:row_end].float()
+        indices_chunk = topk_flat[row_start:row_end].long()
+        valid = (indices_chunk >= 0) & (indices_chunk < total_keys)
+        flat_idx = torch.where(
+            valid.reshape(-1), indices_chunk.reshape(-1), pad_ids[: n_rows * topk]
+        )
+        gather_idx = indices_chunk.masked_fill(~valid, 0).reshape(-1)
+        selected_k = k_flat.index_select(0, gather_idx).reshape(n_rows, topk, indexer_dim).float()
+        dot = torch.bmm(q_chunk, selected_k.transpose(1, 2))  # (rows, heads, topk)
+        score_grad = (index_flat[row_start:row_end] - attn_flat[row_start:row_end]).float()
+        score_grad = (score_grad * grad_scale).masked_fill(~valid, 0.0)
+        head_coeff = (dot > 0).to(dtype=torch.float32)
+        if grad_w_flat is not None:
+            dot.relu_()
+            dot.mul_(score_grad.unsqueeze(1))
+            grad_w_flat[row_start:row_end].copy_(dot.sum(dim=-1))
+        head_coeff.mul_(w_chunk.unsqueeze(-1))
+        head_coeff.mul_(score_grad.unsqueeze(1))
+        contributions = torch.bmm(head_coeff.transpose(1, 2), q_chunk)  # (rows, topk, dim)
+        flat_contrib = contributions.reshape(-1, indexer_dim)
+        if use_index_add:
+            grad_k_ext.index_add_(0, flat_idx, flat_contrib)
+        else:
+            if key_ids is None:
+                key_ids = torch.arange(grad_k_ext.size(0), device=device, dtype=torch.int64)
+            sorted_keys, order = torch.sort(flat_idx, stable=True)
+            sorted_contributions = flat_contrib.index_select(0, order)
+            prefix = torch.nn.functional.pad(
+                torch.cumsum(sorted_contributions, dim=0), (0, 0, 1, 0)
+            )
+            left = torch.searchsorted(sorted_keys, key_ids, right=False)
+            right = torch.searchsorted(sorted_keys, key_ids, right=True)
+            grad_k_ext.add_(prefix.index_select(0, right) - prefix.index_select(0, left))
+    grad_k = grad_k_ext[:total_keys].reshape_as(k_idx_bsd).to(dtype=k_idx_bsd.dtype)
+    grad_w = (
+        grad_w_flat.reshape_as(w_bsh).to(dtype=w_bsh.dtype) if grad_w_flat is not None else None
+    )
+    return grad_w, grad_k
+
+
+def _override_indexer_grads(ig: dict, det_w: Optional[Tensor], det_k: Optional[Tensor]) -> dict:
+    """Replace cuDNN's atomically accumulated indexer grads with the deterministic ones."""
+    out = {k: ig[k] for k in ("d_index_q", "d_weights", "d_index_k")}
+    if det_k is not None:
+        out["d_index_k"] = det_k.to(dtype=out["d_index_k"].dtype).reshape(out["d_index_k"].shape)
+    if det_w is not None:
+        out["d_weights"] = det_w.to(dtype=out["d_weights"].dtype).reshape(out["d_weights"].shape)
+    return out
+
+
 class CSASparseAttnFunc(torch.autograd.Function):
     """Sparse attention fwd + bwd on flat tensors.
 
@@ -1562,6 +1830,9 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
+            **_deterministic_sparse_bwd_kwargs(
+                q, kv, out, lse, attn_sink, topk_idxs, ctx.topk_length, ctx.softmax_scale
+            ),
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
         return dq, dkv, d_sink, None, None, None, None, None, None
@@ -1975,6 +2246,12 @@ def _indexer_topk_core(
             for output_name in ("out_indices", "out_logits", "softmax_out"):
                 compact_kwargs.pop(output_name, None)
             del returned_buffers, actual, expected
+        if deterministic:
+            # The kernel's ``deterministic`` flag fixes *which* ids are selected but not their
+            # slot order; make the outputs a pure function of the selected set.
+            topk_indices, compact_softmax = _canonicalize_compact_topk(
+                topk_indices, compact_logits, compact_softmax
+            )
         del compact_logits, compact_result
 
         topk_indices = topk_indices.int()
@@ -2956,6 +3233,25 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                     bwd_idx = index_score_for_bwd
                     bwd_topk = topk_indices_cmp
 
+                det_w = det_k = None
+                # Skip in passes whose autograd graph is never used (the no_grad pass of an
+                # activation checkpoint): the query activation does not require grad there.
+                if _deterministic_requested(deterministic) and ctx.needs_input_grad[0]:
+                    # cuDNN accumulates dK (and dW on SM90) with atomics; compute the
+                    # deterministic replacements first because the cuDNN kernel overwrites
+                    # its score operands.
+                    det_w, det_k = _deterministic_sparse_indexer_grads_wk(
+                        bwd_q,
+                        bwd_w,
+                        bwd_k,
+                        bwd_attn,
+                        bwd_idx,
+                        bwd_topk,
+                        loss_coeff=indexer_loss_coeff,
+                        grad_loss=unit_grad_loss,
+                        sm_scale=indexer_softmax_scale,
+                        compute_grad_w=_requires_native_deterministic_indexer_grad_w(bwd_q),
+                    )
                 ig = _DSA.indexer_backward_wrapper(
                     bwd_q,
                     bwd_w,
@@ -2968,6 +3264,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                     grad_loss=unit_grad_loss,
                     block_I=128,
                 )
+                if det_k is not None:
+                    ig = _override_indexer_grads(ig, det_w, det_k)
 
                 if is_thd:
                     precomputed_grad_q_indexer = ig["d_index_q"].squeeze(0)
@@ -3048,6 +3346,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_weights,
         )
         ctx.softmax_scale = softmax_scale
+        ctx.deterministic = deterministic
         ctx.is_thd = is_thd
         ctx.padding_row_mask = padding_row_mask
         ctx.np_ = np_
@@ -3111,6 +3410,17 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             global_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
+            **_deterministic_sparse_bwd_kwargs(
+                q_flat,
+                kv_flat,
+                out_flat,
+                lse,
+                attn_sink,
+                global_idxs,
+                topk_length,
+                ctx.softmax_scale,
+                requested=ctx.deterministic,
+            ),
         )
         if is_thd:
             grad_query = attn_bwd["dq"]
@@ -3291,18 +3601,41 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 loss_divisor=loss_divisor,
             )
             if loss_coeff > 0:
+                bwd_q = q_indexer.view(1, total_q, idx_nh, idx_hd)
+                bwd_w = weights.view(1, total_q, idx_nh)
+                bwd_k = k_indexer.view(1, total_comp, idx_hd)
+                bwd_attn = target.view(1, total_q, indexer_topk)
+                bwd_idx = predict.view(1, total_q, indexer_topk)
+                bwd_topk = indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk)
+                det_w = det_k = None
+                if _deterministic_requested() and ctx.needs_input_grad[0]:
+                    # See FusedCSAIndexerSparseAttnFunc: atomic-free dK/dW before the cuDNN call.
+                    det_w, det_k = _deterministic_sparse_indexer_grads_wk(
+                        bwd_q,
+                        bwd_w,
+                        bwd_k,
+                        bwd_attn,
+                        bwd_idx,
+                        bwd_topk,
+                        loss_coeff=bwd_loss_coeff,
+                        grad_loss=unit_grad_loss,
+                        sm_scale=indexer_softmax_scale,
+                        compute_grad_w=_requires_native_deterministic_indexer_grad_w(bwd_q),
+                    )
                 ig = _DSA.indexer_backward_wrapper(
-                    q_indexer.view(1, total_q, idx_nh, idx_hd),
-                    weights.view(1, total_q, idx_nh),
-                    k_indexer.view(1, total_comp, idx_hd),
-                    target.view(1, total_q, indexer_topk),
-                    predict.view(1, total_q, indexer_topk),
-                    indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk),
+                    bwd_q,
+                    bwd_w,
+                    bwd_k,
+                    bwd_attn,
+                    bwd_idx,
+                    bwd_topk,
                     sm_scale=indexer_softmax_scale,
                     loss_coeff=bwd_loss_coeff,
                     grad_loss=unit_grad_loss,
                     block_I=128,
                 )
+                if det_k is not None:
+                    ig = _override_indexer_grads(ig, det_w, det_k)
         else:
             cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
             max_seqlen_k = max_seqlen_q // ratio
@@ -3528,6 +3861,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
+            **_deterministic_sparse_bwd_kwargs(
+                query, kv_full, out_flat, lse, attn_sink, topk_idxs, topk_length, ctx.softmax_scale
+            ),
         )
         nvtx_range_pop("dsv4_cp_sparse_attention_backward")
 
