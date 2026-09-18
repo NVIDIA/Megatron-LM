@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.moe.flashinfer_mxfp8 import select_routed_mxfp8_active_rows
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -17,6 +18,14 @@ def reset_inference_mode():
     InferenceMode.unset_active()
     yield
     InferenceMode.unset_active()
+
+
+def _mxfp8_weight():
+    return MXFP8Tensor(
+        data=torch.empty(1, dtype=torch.float8_e4m3fn),
+        scale=torch.empty(1, dtype=torch.uint8),
+        backend="triton",
+    )
 
 
 def test_inference_mode_tracks_bounded_mxfp8_rows():
@@ -92,6 +101,56 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     assert config.fp8 is None
 
 
+def test_vllm_backend_accepts_mxfp8_config_for_per_layer_dispatch():
+    config = _make_bounded_mxfp8_config(
+        inference_grouped_gemm_backend="vllm",
+        inference_flashinfer_mxfp8_token_capacity=None,
+        expert_model_parallel_size=1,
+    )
+
+    assert config.inference_grouped_gemm_backend.value == "vllm"
+
+
+def test_vllm_mxfp8_layer_dispatches_to_mcore_path():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    expected = (object(), None)
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=True,
+        _uses_mxfp8_weights=True,
+        _fc1_weight=_mxfp8_weight(),
+        _fc2_weight=_mxfp8_weight(),
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.VLLM,
+        _mcore_fused_moe_forward=lambda hidden, probs, routing_map: expected,
+        _vllm_forward=lambda *args, **kwargs: pytest.fail("BF16 vLLM path was selected"),
+    )
+
+    with InferenceMode.active():
+        actual = InferenceGroupedMLP.forward(
+            grouped_mlp,
+            torch.empty(1, 1),
+            None,
+            torch.empty(1, 1),
+            routing_map=torch.zeros(1, 1, dtype=torch.int64),
+        )
+
+    assert actual is expected
+
+
+def test_lazy_weight_build_rejects_partially_selected_expert_projection():
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped_mlp = SimpleNamespace(
+        num_local_experts=1,
+        linear_fc1=SimpleNamespace(weight0=_mxfp8_weight()),
+        linear_fc2=SimpleNamespace(weight0=torch.empty(1, dtype=torch.bfloat16)),
+    )
+
+    with pytest.raises(TypeError, match="select both expert projections"):
+        InferenceGroupedMLP._expert_weights_use_mxfp8(grouped_mlp)
+
+
 @pytest.mark.parametrize("activation_func", [F.gelu, F.silu, F.relu])
 def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func):
     with pytest.raises(ValueError, match="supports only non-gated squared-ReLU experts"):
@@ -101,13 +160,6 @@ def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func)
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        (
-            {
-                "inference_grouped_gemm_backend": "vllm",
-                "inference_flashinfer_mxfp8_token_capacity": None,
-            },
-            "vLLM Triton fused MoE only supports BF16",
-        ),
         ({"fp8_param": False}, "fp8_param must be enabled"),
         ({"fp8": None, "fp8_param": False}, "requires.*FP8 enabled"),
         ({"inference_moe_token_dispatcher_type": "nccl"}, "requires.*nvls"),
@@ -145,6 +197,21 @@ def test_flashinfer_mxfp8_refresh_reports_noop_before_weight_build():
     assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
 
 
+def test_flashinfer_mxfp8_refresh_skips_bf16_expert_weights():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=True,
+        _uses_mxfp8_weights=False,
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER,
+        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+    )
+
+    assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
+
+
 def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     from megatron.core.transformer.moe import experts
 
@@ -161,6 +228,7 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     )
 
     grouped_mlp = SimpleNamespace(
+        _uses_mxfp8_weights=False,
         _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _flashinfer_activation_type=object(),
