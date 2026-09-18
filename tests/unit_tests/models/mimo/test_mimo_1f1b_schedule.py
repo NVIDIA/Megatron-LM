@@ -17,7 +17,7 @@ from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from examples.mimo.training.grad_sync import configure_grad_sync
-from examples.mimo.training.runtime import wrap_active_modules_with_ddp
+from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -37,6 +37,8 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.rerun_state_machine import RerunDataIterator, RerunMode, get_rerun_state_machine
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -52,6 +54,142 @@ except ImportError:
     TERowParallelLinear = None
 
 logger = logging.getLogger(__name__)
+
+
+def test_receiver_shape_prepeek_replays_rerun_batch_without_refetching():
+    """A rerun re-derives the receive shape from the buffered logical batch."""
+
+    class CountingIterator:
+        def __init__(self):
+            self.fetches = 0
+
+        def __next__(self):
+            self.fetches += 1
+            return {"batch_id": self.fetches}
+
+    source = CountingIterator()
+    data_iterator = RerunDataIterator(source)
+    prepared_batches = []
+    communicator = SimpleNamespace(
+        has_receiver_derived_bridge_shapes=True, prepare_bridge_recv_shapes=prepared_batches.append
+    )
+    rerun_state_machine = get_rerun_state_machine()
+    previous_mode = rerun_state_machine.get_mode()
+    rerun_state_machine.set_mode(RerunMode.REPORT_DETERMINISM_STATS)
+
+    try:
+        first = schedule._prepare_forward_data_iterator(
+            data_iterator, communicator, is_multimodule=True
+        )
+        assert next(first) == {"batch_id": 1}
+        assert source.fetches == 1
+
+        data_iterator.rewind()
+        replay = schedule._prepare_forward_data_iterator(
+            data_iterator, communicator, is_multimodule=True
+        )
+        assert next(replay) == {"batch_id": 1}
+        assert source.fetches == 1
+        assert prepared_batches == [{"batch_id": 1}, {"batch_id": 1}]
+    finally:
+        data_iterator.advance()
+        rerun_state_machine.set_mode(previous_mode)
+
+
+def test_bridge_receive_shape_preparation_rejects_unconsumed_shape():
+    """Double preparation fails locally before communication can use a stale shape."""
+
+    class Bridge:
+        skip_shape_exchange = True
+        src_module_name = "encoder"
+        tensor_ndim = 2
+
+    bridge = Bridge()
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+    communicator.rank_module_map = {
+        "language": SimpleNamespace(bridge_comms_as_dest_module=[bridge])
+    }
+    communicator.bridge_recv_shape_fns = {"encoder": lambda batch: (batch["rows"], 8)}
+    communicator._next_bridge_recv_shapes = {}
+
+    communicator.prepare_bridge_recv_shapes({"rows": 3})
+    with pytest.raises(RuntimeError, match="prepared more than once"):
+        communicator.prepare_bridge_recv_shapes({"rows": 4})
+
+
+def test_disabled_bridge_rejects_intermediate_module():
+    """Skipping backward on an intermediate module would strand its upstream bridge."""
+    topology = {"source": ["encoder"], "encoder": ["language"], "language": []}
+    with pytest.raises(NotImplementedError, match="graph source module"):
+        MultiModulePipelineCommunicator(
+            {module_name: object() for module_name in topology},
+            topology,
+            object(),
+            bridge_requires_backward={"encoder": False},
+        )
+
+
+def test_disabled_bridge_results_keep_explicit_none_keys():
+    """MultiModule preserves None so detached source backward is skipped by key."""
+
+    class DisabledBridge:
+        src_module_name = "encoder"
+
+        def send_forward_recv_backward(self, output):
+            del output
+            return None
+
+        def recv_backward(self):
+            return None
+
+        def send_backward_recv_forward(self, grad, forward_shape=None):
+            assert grad is None
+            assert forward_shape is None
+            return "activation"
+
+        def send_backward(self, grad):
+            assert grad is None
+
+    bridge = DisabledBridge()
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+    communicator.rank_module_map = {
+        "encoder": SimpleNamespace(
+            pp_rank=0,
+            pp_size=1,
+            bridge_comms_as_src_module=[bridge],
+            bridge_comms_as_dest_module=[],
+        )
+    }
+    assert communicator.send_forward_recv_backward({"encoder": "output"}) == {"encoder": None}
+    assert communicator.recv_backward() == {"encoder": None}
+
+    communicator.rank_module_map = {
+        "language": SimpleNamespace(
+            pp_rank=0,
+            pp_size=1,
+            bridge_comms_as_src_module=[],
+            bridge_comms_as_dest_module=[bridge],
+        )
+    }
+    communicator._next_bridge_recv_shapes = {}
+    assert communicator.send_backward_recv_forward({"encoder": None}) == {"encoder": "activation"}
+    communicator.send_backward({"encoder": None})
+
+
+def test_backward_step_skips_detached_output_with_explicit_none_grad(monkeypatch):
+    """A disabled bridge's explicit None does not seed or invoke source backward."""
+    monkeypatch.setattr(
+        torch.autograd,
+        "backward",
+        lambda *args, **kwargs: pytest.fail("detached source must not run backward"),
+    )
+    config = SimpleNamespace(grad_scale_func=None, deallocate_pipeline_outputs=False, timers=None)
+    assert (
+        schedule.backward_step_multimodule(
+            {}, {"encoder": torch.ones(2)}, {"encoder": None}, config, MIMO_LANGUAGE_MODULE_KEY
+        )
+        == {}
+    )
 
 
 # ============================================================================
@@ -70,20 +208,22 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     collapse (tp_ep_pp = tp x pp, expt_dp = dp) without changing the base rank layout.
     """
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp],
-        dim_names=["tp", "cp", "pp", "dp"],
+        shape=[tp, cp, 1, pp, dp],
+        dim_names=["tp", "cp", "gtp_remat", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )
     grid.register_view(
         "expert",
-        shape=[tp, cp, pp, dp],
-        dim_names=["expt_tp", "ep", "pp", "expt_dp"],
+        shape=[tp, cp, 1, pp, dp],
+        dim_names=["expt_tp", "ep", "expt_gtp_remat", "pp", "expt_dp"],
         shared_dims=["pp"],
     )
     for dims in (
         ["tp"],
         ["cp"],
+        ["gtp_remat"],
+        ["tp", "cp"],
         ["pp"],
         ["dp"],
         ["dp", "cp"],
@@ -91,7 +231,7 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
         ["tp", "cp", "dp", "pp"],
     ):
         grid.create_pg(dims)
-    for dims in (["ep"], ["expt_dp"], ["expt_tp", "ep", "pp"]):
+    for dims in (["ep"], ["expt_gtp_remat"], ["expt_dp"], ["expt_tp", "ep", "pp"]):
         grid.create_pg(dims, view="expert")
     _active_grids.append(grid)
     return grid
@@ -112,18 +252,22 @@ def get_pg_collection(grid):
     pg_collection = ProcessGroupCollection()
     pg_collection.tp = grid.get_pg("tp")
     pg_collection.cp = grid.get_pg("cp")
+    pg_collection.tp_cp = grid.get_pg(["tp", "cp"])
     pg_collection.pp = grid.get_pg("pp")
     pg_collection.ep = grid.get_pg("ep", view="expert")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
     pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
     pg_collection.expt_tp = pg_collection.tp
-    pg_collection.gtp_remat = None
-    pg_collection.expt_gtp_remat = None
+    pg_collection.gtp_remat = grid.get_pg("gtp_remat")
+    pg_collection.expt_gtp_remat = grid.get_pg("expt_gtp_remat", view="expert")
     # Expert groups from the expert view (dense here, so tp_ep_pp resolves to tp x pp).
     pg_collection.mp = grid.get_pg(["tp", "pp"])
     pg_collection.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
     pg_collection.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+    if is_rank_in_grid(grid):
+        assert pg_collection.gtp_remat.size() == 1
+        assert pg_collection.expt_gtp_remat.size() == 1
     return pg_collection
 
 
@@ -281,13 +425,18 @@ def get_projection_config(hidden_size, bias=True):
     return cfg
 
 
-def get_projection_layer_spec():
+def get_projection_layer_spec(projection_type="mlp"):
     """Layer spec for the vision-projection MLP."""
     if TEColumnParallelLinear is None or TERowParallelLinear is None:
         raise RuntimeError("TEColumnParallelLinear and TERowParallelLinear are required")
     return ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+        submodules=MLPSubmodules(
+            linear_fc1=(
+                ColumnParallelLinear if projection_type == "affine" else TEColumnParallelLinear
+            ),
+            linear_fc2=TERowParallelLinear,
+        ),
     )
 
 
@@ -301,6 +450,7 @@ def get_vision_submodules_spec(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    projection_type="mlp",
 ):
     """Get the submodule spec for the vision modality.
 
@@ -353,10 +503,11 @@ def get_vision_submodules_spec(
         module=MultimodalProjector,
         params={
             "config": get_projection_config(hidden_size=language_hidden_size, bias=bias),
-            "submodules": get_projection_layer_spec().submodules,
-            "projector_type": "mlp",
+            "submodules": get_projection_layer_spec(projection_type).submodules,
+            "projector_type": projection_type,
             "input_size": vision_config.hidden_size,
             "tp_group": pg_collection.tp,
+            "pg_collection": pg_collection,
         },
     )
 
@@ -385,6 +536,12 @@ def get_mimo_model(
     per_token_loss=False,
     use_layer_wise_distributed_optimizer=False,
     share_embeddings_and_output_weights=False,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+    freeze_encoder=False,
+    projection_type="mlp",
+    language_pg_collection=None,
+    vision_pg_collection=None,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -409,8 +566,18 @@ def get_mimo_model(
         share_embeddings_and_output_weights: If True, tie the LLM word embedding and
             output-layer weights (GPTModel kwarg of the same name).
     """
-    language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
-    vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
+    encoder_hidden_size = encoder_hidden_size or hidden_size
+    language_pg = language_pg_collection
+    if language_pg is None:
+        language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
+    vision_pg = vision_pg_collection
+    if vision_pg is None:
+        vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
+
+    if is_rank_in_grid(encoder_grid):
+        configure_module_rng(SimpleNamespace(seed=123), vision_pg, 10_000)
+    if is_rank_in_grid(llm_grid):
+        configure_module_rng(SimpleNamespace(seed=123), language_pg, 0)
 
     language_model_spec = get_language_model_spec(
         num_layers=num_layers,
@@ -425,9 +592,20 @@ def get_mimo_model(
         per_token_loss=per_token_loss,
         share_embeddings_and_output_weights=share_embeddings_and_output_weights,
     )
+    language_gtp_size = (
+        llm_grid.shape[llm_grid.dim_names.index("gtp_remat")]
+        if "gtp_remat" in llm_grid.dim_names
+        else 1
+    )
+    language_config = language_model_spec.params["config"]
+    language_config.use_cpu_initialization = language_gtp_size == 1
+    language_config.gtp_weight_remat_size = language_gtp_size
+    language_config.tensor_parallel_num_weight_shards = (
+        language_config.tensor_model_parallel_size * language_gtp_size
+    )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
-        hidden_size=hidden_size,
+        hidden_size=encoder_hidden_size,
         num_attention_heads=8,
         language_hidden_size=hidden_size,
         pg_collection=vision_pg,
@@ -435,7 +613,30 @@ def get_mimo_model(
         bias=bias,
         dropout=dropout,
         per_token_loss=per_token_loss,
+        projection_type=projection_type,
     )
+    language_input_projections = {}
+    if language_rank_input_projection:
+        projection_config = get_projection_config(hidden_size=hidden_size, bias=bias)
+        projection_config.tensor_model_parallel_size = llm_grid.shape[
+            llm_grid.dim_names.index("tp")
+        ]
+        projection_config.gtp_weight_remat_size = language_gtp_size
+        projection_config.tensor_parallel_num_weight_shards = (
+            projection_config.tensor_model_parallel_size * language_gtp_size
+        )
+        language_input_projections[encoder_name] = ModuleSpec(
+            module=MultimodalProjector,
+            params={
+                "config": projection_config,
+                "submodules": get_projection_layer_spec(projection_type).submodules,
+                "projector_type": projection_type,
+                "input_size": encoder_hidden_size,
+                "tp_group": language_pg.tp,
+                "pg_collection": language_pg,
+            },
+        )
+        vision_submodule_spec.submodules["input_projections"] = []
 
     module_to_grid_map = {encoder_name: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid}
     topology = {encoder_name: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []}
@@ -443,6 +644,7 @@ def get_mimo_model(
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={encoder_name: vision_submodule_spec},
+        language_model_input_projections_spec=language_input_projections,
         special_token_ids={encoder_name: 50257},
         module_to_grid_map=module_to_grid_map,
     )
@@ -461,12 +663,12 @@ def get_mimo_model(
             use_distributed_optimizer=True,
         )
 
-    if use_layer_wise_distributed_optimizer:
+    if use_layer_wise_distributed_optimizer or freeze_encoder:
         wrap_active_modules_with_ddp(
             SimpleNamespace(
                 mimo_encoder_ddp_overlap=False,
                 freeze_lm=False,
-                freeze_vit=False,
+                freeze_vit=freeze_encoder,
                 freeze_projection=False,
             ),
             mimo_model,
@@ -474,7 +676,7 @@ def get_mimo_model(
                 module_pgs={MIMO_LANGUAGE_MODULE_KEY: language_pg, encoder_name: vision_pg}
             ),
             ddp_config,
-            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=True,
         )
     else:
@@ -517,6 +719,7 @@ class DataIterator:
         encoder_name,
         image_token_id=50257,
         image_seq_length=None,
+        variable_image_seq_length=False,
     ):
         self.hidden_size = hidden_size
         self.seq_length = seq_length
@@ -525,13 +728,19 @@ class DataIterator:
         self.encoder_name = encoder_name
         self.image_token_id = image_token_id
         self.image_seq_length = image_seq_length or (seq_length // 2)
+        self.variable_image_seq_length = variable_image_seq_length
+        self.num_batches_yielded = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        self.num_batches_yielded += 1
+        image_seq_length = self.image_seq_length
+        if self.variable_image_seq_length:
+            image_seq_length -= (self.num_batches_yielded - 1) % 4
         encoder_hidden_states = torch.randn(
-            self.image_seq_length,
+            image_seq_length,
             self.micro_batch_size,
             self.hidden_size,
             device='cuda',
@@ -539,7 +748,7 @@ class DataIterator:
         )
 
         image_tokens = torch.full(
-            (self.micro_batch_size, self.image_seq_length),
+            (self.micro_batch_size, image_seq_length),
             self.image_token_id,
             dtype=torch.long,
             device='cuda',
@@ -547,7 +756,7 @@ class DataIterator:
         text_tokens = torch.randint(
             1,
             self.vocab_size,
-            (self.micro_batch_size, self.seq_length - self.image_seq_length),
+            (self.micro_batch_size, self.seq_length - image_seq_length),
             device='cuda',
         )
         input_ids = torch.cat([image_tokens, text_tokens], dim=1)
@@ -606,6 +815,11 @@ def run_mimo_1f1b_test(
     micro_batch_size=2,
     num_microbatches=4,
     use_layer_wise_distributed_optimizer=False,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+    freeze_encoder=False,
+    projection_type="mlp",
+    skip_bridge_shape_exchange=False,
 ):
     """Run MIMO model through 1F1B schedule and verify.
 
@@ -623,6 +837,7 @@ def run_mimo_1f1b_test(
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
     encoder_name = "images"
+    encoder_hidden_size = encoder_hidden_size or hidden_size
 
     encoder_grid = create_hypercomm_grid(
         offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
@@ -646,6 +861,10 @@ def run_mimo_1f1b_test(
         seq_len=seq_length,
         per_token_loss=True,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+        encoder_hidden_size=encoder_hidden_size,
+        language_rank_input_projection=language_rank_input_projection,
+        freeze_encoder=freeze_encoder,
+        projection_type=projection_type,
     )
 
     # Use the production grad-sync hook (finalize per module over its own groups +
@@ -688,7 +907,22 @@ def run_mimo_1f1b_test(
         mimo_model.config,
         dim_mapping={'s': 0, 'h': 2, 'b': 1},
         module_output_ndim={encoder_name: 2},
+        bridge_recv_shape_fns=(
+            {
+                encoder_name: lambda batch: (
+                    int((batch["input_ids"] == 50257).sum()),
+                    encoder_hidden_size if language_rank_input_projection else hidden_size,
+                )
+            }
+            if skip_bridge_shape_exchange
+            else None
+        ),
     )
+    if skip_bridge_shape_exchange:
+        for bridge_comm in communicator.bridge_comms:
+            bridge_comm._communicate_shapes = lambda *args, **kwargs: pytest.fail(
+                "shape exchange must not run on the receiver-derived path"
+            )
 
     # Compute per-rank micro-batch size for asymmetric DP.
     # The LLM's MBS is the schedule-level MBS. The encoder's MBS is adjusted
@@ -706,15 +940,37 @@ def run_mimo_1f1b_test(
         is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))
     )
     if encoder_needs_data and not llm_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, encoder_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            encoder_hidden_size,
+            seq_length,
+            encoder_mbs,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
+        )
     elif llm_needs_data and not encoder_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, llm_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            encoder_hidden_size,
+            seq_length,
+            llm_mbs,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
+        )
     elif encoder_needs_data and llm_needs_data:
         # Colocated: both encoder and LLM on same rank. Use LLM's MBS since
         # the LLM drives the schedule. (encoder_dp == llm_dp when colocated)
         data_iterator = DataIterator(
-            hidden_size, seq_length, micro_batch_size, vocab_size, encoder_name
+            encoder_hidden_size,
+            seq_length,
+            micro_batch_size,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
         )
+    raw_data_iterator = data_iterator
+    if skip_bridge_shape_exchange and data_iterator is not None:
+        data_iterator = RerunDataIterator(data_iterator)
 
     # Build MultiModuleProcessGroupCollection (reuse pre-created pg_collections)
     module_pgs = {}
@@ -787,6 +1043,23 @@ def run_mimo_1f1b_test(
         assert torch.isfinite(
             torch.as_tensor(grad_norm)
         ).all(), f"Expected finite grad norm, got {grad_norm}"
+        if skip_bridge_shape_exchange:
+            schedule.forward_backward_pipelining_without_interleaving(
+                forward_step_func=step_func,
+                data_iterator=data_iterator,
+                model=[mimo_model],
+                num_microbatches=num_microbatches,
+                seq_length=seq_length,
+                micro_batch_size=micro_batch_size,
+                forward_only=True,
+                p2p_communicator=communicator,
+                pg_collection=pg_collection,
+            )
+            if raw_data_iterator is not None:
+                assert raw_data_iterator.num_batches_yielded == 2 * num_microbatches
+            assert all(
+                not bridge_comm._sent_forward_shapes for bridge_comm in communicator.bridge_comms
+            ), "Expected every remembered forward shape to be consumed by backward"
 
         # Verify results on last LLM stage
         if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
@@ -945,7 +1218,7 @@ class TestMimo1F1BSchedule:
         )
 
     def test_fan_out_dp1_to_dp4_enc_tp2_pp2_8gpu(self):
-        """Fan-out 1→4: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.
+        """Receiver-derived fan-out: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.
 
         Encoder has PP and TP. Bridge fan-out splits encoder output into
         4 parts for 4 LLM DP ranks each with MBS=1.
@@ -968,6 +1241,55 @@ class TestMimo1F1BSchedule:
             seq_length=64,
             micro_batch_size=1,
             num_microbatches=4,
+            skip_bridge_shape_exchange=True,
+        )
+
+    def test_fan_out_dp1_to_dp4_enc_tp2_pp2_legacy_8gpu(self):
+        """Legacy shape-exchange fan-out on the same 8-GPU topology."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=2,
+            encoder_pp=2,
+            encoder_dp=1,
+            encoder_offset=0,
+            llm_tp=1,
+            llm_pp=1,
+            llm_dp=4,
+            llm_offset=4,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=1,
+            num_microbatches=4,
+        )
+
+    def test_language_rank_input_projection_with_frozen_encoder_8gpu(self):
+        """Language ranks project unequal-width features from frozen encoder ranks."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=1,
+            encoder_pp=1,
+            encoder_dp=4,
+            encoder_offset=0,
+            llm_tp=2,
+            llm_pp=1,
+            llm_dp=2,
+            llm_offset=4,
+            hidden_size=256,
+            encoder_hidden_size=128,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=2,
+            language_rank_input_projection=True,
+            freeze_encoder=True,
+            projection_type="affine",
         )
 
     @pytest.mark.parametrize("use_layer_wise_distributed_optimizer", [False, True])

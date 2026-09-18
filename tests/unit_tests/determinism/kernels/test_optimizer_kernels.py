@@ -12,6 +12,7 @@ import torch
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -73,6 +74,32 @@ class TestGradNormAndClip:
                 continue
             for j, (a, b) in enumerate(zip(ref, got)):
                 assert bytes_equal(a, b), f"clipped grad {j} differs on replay {i}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_tensor_metric_l2_replays(monkeypatch, dtype):
+    """Replay TE's per-tensor norm outputs through the actual batched metric path."""
+    if _fused_l2_norm_impl() is None:
+        pytest.skip("TransformerEngine multi-tensor L2 kernel is unavailable")
+    seeded()
+    # Span many reduction CTAs and include uneven chunk boundaries and small tensors.
+    tensors = tuple(
+        torch.randn(n, device="cuda", dtype=dtype) for n in (4_194_321, 131_071, 4097, 1)
+    )
+    metric = L2NormMetric()
+
+    def unexpected_fallback(tensor):
+        pytest.fail("Expected the fused multi-tensor L2 path, not the per-tensor fallback")
+
+    monkeypatch.setattr(metric, "contribution", unexpected_fallback)
+    assert_replays_bit_exact(
+        lambda *values: metric.contribution_batch(values),
+        tensors,
+        replays=8,
+        backward=False,
+        contention=True,
+        what=f"L2NormMetric.contribution_batch ({dtype})",
+    )
 
 
 def test_fused_adam_step_replays():

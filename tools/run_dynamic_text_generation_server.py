@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Optional
 
 # tools/ lives at the repo root; put the repo root on sys.path so the
 # megatron.* and examples.* packages are importable regardless of cwd.
@@ -127,6 +128,52 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         ),
     )
     return parser
+
+
+def parse_args_and_detect_vlm(
+    extra_args_provider, args_defaults: dict, user_passed_attrs: Optional[set] = None
+):
+    """Parse CLI args and auto-detect VLM vs language model only from the checkpoint.
+
+    `add_multimodal_extra_args` via `add_text_generation_server_args` requires
+    --language-model-type or --tokenizer-prompt-format for a text-only checkpoint, so this injects
+    placeholders before parsing when the caller hasn't already set them, then overwrites them with
+    real values once the checkpoint shape is known.
+    Precedence for VLM-relevant args is CLI > checkpoint > parser default.
+
+    Callers that inject their own argv defaults first should compute user_passed_attrs beforehand
+    and pass it in.
+
+    Returns (args, is_vlm).
+    """
+    if user_passed_attrs is None:
+        user_passed_attrs = set()
+        for tok in sys.argv[1:]:
+            if tok.startswith('--'):
+                user_passed_attrs.add(tok[2:].split('=', 1)[0].replace('-', '_'))
+
+    _defaults = []
+    if "language_model_type" not in user_passed_attrs:
+        _defaults += ["--language-model-type", "placeholder"]
+    if "tokenizer_prompt_format" not in user_passed_attrs:
+        _defaults += ["--tokenizer-prompt-format", "mistral"]
+    sys.argv[1:1] = _defaults
+
+    parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    initialize_megatron()
+    args = get_args()
+
+    is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
+    # Tiling and dynamic_resolution are mutually exclusive at inference, so
+    # use --use-tiling explicitly.
+    if getattr(args, 'use_tiling', False):
+        args.dynamic_resolution = False
+    if is_vlm:
+        _print_resolved_args("resolved VLM arguments", args)
+    if torch.distributed.get_rank() == 0:
+        print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
+
+    return args, is_vlm
 
 
 def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
@@ -346,9 +393,9 @@ if __name__ == "__main__":
     with torch.inference_mode():
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
-        # Snapshot what the user actually typed BEFORE we inject defaults, so
-        # _detect_vlm_from_checkpoint can tell explicit CLI args from injected
-        # defaults / parser defaults.  Precedence: CLI > checkpoint > default.
+        # Snapshot what the user actually typed BEFORE we inject defaults below,
+        # so parse_args_and_detect_vlm's checkpoint-vs-CLI precedence isn't
+        # confounded by server-specific injected defaults. Precedence: CLI > checkpoint > default.
         user_passed_attrs = set()
         for tok in sys.argv[1:]:
             if tok.startswith('--'):
@@ -366,13 +413,6 @@ if __name__ == "__main__":
             "1",
             "--inference-dynamic-batching-buffer-size-gb",
             "2.0",
-            # Placeholders for add_multimodal_extra_args' required args. These
-            # are injected as defaults, so _detect_vlm_from_checkpoint will
-            # replace them with the checkpoint's real values when loading a VLM.
-            "--language-model-type",
-            "placeholder",
-            "--tokenizer-prompt-format",
-            "mistral",
         ]
         # store_true flags: only inject when the user hasn't expressed a
         # conflicting choice on the CLI.
@@ -388,25 +428,11 @@ if __name__ == "__main__":
             _defaults.append("--return-log-probs")
         sys.argv[1:1] = _defaults
 
-        parse_and_validate_args(
+        args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
+            user_passed_attrs=user_passed_attrs,
         )
-        initialize_megatron()
-
-        args = get_args()
-
-        # Auto-detect VLM and copy VLM args from the checkpoint with precedence
-        # CLI > checkpoint > parser default.  Tiling and dynamic_resolution are
-        # mutually exclusive at inference, so honor --use-tiling explicitly.
-        is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
-        if getattr(args, 'use_tiling', False):
-            args.dynamic_resolution = False
-        if is_vlm:
-            _print_resolved_args("resolved VLM arguments", args)
-
-        if torch.distributed.get_rank() == 0:
-            print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
 
         # Match training's NVTX gating (training.py only flips this when both
         # --profile and --nvtx-ranges are set). Otherwise the engine-side

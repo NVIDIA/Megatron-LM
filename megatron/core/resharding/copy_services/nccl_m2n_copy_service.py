@@ -124,7 +124,9 @@ def _has_nccl_cuda_backend(group: Any) -> bool:
     if dist.get_backend(group) == dist.Backend.NCCL:
         return True
     if group is None:
-        return False
+        # DeviceMesh can initialize WORLD with an unspecified backend while
+        # registering NCCL for CUDA. Inspect it just like an explicit group.
+        group = dist.group.WORLD
     # NeMo RL's cross-world refit group keeps Gloo as its default for CPU
     # object collectives and registers NCCL specifically for CUDA tensors.
     try:

@@ -430,6 +430,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
     ),
     KernelEntry(
+        name="tensor_metric_l2",
+        sources=("megatron/training/tensor_metrics/definitions.py",),
+        tests=(K + "test_optimizer_kernels.py",),
+        kind="dispatch",
+        notes="L2NormMetric dispatches TE multi_tensor_l2norm with per-tensor output enabled, "
+        "then squares each norm. Replayed for FP16, BF16 and FP32 batches under side-stream "
+        "contention, with the per-tensor fallback forbidden so the fused path is exercised.",
+    ),
+    KernelEntry(
         name="ddp_grad_buffer_reductions",
         sources=("megatron/core/distributed/param_and_grad_buffer.py",),
         tests=(C + "test_gpt_model.py",),
@@ -467,6 +476,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
+            "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),
@@ -480,6 +490,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/custom_layers/batch_invariant_kernels.py",),
         tests=(
             K + "test_inference_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
         ),
         kind="triton",

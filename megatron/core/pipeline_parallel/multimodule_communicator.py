@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -117,6 +117,8 @@ class MultiModulePipelineCommunicator:
         config: ModelParallelConfig,
         dim_mapping: Dict[str, List[int]] = None,
         module_output_ndim: Optional[Dict[str, int]] = None,
+        bridge_recv_shape_fns: Optional[Dict[str, Callable[[Dict], Tuple[int, ...]]]] = None,
+        bridge_requires_backward: Optional[Dict[str, bool]] = None,
     ):
         """
         Initialize the MultiModulePipelineCommunicator.
@@ -150,12 +152,28 @@ class MultiModulePipelineCommunicator:
                 Example:
                     module_output_ndim = {'image_encoder': 2, 'llm': 3}
                 Default: None (all modules assumed 3D)
+            bridge_recv_shape_fns: Optional mapping from source module name to a callback
+                that derives the exact forward receive shape from the destination batch.
+                Providing a callback skips shape exchange for that bridge. This mapping
+                must be configured identically on all ranks.
+            bridge_requires_backward: Per-source backward policy. Missing sources default to True.
         """
         self.module_to_grid_map = module_to_grid_map
         self.topology = topology
         self.config = config
         self.dim_mapping = dim_mapping
         self.module_output_ndim = module_output_ndim or {}
+        self.bridge_recv_shape_fns = bridge_recv_shape_fns or {}
+        self.bridge_requires_backward = dict(bridge_requires_backward or {})
+        for module_name, requires_backward in self.bridge_requires_backward.items():
+            if requires_backward is False and (
+                module_name not in self.topology or not self._is_source_module(module_name)
+            ):
+                raise NotImplementedError(
+                    "bridge_requires_backward=False requires a graph source module"
+                )
+        self._schedule_forward_only = False
+        self._next_bridge_recv_shapes: Dict[BridgeCommunicator, Tuple[int, ...]] = {}
         self.current_rank = dist.get_rank()
 
         # Build bridge communicators for all modules
@@ -180,6 +198,8 @@ class MultiModulePipelineCommunicator:
                     src_module_name=src_module_name,
                     dest_module_name=dest_module_name,
                     tensor_ndim=self.module_output_ndim.get(src_module_name, 3),
+                    skip_shape_exchange=src_module_name in self.bridge_recv_shape_fns,
+                    requires_backward=self.bridge_requires_backward.get(src_module_name, True),
                 )
                 self.bridge_comms.append(bridge_comm)
 
@@ -354,7 +374,9 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    received_tensor = bridge_comm.recv_forward()
+                    received_tensor = bridge_comm.recv_forward(
+                        recv_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None)
+                    )
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
@@ -364,6 +386,41 @@ class MultiModulePipelineCommunicator:
                 )
                 input_dict[module_name] = _restore_tensor_from_comm(received_tensor)
         return input_dict
+
+    @property
+    def has_receiver_derived_bridge_shapes(self) -> bool:
+        """Whether this rank receives from a bridge whose shape is batch-derived."""
+        return any(
+            bridge_comm.skip_shape_exchange
+            for rank_module_info in self.rank_module_map.values()
+            for bridge_comm in rank_module_info.bridge_comms_as_dest_module
+        )
+
+    def set_forward_only(self, forward_only: bool) -> None:
+        """Set whether bridge sends should expect matching backward receives."""
+        self._schedule_forward_only = forward_only
+
+    def prepare_bridge_recv_shapes(self, batch: Dict) -> None:
+        """Derive and retain only the shapes needed by the next bridge receive."""
+        if not isinstance(batch, dict):
+            raise TypeError("batch-derived bridge shapes require a dictionary batch")
+
+        for rank_module_info in self.rank_module_map.values():
+            for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
+                if not bridge_comm.skip_shape_exchange:
+                    continue
+                if bridge_comm in self._next_bridge_recv_shapes:
+                    raise RuntimeError("bridge receive shape was prepared more than once")
+                shape_fn = self.bridge_recv_shape_fns[bridge_comm.src_module_name]
+                shape = tuple(shape_fn(batch))
+                if len(shape) != bridge_comm.tensor_ndim or any(
+                    not isinstance(dim, int) or dim < 0 for dim in shape
+                ):
+                    raise ValueError(
+                        f"invalid receive shape {shape} for bridge source "
+                        f"{bridge_comm.src_module_name!r}"
+                    )
+                self._next_bridge_recv_shapes[bridge_comm] = shape
 
     def send_forward(self, output_dict: Dict[str, torch.Tensor], is_last_stage: bool = False):
         """Send forward activation tensor.
@@ -376,7 +433,9 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    bridge_comm.send_forward(output_dict[module_name])
+                    bridge_comm.send_forward(
+                        output_dict[module_name], expect_backward=not self._schedule_forward_only
+                    )
             else:
                 # If not last stage, send forward activation by using P2P communicator.
                 tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name])
@@ -437,7 +496,8 @@ class MultiModulePipelineCommunicator:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
                     received_tensor = bridge_comm.send_backward_recv_forward(
-                        grad_dict[bridge_comm.src_module_name]
+                        grad_dict[bridge_comm.src_module_name],
+                        forward_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None),
                     )
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:

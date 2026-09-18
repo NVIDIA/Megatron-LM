@@ -164,6 +164,24 @@ def test_safely_set_viewless_tensor_data():
     assert torch.equal(tensor, new_data_tensor)
 
 
+def test_copy_parameter_metadata_copies_public_attributes_only():
+    source = torch.nn.Parameter(torch.ones(1))
+    destination = torch.nn.Parameter(torch.zeros(1))
+    process_group = object()
+
+    source.tensor_model_parallel = True
+    source.group = process_group
+    source.future_planner_metadata = "preserved without a name allowlist"
+    source._quantizer = "tensor-subclass implementation detail"
+
+    util.copy_parameter_metadata(destination, source)
+
+    assert destination.tensor_model_parallel is True
+    assert destination.group is process_group
+    assert destination.future_planner_metadata == "preserved without a name allowlist"
+    assert not hasattr(destination, "_quantizer")
+
+
 def test_assert_viewless_tensor():
     tensor = torch.rand((3, 4))
     assert torch.equal(util.assert_viewless_tensor(tensor), tensor)
