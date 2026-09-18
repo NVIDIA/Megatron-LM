@@ -11,11 +11,6 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-try:
-    from nemo.lens.helpers import managed_span as _otel_managed_span
-except ImportError:
-    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
-
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -23,6 +18,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
+from megatron.core.telemetry import telemetry as _otel
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
@@ -285,8 +281,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
         # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
         # group is enabled, so zero cost on normal runs.
-        with _otel_managed_span(
-            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        with _otel.managed_span(
+            _otel.DETAIL, 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
             hidden_states, residual, connection_state, recompute_context = (
                 self._prepare_mixer_state(
@@ -298,7 +294,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
-            with _otel_managed_span('layer', 'megatron.layer.mamba'):
+            with _otel.managed_span(_otel.DETAIL, 'megatron.layer.mamba'):
                 if packed_sequence_cp_metadata is None:
                     mixer_out_with_bias = self.mixer(
                         hidden_states,
