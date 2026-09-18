@@ -615,33 +615,75 @@ def test_flex_dense_metadata_preserves_invalid_routes():
     dispatcher.tp_size = 2
     dispatcher.ep_size = 2
     dispatcher.num_local_experts = 2
+    # HybridEP dense indices come with full-width [num_tokens, num_experts] probs.
+    dispatcher.config = SimpleNamespace(moe_flex_dispatcher_backend="hybridep")
     routing_map = torch.tensor([[0, -1], [3, 1]], dtype=torch.int16)
     probs = torch.ones((2, 4))
 
-    expanded_routes, _ = dispatcher._initialize_metadata(routing_map, probs)
+    expanded_routes, expanded_probs = dispatcher._initialize_metadata(routing_map, probs)
 
     expected = torch.tensor([[0, 2, -1, -1], [5, 7, 1, 3]], dtype=torch.int16)
     assert torch.equal(expanded_routes, expected)
+    # Full-width probs keep the [num_tokens, world_size, num_local_experts] expansion.
+    assert expanded_probs.shape == (2, 4, 2)
+
+
+@pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+def test_flex_dense_metadata_expands_topk_probs_like_indices(backend):
+    """deepep/ncclep: the router pairs dense indices with the selected [num_tokens, topk] weights;
+    both are expanded per expert-TP rank in the same slot order."""
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.tp_size = 2
+    dispatcher.ep_size = 2
+    dispatcher.num_local_experts = 2
+    dispatcher.config = SimpleNamespace(moe_flex_dispatcher_backend=backend)
+    routing_map = torch.tensor([[0, 3], [3, 1]], dtype=torch.int64)
+    probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
+
+    expanded_routes, expanded_probs = dispatcher._initialize_metadata(routing_map, probs)
+
+    assert torch.equal(expanded_routes, torch.tensor([[0, 2, 5, 7], [5, 7, 1, 3]]))
+    torch.testing.assert_close(
+        expanded_probs, torch.tensor([[0.6, 0.6, 0.4, 0.4], [0.7, 0.7, 0.3, 0.3]])
+    )
+    # Full-width probs with dense indices are a contract violation for these backends.
+    with pytest.raises(AssertionError):
+        dispatcher._initialize_metadata(routing_map, torch.ones((2, 4)))
 
 
 @pytest.mark.parametrize("manager_cls", [_DeepepManager, _NCCLEPManager])
-def test_dense_required_manager_accepts_dense_indices(monkeypatch, manager_cls):
+@pytest.mark.parametrize("dense_probs", [False, True])
+def test_dense_required_manager_accepts_dense_indices(monkeypatch, manager_cls, dense_probs):
     manager = object.__new__(manager_cls)
     manager.num_experts = 4
     manager.router_topk = 2
     if isinstance(manager, _DeepepManager):
         manager.capacity_factor = None
     dense_indices = torch.tensor([[0, 2], [3, 1]], dtype=torch.int16)
-    probs = torch.tensor([[0.6, 0.0, 0.4, 0.0], [0.0, 0.3, 0.0, 0.7]])
+    full_probs = torch.tensor([[0.6, 0.0, 0.4, 0.0], [0.0, 0.3, 0.0, 0.7]])
+    expected_probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
+    # The flex router hands these managers the already-selected [num_tokens, topk] weights
+    # (TopKRouter.routing); setup_metadata runs inside the compiled dispatch_preprocess and must
+    # store them without any gather. Full-width probs (direct callers) are still gathered.
+    probs = expected_probs.clone() if dense_probs else full_probs
 
     monkeypatch.setattr(
         torch, "topk", lambda *args, **kwargs: pytest.fail("dense routing must not call torch.topk")
     )
+    if dense_probs:
+        monkeypatch.setattr(
+            torch.Tensor,
+            "gather",
+            lambda *args, **kwargs: pytest.fail("dense probs must be stored without a gather"),
+        )
     manager.setup_metadata(dense_indices, probs)
 
     assert manager.token_indices.dtype == torch.int64
     assert torch.equal(manager.token_indices, dense_indices.long())
-    torch.testing.assert_close(manager.token_probs, torch.tensor([[0.6, 0.4], [0.7, 0.3]]))
+    torch.testing.assert_close(manager.token_probs, expected_probs)
+    if dense_probs:
+        # Stored without a copy (reshape may return a new view object of the same storage).
+        assert manager.token_probs.data_ptr() == probs.data_ptr()
 
 
 @pytest.mark.parametrize("explicit_dense_routing", [False, True])

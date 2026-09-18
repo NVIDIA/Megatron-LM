@@ -853,6 +853,21 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
                 topk_indices=topk_indices,
             )
+            if (
+                self.config.moe_token_dispatcher_type == "flex"
+                and self.config.moe_flex_dispatcher_backend in ("deepep", "ncclep")
+                and self.config.moe_expert_capacity_factor is None
+            ):
+                # These backends dispatch (topk weights, topk indices). Select them here, in eager
+                # mode, so the token dispatcher's torch.compile'd dispatch_preprocess() has no
+                # differentiable compute left. This is to reduce CPU overhead incurred by extra
+                # torch.compiled functions
+                if topk_indices is not None:
+                    # Dense indices from TE's fused top-k; gather the weights at those indices.
+                    probs = probs.gather(1, routing_map.long())
+                else:
+                    # Bool routing map (no dense TE output): reconstruct indices with torch.topk.
+                    probs, routing_map = torch.topk(probs, self.topk, dim=-1)
 
         # Dropless HybridEP consumes routing metadata directly, so exclude padding rows before
         # dispatch. Other dispatchers retain their existing fixed-route assumptions.

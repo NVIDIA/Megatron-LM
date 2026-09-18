@@ -1345,16 +1345,23 @@ class _DeepepManager(_DispatchManager):
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
 
-        probs = probs.reshape(num_tokens, self.num_experts)
+        probs = probs.reshape(num_tokens, -1)
         if routing_map.dtype == torch.bool:
             routing_map = routing_map.reshape(num_tokens, self.num_experts)
             # Convert the format of routing map from multihot to indices.
             self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
         else:
-            self.token_indices = routing_map.reshape(num_tokens, self.router_topk).contiguous()
+            # Dense top-k indices. This method runs inside the torch.compile'd
+            # dispatch_preprocess(), so it must stay free of differentiable compute: the flex
+            # router already selected the matching [num_tokens, topk] weights (TopKRouter.routing)
+            # and they are stored as is. Full-width probs (direct callers) are gathered here.
+            self.token_indices = routing_map.reshape(num_tokens, -1).contiguous()
             if self.token_indices.dtype != torch.int64:
                 self.token_indices = self.token_indices.to(torch.int64)
-            self.token_probs = probs.gather(1, self.token_indices)
+            if probs.shape[-1] == self.token_indices.shape[-1]:
+                self.token_probs = probs
+            else:
+                self.token_probs = probs.gather(1, self.token_indices)
         # Mask the indices of dropped tokens with -1
         if self.capacity_factor is not None:
             mask = self.token_probs == 0
@@ -1666,16 +1673,23 @@ class _NCCLEPManager(_DispatchManager):
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
-        probs = probs.reshape(num_tokens, self.num_experts)
+        probs = probs.reshape(num_tokens, -1)
         if routing_map.dtype == torch.bool:
             # Convert the multihot routing map to (topk weights, topk indices).
             self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
         else:
-            # Consume TE's direct top-k output without reconstructing it from a sparse map.
-            self.token_indices = routing_map.reshape(num_tokens, self.router_topk).contiguous()
+            # Dense top-k indices (TE's direct output). This method runs inside the
+            # torch.compile'd dispatch_preprocess(), so it must stay free of differentiable
+            # compute: the flex router already selected the matching [num_tokens, topk] weights
+            # (TopKRouter.routing) and they are stored as is. Full-width probs (direct callers)
+            # are gathered here.
+            self.token_indices = routing_map.reshape(num_tokens, -1).contiguous()
             if self.token_indices.dtype != torch.int64:
                 self.token_indices = self.token_indices.to(torch.int64)
-            self.token_probs = probs.gather(1, self.token_indices)
+            if probs.shape[-1] == self.token_indices.shape[-1]:
+                self.token_probs = probs
+            else:
+                self.token_probs = probs.gather(1, self.token_indices)
         self.num_local_tokens = num_tokens
 
     def _ensure_bootstrap(self):
@@ -1967,10 +1981,27 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         Bool routing maps are expanded from [num_local_tokens, num_experts] to
         [num_local_tokens, world_size, num_local_experts]. Dense top-k indices are expanded
-        from [num_local_tokens, topk] to [num_local_tokens, topk * expert_tp_size].
+        from [num_local_tokens, topk] to [num_local_tokens, topk * expert_tp_size]. probs follow
+        the same rule: full [num_local_tokens, num_experts] probs are expanded like a bool map;
+        dense [num_local_tokens, topk] probs (the router already selected the top-k weights, see
+        TopKRouter.routing for the deepep/ncclep backends) are expanded like the dense indices.
         """
         num_local_tokens = routing_map.shape[0]
         world_size = self.tp_size * self.ep_size
+        # Probability layout is a contract with the router, not inferred from shapes (topk may
+        # equal num_experts): for the deepep/ncclep backends the router pairs dense indices with
+        # the selected [num_local_tokens, topk] weights; every other case (bool routing map, or
+        # HybridEP's dense int16 indices) carries full [num_local_tokens, num_experts] probs.
+        dense_probs = routing_map.dtype != torch.bool and self.config.moe_flex_dispatcher_backend in (
+            "deepep",
+            "ncclep",
+        )
+        if dense_probs:
+            assert probs.shape[-1] == routing_map.shape[-1], (
+                f"{self.config.moe_flex_dispatcher_backend} dispatch expects probs selected at the "
+                f"dense top-k indices, got probs {tuple(probs.shape)} for indices "
+                f"{tuple(routing_map.shape)}"
+            )
         if routing_map.dtype == torch.bool:
             routing_map = (
                 routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
@@ -1992,11 +2023,21 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             routing_map = (
                 expanded_indices.reshape(num_local_tokens, -1).to(routing_map.dtype).contiguous()
             )
-        probs = (
-            probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
-            .expand(-1, -1, self.tp_size, -1)
-            .reshape(num_local_tokens, world_size, self.num_local_experts)
-        ).contiguous()
+        if dense_probs:
+            # [num_local_tokens, topk] -> [num_local_tokens, topk * tp_size], one copy per
+            # expert-TP rank, in the same slot order as the expanded indices above.
+            probs = (
+                probs.unsqueeze(-1)
+                .expand(-1, -1, self.tp_size)
+                .reshape(num_local_tokens, -1)
+                .contiguous()
+            )
+        else:
+            probs = (
+                probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
+                .expand(-1, -1, self.tp_size, -1)
+                .reshape(num_local_tokens, world_size, self.num_local_experts)
+            ).contiguous()
 
         return routing_map, probs
 

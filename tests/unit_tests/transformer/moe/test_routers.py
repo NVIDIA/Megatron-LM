@@ -728,6 +728,49 @@ class TestAuxLossFreeTop2Router:
         ).to(self.router.local_tokens_per_expert.dtype)
         torch.testing.assert_close(self.router.local_tokens_per_expert, expected)
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+        reason="TE fused router ops not available",
+    )
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+    @pytest.mark.parametrize("dense_te_indices", [False, True])
+    def test_flex_dense_backends_get_topk_probs_from_router(
+        self, monkeypatch, backend, dense_te_indices
+    ):
+        """For the deepep/ncclep flex backends the router returns the selected [num_tokens, topk]
+        weights next to int64 indices (so the dispatcher's compiled dispatch_preprocess has no
+        differentiable compute), both with TE's dense index output and with the bool-map
+        fallback. The weights must match the full-width routing probs at those indices."""
+        if dense_te_indices and not HAVE_DENSE_ROUTER_FUSION:
+            pytest.skip("TE dense fused router output is not available")
+        monkeypatch.setattr(
+            router_module, "fused_topk_with_score_function_supports_topk_indices", dense_te_indices
+        )
+        self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = True
+        hidden_states = torch.randn(
+            (4, 2, self.router.config.hidden_size), device="cuda"
+        ).bfloat16()
+
+        # Reference: the alltoall dispatcher path returns full-width probs and a bool map.
+        self.router.config.moe_token_dispatcher_type = "alltoall"
+        with torch.no_grad():
+            full_probs, bool_map = self.router(hidden_states)
+
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = backend
+        self.router.config.moe_expert_capacity_factor = None
+        with torch.no_grad():
+            probs, topk_indices = self.router(hidden_states)
+
+        topk = self.router.config.moe_router_topk
+        assert topk_indices.dtype == torch.int64
+        assert topk_indices.shape == (8, topk)
+        assert probs.shape == (8, topk)
+        assert bool_map.gather(1, topk_indices).all()
+        torch.testing.assert_close(probs, full_probs.gather(1, topk_indices))
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_expert_bias_update_preserves_large_integer_count_ordering(self):
         counts = torch.tensor([2**24 + 1, 2**24], dtype=torch.int64, device="cuda")
