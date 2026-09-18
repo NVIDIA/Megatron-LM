@@ -727,12 +727,24 @@ class _StreamwiseSigmoidWriteback(torch.autograd.Function):
         return grad_residual, grad_update, grad_write_logits, grad_retention_logits, None, None
 
 
+def _streamwise_autograd_needed(*tensors: Tensor | None) -> bool:
+    """Return whether the fused streamwise operation needs backward state."""
+
+    return (
+        not torch.is_inference_mode_enabled()
+        and torch.is_grad_enabled()
+        and any(tensor is not None and tensor.requires_grad for tensor in tensors)
+    )
+
+
 def streamwise_sigmoid_read(hidden_states: Tensor, read_logits: Tensor, num_streams: int) -> Tensor:
     """Read full-width streams from raw padded logits with fused CUDA dispatch."""
 
     stream_width = _validate_raw_read_inputs(hidden_states, read_logits, num_streams)
     if _can_use_streamwise_triton(hidden_states, read_logits, num_streams, stream_width):
-        return _StreamwiseSigmoidRead.apply(hidden_states, read_logits, num_streams)
+        if _streamwise_autograd_needed(hidden_states, read_logits):
+            return _StreamwiseSigmoidRead.apply(hidden_states, read_logits, num_streams)
+        return _streamwise_sigmoid_read_triton(hidden_states, read_logits, num_streams)
 
     read_factors = torch.sigmoid(read_logits[:num_streams].float())
     return streamwise_read(hidden_states, read_factors)
@@ -766,12 +778,23 @@ def streamwise_sigmoid_writeback(
         stream_width,
     )
     if supports_triton and branch_update.is_contiguous():
-        return _StreamwiseSigmoidWriteback.apply(
+        if _streamwise_autograd_needed(
+            residual_stream, branch_update, write_logits, retention_logits
+        ):
+            return _StreamwiseSigmoidWriteback.apply(
+                residual_stream,
+                branch_update,
+                write_logits,
+                retention_logits,
+                num_streams,
+                retention_max_forget,
+            )
+        return _streamwise_sigmoid_write_triton(
             residual_stream,
             branch_update,
             write_logits,
-            retention_logits,
             num_streams,
+            retention_logits,
             retention_max_forget,
         )
 

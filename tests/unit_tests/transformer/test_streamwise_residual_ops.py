@@ -347,6 +347,72 @@ def test_fused_cuda_production_geometry_gradients_signs_and_determinism(batch_to
     not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
     reason="Direct streamwise Triton kernels require CUDA and Triton.",
 )
+@pytest.mark.parametrize(
+    ("context_factory", "use_retention"),
+    [
+        (torch.no_grad, False),
+        (torch.no_grad, True),
+        (torch.inference_mode, False),
+        (torch.inference_mode, True),
+    ],
+    ids=("no_grad", "no_grad_retention", "inference", "inference_retention"),
+)
+def test_fused_cuda_forward_only_context_matches_reference(context_factory, use_retention):
+    """Forward-only execution must not construct custom-autograd backward state."""
+
+    torch.manual_seed(4321)
+    num_streams = 3
+    stream_width = 64
+    max_forget = 0.2
+    residual_source = torch.randn(
+        256, num_streams * stream_width, device="cuda", dtype=torch.bfloat16
+    )
+    update_source = torch.randn(256, stream_width, device="cuda", dtype=torch.bfloat16)
+    read_logits = _padded_logits(torch.tensor([-0.8, -0.7, -0.6], device="cuda"))
+    write_logits = _padded_logits(torch.tensor([-0.01, 0.0, 0.01], device="cuda"))
+    retention_logits = _padded_logits(torch.tensor([4.8, 4.9, 5.0], device="cuda"))
+
+    with context_factory():
+        # Cloning inside inference_mode reproduces the inference tensors from the
+        # dynamic generation runtime that custom autograd Functions cannot save.
+        residual = residual_source.clone()
+        update = update_source.clone()
+        assert _can_use_streamwise_triton(residual, read_logits, num_streams, stream_width)
+
+        read = streamwise_sigmoid_read(residual, read_logits, num_streams)
+        output = streamwise_sigmoid_writeback(
+            residual,
+            update + 0.125 * read,
+            write_logits,
+            num_streams,
+            retention_logits=retention_logits if use_retention else None,
+            retention_max_forget=max_forget if use_retention else 0.0,
+        )
+
+        reference_read = streamwise_read(residual, torch.sigmoid(read_logits[:num_streams].float()))
+        retention_factors = None
+        if use_retention:
+            retention_factors = 1.0 - max_forget * torch.sigmoid(
+                -retention_logits[:num_streams].float()
+            )
+        reference_output = streamwise_writeback(
+            residual,
+            update + 0.125 * reference_read,
+            2.0 * torch.sigmoid(write_logits[:num_streams].float()),
+            retention_factors=retention_factors,
+        )
+        read_error = _relative_l2(read, reference_read)
+        output_error = _relative_l2(output, reference_output)
+
+    assert not output.requires_grad
+    assert read_error <= 0.02
+    assert output_error <= 0.02
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
 def test_fused_cuda_profile_has_no_map_construction_or_map_gradient_gemm():
     torch.manual_seed(5678)
     num_streams = 3
