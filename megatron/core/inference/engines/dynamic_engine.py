@@ -10,7 +10,7 @@ import time
 import warnings
 from collections import OrderedDict, deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
@@ -33,6 +33,12 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
+)
+from megatron.core.inference.contexts.kv_block_allocator import (
+    MAX_CACHED_PROMPT_TOP_N_LOGPROBS,
+    PendingPromptLogprobsRow,
+    PromptLogprobsBlock,
+    PromptLogprobsKey,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -298,6 +304,12 @@ class RequestEntry:
 
     record: DynamicInferenceRequestRecord
     future: asyncio.Future[DynamicInferenceRequest]
+    # Prompt score payload lives in allocator-owned sidecars while a request is
+    # active. This dict holds only strong object references, keyed by logical
+    # prompt block, so allocator eviction or reset cannot invalidate the result.
+    prompt_logprob_blocks: Dict[int, PromptLogprobsBlock] = field(default_factory=dict)
+    prompt_logprobs_cache_key: Optional[PromptLogprobsKey] = None
+    prompt_logprobs_complete: bool = False
 
 
 class DynamicInferenceEngineStepResult(TypedDict):
@@ -1351,6 +1363,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     req.prompt_log_probs = None
                     req.prompt_top_n_logprobs = None
                     req.num_matched_prefix_blocks = 0
+                if req_id in waiting_request_ids:
+                    self._discard_prompt_logprob_state(self.requests[req_id])
 
             # Reset the chunked prefill request id
             self.chunked_prefill_request_id = -1
@@ -1361,7 +1375,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Checkpoint resident requests that are marked for recompute.
         for request_id in recompute_resident_ids:
-            self.requests[request_id].record.checkpoint()
+            self._checkpoint_request_for_recompute(self.requests[request_id])
 
         # If we are not using the inference coordinator, we need to manually handle state.
         if not self.use_coordinator:
@@ -1523,6 +1537,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
+        self._discard_prompt_logprob_state(request_entry)
         finished_request = self._complete_request(request_entry)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
@@ -1636,10 +1651,42 @@ class DynamicInferenceEngine(AbstractEngine):
                 raise ValueError(f"Cannot resume unknown request ID {request_id}.")
         elif request_id in self.requests:
             raise ValueError(f"Request ID {request_id} is already active.")
+
+        prompt_logprobs_cache_key = None
+        needs_prompt_logprobs = (
+            request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        )
+        wants_cached_prompt_logprobs = (
+            self.context.enable_prefix_caching
+            and request.enable_prefix_caching
+            and needs_prompt_logprobs
+            and request.sampling_params.top_n_logprobs <= MAX_CACHED_PROMPT_TOP_N_LOGPROBS
+        )
+        if wants_cached_prompt_logprobs:
+            prompt_logprobs_cache_key = PromptLogprobsKey.create(
+                mode=self.context.config.logprobs_mode,
+                top_n=request.sampling_params.top_n_logprobs,
+                sampling_backend=self.context.config.sampling_backend,
+                temperature=request.sampling_params.temperature,
+                top_k=request.sampling_params.top_k,
+                top_p=request.sampling_params.top_p,
+            )
+            # Context-only state; DynamicInferenceRequest.serialize explicitly
+            # removes it from the wire representation.
+            request._prompt_logprobs_cache_key = prompt_logprobs_cache_key
         else:
+            # A checkpointed decode segment may reuse the same request ID while
+            # deliberately skipping its expanded prompt scores.
+            self.context.prompt_logprobs_cache_keys.pop(request_id, None)
+            self.context.prompt_logprobs_block_hashes.pop(request_id, None)
+            self.context.prompt_logprobs_matched_refs.pop(request_id, None)
+
+        if not is_resume:
             self.requests[request_id] = RequestEntry(
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
+                prompt_logprobs_cache_key=prompt_logprobs_cache_key,
             )
             request.add_event_add_engine()  # Record when request enters engine
 
@@ -1648,6 +1695,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 epoch = self._generation_epoch
                 request.policy_epoch = [(0, epoch)]
                 request.kv_cache_epoch = [(0, epoch)]
+        else:
+            entry = self.requests[request_id]
+            if entry.prompt_logprobs_cache_key != prompt_logprobs_cache_key:
+                entry.prompt_logprob_blocks.clear()
+                entry.prompt_logprobs_complete = False
+                entry.prompt_logprobs_cache_key = prompt_logprobs_cache_key
+            elif prompt_logprobs_cache_key is not None and entry.prompt_logprob_blocks:
+                self.context.prompt_logprobs_matched_refs[request_id] = dict(
+                    entry.prompt_logprob_blocks
+                )
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -2120,6 +2177,198 @@ class DynamicInferenceEngine(AbstractEngine):
             image_token_mask=mask_tensor,
         )
 
+    def _materialize_prompt_logprob_sidecars(
+        self, entry: RequestEntry, *, retain_state: bool = False
+    ) -> None:
+        """Populate the public prompt-score fields from allocator-owned sidecars."""
+        key = entry.prompt_logprobs_cache_key
+        if key is None:
+            return
+
+        request = entry.record[0]
+        prompt_token_count = len(request.prompt_tokens)
+        if prompt_token_count <= 1:
+            ordered_refs = []
+        else:
+            ordered_refs = [
+                entry.prompt_logprob_blocks[index]
+                for index in range(
+                    (prompt_token_count + self.context.block_size_tokens - 1)
+                    // self.context.block_size_tokens
+                )
+            ]
+        selected_logprobs, top_n_logprobs, top_n_token_ids = (
+            self.context.kv_block_allocator.materialize_prompt_logprobs(
+                ordered_refs, key, prompt_token_count
+            )
+        )
+        request.prompt_log_probs = selected_logprobs.tolist()
+        if key.top_n > 0:
+            request.prompt_top_n_logprobs = []
+            for values, token_ids in zip(top_n_logprobs, top_n_token_ids):
+                result = {}
+                for value, token_id in zip(values.tolist(), token_ids.tolist()):
+                    result[self.controller.tokenizer.detokenize([token_id])] = value
+                request.prompt_top_n_logprobs.append(result)
+        else:
+            request.prompt_top_n_logprobs = None
+
+        if not retain_state:
+            self._discard_prompt_logprob_state(entry)
+
+    def _promote_recomputed_prompt_scores(self, entry: RequestEntry) -> None:
+        """Restore the original prompt scores from the first complete recomputation."""
+        record = entry.record
+        original_request = record[0]
+        expected_count = len(original_request.prompt_tokens) - 1
+        needs_top_n = original_request.sampling_params.top_n_logprobs > 0
+
+        def has_complete_prompt_scores(request: DynamicInferenceRequest) -> bool:
+            logprob_count = 0 if request.prompt_log_probs is None else len(request.prompt_log_probs)
+            top_n_count = (
+                0 if request.prompt_top_n_logprobs is None else len(request.prompt_top_n_logprobs)
+            )
+            return logprob_count >= expected_count and (
+                not needs_top_n or top_n_count >= expected_count
+            )
+
+        if (
+            len(record.requests) == 1
+            or entry.prompt_logprobs_cache_key is not None
+            or not original_request.sampling_params.return_log_probs
+            or original_request.sampling_params.skip_prompt_log_probs
+            or expected_count <= 0
+            or has_complete_prompt_scores(original_request)
+        ):
+            return
+
+        # Prefix-cache offsets are reconstructed while sidecars own the score state.
+        # Without sidecars, a full recomputation starts at prompt position zero.
+        for recomputed_request in record.requests[1:]:
+            if has_complete_prompt_scores(recomputed_request):
+                original_request.prompt_log_probs = list(
+                    recomputed_request.prompt_log_probs[:expected_count]
+                )
+                if needs_top_n:
+                    original_request.prompt_top_n_logprobs = list(
+                        recomputed_request.prompt_top_n_logprobs[:expected_count]
+                    )
+                return
+
+    def _discard_prompt_logprob_state(self, entry: RequestEntry) -> None:
+        """Release request-private prompt-score references and continuation state."""
+        request_id = entry.record[-1].request_id
+        self.context.prompt_logprobs_cache_keys.pop(request_id, None)
+        self.context.prompt_logprobs_block_hashes.pop(request_id, None)
+        self.context.prompt_logprobs_matched_refs.pop(request_id, None)
+        for record_request in entry.record.requests:
+            record_request.__dict__.pop("_prompt_logprobs_cache_key", None)
+            record_request.__dict__.pop("_pending_prompt_logprob_row", None)
+        entry.prompt_logprob_blocks.clear()
+        entry.prompt_logprobs_cache_key = None
+        entry.prompt_logprobs_complete = False
+
+    def _checkpoint_request_for_recompute(self, entry: RequestEntry) -> None:
+        """Checkpoint without reclassifying generated scores as prompt scores."""
+        prompt_logprobs_complete = (
+            entry.prompt_logprobs_cache_key is not None and entry.prompt_logprobs_complete
+        )
+        if prompt_logprobs_complete:
+            self._materialize_prompt_logprob_sidecars(entry)
+        else:
+            self._discard_prompt_logprob_state(entry)
+        entry.record.checkpoint()
+        if prompt_logprobs_complete:
+            checkpointed_request = entry.record[-1]
+            checkpointed_request.sampling_params.skip_prompt_log_probs = True
+            checkpointed_request.sampling_params.return_prompt_top_n_logprobs = False
+            checkpointed_request.sampling_params._sync_prompt_logprobs_fields()
+
+    def _stage_prompt_logprob_updates(
+        self, prompt_logprob_updates: Optional[Dict[int, Dict[str, object]]]
+    ) -> None:
+        """Retain sidecars and stage each partial chunk's outgoing score row."""
+        if not prompt_logprob_updates:
+            return
+
+        for request_id, update in prompt_logprob_updates.items():
+            entry = self.requests[request_id]
+            blocks = update.get("blocks", {})
+            entry.prompt_logprob_blocks.update(blocks)
+            final_prefill = bool(update.get("complete", False))
+            entry.prompt_logprobs_complete = final_prefill and bool(update.get("filled", True))
+            if blocks and not final_prefill:
+                self.context.prompt_logprobs_matched_refs.setdefault(request_id, {}).update(blocks)
+            pending_row = update.pop("pending_row", None)
+            if pending_row is not None:
+                assert isinstance(pending_row, PendingPromptLogprobsRow)
+                request = entry.record[-1]
+                assert (
+                    getattr(request, "_pending_prompt_logprob_row", None) is None
+                ), f"request {request_id} already has an unconsumed prompt-logprob row"
+                request._pending_prompt_logprob_row = pending_row
+
+    def _validate_prompt_logprob_continuation(self, request: DynamicInferenceRequest) -> None:
+        """Require an incoming score row before admitting a cached prompt continuation."""
+        if getattr(request, "_prompt_logprobs_cache_key", None) is None:
+            assert getattr(request, "_pending_prompt_logprob_row", None) is None
+            return
+        if request.finished_chunk_token_count > 0:
+            assert (
+                getattr(request, "_pending_prompt_logprob_row", None) is not None
+            ), f"request {request.request_id} is missing its incoming prompt-logprob row"
+
+    def _bind_prompt_logprob_continuation(self, request: DynamicInferenceRequest) -> None:
+        """Write a continuation's incoming score into its newly assigned physical block."""
+        pending_row = getattr(request, "_pending_prompt_logprob_row", None)
+        if pending_row is None:
+            return
+        if not isinstance(pending_row, PendingPromptLogprobsRow):
+            raise TypeError(f"unexpected prompt-logprob row type: {type(pending_row).__name__}")
+
+        target_position = request.finished_chunk_token_count
+        logical_block_index, local_position = divmod(
+            target_position, self.context.block_size_tokens
+        )
+        request_index = self.context.total_request_count - 1
+        assert int(self.context.request_ids[request_index]) == request.request_id
+        block_id = int(self.context.request_to_kv_block_ids[request_index, logical_block_index])
+        assert block_id >= 0
+        expected_block_hash = (
+            request.precomputed_block_hashes[logical_block_index]
+            if logical_block_index < len(request.precomputed_block_hashes)
+            else None
+        )
+        entry = self.requests[request.request_id]
+        active_refs = self.context.prompt_logprobs_matched_refs.setdefault(request.request_id, {})
+        block_ref = entry.prompt_logprob_blocks.get(logical_block_index)
+        if block_ref is None:
+            block_ref = active_refs.get(logical_block_index)
+        allocator = self.context.kv_block_allocator
+        reservation = pending_row.reservation
+        if reservation is None:
+            reservation = allocator.reserve_prompt_logprobs(
+                logical_block_index=logical_block_index,
+                block_id=block_id,
+                key=request._prompt_logprobs_cache_key,
+                expected_block_hash=expected_block_hash,
+                block=block_ref,
+            )
+            pending_row.bind(allocator, reservation, local_position)
+        elif (
+            reservation.logical_block_index != logical_block_index
+            or reservation.block_id != block_id
+            or reservation.key != request._prompt_logprobs_cache_key
+            or reservation.expected_block_hash != expected_block_hash
+            or pending_row.local_position != local_position
+        ):
+            raise RuntimeError("prompt-logprob row destination changed during continuation")
+        block_ref = pending_row.block
+        if block_ref is not None:
+            active_refs[logical_block_index] = block_ref
+            entry.prompt_logprob_blocks[logical_block_index] = block_ref
+        del request._pending_prompt_logprob_row
+
     def post_process_requests(
         self,
         request_ids: torch.Tensor,
@@ -2137,6 +2386,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
+        prompt_logprob_updates: Optional[Dict[int, Dict[str, object]]] = None,
     ) -> Tuple[List[int], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -2163,6 +2413,8 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_handoff_ssm_slots: Live SSM slots detached for state handoff.
             finished_handoff_decode_tokens: First sampled token and optional MTP proposals
                 needed to resume directly from imported prefill state on decode.
+            prompt_logprob_updates: Allocator-owned sidecar references, prompt-row
+                counts, and any outgoing partial-chunk score row.
 
         Returns:
             Active request IDs and completed requests.
@@ -2176,6 +2428,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
         block_allocator = self.context.kv_block_allocator
+        prompt_logprob_updates = prompt_logprob_updates or {}
+        self._stage_prompt_logprob_updates(prompt_logprob_updates)
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
@@ -2222,6 +2476,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = [tokens]
 
             request: DynamicInferenceRequest = self.get_request(request_id)
+            prompt_logprob_update = prompt_logprob_updates.get(request_id)
 
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
@@ -2338,7 +2593,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         accepted_t != -1
                     ).long()
 
-                if request_id in finished_request_ids:
+                request_finished = request_id in finished_request_ids
+                if request_finished:
                     # Reconstruct routing from per-block storage before popping.
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
@@ -2378,6 +2634,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # The chunked prefill produces useless tokens
                 # so we are not appending them to the generated tokens.
                 # Additionally, chunked prefill request do not finish.
+                request_finished = False
                 active_request_ids.append(request_id)
 
             # When a stop word was found mid-speculative-batch, trim log probs
@@ -2400,8 +2657,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 assert (
                     request_log_probs is not None
                 ), f"Request {request_id} requested log probs, but none were produced."
-                # Initialize lists if they don't exist
-                if not request.prompt_log_probs:
+                uses_prompt_sidecars = (
+                    getattr(request, "_prompt_logprobs_cache_key", None) is not None
+                )
+
+                # Allocator-owned prompt sidecars remain the sole prompt-score
+                # copy while this request is active. Only generated rows belong
+                # on the request itself.
+                if not uses_prompt_sidecars and not request.prompt_log_probs:
                     request.prompt_log_probs = []
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
@@ -2409,7 +2672,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 is_chunked_prefill = request_id == consumed_chunked_prefill_request_id
                 is_prefill = len(request.generated_log_probs) == 0
 
-                if request.sampling_params.skip_prompt_log_probs:
+                if uses_prompt_sidecars:
+                    prompt_row_count = (
+                        int(prompt_logprob_update["prompt_row_count"])
+                        if prompt_logprob_update is not None
+                        else 0
+                    )
+                    assert 0 <= prompt_row_count <= len(request_log_probs)
+                    request.generated_log_probs.extend(request_log_probs[prompt_row_count:])
+                elif request.sampling_params.skip_prompt_log_probs:
                     # We only want decode log probs.
                     if is_chunked_prefill:
                         pass
@@ -2443,13 +2714,26 @@ class DynamicInferenceEngine(AbstractEngine):
                     and request.sampling_params.skip_prompt_log_probs
                 )
             ):
-                # Initialize lists if they don't exist
-                if request.prompt_top_n_logprobs is None:
+                uses_prompt_sidecars = (
+                    getattr(request, "_prompt_logprobs_cache_key", None) is not None
+                )
+
+                # As above, prompt rows stay numeric in compact sidecars until
+                # completion. Detokenize only the generated suffix here.
+                if not uses_prompt_sidecars and request.prompt_top_n_logprobs is None:
                     request.prompt_top_n_logprobs = []
                 if request.generated_top_n_logprobs is None:
                     request.generated_top_n_logprobs = []
 
                 top_n_data_list = top_n_logprobs[req_idx]
+                if uses_prompt_sidecars:
+                    prompt_row_count = (
+                        int(prompt_logprob_update["prompt_row_count"])
+                        if prompt_logprob_update is not None
+                        else 0
+                    )
+                    assert 0 <= prompt_row_count <= len(top_n_data_list)
+                    top_n_data_list = top_n_data_list[prompt_row_count:]
                 prompt_length = len(request.prompt_tokens)
 
                 # Process each token's top-n logprobs
@@ -2462,22 +2746,30 @@ class DynamicInferenceEngine(AbstractEngine):
                         logit_dict[key] = logprob
 
                     # Simple decision: check total count accumulated so far
-                    total_accumulated = len(request.prompt_top_n_logprobs) + len(
-                        request.generated_top_n_logprobs
-                    )
+                    total_accumulated = (
+                        0
+                        if request.prompt_top_n_logprobs is None
+                        else len(request.prompt_top_n_logprobs)
+                    ) + len(request.generated_top_n_logprobs)
 
                     # If skip_prompt_log_probs is False and we haven't reached prompt end,
                     # append to prompt_top_n_logprobs. Otherwise append to generated_top_n_logprobs.
                     if (
-                        not request.sampling_params.skip_prompt_log_probs
+                        not uses_prompt_sidecars
+                        and not request.sampling_params.skip_prompt_log_probs
                         and total_accumulated < prompt_length - 1
                     ):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+            # Both record.merge() and coordinator streaming read original prompt
+            # scores from record[0], so repair it as soon as recomputation completes.
+            self._promote_recomputed_prompt_scores(self.requests[request_id])
+
             # Merge only after the final token's scores and metadata have been applied.
             if finished_entry is not None:
+                self._materialize_prompt_logprob_sidecars(finished_entry)
                 popped_entry = self.requests.pop(request_id)
                 assert popped_entry is finished_entry
                 finished_requests.append(self._complete_request(finished_entry))
@@ -2496,8 +2788,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
-                self.requests[request_id].record.checkpoint()
-                self.get_request(request_id).add_event_evict()
+                entry = self.requests[request_id]
+                self._checkpoint_request_for_recompute(entry)
+                checkpointed_request = self.get_request(request_id)
+                checkpointed_request.add_event_evict()
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
@@ -2743,8 +3037,11 @@ class DynamicInferenceEngine(AbstractEngine):
             return 0
         return computed_tokens
 
-    def schedule_waiting_requests(self) -> None:
-        """Try to schedule requests from the waiting pool."""
+    def schedule_waiting_requests(
+        self, prompt_logprob_updates: Optional[Dict[int, Dict[str, object]]] = None
+    ) -> None:
+        """Stage consumed prompt scores, then schedule requests from the waiting pool."""
+        self._stage_prompt_logprob_updates(prompt_logprob_updates)
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
@@ -2795,7 +3092,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether request, token, and KV-cache capacity permit a chunk.
         """
-        request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
+        request_can_be_added, _, kv_cache_available = self.context.check_availability(
+            req, prefill_chunk_length=1
+        )
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
         token_capacity_available = self.context.active_token_count < self.context.max_tokens
         return (
@@ -2853,7 +3152,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     for block_hash in req.precomputed_block_hashes:
                         if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
+                self._validate_prompt_logprob_continuation(req)
                 self.context.add_request(req)
+                self._bind_prompt_logprob_continuation(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
@@ -3102,22 +3403,16 @@ class DynamicInferenceEngine(AbstractEngine):
                         can_schedule = False
                         break
 
-                # add_request recomputes the skip for this exact chunk and applies a
-                # ">= 2 computed tokens" clamp. When the chunk would compute fewer than
-                # 2 tokens (tight budget late in a batched step, or a prompt that is
-                # all-but-one cached) that clamp shrinks the skip and grows the computed
-                # count by up to one block, which can exceed the token budget
-                # (TokenOverflowError). Only then re-derive the exact effective length
-                # add_request will use and defer on overflow (a later full-budget step
-                # admits the request). For >= 2 computed tokens add_request computes
-                # exactly this chunk, which already fits the budget.
-                if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
-                        req, prefill_chunk_length
-                    )
-                    if self.context.active_token_count + actual_effective > self.context.max_tokens:
-                        can_schedule = False
-                        break
+                request_available, tokens_available, kv_available = self.context.check_availability(
+                    req, prefill_chunk_length
+                )
+                if not (
+                    (is_continuing_chunked_prefill or request_available)
+                    and tokens_available
+                    and kv_available
+                ):
+                    can_schedule = False
+                    break
 
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
@@ -3127,7 +3422,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 if prefill_chunk_length >= remaining_len:
                     self.context.chunked_prefill_request_id = -1
+                    self._validate_prompt_logprob_continuation(req)
                     self.context.add_request(req)
+                    self._bind_prompt_logprob_continuation(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -3137,7 +3434,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     can_schedule = True
                 else:
                     # Partial admit: schedule this chunk and keep the request at the queue head.
+                    self._validate_prompt_logprob_continuation(req)
                     self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
+                    self._bind_prompt_logprob_continuation(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -3279,6 +3578,7 @@ class DynamicInferenceEngine(AbstractEngine):
         emit_lengths: Dict[int, int] = {}
         for rid, entry in self.requests.items():
             request = entry.record[-1]
+            prompt_request = entry.record[0]
             if not getattr(request.sampling_params, "streaming", False):
                 continue
             already = self._partial_emit_lengths.get(rid, 0)
@@ -3292,6 +3592,13 @@ class DynamicInferenceEngine(AbstractEngine):
             emit_end = max(already, total - holdback)
             streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
             if emit_end - already >= streaming_interval:
+                if (
+                    request.sampling_params.return_log_probs
+                    and already == 0
+                    and not prompt_request.sampling_params.skip_prompt_log_probs
+                    and entry.prompt_logprobs_complete
+                ):
+                    self._materialize_prompt_logprob_sidecars(entry, retain_state=True)
                 new_tokens = list(request.generated_tokens[already:emit_end])
                 partial = {"request_id": rid, "new_tokens": new_tokens}
                 if request.sampling_params.return_log_probs:
@@ -3301,12 +3608,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     partial["new_top_n_logprobs"] = list(
                         (getattr(request, "generated_top_n_logprobs", None) or [])[already:]
                     )
-                    if already == 0 and not request.sampling_params.skip_prompt_log_probs:
+                    if already == 0 and not prompt_request.sampling_params.skip_prompt_log_probs:
                         partial["prompt_log_probs"] = list(
-                            getattr(request, "prompt_log_probs", None) or []
+                            getattr(prompt_request, "prompt_log_probs", None) or []
                         )
                         partial["prompt_top_n_logprobs"] = list(
-                            getattr(request, "prompt_top_n_logprobs", None) or []
+                            getattr(prompt_request, "prompt_top_n_logprobs", None) or []
                         )
                 partials.append(partial)
                 emit_lengths[rid] = emit_end
@@ -3359,6 +3666,7 @@ class DynamicInferenceEngine(AbstractEngine):
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
+            prompt_logprob_updates = step_result.get("prompt_logprob_updates", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
             finished_handoff_ssm_slots = step_result.get("finished_handoff_ssm_slots", None)
@@ -3387,6 +3695,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 finished_handoff_block_ids=finished_handoff_block_ids,
                 finished_handoff_ssm_slots=finished_handoff_ssm_slots,
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,
+                prompt_logprob_updates=prompt_logprob_updates,
             )
 
         else:
@@ -4003,6 +4312,7 @@ class DynamicInferenceEngine(AbstractEngine):
         for entry in self.requests.values():
             if not entry.future.done():
                 entry.future.cancel()
+            self._discard_prompt_logprob_state(entry)
 
         # ZMQ cleanup; designed to be idempotent.
         sock = getattr(self, 'socket_for_receiving_requests', None)
