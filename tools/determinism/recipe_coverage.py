@@ -161,6 +161,8 @@ def build_report(inventories: list[dict], evidence: list[dict]) -> dict:
             issues.append(f"Rank {rank}: source or environment context changed during capture")
         if inventory.get("truncated", False):
             issues.append(f"Rank {rank}: signature limit reached")
+        for issue in inventory.get("capture_issues", []):
+            issues.append(f"Rank {rank}: {issue}")
         for operation in inventory["operations"]:
             signature = operation["signature"]
             key = signature_key(signature)
