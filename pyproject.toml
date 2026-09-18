@@ -15,6 +15,9 @@ include = [
     "megatron.training.*",
 ]
 
+[tool.setuptools.package-data]
+"megatron.core.allocator" = ["csrc/*.cpp"]
+
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
 readme = { file = "README.md", content-type = "text/markdown" }

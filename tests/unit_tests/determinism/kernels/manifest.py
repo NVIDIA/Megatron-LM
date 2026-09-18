@@ -451,7 +451,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vmm_symm_allocator",
-        sources=("megatron/core/allocator/vmm_symm_allocator.py",),
+        sources=(
+            "megatron/core/allocator/vmm_symm_allocator.py",
+            "megatron/core/allocator/csrc/vmm_symm_allocator.cpp",
+        ),
         kind="cuda-ext",
         exempt_reason="Pluggable allocator (CUDA VMM driver calls); allocation only, no "
         "compute kernel.",
