@@ -237,6 +237,12 @@ class SSMDynamicInferenceMixin:
                 zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
             # Reshape from [N*S, 1, d] to [N, S, d] for the decode kernels.
             zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
+            # ReplaySSM (Mamba-2 speculative decoding): hand the hook the context so
+            # it can read the ring buffers / cursors itself. Passed only when the
+            # feature is enabled, so hooks that do not support it are unaffected.
+            replay_kwargs = {}
+            if getattr(context, "mamba_replay_ssm", False):
+                replay_kwargs = {"replay_context": context}
             y_decode = self.ssm_decode(
                 zxBCdt_decode,
                 conv_state,
@@ -244,6 +250,7 @@ class SSMDynamicInferenceMixin:
                 batch_indices=context.mamba_metadata.batch_indices_decode,
                 intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
+                **replay_kwargs,
             )
             # Flatten back to [N*S, 1, d] to match the merge logic.
             y_decode = y_decode.view(decode_token_count, 1, -1)
