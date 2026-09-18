@@ -95,19 +95,20 @@ def test_pipeline_p2p_fixed_shape_requires_max_seqlen_with_max_alignment():
 
 
 @pytest.mark.parametrize("vpp_size", [1, 2])
-def test_pipeline_p2p_fixed_shape_rejects_virtual_pipeline_parallelism(vpp_size):
-    """vpp_size=1 must be rejected too: get_forward_backward_func() picks the interleaved
-    schedule on `is not None`, so even a size of 1 bypasses get_tensor_shapes()."""
-    with pytest.raises(ValueError, match="not supported with virtual pipeline"):
-        ModelParallelConfig(
-            pipeline_p2p_fixed_shape=True,
-            sequence_packing_scheduler="dp_balanced",
-            max_seqlen_per_dp_cp_rank=2048,
-            pad_packed_seq_alignment="max",
-            pipeline_model_parallel_size=4,
-            virtual_pipeline_model_parallel_size=vpp_size,
-            pipeline_dtype=torch.bfloat16,
-        )
+def test_pipeline_p2p_fixed_shape_accepts_virtual_pipeline_parallelism(vpp_size):
+    """The interleaved schedule derives the fixed packed shape (max_seqlen_per_dp_cp_rank, 1, H)
+    the same way get_tensor_shapes() does, so the optimization is valid under VPP as well."""
+    config = ModelParallelConfig(
+        pipeline_p2p_fixed_shape=True,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=2048,
+        pad_packed_seq_alignment="max",
+        pipeline_model_parallel_size=4,
+        virtual_pipeline_model_parallel_size=vpp_size,
+        pipeline_dtype=torch.bfloat16,
+    )
+    assert config.pipeline_p2p_fixed_shape
+    assert config.virtual_pipeline_model_parallel_size == vpp_size
 
 
 def test_pipeline_p2p_fixed_shape_requires_tp_divisible_max_seqlen():
@@ -145,26 +146,28 @@ def test_pipeline_p2p_fixed_shape_warns_when_mtp_standalone():
         )
 
 
-def test_pipeline_p2p_fixed_shape_rejects_layout_derived_vpp():
-    """Flexible layouts derive VPP after ModelParallelConfig.__post_init__ has returned."""
-    with pytest.raises(ValueError, match="not supported with virtual pipeline"):
-        TransformerConfig(
-            num_layers=4,
-            hidden_size=64,
-            num_attention_heads=4,
-            pipeline_model_parallel_size=2,
-            pipeline_model_parallel_layout=[
-                ["embedding"],
-                ["decoder", "decoder"],
-                ["decoder", "decoder"],
-                ["loss"],
-            ],
-            pipeline_dtype=torch.bfloat16,
-            pipeline_p2p_fixed_shape=True,
-            sequence_packing_scheduler="dp_balanced",
-            max_seqlen_per_dp_cp_rank=2048,
-            pad_packed_seq_alignment="max",
-        )
+def test_pipeline_p2p_fixed_shape_accepts_layout_derived_vpp():
+    """Flexible layouts derive VPP after ModelParallelConfig.__post_init__ has returned; the
+    fixed packed shape stays valid for the interleaved schedule."""
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=64,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_model_parallel_layout=[
+            ["embedding"],
+            ["decoder", "decoder"],
+            ["decoder", "decoder"],
+            ["loss"],
+        ],
+        pipeline_dtype=torch.bfloat16,
+        pipeline_p2p_fixed_shape=True,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=2048,
+        pad_packed_seq_alignment="max",
+    )
+    assert config.pipeline_p2p_fixed_shape
+    assert config.virtual_pipeline_model_parallel_size == 2
 
 
 def test_pipeline_p2p_fixed_shape_warns_for_layout_derived_standalone_mtp(monkeypatch):

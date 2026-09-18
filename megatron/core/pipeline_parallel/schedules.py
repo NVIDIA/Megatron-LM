@@ -1283,8 +1283,14 @@ def forward_backward_pipelining_with_interleaving(
         # Note: This is a simplified approach - proper VPP support may need more complex logic
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
-    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
-    tensor_shape[0] = tensor_shape[0] // cp_group.size()
+    if config.variable_seq_lengths and config.pipeline_p2p_fixed_shape:
+        # Packed THD batches are padded to max_seqlen_per_dp_cp_rank and flattened to batch 1
+        # before the pipeline (same derivation as get_tensor_shapes()); with the shape exchange
+        # skipped this is the receive-buffer shape of every P2P transfer.
+        tensor_shape = [config.max_seqlen_per_dp_cp_rank, 1, hidden_dim]
+    else:
+        tensor_shape = [seq_length, micro_batch_size, hidden_dim]
+        tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
 
