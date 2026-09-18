@@ -1470,6 +1470,17 @@ def forward_backward_pipelining_with_interleaving(
 
         return input_tensor_grad
 
+    delayed_megamoe_wgrad_manager = None
+    if config.delay_megamoe_wgrad:
+        from megatron.core.transformer.moe.experts import DelayedMegaMoeWgradManager
+
+        unwrapped_model_chunks = []
+        for model_chunk in model:
+            unwrapped_model_chunks.append(
+                get_attr_wrapped_model(model_chunk, "config", return_model_obj=True)
+            )
+        delayed_megamoe_wgrad_manager = DelayedMegaMoeWgradManager(unwrapped_model_chunks)
+
     def forward_backward_helper_wrapper(
         f_virtual_microbatch_id=None,
         b_virtual_microbatch_id=None,
@@ -1519,15 +1530,23 @@ def forward_backward_pipelining_with_interleaving(
                 )
                 if post_forward is not None:
                     forward_output_tensor = post_forward(forward_output_tensor)
+                    if delayed_megamoe_wgrad_manager is not None:
+                        delayed_megamoe_wgrad_manager.on_forward_p2p_launched()
 
             # Backward pass.
             if b_virtual_microbatch_id is not None:
                 backward_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
+                if f_virtual_microbatch_id is None and delayed_megamoe_wgrad_manager is not None:
+                    delayed_megamoe_wgrad_manager.flush()
                 if pre_backward is not None:
                     pre_backward()
                 backward_input_tensor_grad = backward_step_helper(b_virtual_microbatch_id)
                 if post_backward is not None:
                     backward_input_tensor_grad = post_backward(backward_input_tensor_grad)
+                if delayed_megamoe_wgrad_manager is not None and post_backward is not None:
+                    delayed_megamoe_wgrad_manager.on_backward_p2p_launched(
+                        backward_model_chunk_id
+                    )
             return forward_output_tensor, backward_input_tensor_grad
 
     # ==============================main logic=========================================
@@ -2057,8 +2076,16 @@ def forward_backward_pipelining_with_interleaving(
                 if recv_next:
                     output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
+            if delayed_megamoe_wgrad_manager is not None:
+                delayed_megamoe_wgrad_manager.on_backward_p2p_launched(cur_model_chunk_id)
+                # Flush any pending wgrads.
+                delayed_megamoe_wgrad_manager.flush()
+
         if send_prev_wait_handle is not None:
             send_prev_wait_handle.wait()
+
+        if delayed_megamoe_wgrad_manager is not None:
+            delayed_megamoe_wgrad_manager.flush()
 
         # Launch any remaining grad reductions.
         enable_grad_sync()

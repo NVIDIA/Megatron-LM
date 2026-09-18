@@ -3394,13 +3394,32 @@ class TransformerConfig(ModelParallelConfig):
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
-            assert (
-                self.overlap_moe_expert_parallel_comm
-            ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'delay_wgrad_compute'
+            )
             if self.cuda_graph_impl == "transformer_engine":
                 assert is_te_min_version("2.10.0"), (
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
                     'partial cuda graph'
+                )
+
+        if self.delay_megamoe_wgrad:
+            if not self.moe_use_transformer_engine_fused_moe:
+                raise ValueError(
+                    "delay_megamoe_wgrad requires moe_use_transformer_engine_fused_moe=True."
+                )
+            if (
+                self.pipeline_model_parallel_size <= 1
+                or self.virtual_pipeline_model_parallel_size is None
+                or not self.overlap_p2p_comm
+                or self.batch_p2p_comm
+                or not self.gradient_accumulation_fusion
+            ):
+                raise ValueError(
+                    "delay_megamoe_wgrad requires interleaved pipeline parallelism with "
+                    "overlap_p2p_comm=True and batch_p2p_comm=False, plus "
+                    "gradient_accumulation_fusion=True."
                 )
 
         if self.overlap_dispatch_backward_with_experts_wgrad:
