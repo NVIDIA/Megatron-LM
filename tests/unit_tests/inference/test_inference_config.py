@@ -29,6 +29,18 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize("backend", list(InferenceGroupedGemmBackend))
+    def test_grouped_gemm_backend_parses_config_value(self, backend):
+        assert InferenceGroupedGemmBackend.from_config(backend.value) is backend
+        assert InferenceGroupedGemmBackend.from_config(backend) is backend
+
+    def test_grouped_gemm_backend_reports_supported_config_values(self):
+        with pytest.raises(
+            ValueError,
+            match="inference_grouped_gemm_backend must be one of.*'flashinfer'.*'torch'.*'vllm'",
+        ):
+            InferenceGroupedGemmBackend.from_config("unknown")
+
     @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),
         [
@@ -36,15 +48,16 @@ class TestInferenceConfig:
             (InferenceGroupedGemmBackend.TORCH, "triton"),
             ("flashinfer", "triton"),
             (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
+            ("vllm", "triton"),
+            (InferenceGroupedGemmBackend.VLLM, "triton"),
         ],
     )
     def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
         assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
 
-    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
-    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
-            resolve_mxfp8_backend(grouped_gemm_backend)
+            resolve_mxfp8_backend("unknown")
 
     @staticmethod
     def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):
