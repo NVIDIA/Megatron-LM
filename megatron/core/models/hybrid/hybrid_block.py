@@ -36,6 +36,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -662,6 +663,8 @@ class HybridStack(MegatronModule):
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                                 physical_layer_idx, hidden_states
                             )
+                        # Keep both residuals in the layer's layout, inside the CP conversions.
+                        residual_accumulator = hidden_states
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
@@ -704,6 +707,7 @@ class HybridStack(MegatronModule):
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
+                        observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if cp_layout_state is not None:
                             hidden_states = cp_layout_state.finalize_layer(
                                 physical_layer_idx, hidden_states

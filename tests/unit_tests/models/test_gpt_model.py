@@ -97,6 +97,44 @@ class TestGPTModel:
                 max_sequence_length=4,
             )
 
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+    def test_hsm_requires_two_mtp_layers(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+        assert config.mtp_hsm is True
+
+    def test_rejects_hybrid_mtp_override(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_hybrid_override_pattern="*",
+        )
+        with pytest.raises(
+            ValueError, match="mtp_hybrid_override_pattern is not supported by GPTModel"
+        ):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
     @pytest.mark.internal
     def test_set_input_tensor(self):
         config: TransformerConfig = self.gpt_model.config

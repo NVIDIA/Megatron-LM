@@ -61,9 +61,13 @@ spec:
     ls -al 
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml 
-    cp .coverage {assets_dir}/coverage_report
-    cp coverage.xml {assets_dir}
+    if [[ -f .coverage ]]; then
+        /opt/venv/bin/coverage xml
+        cp .coverage {assets_dir}/coverage_report
+        cp coverage.xml {assets_dir}
+    else
+        echo "No unit-test coverage data was produced; skipping coverage export."
+    fi
 
 products:
   - test_case: [tests/unit_tests/test_model_configs.py]
