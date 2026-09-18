@@ -17,11 +17,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is u
 
 @pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize("strided_gate", [False, True])
-def test_output_norm_replays(zero_centered, strided_gate):
+@pytest.mark.parametrize(
+    "batch,length,heads,dim,cp", [(1, 1027, 16, 128, 1), (2, 37, 8, 64, 2), (3, 13, 4, 256, 4)]
+)
+def test_output_norm_replays(zero_centered, strided_gate, batch, length, heads, dim, cp):
     te = pytest.importorskip("transformer_engine.pytorch")
     seeded()
     norm = te.RMSNorm(
-        128, eps=1e-6, params_dtype=torch.bfloat16, zero_centered_gamma=zero_centered, device="cuda"
+        dim, eps=1e-6, params_dtype=torch.bfloat16, zero_centered_gamma=zero_centered, device="cuda"
     )
 
     class GatedNorm(torch.nn.Module):
@@ -30,10 +33,10 @@ def test_output_norm_replays(zero_centered, strided_gate):
             self.config = SimpleNamespace(
                 deterministic_mode=False, gdn_gated_output_norm_fusion=True
             )
-            self.cp_size = 1
+            self.cp_size = cp
             self.activation = "silu"
             self.out_norm = norm
-            self.value_head_dim = 128
+            self.value_head_dim = dim
 
         def forward(self, x, gate):
             # The module entry checks the supported layout on every replay.
@@ -41,9 +44,13 @@ def test_output_norm_replays(zero_centered, strided_gate):
             assert result.shape == x.shape
             return result
 
-    x = torch.randn((1, 1027, 16, 128), device="cuda", dtype=torch.bfloat16).requires_grad_()
-    projection = torch.randn((1, 1027, 5152), device="cuda", dtype=x.dtype)
-    gate = projection[..., 3072:5120].reshape_as(x)
+    x = torch.randn(
+        (batch, length, heads, dim), device="cuda", dtype=torch.bfloat16
+    ).requires_grad_()
+    projection = torch.randn((length, batch, heads * dim * 2 + 32), device="cuda", dtype=x.dtype)
+    gate = (
+        projection[..., 17 : 17 + heads * dim].view(length, batch, heads, dim).permute(1, 0, 2, 3)
+    )
     if not strided_gate:
         gate = gate.contiguous()
     gate = gate.detach().requires_grad_()

@@ -1,10 +1,29 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""GDN output RMSNorm/SiLU fusion preserving intermediate BF16 rounding."""
+"""GDN output RMSNorm/SiLU fusion preserving intermediate activation rounding."""
 
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _row_offset(
+    row,
+    SEQUENCE: tl.constexpr,
+    HEADS: tl.constexpr,
+    STRIDE_B: tl.constexpr,
+    STRIDE_S: tl.constexpr,
+    STRIDE_H: tl.constexpr,
+    FLAT_TOKENS: tl.constexpr,
+):
+    """Address logical [batch, sequence, head] rows without copying tensor views."""
+    token = row // HEADS
+    if FLAT_TOKENS:
+        offset = token * STRIDE_S
+    else:
+        offset = (token // SEQUENCE) * STRIDE_B + (token % SEQUENCE) * STRIDE_S
+    return offset + (row % HEADS) * STRIDE_H
 
 
 @triton.jit
@@ -17,7 +36,11 @@ def gated_norm_fwd(
     ROWS: tl.constexpr,
     HEADS: tl.constexpr,
     D: tl.constexpr,
-    GATE_STRIDE: tl.constexpr,
+    SEQUENCE: tl.constexpr,
+    X_STRIDES: tl.constexpr,
+    GATE_STRIDES: tl.constexpr,
+    X_FLAT_TOKENS: tl.constexpr,
+    GATE_FLAT_TOKENS: tl.constexpr,
     EPS: tl.constexpr,
     ZERO_CENTERED: tl.constexpr,
     BT: tl.constexpr,
@@ -26,14 +49,24 @@ def gated_norm_fwd(
     row = tl.program_id(0) * BT + tl.arange(0, BT)
     d = tl.arange(0, D)
     off = row[:, None] * D + d[None, :]
-    xv = tl.load(x + off, row[:, None] < ROWS, 0).to(tl.float32)
+    if X_FLAT_TOKENS and X_STRIDES[1] == HEADS * D and X_STRIDES[2] == D and X_STRIDES[3] == 1:
+        xoff = off
+    else:
+        xrow = _row_offset(
+            row, SEQUENCE, HEADS, X_STRIDES[0], X_STRIDES[1], X_STRIDES[2], X_FLAT_TOKENS
+        )
+        xoff = xrow[:, None] + d[None, :] * X_STRIDES[3]
+    xv = tl.load(x + xoff, row[:, None] < ROWS, 0).to(tl.float32)
     w = tl.load(weight + d).to(tl.float32)
     if ZERO_CENTERED:
         w += 1
     inv = tl.rsqrt(tl.sum(xv * xv, 1) / D + EPS)
-    # TE produces a BF16 RMSNorm output before the FP32 gating multiply.
+    # TE materializes RMSNorm in the activation dtype before FP32 gating.
     norm = (xv * inv[:, None] * w[None, :]).to(x.dtype.element_ty).to(tl.float32)
-    goff = (row // HEADS)[:, None] * GATE_STRIDE + (row % HEADS)[:, None] * D + d[None, :]
+    grow = _row_offset(
+        row, SEQUENCE, HEADS, GATE_STRIDES[0], GATE_STRIDES[1], GATE_STRIDES[2], GATE_FLAT_TOKENS
+    )
+    goff = grow[:, None] + d[None, :] * GATE_STRIDES[3]
     gv = tl.load(gate + goff, row[:, None] < ROWS, 0).to(tl.float32)
     result = norm * (gv * tl.sigmoid(gv))
     tl.store(out + off, result, row[:, None] < ROWS)
@@ -53,7 +86,11 @@ def gated_norm_bwd(
     ROWS: tl.constexpr,
     HEADS: tl.constexpr,
     D: tl.constexpr,
-    GATE_STRIDE: tl.constexpr,
+    SEQUENCE: tl.constexpr,
+    X_STRIDES: tl.constexpr,
+    GATE_STRIDES: tl.constexpr,
+    X_FLAT_TOKENS: tl.constexpr,
+    GATE_FLAT_TOKENS: tl.constexpr,
     ZERO_CENTERED: tl.constexpr,
     BT: tl.constexpr,
 ):
@@ -62,7 +99,14 @@ def gated_norm_bwd(
     row = tile * BT + tl.arange(0, BT)
     d = tl.arange(0, D)
     off = row[:, None] * D + d[None, :]
-    xv = tl.load(x + off, row[:, None] < ROWS, 0).to(tl.float32)
+    if X_FLAT_TOKENS and X_STRIDES[1] == HEADS * D and X_STRIDES[2] == D and X_STRIDES[3] == 1:
+        xoff = off
+    else:
+        xrow = _row_offset(
+            row, SEQUENCE, HEADS, X_STRIDES[0], X_STRIDES[1], X_STRIDES[2], X_FLAT_TOKENS
+        )
+        xoff = xrow[:, None] + d[None, :] * X_STRIDES[3]
+    xv = tl.load(x + xoff, row[:, None] < ROWS, 0).to(tl.float32)
     w = tl.load(weight + d).to(tl.float32)
     if ZERO_CENTERED:
         w += 1
@@ -70,7 +114,10 @@ def gated_norm_bwd(
     xn = xv * inv[:, None]
     norm = (xn * w[None, :]).to(x.dtype.element_ty).to(tl.float32)
     grad = tl.load(dy + off, row[:, None] < ROWS, 0).to(tl.float32)
-    goff = (row // HEADS)[:, None] * GATE_STRIDE + (row % HEADS)[:, None] * D + d[None, :]
+    grow = _row_offset(
+        row, SEQUENCE, HEADS, GATE_STRIDES[0], GATE_STRIDES[1], GATE_STRIDES[2], GATE_FLAT_TOKENS
+    )
+    goff = grow[:, None] + d[None, :] * GATE_STRIDES[3]
     gv = tl.load(gate + goff, row[:, None] < ROWS, 0).to(tl.float32)
     sig = tl.sigmoid(gv)
     grad_norm = (grad * (gv * sig)).to(x.dtype.element_ty).to(tl.float32)
@@ -93,10 +140,11 @@ def forward_impl(
     bt: int = 4,
     warps: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalize and gate contiguous activations with an optionally strided gate."""
-    rows, d = x.numel() // x.shape[-1], x.shape[-1]
-    heads = gate.shape[-2]
-    out = torch.empty_like(x)
+    """Normalize and gate [batch, sequence, head, dimension] tensor views."""
+    batch, sequence, heads, d = x.shape
+    rows = batch * sequence * heads
+    x_strides, gate_strides = x.stride(), gate.stride()
+    out = torch.empty_like(x, memory_format=torch.contiguous_format)
     rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
     gated_norm_fwd[(triton.cdiv(rows, bt),)](
         x,
@@ -107,7 +155,11 @@ def forward_impl(
         ROWS=rows,
         HEADS=heads,
         D=d,
-        GATE_STRIDE=gate.stride(-3),
+        SEQUENCE=sequence,
+        X_STRIDES=x_strides,
+        GATE_STRIDES=gate_strides,
+        X_FLAT_TOKENS=batch == 1 or x_strides[0] == sequence * x_strides[1],
+        GATE_FLAT_TOKENS=batch == 1 or gate_strides[0] == sequence * gate_strides[1],
         EPS=eps,
         ZERO_CENTERED=zero_centered,
         BT=bt,
@@ -129,9 +181,11 @@ def backward_impl(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute activation, gate, and RMSNorm-weight gradients."""
     dy = dy.contiguous()
-    rows, d = x.numel() // x.shape[-1], x.shape[-1]
-    dx = torch.empty_like(x)
-    dgate = torch.empty(gate.shape, device=gate.device, dtype=gate.dtype)
+    batch, sequence, heads, d = x.shape
+    rows = batch * sequence * heads
+    x_strides, gate_strides = x.stride(), gate.stride()
+    dx = torch.empty_like(x, memory_format=torch.contiguous_format)
+    dgate = torch.empty_like(gate, memory_format=torch.contiguous_format)
     dw = torch.empty((triton.cdiv(rows, bt), d), device=x.device, dtype=torch.float32)
     gated_norm_bwd[(triton.cdiv(rows, bt),)](
         x,
@@ -143,9 +197,13 @@ def backward_impl(
         dgate,
         dw,
         ROWS=rows,
-        HEADS=gate.shape[-2],
+        HEADS=heads,
         D=d,
-        GATE_STRIDE=gate.stride(-3),
+        SEQUENCE=sequence,
+        X_STRIDES=x_strides,
+        GATE_STRIDES=gate_strides,
+        X_FLAT_TOKENS=batch == 1 or x_strides[0] == sequence * x_strides[1],
+        GATE_FLAT_TOKENS=batch == 1 or gate_strides[0] == sequence * gate_strides[1],
         ZERO_CENTERED=zero_centered,
         BT=bt,
         num_warps=warps,
@@ -193,26 +251,25 @@ def validate_gated_norm(module: torch.nn.Module, x: torch.Tensor, gate: torch.Te
     prefix = "gdn_gated_output_norm_fusion requires "
     if module.config.deterministic_mode:
         raise ValueError(prefix + "deterministic_mode=False.")
-    if module.cp_size != 1:
-        raise ValueError(prefix + "context_parallel_size=1.")
     if module.activation not in ("silu", "swish"):
         raise ValueError(prefix + "SiLU/Swish activation.")
     if type(module.out_norm).__name__ != "RMSNorm":
         raise ValueError(prefix + "an RMSNorm output normalization module.")
-    if not x.is_cuda or x.dtype != torch.bfloat16:
-        raise ValueError(prefix + "CUDA BF16 core attention output.")
-    if not x.is_contiguous() or x.ndim == 0 or x.shape[-1] != 128:
-        raise ValueError(prefix + "contiguous core attention output with head dimension 128.")
-    if gate.ndim != 4 or gate.shape[0] != 1 or gate.shape[-2:] != (16, 128):
-        raise ValueError(prefix + "gate shape [1, sequence_length, 16, 128].")
-    if x.numel() == 0 or x.numel() != gate.numel():
-        raise ValueError(
-            prefix + "nonempty core attention output and gate with equal element counts."
-        )
-    if gate.stride(-1) != 1 or gate.stride(-2) != 128:
-        raise ValueError(prefix + "contiguous elements within each gate token (strides 1 and 128).")
+    if not x.is_cuda or x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(prefix + "CUDA BF16 or FP16 core attention output.")
+    if x.ndim != 4 or gate.shape != x.shape:
+        raise ValueError(prefix + "matching output and gate shapes [batch, sequence, heads, dim].")
+    if x.numel() == 0:
+        raise ValueError(prefix + "nonempty core attention output and gate.")
+    d = x.shape[-1]
+    if d & (d - 1):
+        raise ValueError(prefix + "a power-of-two head dimension.")
+    if gate.dtype not in (x.dtype, torch.float32):
+        raise ValueError(prefix + "a gate in the activation dtype or FP32.")
     if gate.device != x.device:
         raise ValueError(prefix + "core attention output and gate on the same CUDA device.")
     weight = module.out_norm.weight
-    if weight.device != x.device or weight.shape != (128,) or not weight.is_contiguous():
-        raise ValueError(prefix + "a contiguous 128-element RMSNorm weight on the input device.")
+    if weight.device != x.device or weight.shape != (d,) or not weight.is_contiguous():
+        raise ValueError(prefix + "a contiguous RMSNorm weight of size dim on the input device.")
+    if weight.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(prefix + "a BF16, FP16 or FP32 RMSNorm weight.")
