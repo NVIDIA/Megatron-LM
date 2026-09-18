@@ -1871,14 +1871,14 @@ def _precalculate_loss_weights(boundaries, labels):
     """Precompute packed-sample loss weights before context-parallel sharding."""
     weights = torch.zeros(labels.shape[0], dtype=torch.float32, device=labels.device)
     valid_counts = []
+    boundaries = boundaries.tolist()
 
     for start, end in zip(boundaries[:-1], boundaries[1:]):
-        start = int(start.item())
-        end = min(int(end.item()), labels.shape[0])
+        end = min(end, labels.shape[0])
         valid = labels[start:end] != IGNORE_INDEX
         count = valid.sum()
         if count > 0:
-            weights[start:end][valid] = count.float().rsqrt()
+            weights[start:end] = torch.where(valid, count.float().rsqrt(), weights.new_zeros(()))
             valid_counts.append(count)
 
     if not valid_counts:
