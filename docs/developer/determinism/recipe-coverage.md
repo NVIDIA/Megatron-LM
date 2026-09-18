@@ -178,7 +178,9 @@ while allowing the original training calls to proceed.
 The adapter supports the six direct TP/SP mappings (copy, reduce, first/last
 dimension all-gather and reduce-scatter), explicit multi-rank groups, FP32/BF16,
 equal shards and default mapping options. It records actual group membership,
-local rank, backend, NCCL version/settings, local GPU UUID, forward/backward
+local rank, backend, NCCL version, all explicit `NCCL_`/`TORCH_NCCL_` environment
+overrides, the actual group's stream priority, exposed scalar NCCL configuration
+and backend flags, local GPU UUID, forward/backward
 policy, and input/upstream-gradient bytes. Each invocation is retained in order,
 including repeated backward traversals. Input snapshots precede possible
 in-place reduction. Restoration preserves logical bytes, shapes, strides,
@@ -201,6 +203,9 @@ Use the recipe's actual GPU count rather than assuming eight. The launcher uses
 the existing evidence plugin with a dedicated fixture, excluding generic
 unit-test defaults that would change the recipe's NCCL settings. Every rank's
 manifest, blob hashes and peer contracts are checked before collective replay.
+Groups are recreated with their recorded options; identical memberships with
+different options remain distinct. Options that cannot be restored exactly are
+rejected. Split communicators require a separate adapter for their parent group.
 The initial protocol requires the same mapping/invocation/phase order on all
 global ranks; disjoint TP groups are supported. Each event runs three times with
 side-stream contention, compares all output/input-gradient bytes, and checks an

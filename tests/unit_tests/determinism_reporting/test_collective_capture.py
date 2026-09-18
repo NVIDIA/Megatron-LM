@@ -2,11 +2,13 @@
 
 """CPU contract checks for opt-in collective snapshots, hooks and replay inputs."""
 
+import copy
 import hashlib
 import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -21,6 +23,8 @@ from tools.determinism.collective_capture import (
     load_captures,
     load_tensor,
     prepare_replay,
+    process_group_options,
+    restore_group_options,
 )
 from tools.determinism.recipe_coverage import DETERMINISTIC, UNVERIFIED, build_report
 
@@ -105,6 +109,22 @@ def test_snapshot_preserves_singleton_broadcast_views(tmp_path, shape):
     restored = load_tensor(store.root, descriptor, max_bytes=4096)
     assert restored.stride() == value.stride()
     assert torch.signbit(restored).all()
+
+
+def test_event_reservation_bounds_overlapping_snapshots(tmp_path):
+    store = CollectiveCapture(tmp_path / 'capture', max_bytes=4096, max_events=1)
+
+    def snapshot(index):
+        try:
+            store.snapshot(torch.full((2, 3), float(index)))
+            return True
+        except ValueError:
+            return False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(snapshot, range(2)))
+    assert sum(results) == 1
+    assert len(list(store.root.glob('*.bin'))) == 1
 
 
 @pytest.mark.parametrize(
@@ -293,7 +313,9 @@ def test_capture_rank_contract_and_exact_recipe_join(tmp_path, monkeypatch, mapp
     assert report["capture_issues"]
 
 
-@pytest.mark.parametrize("fault", ["runtime", "uuid", "members", "nccl", "version", "warn_only"])
+@pytest.mark.parametrize(
+    "fault", ["runtime", "uuid", "members", "nccl", "version", "warn_only", "group_options"]
+)
 def test_preparation_rejects_runtime_or_physical_rank_changes_before_loading_tensors(
     tmp_path, monkeypatch, mappings, fault
 ):
@@ -302,6 +324,12 @@ def test_preparation_rejects_runtime_or_physical_rank_changes_before_loading_ten
     event = captures[0]["events"][0]
     collective = event["signature"]["configuration"]["collective"]
     collective.update(backend="nccl", device_uuid="GPU-original", nccl_version=[2, 20, 0])
+    collective['group_options'] = {'is_high_priority_stream': False, 'config': {}}
+    monkeypatch.setattr(
+        collective_capture,
+        'process_group_options',
+        lambda group, device: {'is_high_priority_stream': False, 'config': {}},
+    )
     monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "nccl")
     monkeypatch.setattr(
         torch.cuda, "nccl", SimpleNamespace(version=lambda: (2, 20, 0)), raising=False
@@ -327,10 +355,146 @@ def test_preparation_rejects_runtime_or_physical_rank_changes_before_loading_ten
         collective["nccl_environment"]["NCCL_ALGO"] = "different"
     elif fault == "version":
         collective["nccl_version"] = [2, 21, 0]
+    elif fault == "group_options":
+        collective['group_options']['is_high_priority_stream'] = True
     else:
         monkeypatch.setattr(torch, "is_deterministic_algorithms_warn_only_enabled", lambda: True)
     with pytest.raises(ValueError, match="differs"):
         prepare_replay(event, tmp_path / "rank-0", group(), max_bytes=4096)
+
+
+@pytest.fixture
+def nccl_options(monkeypatch):
+    class Options:
+        def __init__(self, is_high_priority_stream=False):
+            self.is_high_priority_stream = is_high_priority_stream
+            self.split_from = None
+            self.enable_reconfigure = False
+            self.use_pg_for_symm_mem_rendezvous = False
+            self.config = SimpleNamespace(
+                blocking=-1, min_ctas=-1, max_ctas=-1, cga_cluster_size=-1, net_name=None
+            )
+
+    monkeypatch.setattr(
+        torch.distributed, 'ProcessGroupNCCL', SimpleNamespace(Options=Options), raising=False
+    )
+    return Options
+
+
+@pytest.mark.parametrize('priority', [False, True])
+def test_actual_group_options_round_trip_including_unknown_future_scalar_fields(
+    nccl_options, priority
+):
+    options = nccl_options(is_high_priority_stream=priority)
+    options.config.min_ctas = 4
+    options.config.max_ctas = 16
+    options.config.net_name = 'IB'
+    options.use_pg_for_symm_mem_rendezvous = True
+    group = SimpleNamespace(_get_backend=lambda device: SimpleNamespace(options=options))
+    signature = process_group_options(group, torch.device('cuda'))
+    assert signature == {
+        'is_high_priority_stream': priority,
+        'config': {
+            'blocking': -1,
+            'min_ctas': 4,
+            'max_ctas': 16,
+            'cga_cluster_size': -1,
+            'net_name': 'IB',
+        },
+        'flags': {'enable_reconfigure': False, 'use_pg_for_symm_mem_rendezvous': True},
+    }
+    restored = restore_group_options(signature)
+    assert restored is not options
+    assert restored.is_high_priority_stream is priority
+    assert restored.use_pg_for_symm_mem_rendezvous is True
+    assert vars(restored.config) == vars(options.config)
+    options.config.future_field = 7
+    assert process_group_options(group, torch.device('cuda'))['config']['future_field'] == 7
+    with pytest.raises(ValueError, match='fields differ'):
+        restore_group_options(process_group_options(group, torch.device('cuda')))
+
+
+@pytest.mark.parametrize(
+    'fault', ['split_from', 'enable_reconfigure', 'use_pg_for_symm_mem_rendezvous', 'opaque_config']
+)
+def test_unsupported_group_options_cannot_be_erased(nccl_options, fault):
+    options = nccl_options()
+    if fault == 'opaque_config':
+        options.config.opaque = object()
+    else:
+        setattr(options, fault, object())
+    group = SimpleNamespace(_get_backend=lambda device: SimpleNamespace(options=options))
+    with pytest.raises(ValueError):
+        process_group_options(group, torch.device('cuda'))
+
+
+def test_new_nccl_environment_overrides_are_recorded(monkeypatch):
+    monkeypatch.setenv('NCCL_P2P_DISABLE', '1')
+    monkeypatch.setenv('TORCH_NCCL_AVOID_RECORD_STREAMS', '1')
+    signature = collective_capture.nccl_environment()
+    assert signature['NCCL_P2P_DISABLE'] == '1'
+    assert signature['TORCH_NCCL_AVOID_RECORD_STREAMS'] == '1'
+
+
+def test_backward_communication_policy_change_stays_visible(tmp_path, monkeypatch, mappings):
+    monkeypatch.setenv('NCCL_P2P_DISABLE', '0')
+    store = CollectiveCapture(tmp_path / 'capture', max_bytes=4096, max_events=10)
+    with install_bindings(Inventory(torch, 10, collectives=store), [binding()]):
+        value = torch.ones(2, 3, requires_grad=True)
+        output = mappings.copy_to_tensor_model_parallel_region(value, group=group())
+        monkeypatch.setenv('NCCL_P2P_DISABLE', '1')
+        output.sum().backward()
+    assert torch.equal(value.grad, torch.full_like(value, 2))
+    signature = store.events[-1]['signature']
+    assert signature['configuration']['collective']['nccl_environment']['NCCL_P2P_DISABLE'] == '0'
+    assert signature['backward_collective']['nccl_environment']['NCCL_P2P_DISABLE'] == '1'
+
+
+@pytest.mark.parametrize(
+    'options',
+    [
+        None,
+        {},
+        {'is_high_priority_stream': False, 'config': {}},
+        {'is_high_priority_stream': 'false', 'config': {}, 'flags': {}},
+    ],
+)
+def test_incomplete_nccl_options_cannot_match_even_when_both_sides_omit_them(
+    tmp_path, monkeypatch, mappings, options
+):
+    inventories = make_capture(tmp_path, monkeypatch, mappings)
+    for inventory in inventories:
+        inventory['operations'] = inventory['operations'][:1]
+        contract = inventory['operations'][0]['signature']['configuration']['collective']
+        contract['backend'] = 'nccl'
+        contract['group_options'] = options
+    evidence = [
+        {
+            'schema_version': 1,
+            'kind': 'determinism_coverage',
+            'context': inventories[0]['context'],
+            'run_id': 'incomplete-options-fixture',
+            'ranks_present': [0, 1],
+            'cases': [
+                {
+                    'case_id': 'fixture',
+                    'status': DETERMINISTIC,
+                    'observations': [
+                        {
+                            'rank': rank,
+                            'signature': copy.deepcopy(inventory['operations'][0]['signature']),
+                            'protocol': {'replays': 3},
+                            'status': DETERMINISTIC,
+                        }
+                        for rank, inventory in enumerate(inventories)
+                    ],
+                }
+            ],
+        }
+    ]
+    result = build_report(inventories, evidence)
+    assert result['counts'][UNVERIFIED] == 2
+    assert all('group options' in operation['reason'] for operation in result['operations'])
 
 
 @pytest.mark.parametrize(

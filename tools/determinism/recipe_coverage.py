@@ -48,6 +48,20 @@ def _has_memory_fill_policy(signature: dict) -> bool:
     )
 
 
+def _has_collective_options(signature: dict) -> bool:
+    """Captured NCCL invocations require explicit group-specific settings."""
+    collective = signature.get("configuration", {}).get("collective", {})
+    if collective.get("capture_schema") != 1 or collective.get("backend") != "nccl":
+        return True
+    options = collective.get("group_options")
+    return (
+        isinstance(options, dict)
+        and type(options.get("is_high_priority_stream")) is bool
+        and isinstance(options.get("config"), dict)
+        and isinstance(options.get("flags"), dict)
+    )
+
+
 def _evidence_index(
     reports: list[dict], context: dict, observed_by_rank: dict[int, set[str]]
 ) -> tuple[dict, list[str]]:
@@ -77,7 +91,7 @@ def _evidence_index(
                 if type(rank) is not int or rank not in expected:
                     raise ValueError("Evidence contains an invalid rank")
                 signature = observation["signature"]
-                if not _has_memory_fill_policy(signature):
+                if not _has_memory_fill_policy(signature) or not _has_collective_options(signature):
                     continue
                 signatures = [signature]
                 # A forward+backward replay also compared its forward outputs.
@@ -192,6 +206,9 @@ def build_report(inventories: list[dict], evidence: list[dict]) -> dict:
         if not _has_memory_fill_policy(operation["signature"]):
             status = UNVERIFIED
             reason = "Memory-fill policy is missing or not a boolean"
+        elif not _has_collective_options(operation["signature"]):
+            status = UNVERIFIED
+            reason = "Captured NCCL group options are missing or malformed"
         elif NONDETERMINISTIC in statuses:
             status = NONDETERMINISTIC
             reason = "Matching numerical mismatch; passing evidence does not erase it"
