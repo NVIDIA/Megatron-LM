@@ -343,6 +343,7 @@ def convert_checkpoint(
     param_to_param_group_map={},
     rename_mtp_keys=False,
     swiglu_modules=None,
+    model_weights_only: bool = False,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
 
@@ -372,6 +373,16 @@ def convert_checkpoint(
     MCore torch_dist format.
 
     \b
+    Model weights only (model_weights_only=True)
+    ===========================================
+    Emits only 'model.*' weights plus the non-optimizer common state ('args',
+    'iteration', 'checkpoint_version'). All 'optimizer.*' entries are dropped,
+    and optimizer tensors are never even loaded. Use this for Megatron-FSDP v2,
+    whose optimizer checkpointing is unimplemented; load the result with
+    '--no-load-optim' ('--no-save-optim' does not affect loading). 'rng_state*'
+    is dropped as before, so loading may also need '--no-load-rng'.
+
+    \b
     Examples
     ========
     Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
@@ -393,6 +404,11 @@ def convert_checkpoint(
     metadata = reader.read_metadata()
     state_dict = {}
     for key, md in metadata.state_dict_metadata.items():
+        # Model-weights-only mode: never allocate (or load) optimizer tensors.
+        # Skipping them here avoids materializing potentially enormous optimizer
+        # state that would be dropped later anyway.
+        if model_weights_only and key.startswith("optimizer."):
+            continue
         if isinstance(md, TensorStorageMetadata):
             # Initialize tensor storage
             assert len(md.size) > 0, (
@@ -584,6 +600,11 @@ def convert_checkpoint(
 
         if isinstance(value, torch.Tensor):
             if key.startswith("optimizer.state."):
+                if model_weights_only:
+                    # Defensive: optimizer keys are already filtered out at load
+                    # time. Drop any stray one instead of converting it, so that
+                    # model-weights-only output can never contain optimizer state.
+                    continue
                 # Special handling for optimizer state
                 key_list = key.split(".")
                 new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[3:])}.{key_list[2]}"
@@ -640,18 +661,32 @@ def convert_checkpoint(
                         value = value.reshape(orig_shape).redistribute(placements=[Shard(0)])
                 split_tensors = {new_key: value}
 
-            # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes)
-            for key, value in list(split_tensors.items()):
-                if is_swiglu_key(key):
-                    swiglu_w_and_v = split_swiglu_weight(key, value)
+            # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes).
+            # Capture the pre-split keys before the loop: the loop rebinds its
+            # iteration variable, so reading it afterwards made the param-group
+            # propagation below depend on whichever split key happened to be
+            # iterated last (it only worked by accident).
+            orig_keys = list(split_tensors.keys())
+            for split_key, split_value in list(split_tensors.items()):
+                if is_swiglu_key(split_key):
+                    swiglu_w_and_v = split_swiglu_weight(split_key, split_value)
                     split_tensors.update(swiglu_w_and_v)
-                    del split_tensors[key]
+                    del split_tensors[split_key]
                     _swiglu_split_count += 1
 
             fsdp_dtensor_state_dict.update(split_tensors)
-            if is_param and key in param_to_param_group_map:
-                for new_key in split_tensors.keys():
-                    param_to_param_group_map[new_key] = param_to_param_group_map[key]
+            if is_param:
+                # Propagate each pre-split key's param group to the key(s) it
+                # produced. SWiGLU splitting only inserts a `_w`/`_v` marker
+                # before the weight/bias suffix, so generated keys keep the
+                # pre-split key as a prefix.
+                for orig_key in orig_keys:
+                    if orig_key not in param_to_param_group_map:
+                        continue
+                    orig_param_group = param_to_param_group_map[orig_key]
+                    for new_key in split_tensors.keys():
+                        if new_key == orig_key or new_key.startswith(orig_key):
+                            param_to_param_group_map[new_key] = orig_param_group
         elif key.startswith("rng_state"):
             # Skip RNG states
             continue
@@ -736,28 +771,40 @@ def convert_checkpoint(
         )
     )
     common_state = load_common(input_dir)
-    try:
-        if "param_groups" in common_state["optimizer"]:
-            ckpt_param_groups = common_state["optimizer"]["param_groups"]
-        else:
-            ckpt_param_groups = []
-            for opt_state_dict in common_state["optimizer"].values():
-                ckpt_param_groups.extend(opt_state_dict["optimizer"]["param_groups"])
-    except:
-        ckpt_param_groups = None
+    # ckpt_param_groups is only consumed to reconstruct optimizer.* entries, so
+    # in model-weights-only mode there is no need to read it at all.
+    ckpt_param_groups = None
+    if not model_weights_only:
+        try:
+            if "param_groups" in common_state["optimizer"]:
+                ckpt_param_groups = common_state["optimizer"]["param_groups"]
+            else:
+                ckpt_param_groups = []
+                for opt_state_dict in common_state["optimizer"].values():
+                    ckpt_param_groups.extend(opt_state_dict["optimizer"]["param_groups"])
+        except:
+            ckpt_param_groups = None
     common_state = flatten(common_state)
     for key, value in common_state.items():
         if key.startswith("optimizer.optimizer.param_groups."):
             key = key.replace(
                 "optimizer.optimizer.param_groups.", "optimizer.param_groups."
             )
+        if model_weights_only and key.startswith("optimizer."):
+            # Keep the non-optimizer common state (args, iteration,
+            # checkpoint_version, ...), but emit no optimizer.* key of any kind.
+            continue
         assert key not in fsdp_dtensor_state_dict, (
             f"Key '{key}' already exists in fsdp_dtensor_state_dict."
         )
         fsdp_dtensor_state_dict[key] = value
 
-    # set up per-parameter param_groups
-    if param_to_param_group_map and ckpt_param_groups is not None:
+    # set up per-parameter param_groups (optimizer metadata only)
+    if (
+        not model_weights_only
+        and param_to_param_group_map
+        and ckpt_param_groups is not None
+    ):
         for name in list(fsdp_dtensor_state_dict.keys()):
             if not name.startswith(model_weight_prefix) or name.endswith(".expert_bias"):
                 continue
@@ -765,7 +812,10 @@ def convert_checkpoint(
             assert name in param_to_param_group_map, f"Missing param group for {name}"
             param_group_id = param_to_param_group_map[name]
             assert param_group_id < len(ckpt_param_groups), f"Invalid param group id {param_group_id} for {name}"
-            name_without_prefix = name[len(model_weight_prefix):]
+            # `name` is `<model_weight_prefix>.<param>`, so strip the prefix
+            # *including* its leading dot: otherwise the f-string below adds a
+            # second separator and produces a double-dot key.
+            name_without_prefix = name[len(model_weight_prefix):].lstrip(".")
             fsdp_dtensor_state_dict[
                 f"{optimizer_param_to_group_prefix}.{name_without_prefix}"
             ] = ckpt_param_groups[param_group_id]
@@ -828,6 +878,20 @@ def convert_checkpoint(
          "Auto-detected if not set: enabled when '.mtp.layers.*.transformer_layer' "
          "keys are found in the checkpoint.",
 )
+@click.option(
+    "--model-weights-only",
+    is_flag=True,
+    help="Convert only 'model.*' weights and omit ALL 'optimizer.*' entries. "
+         "Use this to load into Megatron-FSDP v2, whose optimizer checkpointing "
+         "is not implemented (optimizer state is therefore unsupported): the "
+         "resulting checkpoint contains no optimizer state of any kind. "
+         "On the load side pair this with '--no-load-optim' ('--no-save-optim' "
+         "does not affect loading). The converter also drops 'rng_state*', so "
+         "loading may additionally require '--no-load-rng'; if the output is "
+         "missing 'args'/'iteration'/'checkpoint_version' or any model weight, "
+         "loading may require '--no-strict-fsdp-dtensor-load' and "
+         "'--dist-ckpt-strictness ignore_all'.",
+)
 def convert_torch_dist_to_fsdp_dtensor(
     input_dir,
     output_dir,
@@ -839,6 +903,7 @@ def convert_torch_dist_to_fsdp_dtensor(
     output_model_weight_prefix,
     param_to_param_group_map_json,
     rename_mtp_keys,
+    model_weights_only,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
 
@@ -939,6 +1004,7 @@ def convert_torch_dist_to_fsdp_dtensor(
         param_to_param_group_map=param_to_param_group_map,
         rename_mtp_keys=rename_mtp_keys,
         swiglu_modules=_swiglu_modules,
+        model_weights_only=model_weights_only,
     )
 
     click.echo(
