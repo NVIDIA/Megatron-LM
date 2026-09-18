@@ -297,7 +297,8 @@ runs:
       if: >-
         always() && inputs.tag == 'latest' &&
         (inputs.test_case == 'tests/unit_tests/determinism/kernels/**/*.py' ||
-         inputs.test_case == 'determinism_kernel_perf')
+         inputs.test_case == 'determinism_kernel_perf' ||
+         inputs.test_case == 'determinism_collective_perf')
       shell: bash -e -u -o pipefail {0}
       env:
         LOG_BASE: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}

@@ -383,6 +383,44 @@ own format. Use the explicit collective publication and artifact-consumer paths
 below for this report kind. Reviewed baseline promotion and production-recipe
 performance acceptance remain separate work.
 
+### Run the collective CI producer
+
+The H100 and GB200 nightly `determinism_collective_perf` recipes run the complete
+capture/replay/reference/timing pipeline on one node (eight H100 or four GB200
+ranks). They require the collective capture/replay and early startup dependencies.
+An ordinary PR or merge-group cadence does not select this pilot; the existing
+explicit cadence bypass can select it. The existing workflow stamps the actual
+producer outcome, uploads its logs, and selects the corresponding
+`--collective-platform` CPU consumer. Missing or unsuccessful selected producers
+fail artifact verification; existing activation selection remains independent.
+
+To run the same producer in an allocated, clean source checkout:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/collective_pipeline.py \
+  --output /results/collective-performance --gpus 8
+```
+
+Use `--gpus 4` for the GB200 recipe. Launch the parent outside torchrun. The
+producer launches its own fresh worker groups, preserves every stage log and
+requires a fresh output directory. A failed capture, replay, accuracy check,
+recipe join or timing arm stops the pipeline and retains the incomplete attempt.
+The final CPU verification requires the complete matrix before marking the
+producer complete.
+
+This bounded synthetic workload covers six direct TP/SP mappings in FP32/BF16,
+forward/backward, with explicit rank-local inputs/upstream gradients, nonzero
+offsets and noncontiguous three-dimensional tensors. Pair-sized and world-sized
+groups exercise distinct priority/CTA options, producing 96 events per rank.
+The default three fresh-process policy pairs use 20 warmup and 50 measured
+samples per event. CI measures current-head deterministic/default overhead;
+base/head comparisons remain available through the separate
+`benchmark_collectives.py --base-checkout` entrypoint. No budgets are imposed by
+this pilot, and complete results remain `not_gated`. It does not establish
+production recipe, multi-node, overlap or full-state/restart acceptance. Recipe
+and workflow implementation alone does not establish a successful protected CI
+run.
+
 ### Publish and transport captured collective evidence
 
 Publish a complete capture, its matching replay/accuracy report and timing tree:
@@ -441,9 +479,9 @@ artifacts cannot substitute for it. `--platform` continues to select the existin
 activation producers; both kinds can be requested together and are reported
 separately. A missing, failed, stale, wrong-platform or ambiguous selected producer
 fails verification. The derived bundles retain the source records and unbudgeted
-status. This data-consumer support does not by itself schedule a collective
-producer; automatic recipe/workflow selection and protected CI execution remain
-separate rollout requirements.
+status. The nightly producer recipes and workflow selection described above
+provide the automatic path. Protected CI acceptance, reviewed performance limits
+and durable baseline promotion remain separate rollout requirements.
 
 ## Consume CI artifacts
 

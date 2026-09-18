@@ -3,11 +3,13 @@
 """CI collective transport checks; synthetic metadata never substitutes for a CI run."""
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 
 import pytest
+import yaml
 
 from tests.unit_tests.determinism_reporting.test_ci_baselines import ATTEMPT, REPOSITORY, RUN
 from tests.unit_tests.determinism_reporting.test_ci_baselines import inputs as activation_inputs
@@ -17,7 +19,11 @@ from tests.unit_tests.determinism_reporting.test_collective_baseline import (
     consumer,
     write_json,
 )
-from tests.unit_tests.determinism_reporting.test_paired_performance import SCRIPTS, load_module
+from tests.unit_tests.determinism_reporting.test_paired_performance import (
+    ROOT,
+    SCRIPTS,
+    load_module,
+)
 
 
 @pytest.fixture
@@ -168,3 +174,53 @@ def test_single_retried_upload_is_accepted_without_selecting_between_duplicates(
     directory = inputs(ci, consumer, root)
     directory.rename(root / (directory.name + "-retry"))
     assert collect(ci, root, tmp_path / "output")["status"] == "complete"
+
+
+@pytest.mark.parametrize("selected", [["dgx_h100"], ["dgx_gb200"], ["dgx_h100", "dgx_gb200"]])
+def test_actual_workflow_shell_selects_collectives_and_rejects_missing_uploads(
+    ci, consumer, tmp_path, selected
+):
+    root = tmp_path / "determinism-inputs"
+    for platform in selected:
+        inputs(ci, consumer, root, platform)
+    (tmp_path / "tests").symlink_to(ROOT / "tests", target_is_directory=True)
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
+    step = next(
+        row
+        for row in workflow["jobs"]["cicd-determinism-baselines"]["steps"]
+        if row["name"] == "Verify replay and timing artifacts"
+    )
+    environment = {
+        **os.environ,
+        "GITHUB_REPOSITORY": REPOSITORY,
+        "GITHUB_RUN_ID": str(RUN),
+        "GITHUB_RUN_ATTEMPT": str(ATTEMPT),
+        "REVISION": REVISION,
+        "H100_SELECTED": "false",
+        "GB200_SELECTED": "false",
+        "H100_COLLECTIVE_SELECTED": "true" if "dgx_h100" in selected else "false",
+        "GB200_COLLECTIVE_SELECTED": "true" if "dgx_gb200" in selected else "false",
+    }
+
+    def execute():
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", step["run"]],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        report = json.loads((tmp_path / "determinism-baselines/report.json").read_text())
+        return result, report
+
+    result, report = execute()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert report["status"] == "complete" and len(report["platforms"]) == len(selected)
+    assert all(
+        row["kind"] == "collective" and row["status"] == "not_gated" for row in report["platforms"]
+    )
+    shutil.rmtree(tmp_path / "determinism-baselines")
+    shutil.rmtree(next(root.iterdir()))
+    result, report = execute()
+    assert result.returncode == 1 and report["status"] == "not_verified"
+    assert any(row["status"] == "not_verified" for row in report["platforms"])

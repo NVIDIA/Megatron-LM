@@ -252,6 +252,8 @@ def test_actual_ci_shell_consumes_named_artifacts_and_retains_failure_report(ci,
         "REVISION": REVISION,
         "H100_SELECTED": "true",
         "GB200_SELECTED": "false",
+        "H100_COLLECTIVE_SELECTED": "false",
+        "GB200_COLLECTIVE_SELECTED": "false",
     }
     result = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", step["run"]],
@@ -281,7 +283,8 @@ def test_actual_ci_shell_consumes_named_artifacts_and_retains_failure_report(ci,
     )
 
 
-def test_actual_producer_shell_stamps_failure_without_changing_it(tmp_path):
+@pytest.mark.parametrize("test_case", ["determinism_kernel_perf", "determinism_collective_perf"])
+def test_actual_producer_shell_stamps_failure_without_changing_it(tmp_path, test_case):
     action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
     step = next(
         step for step in action["runs"]["steps"] if step.get("id") == "determinism-artifact"
@@ -289,7 +292,7 @@ def test_actual_producer_shell_stamps_failure_without_changing_it(tmp_path):
     environment = {
         **os.environ,
         "LOG_BASE": str(tmp_path / "logs"),
-        "TEST_CASE": "determinism_kernel_perf",
+        "TEST_CASE": test_case,
         "PLATFORM": "dgx_h100",
         "PRODUCER_OUTCOME": "failure",
         "PRODUCER_EXIT_CODE": "1",
