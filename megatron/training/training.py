@@ -6637,7 +6637,6 @@ def evaluate_and_print_results(
         assert len(cfg.validation.validation_set_names) == len(data_iterators), \
             f"Number of --validation-set-names ({len(cfg.validation.validation_set_names)}) must match " \
             f"the number of validation datasets ({len(data_iterators)})"
-        )
 
     callback_manager.trigger(start_event)
 
