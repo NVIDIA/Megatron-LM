@@ -466,6 +466,7 @@ class QSACoreAttention(torch.nn.Module):
         self.config = config
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
+        self.pg_collection = pg_collection
         self.softmax_scale = (
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(config.kv_channels)
         )
@@ -586,9 +587,34 @@ class QSACoreAttention(torch.nn.Module):
             )
         assert attention_bias is None, "QSA does not support attention bias"
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        # The sparse (FlexAttention) and dense-masked (SDPA) paths run their kernel directly on
+        # the local q/k/v the owning attention hands them, so under CP>1 they would attend over
+        # the local zigzag slice only while the block selection (computed by the indexer over the
+        # gathered full sequence) is over the full sequence. Gather q/k/v to the full causal
+        # sequence -- the per-token RoPE the owning attention applied already uses each token's
+        # correct global position, so it stays aligned after the gather -- run the sparse kernel
+        # over the full sequence with the full-seq selection, then split the output back to the
+        # local slice. Numerically exact vs CP=1; the sparse kernel is O(global_s^2) here, so the
+        # block-sparse triton kernel remains the long-seq production follow-up. The all-selected
+        # dense path above delegates to ``dense_core_attention`` (which carries
+        # ``cp_comm_type``) and is already CP-aware, so it is left untouched.
+        cp_size = get_pg_size(self.pg_collection.cp)
+        if cp_size > 1:
+            from megatron.core.ssm.mamba_context_parallel import (
+                reconstruct_tensor_cp,
+                split_tensor_cp,
+            )
+
+            query = reconstruct_tensor_cp(query, packed_seq_params, dim=0)
+            key = reconstruct_tensor_cp(key, packed_seq_params, dim=0)
+            value = reconstruct_tensor_cp(value, packed_seq_params, dim=0)
         if self.sparse_backend == "dense_masked":
-            return self._dense_masked_forward(query, key, value, selection, is_thd)
-        return self._flex_forward(query, key, value, selection, is_thd)
+            out = self._dense_masked_forward(query, key, value, selection, is_thd)
+        else:
+            out = self._flex_forward(query, key, value, selection, is_thd)
+        if cp_size > 1:
+            out = split_tensor_cp(out, packed_seq_params, dim=0)
+        return out
 
 
 def build_qsa_dense_mask(selection: QSASelection, seq_len: int) -> Tensor:
