@@ -14,6 +14,8 @@ import importlib
 import inspect
 import json
 import math
+import os
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -39,6 +41,74 @@ NCCL_KEYS = (
     "NCCL_COLLNET_ENABLE",
 )
 DTYPES = {str(dtype): dtype for dtype in (torch.float32, torch.bfloat16)}
+
+
+def nccl_environment() -> dict:
+    """Retain explicit NCCL/PyTorch communication overrides, including new keys."""
+    keys = set(NCCL_KEYS) | {key for key in os.environ if key.startswith(("NCCL_", "TORCH_NCCL_"))}
+    return {key: os.environ.get(key) for key in sorted(keys)}
+
+
+def _options_signature(options) -> dict:
+    if getattr(options, "split_from", None) is not None:
+        raise ValueError("Split communicators need a separate adapter")
+    flags = {}
+    for key in ("use_pg_for_symm_mem_rendezvous", "enable_reconfigure"):
+        if hasattr(options, key):
+            value = getattr(options, key)
+            if type(value) is not bool:
+                raise ValueError("NCCL group flag is not a boolean")
+            flags[key] = value
+    config = {}
+    for key in dir(options.config):
+        if key.startswith("_"):
+            continue
+        value = getattr(options.config, key)
+        if callable(value):
+            continue
+        if value is not None and type(value) not in (str, bool, int, float):
+            raise ValueError("NCCL configuration contains an unsupported option")
+        config[key] = value
+    if type(options.is_high_priority_stream) is not bool:
+        raise ValueError("NCCL stream priority is unavailable")
+    signature = {
+        "is_high_priority_stream": options.is_high_priority_stream,
+        "config": config,
+        "flags": flags,
+    }
+    json.dumps(signature, allow_nan=False)
+    return signature
+
+
+def process_group_options(group: torch.distributed.ProcessGroup, device: torch.device) -> dict:
+    """Read options from the actual NCCL backend, not process-wide defaults."""
+    try:
+        return _options_signature(group._get_backend(device).options)
+    except AttributeError as error:
+        raise ValueError("NCCL process-group options are unavailable") from error
+
+
+def restore_group_options(signature: dict) -> torch.distributed.ProcessGroupNCCL.Options:
+    """Recreate the captured exposed NCCL configuration before group creation."""
+    options = torch.distributed.ProcessGroupNCCL.Options(
+        is_high_priority_stream=signature["is_high_priority_stream"]
+    )
+    defaults = _options_signature(options)
+    if set(signature) != set(defaults) or any(
+        set(signature[key]) != set(defaults[key]) for key in ('config', 'flags')
+    ):
+        raise ValueError("Captured NCCL option fields differ from this backend")
+    for key, value in signature["config"].items():
+        if value != defaults["config"][key]:
+            setattr(options.config, key, value)
+    for key, value in signature['flags'].items():
+        if value != defaults['flags'][key]:
+            setattr(options, key, value)
+    if json.dumps(_options_signature(options), sort_keys=True) != json.dumps(
+        signature, sort_keys=True
+    ):
+        raise ValueError("NCCL options could not be restored exactly")
+    return options
 
 
 def tensor_metadata(value: torch.Tensor) -> dict:
@@ -187,6 +257,7 @@ def load_captures(root: Path, *, max_bytes: int) -> list[dict]:
                 "input",
                 "grad_enabled",
                 "warn_only",
+                "group_options",
             }
             if signature["phase"] == "forward_backward":
                 fields.update(("gradient", "backward_grad_enabled"))
@@ -211,7 +282,14 @@ def load_captures(root: Path, *, max_bytes: int) -> list[dict]:
                 raise ValueError("Invalid collective identity or group assignment")
             if type(signature["runtime"].get("fill_uninitialized_memory")) is not bool:
                 raise ValueError("Collective capture lacks explicit memory-fill policy")
-            if "backward_runtime" in signature or "backward_deterministic_algorithms" in signature:
+            if any(
+                key in signature
+                for key in (
+                    'backward_runtime',
+                    'backward_deterministic_algorithms',
+                    'backward_collective',
+                )
+            ):
                 raise ValueError(
                     "Mixed forward/backward runtime requires a separate replay adapter"
                 )
@@ -283,6 +361,7 @@ def load_captures(root: Path, *, max_bytes: int) -> list[dict]:
                         "backend",
                         "nccl_version",
                         "nccl_environment",
+                        "group_options",
                     )
                 ) or any(
                     peer["input"][key] != collective["input"][key] for key in ("shape", "dtype")
@@ -311,8 +390,6 @@ def prepare_replay(
     preparation errors across ranks before entering any mapping collective.
     Runtime mismatches are rejected, never fixed by relabelling the capture.
     """
-    import os
-
     from tools.determinism.capture_recipe import runtime_signature
 
     signature = event["signature"]
@@ -323,6 +400,7 @@ def prepare_replay(
         or torch.is_deterministic_algorithms_warn_only_enabled()
         or "backward_runtime" in signature
         or "backward_deterministic_algorithms" in signature
+        or "backward_collective" in signature
     ):
         raise ValueError("Replay runtime differs from the captured policy")
     actual = {
@@ -332,7 +410,10 @@ def prepare_replay(
         "backend": str(torch.distributed.get_backend(group)),
         "nccl_version": list(torch.cuda.nccl.version()),
         "device_uuid": str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
-        "nccl_environment": {key: os.environ.get(key) for key in NCCL_KEYS},
+        "nccl_environment": nccl_environment(),
+        "group_options": process_group_options(
+            group, torch.device("cuda", torch.cuda.current_device())
+        ),
     }
     if actual["backend"] != "nccl" or any(
         value != collective[key] for key, value in actual.items()
@@ -362,15 +443,29 @@ class CollectiveCapture:
         self.calls = 0
         self.events: list[dict] = []
         self.issues: set[str] = set()
+        self._snapshots = 0
+        self._lock = threading.Lock()
+
+    def next_call_id(self) -> int:
+        """Assign a unique invocation ID even when Python callers overlap."""
+        with self._lock:
+            call_id = self.calls
+            self.calls += 1
+            return call_id
 
     def snapshot(self, value: torch.Tensor) -> dict:
         """Save logical bytes before a collective can modify the source tensor."""
+        with self._lock:
+            return self._snapshot(value)
+
+    def _snapshot(self, value: torch.Tensor) -> dict:
         metadata = tensor_metadata(value)
         size = value.numel() * value.element_size()
         if max(size, storage_elements(metadata) * value.element_size()) > self.max_bytes:
             raise ValueError("Collective tensor exceeds the capture byte limit")
-        if len(self.events) >= self.max_events or self.bytes_written + size > self.max_bytes:
+        if self._snapshots >= self.max_events or self.bytes_written + size > self.max_bytes:
             raise ValueError("Collective capture limit reached")
+        self._snapshots += 1
         payload = (
             value.detach()
             .cpu()
@@ -410,8 +505,6 @@ class CollectiveCapture:
 
 def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> Callable:
     """Capture supported mapping calls with their actual group and tensor bytes."""
-    import os
-
     from tools.determinism.capture_recipe import input_signature, runtime_signature
 
     store = inventory.collectives
@@ -435,8 +528,7 @@ def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> 
         bound = parameters.bind(*args, **kwargs)
         bound.apply_defaults()
         values = bound.arguments
-        call_id = store.calls
-        store.calls += 1
+        call_id = store.next_call_id()
         try:
             group = values.get("group")
             if group is None or group.size() < 2:
@@ -475,7 +567,10 @@ def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> 
                     if local.is_cuda
                     else None
                 ),
-                "nccl_environment": {key: os.environ.get(key) for key in NCCL_KEYS},
+                "nccl_environment": nccl_environment(),
+                "group_options": (
+                    process_group_options(group, local.device) if local.is_cuda else None
+                ),
                 "input": metadata,
                 "grad_enabled": torch.is_grad_enabled(),
                 "warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
@@ -514,6 +609,14 @@ def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> 
                 }
                 runtime = runtime_signature(torch)
                 mode = torch.are_deterministic_algorithms_enabled()
+                communication = {
+                    'nccl_environment': nccl_environment(),
+                    'group_options': (
+                        process_group_options(group, gradient.device) if gradient.is_cuda else None
+                    ),
+                }
+                if any(value != collective[key] for key, value in communication.items()):
+                    backward_signature['backward_collective'] = communication
                 if runtime != signature["runtime"] or mode != signature["deterministic_algorithms"]:
                     backward_signature.update(
                         backward_runtime=runtime, backward_deterministic_algorithms=mode

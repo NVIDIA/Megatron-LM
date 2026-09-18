@@ -7,6 +7,7 @@ This instrumented same-allocation protocol is separate from recipe state replay
 and performance. It never claims that unbound/native collectives were captured.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -21,7 +22,12 @@ from tests.unit_tests.determinism.kernels.harness import (
 )
 from tests.unit_tests.test_utilities import Utils
 from tools.determinism.capture_recipe import source_context
-from tools.determinism.collective_capture import load_captures, load_tensor, prepare_replay
+from tools.determinism.collective_capture import (
+    load_captures,
+    load_tensor,
+    prepare_replay,
+    restore_group_options,
+)
 from tools.determinism.collective_reference import collective_reference, collective_rtol
 from tools.determinism.recipe_coverage import signature_key
 from tools.determinism.reference import assert_reference_close, assert_replay_sensitivity
@@ -29,7 +35,7 @@ from tools.determinism.reference import assert_reference_close, assert_replay_se
 CAPTURE_PATH = os.environ.get("MCORE_DETERMINISM_COLLECTIVE_CAPTURE")
 if not CAPTURE_PATH:
     pytest.skip("requires an explicit collective recipe capture", allow_module_level=True)
-CAPTURE_ROOT = Path(CAPTURE_PATH)
+CAPTURE_ROOT = Path(os.environ["MCORE_DETERMINISM_COLLECTIVE_CAPTURE"])
 MAX_BYTES = int(os.environ.get("MCORE_DETERMINISM_COLLECTIVE_MAX_BYTES", 256 * 1024 * 1024))
 CAPTURES = load_captures(CAPTURE_ROOT, max_bytes=MAX_BYTES)
 
@@ -37,6 +43,11 @@ pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NCCL GPUs"),
     pytest.mark.launch_on_gb200,
 ]
+
+
+def group_key(collective):
+    """Distinguish communicators with the same members but different options."""
+    return json.dumps([collective["group_ranks"], collective["group_options"]], sort_keys=True)
 
 
 @pytest.fixture(scope="module")
@@ -53,18 +64,18 @@ def replay_groups():
     errors = [None] * len(CAPTURES)
     torch.distributed.all_gather_object(errors, error)
     assert not any(errors), errors
-    memberships = sorted(
-        {
-            tuple(event["signature"]["configuration"]["collective"]["group_ranks"])
-            for report in CAPTURES
-            for event in report["events"]
-        }
-    )
+    specifications = {}
+    for report in CAPTURES:
+        for event in report["events"]:
+            collective = event["signature"]["configuration"]["collective"]
+            specifications[group_key(collective)] = collective
     groups = {}
-    for members in memberships:
-        group = torch.distributed.new_group(ranks=list(members), backend="nccl")
+    for key, collective in sorted(specifications.items()):
+        members = collective["group_ranks"]
+        options = restore_group_options(collective["group_options"])
+        group = torch.distributed.new_group(ranks=members, backend="nccl", pg_options=options)
         if rank in members:
-            groups[members] = group
+            groups[key] = group
     try:
         yield groups
     finally:
@@ -97,7 +108,7 @@ def test_captured_collective_replay(replay_groups, event_index):
     signature = event["signature"]
     collective = signature["configuration"]["collective"]
     members = collective["group_ranks"]
-    group = replay_groups[tuple(members)]
+    group = replay_groups[group_key(collective)]
     prepared, error = None, None
     try:
         prepared = prepare_replay(event, CAPTURE_ROOT / f"rank-{rank}", group, max_bytes=MAX_BYTES)
