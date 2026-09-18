@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
+from .shard_planner import plan_sharded_transfer
 from .utils import (
     ParameterMetadata,
     ReshardPlan,
@@ -23,6 +25,14 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default number of logical parameters per lockstep execution batch, for copy
+# services that support multiple runs per plan (currently NCCL). Submitting the
+# whole model as one ncclGroup deadlocks NCCL once the group is large enough to
+# be split into several kernel plans (https://github.com/pytorch/pytorch/issues/174288),
+# so the transfer is issued in small, globally agreed batches instead. Override
+# with MEGATRON_REFIT_MAX_PARAMS_PER_BATCH; 0 disables the cap.
+DEFAULT_MAX_PARAMS_PER_BATCH = 32
 
 
 @dataclass(frozen=True)
@@ -360,13 +370,111 @@ def _iter_global_transfer_ops(
                 )
             # Choose a representative source metadata with DP round-robin balancing.
             src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
-            sources = _determine_source_ranks_for_dst_param(
-                resolved_name, src_metadata, dst_metadata, dst_rank
-            )
+            if dst_metadata.is_gtp or any(metadata.is_gtp for metadata in src_meta_list):
+                # A GTP shard is an additional dim-0 partition layered on top
+                # of the TP layout. Plan in logical global coordinates so TP,
+                # packed parameters, GTP padding, and their combinations compose.
+                sources = plan_sharded_transfer(
+                    resolved_name, src_meta_list, src_metadata, dst_metadata
+                )
+            else:
+                # Preserve the established TP/DP lowering for non-GTP models.
+                sources = _determine_source_ranks_for_dst_param(
+                    resolved_name, src_metadata, dst_metadata, dst_rank
+                )
             for src_rank, src_slice, dst_slice in sources:
                 task_id = next_task_id
                 next_task_id += 1
                 yield task_id, dst_rank, src_rank, src_slice, dst_slice, src_metadata, dst_metadata
+
+
+def _build_execution_batch_ids(
+    dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
+    src_param_metadata: dict[str, list[ParameterMetadata]],
+    max_batch_bytes: int | None = None,
+) -> tuple[dict[str, int], int]:
+    """Assign complete logical parameters to deterministic memory-bounded batches.
+
+    The planner is replayed from the same global metadata roster on every rank,
+    so these IDs let the generic executor call ``CopyService.run()`` in lockstep
+    without another collective. Source and destination bytes are accumulated per
+    rank; starting a new batch when any rank would cross the soft limit bounds
+    both sender-side dequantization and receiver-side staging. All replicas and
+    shards of one resolved parameter stay in one batch. ``None`` disables the byte
+    limit; batches are then bounded only by the per-batch parameter cap
+    (``DEFAULT_MAX_PARAMS_PER_BATCH`` / ``MEGATRON_REFIT_MAX_PARAMS_PER_BATCH``), which
+    keeps every rank's NCCL P2P group small enough to stay in a single kernel plan.
+    """
+    parameter_order: list[str] = []
+    destination_bytes: dict[str, dict[int, int]] = {}
+    for dst_rank in sorted(dst_param_metadata_by_rank):
+        for resolved_name, metadata in dst_param_metadata_by_rank[dst_rank].items():
+            if resolved_name not in destination_bytes:
+                parameter_order.append(resolved_name)
+                destination_bytes[resolved_name] = {}
+            # MXFP8 tensors are materialized/received as logical BF16 by the
+            # generic executor, so their one-byte physical element size would
+            # underestimate transient memory. Plain wider dtypes keep their
+            # actual element size.
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            destination_bytes[resolved_name][metadata.owner_rank] = max(
+                destination_bytes[resolved_name].get(metadata.owner_rank, 0), tensor_bytes
+            )
+
+    # Cap on logical parameters per batch. A byte budget alone can still pack
+    # thousands of small tensors (norm weights, biases, router expert_bias) into
+    # one batch_isend_irecv; NCCL splits such large groups into kernel plans at
+    # rank-dependent points, and matching sends/recvs that land in different plans
+    # deadlock (https://github.com/pytorch/pytorch/issues/174288). Every rank
+    # evaluates this from the same roster and environment, so batches agree.
+    max_batch_params_env = os.environ.get("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH")
+    max_batch_params: int | None = (
+        int(max_batch_params_env) if max_batch_params_env else DEFAULT_MAX_PARAMS_PER_BATCH
+    )
+    if max_batch_params <= 0:
+        max_batch_params = None
+
+    if max_batch_bytes is None and max_batch_params is None:
+        return {resolved_name: 0 for resolved_name in parameter_order}, 1
+    if max_batch_bytes is not None and max_batch_bytes <= 0:
+        raise ValueError("max_batch_bytes must be positive or None")
+    byte_limit = float("inf") if max_batch_bytes is None else max_batch_bytes
+
+    source_bytes: dict[str, dict[int, int]] = {}
+    for resolved_name in parameter_order:
+        rank_bytes: dict[int, int] = {}
+        for metadata in _find_source_metadata(src_param_metadata, resolved_name) or ():
+            tensor_bytes = math.prod(metadata.shape) * max(metadata.element_size, 2)
+            rank_bytes[metadata.owner_rank] = max(
+                rank_bytes.get(metadata.owner_rank, 0), tensor_bytes
+            )
+        source_bytes[resolved_name] = rank_bytes
+
+    batch_ids: dict[str, int] = {}
+    batch_id = 0
+    current_rank_bytes: dict[int, int] = {}
+    current_params = 0
+    for resolved_name in parameter_order:
+        parameter_rank_bytes = dict(source_bytes[resolved_name])
+        for rank, tensor_bytes in destination_bytes[resolved_name].items():
+            parameter_rank_bytes[rank] = parameter_rank_bytes.get(rank, 0) + tensor_bytes
+
+        over_bytes = any(
+            current_rank_bytes.get(rank, 0) + tensor_bytes > byte_limit
+            for rank, tensor_bytes in parameter_rank_bytes.items()
+        )
+        over_params = max_batch_params is not None and current_params >= max_batch_params
+        if current_rank_bytes and (over_bytes or over_params):
+            batch_id += 1
+            current_rank_bytes.clear()
+            current_params = 0
+
+        batch_ids[resolved_name] = batch_id
+        current_params += 1
+        for rank, tensor_bytes in parameter_rank_bytes.items():
+            current_rank_bytes[rank] = current_rank_bytes.get(rank, 0) + tensor_bytes
+
+    return batch_ids, batch_id + 1 if batch_ids else 1
 
 
 def _tensor_mesh(metadata: ParameterMetadata) -> tuple[int, ...]:
@@ -545,6 +653,10 @@ def _build_tensor_reshard_specs(
             # error. Keep this helper side-effect free for callers that invoke
             # it independently in tests.
             return None, f"{resolved_name}: source parameter metadata is missing"
+        if any(metadata.is_gtp for metadata in src_meta_list) or any(
+            metadata.is_gtp for metadata in dst_by_rank.values()
+        ):
+            return None, f"{resolved_name}: GTP shards are unsupported by native resharding"
 
         src_groups: dict[tuple[int, ...], dict[int, ParameterMetadata]] = {}
         for metadata in src_meta_list:
@@ -664,14 +776,23 @@ def build_plan_from_rosters(
     dst_param_metadata_by_rank: dict[int, dict[str, ParameterMetadata]],
     src_param_metadata: dict[str, list[ParameterMetadata]],
     my_global_rank: int,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Replay the deterministic global schedule and keep only this rank's ops.
 
     Pure and collective-free, so it can be tested or reused with preassembled
     rosters without touching the process group. Live membership orchestration
-    is intentionally outside this module.
+    is intentionally outside this module. ``execution_batch_bytes`` is an optional
+    soft per-rank limit; a single complete parameter may exceed it. ``None`` keeps
+    the model-wide submission behavior.
     """
-    my_plan = ReshardPlan([], [])
+    batch_ids, num_batches = _build_execution_batch_ids(
+        dst_param_metadata_by_rank, src_param_metadata, max_batch_bytes=execution_batch_bytes
+    )
+    my_plan = ReshardPlan(
+        [], [], num_batches=num_batches, execution_batch_bytes=execution_batch_bytes
+    )
+    total_tasks = 0
     for (
         task_id,
         dst_rank,
@@ -681,6 +802,7 @@ def build_plan_from_rosters(
         src_metadata,
         dst_metadata,
     ) in _iter_global_transfer_ops(dst_param_metadata_by_rank, src_param_metadata):
+        total_tasks = task_id + 1
         if dst_rank == my_global_rank:
             my_plan.recv_ops.append(
                 TransferOp(
@@ -690,6 +812,7 @@ def build_plan_from_rosters(
                     my_slice=dst_slice,
                     peer_slice=src_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
         if src_rank == my_global_rank:
@@ -701,9 +824,11 @@ def build_plan_from_rosters(
                     my_slice=src_slice,
                     peer_slice=dst_slice,
                     task_id=task_id,
+                    batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
                 )
             )
 
+    my_plan.total_tasks = total_tasks
     logger.info(
         f"Rank {my_global_rank}: Built plan locally - {len(my_plan.recv_ops)} recvs, "
         f"{len(my_plan.send_ops)} sends"
@@ -721,6 +846,7 @@ def build_local_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """
     Build this rank's reshard plan locally: all-gather the parameter metadata,
@@ -735,7 +861,9 @@ def build_local_reshard_plan(
 
     src_module/dst_module may be None for non-collocated ranks (destination-only,
     source-only, or idle). Each rank contributes metadata only for the models it
-    owns, including its parallel-group membership.
+    owns, including its parallel-group membership. ``execution_batch_bytes`` is
+    an optional soft per-rank limit for transient generic-executor staging;
+    ``None`` keeps the model-wide submission behavior.
     """
     # group.rank()/size() (not dist.get_rank(group)) support cross-cluster PGs
     # whose members have independent default PGs.
@@ -753,14 +881,29 @@ def build_local_reshard_plan(
     )
 
     # One all-gather gives every rank the full (src, dst) picture, replacing the
-    # gather-to-0 + scatter.
-    gathered_pairs = [None] * world_size
-    dist.all_gather_object(gathered_pairs, (my_src_metadata, my_dst_metadata), group=group)
+    # gather-to-0 + scatter. Include each rank's configured staging limit so a
+    # heterogeneous source/destination cluster deterministically uses the
+    # smallest configured value and every rank derives matching batches. None
+    # means that rank does not request a cap; all None preserves one model-wide
+    # submission.
+    gathered_entries = [None] * world_size
+    dist.all_gather_object(
+        gathered_entries, (my_src_metadata, my_dst_metadata, execution_batch_bytes), group=group
+    )
     del my_src_metadata, my_dst_metadata
 
+    configured_limits = [entry[2] for entry in gathered_entries if entry[2] is not None]
+    execution_batch_bytes = min(configured_limits) if configured_limits else None
+    gathered_pairs = [(entry[0], entry[1]) for entry in gathered_entries]
+    del gathered_entries
     dst_param_metadata_by_rank, src_param_metadata = index_metadata_rosters(gathered_pairs)
     del gathered_pairs
-    return build_plan_from_rosters(dst_param_metadata_by_rank, src_param_metadata, my_global_rank)
+    return build_plan_from_rosters(
+        dst_param_metadata_by_rank,
+        src_param_metadata,
+        my_global_rank,
+        execution_batch_bytes=execution_batch_bytes,
+    )
 
 
 def build_centralized_reshard_plan(
@@ -770,6 +913,7 @@ def build_centralized_reshard_plan(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> ReshardPlan:
     """Deprecated compatibility wrapper for :func:`build_local_reshard_plan`."""
     warnings.warn(
@@ -784,4 +928,5 @@ def build_centralized_reshard_plan(
         group=group,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
+        execution_batch_bytes=execution_batch_bytes,
     )

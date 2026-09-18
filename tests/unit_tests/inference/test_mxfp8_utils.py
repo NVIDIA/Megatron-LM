@@ -11,6 +11,7 @@ Tests cover:
 import pytest
 import torch
 
+from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize, mxfp8_quantize_into
 from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
 
 pytestmark = [
@@ -149,8 +150,6 @@ class TestMxfp8Quantize:
     )
     def test_data_matches_reference(self, M, K):
         """Quantized FP8 data matches PyTorch reference."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         torch.manual_seed(42)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
 
@@ -180,8 +179,6 @@ class TestMxfp8Quantize:
     )
     def test_scales_match_reference(self, M, K):
         """Swizzled scales match ref_to_mxfp scales passed through ref_swizzle."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         torch.manual_seed(42)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
 
@@ -199,8 +196,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 2688)])
     def test_all_zeros_input(self, M, K):
         """All-zero input produces all-zero FP8 data and zero scales."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         x = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
         data, scales = mxfp8_quantize(x)
         assert (data.float() == 0).all()
@@ -209,8 +204,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 256)])
     def test_constant_input(self, M, K):
         """Constant input: all elements in a group have the same value."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         x = torch.full((M, K), 1.0, device="cuda", dtype=torch.bfloat16)
         data, _ = mxfp8_quantize(x)
         _, ref_data = ref_to_mxfp(x)
@@ -221,8 +214,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
     def test_input_dtypes(self, dtype):
         """Kernel accepts bf16, fp16, and fp32 inputs."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         x = torch.randn(16, 128, device="cuda", dtype=dtype)
         data, _ = mxfp8_quantize(x)
         assert data.dtype == torch.float8_e4m3fn
@@ -231,8 +222,6 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("M", [1, 127, 128, 129, 255, 256, 257, 512])
     def test_various_row_counts(self, M):
         """Test row counts that are not multiples of 128 (macro tile boundary)."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         K = 128
         torch.manual_seed(42)
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
@@ -245,14 +234,31 @@ class TestMxfp8Quantize:
     @pytest.mark.parametrize("seed", [0, 7, 42, 123, 999])
     def test_reproducible(self, seed):
         """Same input always produces same output."""
-        from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
-
         torch.manual_seed(seed)
         x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
         d1, s1 = mxfp8_quantize(x)
         d2, s2 = mxfp8_quantize(x)
         torch.testing.assert_close(d1.view(torch.uint8), d2.view(torch.uint8), atol=0, rtol=0)
         torch.testing.assert_close(s1.view(torch.uint8), s2.view(torch.uint8), atol=0, rtol=0)
+
+    def test_quantize_into_reuses_storage_and_clears_padding(self):
+        """Existing output buffers match allocating quantization byte-for-byte."""
+        torch.manual_seed(42)
+        x = torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)
+        expected_data, expected_scale = mxfp8_quantize(x)
+        out_data = torch.empty_like(expected_data)
+        out_scale = torch.full_like(expected_scale.view(torch.uint8), 0xFF).view(
+            torch.float8_e8m0fnu
+        )
+        data_ptr = out_data.data_ptr()
+        scale_ptr = out_scale.data_ptr()
+
+        mxfp8_quantize_into(x, out_data, out_scale)
+
+        assert out_data.data_ptr() == data_ptr
+        assert out_scale.data_ptr() == scale_ptr
+        assert torch.equal(out_data, expected_data)
+        assert torch.equal(out_scale.view(torch.uint8), expected_scale.view(torch.uint8))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -300,6 +306,22 @@ class TestMXFP8Tensor:
         )
         with pytest.raises(ValueError, match="shape mismatch"):
             tensor.copy_(torch.randn(32, 128, device="cuda", dtype=torch.bfloat16))
+
+    def test_triton_copy_does_not_allocate_quantized_outputs(self, monkeypatch):
+        source = torch.randn(129, 160, device="cuda", dtype=torch.bfloat16)
+        tensor = MXFP8Tensor.from_bf16(source, backend="triton")
+        updated = torch.randn_like(source)
+        expected = MXFP8Tensor.from_bf16(updated, backend="triton")
+
+        def fail_from_bf16(*args, **kwargs):
+            raise AssertionError("Triton copy_ allocated temporary quantized outputs")
+
+        monkeypatch.setattr(MXFP8Tensor, "from_bf16", fail_from_bf16)
+
+        tensor.copy_(updated)
+
+        assert torch.equal(tensor.data, expected.data)
+        assert torch.equal(tensor.scale.view(torch.uint8), expected.scale.view(torch.uint8))
 
     def test_copy_requires_backend(self):
         source = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
@@ -654,6 +676,134 @@ class TestSquaredReluAndQuantizeMxfp8:
             ref_data.view(torch.uint8),
             atol=0,
             rtol=0,
+        )
+
+
+CLAMP_SCALE = 16.0
+
+
+def _ref_clamped_squared_relu(x, clamp_scale):
+    """PyTorch model of the fused kernel's clamped activation, before quantization.
+
+    Mirrors ``_clamped_relu`` + square: the tanh soft-clamped pre-activation stays in FP32
+    (matching training's fused ``weighted_clamped_squared_relu``) and is rounded to BF16
+    only after the square. This is the same BF16 tensor the separate-quantization route
+    materializes with ``padded_squared_relu``, so quantizing it is what the fused kernel
+    must reproduce.
+    """
+    relu = torch.clamp(x.float(), min=0.0)
+    clamped = clamp_scale * torch.tanh(relu / clamp_scale)
+    return (clamped**2).to(torch.bfloat16)
+
+
+class TestSquaredReluAndQuantizeMxfp8Clamped:
+    """The tanh soft clamp fused into squared_relu_and_quantize_mxfp8.
+
+    config.activation_func_tanh_clamp_scale preconditions the pre-activation with
+    ``s * tanh(x / s)``. In the fused kernel the clamp runs before the per-group-of-32
+    amax, so it shapes the MXFP8 bins rather than being applied after quantization —
+    these pin data and scales to the same PyTorch reference the unclamped tests use.
+
+    Inputs are scaled past the clamp so the tanh saturates; inside the linear region a
+    dropped clamp would be indistinguishable.
+    """
+
+    @staticmethod
+    def _saturating_input(M, K, seed=42):
+        torch.manual_seed(seed)
+        return torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 50.0
+
+    @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 128), (128, 2688), (256, 1856)])
+    def test_clamped_data_matches_pytorch_ref(self, M, K):
+        """Fused FP8 data matches the clamped PyTorch activation quantized with ref_to_mxfp."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        x = self._saturating_input(M, K)
+        perm_map = _make_permutation_map(M, num_padding=0)
+
+        _, ref_data = ref_to_mxfp(_ref_clamped_squared_relu(x, CLAMP_SCALE))
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M), clamp_scale=CLAMP_SCALE)
+
+        torch.testing.assert_close(
+            fused_result.data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0
+        )
+
+    @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 128), (128, 2688)])
+    def test_clamped_scales_match_pytorch_ref(self, M, K):
+        """Clamping before the amax gives the block scales of the clamped activation."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        x = self._saturating_input(M, K)
+        perm_map = _make_permutation_map(M, num_padding=0)
+
+        ref_scales_2d, _ = ref_to_mxfp(_ref_clamped_squared_relu(x, CLAMP_SCALE))
+        ref_swizzled = ref_swizzle(ref_scales_2d)
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M), clamp_scale=CLAMP_SCALE)
+
+        torch.testing.assert_close(
+            fused_result.scale.view(torch.uint8), ref_swizzled.view(torch.uint8), atol=0, rtol=0
+        )
+
+    @pytest.mark.parametrize("M,K,num_padding", [(32, 128, 8), (128, 2688, 64)])
+    def test_clamped_real_rows_match_pytorch_ref_with_padding(self, M, K, num_padding):
+        """Alignment-padding rows stay skipped on the clamped path."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        x = self._saturating_input(M, K)
+        perm_map = _make_permutation_map(M, num_padding=num_padding)
+
+        real_rows = M - num_padding
+        _, ref_data = ref_to_mxfp(_ref_clamped_squared_relu(x[:real_rows], CLAMP_SCALE))
+        fused_result = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M), clamp_scale=CLAMP_SCALE)
+
+        torch.testing.assert_close(
+            fused_result.data[:real_rows].view(torch.uint8),
+            ref_data.view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+
+    def test_clamp_changes_the_result(self):
+        """Guard against the clamp being silently dropped inside the fused quantize kernel."""
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+
+        M, K = 128, 256
+        x = self._saturating_input(M, K)
+        perm_map = _make_permutation_map(M, num_padding=0)
+
+        unclamped = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M))
+        clamped = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M), clamp_scale=CLAMP_SCALE)
+
+        assert not torch.equal(clamped.data.view(torch.uint8), unclamped.data.view(torch.uint8))
+        # The clamp bounds the activation by s ** 2, so it must also lower the block scales.
+        assert not torch.equal(clamped.scale.view(torch.uint8), unclamped.scale.view(torch.uint8))
+
+    def test_matches_unfused_activation_then_quantize(self):
+        """Fused clamp+quantize agrees with the disable_fused_quant_kernels route.
+
+        mcore_fused_moe falls back to padded_squared_relu followed by
+        MXFP8Tensor.from_bf16 when fused quant kernels are disabled; both routes must
+        quantize the same clamped BF16 activation.
+        """
+        from megatron.core.inference.moe.activations import (
+            padded_squared_relu,
+            squared_relu_and_quantize_mxfp8,
+        )
+
+        M, K = 128, 256
+        x = self._saturating_input(M, K)
+        perm_map = _make_permutation_map(M, num_padding=0)
+
+        fused = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M), clamp_scale=CLAMP_SCALE)
+        unfused = MXFP8Tensor.from_bf16(
+            padded_squared_relu(x, perm_map, _vt(M), clamp_scale=CLAMP_SCALE), backend="triton"
+        )
+
+        torch.testing.assert_close(
+            fused.data.view(torch.uint8), unfused.data.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            fused.scale.view(torch.uint8), unfused.scale.view(torch.uint8), atol=0, rtol=0
         )
 
 

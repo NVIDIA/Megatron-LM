@@ -36,6 +36,10 @@ def _make_pg():
     # With a single optimizer instance the intra-instance groups are the full groups.
     pg.intra_dp_cp.size.return_value = 1
     pg.intra_expt_dp.size.return_value = 1
+    # A real ProcessGroupCollection returns None for an unset field, and a module with no
+    # GTP axis leaves this unset. Mock would otherwise auto-create a group whose rank is
+    # a Mock rather than an int.
+    pg.gtp_remat = None
     return pg
 
 
@@ -233,6 +237,20 @@ class TestPrintNumParams:
         _print_num_params(model, pg_collection=pg)
         captured = capsys.readouterr()
         assert captured.out == ""
+
+    @pytest.mark.parametrize("gtp_remat_rank, expect_output", [(0, True), (1, False)])
+    def test_gtp_remat_rank_gates_output(self, capsys, gtp_remat_rank, expect_output):
+        # GTP-remat peers hold replicas and report identical counts, so only the first of
+        # them prints. get_pg_rank short-circuits to 0 when torch.distributed is down, so
+        # pin it to keep this independent of how the suite is launched.
+        pg = _make_pg()
+        pg.gtp_remat = Mock()
+        pg.gtp_remat.rank.return_value = gtp_remat_rank
+        model = [_make_model_module()]
+        with patch("torch.distributed.is_initialized", return_value=True):
+            _print_num_params(model, pg_collection=pg)
+        captured = capsys.readouterr()
+        assert bool(captured.out) is expect_output
 
     def test_param_count_is_correct(self, capsys):
         pg = _make_pg()

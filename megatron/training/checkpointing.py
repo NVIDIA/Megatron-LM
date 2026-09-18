@@ -46,10 +46,19 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
+from megatron.core.post_training.modelopt.checkpointing import (
+    save_modelopt_state,
+    save_sharded_modelopt_state,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    grant_shape_mismatch_for_gtp_padding,
+    resolve_gtp_pad_for_alignment,
+    unwrap_model,
+)
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
@@ -459,7 +468,7 @@ def get_rng_state(
     """Collect rng state across data parallel ranks.
 
     dp_group threads the data-parallel group used for RNG gather/indexing.
-    dp_cp_group threads the data-parallel (with context-parallel) group used for checkpoint replica id.
+    dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     args = get_args()
@@ -485,24 +494,30 @@ def get_rng_state(
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_rank = (
-        get_pg_rank(dp_cp_group)
+    dp_cp_group = (
+        dp_cp_group
         if dp_cp_group is not None
-        else mpu.get_data_parallel_rank(with_context_parallel=True)
+        else mpu.get_data_parallel_group(with_context_parallel=True)
     )
+    dp_cp_rank = get_pg_rank(dp_cp_group)
     if ckpt_format == 'torch_dist':
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
+        # Tracker streams are seeded per rank (tensor_parallel/random.py), so an axis left out
+        # of the key becomes a replica and those ranks restore a peer's stream. ep/etp/gtp_remat
+        # do not tile the grid; pp x tp x dp_cp does.
+        dp_cp_size = get_pg_size(dp_cp_group)
         rng_state_list = ShardedObject(
             f'{key_prefix}rng_state',
             rng_state_list,
-            (pp_size, tp_size),
-            (pp_rank, tp_rank),
-            replica_id=dp_cp_rank,
+            (pp_size, tp_size, dp_cp_size),
+            (pp_rank, tp_rank, dp_cp_rank),
         )
     elif ckpt_format == 'fsdp_dtensor':
+        # TODO: this key omits dp_cp, so dp_cp peers become replicas and restore each other's
+        # tracker streams. Fixing it also needs the matching lookup in load_checkpoint.
         pp_rank = get_pg_rank(pp_group)
         tp_rank = get_pg_rank(tp_group)
         rng_state_list = {f'({pp_rank}, {tp_rank})': rng_state_list}
@@ -622,6 +637,7 @@ def save_checkpoint(
     pp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
 ):
@@ -641,7 +657,10 @@ def save_checkpoint(
 
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
-        dp_group: Data parallel group (default: None, falls back to mpu API)
+        dp_group: Data parallel replicate group, for RNG state and checkpoint replicas
+            (default: None, falls back to mpu API)
+        dp_gtp_remat_group: Full data-distribution group (dp x gtp_remat), for indexing the
+            per-rank dataloader state (default: None, falls back to mpu API)
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     """
     start_ckpt = time()
@@ -726,16 +745,6 @@ def save_checkpoint(
         expert_parallel=expert_parallel,
         expert_rank=expert_rank,
         return_base_dir=return_base_dir,
-    )
-
-    # Save dataloader state if the external dataloader supports it.
-    maybe_save_dataloader_state(
-        train_data_iterator,
-        iteration,
-        getattr(args, 'dataloader_save', None),
-        tp_group=tp_group,
-        pp_group=pp_group,
-        dp_group=dp_group,
     )
 
     # Save distributed optimizer's custom parameter state.
@@ -1016,6 +1025,21 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
 
+    # Save dataloader state if the external dataloader supports it. This runs after the
+    # checkpoint write: the dataloader state lands in the same iteration directory, and
+    # dist_checkpointing.save treats a non-empty directory as a partial checkpoint left by a
+    # crash. The dataloader shards on the full data-distribution axis, so gtp_remat peers hold
+    # distinct micro-batches and need distinct state files: pass dp x gtp_remat here, not the
+    # replicate dp_group.
+    maybe_save_dataloader_state(
+        train_data_iterator,
+        iteration,
+        getattr(args, 'dataloader_save', None),
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_group=dp_gtp_remat_group,
+    )
+
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
         if not args.async_save:
@@ -1267,6 +1291,8 @@ def save_tokenizer_assets(
     tokenizer: MegatronTokenizer,
     config: TokenizerConfig,
     checkpoint_path: str,
+    *,
+    raise_on_error: bool = False,
 ) -> None:
     """Save tokenizer files to the checkpoint directory.
 
@@ -1278,6 +1304,7 @@ def save_tokenizer_assets(
         tokenizer: The tokenizer instance to save.
         config: Tokenizers config.
         checkpoint_path: The checkpoint directory path.
+        raise_on_error: Propagate tokenizer persistence errors to the caller.
     """
     if tokenizer is None:
         return
@@ -1396,6 +1423,8 @@ def save_tokenizer_assets(
             import traceback
 
             logger.error(traceback.format_exc())
+        if raise_on_error:
+            raise
 
 
 @_disable_gc()
@@ -1486,13 +1515,21 @@ def maybe_save_dataloader_state(
     If the provided dataloader has `save_state` method, then it is called to save the state.
     Otherwise, no state is saved.
 
+    State is written once per data-parallel rank, as `train_dataloader_dprank{rank}.pt`. A
+    dataloader whose `save_state` returns the same state on every data-parallel rank can set
+    `is_save_state_rank_independent = True` on the iterable; then only data rank 0 writes,
+    to `train_dataloader_dprank000.pt`, and every rank restores from that file. `save_state`
+    is then called on data rank 0 only, so it must not be collective.
+
     Args:
         train_iterator (iterable): Train dataloader.
         iteration (int): Current iteration.
         dataloader_save_path (str): Path where the dataloader state is saved.
         tp_group (ProcessGroup): Tensor-parallel group, or MPU fallback when unset.
         pp_group (ProcessGroup): Pipeline-parallel group, or MPU fallback when unset.
-        dp_group (ProcessGroup): Data-parallel group, or MPU fallback when unset.
+        dp_group (ProcessGroup): Full data-distribution group (dp x gtp_remat), matching the
+            axis the dataloader shards on, or MPU fallback when unset. Passing the replicate
+            data-parallel group instead makes gtp_remat peers write the same file.
     """
     # If no dataloader or saving path is provided, exit early, otherwise, raise an error.
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
@@ -1518,7 +1555,18 @@ def maybe_save_dataloader_state(
         return
 
     dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
-    train_dataloader_state_dict = train_iterator.iterable.save_state()
+    # A loader that advances a global cursor and slices it by rank returns the same state on
+    # every data-parallel rank. It can say so to collapse the per-rank files into a single
+    # dprank000 file that every rank restores from.
+    is_save_state_rank_independent = getattr(
+        train_iterator.iterable, 'is_save_state_rank_independent', False
+    )
+    # Ranks that will not write anything skip building the state at all.
+    writes_state_file = dp_rank == 0 or not is_save_state_rank_independent
+    train_dataloader_state_dict = (
+        train_iterator.iterable.save_state() if writes_state_file else None
+    )
+    state_file_rank = 0 if is_save_state_rank_independent else dp_rank
     if dp_rank == 0:
         print(f'saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}')
     data_state_save_path = get_checkpoint_name(
@@ -1534,7 +1582,7 @@ def maybe_save_dataloader_state(
         pipeline_rank=0,
         expert_parallel=False,
         expert_rank=0,
-        basename=f'train_dataloader_dprank{dp_rank:03d}.pt',
+        basename=f'train_dataloader_dprank{state_file_rank:03d}.pt',
     )
 
     data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
@@ -1960,6 +2008,15 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
+
+    # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
+    # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
+    gtp_pad_for_alignment = resolve_gtp_pad_for_alignment(
+        fp4=getattr(args, 'fp4', None) is not None,
+        fp8_recipe=getattr(args, 'fp8_recipe', None),
+        fp8=getattr(args, 'fp8', None) is not None,
+    )
+    grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
         checkpoint_name,
@@ -2320,6 +2377,13 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
 
+    # ScMoE shortcut-connection args. Both of these change the parameter set: every shortcut pair
+    # owns an extra pre-MLP norm, and moe_shortcut_post_norm adds a second norm per pair, so they
+    # must follow the checkpoint. moe_shortcut_parallel is deliberately not restored; it only
+    # selects the all-to-all overlap schedule and should stay under launch-time control.
+    _set_arg('moe_shortcut_connection', force=True)
+    _set_arg('moe_shortcut_post_norm', force=True)
+
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
     _set_arg('mamba_head_dim', force=True)
@@ -2339,6 +2403,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+    _set_arg('moe_use_norm_before_up_proj', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
@@ -2398,6 +2463,10 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         return False
 
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
+    if not vars(ckpt_args):
+        # Checkpoints imported by Megatron Bridge may omit training args entirely.
+        # Without explicit source-model metadata, keep the regular loading path.
+        return None, False
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
     )
@@ -2576,8 +2645,11 @@ def load_checkpoint(
         )
 
         # Determine if RNG state will be loaded
+        # world_size must match too: the rng shard key includes dp_cp, so a DP rescale leaves this
+        # rank with no shard to load.
         if (
             ckpt_tp_pp == run_tp_pp
+            and ckpt_world_size == run_world_size
             and not release
             and not args.finetune
             and not args.no_load_rng
@@ -2599,6 +2671,8 @@ def load_checkpoint(
             gen_sd_rng_state = None
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0('{}: RNG state will be ignored'.format(mismatch_msg))
+            elif ckpt_world_size != run_world_size:
+                print_rank_0('Job sharding has changed: RNG state will be ignored')
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
@@ -3057,7 +3131,33 @@ def load_checkpoint(
                 'exiting ...'.format(checkpoint_name)
             )
             raise e
+
+        # Quantized weights are stored dequantized to BF16 with no block scales, so loading
+        # them re-quantizes a value that has already been through one quantization round
+        # trip, while a training step quantizes the main weights. Same quantizer, different
+        # input, so for MXFP8 the block scales do not come back the same. Recover the compute
+        # weights from the main weights in the optimizer state instead. Reaching here already
+        # implies they were loaded: the enclosing block excludes --no-load-optim, --finetune
+        # and release checkpoints, and the load above re-raises on failure.
+        if (
+            not skip_load_to_model_and_opt
+            and optimizer is not None
+            and not getattr(optimizer, 'is_stub_optimizer', False)
+            and (
+                getattr(args, 'fp8_param_gather', False)
+                or getattr(args, 'fp4_param_gather', False)
+            )
+        ):
+            optimizer.quantize_and_sync_model_params_from_main_params()
     else:
+        if getattr(args, 'fp8_param_gather', False) or getattr(args, 'fp4_param_gather', False):
+            print_rank_0(
+                'WARNING: quantized params were loaded without the optimizer main params, so '
+                'they were re-quantized from the dequantized values in the checkpoint rather '
+                'than re-derived from the main params. The block scales need not match the '
+                'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
+                'identical to those saved. Load the optimizer state to avoid this.'
+            )
         if (args.fp16 or args.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
@@ -3210,51 +3310,3 @@ def _to_dtensor(wrapped_model, model_state_dict):
             new_model_sd[k] = torch.distributed.tensor.distribute_tensor(v, device_mesh)
 
     return new_model_sd
-
-
-def load_biencoder_checkpoint(
-    model, only_query_model=False, only_context_model=False, custom_load_path=None
-):
-    """
-    selectively load retrieval models for indexing/retrieving
-    from saved checkpoints
-    """
-
-    args = get_args()
-
-    model = unwrap_model(model)
-
-    load_path = custom_load_path if custom_load_path is not None else args.load
-
-    tracker_filename = get_checkpoint_tracker_filename(load_path)
-
-    with maybe_msc.open(tracker_filename, 'r') as f:
-        iteration = int(f.read().strip())
-
-    checkpoint_name = get_checkpoint_name(
-        load_path, iteration, args.use_distributed_optimizer, release=False
-    )
-
-    if mpu.get_data_parallel_rank() == 0:
-        print(
-            'global rank {} is loading checkpoint {}'.format(
-                torch.distributed.get_rank(), checkpoint_name
-            )
-        )
-
-    state_dict = torch.load(checkpoint_name, map_location='cpu')
-    ret_state_dict = state_dict['model']
-
-    if only_query_model:
-        ret_state_dict.pop('context_model')
-    if only_context_model:
-        ret_state_dict.pop('query_model')
-
-    assert len(model) == 1
-    model[0].load_state_dict(ret_state_dict)
-    torch.distributed.barrier()
-
-    if mpu.get_data_parallel_rank() == 0:
-        print(' successfully loaded {}'.format(checkpoint_name))
-
-    return model

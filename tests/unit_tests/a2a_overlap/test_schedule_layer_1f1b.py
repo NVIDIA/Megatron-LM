@@ -26,34 +26,12 @@ from tests.unit_tests.a2a_overlap.utils import (
     get_valid_fp8_flags,
     reset_model,
 )
-from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp8_dispatch_available
-
-# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
-pytestmark = pytest.mark.flaky_in_dev
-
-
-def is_nccl_ep_zero_copy_available():
-    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), absent in a plain
-    NCCL-EP build."""
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
-
-    if not HAVE_TE_EP:
-        return False
-    try:
-        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-def is_op_fuser_available():
-    """The static-shape/zero-copy path runs the TE op-fuser grouped GEMM (needs TE>=2.14 ops)."""
-    try:
-        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
-    except ImportError:
-        return False
-    return is_te_min_version("2.14.0")
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_fp8_dispatch_available,
+    is_nccl_ep_zero_copy_available,
+    is_op_fuser_available,
+)
 
 
 def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):

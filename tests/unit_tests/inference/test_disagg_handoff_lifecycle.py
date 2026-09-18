@@ -179,8 +179,8 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
     def _check_stop_words_for_request_post_append(self, request):
         for stop_word_ids in request.stop_word_ids or []:
             if request.generated_tokens[-len(stop_word_ids) :] == stop_word_ids:
-                return True, 0
-        return False, 0
+                return True, 0, 0
+        return False, 0, 0
 
 
 def _meta(request_id):
@@ -629,13 +629,25 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     engine._pending_kv_imports.append(pending)
     engine._record_handoff_completion_notification(4, failed=True)
 
-    engine._poll_pending_kv_imports()
-    engine._admit_pending_kv_imports()
+    with (
+        mock.patch(
+            "megatron.core.inference.disaggregation.inference_state_handoff.logging.error"
+        ) as log_error,
+        mock.patch(
+            "megatron.core.inference.disaggregation.inference_state_handoff.logging.exception"
+        ) as log_exception,
+    ):
+        engine._poll_pending_kv_imports()
+        engine._admit_pending_kv_imports()
 
     assert isinstance(pending.future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == []
     assert not engine._pending_kv_imports
     assert engine._quarantined_kv_imports == [pending]
+    log_error.assert_called_once_with(
+        "Quarantining request %d cache storage after an incomplete handoff", 4
+    )
+    log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 4)
 
 
 def test_completed_handoff_keeps_notification_while_decode_is_full(handoff_loop):
@@ -755,16 +767,23 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     engine.finished_request_count = 0
     engine.use_coordinator = False
     engine.is_mp_coordinator = False
-    engine.controller = SimpleNamespace(
-        tokenizer=object(), detokenize=mock.Mock(side_effect=["prompt", "answer"])
-    )
+    tokenizer = SimpleNamespace(eod=None, detokenize=mock.Mock(return_value="answer"))
+
+    def complete_request(request_entry):
+        finished_request = request_entry.record.merge()
+        request_entry.future.set_result(finished_request)
+        return finished_request
+
+    engine._complete_request = complete_request
 
     engine._complete_handoff_request_without_forward(7)
 
     assert request.status == Status.COMPLETED
     assert request.generated_length == 1
-    assert request.generated_text == "answer"
-    assert request_future.result() is record
+    finished_request = request_future.result()
+    assert isinstance(finished_request, DynamicInferenceRequest)
+    assert finished_request.generated_text is None
+    assert finished_request.finalize_text(tokenizer).generated_text == "answer"
     assert engine.finished_request_count == 1
     assert 7 not in engine.requests
 
@@ -995,11 +1014,15 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     engine._handoff_completion_tracker.report.assert_called_once_with(8, True)
 
     engine._record_handoff_completion_notification(8, failed=True)
-    engine._admit_pending_kv_imports()
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.logging.exception"
+    ) as log_exception:
+        engine._admit_pending_kv_imports()
 
     assert isinstance(future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
     assert not engine._pending_kv_imports
+    log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 8)
 
 
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):

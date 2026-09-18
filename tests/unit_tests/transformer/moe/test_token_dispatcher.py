@@ -21,7 +21,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import (
+    Utils,
+    is_nccl_ep_available,
+    is_nccl_ep_fp8_dispatch_available,
+    is_nccl_ep_zero_copy_available,
+    is_op_fuser_available,
+)
 
 
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
@@ -507,54 +513,6 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
-def is_nccl_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
-
-    return HAVE_TE_EP
-
-
-def is_nccl_ep_zero_copy_available():
-    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), which a plain
-    NCCL-EP build lacks -- gate zero-copy tests on these separately from is_nccl_ep_available()."""
-    if not is_nccl_ep_available():
-        return False
-    try:
-        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-def is_op_fuser_available():
-    """The static-shape/zero-copy path runs the TE op-fuser grouped GEMM (needs TE>=2.14 ops)."""
-    try:
-        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
-    except ImportError:
-        return False
-    return is_te_min_version("2.14.0")
-
-
-def is_nccl_ep_fp8_dispatch_available():
-    """MXFP8 wire dtypes need a TE build whose EpBuffer takes the quant recipes AND that returns
-    the plain-tensor MXFP8 carrier (mxfp8_carrier_to_grouped, TE PR #3355 -- older quant-recipe
-    builds return a GroupedTensor payload the op-fuser attrs cannot rebuild), plus MXFP8 hardware
-    support (Blackwell) for the quantize kernels and the grouped GEMM."""
-    if not is_nccl_ep_available():
-        return False
-    import inspect
-
-    try:
-        import transformer_engine.pytorch.ep as te_ep
-        from transformer_engine.pytorch.fp8 import check_mxfp8_support
-    except ImportError:
-        return False
-    if "dispatch_fwd_quant_recipe" not in inspect.signature(te_ep.EpBuffer).parameters:
-        return False
-    if not hasattr(te_ep, "mxfp8_carrier_to_grouped"):
-        return False
-    return check_mxfp8_support()[0]
-
-
 def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     manager = _HybridEPManager.__new__(_HybridEPManager)
     manager.group = object()
@@ -614,15 +572,7 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize(
-        "moe_flex_dispatcher_backend",
-        [
-            "deepep",
-            "hybridep",
-            # NCCL EP aborts in dev CI with a pybind11 GIL dec_ref failure.
-            pytest.param("ncclep", marks=pytest.mark.flaky_in_dev),
-        ],
-    )
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep", "ncclep"])
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_forward_backward(
         self,
@@ -703,96 +653,3 @@ class TestFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
         container.moe_layer_variant_parity_test(variant)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
-    @pytest.mark.timeout(120)
-    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
-    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
-    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
-    def test_capacity_forward_backward(
-        self,
-        tp_size,
-        ep_size,
-        permute_fusion,
-        moe_flex_dispatcher_backend,
-        moe_permute_fusion_into_hybridep,
-    ):
-        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
-            pytest.skip("Deep EP is not available")
-        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
-            pytest.skip("Hybrid EP is not available")
-        if moe_permute_fusion_into_hybridep:
-            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
-                pytest.skip(
-                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
-                )
-        if permute_fusion:
-            config.ENABLE_EXPERIMENTAL = True
-        container = MoEModelTestContainer(
-            tp_size=tp_size,
-            ep_size=ep_size,
-            pp_size=1,
-            num_moe_experts=8,
-            moe_router_topk=2,
-            moe_router_load_balancing_type="aux_loss",
-            moe_token_dispatcher_type="flex",
-            moe_token_drop_policy="probs",
-            moe_expert_capacity_factor=0.5,
-            moe_pad_expert_input_to_capacity=False,
-            moe_permute_fusion=permute_fusion,
-            hidden_size=1024,
-            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
-            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
-            test_dtype=torch.bfloat16,
-        )
-        container.dispatcher_capacity_test()
-        config.ENABLE_EXPERIMENTAL = False
-
-    @pytest.mark.skipif(
-        not is_te_min_version("1.7.0"), reason="TE 1.7.0 is required for MoE with FP8."
-    )
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
-    @pytest.mark.timeout(120)
-    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
-    @pytest.mark.parametrize("permute_fusion", [True])
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
-    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
-    def test_router_padding_for_fp8_forward_backward(
-        self,
-        tp_size,
-        ep_size,
-        permute_fusion,
-        moe_flex_dispatcher_backend,
-        moe_permute_fusion_into_hybridep,
-    ):
-        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
-            pytest.skip("Deep EP is not available")
-        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
-            pytest.skip("Hybrid EP is not available")
-        if moe_permute_fusion_into_hybridep:
-            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
-                pytest.skip(
-                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
-                )
-        if permute_fusion:
-            config.ENABLE_EXPERIMENTAL = True
-        container = MoEModelTestContainer(
-            tp_size=tp_size,
-            ep_size=ep_size,
-            pp_size=1,
-            num_moe_experts=32,
-            moe_router_topk=4,
-            moe_router_load_balancing_type="aux_loss",
-            moe_token_dispatcher_type="flex",
-            moe_pad_expert_input_to_capacity=False,
-            moe_permute_fusion=permute_fusion,
-            hidden_size=1024,
-            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
-            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
-            test_dtype=torch.bfloat16,
-        )
-        container.dispatcher_router_padding_for_fp8_test()
-        config.ENABLE_EXPERIMENTAL = False

@@ -17,12 +17,17 @@ package self-contained, with no `fla` import at run time.
 
 Take care when changing the probes: they choose which autotune configurations
 exist, so editing one changes which kernel variants get benchmarked and picked.
+Every GDP autotune config list must pass through `autotune_configs`: timing-based
+selection can otherwise choose numerically different reduction tilings between
+deterministic-mode processes.
 """
 
 import functools
 import os
 
 import torch
+
+from megatron.core.ssm.ops.common.determinism import autotune_configs
 
 try:
     import triton
@@ -174,7 +179,9 @@ _BT_LIST = [8, 16, 32, 64, 128]
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]],
+    configs=autotune_configs(
+        [triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]]
+    ),
     key=["D"],
 )
 @triton.jit
@@ -194,11 +201,13 @@ def l2norm_fwd_kernel1(x, y, rstd, eps, D, BD: tl.constexpr):
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BT": BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in _BT_LIST
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({"BT": BT}, num_warps=num_warps)
+            for num_warps in [1, 2, 4, 8, 16]
+            for BT in _BT_LIST
+        ]
+    ),
     key=["D", "NB"],
 )
 @triton.jit(do_not_specialize=["T"])

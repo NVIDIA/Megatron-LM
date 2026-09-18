@@ -14,6 +14,8 @@ transition matrix; `solve_tril` inverts `I + A` afterwards.
 
 import torch
 
+from megatron.core.ssm.ops.common.determinism import autotune_configs
+
 from .common import HAVE_TRITON, exp2, prepare_chunk_indices, tl, triton
 
 
@@ -24,12 +26,14 @@ from .common import HAVE_TRITON, exp2, prepare_chunk_indices, tl, triton
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
+            for BK in [32, 64, 128]
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=['H', 'HV', 'K', 'BT', 'IS_VARLEN'],
 )
 @triton.jit(do_not_specialize=['T'])

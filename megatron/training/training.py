@@ -43,7 +43,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -138,6 +138,7 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
+from megatron.training.callbacks import Callback, CallbackContext, CallbackManager, normalize_callbacks
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -261,6 +262,7 @@ stimer = StragglerDetector()
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
+_seqlen_stats_are_global: bool = False
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -728,7 +730,7 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -747,6 +749,21 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     _seqlen_stats_in_iteration[0] += seqlens.sum()
     _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
     _seqlen_stats_active = True
+    _seqlen_stats_are_global = False
+
+
+def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
+    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if total_real_tokens is None or seqlen_squared_sum is None:
+        return
+    if _seqlen_stats_in_iteration is None:
+        device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else 'cpu'
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    _seqlen_stats_in_iteration[0] = float(total_real_tokens)
+    _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
+    _seqlen_stats_active = True
+    _seqlen_stats_are_global = True
 
 
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
@@ -774,13 +791,15 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
     factor of ``TP * CP * PP``, which we divide out.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if not _seqlen_stats_active:
         # BSHD path: never allocated the tensor; tell the caller to use the
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+    if _seqlen_stats_are_global:
+        dedup = 1
+    elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
@@ -796,6 +815,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
@@ -1497,6 +1517,17 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
+    """Wrap the training data iterator for hybrid context parallelism.
+
+    The rerun state machine asserts that every training data iterator is a
+    RerunDataIterator; a raw iter() around HybridCPDataLoaderWrapper would
+    strip the wrapping applied at dataloader build time and fail that assert
+    on the first train step.
+    """
+    return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1512,6 +1543,7 @@ def pretrain(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
+    callbacks: list[Callback] | CallbackManager | None = None,
 ):
     """Main training program.
 
@@ -1558,6 +1590,8 @@ def pretrain(
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+
+    callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1814,6 +1848,8 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.trigger("on_setup_start")
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
@@ -1927,6 +1963,11 @@ def pretrain(
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
+    callback_manager.callback_context.model = model
+    callback_manager.callback_context.optimizer = optimizer
+    callback_manager.callback_context.scheduler = opt_param_scheduler
+    callback_manager.trigger("on_data_init_start")
+
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
     # startup on its own -- the 'data_loading' span group exists exactly for this.
@@ -2038,6 +2079,7 @@ def pretrain(
                     inference_model,
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
+                    callback_manager=callback_manager,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2084,7 +2126,12 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                swap_model_weights(model, inference_model, args.refit_method)
+                swap_model_weights(
+                    model,
+                    inference_model,
+                    args.refit_method,
+                    execution_batch_bytes=args.refit_execution_batch_bytes,
+                )
                 rl_eval_model = inference_model
                 rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
@@ -2102,7 +2149,9 @@ def pretrain(
                 iteration, process_non_loss_data_func, model_cfg,
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
                 non_loss_data_func=non_loss_data_func,
-                pg_collection=pg_collection, p2p_communicator=p2p_communicator
+                pg_collection=pg_collection, p2p_communicator=p2p_communicator,
+                callback_manager=callback_manager,
+                is_test=False,
             )
 
     if args.do_test:
@@ -2120,6 +2169,8 @@ def pretrain(
             non_loss_data_func=non_loss_data_func,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=True,
         )
 
     wandb_writer = get_wandb_writer()
@@ -2341,6 +2392,48 @@ def _freeze_all_model_chunks(model_list):
     return model_list
 
 
+def _freeze_base_model_for_mtp(model_list):
+    """Freeze backbone parameters and router bias updates while keeping MTP trainable."""
+    frozen_params = 0
+    trainable_params = 0
+    frozen_router_biases = 0
+
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_mtp_parameter = 'mtp.layers.' in name
+            param.requires_grad_(is_mtp_parameter)
+            if is_mtp_parameter:
+                trainable_params += param.numel()
+            else:
+                frozen_params += param.numel()
+
+        for name, module in model_module.named_modules():
+            if hasattr(module, 'expert_bias'):
+                freeze_router_bias = 'mtp.layers.' not in name
+                module.frozen_expert_bias = freeze_router_bias
+                if freeze_router_bias:
+                    frozen_router_biases += 1
+
+    print_rank_0(
+        f'[freeze-base-model-for-mtp] Frozen {frozen_params:,} backbone parameters and '
+        f'{frozen_router_biases:,} backbone router expert-bias buffers. '
+        f'Trainable MTP parameters: {trainable_params:,}.'
+    )
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+    """Install the requested freeze hook before a config-built model is wrapped."""
+    freeze_hook = None
+    if freeze_all_layers:
+        freeze_hook = _freeze_all_model_chunks
+    elif freeze_base_model_for_mtp:
+        freeze_hook = _freeze_base_model_for_mtp
+
+    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(freeze_hook)
+
+
 def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
@@ -2429,6 +2522,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
         _freeze_all_model_chunks(model)
+    elif args.freeze_base_model_for_mtp:
+        _freeze_base_model_for_mtp(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2703,10 +2798,13 @@ def setup_model_and_optimizer(
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
 
-            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
-            # and skips grad-buffer allocation for all params (matching get_model behavior).
-            if args.freeze_all_layers:
-                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+            # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
+            # gradient storage for parameters that remain trainable (matching get_model behavior).
+            _add_model_freeze_pre_wrap_hook(
+                model_config,
+                freeze_all_layers=args.freeze_all_layers,
+                freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
+            )
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
@@ -3096,6 +3194,20 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 for optim_instance in mxfp8_overlap_optimizers:
                     optim_instance._copy_main_params_to_param_buffer()
 
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            (
+                data_iterator,
+                scheduled_num_microbatches,
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+            set_seqlen_stats_in_iteration(
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            )
+        else:
+            scheduled_num_microbatches = get_num_microbatches()
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -3105,7 +3217,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         grad_context, forward_only = _forward_backward_grad_context(args)
         _fb_cm = (
-            span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=get_num_microbatches())
+            span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
         with grad_context, _fb_cm:
@@ -3113,7 +3225,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
-                num_microbatches=get_num_microbatches(),
+                num_microbatches=scheduled_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -3279,6 +3391,31 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
+    """Return tracker slots and active CSA indexer modules for loss logging."""
+    tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
+    if args.csa_compress_ratios is None:
+        return tracker_layers, None
+
+    ratios = args.csa_compress_ratios
+    if is_hybrid_model(args):
+        from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+        parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+        mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
+        tracker_layers = args.num_layers + mtp_pattern_layers
+        main_indexers = sum(ratio == 4 for ratio in ratios[: args.num_layers])
+        mtp_indexers_per_depth = sum(
+            ratio == 4 for ratio in ratios[args.num_layers : tracker_layers]
+        )
+        mtp_indexer_repeats = 1 if args.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        indexer_layers = main_indexers + (mtp_indexers_per_depth * mtp_indexer_repeats)
+    else:
+        indexer_layers = sum(ratio == 4 for ratio in ratios[:tracker_layers])
+
+    return tracker_layers, 0 if args.csa_dense_mode else indexer_layers
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3295,8 +3432,11 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    model=None,
+    callback_manager: CallbackManager | None = None,
 ):
     """Log training information such as losses, timing, ...."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -3304,8 +3444,11 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # total_loss_dict sums over a log interval and is reset once printed. The first
+    # iteration always prints: under --log-interval 100 that is an extra line inside an
+    # interval still accumulating, so it must not reset; under --log-interval 1 that line
+    # *is* the interval, so it must, or the next print covers two iterations.
+    should_reset = not is_first_iteration or iteration % args.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -3546,12 +3689,31 @@ def training_log(
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+            assert pg_collection.has_language_model(), (
+                "DSA indexer logging requires a language-model ProcessGroupCollection"
+            )
+            pg_collection = pg_collection.get_language_model_collection()
+        if pg_collection is None:
+            # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
+            # The core logger still receives explicit groups and does not read MPU globals.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['pp', 'dp']
+            )
+        assert isinstance(
+            pg_collection, ProcessGroupCollection
+        ), "DSA indexer logging requires a ProcessGroupCollection"
+        indexer_tracker_layers, indexer_layer_count = _get_indexer_logging_layer_counts(args)
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
+            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=indexer_tracker_layers,
+            num_indexer_layers=indexer_layer_count,
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3565,13 +3727,14 @@ def training_log(
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
         throughput = num_floating_point_operations(
             args,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
+        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -3669,6 +3832,12 @@ def training_log(
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+
+        log_fragments: list[str] = []
+        callback_manager.callback_context.log_fragments = log_fragments
+        callback_manager.callback_context.timers_to_log = timers_to_log
+        callback_manager.trigger("on_log")
+        log_string += "".join(log_fragments)
         print_rank_last(log_string)
 
         # OTel: emit training metrics at log interval (export rank only). Loss and
@@ -3738,10 +3907,23 @@ def training_log(
     return report_memory_flag
 
 
+def _should_compute_params_norm(args, iteration, is_first_iteration):
+    """Whether this iteration can emit the parameter norm."""
+    return args.log_params_norm and (
+        is_first_iteration
+        or iteration % args.log_interval == 0
+        or (
+            bool(args.tensorboard_dir)
+            and iteration % args.tensorboard_log_interval == 0
+        )
+    )
+
+
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
     if args.save is None:
         return
+    llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
     # Compute job throughput.
     # args.num_floating_point_operations_so_far keeps track of floating-point operations
@@ -3749,7 +3931,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     global _TRAIN_START_TIME
     job_throughput = (
         num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
-    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * llm_world_size)
 
     # Compute cumulative throughput since jobs of this world size were launched.
     # `get_start_time_from_progress_log` returns start time and number of floating-point
@@ -3758,7 +3940,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     elapsed_time = (datetime.now() - start_time).total_seconds()
     cumulative_throughput = (
         num_floating_point_operations_so_far - start_num_floating_point_operations
-    ) / (elapsed_time * 10**12 * args.world_size)
+    ) / (elapsed_time * 10**12 * llm_world_size)
 
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
@@ -3872,6 +4054,8 @@ def save_checkpoint_and_time(
         tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
         pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
         dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+        # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
+        dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
         # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
         dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
         expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
@@ -3883,7 +4067,8 @@ def save_checkpoint_and_time(
 
         if should_report_memory:
             # Track memory before checkpoint save.
-            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
+            # Gate on the full data-distribution group so gtp_remat peers do not each report.
+            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
 
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
@@ -3901,6 +4086,7 @@ def save_checkpoint_and_time(
                 pp_group=pp_group,
                 dp_cp_group=dp_cp_group,
                 dp_group=dp_group,
+                dp_gtp_remat_group=dp_gtp_remat_group,
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
             )
@@ -3912,7 +4098,7 @@ def save_checkpoint_and_time(
         if should_report_memory:
             # Track memory after checkpoint save.
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True):
-                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
+                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
 
         if args.fp8:
@@ -4185,6 +4371,7 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    callback_manager: CallbackManager | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4193,6 +4380,7 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     """
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
 
@@ -4309,7 +4497,7 @@ def train(
     one_logger = get_one_logger()
 
     if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+        train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
     if args.run_workload_inspector_server:
         try:
@@ -4362,9 +4550,15 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(
-        model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
-    ) and args.overlap_grad_reduce:
+    # MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them --
+    # and defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to
+    # know which backward that is. Without it every backward finalizes that axis, the
+    # accumulation buffer is dropped, and only the last microbatch's gradient survives.
+    # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
+    # so without that flag there is nothing for no_sync to suppress.
+    if isinstance(model[0], FullyShardedDataParallelV2) or (
+        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and args.overlap_grad_reduce
+    ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
@@ -4485,7 +4679,7 @@ def train(
             'total_flops_since_current_train_start': num_floating_point_operations_since_current_train_start,
             'num_floating_point_operations_so_far': num_floating_point_operations_so_far,
             'consumed_train_samples': args.consumed_train_samples,
-            'world_size': args.world_size,
+            'world_size': getattr(args, 'mimo_llm_world_size', args.world_size),
             'seq_length': args.seq_length,
         }
 
@@ -4568,6 +4762,8 @@ def train(
     _end_otel_startup_span()
     _start_otel_train_span()
 
+    callback_manager.trigger("on_train_start")
+
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
@@ -4633,6 +4829,8 @@ def train(
                     f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                                 "transition, saving checkpoint before exiting.")
                     save_checkpoint_and_time(
                         iteration,
                         model,
@@ -4642,6 +4840,16 @@ def train(
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
                     )
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
+                                 "exiting so the run can be relaunched at the new batch size.")
+                    # Break here rather than leaving it to the `should_exit` check further
+                    # down the loop body, which sits after train_step and would run one more
+                    # iteration at the new microbatch count before stopping.
+                    should_exit = True
+                    break
+                print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                             "transition but --save is unset, so there is no checkpoint to "
+                             "relaunch from; continuing at the new batch size.")
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
@@ -4665,6 +4873,9 @@ def train(
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
+            assert (
+                getattr(config, "sequence_packing_scheduler", None) is None
+            ), "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -4713,6 +4924,9 @@ def train(
             max_attention_logit = None
             _step_span = None
         else:
+
+            callback_manager.trigger("on_train_step_start")
+
             # OTel: dedicated span for the first iteration actually executed in this
             # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
             # just the first one that runs. Kept separate from the per-step span below
@@ -4757,6 +4971,12 @@ def train(
                     _otel_safe_set_attrs(
                         _step_span, {'megatron.skipped': bool(skipped_iter)}
                     )
+
+            callback_manager.callback_context.loss_dict = loss_dict
+            callback_manager.callback_context.grad_norm = grad_norm
+            callback_manager.callback_context.skipped_iter = bool(skipped_iter)
+            callback_manager.trigger("on_train_step_end")
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -4890,13 +5110,13 @@ def train(
                 loss_scale = 1.0
             params_norm = None
 
-            if args.log_params_norm:
+            if _should_compute_params_norm(args, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
                 # + all-reduce that BLOCKS the training loop -- exposed goodput cost
                 # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
                 # cost span (it stalls the critical path), unlike passive monitors.
                 with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
-                    params_norm = calc_params_l2_norm(model)
+                    params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
             if optimizer is not None:
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
             else:
@@ -4920,6 +5140,8 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    model=model,
+                    callback_manager=callback_manager,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -4954,7 +5176,12 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    swap_model_weights(model, inference_model, args.refit_method)
+                    swap_model_weights(
+                        model,
+                        inference_model,
+                        args.refit_method,
+                        execution_batch_bytes=args.refit_execution_batch_bytes,
+                    )
                     rl_eval_model = inference_model
                     rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(
@@ -4972,7 +5199,8 @@ def train(
                                        config, verbose=False, write_to_tensorboard=True,
                                        non_loss_data_func=non_loss_data_func,
                                        pg_collection=pg_collection,
-                                       p2p_communicator=p2p_communicator)
+                                       p2p_communicator=p2p_communicator,
+                                       callback_manager=callback_manager, is_test=False)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -5061,6 +5289,8 @@ def train(
     if args.rl_profile:
         shutdown_rl_profiler()
 
+    callback_manager.trigger("on_train_end")
+
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
         # Deregister NCCL user-buffer memory pools before exit.
@@ -5121,10 +5351,16 @@ def evaluate(
     eval_iters=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Evaluation."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
+
+    step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
+    step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -5200,14 +5436,29 @@ def evaluate(
 
             # Don't care about timing during evaluation
             config.timers = None
+
+            if getattr(config, "sequence_packing_scheduler", None) is not None:
+                try:
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                    )
+                except StopIteration:
+                    break
+            else:
+                packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
+
             ft_integration.on_eval_step_start()
+
+            callback_manager.trigger(step_start_event)
+
             with _otel_managed_span('evaluate', 'megatron.evaluate.step',
                                     **{'megatron.eval_iteration': iteration}):
                 loss_dicts = forward_backward_func(
                     forward_step_func=forward_step_func,
-                    data_iterator=data_iterator,
+                    data_iterator=packed_data_iterator,
                     model=model,
-                    num_microbatches=eval_num_microbatches,
+                    num_microbatches=scheduled_eval_num_microbatches,
                     seq_length=args.seq_length,
                     micro_batch_size=eval_micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,
@@ -5216,6 +5467,9 @@ def evaluate(
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                 )
+
+            callback_manager.trigger(step_end_event)
+
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
 
@@ -5324,13 +5578,19 @@ def evaluate_and_print_results(
     non_loss_data_func=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Helper function to evaluate and dump results on screen."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
         writer = None
+
+    start_event = "on_test_start" if is_test else "on_eval_start"
+    end_event = "on_test_end" if is_test else "on_eval_end"
 
     wandb_writer = get_wandb_writer()
 
@@ -5364,6 +5624,8 @@ def evaluate_and_print_results(
             f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
             f"the number of validation datasets ({len(data_iterators)})"
 
+    callback_manager.trigger(start_event)
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -5371,6 +5633,7 @@ def evaluate_and_print_results(
                 suffix = f"-{args.validation_set_names[index]}"
             else:
                 suffix = f"-{index}"
+
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
@@ -5382,6 +5645,8 @@ def evaluate_and_print_results(
             eval_iters=iterations,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=is_test,
         )
         # Timelimit hit during evaluation
         if timelimit:
@@ -5415,6 +5680,9 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+    callback_manager.callback_context.total_loss_dict = total_loss_dict
+    callback_manager.trigger(end_event)
 
 
 def cyclic_iter(iterable):

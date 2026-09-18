@@ -4,6 +4,13 @@
 
 from __future__ import annotations
 
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
+
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
+
 import argparse
 from functools import partial
 
@@ -45,11 +52,11 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
 def _set_stock_parallel_args(args: argparse.Namespace) -> None:
     # validate_args and the stock training loop consume these fields.
-    args.tensor_model_parallel_size = args.llm_tp
-    args.pipeline_model_parallel_size = args.llm_pp
-    args.context_parallel_size = args.llm_cp
-    args.expert_model_parallel_size = args.llm_ep
-    args.expert_tensor_parallel_size = args.llm_expt_tp or 1
+    args.tensor_model_parallel_size = args.mimo_llm_tp
+    args.pipeline_model_parallel_size = args.mimo_llm_pp
+    args.context_parallel_size = args.mimo_llm_cp
+    args.expert_model_parallel_size = args.mimo_llm_ep
+    args.expert_tensor_parallel_size = args.mimo_llm_expt_tp or 1
 
 
 def _parse_and_validate() -> argparse.Namespace:
@@ -72,7 +79,10 @@ def _parse_and_validate() -> argparse.Namespace:
 
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = calculate_padded_vocab_size(
-            args.vocab_size, args.make_vocab_size_divisible_by, args.llm_tp, logging_enabled=False
+            args.vocab_size,
+            args.make_vocab_size_divisible_by,
+            args.mimo_llm_tp,
+            logging_enabled=False,
         )
     return args
 

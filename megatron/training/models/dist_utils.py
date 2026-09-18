@@ -227,7 +227,14 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
         model: List of model modules to count parameters from
         pg_collection: Model communication process groups.
     """
-    if (pg_collection.dp.rank() == 0) and (pg_collection.cp.rank() == 0):
+    # GTP-remat peers hold replicas, so their counts are identical; without this the
+    # line repeats once per weight shard. TP ranks can hold different shards, so they
+    # stay un-deduplicated.
+    if (
+        (pg_collection.dp.rank() == 0)
+        and (pg_collection.cp.rank() == 0)
+        and (get_pg_rank(pg_collection.gtp_remat) == 0)
+    ):
         print(
             " > number of parameters on (tensor, gtp_remat, pipeline) model parallel rank ({}, {}, {}): {}".format(
                 pg_collection.tp.rank(),
