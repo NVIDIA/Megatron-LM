@@ -3510,6 +3510,8 @@ class TestMultiTokenPredictionHybrid:
         def output_layer(output, **kwargs):
             return output, None
 
+        output_layer.gather_output = False
+
         def compute_language_model_loss(labels, logits):
             call_counts["main_loss"] += 1
             return labels.to(dtype=logits.dtype) + 1000.0
