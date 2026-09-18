@@ -699,7 +699,7 @@ class TestRLUtils:
         """Test that getting logprobs at least does not crash."""
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
 
-        model = MockModel(pg_collection=ProcessGroupCollection.use_mpu_process_groups())
+        model = MockModel()
         tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
         logprobs = rl_utils.get_logprobs(
             model, tokens, position_ids=None, sequence_packing=use_sequence_packing
@@ -822,7 +822,7 @@ class TestRLUtils:
             grpo_group_size=group_size,
         )
 
-        model = MockModel(pg_collection=ProcessGroupCollection.use_mpu_process_groups())
+        model = MockModel()
         tokenizer = MockTokenizer()
 
         # A single-turn rollout whose only turn is short and lacks eod must be rejected:
@@ -929,7 +929,7 @@ class TestRLUtils:
         oversampling (ratio < 1) consumes a fraction of the rows per step."""
         world_size, dp, tp, pp = initialize_model_parallel
         tokenizer = MockTokenizer()
-        model = MockModel(pg_collection=ProcessGroupCollection.use_mpu_process_groups())
+        model = MockModel()
 
         def single(problem_id, reward):
             return make_token_rollout(

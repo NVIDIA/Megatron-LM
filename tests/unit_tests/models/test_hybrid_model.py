@@ -116,6 +116,8 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         embd_group, _ = torch.distributed.new_subgroups_by_enumeration(
             embd_rank_groups, timeout=timedelta(minutes=30)
         )
+        if embd_group == torch.distributed.GroupMember.NON_GROUP_MEMBER:
+            embd_group = None
 
         # Create model with custom process groups
         from megatron.core.process_groups_config import ProcessGroupCollection
@@ -284,6 +286,7 @@ class TestHybridModel:
                 vocab_size=100,
                 max_sequence_length=4,
                 hybrid_layer_pattern="-",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
     @pytest.mark.parametrize("mtp_num_layers", [0, 1, 3])
@@ -310,6 +313,7 @@ class TestHybridModel:
                 vocab_size=100,
                 max_sequence_length=4,
                 hybrid_layer_pattern="-/-/-",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert config.mtp_num_layers == mtp_num_layers
@@ -334,6 +338,7 @@ class TestHybridModel:
                 vocab_size=100,
                 max_sequence_length=4,
                 hybrid_layer_pattern=pattern,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert config.mtp_hsm is True
@@ -354,6 +359,7 @@ class TestHybridModel:
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="-/-/-",
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         assert config.mtp_num_layers == 2

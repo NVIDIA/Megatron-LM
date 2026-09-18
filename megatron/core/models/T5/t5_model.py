@@ -15,10 +15,7 @@ from megatron.core.models.common.embeddings.relative_pos_embedding import Relati
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import (
-    ProcessGroupCollection,
-    warn_global_process_group_fallback,
-)
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -164,25 +161,20 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        if pg_collection is None:
-            warn_global_process_group_fallback(type(self).__name__)
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        for _pg in ('tp', 'cp', 'pp'):
-            if _pg not in vars(pg_collection):
-                raise ValueError(f"T5Model pg_collection must have {_pg}")
-        if 'embd' not in vars(pg_collection):
-            raise ValueError(
-                "T5Model pg_collection must have embd; explicitly set it to None when unused"
-            )
-        if (
-            share_embeddings_and_output_weights
-            and config.pipeline_model_parallel_size > 1
-            and (pre_process or post_process)
-            and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
-        ):
-            raise ValueError(
-                "T5Model tied pipeline embedding/output stages require a usable embd group"
-            )
+        if pg_collection is not None:
+            if 'embd' not in vars(pg_collection):
+                raise ValueError(
+                    "T5Model pg_collection must have embd; explicitly set it to None when unused"
+                )
+            if (
+                share_embeddings_and_output_weights
+                and config.pipeline_model_parallel_size > 1
+                and (pre_process or post_process)
+                and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
+            ):
+                raise ValueError(
+                    "T5Model tied pipeline embedding/output stages require a usable embd group"
+                )
         super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
 
         self.config: TransformerConfig = config
@@ -200,7 +192,6 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
-        self.tp_group = pg_collection.tp
 
         self.model_type = ModelType.encoder_or_decoder
 
