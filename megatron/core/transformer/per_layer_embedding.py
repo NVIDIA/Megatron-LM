@@ -317,6 +317,10 @@ class PerLayerEmbedding(MegatronModule):
         self._ngram_ids: Optional[Tensor] = None
         self._position_in_segment: Optional[Tensor] = None
         self._position_in_sequence: Optional[Tensor] = None
+        # Set by ``prepare`` when running THD (packed) under CP>1: the layer then
+        # reconstructs the full causal stream TP/CP-replicated (QSA pattern) instead
+        # of the sbhd SP-sharded path. None means sbhd / CP=1.
+        self._cp_packed_seq_params: Optional["PackedSeqParams"] = None
 
     # ------------------------------------------------------------------ inputs
     def prepare(self, token_ids: Tensor, cu_seqlens: Optional[Tensor] = None) -> None:
@@ -329,16 +333,20 @@ class PerLayerEmbedding(MegatronModule):
         from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp
 
         if parallel_state.get_context_parallel_world_size() > 1:
+            # THD (packed) inputs: thread the sequence boundaries through a
+            # PackedSeqParams so the reconstruct undoes the same per-sequence zigzag
+            # partition the data loader applied (sbhd keeps the plain reorder path).
+            self._cp_packed_seq_params = None
             if cu_seqlens is not None:
-                raise NotImplementedError(
-                    "PerLayerEmbedding context parallelism currently supports sbhd only; "
-                    "THD (packed) CP is not yet wired (needs a PackedSeqParams-aware "
-                    "reconstruct_tensor_cp path)."
+                from megatron.core.packed_seq_params import PackedSeqParams
+
+                self._cp_packed_seq_params = PackedSeqParams(
+                    cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens, qkv_format="thd"
                 )
             # Reconstruct the global token stream so n-gram hashing — which looks back
             # ``ngram_size`` tokens — is correct across CP-rank boundaries, rather than being
             # fed a CP-local slice whose first tokens have no left context.
-            token_ids = reconstruct_tensor_cp(token_ids, None, dim=1)
+            token_ids = reconstruct_tensor_cp(token_ids, self._cp_packed_seq_params, dim=1)
         with torch.no_grad():
             self._ngram_ids = self.ple_embedding.compute_ngram_ids(token_ids, cu_seqlens)
             # Conv taps must not read across packed-sequence boundaries.
@@ -353,7 +361,11 @@ class PerLayerEmbedding(MegatronModule):
     def _local_positions(self, seq_len_local: int) -> Tensor:
         """[s_local, b] positions (within their document) of this rank's tokens."""
         positions = self._position_in_sequence.transpose(0, 1)  # [s, b]
-        if self.config.sequence_parallel and self.tp_group.size() > 1:
+        if (
+            self.config.sequence_parallel
+            and self.tp_group.size() > 1
+            and self._cp_packed_seq_params is None  # THD CP computes the full stream replicated
+        ):
             rank = self.tp_group.rank()
             positions = positions[rank * seq_len_local : (rank + 1) * seq_len_local]
         assert positions.shape[0] == seq_len_local, (
@@ -371,7 +383,11 @@ class PerLayerEmbedding(MegatronModule):
         tensor-parallel rank.
         """
         s_local = x.shape[0]
-        if self.config.sequence_parallel and self.tp_group.size() > 1:
+        if (
+            self.config.sequence_parallel
+            and self.tp_group.size() > 1
+            and self._cp_packed_seq_params is None  # THD CP already holds the full stream
+        ):
             assert s_local >= self.halo, (
                 f"sequence-parallel chunk ({s_local} tokens) shorter than the PLE conv receptive "
                 f"field ({self.halo})"
@@ -404,7 +420,21 @@ class PerLayerEmbedding(MegatronModule):
         from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp, split_tensor_cp
 
         cp_size = parallel_state.get_context_parallel_world_size()
-        if cp_size > 1:
+        thd_cp = cp_size > 1 and self._cp_packed_seq_params is not None
+        sp_replicated = False
+        if thd_cp:
+            # THD CP: undo sequence parallelism first, then rebuild the full causal
+            # stream through the PackedSeqParams-aware reconstruct; the layer runs
+            # TP/CP-replicated (QSA pattern) and is re-sharded on the way out.
+            from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+            if self.config.sequence_parallel and self.tp_group.size() > 1:
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=self.tp_group
+                )
+                sp_replicated = True
+            hidden_states = reconstruct_tensor_cp(hidden_states, self._cp_packed_seq_params, dim=0)
+        elif cp_size > 1:
             # Gather the full sequence (true causal order) so the causal dilated conv reads
             # across CP-rank boundaries; every rank redundantly computes the full layer, then
             # the output is split back to this rank's CP-local slice. No-op when CP size is 1.
@@ -414,6 +444,12 @@ class PerLayerEmbedding(MegatronModule):
         dtype = hidden_states.dtype
 
         embeddings = self.ple_embedding(self._ngram_ids).to(dtype)  # [s_local, b, embed_dim]
+        if thd_cp and self.config.sequence_parallel and self.tp_group.size() > 1:
+            # The n-gram lookup is reduce-scattered across TP under SP (s//tp rows); the
+            # THD CP path computes the full stream TP-replicated, so undo that sharding.
+            from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+            embeddings = gather_from_sequence_parallel_region(embeddings, group=self.tp_group)
         assert (
             embeddings.shape[0] == s_local
         ), f"PLE embeddings cover {embeddings.shape[0]} tokens but the layer input has {s_local}"
@@ -438,6 +474,12 @@ class PerLayerEmbedding(MegatronModule):
         positions = self._local_positions(s_local)
         conv_out = self._causal_dilated_conv(gated_value_normed, positions)
         out = gated_value + F.silu(conv_out.float()).to(dtype)
-        if cp_size > 1:
+        if thd_cp:
+            from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
+
+            out = split_tensor_cp(out, self._cp_packed_seq_params, dim=0)
+            if sp_replicated:
+                out = scatter_to_sequence_parallel_region(out, group=self.tp_group)
+        elif cp_size > 1:
             out = split_tensor_cp(out, None, dim=0)
         return out
