@@ -161,20 +161,25 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        if pg_collection is not None:
-            if 'embd' not in vars(pg_collection):
-                raise ValueError(
-                    "T5Model pg_collection must have embd; explicitly set it to None when unused"
-                )
-            if (
-                share_embeddings_and_output_weights
-                and config.pipeline_model_parallel_size > 1
-                and (pre_process or post_process)
-                and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
-            ):
-                raise ValueError(
-                    "T5Model tied pipeline embedding/output stages require a usable embd group"
-                )
+        assert pg_collection is not None, (
+            "T5Model requires an explicit pg_collection with tp/cp/pp; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
+        for _pg in ('tp', 'cp', 'pp'):
+            assert _pg in vars(pg_collection), f"T5Model pg_collection must have {_pg}"
+        if 'embd' not in vars(pg_collection):
+            raise ValueError(
+                "T5Model pg_collection must have embd; explicitly set it to None when unused"
+            )
+        if (
+            share_embeddings_and_output_weights
+            and config.pipeline_model_parallel_size > 1
+            and (pre_process or post_process)
+            and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
+        ):
+            raise ValueError(
+                "T5Model tied pipeline embedding/output stages require a usable embd group"
+            )
         super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
 
         self.config: TransformerConfig = config
@@ -192,12 +197,6 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
-        assert pg_collection is not None, (
-            "T5Model requires an explicit pg_collection with tp/cp/pp; "
-            "see docs/developer/parallel-state-deprecation.md"
-        )
-        for _pg in ('tp', 'cp', 'pp'):
-            assert hasattr(pg_collection, _pg), f"T5Model pg_collection must have {_pg}"
         self.tp_group = pg_collection.tp
 
         self.model_type = ModelType.encoder_or_decoder

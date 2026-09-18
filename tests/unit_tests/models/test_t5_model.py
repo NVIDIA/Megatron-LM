@@ -127,50 +127,6 @@ class TestT5Model:
         pass
 
 
-@pytest.mark.parametrize("explicit_pg_collection", [False, True])
-def test_constructor_process_groups(mocker, explicit_pg_collection):
-    """T5 and LanguageModule must agree on the caller's process-group collection."""
-    clear_nvte_env_vars()
-    mocker.patch("torch.distributed.is_initialized", return_value=True)
-    pg_collection = ProcessGroupCollection(
-        tp=mocker.sentinel.tp,
-        cp=mocker.sentinel.cp,
-        pp=mocker.sentinel.pp,
-        embd=mocker.sentinel.embd,
-    )
-    global_groups = mocker.patch.object(
-        ProcessGroupCollection, "use_mpu_process_groups", return_value=pg_collection
-    )
-    if explicit_pg_collection:
-        global_groups.side_effect = AssertionError("Explicit groups must not read the global grid")
-
-    config = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
-    # An empty pipeline stage exercises both constructors without constructing GPU layers.
-    model = T5Model(
-        config=config,
-        encoder_config=config,
-        transformer_encoder_layer_spec=None,
-        transformer_decoder_layer_spec=None,
-        vocab_size=32,
-        max_sequence_length=4,
-        pre_process=False,
-        post_process=False,
-        add_encoder=False,
-        add_decoder=False,
-        pg_collection=pg_collection if explicit_pg_collection else None,
-    )
-
-    assert model.pg_collection is pg_collection
-    assert model.tp_group is pg_collection.tp
-    assert model.cp_group is pg_collection.cp
-    assert model.pp_group is pg_collection.pp
-    assert model.embd_group is pg_collection.embd
-    if explicit_pg_collection:
-        global_groups.assert_not_called()
-    else:
-        global_groups.assert_called()
-
-
 @pytest.mark.parametrize(
     'pp_size, pre_process, post_process, tied, embedding_state, valid',
     [

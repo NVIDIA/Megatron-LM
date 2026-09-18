@@ -15,7 +15,6 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
