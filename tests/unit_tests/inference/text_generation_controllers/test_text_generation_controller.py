@@ -2901,7 +2901,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
-            hybrid_layer_pattern="***M" if is_hybrid_model else None,
+            hybrid_layer_pattern="***M/*/*/*" if is_hybrid_model else None,
         )
         self.text_generation_controller.num_speculative_tokens = 3
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context

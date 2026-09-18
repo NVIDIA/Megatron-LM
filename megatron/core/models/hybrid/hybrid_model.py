@@ -206,10 +206,44 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        if self.mtp_num_depths > 0:
+            if self.config.mtp_num_layers is None:
+                self.config.mtp_num_layers = self.mtp_num_depths
+            elif self.config.mtp_num_layers != self.mtp_num_depths:
+                raise ValueError(
+                    f"hybrid_layer_pattern defines {self.mtp_num_depths} MTP depths, "
+                    f"but mtp_num_layers is {self.config.mtp_num_layers}"
+                )
+        if (
+            self.config.mtp_num_layers
+            and self.mtp_num_depths == 0
+            and self.config.mtp_hybrid_override_pattern is None
+        ):
+            raise ValueError(
+                "HybridModel has mtp_num_layers set but no MTP template. "
+                "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM')."
+            )
+
+        # Validate the full architecture, including MTP heads on other pipeline stages.
         if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
             raise ValueError(
                 "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
                 "overlap scheduler does not expand the nested HybridStack."
+            )
+        if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
+            raise ValueError(
+                "freeze_base_model_for_mtp requires the HybridModel architecture "
+                "to define at least one MTP head"
+            )
+        if self.mtp_num_depths > 0 and self.position_embedding_type not in ('rope', 'none'):
+            raise ValueError(
+                "Multi-Token Prediction (MTP) is not supported with "
+                f"{self.position_embedding_type} position embedding type. "
+                "The supported position embedding types are rope and none."
+            )
+        if self.config.mtp_hsm and self.mtp_num_depths < 2:
+            raise ValueError(
+                "mtp_hsm=True requires at least two MTP heads in the HybridModel architecture."
             )
 
         # Determine if MTP is needed (based on pattern parsing)
