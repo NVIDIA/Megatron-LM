@@ -7,30 +7,6 @@ sequence-length dependent host synchronization is needed in the forward path.
 
 import torch
 
-# Match main DSA's 1 GiB score budget, shared across concurrently live matrices.
-# This bounds score slabs, not kernel-private workspaces or the model's activations.
-_INDEXER_WORKSPACE_BYTES = 1024 * 1024 * 1024
-
-
-def query_chunk_rows(total_rows: int, score_width: int, live_buffers: int = 1) -> int:
-    """Choose shape-only query chunks without synchronizing packed lengths to the host."""
-    padded_width = ((max(1, score_width) + 127) // 128) * 128
-    rows = max(1, _INDEXER_WORKSPACE_BYTES // (4 * padded_width * live_buffers))
-    # As in main's DSA path, align when the budget permits; tail chunks stay exact.
-    if rows >= 512:
-        rows = rows // 512 * 512
-    return max(1, min(total_rows, rows))
-
-
-def slice_query_layout(cu_seqlens_q, q_causal_offsets, start: int, end: int):
-    """Rebase a packed query interval while keeping each segment's original K coordinates."""
-    cu_chunk = (cu_seqlens_q - start).clamp(0, end - start)
-    offsets = (start - cu_seqlens_q[:-1]).clamp_min(0)
-    if q_causal_offsets is not None:
-        offsets = offsets + q_causal_offsets
-    offsets = torch.where(cu_chunk[1:] > cu_chunk[:-1], offsets, 0)
-    return cu_chunk, offsets
-
 
 def _prefix(lengths):
     return torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))

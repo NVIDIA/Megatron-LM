@@ -27,6 +27,7 @@ from .fused_sparse_attention import (
 from .fused_sparse_attention import _get_topk_alignment as get_flash_mla_topk_alignment
 
 _DSA: Any = None
+_CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 
 
 def _ensure_dsa_namespace():
@@ -495,145 +496,31 @@ def _kl_loss_from_dense_scores(
     (LSE); those rows contribute 0 to the loss — the same ``row_valid``
     semantics as the reference ``compute_dsa_indexer_loss``.
     """
-    return csa_indexer_loss_kernels.dense_kl_loss(
-        attn_score, attn_l1norm, index_score, index_lse, loss_coeff, calculate_per_token_loss
-    )
+    eps = _CLIP_PROB_MIN
+    # row_valid: rows with at least one un-masked KV position.
+    row_valid = (attn_l1norm > eps) & torch.isfinite(index_lse)
 
+    # Safe denoms: replace invalid rows with a finite value so target /
+    # log-predict don't produce NaN; the row mask zeroes their KL below.
+    safe_l1 = attn_l1norm.clamp(min=eps)
+    safe_lse = torch.where(row_valid, index_lse, torch.zeros_like(index_lse))
 
-def _dense_indexer_loss_and_grads(
-    query,
-    kv_full,
-    compressed_kv,
-    attn_sink,
-    window_indices,
-    q_indexer,
-    k_indexer,
-    weights,
-    softmax_scale,
-    indexer_softmax_scale,
-    loss_coeff,
-    loss_divisor,
-    ratio,
-    max_seqlen_q,
-    indexer_layout,
-    q_padding_mask,
-):
-    """Compute full-key teacher loss in bounded query slabs using the existing cuDNN kernels.
+    target = attn_score / safe_l1.unsqueeze(-1)
+    target_clamped = target.clamp(min=eps)
+    # Per-position validity: the indexer-score kernel emits -inf at
+    # ratio-masked positions; those contribute 0 to KL by the
+    # ``0 · log(0/p) = 0`` convention. Without this gate, the eps-clamp
+    # on target makes the term ``eps · (log eps - (-inf)) = +inf``.
+    position_valid = torch.isfinite(index_score)
+    safe_index_score = torch.where(position_valid, index_score, torch.zeros_like(index_score))
+    log_predict = safe_index_score - safe_lse.unsqueeze(-1)
 
-    cuDNN normalizes each backward by its query count. Scaling its coefficient by
-    chunk_rows / total_q preserves the original full-query gradient convention;
-    the caller then applies the real-token/global-CP divisor once. Accumulate K
-    gradients in FP32 across slabs and round only after the final accumulation.
-    """
-    total_q = q_indexer.shape[0]
-    cu_q, cu_k, causal_offsets = indexer_layout
-    max_k = max_seqlen_q // ratio
-    torch._assert_async(
-        (((cu_q[1:] - cu_q[:-1]) == 0) | ((cu_k[1:] - cu_k[:-1]) > 0)).all(),
-        "cuDNN dense packed indexer loss requires a compressed key in each nonempty Q "
-        "segment; use sparse loss or dsa_kernel_backend='none' for shorter documents.",
-    )
-    # Budget for score/teacher buffers and frontend temporaries; KL is fused on CUDA.
-    chunk_rows = packed_layout.query_chunk_rows(total_q, max_k, live_buffers=4)
-    grad_q = torch.empty_like(q_indexer)
-    grad_weights = torch.empty_like(weights)
-    grad_k = torch.zeros_like(k_indexer, dtype=torch.float32)
-    chunk_grad_k = torch.empty_like(grad_k)
-    loss = query.new_zeros((), dtype=torch.float32)
-    unit_grad_loss = query.new_ones((), dtype=torch.float32)
-    for start in range(0, total_q, chunk_rows):
-        end = min(start + chunk_rows, total_q)
-        if chunk_rows >= total_q:
-            local_cu_q, offsets = cu_q, causal_offsets
-        else:
-            local_cu_q, offsets = packed_layout.slice_query_layout(cu_q, causal_offsets, start, end)
-        metadata = dict(
-            cu_seqlens_q=local_cu_q,
-            cu_seqlens_kv=cu_k,
-            max_seqlen_q=min(max_seqlen_q, end - start),
-            max_seqlen_kv=max_k,
-            q_causal_offsets=offsets,
-        )
-        index_score, index_lse = _compute_dense_indexer_score(
-            q_indexer[start:end],
-            k_indexer.unsqueeze(1),
-            weights[start:end],
-            qhead_per_kv_head=q_indexer.shape[1],
-            indexer_softmax_scale=indexer_softmax_scale,
-            ratio=ratio,
-            **metadata,
-        )
-        mask = None if q_padding_mask is None else q_padding_mask[start:end]
-        if mask is not None:
-            index_score.masked_fill_(mask.unsqueeze(-1), float("-inf"))
-            index_lse.masked_fill_(mask, float("-inf"))
-        teacher_lse = _compute_full_csa_teacher_lse(
-            query[start:end],
-            query[start:end],
-            kv_full,
-            compressed_kv,
-            attn_sink,
-            window_indices[start:end],
-            softmax_scale,
-            ratio,
-            **metadata,
-        )
-        attn_score, attn_l1norm = _compute_dense_attn_score(
-            query[start:end],
-            compressed_kv.unsqueeze(1),
-            teacher_lse,
-            qhead_per_kv_head=query.shape[1],
-            softmax_scale=softmax_scale,
-            ratio=ratio,
-            **metadata,
-        )
-        if mask is not None:
-            attn_score.masked_fill_(mask.unsqueeze(-1), 0)
-            attn_l1norm.masked_fill_(mask, 0)
-        loss.add_(
-            _kl_loss_from_dense_scores(
-                attn_score,
-                attn_l1norm,
-                index_score,
-                index_lse,
-                loss_coeff,
-                calculate_per_token_loss=True,
-            )
-        )
-        # Backward owns and overwrites both score buffers; the loss has consumed them.
-        if mask is not None:
-            index_score.masked_fill_(mask.unsqueeze(-1), 0)
-            index_lse.masked_fill_(mask, 0)
-        # The frontend overwrites (and zero-initializes) the supplied FP32 K buffer.
-        _DSA.dense_indexer_backward_wrapper(
-            q_indexer[start:end],
-            weights[start:end],
-            k_indexer,
-            attn_score,
-            attn_l1norm,
-            index_score,
-            index_lse,
-            sm_scale=indexer_softmax_scale,
-            loss_coeff=loss_coeff * ((end - start) / total_q),
-            grad_loss=unit_grad_loss,
-            block_I=128,
-            ratio=ratio,
-            cu_seqlens_q=local_cu_q,
-            cu_seqlens_k=cu_k,
-            max_seqlen_q=min(max_seqlen_q, end - start),
-            max_seqlen_k=max_k,
-            q_causal_offsets=offsets,
-            d_index_q=grad_q[start:end],
-            d_weights=grad_weights[start:end],
-            d_index_k=chunk_grad_k,
-        )
-        grad_k.add_(chunk_grad_k)
-        del index_score, index_lse, attn_score, attn_l1norm, teacher_lse
-    return loss / loss_divisor, {
-        "d_index_q": grad_q,
-        "d_weights": grad_weights,
-        "d_index_k": grad_k.to(k_indexer.dtype),
-    }
+    kl_terms = target_clamped * (torch.log(target_clamped) - log_predict)
+    kl_terms = torch.where(position_valid, kl_terms, torch.zeros_like(kl_terms))
+    kl_per_row = kl_terms.sum(dim=-1)  # (B, S_q)
+    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
+    return loss_coeff * loss
 
 
 class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
@@ -769,24 +656,101 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                         block_I=128,
                     )
             else:
-                indexer_loss, ig = _dense_indexer_loss_and_grads(
+                cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
+                max_seqlen_k = max_seqlen_q // ratio
+                torch._assert_async(
+                    (
+                        ((cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 0)
+                        | ((cu_seqlens_k[1:] - cu_seqlens_k[:-1]) > 0)
+                    ).all(),
+                    "cuDNN dense packed indexer loss requires a compressed key in each "
+                    "nonempty Q segment; use sparse loss or dsa_kernel_backend='none' "
+                    "for shorter documents.",
+                )
+                index_score, index_lse = _compute_dense_indexer_score(
+                    q_indexer,
+                    k_indexer.unsqueeze(1),
+                    weights,
+                    qhead_per_kv_head=idx_nh,
+                    indexer_softmax_scale=indexer_softmax_scale,
+                    ratio=ratio,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_k,
+                    q_causal_offsets=q_causal_offsets,
+                )
+                if q_padding_mask is not None:
+                    index_score = index_score.masked_fill(
+                        q_padding_mask.unsqueeze(-1), float("-inf")
+                    )
+                    index_lse = index_lse.masked_fill(q_padding_mask, float("-inf"))
+                dense_teacher_lse = _compute_full_csa_teacher_lse(
+                    query.detach(),
                     query,
                     kv_full,
-                    compressed_kv,
+                    compressed_kv.detach(),
                     attn_sink,
                     window_topk_idxs,
-                    q_indexer,
-                    k_indexer,
-                    weights,
                     softmax_scale,
-                    indexer_softmax_scale,
-                    loss_coeff,
-                    loss_divisor,
                     ratio,
-                    max_seqlen_q,
-                    indexer_layout,
-                    q_padding_mask,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_k,
+                    q_causal_offsets=q_causal_offsets,
                 )
+                attn_score, attn_l1norm = _compute_dense_attn_score(
+                    query.detach(),
+                    compressed_kv.detach().unsqueeze(1),
+                    dense_teacher_lse,
+                    qhead_per_kv_head=np_,
+                    softmax_scale=softmax_scale,
+                    ratio=ratio,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_k,
+                    q_causal_offsets=q_causal_offsets,
+                )
+                if q_padding_mask is not None:
+                    attn_score = attn_score.masked_fill(q_padding_mask.unsqueeze(-1), 0)
+                    attn_l1norm = attn_l1norm.masked_fill(q_padding_mask, 0)
+                raw_local_loss = _kl_loss_from_dense_scores(
+                    attn_score,
+                    attn_l1norm,
+                    index_score,
+                    index_lse,
+                    loss_coeff,
+                    calculate_per_token_loss=True,
+                )
+                indexer_loss = raw_local_loss / loss_divisor
+
+                if loss_coeff > 0:
+                    index_score_for_bwd = index_score.clone()
+                    index_lse_for_bwd = index_lse
+                    if q_padding_mask is not None:
+                        index_score_for_bwd[q_padding_mask] = 0
+                        index_lse_for_bwd = index_lse.masked_fill(q_padding_mask, 0)
+                    ig = _DSA.dense_indexer_backward_wrapper(
+                        q_indexer,
+                        weights,
+                        k_indexer,
+                        attn_score,
+                        attn_l1norm,
+                        index_score_for_bwd,
+                        index_lse_for_bwd,
+                        sm_scale=indexer_softmax_scale,
+                        loss_coeff=bwd_loss_coeff,
+                        grad_loss=unit_grad_loss,
+                        block_I=128,
+                        ratio=ratio,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        q_causal_offsets=q_causal_offsets,
+                    )
         if loss_coeff > 0:
             saved_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd) * real_row_scale
             saved_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd) * real_row_scale
@@ -1033,35 +997,25 @@ def indexer_topk(
         return torch.full((q.shape[0], topk), -1, device=q.device, dtype=torch.int32), torch.zeros(
             q.shape[0], device=q.device, dtype=torch.int32
         )
-    output = torch.empty((q.shape[0], topk), device=q.device, dtype=torch.int32)
-    valid_counts = torch.empty(q.shape[0], device=q.device, dtype=torch.int32)
-    chunk_rows = packed_layout.query_chunk_rows(q.shape[0], max_seqlen_kv)
-    for start in range(0, q.shape[0], chunk_rows):
-        end = min(start + chunk_rows, q.shape[0])
-        if chunk_rows >= q.shape[0]:
-            cu_q, offsets = cu_seqlens_q, q_causal_offsets
-        else:
-            cu_q, offsets = packed_layout.slice_query_layout(
-                cu_seqlens_q, q_causal_offsets, start, end
-            )
-        scores = _DSA.indexer_forward_wrapper(
-            q[start:end],
-            k.unsqueeze(1),
-            w[start:end],
-            ratio=ratio,
-            cu_seqlens_q=cu_q,
-            cu_seqlens_k=cu_seqlens_kv,
-            max_seqlen_q=min(max_seqlen_q, end - start),
-            max_seqlen_k=max_seqlen_kv,
-            q_causal_offsets=offsets,
-        )["scores"].contiguous()
-        lengths = packed_layout.build_seq_lens(cu_q, cu_seqlens_kv, end - start, ratio, offsets)
-        candidates = _DSA.indexer_top_k_wrapper(
-            scores, lengths, top_k=min(topk, max_seqlen_kv), next_n=1, return_val=False
-        )["indices"]
-        ids, counts = packed_layout.sanitize_topk(candidates, scores, lengths, output_width=topk)
-        output[start:end] = ids
-        valid_counts[start:end] = counts
-        # Do not retain the previous slab while allocating the next one.
-        del scores, candidates, ids, counts
-    return output, valid_counts
+    # Score the CP-local query shard in one call, matching the CSA dense backend.
+    # DSA's _indexer_topk_from_score_chunks / _indexer_top_k_wrapper_chunked
+    # in dsa_cudnn_kernels.py (#5099) are references if profiling identifies this
+    # workspace as an end-to-end peak and motivates ratio-aware query chunking.
+    scores = _DSA.indexer_forward_wrapper(
+        q,
+        k.unsqueeze(1),
+        w,
+        ratio=ratio,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_kv,
+        q_causal_offsets=q_causal_offsets,
+    )["scores"].contiguous()
+    lengths = packed_layout.build_seq_lens(
+        cu_seqlens_q, cu_seqlens_kv, q.shape[0], ratio, q_causal_offsets
+    )
+    candidates = _DSA.indexer_top_k_wrapper(
+        scores, lengths, top_k=min(topk, max_seqlen_kv), next_n=1, return_val=False
+    )["indices"]
+    return packed_layout.sanitize_topk(candidates, scores, lengths, output_width=topk)

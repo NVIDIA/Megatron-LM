@@ -50,18 +50,6 @@ def test_packed_indexer_metadata_and_loss_replay():
     cu_q = torch.tensor([0, 65, 65, 256], device="cuda", dtype=torch.int32)
     cu_k = torch.tensor([0, 32, 32, 96], device="cuda", dtype=torch.int32)
     offsets = torch.tensor([63, 0, 65], device="cuda", dtype=torch.int32)
-    expected_lengths = packed_layout.build_seq_lens(cu_q, cu_k, 256, 4, offsets)
-    for start, end in ((0, 33), (33, 101), (101, 256)):
-        sliced_cu, sliced_offsets = packed_layout.slice_query_layout(cu_q, offsets, start, end)
-        torch.testing.assert_close(
-            packed_layout.build_seq_lens(sliced_cu, cu_k, end - start, 4, sliced_offsets),
-            expected_lengths[start:end],
-            rtol=0,
-            atol=0,
-        )
-    for length in (128 * 1024, 256 * 1024):
-        rows = packed_layout.query_chunk_rows(length // 8, length // 4, live_buffers=4)
-        assert rows * (length // 4) * 4 * 4 <= packed_layout._INDEXER_WORKSPACE_BYTES
     scores = torch.randn(256, 64, device="cuda")
     candidates = torch.randint(-1, 70, (256, 32), device="cuda", dtype=torch.int32)
 
@@ -84,15 +72,6 @@ def test_packed_indexer_metadata_and_loss_replay():
             target, predict, indices, 0.2, True, 256
         ),
         loss(target, predict, indices),
-    )
-
-    def dense_loss(t, score):
-        return packed_sparse_attention._kl_loss_from_dense_scores(
-            t, t.sum(-1), score, torch.logsumexp(score, dim=-1), 0.2, True
-        )
-
-    assert_replays_bit_exact(
-        dense_loss, (target, torch.randn_like(target)), backward=False, contention=True
     )
 
 

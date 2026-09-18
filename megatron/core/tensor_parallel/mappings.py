@@ -666,7 +666,7 @@ class _GatherFromSequenceParallelRegionAsync(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Preserve the synchronous gather's reduce-scatter backward semantics."""
         if ctx.tensor_parallel_output_grad:
-            grad_input = async_reduce_scatter_along_first_dim(grad_output, group=ctx.group).wait()
+            grad_input = _reduce_scatter_along_first_dim(grad_output, ctx.group)
         else:
             grad_input = _split_along_first_dim(grad_output, ctx.group)
         return grad_input, None, None, None
