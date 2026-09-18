@@ -584,9 +584,7 @@ class KimiDeltaAttention(_GDNBase):
             # below, whose backward all-gathers the complete beta gradient; therefore this
             # gather's backward only splits instead of reduce-scattering duplicate gradients.
             beta_input = tensor_parallel.gather_from_sequence_parallel_region(
-                beta_input,
-                tensor_parallel_output_grad=False,
-                group=self.pg_collection.tp,
+                beta_input, tensor_parallel_output_grad=False, group=self.pg_collection.tp
             )
         beta, _ = self.beta_proj(beta_input)
         beta = tensor_parallel.scatter_to_tensor_model_parallel_region(

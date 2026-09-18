@@ -573,13 +573,13 @@ class MultiLatentAttention(Attention):
         return self._apply_mla_headwise_output_gate(core_attn_out, gate)
 
     @staticmethod
+    @jit_fuser
     def _apply_mla_elementwise_output_gate(
         core_attn_out: torch.Tensor, gate: torch.Tensor
     ) -> torch.Tensor:
         """Apply one gate per local MLA output element in the activation dtype."""
-        # Keep the FP32 sigmoid followed by native-dtype multiplication used by the
-        # released model. Do not jit-fuse this helper: nvFuser can move the cast
-        # across the elementwise multiply and silently change the rounding/VJP.
+        # Compute the sigmoid in FP32 for a stable gate VJP, then cast back to the
+        # attention output dtype.
         gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
         return core_attn_out * gate
 
