@@ -283,12 +283,13 @@ def loss_func(
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: HybridModel):
+def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
+        return_schedule_plan (bool): Return the EP overlap plan instead of executing forward.
     """
     args = get_args()
     timers = get_timers()
@@ -346,7 +347,8 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(
+        forward = model.build_schedule_plan if return_schedule_plan else model
+        output_tensor = forward(
             tokens,
             position_ids,
             attention_mask,

@@ -1090,6 +1090,83 @@ class TestParallelHybridBlockCudagraphs:
         )
 
 
+class TestBackwardDWWrapper:
+    @pytest.mark.parametrize("has_attention", [False, True])
+    @pytest.mark.parametrize("mlp_kind", ["dense", "routed", "shared"])
+    @pytest.mark.parametrize("capture", ["eager", "attention", "router", "attention_router"])
+    def test_init_backward_dw_wrapper(self, has_attention, mlp_kind, capture):
+        """Initialize through the production import path, including Hybrid E/dense layers."""
+        from megatron.core.models.common.utils import _BackwardDWWrapper
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        calls = []
+
+        class RecordingModule(torch.nn.Linear):
+            def __init__(self, name):
+                super().__init__(2, 2)
+                self.name = name
+
+            def backward_dw(self, **kwargs):
+                calls.append((self.name, kwargs))
+
+        layer = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(layer)
+        layer.self_attention = RecordingModule("attention") if has_attention else IdentityOp()
+        layer.mlp = RecordingModule("mlp")
+        layer.is_moe_layer = mlp_kind != "dense"
+        layer.mlp.use_shared_expert = mlp_kind == "shared"
+        if layer.mlp.use_shared_expert:
+            layer.mlp.shared_experts = RecordingModule("shared")
+        scopes = {
+            "eager": [],
+            "attention": [CudaGraphModule.attn],
+            "router": [CudaGraphModule.moe_router],
+            "attention_router": [CudaGraphModule.attn, CudaGraphModule.moe_router],
+        }[capture]
+        layer.config = SimpleNamespace(cuda_graph_modules=scopes)
+        layer.cuda_graphs = [] if capture == "eager" else [object()]
+
+        layer.init_backward_dw_wrapper()
+        wrapper = layer.backward_dw_wrapper
+        assert type(wrapper) is _BackwardDWWrapper
+        assert (wrapper.attn_dw_callable is not None) == has_attention
+        expected_parameters = list(layer.self_attention.parameters())
+        if layer.mlp.use_shared_expert:
+            expected_parameters.extend(layer.mlp.shared_experts.parameters())
+        assert [id(parameter) for parameter in wrapper.parameters()] == [
+            id(parameter) for parameter in expected_parameters
+        ]
+        wrapper.set_graphed_backward_dw_callable(lambda: calls.append(("graph", {})))
+        wrapper.backward_dw()
+
+        expected_calls = []
+        if layer.is_moe_layer and CudaGraphModule.moe_router not in scopes:
+            expected_calls.append(("mlp", {"routed_experts": False, "shared_experts": True}))
+        if has_attention and CudaGraphModule.attn not in scopes:
+            expected_calls.append(("attention", {}))
+        if capture != "eager":
+            expected_calls.append(("graph", {}))
+        assert calls == expected_calls
+        assert wrapper.layer is None
+
+    def test_init_backward_dw_wrapper_rejects_missing_real_attention_wgrad(self):
+        """Only absent attention is optional; a real module must implement backward_dw."""
+        layer = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(layer)
+        layer.config = SimpleNamespace(cuda_graph_modules=[])
+        layer.self_attention = torch.nn.Linear(2, 2)
+        with pytest.raises(AttributeError, match="backward_dw"):
+            layer.init_backward_dw_wrapper()
+
+    def test_init_backward_dw_wrapper_rejects_non_transformer_layer(self):
+        """Identity attention support does not relax the supported layer type."""
+        layer = GraphableMegatronModule.__new__(GraphableMegatronModule)
+        torch.nn.Module.__init__(layer)
+        layer.config = SimpleNamespace(cuda_graph_modules=[])
+        with pytest.raises(AssertionError, match="only supports TransformerLayer"):
+            layer.init_backward_dw_wrapper()
+
+
 class TestHybridTECudaGraphDiscovery:
     @staticmethod
     def _bare_hybrid_wrapper(*, offload_in_graph=None):
@@ -1399,6 +1476,7 @@ class TestHybridTECudaGraphDiscovery:
         from megatron.core.transformer.identity_op import IdentityOp
 
         class Config:
+            overlap_moe_expert_parallel_comm = False
             recompute_granularity = None
             recompute_modules = []
             fp8 = False
@@ -1439,6 +1517,7 @@ class TestHybridTECudaGraphDiscovery:
         from megatron.core.transformer.identity_op import IdentityOp
 
         class Config:
+            overlap_moe_expert_parallel_comm = False
             recompute_granularity = None
             recompute_modules = []
             fp8 = True

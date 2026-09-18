@@ -3806,18 +3806,20 @@ class TransformerConfig(ModelParallelConfig):
                 self.pipeline_model_parallel_size > 1
                 or (self.virtual_pipeline_model_parallel_size or 1) > 1
             )
-            if graph_dynamic_pp_vpp and not self.cuda_graph_dynamic_microbatches:
+            if (
+                graph_dynamic_pp_vpp or self.overlap_moe_expert_parallel_comm
+            ) and not self.cuda_graph_dynamic_microbatches:
                 raise ValueError(
-                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP requires "
+                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP or EP overlap "
+                    "requires "
                     "cuda_graph_dynamic_microbatches=True so each in-flight forward owns a "
                     "distinct CUDA graph input slot until its backward completes."
                 )
-            if self.overlap_moe_expert_parallel_comm or self.delay_wgrad_compute:
+            if self.delay_wgrad_compute:
                 raise ValueError(
                     "CUDA-graphed balanced DSA dynamic-pack routing does not yet support "
-                    "overlap_moe_expert_parallel_comm or delay_wgrad_compute: those modes force "
-                    "CUDA graph capture back to the runtime microbatch count instead of the THD "
-                    "packing upper bound, so a still-live graph input slot could be reused."
+                    "delay_wgrad_compute: route input slots must remain live until the "
+                    "separate weight-gradient graph has completed."
                 )
         if (
             self.dsa_cp_balance_indexer
@@ -4078,10 +4080,16 @@ class TransformerConfig(ModelParallelConfig):
             assert is_torch_min_version(
                 "2.6.0"
             ), "A2A Overlap encounters hang issue with torch version < 2.6.0"
-            if self.pipeline_model_parallel_size > 1:
-                assert self.virtual_pipeline_model_parallel_size is not None, (
-                    "If enabling EP A2A overlap, virtual_pipeline_model_parallel_size "
-                    "must be specified when pipeline_model_parallel_size > 1"
+            if (
+                self.pipeline_model_parallel_size > 1
+                and self.virtual_pipeline_model_parallel_size is None
+            ):
+                assert (
+                    not self.delay_wgrad_compute
+                ), "Non-interleaved PP with EP overlap does not support delayed weight gradients"
+                assert self.num_microbatches_with_partial_activation_checkpoints is None, (
+                    "Non-interleaved PP with EP overlap does not support per-microbatch "
+                    "activation checkpoint selection"
                 )
             # Expert model parallelism requirements
             assert (
