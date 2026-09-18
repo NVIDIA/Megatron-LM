@@ -465,6 +465,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
+            "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),
