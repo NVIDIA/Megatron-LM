@@ -734,16 +734,24 @@ def test_supplied_block_hashes_are_not_re_salted():
 
 def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
     admission = {"rollout_id": "r0", "model_call_id": "c1"}
+    media_tensors = {"imgs": torch.ones(1, 2, 4)}
     request = _make_dynamic_request(
-        uid="chatcmpl-fixed", offload_params={"ng_capture": admission}, generated_tokens=[10]
+        uid="chatcmpl-fixed",
+        offload_params={"ng_capture": admission},
+        media_tensors=media_tensors,
+        generated_tokens=[10],
     )
     request.generated_log_probs = [-0.25]
     record = DynamicInferenceRequestRecord.from_request(request)
     record.checkpoint()
+    assert record.requests[-1].media_tensors is media_tensors
     merged = record.merge()
 
     assert merged.uid == "chatcmpl-fixed"
     assert merged.offload_params == {"ng_capture": admission}
+    # Like offload_params, the media tensors are stager material: kept through the
+    # merge, dropped from the wire.
+    assert merged.media_tensors is media_tensors
 
     serialized = merged.serialize(
         payload_offloaded=True,
@@ -751,6 +759,7 @@ def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
     )
     assert serialized["uid"] == "chatcmpl-fixed"
     assert "offload_params" not in serialized
+    assert "media_tensors" not in serialized
     assert serialized["generated_log_probs"] is None
     assert serialized["payload_offloaded"] is True
     assert serialized["payload_stage_metadata"] == {"ng_commit_coords": {"staging_key": "r0/c1"}}
@@ -764,13 +773,17 @@ def test_offloaded_request_payload_and_serialize():
     serialize(payload_offloaded=True) drops that data from the wire, marks the reply, and
     restores local state; defaults are unchanged."""
     routing = np.array([[1], [2], [3], [4]])  # total_tokens - 1 rows
+    imgs = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
 
-    def make_request():
+    def make_request(multimodal=False):
         req = DynamicInferenceRequest(
             request_id=7,
             prompt_tokens=torch.tensor([1, 2, 3]),
             sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
             generated_tokens=[10, 11],
+            # A VLM request also keeps its compact prompt and the encoder's inputs.
+            compact_prompt_tokens=torch.tensor([1, 2]) if multimodal else None,
+            media_tensors={"imgs": imgs} if multimodal else None,
         )
         req.generated_log_probs = [-0.5, -0.25]
         req.prompt_log_probs = torch.tensor([-1.0, -2.0])
@@ -784,6 +797,12 @@ def test_offloaded_request_payload_and_serialize():
     assert payload.generated_log_probs == [-0.5, -0.25]
     assert payload.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
     assert payload.routing_indices is routing
+    assert payload.compact_prompt_token_ids is None and payload.media_tensors is None
+
+    vlm_payload = OffloadedRequestPayload.from_request(make_request(multimodal=True))
+    assert vlm_payload.compact_prompt_token_ids == [1, 2]
+    assert torch.equal(vlm_payload.media_tensors["imgs"], imgs)
+    assert vlm_payload.media_tensors["imgs"].device.type == "cpu"
 
     obj = req.serialize(payload_offloaded=True)
     assert obj["payload_offloaded"] is True

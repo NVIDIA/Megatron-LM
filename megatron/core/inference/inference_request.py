@@ -706,6 +706,12 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     compact_prompt_tokens: Optional[torch.Tensor] = None
+    # The media tensors the vision encoder consumed (``imgs`` as packed patches or
+    # padded pixels, ``imgs_sizes``, ``num_frames``, ``num_tiles``; absent keys omitted).
+    # References to the VLM request's own tensors, so a payload stager can take custody
+    # of the exact pixels the request ran on. Preserved across checkpoint/merge (the
+    # merged finished request is a plain DynamicInferenceRequest); never on the wire.
+    media_tensors: Optional[Dict[str, torch.Tensor]] = None
     # Opaque JSON/msgpack-compatible metadata owned by an external payload stager.
     offload_params: Optional[Dict[str, Any]] = None
     # remaining prompt tokens are used for chunked prefill
@@ -890,6 +896,9 @@ class DynamicInferenceRequest(InferenceRequest):
         # Request metadata is input-only. Only the stager's response metadata
         # crosses back to the REST endpoint.
         obj.pop("offload_params", None)
+        # Media tensors are engine-local custody material for the payload stager
+        # (OffloadedRequestPayload.media_tensors); the REST reply never needs them.
+        obj.pop("media_tensors", None)
         obj["prompt_length"] = prompt_len
         obj["payload_offloaded"] = payload_offloaded
         obj["payload_stage_metadata"] = dict(payload_stage_metadata or {})
@@ -1107,6 +1116,7 @@ class DynamicInferenceRequestRecord:
             uid=old_request.uid,
             prompt_tokens=new_prompt_tokens,
             compact_prompt_tokens=old_request.compact_prompt_tokens,
+            media_tensors=old_request.media_tensors,
             sampling_params=old_request.sampling_params,
             offload_params=old_request.offload_params,
             status=old_request.status,
@@ -1208,6 +1218,7 @@ class DynamicInferenceRequestRecord:
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             compact_prompt_tokens=first_request.compact_prompt_tokens,
+            media_tensors=first_request.media_tensors,
             offload_params=first_request.offload_params,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
@@ -1270,6 +1281,17 @@ class OffloadedRequestPayload:
 
     Self-contained: a consumer can rebuild the served sequence from it alone,
     keyed by the request uid (the OpenAI response id).
+
+    ``prompt_token_ids`` is the prompt the model ran on. For a VLM request that is the
+    *expanded* sequence (one media token per projected embedding), which is what a
+    trainer needs. ``compact_prompt_token_ids`` is the pre-expansion prompt the endpoint
+    tokenized (one media token per image/video), which is what a later turn must splice
+    against (see ``RequestPromptPreparer``); it is ``None`` for text-only requests and
+    for requests admitted with ``media_tokens_preexpanded``. ``media_tensors`` is
+    ``None`` for text-only requests; otherwise it holds host copies of what the vision
+    encoder consumed (``imgs`` as packed patches ``[1, total_patches, C*P*P]`` on the
+    HTTP path, ``imgs_sizes``, and ``num_frames`` / ``num_tiles`` when present), so a
+    trainer can project the same media the policy generated against.
     """
 
     prompt_token_ids: Optional[list[int]]
@@ -1277,6 +1299,8 @@ class OffloadedRequestPayload:
     generated_log_probs: Optional[list[float]]
     prompt_log_probs: Optional[list[float]]
     routing_indices: Optional[np.ndarray]
+    compact_prompt_token_ids: Optional[list[int]] = None
+    media_tensors: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
@@ -1303,6 +1327,16 @@ class OffloadedRequestPayload:
             generated_log_probs=to_plain_list(request.generated_log_probs),
             prompt_log_probs=to_plain_list(request.prompt_log_probs),
             routing_indices=request.routing_indices,
+            compact_prompt_token_ids=to_plain_list(request.compact_prompt_tokens),
+            media_tensors=(
+                None
+                if request.media_tensors is None
+                else {
+                    name: tensor.detach().cpu()
+                    for name, tensor in request.media_tensors.items()
+                    if tensor is not None
+                }
+            ),
         )
 
 
@@ -1346,7 +1380,18 @@ class RequestPromptPreparationResult:
 
 
 class RequestPromptPreparer(Protocol):
-    """Protocol for resolving an exact prompt before engine admission."""
+    """Protocol for resolving an exact prompt before engine admission.
+
+    The preparer runs on the model-parallel coordinator before the request is
+    broadcast, i.e. before ``DynamicInferenceEngine.add_request`` tokenizes or expands
+    anything. For a multimodal request ``prompt`` is therefore the *compact* render
+    (one media token per image/video, as the chat endpoint tokenized it) and the
+    returned prompt must stay in that space: ``_build_vlm_request`` expands every
+    media token it finds, so a prefix spliced in already-expanded form would be
+    expanded a second time and fail the placeholder-count check. Consumers that
+    store previous turns should splice with ``OffloadedRequestPayload.
+    compact_prompt_token_ids`` and verify against ``prompt_token_ids``.
+    """
 
     def prepare_prompt(
         self,
