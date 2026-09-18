@@ -54,7 +54,7 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.typed_torch import not_none
 
 try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import transformer_engine as te  # type: ignore[import-untyped]
 
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
@@ -213,6 +213,11 @@ def get_dsv4_hybrid_module_spec_for_backend(
         ),
     )
 
+    linear_o_group_proj = None
+    if HAVE_TE:
+        te_ops = getattr(te.pytorch, "ops", None)
+        linear_o_group_proj = getattr(te_ops, "BatchedLinear", None)
+
     attention = ModuleSpec(
         module=DSv4HybridSelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
@@ -221,6 +226,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
             linear_q_up_proj=backend.column_parallel_linear(),
             linear_kv_proj=backend.column_parallel_linear(),
             core_attention=core_attention,
+            linear_o_group_proj=linear_o_group_proj,
             linear_proj=backend.row_parallel_linear(),
             q_layernorm=qk_norm,
             kv_layernorm=qk_norm,
