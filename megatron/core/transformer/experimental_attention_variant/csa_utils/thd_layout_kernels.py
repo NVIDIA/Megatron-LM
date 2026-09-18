@@ -541,12 +541,19 @@ if _CUTE_AVAILABLE:
         for seq in range(n_seq):
             seq_start = cu_seqlens[seq]
             seq_end = cu_seqlens[seq + 1]
-            local_end = cute.min(seq_end, global_start + l_local)
-            first = cute.ceil_div(cute.max(global_start - d_comp - seq_start, 0), ratio)
+            local_end = seq_end
+            if local_end > global_start + l_local:
+                local_end = global_start + l_local
+            first_numer = global_start - d_comp - seq_start
+            if first_numer < 0:
+                first_numer = 0
+            first = cute.ceil_div(first_numer, ratio)
             stop = (local_end - seq_start) // ratio
             count = cutlass.Int32(0)
             if seq_start < local_end and global_start < local_end:
-                count = cute.max(stop - first, 0)
+                count = stop - first
+                if count < 0:
+                    count = 0
             tokens = count * ratio
             if row >= running_tokens and row < running_tokens + tokens:
                 offset = row - running_tokens
@@ -566,7 +573,10 @@ if _CUTE_AVAILABLE:
             compact_to_source[row] = source_row
             if row % ratio == 0:
                 comp_ids[row // ratio] = group_id
-                position_ids[row // ratio] = cute.max(group_id, 0) * ratio
+                position_id = cutlass.Int32(0)
+                if group_id >= 0:
+                    position_id = group_id * ratio
+                position_ids[row // ratio] = position_id
         if row < l_local + d_comp:
             source_to_compact[row] = compact_row
 
@@ -588,6 +598,9 @@ if _CUTE_AVAILABLE:
         compact_len: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        rows = compact_len
+        if rows < l_local + d_comp:
+            rows = l_local + d_comp
         _launch_named(
             _compressor_row_maps_kernel,
             "dsv4_cp_compressor_row_maps",
@@ -607,7 +620,7 @@ if _CUTE_AVAILABLE:
                 d_comp,
                 compact_len,
             ),
-            grid=(cute.ceil_div(cute.max(compact_len, l_local + d_comp), 128), 1, 1),
+            grid=(cute.ceil_div(rows, 128), 1, 1),
             block=(128, 1, 1),
             stream=stream,
         )
