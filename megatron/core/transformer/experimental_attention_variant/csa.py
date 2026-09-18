@@ -1598,7 +1598,9 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_kv_local.squeeze(1), group=cp_group
                 ).wait()
 
-        use_indexer_loss = training_with_grad and compressed_topk is not None
+        use_indexer_loss = (
+            training_with_grad and compressed_topk is not None and indexer_loss_coeff > 0
+        )
         # ``use_indexer_loss`` implies the RS consumer edges above were built,
         # so the fused indexer-loss path always runs with backward overlap.
         overlap_cp_backward = use_indexer_loss and self.use_fused_kernels
@@ -1734,8 +1736,8 @@ class CompressedSparseAttention(MegatronModule):
                 query, kv_full_thd, self.attn_sink.float(), topk_idxs, self.softmax_scale
             )
         if training_with_grad and indexer is not None:
-            # A pack shorter than the compression ratio has no selected keys.
-            # Keep indexer parameters in autograd with explicit zero gradients.
+            # Zero loss or a pack without compressed keys still needs explicit
+            # indexer gradients, without saving full-size zero gradients in forward.
             zero_loss = (
                 q_indexer_cp.sum() + k_indexer_rank_major.sum() + weights_indexer_cp.sum()
             ) * 0.0

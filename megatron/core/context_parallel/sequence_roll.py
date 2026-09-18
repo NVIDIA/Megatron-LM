@@ -87,3 +87,57 @@ def roll_contiguous(tensor, dims, cp_group, packed_seq_params=None, fill_value=0
     shape = [1] * tensor.ndim
     shape[dims] = tensor.shape[dims]
     return _RollLeft.apply(tensor, cp_group, dims).masked_fill(~valid.view(shape), fill_value)
+
+
+def roll_contiguous_fields(tensors, cp_group, packed_seq_params=None, fill_values=None):
+    """Roll non-differentiable token fields together, preserving each dtype and fill value.
+
+    This batches one depth's IDs/positions/masks; activations continue to use the
+    differentiable roll above. No cross-layer cache or model-wide state is introduced.
+    """
+    present = [tensor for tensor in tensors if tensor is not None]
+    if not present:
+        return tuple(tensors)
+    reference = present[0]
+    length = reference.shape[-1]
+    if any(
+        t.requires_grad or t.shape[-1] != length or t.device != reference.device for t in present
+    ):
+        raise ValueError("Token fields require matching sequence lengths/devices and no gradients.")
+    if fill_values is None:
+        fill_values = (0,) * len(tensors)
+    if len(fill_values) != len(tensors):
+        raise ValueError("Each token field needs one fill value.")
+    if length == 0:
+        return tuple(None if t is None else t.clone() for t in tensors)
+    valid = _continuation_mask(reference, packed_seq_params, cp_group, -1)
+    rank = cp_group.rank() if cp_group is not None else 0
+    size = cp_group.size() if cp_group is not None else 1
+    outputs, received, sends, ops = [], [], [], []
+    for tensor, fill in zip(tensors, fill_values):
+        if tensor is None:
+            outputs.append(None)
+            continue
+        result = torch.roll(tensor, -1, -1)
+        result[..., -1].fill_(fill)
+        outputs.append(result)
+        if rank > 0:
+            send = tensor[..., 0].contiguous()
+            sends.append(send)  # Retain temporary send storage until all work completes.
+            ops.append(
+                dist.P2POp(dist.isend, send, dist.get_global_rank(cp_group, rank - 1), cp_group)
+            )
+        if rank + 1 < size:
+            recv = torch.empty_like(tensor[..., 0])
+            received.append((result, recv))
+            ops.append(
+                dist.P2POp(dist.irecv, recv, dist.get_global_rank(cp_group, rank + 1), cp_group)
+            )
+    for work in dist.batch_isend_irecv(ops) if ops else []:
+        work.wait()
+    for result, recv in received:
+        result[..., -1].copy_(recv)
+    for result, fill in zip(outputs, fill_values):
+        if result is not None:
+            result.masked_fill_(~valid, fill)
+    return tuple(outputs)

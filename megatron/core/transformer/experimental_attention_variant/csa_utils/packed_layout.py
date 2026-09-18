@@ -7,6 +7,30 @@ sequence-length dependent host synchronization is needed in the forward path.
 
 import torch
 
+# Match main DSA's 1 GiB score budget, shared across concurrently live matrices.
+# This bounds score slabs, not kernel-private workspaces or the model's activations.
+_INDEXER_WORKSPACE_BYTES = 1024 * 1024 * 1024
+
+
+def query_chunk_rows(total_rows: int, score_width: int, live_buffers: int = 1) -> int:
+    """Choose shape-only query chunks without synchronizing packed lengths to the host."""
+    padded_width = ((max(1, score_width) + 127) // 128) * 128
+    rows = max(1, _INDEXER_WORKSPACE_BYTES // (4 * padded_width * live_buffers))
+    # As in main's DSA path, align when the budget permits; tail chunks stay exact.
+    if rows >= 512:
+        rows = rows // 512 * 512
+    return max(1, min(total_rows, rows))
+
+
+def slice_query_layout(cu_seqlens_q, q_causal_offsets, start: int, end: int):
+    """Rebase a packed query interval while keeping each segment's original K coordinates."""
+    cu_chunk = (cu_seqlens_q - start).clamp(0, end - start)
+    offsets = (start - cu_seqlens_q[:-1]).clamp_min(0)
+    if q_causal_offsets is not None:
+        offsets = offsets + q_causal_offsets
+    offsets = torch.where(cu_chunk[1:] > cu_chunk[:-1], offsets, 0)
+    return cu_chunk, offsets
+
 
 def _prefix(lengths):
     return torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))
@@ -24,7 +48,7 @@ def _visible_groups(cu, start, end, ratio, halo):
     return first, counts
 
 
-def compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, capacity, cp_size):
+def _compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, capacity, cp_size):
     """Gather complete groups and their ratio-4 predecessors; retain autograd edges."""
     local_rows = hidden.shape[0]
     first, counts = _visible_groups(cu, global_start, global_start + local_rows, ratio, halo)
@@ -35,14 +59,14 @@ def compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, ca
     valid = rows < local_comp_cu[-1]
     group_ids = first[seq] + rows - local_comp_cu[seq]
     source_rows = cu[seq, None] + group_ids[:, None] * ratio + torch.arange(ratio, device=cu.device)
-    source_rows = source_rows - global_start + boundary.shape[0]
-    inputs = torch.cat((boundary, hidden), dim=0)
-    safe_rows = source_rows.clamp(0, inputs.shape[0] - 1).long()
-    gathered = inputs.index_select(0, safe_rows.flatten()).reshape(
-        capacity * ratio, *hidden.shape[1:]
-    )
+    source_rows = (source_rows - global_start).reshape(-1).long()
+    values = hidden.index_select(0, source_rows.clamp(0, local_rows - 1))
     mask_shape = (capacity * ratio,) + (1,) * (hidden.ndim - 1)
-    gathered = gathered * valid.repeat_interleave(ratio).view(mask_shape)
+    if boundary.shape[0]:
+        halo_rows = (source_rows + boundary.shape[0]).clamp(0, boundary.shape[0] - 1)
+        halo_values = boundary.index_select(0, halo_rows)
+        values = torch.where((source_rows < 0).view(mask_shape), halo_values, values)
+    gathered = values * valid.repeat_interleave(ratio).view(mask_shape)
     positions = torch.where(valid, group_ids * ratio, 0)
     group_ids = torch.where(valid, group_ids, -1)
 
@@ -53,18 +77,35 @@ def compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, ca
     group = logical_rows - comp_cu[sequence]
     owner = torch.div(cu[sequence] + (group + 1) * ratio - 1, local_rows, rounding_mode="floor")
     owner = owner.clamp(0, cp_size - 1)
-    row_map = torch.full_like(logical_rows, -1)
-    for rank in range(cp_size):
-        rank_first, rank_counts = _visible_groups(
-            cu, rank * local_rows, (rank + 1) * local_rows, ratio, halo
-        )
-        rank_cu = _prefix(rank_counts)
-        physical = rank * capacity + rank_cu[sequence] + group - rank_first[sequence]
-        row_map = torch.where((owner == rank) & (logical_rows < comp_cu[-1]), physical, row_map)
+    # Compute rank/segment metadata once, then gather each group's owner directly.
+    # Avoid CP_size full passes over every compressed row.
+    rank_start = torch.arange(cp_size, device=cu.device, dtype=cu.dtype)[:, None] * local_rows
+    rank_first = torch.div(
+        (rank_start - halo - cu[:-1]).clamp_min(0) + ratio - 1, ratio, rounding_mode="floor"
+    )
+    rank_stop = torch.div(
+        torch.minimum(cu[1:], rank_start + local_rows) - cu[:-1], ratio, rounding_mode="floor"
+    )
+    rank_counts = (rank_stop - rank_first).clamp_min(0)
+    rank_counts = torch.where(
+        (cu[:-1] < rank_start + local_rows) & (cu[1:] > rank_start), rank_counts, 0
+    )
+    rank_prefix = rank_counts.cumsum(dim=1, dtype=torch.int32) - rank_counts
+    physical = owner * capacity + rank_prefix[owner, sequence] + group - rank_first[owner, sequence]
+    row_map = torch.where(logical_rows < comp_cu[-1], physical, -1)
     return gathered, group_ids, positions, comp_cu, row_map
 
 
-def build_attention_indices(
+_compiled_compactor = torch.compile(_compact_compressor_input, fullgraph=True)
+
+
+def compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, capacity, cp_size):
+    """Gather packed groups with fused CUDA indexing/masking and an eager CPU oracle."""
+    implementation = _compiled_compactor if hidden.is_cuda else _compact_compressor_input
+    return implementation(hidden, boundary, cu, global_start, ratio, halo, capacity, cp_size)
+
+
+def _build_attention_indices(
     cu_seqlens,
     global_start,
     l_local,
@@ -130,6 +171,49 @@ def build_attention_indices(
     return indices, lengths, physical if for_indexer_loss else None, padding_mask
 
 
+_compiled_attention_indices = torch.compile(_build_attention_indices, fullgraph=True)
+
+
+def build_attention_indices(
+    cu_seqlens,
+    global_start,
+    l_local,
+    d_window,
+    window_size,
+    ratio,
+    compressed_width,
+    compressed_topk=None,
+    cu_seqlens_compressed=None,
+    seq_to_rank_row=None,
+    for_indexer_loss=False,
+    compressed_base=None,
+    compressed_rows=None,
+    compressed_is_sequence_major=False,
+    cu_seqlens_unpadded=None,
+    output_alignment=1,
+):
+    """Lower document-relative keys without materializing each CUDA pointwise intermediate."""
+    implementation = _compiled_attention_indices if cu_seqlens.is_cuda else _build_attention_indices
+    return implementation(
+        cu_seqlens,
+        global_start,
+        l_local,
+        d_window,
+        window_size,
+        ratio,
+        compressed_width,
+        compressed_topk=compressed_topk,
+        cu_seqlens_compressed=cu_seqlens_compressed,
+        seq_to_rank_row=seq_to_rank_row,
+        for_indexer_loss=for_indexer_loss,
+        compressed_base=compressed_base,
+        compressed_rows=compressed_rows,
+        compressed_is_sequence_major=compressed_is_sequence_major,
+        cu_seqlens_unpadded=cu_seqlens_unpadded,
+        output_alignment=output_alignment,
+    )
+
+
 def build_seq_lens(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -154,7 +238,7 @@ def build_seq_lens(
     return torch.where(row_valid, seq_lens, torch.zeros_like(seq_lens))
 
 
-def sanitize_topk(
+def _sanitize_topk(
     candidate_indices: torch.Tensor,
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -185,3 +269,12 @@ def sanitize_topk(
     )
     sanitized_indices = sanitized_indices.masked_fill(~selected_valid, -1)
     return sanitized_indices, (sanitized_indices >= 0).sum(dim=-1).int()
+
+
+_compiled_sanitize_topk = torch.compile(_sanitize_topk, fullgraph=True)
+
+
+def sanitize_topk(candidate_indices, scores, seq_lens, output_width=None):
+    """Sanitize selected keys with fused CUDA masks/gathers or the CPU reference path."""
+    implementation = _compiled_sanitize_topk if scores.is_cuda else _sanitize_topk
+    return implementation(candidate_indices, scores, seq_lens, output_width)

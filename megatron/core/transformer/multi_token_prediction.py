@@ -12,7 +12,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
-from megatron.core.context_parallel.sequence_roll import roll_contiguous
+from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -1147,21 +1147,22 @@ def process_mtp_loss(
         )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
-        mtp_labels, _ = roll_tensor(
-            mtp_labels,
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            return_sum=False,
-            cp_layout=config.attention_cp_layout,
-        )
-        if mtp_input_mask is not None:
-            # Each MTP step consumes one additional token. Accumulate validity so
-            # one invalid conditioning token also masks every later step on that path.
-            mask_metadata = torch.cat((loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0)
-            mask_metadata, _ = roll_tensor(
-                mask_metadata,
+        if config.attention_cp_layout == "contiguous":
+            mtp_labels, loss_mask, mtp_input_mask = roll_contiguous_fields(
+                (mtp_labels, loss_mask, mtp_input_mask), cp_group, packed_seq_params
+            )
+            layer_loss_mask = loss_mask
+            if mtp_input_mask is not None:
+                cumulative_mtp_input_mask = (
+                    mtp_input_mask
+                    if cumulative_mtp_input_mask is None
+                    else cumulative_mtp_input_mask & mtp_input_mask
+                )
+                layer_loss_mask = loss_mask * cumulative_mtp_input_mask
+            num_tokens = layer_loss_mask.sum()
+        else:
+            mtp_labels, _ = roll_tensor(
+                mtp_labels,
                 shifts=-1,
                 dims=-1,
                 cp_group=cp_group,
@@ -1169,27 +1170,42 @@ def process_mtp_loss(
                 return_sum=False,
                 cp_layout=config.attention_cp_layout,
             )
-            loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
-            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-            if cumulative_mtp_input_mask is None:
-                cumulative_mtp_input_mask = mtp_input_mask
+            if mtp_input_mask is not None:
+                # Each MTP step consumes one additional token. Accumulate validity so
+                # one invalid conditioning token also masks every later step on that path.
+                mask_metadata = torch.cat(
+                    (loss_mask, mtp_input_mask.to(dtype=loss_mask.dtype)), dim=0
+                )
+                mask_metadata, _ = roll_tensor(
+                    mask_metadata,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                    cp_layout=config.attention_cp_layout,
+                )
+                loss_mask, mtp_input_mask = mask_metadata.chunk(2, dim=0)
+                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+                if cumulative_mtp_input_mask is None:
+                    cumulative_mtp_input_mask = mtp_input_mask
+                else:
+                    cumulative_mtp_input_mask = cumulative_mtp_input_mask & mtp_input_mask
+                layer_loss_mask = loss_mask * cumulative_mtp_input_mask
+                num_tokens = layer_loss_mask.sum()
             else:
-                cumulative_mtp_input_mask = cumulative_mtp_input_mask & mtp_input_mask
-            layer_loss_mask = loss_mask * cumulative_mtp_input_mask
-            num_tokens = layer_loss_mask.sum()
-        else:
-            loss_mask, rolled_num_tokens = roll_tensor(
-                loss_mask,
-                shifts=-1,
-                dims=-1,
-                cp_group=cp_group,
-                packed_seq_params=packed_seq_params,
-                cp_layout=config.attention_cp_layout,
-            )
-            layer_loss_mask = loss_mask
-            # roll_tensor already computed this reduction. Preserve the legacy
-            # no-mask fast path for all non-multimodal MTP callers.
-            num_tokens = rolled_num_tokens
+                loss_mask, rolled_num_tokens = roll_tensor(
+                    loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    cp_layout=config.attention_cp_layout,
+                )
+                layer_loss_mask = loss_mask
+                # roll_tensor already computed this reduction. Preserve the legacy
+                # no-mask fast path for all non-multimodal MTP callers.
+                num_tokens = rolled_num_tokens
 
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
 
@@ -1518,25 +1534,49 @@ class MultiTokenPredictionLayer(MegatronModule):
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
-        if mtp_input_mask is None:
-            input_ids, _ = roll_tensor(
-                input_ids,
-                shifts=-1,
-                dims=-1,
-                cp_group=self.cp_group,
-                packed_seq_params=packed_seq_params,
-                return_sum=False,
-                cp_layout=self.config.attention_cp_layout,
-            )
-        else:
+        if mtp_input_mask is not None:
             assert mtp_input_mask.shape == input_ids.shape, (
                 f"mtp_input_mask shape {mtp_input_mask.shape} must match "
                 f"input_ids shape {input_ids.shape}"
             )
-            # Roll IDs and validity together so CP performs one boundary exchange.
-            token_metadata = torch.cat((input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0)
-            token_metadata, _ = roll_tensor(
-                token_metadata,
+        if self.config.attention_cp_layout == "contiguous":
+            input_ids, position_ids, padding_mask, mtp_input_mask = roll_contiguous_fields(
+                (input_ids, position_ids, padding_mask, mtp_input_mask),
+                self.cp_group,
+                packed_seq_params,
+                fill_values=(0, 0, True, False),
+            )
+            if mtp_input_mask is not None:
+                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+        else:
+            if mtp_input_mask is None:
+                input_ids, _ = roll_tensor(
+                    input_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                    cp_layout=self.config.attention_cp_layout,
+                )
+            else:
+                # Roll IDs and validity together so CP performs one boundary exchange.
+                token_metadata = torch.cat(
+                    (input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0
+                )
+                token_metadata, _ = roll_tensor(
+                    token_metadata,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                    cp_layout=self.config.attention_cp_layout,
+                )
+                input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
+                mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
+            position_ids, _ = roll_tensor(
+                position_ids,
                 shifts=-1,
                 dims=-1,
                 cp_group=self.cp_group,
@@ -1544,28 +1584,17 @@ class MultiTokenPredictionLayer(MegatronModule):
                 return_sum=False,
                 cp_layout=self.config.attention_cp_layout,
             )
-            input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
-            mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-            return_sum=False,
-            cp_layout=self.config.attention_cp_layout,
-        )
-        if padding_mask is not None:
-            padding_mask, _ = roll_tensor(
-                padding_mask,
-                shifts=-1,
-                dims=-1,
-                cp_group=self.cp_group,
-                packed_seq_params=packed_seq_params,
-                return_sum=False,
-                cp_layout=self.config.attention_cp_layout,
-                fill_value=True,
-            )
+            if padding_mask is not None:
+                padding_mask, _ = roll_tensor(
+                    padding_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                    cp_layout=self.config.attention_cp_layout,
+                    fill_value=True,
+                )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 

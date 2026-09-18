@@ -12,6 +12,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.experimental_attention_variant.csa_utils import packed_layout
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     HAVE_HADAMARD,
@@ -58,7 +59,7 @@ def _assert_match(actual, expected):
     ],
 )
 def test_packed_cp_matches_full_attention_and_gradients(
-    cp_size, ratio, backend, sparse, coeff, recompute
+    cp_size, ratio, backend, sparse, coeff, recompute, monkeypatch
 ):
     if Utils.world_size < cp_size:
         pytest.skip(f"requires {cp_size} ranks")
@@ -123,7 +124,19 @@ def test_packed_cp_matches_full_attention_and_gradients(
         rows = slice(pg.cp.rank() * count, (pg.cp.rank() + 1) * count)
         local = whole[rows].clone().requires_grad_()
         whole = whole.requires_grad_()
-        output, _ = model(local, attention_mask=None, packed_seq_params=packed)
+        # Exercise both chunked Top-K and dense loss, including rank/document seams,
+        # against an unchunked CP1 reference without adding another test matrix.
+        with monkeypatch.context() as chunking:
+            if backend == "cudnn" and ratio == 4 and not sparse and coeff > 0:
+                original = packed_layout.query_chunk_rows
+                chunking.setattr(
+                    packed_layout,
+                    "query_chunk_rows",
+                    lambda rows, width, live_buffers=1: min(
+                        128, original(rows, width, live_buffers)
+                    ),
+                )
+            output, _ = model(local, attention_mask=None, packed_seq_params=packed)
         expected, _ = reference(whole, attention_mask=None, packed_seq_params=packed)
         _assert_match(output, expected[rows])
         grad = torch.randn_like(expected)
