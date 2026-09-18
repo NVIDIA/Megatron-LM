@@ -710,6 +710,17 @@ class TransformerConfig(ModelParallelConfig):
     output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
+    moe_skip_dead_recompute: bool = False
+    """If True, an activation-recompute re-run of a MoE layer (recompute_granularity 'full', or
+    'selective' with 'moe' in recompute_modules; Megatron's own checkpoint function, not the
+    Transformer Engine one used under fp8/fp4) skips the work whose outputs nothing in the backward
+    reads: the experts' down projection GEMM (its backward needs its input and weight only) and the
+    expert-parallel combine (its backward is the cached dispatch through the routing handle).  The
+    re-run still builds the same autograd graph and saves the same tensors, so the gradients are
+    what they were; only the recomputed layer output values -- which nobody reads -- are
+    uninitialised.  Requires the flex token dispatcher with the deepep backend, grouped GEMM
+    through Transformer Engine's GroupedLinear, no latent MoE, and (with 'full') one layer per
+    recompute unit, so that no norm inside a recompute unit reads the skipped values."""
 
     ####################
     # fp8 related
@@ -2677,6 +2688,44 @@ class TransformerConfig(ModelParallelConfig):
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
 
+        if self.moe_skip_dead_recompute:
+            if self.recompute_granularity is None or (
+                self.recompute_granularity == "selective" and "moe" not in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_skip_dead_recompute needs the MoE layer to be recomputed: "
+                    "recompute_granularity 'full', or 'selective' with 'moe' in recompute_modules."
+                )
+            if (
+                self.recompute_granularity == "full"
+                and self.recompute_method == "uniform"
+                and self.recompute_num_layers != 1
+            ):
+                raise ValueError(
+                    "moe_skip_dead_recompute with recompute_granularity 'full' needs one layer per "
+                    "recompute unit (recompute_num_layers 1): a unit holding several layers would "
+                    "feed a skipped layer's output into the next layer's input norm."
+                )
+            if self.fp8 or self.fp4:
+                raise ValueError(
+                    "moe_skip_dead_recompute is not supported with fp8/fp4 (the Transformer Engine "
+                    "checkpoint function does not mark the recompute phase)."
+                )
+            if self.moe_token_dispatcher_type != "flex" or self.moe_flex_dispatcher_backend != "deepep":
+                raise ValueError(
+                    "moe_skip_dead_recompute is implemented for the flex token dispatcher with the "
+                    "deepep backend."
+                )
+            if not self.moe_grouped_gemm or self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_skip_dead_recompute needs moe_grouped_gemm through Transformer Engine's "
+                    "GroupedLinear (not the op fuser)."
+                )
+            if self.moe_latent_size:
+                raise ValueError(
+                    "moe_skip_dead_recompute is not supported with latent MoE (fc2_latent_proj reads "
+                    "the combine output)."
+                )
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
