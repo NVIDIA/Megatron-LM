@@ -11,8 +11,6 @@ import sys
 from importlib.metadata import distributions
 from pathlib import Path
 
-from testmon_cache import is_tracked_package, record_phase, validate_phase
-
 PHASES = ("prod", "experimental")
 
 
@@ -50,6 +48,8 @@ def _copy_database(cache_dir: Path, phase: str, rank: int) -> Path:
 
 
 def _testmon_dependency_override() -> str:
+    from testmon_cache import is_tracked_package
+
     installed_packages = {
         name for distribution in distributions() if (name := distribution.metadata["Name"])
     }
@@ -58,6 +58,9 @@ def _testmon_dependency_override() -> str:
 
 
 def _run(args: argparse.Namespace) -> int:
+    # Spawned workers reload this script after its directory leaves sys.path.
+    from testmon_cache import record_phase, validate_phase
+
     try:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
