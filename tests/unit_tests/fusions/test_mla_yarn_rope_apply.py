@@ -73,19 +73,28 @@ def _capture_cuda_graph(function):
 
 
 def _localization_available():
-    try:
-        from torch.cuda.green_contexts import is_localization_supported
-        from torch.cuda.memory import get_num_locality_domains
-    except ImportError:
-        return False
     if not torch.cuda.is_available():
         return False
     device = torch.cuda.current_device()
-    try:
-        supported = is_localization_supported(device)
-    except TypeError:
-        supported = is_localization_supported()
-    return supported and get_num_locality_domains(device) == 2
+    if os.getenv("NVTE_FORCE_DRIVER_LOCALIZATION", "0") != "1":
+        try:
+            from torch.cuda.green_contexts import is_localization_supported
+            from torch.cuda.memory import get_num_locality_domains
+
+            try:
+                supported = is_localization_supported(device)
+            except TypeError:
+                supported = is_localization_supported()
+            if supported and get_num_locality_domains(device) == 2:
+                return True
+        except (ImportError, TypeError):
+            pass
+
+    from transformer_engine.pytorch.tensor.driver_localization import (
+        is_driver_localization_supported,
+    )
+
+    return is_driver_localization_supported(device)
 
 
 class FakeCPGroup:
