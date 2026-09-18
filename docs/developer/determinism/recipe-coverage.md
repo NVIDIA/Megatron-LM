@@ -139,13 +139,82 @@ replays can bypass these wrappers. The inventory is therefore partial by
 construction. Wrappers/hooks can also affect compilation and scheduling: use
 the original uninstrumented recipe for final replay and performance validation.
 
-New model shapes, backends, or environment settings will often be unverified until
-a corresponding test is added. Rank-aware matching does not add a collective
-capture adapter: a generic wrapper cannot recover an explicit process group's
-semantics or reproduce a test's input hashes from opaque argument types. Those
-signatures remain unverified until an adapter records the complete matching
-contract. This exposes the work needed without extrapolating from a nearby
-passing configuration.
+New model shapes, backends, or environment settings remain unverified until
+matching replay evidence exists. Generic bindings do not recover an explicit
+process group's semantics or input hashes from opaque argument types. The
+collective adapter below records those separately; it does not match old seeded
+microbenchmarks by dropping their seeds, hashes or other configuration fields.
+
+## Explicit collective capture and replay
+
+For bounded diagnostics, a binding can select `"adapter": "tensor_parallel_collective"`.
+This mode **copies tensor contents to host memory and synchronizes device work**.
+Use the original uninstrumented recipe for final state replay and performance.
+The default metadata-only mode retains its behavior.
+
+Example binding at an actual call site:
+
+```json
+[
+  {
+    "target": "megatron.core.tensor_parallel.layers:reduce_from_tensor_model_parallel_region",
+    "op_id": "tensor_parallel_mappings",
+    "implementation": "mcore:reduce_from_tensor_model_parallel_region",
+    "adapter": "tensor_parallel_collective"
+  }
+]
+```
+
+Add `--collective-capture /shared/capture --max-collective-bytes 268435456`
+to the inventory command, keeping the original training script and arguments.
+Use a fresh directory on shared storage accessible to every rank. Each rank
+writes a manifest and SHA-256-addressed binary blobs. Raw tensor contents remain
+there; coverage JSON contains metadata and hashes. The byte limit applies per
+rank, including a bound on the storage needed to restore each tensor.
+`--max-signatures` also limits the number of recorded collective events. Exceeded
+limits and unsupported invocations produce capture issues, preventing D coverage
+while allowing the original training calls to proceed.
+
+The adapter supports the six direct TP/SP mappings (copy, reduce, first/last
+dimension all-gather and reduce-scatter), explicit multi-rank groups, FP32/BF16,
+equal shards and default mapping options. It records actual group membership,
+local rank, backend, NCCL version/settings, local GPU UUID, forward/backward
+policy, and input/upstream-gradient bytes. Each invocation is retained in order,
+including repeated backward traversals. Input snapshots precede possible
+in-place reduction. Restoration preserves logical bytes, shapes, strides,
+storage offsets and broadcast views; unused storage is zero-filled. No seed is
+inferred for materialized recipe tensors.
+
+Replay uses the same source, dependencies, environment, allocation and physical
+rank assignment as capture. The launcher applies the standard early MCore
+determinism policy, then checks it against the capture. Preparation rejects a
+different captured policy rather than relabelling it. With all rank captures
+visible, run under the original torchrun topology:
+
+```bash
+python -m torch.distributed.run --nproc-per-node 8 \
+  -m tools.determinism.replay_collectives \
+  --capture /shared/capture --evidence /shared/replay-evidence
+```
+
+Use the recipe's actual GPU count rather than assuming eight. The launcher uses
+the existing evidence plugin with a dedicated fixture, excluding generic
+unit-test defaults that would change the recipe's NCCL settings. Every rank's
+manifest, blob hashes and peer contracts are checked before collective replay.
+The initial protocol requires the same mapping/invocation/phase order on all
+global ranks; disjoint TP groups are supported. Each event runs three times with
+side-stream contention, compares all output/input-gradient bytes, and checks an
+independent CPU FP64 reference using the captured rank inputs. Forward and
+forward/backward evidence are produced separately, with their complete matching
+signatures. The existing consumer joins the resulting report to the inventory.
+
+Implicit groups, TP1, uneven splits, global buffers, alternate output-gradient
+semantics, higher-order autograd, mixed forward/backward runtime, incompatible
+rank schedules, quantized tensors, overlap and unbound/native collectives need
+separate adapters. Missing or corrupt blobs, truncation and incomplete ranks
+cannot establish replay evidence. This remains an operation diagnostic: matching
+results do not certify full training state, restarts, collective interactions,
+cross-allocation behavior, or performance.
 
 Full automatic operation discovery, first-divergence tensor comparison, and
 checkpoint-state certification are separate extensions; this PR provides the

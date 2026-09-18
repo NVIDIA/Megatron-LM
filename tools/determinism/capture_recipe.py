@@ -3,8 +3,9 @@
 """Opt-in inventory of explicitly bound kernel entrypoints during a recipe run.
 
 Run this module under torchrun, passing the original training script and args
-after --. Wrapping records input metadata only; it neither compares tensors nor
-adds CUDA synchronization. Captured calls are not a complete native-kernel trace.
+after --. Default wrapping records metadata without tensor reads or CUDA
+synchronization. Explicit collective capture also saves bounded tensor blobs
+for later replay. Captured calls are not a complete native-kernel trace.
 """
 
 from __future__ import annotations
@@ -130,14 +131,19 @@ def source_context(torch) -> dict:
 class Inventory:
     """Collect distinct signatures with bounded memory and visible truncation."""
 
-    def __init__(self, torch, limit: int):
+    def __init__(self, torch, limit: int, *, collectives=None):
         self.torch = torch
         self.limit = limit
         self.operations: dict[str, dict] = {}
         self.truncated = False
+        self.collectives = collectives
 
     def wrap(self, function, binding):
         """Wrap a declared callable while preserving its result and exceptions."""
+        if binding.get("adapter") == "tensor_parallel_collective":
+            from tools.determinism.collective_capture import wrap_collective
+
+            return wrap_collective(self, function, binding)
 
         @functools.wraps(function)
         def wrapped(*args, **kwargs):
@@ -204,8 +210,13 @@ def install_bindings(inventory: Inventory, bindings: list[dict]):
     try:
         seen = set()
         for binding in bindings:
-            if set(binding) != {"target", "op_id", "implementation"}:
-                raise ValueError("Each binding requires target, op_id and implementation")
+            fields = {"target", "op_id", "implementation"}
+            if set(binding) not in (fields, fields | {"adapter"}) or (
+                "adapter" in binding and binding["adapter"] != "tensor_parallel_collective"
+            ):
+                raise ValueError(
+                    "Each binding requires target, op_id and implementation, with an optional collective adapter"
+                )
             target = binding["target"]
             if target in seen:
                 raise ValueError(f"Duplicate binding: {target}")
@@ -248,10 +259,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--recipe-id", required=True)
     parser.add_argument("--max-signatures", type=int, default=10000)
+    parser.add_argument(
+        "--collective-capture",
+        type=Path,
+        help="Opt in to synchronized collective tensor snapshots in a fresh directory",
+    )
+    parser.add_argument("--max-collective-bytes", type=int, default=256 * 1024 * 1024)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command or args.max_signatures < 1:
+    if not command or args.max_signatures < 1 or args.max_collective_bytes < 1:
         parser.error("A training script and positive signature limit are required")
     # Honor the effective CLI/YAML policy before bound modules can import Core,
     # initialize CUDA or cache backend settings. Training still validates all
@@ -267,7 +284,16 @@ def main(argv: list[str] | None = None) -> int:
     path = args.output / f"rank-{os.environ.get('RANK', '0')}.json"
     if path.exists():
         parser.error("Use a fresh output directory; existing rank evidence will not be overwritten")
-    inventory = Inventory(torch, args.max_signatures)
+    collectives = None
+    if args.collective_capture is not None:
+        from tools.determinism.collective_capture import CollectiveCapture
+
+        collectives = CollectiveCapture(
+            args.collective_capture / f"rank-{os.environ.get('RANK', '0')}",
+            max_bytes=args.max_collective_bytes,
+            max_events=args.max_signatures,
+        )
+    inventory = Inventory(torch, args.max_signatures, collectives=collectives)
     report = {
         "schema_version": 1,
         "kind": "determinism_inventory",
@@ -281,6 +307,9 @@ def main(argv: list[str] | None = None) -> int:
 
     def write():
         report.update(truncated=inventory.truncated, operations=list(inventory.operations.values()))
+        if collectives is not None:
+            report["capture_issues"] = sorted(collectives.issues)
+            collectives.write(report)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         temporary.replace(path)
