@@ -1119,6 +1119,13 @@ class TransformerConfig(ModelParallelConfig):
     supported in TransformerEngine 2.7.0 and above.
     """
 
+    moe_fused_router_chain: bool = False
+    """Experiment line "fuse": run the sigmoid group-limited top-k routing, the dense probs /
+    map, the sequence-wise aux loss and their whole backward as ONE autograd Function with Triton
+    kernels (megatron/core/transformer/moe/fused_router_chain.py). Sigmoid score function with
+    seq_aux_loss balancing only; the eager path is taken where the chain does not apply.
+    """
+
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
