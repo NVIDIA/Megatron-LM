@@ -45,7 +45,10 @@ def triton_signature() -> dict:
 
 def runtime_signature(torch) -> dict:
     """Match the replay producer's schema-1 runtime settings."""
+    from torch.utils import deterministic
+
     return {
+        "fill_uninitialized_memory": deterministic.fill_uninitialized_memory,
         "autocast": torch.is_autocast_enabled(),
         "autocast_dtype": str(torch.get_autocast_dtype("cuda")),
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
@@ -149,13 +152,23 @@ class Inventory:
             }
             result = function(*args, **kwargs)
             self.record(signature, binding["target"])
-            backward_seen = False
+            backward_seen: set[str] = set()
 
             def backward(gradient):
-                nonlocal backward_seen
-                if not backward_seen:
-                    backward_seen = True
-                    self.record({**signature, "phase": "forward_backward"}, binding["target"])
+                backward_signature = {**signature, "phase": "forward_backward"}
+                runtime = runtime_signature(self.torch)
+                mode = self.torch.are_deterministic_algorithms_enabled()
+                if runtime != signature["runtime"] or mode != signature["deterministic_algorithms"]:
+                    backward_signature.update(
+                        backward_runtime=runtime, backward_deterministic_algorithms=mode
+                    )
+                key = signature_key(backward_signature)
+                if key not in backward_seen:
+                    if len(backward_seen) >= self.limit:
+                        self.truncated = True
+                        return gradient
+                    backward_seen.add(key)
+                    self.record(backward_signature, binding["target"])
                 return gradient
 
             def register(value):

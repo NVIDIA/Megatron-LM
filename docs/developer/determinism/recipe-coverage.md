@@ -45,6 +45,11 @@ records shapes, strides, dtypes, gradient requirements, mode, invocation counts,
 and source/environment provenance. It records successful forward calls and uses
 output-gradient hooks to record that backward traversed a call. It neither
 copies tensor contents nor adds CUDA synchronization.
+Hooks recheck runtime settings. When backward uses a different policy, the
+signature retains both the forward settings and explicit `backward_runtime` and
+`backward_deterministic_algorithms` fields. That mixed signature needs its own
+matching evidence. Multiple output hooks are counted once per distinct backward
+policy for a wrapped call; a later traversal under another policy is retained.
 Check every rank's observed signatures and invocation counts against the recipe.
 A training run can finish with an empty inventory when a bound entrypoint is
 unused or calls bypass the binding.
@@ -81,7 +86,13 @@ python -m tools.determinism.recipe_coverage /tmp/recipe-inventory \
 Source revision and the entire recorded environment must match. Shape, stride,
 dtype, mode, implementation, and phase matches are exact; no shape-range or
 backend equivalence is inferred. Driver versions and call-time autocast, TF32,
-and cuDNN settings are part of that match. Triton cache policy/directory and all
+cuDNN settings and the memory-fill flag are part of that match. Both inventory
+and replay must record `runtime.fill_uninitialized_memory` as an explicit boolean.
+Missing or non-boolean values remain unverified, including when both old records
+omit the field. The consumer does not infer a setting from source revision or a
+current default. If backward uses another runtime policy, its fill flag must also
+be explicit. Historical reports are not rewritten to the new default.
+Triton cache policy/directory and all
 `TRITON_AUTOTUNE_BLOCK_*` overrides are matched at startup and at each call,
 including changes made after capture starts. Older evidence without these fields
 does not match a new capture. A cache directory is provenance, not proof that

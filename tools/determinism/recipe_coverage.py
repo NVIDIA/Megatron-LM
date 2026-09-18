@@ -37,6 +37,17 @@ def signature_key(signature: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _has_memory_fill_policy(signature: dict) -> bool:
+    """Legacy or malformed policy records cannot establish a recipe match."""
+    runtimes = [signature.get("runtime")]
+    if "backward_runtime" in signature:
+        runtimes.append(signature["backward_runtime"])
+    return all(
+        isinstance(runtime, dict) and type(runtime.get("fill_uninitialized_memory")) is bool
+        for runtime in runtimes
+    )
+
+
 def _evidence_index(
     reports: list[dict], context: dict, observed_by_rank: dict[int, set[str]]
 ) -> tuple[dict, list[str]]:
@@ -66,6 +77,8 @@ def _evidence_index(
                 if type(rank) is not int or rank not in expected:
                     raise ValueError("Evidence contains an invalid rank")
                 signature = observation["signature"]
+                if not _has_memory_fill_policy(signature):
+                    continue
                 signatures = [signature]
                 # A forward+backward replay also compared its forward outputs.
                 if status == DETERMINISTIC and signature.get("phase") == "forward_backward":
@@ -174,7 +187,10 @@ def build_report(inventories: list[dict], evidence: list[dict]) -> dict:
             if match["status"] != DETERMINISTIC or operation["ranks"] <= set(match["ranks"])
         ]
         statuses = {match["status"] for match in matches}
-        if NONDETERMINISTIC in statuses:
+        if not _has_memory_fill_policy(operation["signature"]):
+            status = UNVERIFIED
+            reason = "Memory-fill policy is missing or not a boolean"
+        elif NONDETERMINISTIC in statuses:
             status = NONDETERMINISTIC
             reason = "Matching numerical mismatch; passing evidence does not erase it"
         elif DETERMINISTIC in statuses and not issues:
