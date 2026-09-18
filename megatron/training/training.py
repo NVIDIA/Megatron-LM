@@ -1367,7 +1367,7 @@ def num_floating_point_operations(
         if mtp_num_layers is None:
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
-        return hybrid_flops(
+        return int(hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
@@ -1402,10 +1402,10 @@ def num_floating_point_operations(
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-        )
+        ))
     else:
         # Compute standard Transformer model FLOPs.
-        return transformer_flops()
+        return int(transformer_flops())
 
 
 def get_start_time_from_progress_log():
@@ -2609,14 +2609,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for disable in per_chunk_disable_bucketing
         ]
 
+        current_stream = torch.cuda.current_stream()
         if config.cuda_graph_impl == "full_iteration":
             # DDP initialization must use the full-iteration capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
+        elif config.cuda_graph_impl == "none":
+            # Eager initialization is serialized with the current stream. A one-shot side stream
+            # can leave cached blocks unavailable to later allocations on the current stream.
+            ddp_stream = current_stream
         else:
             # Preserve a dedicated initialization stream for all other implementations.
             ddp_stream = torch.cuda.Stream()
-        ddp_stream.wait_stream(torch.cuda.current_stream())
+        if ddp_stream is not current_stream:
+            ddp_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
@@ -2634,8 +2640,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # Ensure initialization-stream work completes before touching params on the default stream.
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+        # Ensure side-stream initialization completes before touching params on the current stream.
+        if ddp_stream is not current_stream:
+            current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -4047,6 +4054,8 @@ def save_checkpoint_and_time(
         tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
         pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
         dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+        # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
+        dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
         # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
         dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
         expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
@@ -4058,7 +4067,8 @@ def save_checkpoint_and_time(
 
         if should_report_memory:
             # Track memory before checkpoint save.
-            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
+            # Gate on the full data-distribution group so gtp_remat peers do not each report.
+            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
 
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
@@ -4076,6 +4086,7 @@ def save_checkpoint_and_time(
                 pp_group=pp_group,
                 dp_cp_group=dp_cp_group,
                 dp_group=dp_group,
+                dp_gtp_remat_group=dp_gtp_remat_group,
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
             )
@@ -4087,7 +4098,7 @@ def save_checkpoint_and_time(
         if should_report_memory:
             # Track memory after checkpoint save.
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True):
-                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
+                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
 
         if args.fp8:
