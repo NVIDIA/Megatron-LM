@@ -11,22 +11,6 @@ parameters and checkpoint mappings, state updates, and operation-specific
 communication. Model assembly and global runtime management stay outside.
 
 
-> **Status (PR 1 of 4).** This PR establishes the package and moves the code in.
-> The SSM and attention families still carry their pre-move availability tables
-> (`HAVE_FLA`, `HAVE_CAUSAL_CONV1D`, …) and pick kernels inside their modules;
-> PRs 2 and 3 of this stack replace those with the `backends.py` selectors and
-> provider slots described below, and PR 4 finishes the docs. The guidance here is
-> the contract every *new* operation or backend must follow from now on; where a
-> helper it names does not exist yet, the section says which PR adds it.
-
-
-> **Status (PR 1 of 4).** This PR adds the package, its contributor guide and the two
-> shared helpers. The moves themselves land in the next three PRs of this stack — SSM
-> (helpers, Mamba2, GDN/GDN2, GDP, chunkwise CP), then sparse attention (DSA, CSA,
-> absorbed MLA, DeepSeek-v4), then the layer classes and layer configs — each leaving
-> deprecated aliases at the old paths. The layout and tables below describe the tree at
-> the end of the stack.
-
 Three rules hold everywhere in this package:
 
 1. **Choose once, call directly.** An operation binds its kernels in `__init__`
@@ -60,8 +44,8 @@ megatron/core/ops/
     └── dsv4.py            DeepSeek-v4 hybrid attention
 ```
 
-(`backends.py` and `reference.py` files appear in PRs 2 and 3 as each family is
-converted.)
+A family gains `backends.py` and `reference.py` when it adopts the selector pattern
+below; until then its module carries the availability checks it had before the move.
 
 | Location | Contents |
 | --- | --- |
@@ -191,8 +175,8 @@ Say you are adding a gated linear recurrence called `foo`.
    `backend_slot` asks the provider for `foo_recurrence()` and, if the provider
    predates the slot, falls back to `default()`. `resolve_kernel_backend` uses a
    spec-injected provider when there is one and otherwise derives one from
-   `config`. (`resolve_kernel_backend` and `KernelSelection` arrive in PR 2 of
-   this stack; until then a new operation calls its selector directly.)
+   `config`. Where a family has not adopted the provider slots yet, its module calls its
+   selector directly.
 
 6. **Add the provider slot** only if a different provider could reasonably answer
    it (an existing callable or builder already owns that boundary). Add a typed,
@@ -312,10 +296,6 @@ Rules:
 
 ## Selection
 
-*(This section describes the mechanism PR 2 of this stack adds to
-`megatron/core/models/backends.py`; the slot table lists the slots PRs 2 and 3
-introduce.)*
-
 `BackendSpecProvider` is the only construction API. A provider is configured once,
 when it is built, from the existing config fields collected in
 `megatron.core.models.backends.KernelSelection` (`deterministic_mode`,
@@ -410,7 +390,6 @@ source directory and are unchanged. The full old-to-new table is
 `tests/unit_tests/ops/` holds the package-level tests. In this PR:
 `test_deprecated_imports.py` (canonical module/class ownership and pickle round
 trips, import-path validation, the deprecated-path forwarders, and the absence
-of deprecated imports in the tree). PRs 2–3 add the selector, provider and
-`require` tests (`test_dependency_ownership.py`, `test_kernel_migration.py`,
-`test_kernel_repeatability.py`). Family behaviour tests live with their family
+of deprecated imports in the tree). Selector, provider and `require` tests join it as families adopt the
+selection pattern. Family behaviour tests live with their family
 under `tests/unit_tests/ssm/` and `tests/unit_tests/transformer/`.

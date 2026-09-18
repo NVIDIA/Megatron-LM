@@ -13,12 +13,15 @@ each family's ``backends.py`` says, in code next to the import, exactly what it 
 
 from __future__ import annotations
 
+import logging
 from importlib import import_module, metadata
 from importlib.util import find_spec
 from operator import attrgetter
 from types import ModuleType
 
 from packaging.version import InvalidVersion, Version
+
+logger = logging.getLogger(__name__)
 
 
 def is_available(module: str) -> bool:
@@ -40,22 +43,31 @@ def installed_version(module: str, dist: str | None = None) -> Version | None:
 
     Prefers ``module.__version__`` so source checkouts without distribution metadata still
     report a version, then falls back to ``importlib.metadata`` under ``dist`` (defaults to
-    the top-level module name).
+    the top-level module name). Every ``None`` is logged with its reason: callers treat an
+    unknown version as "requirement not met", which is safe but should not be silent.
     """
     top = module.split(".")[0]
     try:
         package = import_module(top)
-    except ImportError:
+    except ImportError as exc:
+        logger.warning("Cannot determine the version of %s: it failed to import (%s).", top, exc)
         return None
     candidate = getattr(package, "__version__", None)
     if candidate is None:
         try:
             candidate = metadata.version(dist or top)
         except metadata.PackageNotFoundError:
+            logger.warning(
+                "Cannot determine the version of %s: no __version__ and no distribution "
+                "metadata for %r (a source checkout that was not pip-installed?).",
+                top,
+                dist or top,
+            )
             return None
     try:
         return Version(str(candidate))
     except InvalidVersion:
+        logger.warning("Cannot parse the version of %s: %r is not PEP 440.", top, candidate)
         return None
 
 
@@ -73,6 +85,11 @@ def require(
     needed_by: str,
 ) -> ModuleType:
     """Import ``module`` and check it provides ``symbols`` (dotted names allowed).
+
+    ``symbols`` is variadic so the common call reads as a sentence, ``require("fla.ops.foo",
+    "chunk_foo", needed_by="Foo recurrence")``, and stays a one-liner when several exports
+    are needed. Everything after it is keyword-only, so a version string or a distribution
+    name can never be mistaken for a symbol.
 
     Raises ``ImportError`` -- the one exception type every family uses for a missing or
     broken optional library -- with a message that names the operation asking for it.
