@@ -87,48 +87,48 @@ class TestBuildCacheSources(unittest.TestCase):
             self.assertEqual(probes.read_text().splitlines(), expected_probes)
 
     def test_imports_every_available_pr_cache_source(self):
-        """BuildKit receives all readable cache manifests for a PR build."""
-        references = [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE, LEGACY_CACHE]
-        self._assert_sources(references, references, references)
+        """BuildKit receives readable namespaced caches and ignores the legacy cache."""
+        references = [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE]
+        self._assert_sources([*references, LEGACY_CACHE], references, references)
 
     def test_available_base_pr_does_not_hide_the_main_baseline(self):
         """A readable older donor must not prevent importing newer main layers."""
         available = [BASE_PR_CACHE, BASELINE_CACHE, LEGACY_CACHE]
         self._assert_sources(
-            available, available, [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE, LEGACY_CACHE]
+            available, [BASE_PR_CACHE, BASELINE_CACHE], [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE]
         )
 
     def test_missing_base_pr_key_does_not_probe_its_reference(self):
         """Builds without an associated base PR ignore that candidate."""
         self._assert_sources(
             [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE, LEGACY_CACHE],
-            [RUN_CACHE, BASELINE_CACHE, LEGACY_CACHE],
-            [RUN_CACHE, BASELINE_CACHE, LEGACY_CACHE],
+            [RUN_CACHE, BASELINE_CACHE],
+            [RUN_CACHE, BASELINE_CACHE],
             BASE_PR_KEY="",
         )
 
     def test_merge_group_keeps_its_baseline_first_sources(self):
-        """Merge groups retain their existing candidate list and order."""
+        """Merge groups import the baseline first and ignore the legacy cache."""
         self._assert_sources(
             [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE, LEGACY_CACHE],
-            [BASELINE_CACHE, RUN_CACHE, LEGACY_CACHE],
-            [BASELINE_CACHE, RUN_CACHE, LEGACY_CACHE],
+            [BASELINE_CACHE, RUN_CACHE],
+            [BASELINE_CACHE, RUN_CACHE],
             EVENT_NAME="merge_group",
         )
 
     def test_duplicate_main_and_run_reference_is_inspected_and_imported_once(self):
         """Main baseline builds reuse one probe when the run and baseline keys match."""
         self._assert_sources(
-            [BASELINE_CACHE],
-            [BASELINE_CACHE],
             [BASELINE_CACHE, LEGACY_CACHE],
+            [BASELINE_CACHE],
+            [BASELINE_CACHE],
             BASE_PR_KEY="",
             RUN_CACHE=BASELINE_CACHE,
         )
 
-    def test_no_available_cache_emits_empty_sources(self):
-        """A cold registry allows the build to continue with an empty cache input."""
-        self._assert_sources([], [], [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE, LEGACY_CACHE])
+    def test_only_legacy_cache_emits_empty_sources(self):
+        """A registry with only the legacy cache produces an empty cache input."""
+        self._assert_sources([LEGACY_CACHE], [], [RUN_CACHE, BASE_PR_CACHE, BASELINE_CACHE])
 
 
 if __name__ == "__main__":
