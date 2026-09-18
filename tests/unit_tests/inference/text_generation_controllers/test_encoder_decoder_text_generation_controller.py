@@ -85,7 +85,7 @@ class TestEncoderDecoderTextGenerationController:
             add_encoder=True,
             add_decoder=True,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'pp']
+                required_pgs=['tp', 'cp', 'pp', 'embd']
             ),
         ).cuda()
 

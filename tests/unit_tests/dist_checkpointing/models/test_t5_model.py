@@ -66,7 +66,7 @@ def initialize_t5_model(seed, encoder_decoder_spec_fn, num_layers=8, **config_kw
         add_encoder=add_encoder,
         add_decoder=add_decoder,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp', 'pp']
+            required_pgs=['tp', 'cp', 'pp', 'embd']
         ),
     )
 
