@@ -5,9 +5,20 @@
         "url": "https://docs.nvidia.com/megatron-core/developer-guide/nightly/"
     },
     {
-        "name": "0.17.0 (latest)",
+        "name": "0.19.0 (latest)",
+        "version": "0.19.0",
+        "url": "https://docs.nvidia.com/megatron-core/developer-guide/latest/",
+        "preferred": true
+    },
+    {
+        "name": "0.18.0",
+        "version": "0.18.0",
+        "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.18.0/"
+    },
+    {
+        "name": "0.17.0",
         "version": "0.17.0",
-        "url": "https://docs.nvidia.com/megatron-core/developer-guide/latest/"
+        "url": "https://docs.nvidia.com/megatron-core/developer-guide/0.17.0/"
     },
     {
         "name": "0.16.0",

@@ -79,7 +79,26 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
+
+    # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
+    # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.
+    TE_REV=$(sed -n 's/^transformer-engine = .*rev = "\([^"]*\)".*/\1/p' /workspace/pyproject.toml)
+    test -n "${TE_REV}"
+    TE_SHORT_REV="${TE_REV:0:8}"
+    NCCL_EP_JIT_HEADERS=$(find /root/.cache/uv/git-v0/checkouts \
+        -type d \
+        -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" \
+        -print -quit)
+    test -n "${NCCL_EP_JIT_HEADERS}"
+    test -f "${NCCL_EP_JIT_HEADERS}/device/hybrid_ep.cuh"
+    mkdir -p /opt/nccl-ep/include
+    cp -a "${NCCL_EP_JIT_HEADERS}" /opt/nccl-ep/include/
+    test -f /opt/nccl-ep/include/nccl_ep/device/hybrid_ep.cuh
 EOF
+
+ENV NCCL_EP_JIT_SOURCE_DIR=/opt/nccl-ep/include/nccl_ep
+ENV NCCL_EP_JIT_BUILD_INCLUDE_DIR=/usr/include
+ENV NCCL_EP_JIT_CUDA_INCLUDE_DIR=/usr/local/cuda/include
 
 # Install DeepEP
 ARG DEEPEP_COMMIT=de0dd1185142c727b9c118aeb4cc4702e34deeba

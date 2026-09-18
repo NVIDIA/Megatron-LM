@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -323,6 +324,40 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
+# Keys a client may never supply via `chat_template_kwargs`.
+#
+# `chat_template` replaces the Jinja template that the server renders for the
+# request. The template is server/tokenizer configuration (`--chat-template` or
+# the tokenizer's own template), never request data. Honoring a caller-supplied
+# template lets an unauthenticated POST hand us arbitrary Jinja that we then
+# compile and render synchronously: the sandbox blocks attribute escapes, but it
+# does not bound work, so nested `range()` loops or unbounded string
+# multiplication pin the worker and stall every other in-flight request on it.
+_DISALLOWED_CHAT_TEMPLATE_KWARGS = frozenset({"chat_template"})
+
+
+def _sanitize_chat_template_kwargs(raw_kwargs):
+    """Drop request-supplied `chat_template_kwargs` entries that are not caller-controllable.
+
+    Returns a new dict; the caller's object is never mutated. Non-dict input
+    (including `None`) yields an empty dict.
+    """
+    if not isinstance(raw_kwargs, dict):
+        if raw_kwargs is not None:
+            logger.warning("Ignoring non-dict chat_template_kwargs: %s", type(raw_kwargs).__name__)
+        return {}
+
+    sanitized = {k: v for k, v in raw_kwargs.items() if k not in _DISALLOWED_CHAT_TEMPLATE_KWARGS}
+    rejected = sorted(set(raw_kwargs) - set(sanitized))
+    if rejected:
+        logger.warning(
+            "Ignoring disallowed chat_template_kwargs key(s) from request: %s. "
+            "The chat template is server configuration; use --chat-template to set it.",
+            ", ".join(rejected),
+        )
+    return sanitized
+
+
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
@@ -438,12 +473,7 @@ try:
         parallel_tool_calls = req.get("parallel_tool_calls", True)
         tools_requested = bool(tools) and tool_choice != "none"
         messages = req.get("messages")
-        chat_template_kwargs = req.get("chat_template_kwargs", {})
-        if not isinstance(chat_template_kwargs, dict):
-            logger.warning(
-                "Ignoring non-dict chat_template_kwargs: %s", type(chat_template_kwargs).__name__
-            )
-            chat_template_kwargs = {}
+        chat_template_kwargs = _sanitize_chat_template_kwargs(req.get("chat_template_kwargs"))
         # --- 1. Parse Messages ---
         if not messages:
             return Response("Missing 'messages' field", status=400)
@@ -457,13 +487,24 @@ try:
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
+                # Template render + tokenization is synchronous and CPU-bound, so
+                # run it off the event loop. This is a latency mitigation, not a
+                # DoS defense: Jinja rendering is pure Python and holds the GIL,
+                # so an expensive template still degrades the loop badly (it just
+                # no longer hangs it outright). Request-supplied templates are
+                # rejected in _sanitize_chat_template_kwargs -- that is the actual
+                # fix. The real win here is the tokenizer half, which drops into
+                # Rust and releases the GIL for long conversations.
                 prompt_tokens = _coerce_to_token_id_list(
-                    tokenizer.apply_chat_template(
-                        template_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=template_tools,
-                        **chat_template_kwargs,
+                    await asyncio.to_thread(
+                        functools.partial(
+                            tokenizer.apply_chat_template,
+                            template_messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            tools=template_tools,
+                            **chat_template_kwargs,
+                        )
                     )
                 )
 
@@ -506,12 +547,15 @@ try:
 
                         # Get the templated tokenization of just the previous generation
                         retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                            tokenizer.apply_chat_template(
-                                messages_to_last_assistant_message,
-                                tokenize=True,
-                                add_generation_prompt=False,
-                                tools=template_tools,
-                                **chat_template_kwargs,
+                            await asyncio.to_thread(
+                                functools.partial(
+                                    tokenizer.apply_chat_template,
+                                    messages_to_last_assistant_message,
+                                    tokenize=True,
+                                    add_generation_prompt=False,
+                                    tools=template_tools,
+                                    **chat_template_kwargs,
+                                )
                             )
                         )
 
