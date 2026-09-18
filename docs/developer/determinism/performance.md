@@ -296,6 +296,45 @@ paths in every run. Unset and explicit cache locations still remain separate.
 This option does not establish equal cache contents, generated code or dispatch.
 Other runtime settings continue to require exact equality.
 
+For captured collectives, select the distinct pinned bundle format explicitly:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/calibration.py \
+  --collective-baseline /store/first-collective-run <first-manifest-sha256> \
+  --collective-baseline /store/second-collective-run <second-manifest-sha256> \
+  --output /reports/collective-calibration.json
+```
+
+Activation and collective inputs cannot be mixed in one invocation. The
+collective path rechecks every capture blob, replay/reference record, worker
+request and rank timing file before using the paired estimates. It also rejects
+reused raw timing arms under different publication metadata, including a
+head-only bundle that reuses arms from another base/head bundle. Repeated
+publication does not create another observation.
+
+Collective cohorts retain the **entire captured workload on every rank**, not
+only the row being displayed. Recipe identity, call order, input and upstream
+gradient byte hashes, shape/stride/storage offset, precision, rank membership,
+communicator options, source revisions, runtime and measurement settings must
+match. A changed peer input or neighboring captured call splits the cohort.
+Different event indices and groups remain separate even when their timings are
+identical. The tool does not infer equivalence across recipes, reorder events to
+make a match, or erase source/tooling differences to create repeated runs.
+
+The recorded hardware inventory and rank-to-device indices participate in the
+comparison. Host names, GPU UUIDs and checkout paths remain in run provenance;
+they do not split otherwise matching cohorts. Missing runtime/hardware metadata,
+inconsistent rank devices and ambiguous inventory entries fail calibration.
+The captured logical groups and hardware inventory do not prove physical fabric
+equivalence. Distinct device assignments do not prove independent allocations.
+
+The same `--compare-cache-locations` opt-in is available for collectives. JSON
+retains the original paths, full workload metadata, baseline identifiers, each
+run's paired ratios/intervals and arm medians. Markdown shows every event/group,
+including singleton cohorts. Hardware identifiers and environment values are
+part of the detailed provenance; retain and share reports according to the
+same access rules as their input artifacts.
+
 Each bundle contributes one median paired ratio. JSON retains each run's paired
 ratios and within-run intervals; Markdown shows the minimum, median, maximum and
 observed range across runs. Default/deterministic overhead stays separate from
