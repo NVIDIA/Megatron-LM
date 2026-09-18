@@ -134,7 +134,7 @@ def model_provider(
         add_encoder=add_encoder,
         add_decoder=add_decoder,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp', 'pp']
+            required_pgs=['tp', 'cp', 'pp', 'embd']
         ),
     )
 

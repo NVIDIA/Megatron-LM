@@ -81,6 +81,18 @@ class TestParallelAttention:
         else:
             assert num_weights == 66304
 
+    @pytest.mark.parametrize('missing_group', ['tp', 'cp'])
+    def test_constructor_rejects_omitted_process_group(self, missing_group):
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        delattr(pg_collection, missing_group)
+        with pytest.raises(AssertionError, match=f'must have {missing_group} process group'):
+            SelfAttention(
+                self.transformer_config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                pg_collection=pg_collection,
+            )
+
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass

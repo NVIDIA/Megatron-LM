@@ -2227,8 +2227,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 pg_collection, "cp"
             ), "TEDotProductAttention pg_collection must have cp pg"
             if cp_comm_type == "a2a+p2p":
-                assert hasattr(
-                    pg_collection, "hcp"
+                assert "hcp" in vars(
+                    pg_collection
                 ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
         self._tp_group = pg_collection.tp
 
@@ -2261,9 +2261,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    # pg_collection.hcp is guaranteed here: the caller-supplied branch above
-                    # asserts hasattr(pg_collection, "hcp") for cp_comm_type == "a2a+p2p", and
-                    # the fallback branch populates it.
+                    # Both the explicit collection and the compatibility fallback carry hcp.
                     extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type

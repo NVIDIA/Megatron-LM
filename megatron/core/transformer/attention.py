@@ -330,8 +330,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             "Attention requires an explicit pg_collection with tp/cp; "
             "see docs/developer/parallel-state-deprecation.md"
         )
-        assert hasattr(pg_collection, 'tp'), "Attention pg_collection must have tp process group"
-        assert hasattr(pg_collection, 'cp'), "Attention pg_collection must have cp process group"
+        assert 'tp' in vars(pg_collection), "Attention pg_collection must have tp process group"
+        assert 'cp' in vars(pg_collection), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
         # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
         # it on microbatches that carry no per-microbatch CP group.
@@ -1845,8 +1845,8 @@ class SelfAttention(Attention):
         # Q & K layernorm parameters.
         # Only this consistency check needs the DP group, so it is required here rather than in
         # __init__, which requires tp/cp only.
-        assert hasattr(
-            self.pg_collection, 'dp'
+        assert (
+            getattr(self.pg_collection, 'dp', None) is not None
         ), "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
         dp_group = self.pg_collection.dp
         rank = dp_group.rank()

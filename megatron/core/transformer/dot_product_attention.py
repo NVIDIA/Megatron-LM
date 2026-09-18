@@ -69,8 +69,8 @@ class DotProductAttention(MegatronModule):
             "DotProductAttention requires an explicit pg_collection; "
             "see docs/developer/parallel-state-deprecation.md"
         )
-        assert hasattr(
-            pg_collection, 'tp'
+        assert (
+            getattr(pg_collection, 'tp', None) is not None
         ), "DotProductAttention pg_collection must have tp process group"
         self.pg_collection = pg_collection
         self.tp_group = self.pg_collection.tp

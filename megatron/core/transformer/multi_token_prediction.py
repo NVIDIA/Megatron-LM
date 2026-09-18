@@ -2230,8 +2230,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                 getattr(pg_collection, group_name, None) is not None
             ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
         if self.config.mtp_hsm:
-            assert hasattr(
-                pg_collection, 'dp'
+            assert 'dp' in vars(
+                pg_collection
             ), "MultiTokenPredictionBlock with HSM requires a dp process group"
 
         self._build_layers(pg_collection)

@@ -386,6 +386,7 @@ class TestRuntimeCPGroupContract:
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp']),
         )
 
     def teardown_method(self, method):

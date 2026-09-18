@@ -654,7 +654,13 @@ class TestMultiTokenPredictionLayer:
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(
             tp=1, cp=1, use_te=True, use_repeated_layer=repeated
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            ),
+        )
 
         # Quantization is what would otherwise make TE act on the flag, so ask under it.
         config.fp8 = "hybrid"
