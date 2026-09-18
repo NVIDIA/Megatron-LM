@@ -23,7 +23,7 @@ from megatron.training.config.training_config import TokenizerConfig
 @pytest.fixture
 def isolated_globals(monkeypatch):
     """Avoid changing services owned by the distributed test harness."""
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_TOKENIZER"):
+    for name in ("_GLOBAL_ARGS", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE"):
         monkeypatch.setattr(global_vars, name, None)
 
 
@@ -57,6 +57,7 @@ def test_parse_only_prepares_args(monkeypatch, isolated_globals, experimental):
 
     assert arguments.parse_and_validate_args() is args
     assert global_vars.get_args() is args
+    assert global_vars._GLOBAL_TRAIN_STATE is None
     services.assert_not_called()
     if experimental:
         experimental_flag.assert_called_once_with(True)
@@ -155,9 +156,11 @@ def test_vocabulary_resolves_after_config_construction(
     initialize.assert_called_once_with(args)
 
 
-def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globals):
+@pytest.mark.parametrize("args_only", [False, True])
+def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globals, args_only):
     args = _runtime_args()
-    global_vars.set_args(args)
+    if not args_only:
+        global_vars.set_args(args)
     calls = []
     microbatches = Mock(side_effect=lambda **kwargs: calls.append("microbatches"))
     monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)
@@ -179,7 +182,20 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
 
         monkeypatch.setattr(global_vars, name, record)
 
-    global_vars.initialize_runtime_services(args)
+    initialize_train_state = global_vars._set_train_state
+
+    def record_train_state():
+        assert global_vars.get_args() is args
+        calls.append("_set_train_state")
+        initialize_train_state()
+
+    monkeypatch.setattr(global_vars, "_set_train_state", record_train_state)
+    assert global_vars._GLOBAL_TRAIN_STATE is None
+    if args_only:
+        global_vars.set_global_variables(args)
+    else:
+        global_vars.initialize_runtime_services(args)
+    assert isinstance(global_vars.get_train_state(), global_vars.TrainState)
     assert calls == [
         "microbatches",
         "_build_tokenizer",
@@ -190,6 +206,7 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
         "_set_timers",
         "_set_energy_monitor",
         "_set_telemetry",
+        "_set_train_state",
     ]
     microbatches.assert_called_once_with(
         rank=0,
