@@ -1136,6 +1136,10 @@ class _HybridEPManager(_DispatchManager):
             HAVE_HYBRIDEP_DENSE_ROUTING
             and self.config.moe_hybridep_routing_map_mode == "indices"
             and self.num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
+            # With pad-to-capacity the routing map is the capacity mask, so a token can carry
+            # more than topk assignments; a topk reconstruction would drop the padded ones while
+            # tokens_per_expert below still declares the full capacity. Keep the bool map.
+            and not self.drop_and_pad
         ):
             _, self.topk_idx = torch.topk(self.token_probs, self.router_topk, dim=-1)
             self.topk_idx = self.topk_idx.to(torch.int16)
@@ -1992,9 +1996,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # equal num_experts): for the deepep/ncclep backends the router pairs dense indices with
         # the selected [num_local_tokens, topk] weights; every other case (bool routing map, or
         # HybridEP's dense int16 indices) carries full [num_local_tokens, num_experts] probs.
-        dense_probs = routing_map.dtype != torch.bool and self.config.moe_flex_dispatcher_backend in (
-            "deepep",
-            "ncclep",
+        dense_probs = (
+            routing_map.dtype != torch.bool
+            and self.config.moe_flex_dispatcher_backend in ("deepep", "ncclep")
         )
         if dense_probs:
             assert probs.shape[-1] == routing_map.shape[-1], (

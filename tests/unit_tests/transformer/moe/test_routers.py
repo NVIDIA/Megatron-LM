@@ -98,6 +98,42 @@ def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports
     assert "topk_indices" not in received_kwargs
 
 
+@pytest.mark.parametrize("padding", ["none", "mixed", "all"])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_expert_bias_dense_counts_match_bool_path(padding, deterministic):
+    """Dense-index expert-bias counting must give the bool-path counts without changing the
+    tensor shape (no row filtering): padding tokens and invalid (-1) routes get zero weight."""
+    num_tokens, num_experts = 4, 4
+    indices = torch.tensor([[0, 1], [1, 2], [2, 3], [3, -1]])  # last token has one invalid route
+    valid = indices >= 0
+    bool_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool)
+    rows = torch.arange(num_tokens).unsqueeze(-1).expand_as(indices)
+    bool_map[rows[valid], indices[valid]] = True
+    padding_mask = {
+        "none": None,
+        "mixed": torch.tensor([False, True, False, False]),
+        "all": torch.ones(num_tokens, dtype=torch.bool),
+    }[padding]
+
+    def count(routing_map):
+        router = SimpleNamespace(
+            enable_expert_bias=True, local_tokens_per_expert=torch.zeros(num_experts)
+        )
+        prev = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(deterministic)
+        try:
+            TopKRouter._apply_expert_bias(router, routing_map, padding_mask=padding_mask)
+        finally:
+            torch.use_deterministic_algorithms(prev)
+        return router.local_tokens_per_expert
+
+    keep = torch.ones(num_tokens, dtype=torch.bool) if padding_mask is None else ~padding_mask
+    expected = (bool_map & keep.unsqueeze(-1)).sum(dim=0).to(torch.float32)
+
+    assert torch.equal(count(indices), expected)
+    assert torch.equal(count(bool_map), expected)
+
+
 class TestTop2Router:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)

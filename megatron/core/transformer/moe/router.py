@@ -782,15 +782,23 @@ class TopKRouter(Router):
                     assert (
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
-                    if use_dense_indices:
-                        routing_map = routing_map[~flat_mask]
-                    else:
+                    if not use_dense_indices:
                         routing_map = routing_map & (~flat_mask).unsqueeze(-1)
                 if use_dense_indices:
+                    # Fixed-shape counting: keep every [num_tokens, topk] slot and give padding
+                    # tokens and invalid (-1) routes a zero weight instead of filtering rows,
+                    # which would be a data-dependent shape (nonzero + host sync) inside this
+                    # compiled function and inside the moe_router CUDA graph scope.
                     expert_indices = routing_map.reshape(-1).to(torch.long)
                     token_counts = torch.ones_like(
                         expert_indices, dtype=self.local_tokens_per_expert.dtype
                     )
+                    if padding_mask is not None:
+                        valid = (~flat_mask).unsqueeze(-1).expand(-1, routing_map.shape[-1])
+                        token_counts = token_counts * valid.reshape(-1).to(token_counts.dtype)
+                    invalid_routes = expert_indices < 0
+                    expert_indices = expert_indices.masked_fill(invalid_routes, 0)
+                    token_counts = token_counts.masked_fill(invalid_routes, 0)
                     if torch.are_deterministic_algorithms_enabled():
                         self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
                     else:

@@ -594,6 +594,40 @@ def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
     assert torch.equal(manager.topk_idx, torch.tensor([[0], [-1]], dtype=torch.int16))
 
 
+def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
+    """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
+    topk assignments); the indices-mode topk reconstruction would drop the padded assignments
+    while tokens_per_expert still declares the full capacity, so the bool map must be kept."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    num_tokens, num_experts, topk, capacity_factor = 64, 2, 1, 2.0
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False,
+        moe_hybridep_routing_map_mode="indices",
+        moe_router_topk=topk,
+    )
+    manager.group = SimpleNamespace(size=lambda: 1)
+    manager.num_experts = num_experts
+    manager.num_local_experts = num_experts
+    manager.router_topk = topk
+    manager.moe_expert_rank_capacity_factor = None
+    manager.capacity_factor = capacity_factor
+    manager.drop_and_pad = True
+
+    # Every token picked expert 0; pad-to-capacity fills expert 1 with the same tokens.
+    capacity = get_capacity(num_tokens * topk, num_experts, capacity_factor)
+    assert capacity == num_tokens
+    routing_map = torch.ones(num_tokens, num_experts, dtype=torch.bool)
+    probs = torch.zeros(num_tokens, num_experts)
+    probs[:, 0] = 1.0
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager.topk_idx is None
+    assert torch.equal(manager.routing_map.sum(dim=0), torch.tensor([capacity, capacity]))
+    assert torch.equal(manager.tokens_per_expert, torch.tensor([capacity, capacity]))
+
+
 def test_hybridep_dense_input_requires_backend_support(monkeypatch):
     monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
     manager = object.__new__(_HybridEPManager)

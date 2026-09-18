@@ -1067,7 +1067,9 @@ class TransformerConfig(ModelParallelConfig):
     """Routing-map format for HybridEP. ``indices`` requests int16 top-k indices and is the
     default, while ``bool`` forces the bool token-to-expert map. Index routing remains gated on
     Transformer Engine and HybridEP support and the int16 expert limit; unsupported configurations
-    fall back to the bool routing-map path."""
+    fall back to the bool routing-map path. ``moe_pad_expert_input_to_capacity`` also forces the
+    bool path (with a warning): a pad-to-capacity routing map can hold more than topk assignments
+    per token, which dense top-k indices cannot represent."""
 
     moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
@@ -2044,6 +2046,18 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
             raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
+        if (
+            self.moe_hybridep_routing_map_mode == "indices"
+            and self.moe_pad_expert_input_to_capacity
+            and self.moe_token_dispatcher_type == "flex"
+            and self.moe_flex_dispatcher_backend == "hybridep"
+        ):
+            warnings.warn(
+                "moe_hybridep_routing_map_mode='indices' is disabled by "
+                "moe_pad_expert_input_to_capacity: a pad-to-capacity routing map can hold more "
+                "than topk assignments per token, which dense top-k indices cannot represent. "
+                "HybridEP will use the bool routing-map path."
+            )
 
         if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
