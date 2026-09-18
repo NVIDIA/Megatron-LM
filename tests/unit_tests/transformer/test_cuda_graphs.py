@@ -6,11 +6,14 @@ import sys
 
 import pytest
 import torch
+from transformer_engine.pytorch import Linear as TELinear
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -50,7 +53,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -470,10 +473,9 @@ class TestParallelTransformerBlockCudagraphs:
         )
 
     def teardown_method(self, method):
+        # Release validation graphs too, before destroying their process groups.
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -557,10 +559,8 @@ class TestPackedSeqCudagraphs:
 
     def teardown_method(self, method):
         try:
+            delete_cuda_graphs()
             Utils.destroy_model_parallel()
-            _CudagraphGlobalRecord.cudagraph_created = False
-            _CudagraphGlobalRecord.cudagraph_record = []
-            CudaGraphManager.global_mempool = None
         finally:
             for name, value in self.original_nvte_env.items():
                 if value is None:
@@ -867,10 +867,8 @@ def test_cuda_graph_determine_first_last_layer_logic(
     torch.cuda.synchronize()
 
     # Teardown
+    delete_cuda_graphs()
     Utils.destroy_model_parallel()
-    _CudagraphGlobalRecord.cudagraph_created = False
-    _CudagraphGlobalRecord.cudagraph_record = []
-    CudaGraphManager.global_mempool = None
     CudaGraphManager.fwd_mempools = None
     CudaGraphManager.bwd_mempools = None
 
@@ -957,9 +955,8 @@ class TestLLaVACudaGraph:
         )
 
     def teardown_method(self, method):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -1102,9 +1099,8 @@ class TestParallelHybridBlockCudagraphs:
         self.transformer_config = self.mamba_block.config
 
     def teardown_method(self, method):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),
@@ -1778,6 +1774,30 @@ class _RepeatedParameterModule(MegatronModule):
         return x + self.weight
 
 
+def _make_evaluation_module(config, whole_module):
+    """Mimic the expert-bias token accumulator for method and whole-module capture."""
+
+    class EvaluationModule(GraphableMegatronModule if whole_module else MegatronModule):
+        def __init__(self, config):
+            super().__init__(config)
+            self.projection = TELinear(
+                config.hidden_size, config.hidden_size, bias=False, device="cpu"
+            )
+            self.register_buffer("local_tokens_per_expert", torch.zeros(1))
+            self.forward_calls = 0
+
+        def forward(self, x):
+            return self.project(x)
+
+        def project(self, x):
+            self.forward_calls += 1
+            if torch.is_grad_enabled():
+                self.local_tokens_per_expert.add_(1)
+            return self.projection(x) * (2 if self.training else 3)
+
+    return EvaluationModule(config).cuda()
+
+
 class _SimpleNonModule:
     """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
 
@@ -1796,6 +1816,278 @@ def _make_simple_non_module(config):
     return _SimpleNonModule(config)
 
 
+class TestLocalCudaGraphEvaluation:
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    @pytest.mark.parametrize("whole_module", [False, True], ids=["wrapped_method", "whole_module"])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_separate_evaluation_graphs(self, whole_module, pp_size):
+        def first_output(output):
+            return output[0] if isinstance(output, tuple) else output
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=pp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        config = _base_cuda_graph_config(
+            use_cpu_initialization=True, cuda_graph_impl="local", cuda_graph_warmup_steps=0
+        )
+        module = _make_evaluation_module(config, whole_module)
+        if whole_module:
+            manager = module.cudagraph_manager
+        else:
+            manager = CudaGraphManager(
+                config, base_module=module, function_name="project", need_backward=True
+            )
+            module.cudagraph_manager = manager
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
+            module,
+        )
+        test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+
+        def train_step():
+            ddp_model.zero_grad_buffer()
+            x = test_input.detach().clone().requires_grad_()
+            output = first_output(ddp_model(x))
+            output.sum().backward()
+            ddp_model.finish_grad_sync()
+            return (
+                output.detach().clone(),
+                x.grad.clone(),
+                module.projection.weight.main_grad.clone(),
+            )
+
+        # PP creates one runner per microbatch. Validation must not rotate this list even when
+        # it runs a different number of microbatches, while PP=1 reuses its training runner.
+        for _ in range(2):
+            training_reference = train_step()
+        assert module.local_tokens_per_expert.item() == 2
+
+        create_cudagraphs()
+        assert module.local_tokens_per_expert.item() == 2
+        training_runners = list(manager.cudagraph_runners)
+        (val_runner,) = manager.val_cudagraph_runners
+        assert len(training_runners) == pp_size
+        assert not val_runner.grad_enabled
+        assert val_runner.bwd_graph is None
+        assert all(r.mempool == val_runner.mempool for r in training_runners)
+        assert _CudagraphGlobalRecord.cudagraph_record == []
+
+        # Validation must preserve accumulated training tokens, gradients, and runner order.
+        ddp_model.eval()
+        with torch.no_grad():
+            for _ in range(3):
+                eval_input = torch.randn_like(test_input)
+                reference_output = (
+                    module.forward(eval_input)
+                    if whole_module
+                    else module.project(eval_input, eager=True)
+                )
+                forward_calls = module.forward_calls
+                eval_output = first_output(ddp_model(eval_input))
+                assert module.forward_calls == forward_calls
+                torch.testing.assert_close(eval_output, reference_output)
+                assert not eval_output.requires_grad
+
+            # Unrecorded validation shapes must fail through the same lookup as training.
+            with pytest.raises(AssertionError, match="no matching cudagraph runners"):
+                ddp_model(test_input[:2].detach())
+
+        # Forward-only validation graphs cannot satisfy an autograd-enabled call.
+        with pytest.raises(AssertionError, match="no matching cudagraph runners"):
+            ddp_model(test_input)
+
+        assert module.local_tokens_per_expert.item() == 2
+        assert manager.cudagraph_runners == training_runners
+        torch.testing.assert_close(module.projection.weight.main_grad, training_reference[2])
+
+        ddp_model.train()
+        for _ in training_runners * 2:
+            torch.testing.assert_close(train_step(), training_reference)
+        assert module.local_tokens_per_expert.item() == 2 + 2 * len(training_runners)
+
+        delete_cuda_graphs()
+        assert manager.cudagraph_runners == training_runners
+        assert all(r.fwd_graph is None and r.bwd_graph is None for r in training_runners)
+        assert manager.val_cudagraph_runners == []
+        assert val_runner.fwd_graph is None and val_runner.mempool is None
+
+    def test_validation_graphs_match_method_and_inputs(self, monkeypatch):
+        class Module(MegatronModule):
+            def project(self, x, scale):
+                return x * scale
+
+            def shift(self, x, scale):
+                return x + scale
+
+        config = _base_cuda_graph_config(cuda_graph_impl="local", cuda_graph_warmup_steps=0)
+        module = Module(config)
+        managers = [
+            CudaGraphManager(config, base_module=module, function_name=name)
+            for name in ("project", "shift")
+        ]
+        cases = [("project", 4, 2), ("project", 2, 2), ("project", 4, 3), ("shift", 4, 2)]
+        for name, batch_size, scale in cases:
+            x = torch.randn(batch_size, config.hidden_size, device="cuda", requires_grad=True)
+            getattr(module, name)(x, scale=scale).sum().backward()
+        create_cudagraphs()
+        assert sum(len(m.val_cudagraph_runners) for m in managers) == len(cases)
+
+        def fail_eager(*args, **kwargs):
+            pytest.fail("Recorded validation signatures must replay their graphs")
+
+        for manager in managers:
+            monkeypatch.setattr(manager, "func", fail_eager)
+        module.eval()
+        with torch.no_grad():
+            for name, batch_size, scale in cases * 2:
+                x = torch.randn(batch_size, config.hidden_size, device="cuda")
+                output = getattr(module, name)(x, scale=scale)
+                expected = x * scale if name == "project" else x + scale
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    @pytest.mark.skipif(not fp8_available, reason="FP8 requires supported hardware")
+    @pytest.mark.parametrize("recipe", ["delayed", "mxfp8", "nvfp4"])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    def test_validation_capture_preserves_quantization_state(self, recipe, pp_size, monkeypatch):
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=pp_size)
+        model_parallel_cuda_manual_seed(123)
+        if recipe == "mxfp8":
+            from transformer_engine.pytorch.fp8 import check_mxfp8_support
+
+            supported, reason = check_mxfp8_support()
+            if not supported:
+                pytest.skip(reason)
+        elif recipe == "nvfp4":
+            if not is_te_min_version("2.7.0.dev0"):
+                pytest.skip("NVFP4 requires TE >= 2.7")
+            from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+            supported, reason = check_nvfp4_support()
+            if not supported:
+                pytest.skip(reason)
+
+        config = _base_cuda_graph_config(
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=2,
+            fp8="e4m3" if recipe != "nvfp4" else None,
+            fp8_recipe=recipe if recipe != "nvfp4" else "delayed",
+            fp4="e2m1" if recipe == "nvfp4" else None,
+        )
+
+        class QuantizedModule(MegatronModule):
+            def __init__(self):
+                super().__init__(config)
+                self.layer_number = 1
+                self.is_first_microbatch = True
+                self.projection = TELinear(64, 64, bias=False, params_dtype=torch.bfloat16)
+                self.register_buffer("forward_steps", torch.zeros(1, device="cuda"))
+
+            def forward(self, x):
+                self.forward_steps.add_(1)
+                output = self.projection(x, is_first_microbatch=self.is_first_microbatch)
+                self.is_first_microbatch = False
+                return output
+
+        module = QuantizedModule()
+        with torch.no_grad():
+            module.projection.weight.fill_(0.125)
+        module.cudagraph_manager = CudaGraphManager(
+            config, base_module=module, function_name="forward"
+        )
+        ddp_model = DistributedDataParallel(config, DistributedDataParallelConfig(), module)
+        context = get_fp4_context if recipe == "nvfp4" else get_fp8_context
+        x = torch.ones(64, 64, device="cuda", dtype=torch.bfloat16)
+
+        def train_step():
+            ddp_model.zero_grad_buffer()
+            module.set_is_first_microbatch()
+            for _ in range(pp_size):
+                with context(config):
+                    output = ddp_model(x.detach().requires_grad_())
+                output.sum().backward()
+            ddp_model.finish_grad_sync()
+            return output.detach().clone()
+
+        train_step()
+        create_fwd_graph = _CudaGraphRunner.create_fwd_graph
+        checked_state = []
+
+        def capture_fwd(runner, *args, **kwargs):
+            if runner.training:
+                return create_fwd_graph(runner, *args, **kwargs)
+            buffers = {name: buf.clone() for name, buf in module.named_buffers()}
+            quant_recipe = runner.fp4_recipe if recipe == "nvfp4" else runner.fp8_recipe
+            quant_state = cuda_graphs_module.save_fp8_tensors([module], quant_recipe)
+            create_fwd_graph(runner, *args, **kwargs)
+            torch.testing.assert_close(dict(module.named_buffers()), buffers)
+            torch.testing.assert_close(
+                cuda_graphs_module.save_fp8_tensors([module], quant_recipe), quant_state
+            )
+            checked_state.append(True)
+
+        monkeypatch.setattr(_CudaGraphRunner, "create_fwd_graph", capture_fwd)
+        create_cudagraphs()
+        assert checked_state == [True]
+        reference = train_step()
+        module.eval()
+        module.set_is_first_microbatch()
+        with torch.no_grad(), context(config):
+            for _ in range(2):
+                torch.testing.assert_close(module(x), reference)
+            # Preserve the calibrated range: increasing magnitude saturates delayed FP8.
+            module.projection.weight.neg_()
+        # The first training microbatch must refresh weights after validation's second
+        # microbatch disabled the shared FP8/FP4 parameter-cache update flag.
+        module.train()
+        torch.testing.assert_close(train_step(), -reference, rtol=0, atol=0)
+        module.eval()
+        module.set_is_first_microbatch()
+        with torch.no_grad(), context(config):
+            module.projection.weight.neg_()
+            torch.testing.assert_close(module(x), reference, rtol=0, atol=0)
+
+    def test_shared_pool_preserves_live_output_aliases(self):
+        class InplaceModule(MegatronModule):
+            def project(self, x):
+                return x * 3 if self.training else x.mul_(3)
+
+        config = _base_cuda_graph_config(cuda_graph_impl="local", cuda_graph_warmup_steps=1)
+        modules = [InplaceModule(config) for _ in range(2)]
+        for module in modules:
+            CudaGraphManager(config, base_module=module, function_name="project")
+        x = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+        modules[1].project(modules[0].project(x)).sum().backward()
+        create_cudagraphs()
+        for module in modules:
+            module.eval()
+        with torch.no_grad():
+            for _ in range(3):
+                x = torch.randn(4, config.hidden_size, device="cuda")
+                saved_x = x.clone()
+                first = modules[0].project(x)
+                expected_first = saved_x * 3
+                second = modules[1].project(first)
+                torch.testing.assert_close(x, saved_x)
+                torch.testing.assert_close(first, expected_first)
+                torch.testing.assert_close(second, expected_first * 3)
+
+
 class TestCheckpointParameterDiscovery:
     """Local-CG discovery and DDP readiness for a checkpointed nested module."""
 
@@ -1805,12 +2097,7 @@ class TestCheckpointParameterDiscovery:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
-        if _CudagraphGlobalRecord.cudagraph_created:
-            delete_cuda_graphs()
-        else:
-            _CudagraphGlobalRecord.cudagraph_record = []
-            _CudagraphGlobalRecord.cudagraph_inference_record = []
-            CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
         torch.cuda.set_stream(torch.cuda.default_stream())
         Utils.destroy_model_parallel()
 
@@ -1893,12 +2180,7 @@ class TestRepeatedParameterCapture:
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
-        if _CudagraphGlobalRecord.cudagraph_created:
-            delete_cuda_graphs()
-        else:
-            _CudagraphGlobalRecord.cudagraph_record = []
-            _CudagraphGlobalRecord.cudagraph_inference_record = []
-            CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
         torch.cuda.set_stream(torch.cuda.default_stream())
         Utils.destroy_model_parallel()
 
@@ -1952,6 +2234,7 @@ class TestRepeatedParameterCapture:
         create_cudagraphs()
 
         assert len(manager.cudagraph_runners) == 2
+        assert len(manager.val_cudagraph_runners) == 1
         torch.testing.assert_close(module.weight.main_grad, record_wgrad)
 
         ddp_model.zero_grad_buffer()
@@ -1994,10 +2277,7 @@ class TestInlineCaptureManager:
         )
 
     def teardown_method(self, method):
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        _CudagraphGlobalRecord.cudagraph_inference_record = []
-        CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
