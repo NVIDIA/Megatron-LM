@@ -277,12 +277,10 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Whole-layer + mixer lens spans, mirroring transformer_layer.py so the hybrid
-        # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
-        # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
-        # group is enabled, so zero cost on normal runs.
+        # Keep Mamba whole-layer and mixer spans aligned with the transformer-layer
+        # breakdown. These high-cardinality spans are gated by ``megatron.detail``.
         with _otel.managed_span(
-            _otel.DETAIL, 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+            _otel.DETAIL, _otel.SPAN_LAYER_FORWARD, **{_otel.LAYER_NUMBER: self.layer_number}
         ):
             hidden_states, residual, connection_state, recompute_context = (
                 self._prepare_mixer_state(
@@ -294,7 +292,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
-            with _otel.managed_span(_otel.DETAIL, 'megatron.layer.mamba'):
+            with _otel.managed_span(_otel.DETAIL, _otel.SPAN_LAYER_MAMBA):
                 if packed_sequence_cp_metadata is None:
                     mixer_out_with_bias = self.mixer(
                         hidden_states,

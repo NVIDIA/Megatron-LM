@@ -686,7 +686,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
-    @_otel.trace_fn(_otel.DETAIL, 'megatron.grad_sync.finish')
+    @_otel.trace_fn(_otel.DETAIL, _otel.SPAN_GRAD_SYNC_FINISH)
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
