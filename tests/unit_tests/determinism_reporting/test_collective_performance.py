@@ -462,6 +462,11 @@ def test_measure_excludes_setup_and_restores_mutated_inputs(adapter, monkeypatch
 
 @pytest.mark.parametrize("fault", [None, "missing_rank", "changed_evidence", "changed_source"])
 def test_parent_launches_paired_arms_and_retains_failures(adapter, monkeypatch, tmp_path, fault):
+    # This mocked parent is independent of pytest's own distributed launcher.
+    monkeypatch.delenv("TORCHELASTIC_RUN_ID", raising=False)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
     driver = load_module("benchmark_collectives")
     captures = capture_records()
     capture_root = tmp_path / "capture"
@@ -546,6 +551,28 @@ def test_parent_launches_paired_arms_and_retains_failures(adapter, monkeypatch, 
         assert len(report["comparisons"]) == 2
         assert len(report["runs"]) == 12
         assert all(len(run["rank_files"]) == 2 for run in report["runs"])
+
+
+@pytest.mark.parametrize(
+    "variable,value",
+    [
+        ("TORCHELASTIC_RUN_ID", "single-rank-torchrun"),
+        ("RANK", "1"),
+        ("WORLD_SIZE", "2"),
+        ("LOCAL_WORLD_SIZE", "2"),
+    ],
+)
+def test_parent_rejects_nested_distributed_launch(adapter, monkeypatch, tmp_path, variable, value):
+    for key in ("TORCHELASTIC_RUN_ID", "RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(variable, value)
+    driver = load_module("benchmark_collectives")
+    with pytest.raises(SystemExit) as stopped:
+        driver.main(
+            ["--capture", "unused", "--evidence", "unused", "--output", str(tmp_path / "out")]
+        )
+    assert stopped.value.code == 2
+    assert not (tmp_path / "out").exists()
 
 
 def test_startup_package_does_not_select_head_production(adapter, tmp_path):

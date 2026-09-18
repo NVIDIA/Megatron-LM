@@ -74,7 +74,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if min(args.pairs, args.warmup, args.steps, args.max_bytes) < 1:
         parser.error("pairs, warmup, steps and max-bytes must be positive")
-    if "RANK" in os.environ:
+    if (
+        "TORCHELASTIC_RUN_ID" in os.environ
+        or int(os.environ.get("WORLD_SIZE", "1")) != 1
+        or int(os.environ.get("LOCAL_WORLD_SIZE", "1")) != 1
+        or int(os.environ.get("RANK", "0")) != 0
+    ):
         parser.error("Launch the parent outside torchrun")
     if args.max_regression_ratio is not None and args.base_checkout is None:
         parser.error("A revision limit requires --base-checkout")
