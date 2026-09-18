@@ -21,6 +21,7 @@ from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -278,28 +279,42 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
     prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
 
-    # Start send and recv ops
+    # Keep each boundary exchange on its CP communicator. Using the default WORLD
+    # communicator couples otherwise independent DP lanes and can deadlock when
+    # packed batches issue different P2P sequences.
     ops = []
     if local_rank != 0:
-        req_send_first_part = torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank)
-        ops.append(req_send_first_part)
-        req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
-        ops.append(req_recv_second_part)
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
+            )
+        )
     else:
         # Inserted elements are set to be 0.0.
         tensor_recv_list[1] = 0
     if local_rank != len(global_ranks) - 1:
-        req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
-        ops.append(req_recv_first_part)
-        req_send_second_part = torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank)
-        ops.append(req_send_second_part)
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
+            )
+        )
     else:
         # For the last CP rank, the removed elements of second part go into the first part
         tensor_recv_list[0] = tensor_send_list[1]
 
     # Wait for all communication operations to complete
-    for op in ops:
-        op.wait()
+    for request in torch.distributed.batch_isend_irecv(ops):
+        request.wait()
 
     # Splicing: Replace boundary elements with received elements from adjacent ranks
     # This ensures proper sequence continuity across CP boundaries
@@ -398,19 +413,35 @@ def _roll_tensor_packed_seq(
 
         ops = []
         if local_rank != 0:
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
+                )
+            )
         else:
             tensor_recv_list[1].zero_()
 
         if local_rank != cp_size - 1:
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
+                )
+            )
+            ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
+                )
+            )
         else:
             tensor_recv_list[0].copy_(tensor_send_list[1])
 
-        for op in ops:
-            op.wait()
+        for request in torch.distributed.batch_isend_irecv(ops):
+            request.wait()
 
         index = [slice(None)] * rolled_chunks[0].dim()
         index[dims] = shifts
@@ -1099,6 +1130,21 @@ def process_mtp_loss(
         )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
+        if is_observing_tensor("mtp_logits"):
+            gather_output = (
+                getattr(output_layer, "gather_output")
+                if runtime_gather_output is None
+                else runtime_gather_output
+            )
+            observe_tensor(
+                output_layer,
+                f"mtp_logits.{mtp_layer_number}",
+                "mtp_logits",
+                mtp_logits,
+                tp_shard_dim=None if gather_output else -1,
+                sequence_dim=0,
+                batch_dim=1,
+            )
         mtp_labels, _ = roll_tensor(
             mtp_labels,
             shifts=-1,
@@ -1312,6 +1358,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 "skip_bias_add": False,
                 "is_expert": False,
                 "tp_group": pg_collection.tp if pg_collection is not None else None,
+                # Pass the collection, not just tp: the linear reads its GTP axis from it.
+                # With only tp_group it falls back to the MPU globals, which a MIMO run
+                # never creates, and the projection is then silently built unsharded.
+                "pg_collection": pg_collection,
             }
             self.e_proj = build_module(
                 self.submodules.e_proj,
@@ -1344,6 +1394,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_expert=False,
                 tp_comm_buffer_name="mtp_eh_proj",
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                # Same reason as projection_kwargs above: the GTP axis comes from the
+                # collection, and tp_group alone leaves it to the MPU fallback.
+                pg_collection=pg_collection,
                 name=(name + ".eh_proj") if name is not None else None,
             )
             self.e_proj = None
@@ -2134,6 +2187,12 @@ class MultiTokenPredictionBlock(MegatronModule):
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
+        if self.config.mtp_hsm and (
+            self.config.mtp_num_layers is None
+            or self.config.mtp_num_layers < 2
+            or 0 < mtp_num_depths < 2
+        ):
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
                 raise ValueError(

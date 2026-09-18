@@ -18,6 +18,8 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
     add_model_provider_args,
 )
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
+from examples.mimo.training.args import add_hetero_grid_args
+from megatron.core.transformer.enums import AttnBackend
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
@@ -90,6 +92,17 @@ def test_freeze_flags_drive_tower_freezing():
     assert args.freeze_vit is True
     assert args.freeze_lm is True
     assert args.freeze_projection is False
+
+
+@pytest.mark.parametrize("backend", [None, *AttnBackend])
+def test_vision_encoder_attention_backend_arg_uses_full_enum(backend):
+    argv = ["--model-provider", NEMOTRON_MODEL_PROVIDER]
+    if backend is not None:
+        argv.extend(["--mimo-vision-encoder-attention-backend", backend.name])
+
+    args = _parse(argv)
+
+    assert args.mimo_vision_encoder_attention_backend is backend
 
 
 # --- Config parity gate (requires torch; runs in CI) ----------------------
@@ -196,7 +209,10 @@ def _parse_validate(argv):
     saved = sys.argv
     sys.argv = ["pytest"] + argv
     try:
-        args = parse_args(add_model_provider_args, ignore_unknown_args=True)
+        args = parse_args(
+            lambda parser: add_hetero_grid_args(add_model_provider_args(parser)),
+            ignore_unknown_args=True,
+        )
     finally:
         sys.argv = saved
     validate_args(args)
@@ -311,6 +327,37 @@ def test_vision_submodules_spec_wires_radio_encoder():
 
 
 @pytest.mark.parametrize(
+    ("encoder_args", "expected_backend", "expected_flash_version"),
+    [
+        ([], AttnBackend.flash, 2),
+        (["--mimo-vision-encoder-attention-backend", "fused"], AttnBackend.fused, 2),
+        (
+            [
+                "--mimo-vision-encoder-attention-backend",
+                "flash",
+                "--mimo-vision-encoder-flash-attention-version",
+                "4",
+            ],
+            AttnBackend.flash,
+            4,
+        ),
+    ],
+)
+def test_vision_attention_backend_overrides(encoder_args, expected_backend, expected_flash_version):
+    """Encoder settings inherit global values unless explicitly overridden."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import vision_submodules_spec
+
+    argv = _build_argv(*_PRESET_20L)
+    argv.extend(["--flash-attention-version", "2", *encoder_args])
+    args = _parse_validate(argv)
+    spec = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+    config = spec.submodules["encoders"][RADIO_ENCODER_MODULE_NAME].params["transformer_config"]
+
+    assert config.attention_backend is expected_backend
+    assert config.flash_attention_version == expected_flash_version
+
+
+@pytest.mark.parametrize(
     "pixel_shuffle,expected_projection_input_size", [(True, 5120), (False, 1280)]
 )
 def test_projection_input_size_tracks_pixel_shuffle(pixel_shuffle, expected_projection_input_size):
@@ -329,6 +376,37 @@ def test_projection_input_size_tracks_pixel_shuffle(pixel_shuffle, expected_proj
     assert encoder.params["apply_pixel_shuffle"] is pixel_shuffle
     assert projection.params["input_size"] == expected_projection_input_size
     assert projection.params["config"].ffn_hidden_size == 4 * expected_projection_input_size
+
+
+def test_language_rank_placement_uses_language_parallelism():
+    from examples.mimo.model_providers import resolve_provider
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        language_input_projection_spec,
+        nemotron_language_config,
+        vision_submodules_spec,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    args = _parse_validate(_build_argv(*_PRESET_20L))
+    args.mimo_run_input_projections_on_llm_ranks = True
+    encoder_spec = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+
+    assert encoder_spec.submodules["input_projections"] == []
+
+    args.tensor_parallel_num_weight_shards = 4
+    language_config = nemotron_language_config(
+        args, tp_size=2, pp_size=1, ep_size=1, expt_tp_size=1
+    )
+    language_spec = ModuleSpec(module=object, params={"config": language_config})
+    projection = language_input_projection_spec(args, None, None, language_spec)
+
+    assert projection.params["input_size"] == 5120
+    assert projection.params["config"].tensor_model_parallel_size == 2
+    assert projection.params["config"].gtp_weight_remat_size == 2
+    provider = resolve_provider(args)
+    assert provider.language_input_projection_specs[RADIO_ENCODER_MODULE_NAME] is (
+        language_input_projection_spec
+    )
 
 
 # A full model instantiation (constructing MambaModel / RADIOEncoderWrapper) needs
