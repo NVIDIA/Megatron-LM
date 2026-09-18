@@ -57,17 +57,17 @@ def collective_reference(
     dtype = inputs[0].dtype
     tensors = inputs + grad_outputs
     if dtype not in (torch.float32, torch.bfloat16) or any(
-        tensor.device.type != "cpu" or tensor.dtype != dtype or tensor.ndim != 2
+        tensor.device.type != "cpu" or tensor.dtype != dtype or tensor.ndim < 1
         for tensor in tensors
     ):
-        raise ValueError("Reference inputs must be two-dimensional CPU FP32 or BF16 tensors")
+        raise ValueError("Reference inputs must be non-scalar CPU FP32 or BF16 tensors")
     if any(tensor.shape != inputs[0].shape for tensor in inputs) or any(
         tensor.shape != grad_outputs[0].shape for tensor in grad_outputs
     ):
         raise ValueError("Only equal-sized rank shards are supported")
     x = [value.detach().double() for value in inputs]
     dy = [value.detach().double() for value in grad_outputs]
-    dim = 0 if case.endswith("first") else 1
+    dim = 0 if case.endswith("first") else inputs[0].ndim - 1
     reductions = {}
 
     def reduced(values, key, split):

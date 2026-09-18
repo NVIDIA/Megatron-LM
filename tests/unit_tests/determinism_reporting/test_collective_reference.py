@@ -85,6 +85,22 @@ def test_all_mapping_outputs_and_gradients_match_hand_calculated_values(
         )
 
 
+@pytest.mark.parametrize("layout", ["contiguous_offset", "strided_offset", "broadcast_offset"])
+def test_replay_clone_preserves_captured_storage_offset(harness, layout):
+    source = torch.arange(24, dtype=torch.float32).reshape(4, 6)[1:]
+    if layout == "strided_offset":
+        source = source[:, ::2]
+    elif layout == "broadcast_offset":
+        source = source[:1].expand(3, 6)
+    source.requires_grad_()
+    clone = harness.clone_inputs((source,))[0]
+    assert clone.storage_offset() == source.storage_offset()
+    assert clone.stride() == source.stride()
+    assert clone.requires_grad
+    assert torch.equal(clone, source)
+    assert clone.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fault", ["missing_rank", "wrong_rank_slice", "gradient_sign"])
 def test_reference_rejects_rank_routing_and_reduction_corruption(dtype, fault):
@@ -108,6 +124,48 @@ def test_reference_rejects_rank_routing_and_reduction_corruption(dtype, fault):
             atol=0,
             reductions=reductions,
         )
+
+
+@pytest.mark.parametrize(
+    "case", ["copy", "reduce", "gather_first", "scatter_first", "gather_last", "scatter_last"]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(4,), (2, 3, 4)])
+def test_reference_training_shapes_match_the_two_dimensional_contract(case, dtype, shape):
+    value = torch.arange(1, 1 + torch.tensor(shape).prod().item(), dtype=dtype).reshape(shape)
+    dim = 0 if case.endswith("first") else value.ndim - 1
+    output_shape = list(shape)
+    if case.startswith("gather"):
+        output_shape[dim] *= 2
+    elif case.startswith("scatter"):
+        output_shape[dim] //= 2
+    gradient = torch.ones(output_shape, dtype=dtype)
+
+    def flatten(tensor):
+        return (
+            tensor.reshape(tensor.shape[0], -1)
+            if case.endswith("first")
+            else tensor.reshape(-1, tensor.shape[-1])
+        )
+
+    for rank in range(2):
+        reference, reductions, mathematical = collective_reference(
+            case, [value, 10 * value], [gradient, 2 * gradient], rank
+        )
+        flat_reference, flat_reductions, flat_math = collective_reference(
+            case,
+            [flatten(value), flatten(10 * value)],
+            [flatten(gradient), flatten(2 * gradient)],
+            rank,
+        )
+        for key, category in (("out", 0), ("in[0]", 1)):
+            assert torch.equal(flatten(reference[category][key]), flat_reference[category][key])
+            assert torch.equal(flatten(mathematical[category][key]), flat_math[category][key])
+        for key, reduction in reductions.items():
+            assert torch.equal(flatten(reduction.total), flat_reductions[key].total)
+            assert torch.equal(
+                flatten(reduction.sum_absolute_terms), flat_reductions[key].sum_absolute_terms
+            )
 
 
 def test_bf16_reduction_contract_does_not_assume_fp32_accumulation():

@@ -118,7 +118,7 @@ def _clone_preserving_layout(t: torch.Tensor) -> torch.Tensor:
     than production uses (e.g. ``selective_state_update``'s ``TIE_HDIM`` path).
     """
     src = t.detach()
-    if src.is_contiguous():
+    if src.is_contiguous() and src.storage_offset() == 0:
         return src.clone()
     extent = (
         src.storage_offset()
