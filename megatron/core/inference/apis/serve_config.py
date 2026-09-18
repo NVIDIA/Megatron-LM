@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import socket
 from dataclasses import dataclass, field
 
 
@@ -41,4 +42,27 @@ class ServeConfig:
 
     The default of 4 matches the existing ``start_text_gen_server`` default of
     ``num_replicas=4``.
+    """
+
+    sock: socket.socket | None = None
+    """Pre-bound listening socket to serve on instead of binding `host:port`.
+
+    Must already be bound to a real port; when set, `host` / `port` are not used for binding.
+    """
+
+    default_temperature: float = 1.0
+    """Default temperature value when an HTTP request omits `temperature`."""
+
+    default_top_p: float = 1.0
+    """Default top-p value when an HTTP request omits `top_p`."""
+
+    default_top_k: int = 0
+    """Default top-k value when an HTTP request omits `top_k`."""
+
+    eval_mode: bool = False
+    """Use evaluation defaults instead of RL-oriented response behavior.
+
+    In evaluation mode, chat requests default `prevent_retokenization` to false,
+    avoiding transmission of prompt token IDs. Individual requests can still
+    opt in by setting `prevent_retokenization` or `return_tokenized_data`.
     """

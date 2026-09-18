@@ -1,20 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
-import os
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-try:
-    from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
-except:
-    te_parallel_cross_entropy = None
-from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.models.backends import (
+    backend_slot,
+    get_backend_from_config,
+    select_cross_entropy,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -22,14 +18,14 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, set_attention_backend
 from megatron.core.utils import (
+    get_pg_rank,
     get_tensor_model_parallel_group_if_none,
-    is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
 
@@ -46,7 +42,7 @@ class LanguageModule(MegatronModule):
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         super().__init__(config=config)
-        self._set_attention_backend()
+        set_attention_backend(self.config)
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -63,6 +59,17 @@ class LanguageModule(MegatronModule):
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
+        # Choose the cross entropy implementation once, here, rather than on every forward.
+        # select_cross_entropy checks TE >= 2.7.0 for full-iteration CUDA graphs here.
+        self.vocab_parallel_cross_entropy = backend_slot(
+            backend=get_backend_from_config(config),
+            name="vocab_parallel_cross_entropy",
+            default=lambda: select_cross_entropy(
+                cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
+                cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
+                cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
+            ),
+        )
 
     def _setup_mtp_cuda_graphs(self):
         """Wrap `compute_mtp_single_step` with a CudaGraphManager.
@@ -105,42 +112,6 @@ class LanguageModule(MegatronModule):
         return False
 
     # pylint: disable=line-too-long
-    def _set_attention_backend(self):
-        """Set attention backend
-
-        Transformer engine works based on optout. By default all three attention backend flags are set to 1. So if the user choses a particular attention backend we set the other two to 0. If the user choses local, we set all 3 TE env variables to 0.
-        """
-
-        def check_and_set_env_variable(
-            env_variable_name: str, expected_value: int, attn_type: AttnBackend
-        ) -> None:
-            current_value = os.getenv(env_variable_name)
-            assert current_value is None or current_value == str(
-                expected_value
-            ), f'{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash/fused/unfused/auto/local). Default is auto.'
-            os.environ[env_variable_name] = str(expected_value)
-
-        if self.config.attention_backend == AttnBackend.local:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flash)
-        elif self.config.attention_backend == AttnBackend.flash:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.flash)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.flash)
-        elif self.config.attention_backend == AttnBackend.fused:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.fused)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.fused)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 0, AttnBackend.fused)
-        elif self.config.attention_backend == AttnBackend.unfused:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 0, AttnBackend.unfused)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 0, AttnBackend.unfused)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.unfused)
-        elif self.config.attention_backend == AttnBackend.auto:
-            check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
-            check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
-            check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
-
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
 
@@ -153,40 +124,9 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
-        if self.config.cross_entropy_loss_fusion:
-            if self.config.cross_entropy_fusion_impl == 'te':
-                if te_parallel_cross_entropy is not None:
-                    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-                    # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
-                    is_cg_capturable = (
-                        hasattr(self.config, 'cuda_graph_impl')
-                        and self.config.cuda_graph_impl == "full_iteration"
-                    )
-                    if is_cg_capturable and not is_te_min_version("2.7.0"):
-                        from megatron.core.utils import get_te_version
-
-                        current_version = get_te_version()
-                        raise AssertionError(
-                            f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
-                            f"but found version {current_version}. Please upgrade TransformerEngine "
-                            f"or set cuda_graph_impl to a value other than 'full_iteration'."
-                        )
-
-                    loss = te_parallel_cross_entropy(
-                        logits, labels, self.pg_collection.tp, is_cg_capturable
-                    )
-                else:
-                    raise RuntimeError("Trying to use a TE block when it's not present.")
-            elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
-        else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(
-                logits, labels, tp_group=self.tp_group
-            )
-
+        loss = self.vocab_parallel_cross_entropy(logits, labels, self.tp_group)
         # [s b] => [b, s]
-        loss = loss.transpose(0, 1).contiguous()
-        return loss
+        return loss.transpose(0, 1).contiguous()
 
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.
@@ -492,7 +432,7 @@ class LanguageModule(MegatronModule):
         last_stage_word_emb_replica_id = (
             1,  # copy of first stage embedding
             0,
-            parallel_state.get_data_parallel_rank(with_context_parallel=True),
+            get_pg_rank(metadata['dp_cp_group']),
         )
 
         sharded_state_dict[output_layer_weight_key] = make_tp_sharded_tensor_for_checkpoint(

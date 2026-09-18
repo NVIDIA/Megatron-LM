@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +14,9 @@ from torch.optim import SGD, Adam
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.optimizer import (
     ChainedOptimizer,
     OptimizerConfig,
@@ -23,9 +27,18 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.multi_latent_attention import (
+    FusedMLASelfAttention,
+    MLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.test_utils import _init_distributed
@@ -69,9 +82,58 @@ class Net(nn.Module):
         return x
 
 
+def test_copy_optimizer_param_metadata_preserves_allreduce():
+    source = torch.empty(1)
+    destination = torch.empty_like(source)
+    source.allreduce = False
+
+    copy_optimizer_param_metadata(destination, source)
+
+    assert destination.allreduce is False
+
+
+def test_get_param_groups_scopes_alignment_to_explicit_process_group(mocker):
+    """Disjoint module domains must not import each other's optimizer-group keys."""
+    module_group = object()
+    foreign_key = ((('lr_mult', 2.0),), False)
+    get_world_size = mocker.patch("torch.distributed.get_world_size")
+    all_gather_object = mocker.patch("torch.distributed.all_gather_object")
+
+    def world_size(*, group=None):
+        return 1 if group is module_group else 2
+
+    def gather(output, local_keys, *, group=None):
+        output[0] = local_keys
+        if group is None:
+            output[1] = [foreign_key]
+
+    get_world_size.side_effect = world_size
+    all_gather_object.side_effect = gather
+    net = Net()
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+    module_groups = _get_param_groups([net], config, {}, process_group=module_group)
+
+    assert len(module_groups) == 1
+    assert module_groups[0]['params'] == list(net.parameters())
+    get_world_size.assert_called_once_with(group=module_group)
+    assert all_gather_object.call_count == 1
+    assert all_gather_object.call_args.kwargs == {'group': module_group}
+
+    get_world_size.reset_mock()
+    all_gather_object.reset_mock()
+    world_groups = _get_param_groups([net], config, {})
+
+    assert len(world_groups) == 2
+    assert any(not group['params'] and group['lr_mult'] == 2.0 for group in world_groups)
+    get_world_size.assert_called_once_with(group=None)
+    assert all_gather_object.call_args.kwargs == {'group': None}
+
+
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_no_overrides(mock_get_world_size):
     net = Net()
@@ -101,7 +163,8 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_default_overrides(mock_get_world_size):
     """Test that the default overrides are applied to the parameter groups."""
@@ -118,7 +181,8 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_with_overrides(mock_get_world_size):
     net = Net()
@@ -143,7 +207,8 @@ def test_get_param_groups_with_overrides(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_multiple_matches(mock_get_world_size):
     net = Net()
@@ -173,7 +238,8 @@ def test_get_param_groups_multiple_matches(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_overlapping_matches(mock_get_world_size):
     """In this test, we see if we can have two matches that create three param groups."""
@@ -213,7 +279,8 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernorm: bool):
     """In this test, we see if the standard config overrides are applied correctly."""
@@ -249,7 +316,8 @@ def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernor
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, **_: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: bool):
     """In this test, we see if the `apply_wd_to_qk_layernorm` config is applied correctly."""
@@ -624,9 +692,11 @@ def test_mtp_grad_clipping_uses_separate_norms():
     class MockOptimizer:
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+        get_grad_norm = MegatronOptimizer.get_grad_norm
         get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
         has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
         _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
+        _uses_decoupled_grad = MegatronOptimizer._uses_decoupled_grad
         clip_grad_norm = MegatronOptimizer.clip_grad_norm
 
         def __init__(self, params):
@@ -1065,6 +1135,59 @@ def test_optimizer_reload_model_params():
             )
 
 
+def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_matching():
+    if not is_te_min_version("1.10.0"):
+        pytest.skip("Requires TE >= 1.10.0")
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True, mla_down_proj_fusion=True
+        ).self_attention.submodules
+        assert isinstance(submodules, MLASelfAttentionSubmodules)
+        fused_mla = FusedMLASelfAttention(
+            transformer_config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        )
+
+        model = nn.Module()
+        model.decoder = nn.Module()
+        model.decoder.layers = nn.ModuleList([nn.Module()])
+        model.decoder.layers[0].self_attention = fused_mla
+
+        prefix = "module.decoder.layers.0.self_attention."
+        sharded_state_dict = fused_mla.sharded_state_dict(prefix=prefix)
+        q_key = next(k for k in sharded_state_dict if k.endswith("linear_q_down_proj.weight"))
+        kv_key = next(k for k in sharded_state_dict if k.endswith("linear_kv_down_proj.weight"))
+        fused_key = f"{prefix}{next(k for k in fused_mla.state_dict() if k.endswith('linear_qkv_down_proj.weight'))}"
+        q_weight = sharded_state_dict[q_key].data
+        kv_weight = sharded_state_dict[kv_key].data
+        state_dict = {q_key: q_weight, kv_key: kv_weight}
+
+        DistributedOptimizer._synthesize_state_dict_params_for_model(state_dict, model)
+
+        assert fused_key in state_dict
+        assert q_key not in state_dict
+        assert kv_key not in state_dict
+        torch.testing.assert_close(state_dict[fused_key], torch.cat([q_weight, kv_weight], dim=0))
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(
     not is_torch_min_version("2.4.0"),
     reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
@@ -1287,3 +1410,63 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             use_gloo_process_groups=True,  # Should be False when using custom groups
             pg_collection=pg_collection_complete,
         )
+
+
+def _chain_member(param_groups):
+    """A MegatronOptimizer whose ``param_groups`` come from the given raw groups.
+
+    ``MegatronOptimizer.param_groups`` just forwards to ``self.optimizer.param_groups``,
+    so a namespace is enough and no real torch optimizer (or CUDA) is needed.
+    """
+    member = object.__new__(DistributedOptimizer)
+    member.is_stub_optimizer = False
+    member.optimizer = SimpleNamespace(param_groups=param_groups)
+    return member
+
+
+def _chain(*members):
+    chain = object.__new__(ChainedOptimizer)
+    chain.chained_optimizers = list(members)
+    return chain
+
+
+def test_synchronize_steps_with_nested_chained_optimizer():
+    """``_synchronize_steps`` must tolerate a member that is itself a ChainedOptimizer.
+
+    ``LayerWiseDistributedOptimizer`` subclasses ChainedOptimizer and holds more than one
+    inner optimizer whenever the model mixes optimizers, muon plus AdamW for instance, so
+    it presents to an outer chain as a nested ChainedOptimizer. Reaching through
+    ``.optimizer`` asserts on those; going through ``param_groups`` does not.
+    """
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 3}])
+    expert = _chain_member([{'params': [param], 'step': 3}])
+    # TE FusedAdam does not accumulate 'step' for empty param groups, which is the
+    # case _synchronize_steps exists to paper over; it must stay untouched.
+    empty = _chain_member([{'params': [], 'step': 99}])
+    nested = _chain(expert, empty)
+    outer = _chain(dense, nested)
+
+    # The bug this guards: the nested chain has >1 inner optimizer, so the
+    # ``.optimizer`` shortcut the old implementation used is not available.
+    with pytest.raises(AssertionError, match="more than one optimizer"):
+        nested.optimizer
+
+    step = outer._synchronize_steps()
+
+    assert step == 3
+    assert dense.param_groups[0]['step'] == 3
+    assert expert.param_groups[0]['step'] == 3
+    assert empty.param_groups[0]['step'] == 99
+
+
+def test_synchronize_steps_aligns_lagging_group():
+    """A group missing 'step' is left alone; populated groups converge on the one value."""
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 7}])
+    expert = _chain_member([{'params': [param]}])  # no 'step' yet
+    outer = _chain(dense, _chain(expert))
+
+    assert outer._synchronize_steps() == 7
+    assert dense.param_groups[0]['step'] == 7
+    assert 'step' not in expert.param_groups[0]

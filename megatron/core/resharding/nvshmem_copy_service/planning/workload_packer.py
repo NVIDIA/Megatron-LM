@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from typing import Dict, List
 
 from ..logger import PELogger
@@ -37,16 +38,22 @@ class WorkloadPacker:
             tasks = tasks_by_dest[dest_pe]
             workloads[dest_pe] = self._pack_single_destination(tasks, dest_pe)
 
-            if workloads[dest_pe]:
-                total_size = sum(b.total_size for b in workloads[dest_pe])
-                PELogger.debug(
-                    f"  Dest PE {dest_pe}: {len(tasks)} tasks → "
-                    f"{len(workloads[dest_pe])} batches, {total_size} bytes total"
-                )
-            else:
-                PELogger.debug(
-                    f"  Dest PE {dest_pe}: {len(tasks)} tasks → 0 batches (empty after packing)"
-                )
+            if PELogger.is_enabled_for(logging.DEBUG):
+                if workloads[dest_pe]:
+                    total_size = sum(b.total_size for b in workloads[dest_pe])
+                    PELogger.debug(
+                        "  Dest PE %s: %s tasks → %s batches, %s bytes total",
+                        dest_pe,
+                        len(tasks),
+                        len(workloads[dest_pe]),
+                        total_size,
+                    )
+                else:
+                    PELogger.debug(
+                        "  Dest PE %s: %s tasks → 0 batches (empty after packing)",
+                        dest_pe,
+                        len(tasks),
+                    )
 
         return workloads
 
@@ -70,11 +77,17 @@ class WorkloadPacker:
             if (would_exceed_size or would_exceed_task_cap) and current_batch.tasks:
                 # Finalize current batch
                 batches.append(current_batch)
-                task_first_10_string = ", ".join([str(t.task_id) for t in current_batch.tasks[:10]])
-                PELogger.debug(
-                    f"  Packed batch to PE {dest_pe} idx {len(batches) - 1}: "
-                    f"{task_first_10_string}... (total {len(current_batch.tasks)} tasks)"
-                )
+                if PELogger.is_enabled_for(logging.DEBUG):
+                    task_first_10_string = ", ".join(
+                        str(task.task_id) for task in current_batch.tasks[:10]
+                    )
+                    PELogger.debug(
+                        "  Packed batch to PE %s idx %s: %s... (total %s tasks)",
+                        dest_pe,
+                        len(batches) - 1,
+                        task_first_10_string,
+                        len(current_batch.tasks),
+                    )
                 # Start new batch
                 current_batch = WorkloadGroup(dest_pe=dest_pe, tasks=[], total_size=0)
 

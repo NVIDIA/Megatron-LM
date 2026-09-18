@@ -7,6 +7,8 @@ import torch
 
 from .utils import is_torch_min_version
 
+VALID_SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params")
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -43,6 +45,16 @@ class DistributedDataParallelConfig:
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
+
+    expert_data_parallel_sharding_strategy: Optional[str] = None
+    """Sharding strategy applied to expert (MoE) parameters on DP-Shard. Valid values are
+      'no_shard', 'optim', 'optim_grads', 'optim_grads_params'. When set,
+      `data_parallel_sharding_strategy` only applies to non-expert parameters, which allows
+      trading DP-Shard communication against memory separately for the two parameter classes
+      (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
+      already sharded over a narrower DP group than non-expert parameters when expert
+      parallelism is enabled, so the two classes have very different traffic-per-byte.
+      None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -177,13 +189,46 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_max_pool_double_buffer: bool = False
+    """
+    Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+    FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+    user buffer registration and CUDA graph replay for models with asymmetrical
+    FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+    """
+
+    hfsdp_param_gather_overlap: bool = False
+    """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
+    communication domains. DP-Inner retains its size-based prefetch policy, while
+    DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
+    Only effective with ``outer_dp_sharding_strategy='optim'``.
+    """
+
     def __post_init__(self):
         import os
 
         """Check the validity of the config."""
+        if self.expert_data_parallel_sharding_strategy is None:
+            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
+        for field_name in [
+            "data_parallel_sharding_strategy",
+            "expert_data_parallel_sharding_strategy",
+        ]:
+            strategy = getattr(self, field_name)
+            if strategy not in VALID_SHARDING_STRATEGIES:
+                raise ValueError(
+                    f"[Megatron-FSDP] Invalid {field_name}: {strategy}. "
+                    f"Valid values are {VALID_SHARDING_STRATEGIES}."
+                )
+
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        if self.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of double-buffer allocator.
+            self.fsdp_double_buffer = True

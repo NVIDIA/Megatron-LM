@@ -1,5 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain vision language model."""
+
+# Capture the true program start time BEFORE any heavy imports.
+import time
+
+_PROGRAM_START_TIME = time.time()
+
 import warnings
 from copy import deepcopy
 from functools import partial
@@ -23,7 +29,14 @@ from megatron.core.models.vision.vit_layer_specs import (
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import get_submodules, import_module
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    pretrain,
+    print_rank_0,
+    set_startup_timestamps,
+)
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from pretrain_gpt import loss_func
@@ -205,7 +218,9 @@ def model_provider(
         parallel_output=parallel_output,
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
+        language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
+        language_rope_scaling_factor=args.rope_scaling_factor,
         pre_process=parallel_state.is_pipeline_first_stage(),
         post_process=parallel_state.is_pipeline_last_stage(),
         add_encoder=parallel_state.is_pipeline_first_stage(),
@@ -471,6 +486,12 @@ def llava_position_embedding_ranks(pp_ranks):
 
 
 if __name__ == "__main__":
+    # Timestamp right after entering __main__ block (after all imports/library setup)
+    _MAIN_ENTRY_TIME = time.time()
+
+    # Register startup timestamps for timing report in pretrain()
+    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
+
     train_valid_test_datasets_provider.is_distributed = True
 
     args = parse_and_validate_args(
@@ -480,9 +501,9 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )

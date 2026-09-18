@@ -15,6 +15,7 @@ from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.tokenizers import MegatronTokenizerBase
 from megatron.core.utils import log_single_rank
 
@@ -76,6 +77,39 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
+    inter_document_masking: bool = False
+    """When True, return cu_seqlens marking document boundaries within each sample so
+    that attention is restricted to individual documents."""
+    sft_mock_dataset_config_json: Optional[str] = None
+    """JSON string (or path to a JSON file) configuring the mock SFT dataset's
+    sequence-length distribution. Two modes:
+
+      * ``{"mode": "file", "path": "/path/to/seqlens.csv"}`` -- read the
+        per-sample sequence lengths from a CSV file.
+      * ``{"mode": "distribution", "type": "lognormal", "min_seq_len": 1024,
+        "max_seq_len": 8192, "mean_seq_len": 4096, "lognormal_sigma": 1.1}``
+        -- draw lengths from a clipped lognormal distribution.
+
+    Consumed by ``MockSFTLowLevelDataset`` in
+    ``megatron/training/datasets/sft_dataset.py``, which documents the fields.
+    """
+
+    varlen_mock_dataset_config_json: Optional[str] = None
+    """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
+    used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
+    does not implicitly inherit SFT-specific knobs."""
+
+    varlen_sbhd_validation: bool = False
+    """When True, :class:`VarlenDataset.__getitem__` emits SBHD samples padded
+    to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
+    ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
+    SBHD reference run that mirrors the THD path's tokenization but skips all
+    packing — useful for THD numerical-correctness validation.
+
+    NOTE: this is a debugging/verification knob, not a training feature.
+    TODO: drop this field once a functional test covers THD-vs-SBHD numerical
+    parity in CI."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -85,6 +119,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        if self.varlen_sbhd_validation:
+            assert not self.hybrid_context_parallel, (
+                "--varlen-sbhd-validation is incompatible with "
+                "--hybrid-context-parallel (SBHD mode is not packed)."
+            )
 
         self.token_dtype_code = (
             None
@@ -140,7 +180,7 @@ class GPTDataset(MegatronDataset):
         self.cached_loss_mask = None
         self.cached_position_ids = None
 
-        (self.document_index, self.sample_index, self.shuffle_index) = (
+        self.document_index, self.sample_index, self.shuffle_index = (
             self._build_document_sample_shuffle_indices()
         )
 
@@ -233,9 +273,9 @@ class GPTDataset(MegatronDataset):
         """
         if idx is None:
             # Batch padding sequence so the index does not matter
-            text, _ = self._query_document_sample_shuffle_indices(0)
+            text, _, document_lengths = self._query_document_sample_shuffle_indices(0)
         else:
-            text, _ = self._query_document_sample_shuffle_indices(idx)
+            text, _, document_lengths = self._query_document_sample_shuffle_indices(idx)
 
         text = torch.from_numpy(text).long()
         if self.config.add_extra_token_to_sequence:
@@ -279,8 +319,56 @@ class GPTDataset(MegatronDataset):
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
-        if self.config.create_attention_mask:
-            return {
+        if self.config.inter_document_masking:
+            # document_lengths come from _query_document_sample_shuffle_indices
+            # which fetches sequence_length + add_extra_token_to_sequence tokens
+            # total. The extra token is appended to the last document part (used
+            # to produce the shifted labels), so subtract it before computing
+            # cu_seqlens which should index into the sequence_length-sized tokens
+            # tensor.
+            if self.config.add_extra_token_to_sequence:
+                document_lengths[-1] -= 1
+                if document_lengths[-1] == 0:
+                    document_lengths.pop()
+            # If the sample was padded (e.g., the last validation sample),
+            # fold the padding into the last document so cu_seqlens[-1]
+            # equals sequence_length.
+            shortfall = self.config.sequence_length - sum(document_lengths)
+            if shortfall > 0:
+                if document_lengths:
+                    document_lengths[-1] += shortfall
+                else:
+                    document_lengths.append(shortfall)
+            cu_seqlens = torch.tensor(numpy.cumsum([0] + document_lengths), dtype=torch.int32)
+
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+
+            # Reset position IDs per document.
+            position_ids = position_ids.clone()
+            for i in range(1, cu_seqlens.numel()):
+                start = cu_seqlens[i - 1].item()
+                end = cu_seqlens[i].item()
+                position_ids[start:end] = torch.arange(end - start, dtype=torch.long)
+
+            # Pad cu_seqlens to a fixed length so that default_collate can
+            # stack samples with different numbers of documents. Trailing
+            # entries are filled with sequence_length; the merge helper
+            # strips them later.
+            padded_cu_seqlens = torch.full(
+                (self.config.sequence_length + 1,), self.config.sequence_length, dtype=torch.int32
+            )
+            padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
+
+            result = {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "position_ids": position_ids,
+                "cu_seqlens": padded_cu_seqlens,
+                "max_seqlen": max_seqlen,
+            }
+        elif self.config.create_attention_mask:
+            result = {
                 "tokens": tokens,
                 "labels": labels,
                 "attention_mask": attention_mask,
@@ -288,33 +376,36 @@ class GPTDataset(MegatronDataset):
                 "position_ids": position_ids,
             }
         else:
-            return {
+            result = {
                 "tokens": tokens,
                 "labels": labels,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
             }
 
+        return result
+
     def _query_document_sample_shuffle_indices(
         self, idx: int
-    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    ) -> Tuple[numpy.ndarray, numpy.ndarray, list]:
         """Get the text (token ids) and document ids for a given index
 
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Tuple[numpy.ndarray, numpy.ndarray]: The text ids and document ids
+            Tuple[numpy.ndarray, numpy.ndarray, list]: The text ids, document ids,
+                and per-document token counts (before any padding).
         """
         if self.shuffle_index is None:
             # NOTE(asolergi-nv): Lazy memmap the indexes
-            self.shuffle_index = numpy.load(
+            self.shuffle_index = safe_numpy_load(
                 self.path_to_shuffle_index, allow_pickle=True, mmap_mode='r'
             )
-            self.sample_index = numpy.load(
+            self.sample_index = safe_numpy_load(
                 self.path_to_sample_index, allow_pickle=True, mmap_mode='r'
             )
-            self.document_index = numpy.load(
+            self.document_index = safe_numpy_load(
                 self.path_to_document_index, allow_pickle=True, mmap_mode='r'
             )
 
@@ -366,6 +457,8 @@ class GPTDataset(MegatronDataset):
 
         length = sum(map(len, sample_parts))
 
+        document_lengths = [len(p) for p in sample_parts]
+
         # Pad the sample if necessary
         if length < (self.config.sequence_length + self.config.add_extra_token_to_sequence):
             sample_parts.append(
@@ -376,6 +469,7 @@ class GPTDataset(MegatronDataset):
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
             numpy.array(document_ids, dtype=numpy.int64),
+            document_lengths,
         )
 
     def _build_document_sample_shuffle_indices(
@@ -576,7 +670,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the document index from {os.path.basename(path_to_document_index)}",
         )
         t_beg = time.time()
-        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode="r")
+        document_index = safe_numpy_load(path_to_document_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -586,7 +680,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
-        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
+        sample_index = safe_numpy_load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -596,7 +690,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}",
         )
         t_beg = time.time()
-        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
+        shuffle_index = safe_numpy_load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 

@@ -146,9 +146,10 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         --calculate-per-token-loss
         --init-model-with-meta-device
         --ckpt-format fsdp_dtensor
-        --grad-reduce-in-bf16
         --fsdp-double-buffer
         --use-nccl-ub
+        --megatron-fsdp-grad-comm-dtype bf16
+        --megatron-fsdp-main-grads-dtype bf16
     )
 fi
 

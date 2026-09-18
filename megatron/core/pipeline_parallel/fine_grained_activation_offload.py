@@ -1,17 +1,26 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+from torch.autograd.graph import saved_tensors_hooks
 
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
 
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+logger = logging.getLogger(__name__)
 
 
 def debug_rank(message):
@@ -24,34 +33,77 @@ def debug_rank(message):
         print(message)
 
 
-def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
-    """
-    Print an ASCII table summarizing offload bytes across all ranks.
+def _te_do_not_offload(tensor):
+    """Return whether TE marked a tensor-like object as non-offloadable."""
+    if getattr(tensor, "_TE_do_not_offload", False):
+        return True
+    if not hasattr(tensor, "get_data_tensors"):
+        return False
+    try:
+        data_tensors = tensor.get_data_tensors()
+    except Exception:  # pragma: no cover - best effort for third-party tensor wrappers
+        return False
+    return any(
+        data_tensor is not None and getattr(data_tensor, "_TE_do_not_offload", False)
+        for data_tensor in data_tensors
+    )
 
-    Gathers offload data from all ranks and prints a formatted table on rank 0,
-    with rows representing ranks and columns representing groups.
+
+def print_offload_summary_table(
+    total_offload_bytes: Dict[str, int],
+    local_duplicate_summary: Optional[Dict[str, Tuple[int, int]]] = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """
+    Print offload bytes and warn about duplicate copies across participating ranks.
+
+    Gathers both summaries in one object collective and reports them on group rank 0.
+    The table has rows representing ranks and columns representing groups.
+
+    The reported bytes are every byte copied to CPU, so a redundant copy of an
+    already-offloaded storage is counted like any other copy.
 
     Args:
         total_offload_bytes: Dict mapping group names to offload bytes for this rank.
+        local_duplicate_summary: Dict mapping group names to redundant-copy counts
+            and bytes for this rank.
+        process_group: Ranks participating in fine-grained activation offloading.
     """
     # pylint: disable=bad-builtin
     assert torch.distributed.is_initialized()
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank(group=process_group)
+    world_size = torch.distributed.get_world_size(group=process_group)
 
-    # Gather all group names across ranks
-    local_names = list(total_offload_bytes.keys())
-    all_names_list = [None] * world_size
-    torch.distributed.all_gather_object(all_names_list, local_names)
-    all_group_names = sorted(set(name for names in all_names_list for name in names))
+    local_summary = {
+        "offload_bytes": dict(total_offload_bytes),
+        "duplicate_summary": dict(local_duplicate_summary or {}),
+    }
+    all_summaries = [None] * world_size
+    torch.distributed.all_gather_object(all_summaries, local_summary, group=process_group)
 
-    # Gather offload bytes from all ranks: each rank sends a list of bytes per group
-    local_bytes = [total_offload_bytes.get(name, 0) for name in all_group_names]
-    all_bytes_list = [None] * world_size
-    torch.distributed.all_gather_object(all_bytes_list, local_bytes)
-
-    # Print ASCII table on rank 0
     if rank == 0:
+        details = []
+        for summary_rank, summary in enumerate(all_summaries):
+            for name, (copy_count, duplicate_bytes) in sorted(summary["duplicate_summary"].items()):
+                details.append(
+                    f"rank {summary_rank}, {name}: {copy_count} redundant copies, "
+                    f"{duplicate_bytes / (1024 * 1024):.2f} MB"
+                )
+        if details:
+            logger.warning(
+                "Fine-grained activation offloading is copying the same tensor storage to CPU "
+                "more than once within an offload group, wasting host memory and PCIe bandwidth "
+                f"({', '.join(details)}). Offloading proceeds with the duplicated copies."
+            )
+
+        all_group_names = sorted(
+            {name for summary in all_summaries for name in summary["offload_bytes"]}
+        )
+        all_bytes_list = [
+            [summary["offload_bytes"].get(name, 0) for name in all_group_names]
+            for summary in all_summaries
+        ]
+
         # Calculate column widths
         col_width = max(12, max((len(name) for name in all_group_names), default=8) + 2)
         rank_col_width = max(6, len(f"Rank {world_size - 1}") + 2)
@@ -92,12 +144,12 @@ def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
         print(totals_row)
         print("=" * len(header) + "\n")
 
-    torch.distributed.barrier()
+    torch.distributed.barrier(group=process_group)
 
 
-class GPUTensorPool:
+class OffloadTensorPool:
     """
-    GPU memory pool for efficient allocation and deallocation of tensors.
+    Memory pool for efficient allocation and deallocation of tensors.
 
     Features:
     - Supports multiple tensor shapes and dtypes, each with its own pool
@@ -106,7 +158,7 @@ class GPUTensorPool:
     - Uses queue-based management for O(1) allocation and deallocation
 
     Example:
-        pool = GPUTensorPool(device='cuda:0')
+        pool = OffloadTensorPool(device='cuda:0')
         tensor = pool.allocate((128, 512), dtype=torch.float32)
         # ... use tensor ...
         pool.free(tensor, (128, 512), dtype=torch.float32)
@@ -114,10 +166,10 @@ class GPUTensorPool:
 
     def __init__(self, device: str = 'cuda', pin_memory: bool = False):
         """
-        Initialize GPU tensor pool.
+        Initialize offload tensor pool.
 
         Args:
-            device: GPU device, default 'cuda'
+            device: Device, default 'cuda'
             pin_memory: Whether to use pinned memory (mainly for CPU tensors)
         """
         self.device = torch.device(device)
@@ -137,7 +189,7 @@ class GPUTensorPool:
             'pool_misses': 0,  # Number of times a new tensor was created
         }
 
-        debug_rank("GPUTensorPool: Initialized with dynamic allocation")
+        debug_rank("OffloadTensorPool: Initialized with dynamic allocation")
 
     def _get_pool_key(self, shape: Tuple, dtype: torch.dtype) -> Tuple:
         """Generate a unique key for the pool based on shape and dtype."""
@@ -182,7 +234,7 @@ class GPUTensorPool:
             tensor = pool['free'].popleft()
             self._stats['pool_hits'] += 1
             debug_rank(
-                f"GPUTensorPool.allocate: Reused tensor from pool, "
+                f"OffloadTensorPool.allocate: Reused tensor from pool, "
                 f"shape={shape}, dtype={dtype}, "
                 f"remaining in pool={len(pool['free'])}"
             )
@@ -195,7 +247,7 @@ class GPUTensorPool:
 
             memory_mb = self._calculate_memory_size(shape, dtype) / (1024**2)
             debug_rank(
-                f"GPUTensorPool.allocate: Created new tensor, "
+                f"OffloadTensorPool.allocate: Created new tensor, "
                 f"shape={shape}, dtype={dtype}, "
                 f"memory={memory_mb:.2f} MB, "
                 f"total_created={len(pool['all'])}"
@@ -245,7 +297,7 @@ class GPUTensorPool:
         self._stats['current_in_use'] -= 1
 
         debug_rank(
-            f"GPUTensorPool.free: shape={shape}, dtype={dtype}, "
+            f"OffloadTensorPool.free: shape={shape}, dtype={dtype}, "
             f"available in pool={len(pool['free'])}"
         )
 
@@ -294,7 +346,7 @@ class GPUTensorPool:
 
     def reset(self):
         """Reset the pool, marking all tensors as available."""
-        debug_rank("GPUTensorPool: Resetting pool...")
+        debug_rank("OffloadTensorPool: Resetting pool...")
 
         for pool_key, pool in self._pools.items():
             # Clear and refill the free queue
@@ -304,11 +356,11 @@ class GPUTensorPool:
             pool['allocated_count'] = 0
 
         self._stats['current_in_use'] = 0
-        debug_rank("GPUTensorPool: Reset complete")
+        debug_rank("OffloadTensorPool: Reset complete")
 
     def clear(self):
         """Clear the pool and release all GPU memory."""
-        debug_rank("GPUTensorPool: Clearing pool...")
+        debug_rank("OffloadTensorPool: Clearing pool...")
 
         for pool_key, pool in self._pools.items():
             # Clear all references, allowing PyTorch GC to reclaim memory
@@ -322,7 +374,7 @@ class GPUTensorPool:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        debug_rank("GPUTensorPool: Clear complete")
+        debug_rank("OffloadTensorPool: Clear complete")
 
     def __del__(self):
         """Destructor to ensure resources are released."""
@@ -342,10 +394,13 @@ class OffloadTensorGroup:
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
+        # Warmup-only bookkeeping for redundant copies within this group.
+        self.duplicate_storage_tensor_count = 0
+        self.duplicate_storage_bytes = 0
         # Using memory pool is for the compatibility with cuda graph.
-        # Shapes of tensors for expert_fc1 and moe_act are not known in advance,
+        # Shapes of tensors for MoE activation offload groups are not known in advance,
         # so we do not use CPU pool for them.
-        if name == "expert_fc1" or name == "moe_act":
+        if name in ("expert_fc1", "moe_act", "fused_group_mlp"):
             self.use_cpu_pool = False
         else:
             self.use_cpu_pool = True
@@ -375,9 +430,14 @@ class OffloadTensorGroup:
         stream.wait_event(self._reload_event)
 
     def update_offload_info(self, tensor):
-        """Update the offload information."""
+        """Update the offload information with the tensor actually copied to CPU."""
         self.total_offload_bytes += tensor.numel() * tensor.element_size()
         self.total_tensor_count += 1
+
+    def set_duplicate_storage_info(self, tensor_count, duplicate_bytes):
+        """Set redundant-copy statistics calculated for this group."""
+        self.duplicate_storage_tensor_count = tensor_count
+        self.duplicate_storage_bytes = duplicate_bytes
 
 
 class PipelineOffloadManager:
@@ -411,11 +471,18 @@ class PipelineOffloadManager:
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
+        # TE CUDA graph offload paths need a stream/event pair that lives outside
+        # individual layer objects so capture, replay, and backward hooks order
+        # the same D2H/H2D work with the same synchronization primitives.
+        self._cuda_graph_stream = torch.cuda.Stream()
+        self._cuda_graph_event = torch.cuda.Event(external=True)
         # Shared CPU tensor pool for all chunks to improve reuse efficiency
-        self._cpu_tensor_pool = GPUTensorPool(device="cpu", pin_memory=True)
+        self._cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
 
         # Whether the manager is in warmup phase.
         self._is_warmup = True
+        # Whether the manager is in CUDA graph replay phase.
+        self._in_replay = False
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each forward pass.
         self._cached_chunks_forward = []
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each backward pass.
@@ -434,6 +501,12 @@ class PipelineOffloadManager:
         self._delayed_offload_groups = []
         self.reset()
 
+        # Keep the hook context object around so each offload scope can enter/exit
+        # the same autograd saved-tensor hooks without touching private torch APIs.
+        self._saved_tensors_hooks = saved_tensors_hooks(
+            self.on_save_for_backward, self.on_get_saved_tensor
+        )
+
     @property
     def d2h_stream(self):
         """Get the device-to-host (GPU to CPU) transfer stream."""
@@ -445,24 +518,37 @@ class PipelineOffloadManager:
         return self._h2d_stream
 
     @property
+    def cuda_graph_stream(self):
+        """Get the CUDA graph stream."""
+        return self._cuda_graph_stream
+
+    @property
+    def cuda_graph_event(self):
+        """Get the CUDA graph event."""
+        return self._cuda_graph_event
+
+    @property
     def cpu_tensor_pool(self):
         """Get the shared CPU tensor pool."""
         return self._cpu_tensor_pool
 
-    def push_offload_groups(self, group_hook, forced_released_tensors):
+    def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
         debug_rank(f"pushing offload groups to the delayed queue")
-        self._delayed_offload_groups.append((group_hook, forced_released_tensors))
+        # Store the group name because delayed CUDA graph replay flushes later,
+        # after the original group-start site has already moved on.
+        self._delayed_offload_groups.append((group_hook, name, forced_released_tensors))
 
     def flush_delayed_groups(self):
         """Flush the delayed groups."""
         debug_rank("flushing delayed groups")
-        # Flush the delayed groups in reverse order to maintain the order of the groups.
-        for group_hook, forced_released_tensors in reversed(self._delayed_offload_groups):
-            group_hook(forced_released_tensors)
+        # Preserve the original forward commit order; reload scheduling still
+        # relies on the same group order discovered during warmup.
+        for group_hook, name, forced_released_tensors in self._delayed_offload_groups:
+            group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
 
-    def reset(self):
+    def reset(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset manager state for a new training iteration."""
         self._inside_context = False
         self._cur_forward_chunk = None
@@ -473,7 +559,7 @@ class PipelineOffloadManager:
 
         # Call post_warmup_callback after warmup to collect the offload information.
         if self._is_warmup and len(self._cached_chunks_forward) > 0:
-            self.post_warmup_callback()
+            self.post_warmup_callback(process_group=process_group)
         self._cached_chunks_index_backward = 0
         self._cached_chunks_index_forward = 0
 
@@ -520,7 +606,7 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_forward:
             chunk.do_offload = True
 
-    def post_warmup_callback(self):
+    def post_warmup_callback(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Callback after warmup."""
         # pylint: disable=bad-builtin
         debug_rank("post_warmup_callback")
@@ -550,13 +636,53 @@ class PipelineOffloadManager:
                 debug_rank(f"setting offload to false for group {name} at chunk index {chunk_idx}")
             else:
                 break
-        debug_rank(f"offload margin {self._offload_margin}")
         assert self._offload_margin == 0, "Offload margin is not 0"
+        # Disable the groups to meet the delta offload bytes across PP ranks.
+        keep_on_gpu_bytes = self._pp_rank * self._delta_offload_bytes_across_pp_ranks
+        for chunk in self._cached_chunks_backward:
+            for group in chunk.offload_groups:
+                if group.offload and keep_on_gpu_bytes > 0:
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
+                    keep_on_gpu_bytes -= group.total_offload_bytes
+                    group.offload = False
+        # Disable the later groups to meet the activation offload fraction.
+        for chunk in self._cached_chunks_backward:
+            eligible_offload_groups = [
+                group
+                for group in chunk.offload_groups
+                if group.offload and group.total_offload_bytes > 0
+            ]
+            offloaded_groups_count = len(eligible_offload_groups)
+            disabled_groups_count = int(
+                offloaded_groups_count * (1 - self._activation_offload_fraction)
+            )
+            debug_rank(f"Disabled {disabled_groups_count}/{offloaded_groups_count} groups")
+            # Prefer keeping earlier forward groups offloaded because releasing
+            # those activations sooner gives the longest memory-pressure relief.
+            for group in reversed(eligible_offload_groups):
+                if disabled_groups_count > 0:
+                    disabled_groups_count -= 1
+                    group.offload = False
+                else:
+                    break
+        # Warn about source bytes copied to CPU more than once within a single group.
+        # Once one view takes the whole-storage path, every other copy from that
+        # storage in the group is redundant. The copies are left in place -- this
+        # is only a diagnostic. This summary is gathered with the offload bytes
+        # below so post-warmup reporting needs only one object collective.
+        local_duplicate_summary = defaultdict(lambda: [0, 0])
+        for chunk in self._cached_chunks_forward:
+            for group in chunk.offload_groups:
+                if group.offload and group.duplicate_storage_tensor_count > 0:
+                    local_duplicate_summary[group._name][0] += group.duplicate_storage_tensor_count
+                    local_duplicate_summary[group._name][1] += group.duplicate_storage_bytes
         # Dump the offload information
         total_tensor_count = {}
         total_offload_bytes = {}
         for chunk in self._cached_chunks_forward:
             for group in chunk.offload_groups:
+                debug_rank(f"chunk {chunk} group {group} offload {group.offload}")
                 if group.offload:
                     if group._name not in total_tensor_count:
                         total_tensor_count[group._name] = 0
@@ -568,10 +694,16 @@ class PipelineOffloadManager:
             # where the memory cost will not increase anymore.
             if chunk is self._cached_chunks_backward[0]:
                 break
+        debug_rank(f"total_tensor_count {total_tensor_count}")
+        debug_rank(f"total_offload_bytes {total_offload_bytes}")
         # Cache summary for downstream consumers (e.g., unit tests).
         self._offload_summary_bytes = dict(total_offload_bytes)
         self._offload_summary_total_bytes = int(sum(total_offload_bytes.values()))
-        print_offload_summary_table(total_offload_bytes)
+        print_offload_summary_table(
+            total_offload_bytes,
+            {name: tuple(summary) for name, summary in local_duplicate_summary.items()},
+            process_group=process_group,
+        )
 
     def push(self, handler):
         """Add a chunk handler to the backward queue."""
@@ -609,18 +741,25 @@ class PipelineOffloadManager:
 
     def init_model_chunk_offload_handler(
         self,
+        pp_rank,
         vp_size,
         vp_stage,
         min_offloaded_tensor_size=1024 * 1024,
+        delta_offload_bytes_across_pp_ranks=0,
+        activation_offload_fraction: float = 1.0,
         max_inflight_offloads: Optional[int] = None,
     ):
         """
         Initialize a chunk offload handler for a model chunk (microbatch).
 
         Args:
+            pp_rank: Pipeline parallel rank
             vp_size: Virtual pipeline size
             vp_stage: Virtual pipeline stage index (None means stage 0)
             min_offloaded_tensor_size: Minimum tensor size (in elements) to offload
+            delta_offload_bytes_across_pp_ranks:
+                Difference of offload bytes across PP ranks to balance the offload load.
+            activation_offload_fraction: Fraction of eligible groups to offload, in range [0, 1].
             max_inflight_offloads: If set, cap pending offloads per group name before main
                 wait_event; see ``fine_grained_offloading_max_inflight_offloads`` on
                 ``TransformerConfig``.
@@ -632,6 +771,10 @@ class PipelineOffloadManager:
         if self._stages is None:
             self._vpp = vp_size
             self._stages = [[] for _ in range(vp_size)]
+
+        self._delta_offload_bytes_across_pp_ranks = delta_offload_bytes_across_pp_ranks
+        self._pp_rank = pp_rank
+        self._activation_offload_fraction = activation_offload_fraction
 
         if vp_stage is None:
             cur_vpp_rank = 0
@@ -682,10 +825,12 @@ class PipelineOffloadManager:
         """Get the current backward pass chunk handler."""
         return self._cur_backward_chunk
 
-    def mark_not_offloadable(self, tensor: torch.Tensor):
+    def mark_not_offload(self, tensor: torch.Tensor):
         """Mark the current forward chunk as not offloadable."""
         if tensor is not None:
-            tensor.offloading_activation = False
+            # TE marks some tensors with _TE_do_not_offload; this local flag
+            # gives Megatron-owned tensors the same opt-out path.
+            tensor._do_not_offload = True
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
@@ -699,10 +844,7 @@ class PipelineOffloadManager:
         else:
             raise RuntimeError("TE CPU offload is not available")
         self.inside_context = True
-
-        torch._C._autograd._push_saved_tensors_default_hooks(
-            self.on_save_for_backward, self.on_get_saved_tensor
-        )
+        self._saved_tensors_hooks.__enter__()
 
     def __exit__(self, *args: Any):
         """Exit context manager and restore original tensor saving behavior."""
@@ -716,7 +858,7 @@ class PipelineOffloadManager:
         else:
             raise RuntimeError("TE CPU offload is not available")
         self.inside_context = False
-        torch._C._autograd._pop_saved_tensors_default_hooks()
+        self._saved_tensors_hooks.__exit__()
 
     def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
         """
@@ -732,7 +874,7 @@ class PipelineOffloadManager:
         Hook called when autograd retrieves a saved tensor during backward pass.
         Returns the actual tensor (potentially reloading from CPU).
         """
-        debug_rank(f"----on_get_saved_tensor {saved_state}")
+        debug_rank("----on_get_saved_tensor")
         return self.cur_backward_chunk().tensor_pop(saved_state)
 
 
@@ -742,12 +884,43 @@ class ChunkOffloadHandler:
     Manages tensor groups, coordinates asynchronous GPU-CPU transfers, and handles synchronization.
     """
 
+    # Minimum fraction of the underlying storage bytes a non-contiguous view must
+    # cover before offloading the storage instead of gathering the view: the
+    # storage path trades D2H/H2D bytes on the copy engines for skipping the
+    # gather kernel and its temporary GPU buffer, which only pays off when the
+    # view spans most of the storage.
+    BASE_OFFLOAD_MIN_COVERAGE = 0.5
+
+    @_otel_trace_fn('activation_offload', 'megatron.activation.offload')
     def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
-        """Offload."""
+        """Offload.
+
+        A non-contiguous view that covers most of its underlying storage is
+        offloaded as the flat storage (a plain memcpy plus the view's
+        (size, stride, storage_offset) metadata) instead of being gathered into a
+        temporary contiguous copy. The base is resolved through
+        ``untyped_storage()`` rather than ``._base`` because autograd hands the
+        saved-tensor hooks a detach()-ed alias (e.g. CheckpointWithoutOutput's
+        saved input), which drops the view metadata but not the storage.
+        """
         debug_rank("--------offload")
 
+        view_meta = None
         if not src_tensor.is_contiguous():
-            src_tensor = src_tensor.contiguous()
+            storage = src_tensor.untyped_storage()
+            element_size = src_tensor.element_size()
+            covered_bytes = src_tensor.numel() * element_size
+            if (
+                storage.nbytes() % element_size == 0
+                and covered_bytes >= self.BASE_OFFLOAD_MIN_COVERAGE * storage.nbytes()
+            ):
+                view_meta = (src_tensor.size(), src_tensor.stride(), src_tensor.storage_offset())
+                # Flat alias of the full storage; contiguous by construction.
+                src_tensor = torch.empty(0, dtype=src_tensor.dtype, device=src_tensor.device).set_(
+                    storage
+                )
+            else:
+                src_tensor = src_tensor.contiguous()
 
         if use_cpu_pool:
             cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
@@ -757,13 +930,14 @@ class ChunkOffloadHandler:
             )
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
-        state = (src_tensor.device, cpu_backup, use_cpu_pool)
+        state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
         return state
 
+    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool = state
+        dev, cpu_backup, use_cpu_pool, view_meta = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
         gpu_tensor = torch.empty(
@@ -772,6 +946,9 @@ class ChunkOffloadHandler:
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
+        if view_meta is not None:
+            size, stride, storage_offset = view_meta
+            gpu_tensor = gpu_tensor.as_strided(size, stride, storage_offset)
         return gpu_tensor
 
     def __init__(
@@ -818,17 +995,17 @@ class ChunkOffloadHandler:
         # an event recorded in a previous (non-captured) iteration.
         self._offload_pending_by_name.clear()
 
-    def find_group_with_name(self, name: str, start_index: int = 0):
+    def find_group_with_name(
+        self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0
+    ):
         """Find the group with the given name starting from the given index."""
-        return next(
-            (group for group in self.offload_groups[start_index:] if group._name == name), None
-        )
+        return next((group for group in groups[start_index:] if group._name == name), None)
 
     def is_empty_chunk(self, name=None):
         """Check if this chunk has no tensors to manage."""
         debug_rank(f"------is_empty_chunk {self._max_group_size}")
         if name is not None:
-            return self.find_group_with_name(name) is None
+            return self.find_group_with_name(self.offload_groups, name) is None
         return self._max_group_size == 0
 
     def finish_all_groups(self, name=None) -> bool:
@@ -845,15 +1022,19 @@ class ChunkOffloadHandler:
         ):
             return True
         assert name is not None, "Name is required"
-        return self.find_group_with_name(name, self._offloaded_group_index) is None
+        return (
+            self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
+            is None
+        )
 
     def find_next_group(self, name=None):
         """Find the next group with the given name."""
         assert name is not None, "Name is required"
-        return self.find_group_with_name(name, self._offloaded_group_index)
+        return self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
 
-    def tensor_push(self, tensor):
-        """Push tensor to the offload handler."""
+    @staticmethod
+    def _can_manage_tensor_for_offload(tensor):
+        """Return whether the tensor can be managed by activation offload hooks."""
         torch_stray_tensor = isinstance(
             tensor,
             (
@@ -861,7 +1042,16 @@ class ChunkOffloadHandler:
                 torch._subclasses.functional_tensor.FunctionalTensor,
             ),
         )
-        assert not torch_stray_tensor, "Stray tensor should not be offloaded"
+        return (
+            not isinstance(tensor, torch.nn.Parameter)
+            and not torch_stray_tensor
+            and tensor.device.type == "cuda"
+        )
+
+    def tensor_push(self, tensor):
+        """Push tensor to the offload handler."""
+        if not self._can_manage_tensor_for_offload(tensor):
+            return tensor
 
         # Assign unique tag based on group index and position within group
         tensor_tag = (self._offloaded_group_index, self._tensor_count_current_group)
@@ -872,6 +1062,9 @@ class ChunkOffloadHandler:
 
     def tensor_pop(self, tensor_tag):
         """Pop tensor from the offload handler."""
+        if isinstance(tensor_tag, torch.Tensor):
+            debug_rank(f"--------tensor_pop passthrough tensor {tensor_tag.shape}")
+            return tensor_tag
         debug_rank(f"--------tensor_pop {tensor_tag}")
         group_id, idx = tensor_tag
         tensor = self.offload_groups[group_id - 1].pop_tensor(tensor_tag)
@@ -883,34 +1076,57 @@ class ChunkOffloadHandler:
 
     def tensor_need_offloading_checker(self, tensor):
         """Check if the tensor needs to be offloaded."""
-        debug_rank(
-            f"tensor_need_offloading_checker {getattr(tensor, 'offloading_activation', None)}"
-        )
+        debug_rank("tensor_need_offloading_checker")
+        if not self._can_manage_tensor_for_offload(tensor):
+            return False
+        if _te_do_not_offload(tensor):
+            return False
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
         # Respect tensor's offload preference if specified
-        if hasattr(tensor, "offloading_activation") and not tensor.offloading_activation:
+        if getattr(tensor, "_TE_do_not_offload", False) or getattr(
+            tensor, "_do_not_offload", False
+        ):
             return False
         return True
 
-    def bulk_offload_group(self):
+    def bulk_offload_group(self, group_to_offload):
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
-        group_to_offload = self._groups_to_offload[-1]
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
+            # Warmup-only accounting local to this offload group. Every tensor in
+            # the group is alive here, so device + data_ptr identifies its storage.
+            storage_records = (
+                defaultdict(
+                    lambda: {
+                        "storage_bytes": 0,
+                        "transfer_count": 0,
+                        "full_storage_count": 0,
+                        "transferred_bytes": 0,
+                    }
+                )
+                if self.is_warmup
+                else None
+            )
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
                     state = self.offload(
                         tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
                     )
+                    # Account the bytes actually copied to CPU (the base storage
+                    # for view offloads).
                     if self.is_warmup:
-                        group_to_offload.update_offload_info(tensor_on_device)
+                        group_to_offload.update_offload_info(state[1])
+                        self._record_offload_transfer(tensor_on_device, state, storage_records)
+                    # record_stream on the view marks the shared storage
+                    # allocation, so this also covers base-storage offloads.
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
+            if self.is_warmup:
+                self._set_duplicate_storage_info(group_to_offload, storage_records)
             group_to_offload.record_offload_event(self.d2h_stream)
-        self._groups_to_offload.pop()
         nvtx_range_pop(nvtx_msg)
         # Under full-iteration CG capture, the main stream may not wait on d2h
         # events; optional max-inflight enqueues each group's offload event and
@@ -920,6 +1136,34 @@ class ChunkOffloadHandler:
             gname = group_to_offload._name
             self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
             self._drain_offload_pending(gname)
+
+    @staticmethod
+    def _record_offload_transfer(tensor_on_device, state, storage_records):
+        """Record one transfer for group-local duplicate-byte accounting."""
+        _, cpu_backup, _, view_meta = state
+        storage = tensor_on_device.untyped_storage()
+        storage_key = (tensor_on_device.device, storage.data_ptr(), storage.nbytes())
+        record = storage_records[storage_key]
+        record["storage_bytes"] = storage.nbytes()
+        record["transfer_count"] += 1
+        record["full_storage_count"] += int(view_meta is not None)
+        record["transferred_bytes"] += cpu_backup.numel() * cpu_backup.element_size()
+
+    @staticmethod
+    def _set_duplicate_storage_info(group, storage_records):
+        """Calculate exact redundant bytes for storages copied in full by this group."""
+        duplicate_tensor_count = 0
+        duplicate_bytes = 0
+        for record in storage_records.values():
+            # Without a full-storage copy, finding overlap between arbitrary
+            # strided logical views requires real storage-address analysis.
+            if record["full_storage_count"] == 0:
+                continue
+            storage_duplicate_bytes = record["transferred_bytes"] - record["storage_bytes"]
+            if storage_duplicate_bytes > 0:
+                duplicate_tensor_count += record["transfer_count"] - 1
+                duplicate_bytes += storage_duplicate_bytes
+        group.set_duplicate_storage_info(duplicate_tensor_count, duplicate_bytes)
 
     def get_max_deduplicated_groups(self):
         """Get the maximum number of deduplicated groups."""
@@ -959,10 +1203,9 @@ class ChunkOffloadHandler:
             # Reload the last group (last layer) early
             self.bulk_reload_group()
 
-    def should_bulk_offload(self):
+    def should_bulk_offload(self, group):
         """Determine if the current group should be offloaded."""
-        assert len(self._groups_to_offload) > 0, "No groups to offload"
-        group = self._groups_to_offload[-1]
+        assert group in self._groups_to_offload, f"Group {group} is not pending offload"
         debug_rank(f"should_bulk_offload {self.is_warmup} {group.offload}")
         # Don't offload if the chunk is not in warmup stage
         if self.is_warmup:
@@ -983,12 +1226,16 @@ class ChunkOffloadHandler:
 
         return True
 
-    def bulk_offload(self, forced_released_tensors):
+    def bulk_offload(self, name, forced_released_tensors):
         """Offload a group of tensors and optionally release their GPU memory."""
         debug_rank("----bulk_offload")
-        if self.should_bulk_offload():
-            self._groups_to_reload.append(self._groups_to_offload[-1])
-            self.bulk_offload_group()
+        # CUDA graph scoped modules can create several pending groups before a
+        # commit runs, so match by name instead of assuming LIFO order.
+        group_to_offload = self.find_group_with_name(self._groups_to_offload, name)
+        assert group_to_offload is not None, f"Group {name} not found in {self._groups_to_offload}"
+        if self.should_bulk_offload(group_to_offload):
+            self._groups_to_reload.append(group_to_offload)
+            self.bulk_offload_group(group_to_offload)
             # Manually release tensors not auto-freed by torch GC
             if len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
@@ -997,6 +1244,8 @@ class ChunkOffloadHandler:
                         # Ensure tensor is not in use before freeing
                         release_tensor.record_stream(cur_stream)
                         release_tensor.untyped_storage().resize_(0)
+        # A group commit is consumed even when policy keeps its tensors on GPU.
+        self._groups_to_offload.remove(group_to_offload)
 
     def _drain_offload_pending(self, group_name: str) -> None:
         """For ``group_name``, have the main stream wait on older D2H events
@@ -1010,14 +1259,14 @@ class ChunkOffloadHandler:
             old_evt = q.popleft()
             cur.wait_event(old_evt)
 
-    def on_group_commit_forward(self, forced_released_tensors):
+    def on_group_commit_forward(self, name, forced_released_tensors):
         """Called at the end of a layer group's forward pass to trigger offloading."""
         if not self.do_offload:
             return
-        debug_rank("--on_group_commit_forward")
+        debug_rank(f"--on_group_commit_forward {name}")
         # Wait for compute to finish before starting offload
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
-        self.bulk_offload(forced_released_tensors)
+        self.bulk_offload(name, forced_released_tensors)
 
     def bulk_reload(self):
         """Reload the next group of tensors from CPU to GPU."""
@@ -1116,12 +1365,14 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
-        if delay_offload:
+        if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
+            # During TE CUDA graph replay, queue D2H work and launch it after
+            # replay returns, where CPU scheduling can overlap with graph/comm gaps.
             PipelineOffloadManager.get_instance().push_offload_groups(
-                cur_forward_chunk.on_group_commit_forward, forced_released_tensors
+                cur_forward_chunk.on_group_commit_forward, name, forced_released_tensors
             )
         else:
-            cur_forward_chunk.on_group_commit_forward(forced_released_tensors)
+            cur_forward_chunk.on_group_commit_forward(name, forced_released_tensors)
         ctx.cpu_offload_handler = cur_forward_chunk
         ctx.name = name
         return tensor
@@ -1136,7 +1387,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         return grad_output + (None, None, None, None)
 
 
-def fine_grained_offloading_group_commit(
+def fine_grained_offloading_group_offload(
     tensor, name, forced_released_tensors=None, delay_offload=False
 ):
     """
@@ -1153,23 +1404,23 @@ def fine_grained_offloading_group_commit(
     if isinstance(tensor, tuple):
         if len(tensor) == 0:
             return tensor
-        committed0 = fine_grained_offloading_group_commit(
+        offloaded0 = fine_grained_offloading_group_offload(
             tensor[0],
             name=name,
             forced_released_tensors=forced_released_tensors,
             delay_offload=delay_offload,
         )
-        return (committed0,) + tensor[1:]
+        return (offloaded0,) + tensor[1:]
     if isinstance(tensor, list):
         if len(tensor) == 0:
             return tensor
-        committed0 = fine_grained_offloading_group_commit(
+        offloaded0 = fine_grained_offloading_group_offload(
             tensor[0],
             name=name,
             forced_released_tensors=forced_released_tensors,
             delay_offload=delay_offload,
         )
-        return [committed0] + tensor[1:]
+        return [offloaded0] + tensor[1:]
 
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
     if cur_forward_chunk is None:
@@ -1218,13 +1469,6 @@ def fine_grained_offloading_group_start(tensor, name=None):
     return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
 
 
-def fine_grained_offloading_forward_record(event: torch.cuda.Event) -> None:
-    """Record the forward event for cuda graph capture."""
-    d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
-    torch.cuda.current_stream().record_event(event)
-    torch.cuda.current_stream().wait_stream(d2h_stream)
-
-
 class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     """
     Identity operation that marks the end of a layer group for offload synchronization.
@@ -1232,23 +1476,21 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tensor, event: torch.cuda.Event) -> torch.Tensor:
+    def forward(ctx, tensor) -> torch.Tensor:
         """Forward pass for cuda graph capture."""
-        ctx.event = event
+        debug_rank("FineGrainedOffloadingBackwardRecordFunction forward")
         return tensor
 
     @staticmethod
     def backward(ctx, grad_output):
         """Record the backward event and wait for the h2d stream on cuda graph stream."""
-        h2d_stream = PipelineOffloadManager.get_instance().h2d_stream
-        torch.cuda.current_stream().record_event(ctx.event)
-        torch.cuda.current_stream().wait_stream(h2d_stream)
-        return grad_output, None
-
-
-def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
-    """Record the backward event for cuda graph capture."""
-    return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+        debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
+        mgr = PipelineOffloadManager.get_instance()
+        # This event connects TE's graph stream with the reload stream so
+        # backward consumers do not race H2D reloads launched outside the graph.
+        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
+        torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
+        return (grad_output,)
 
 
 class FineGrainedActivationOffloadingInterface:
@@ -1272,14 +1514,33 @@ class FineGrainedActivationOffloadingInterface:
             PipelineOffloadManager.get_instance().__exit__()
 
     @staticmethod
+    def cuda_graph_stream():
+        """Get the CUDA graph stream."""
+        return PipelineOffloadManager.get_instance().cuda_graph_stream
+
+    @staticmethod
+    def cuda_graph_event():
+        """Get the CUDA graph event."""
+        return PipelineOffloadManager.get_instance().cuda_graph_event
+
+    @staticmethod
     def init_chunk_handler(
-        vp_size, vp_stage, min_offloaded_tensor_size, max_inflight_offloads: Optional[int] = None
+        pp_rank,
+        vp_size,
+        vp_stage,
+        min_offloaded_tensor_size,
+        delta_offload_bytes_across_pp_ranks,
+        activation_offload_fraction,
+        max_inflight_offloads: Optional[int] = None,
     ):
         """Initialize the chunk handler, called at the start of a microbatch forward pass."""
         PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
+            pp_rank,
             vp_size,
             vp_stage,
             min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction,
             max_inflight_offloads=max_inflight_offloads,
         )
 
@@ -1288,31 +1549,62 @@ class FineGrainedActivationOffloadingInterface:
         """Get the fine-grained offload context"""
         return PipelineOffloadManager.get_instance() if flag else nullcontext()
 
-    @staticmethod
-    def group_commit(tensor, name, forced_released_tensors=None, delay_offload=False):
-        """Group commit the tensors."""
-        return fine_grained_offloading_group_commit(
-            tensor, name, forced_released_tensors, delay_offload
-        )
+    def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
+        """Group offload the tensors."""
+        if self.offload:
+            return fine_grained_offloading_group_offload(
+                tensor, self.name, forced_released_tensors, delay_offload
+            )
+        return tensor
 
     @staticmethod
-    def mark_not_offloadable(tensor: torch.Tensor):
+    def mark_not_offload(tensor: torch.Tensor):
         """Mark the tensor as not offloadable."""
-        PipelineOffloadManager.get_instance().mark_not_offloadable(tensor)
+        PipelineOffloadManager.get_instance().mark_not_offload(tensor)
 
     @staticmethod
-    def forward_record(event: torch.cuda.Event) -> None:
+    def forward_record() -> None:
         """Record the forward event for cuda graph capture."""
-        d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
-        torch.cuda.current_stream().record_event(event)
-        torch.cuda.current_stream().wait_stream(d2h_stream)
+        mgr = PipelineOffloadManager.get_instance()
+        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
+        torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
 
     @staticmethod
-    def reset():
+    def backward_record(tensor) -> torch.Tensor:
+        """Record the backward event for cuda graph capture."""
+        return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
+
+    @staticmethod
+    def reset(process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset the chunk handler."""
-        PipelineOffloadManager.get_instance().reset()
+        PipelineOffloadManager.get_instance().reset(process_group=process_group)
 
     @staticmethod
     def reset_instance():
         """Reset the singleton instance."""
         PipelineOffloadManager.reset_instance()
+
+    @staticmethod
+    def flush_delayed_groups():
+        """Flush the delayed groups."""
+        PipelineOffloadManager.get_instance().flush_delayed_groups()
+
+    @staticmethod
+    def disable_offload():
+        """Disable the offload."""
+        PipelineOffloadManager.get_instance().disable_offload()
+
+    @staticmethod
+    def enable_offload():
+        """Enable the offload."""
+        PipelineOffloadManager.get_instance().enable_offload()
+
+    @staticmethod
+    def enter_replay():
+        """Enter CUDA graph replay mode to enable delayed offloading."""
+        PipelineOffloadManager.get_instance()._in_replay = True
+
+    @staticmethod
+    def exit_replay():
+        """Exit CUDA graph replay mode."""
+        PipelineOffloadManager.get_instance()._in_replay = False

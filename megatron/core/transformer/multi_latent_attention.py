@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import math
@@ -14,7 +14,6 @@ try:
     HAVE_EINOPS = True
 except ImportError:
     HAVE_EINOPS = False
-
 
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
@@ -37,6 +36,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.attention import Attention, LinearProjBuilder
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -59,6 +59,28 @@ except:
 
 
 if HAVE_TE:
+    import transformer_engine_torch as tex
+
+    try:
+        from transformer_engine.pytorch.attention import (
+            FusedMLAQUpProjFunction,
+            FusedMLAQUpProjRopeQuant,
+        )
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            mxfp8_quantize_only,
+            mxfp8_transpose_swizzle,
+        )
+    except ImportError:
+        # Older TE lacks the fused MLA Q up-proj kernel and its MXFP8 quantize/swizzle
+        # helpers. Stub them all together so this module still imports; the fused path is
+        # gated on FusedMLAQUpProjRopeQuant being non-None.
+        FusedMLAQUpProjFunction = None
+        FusedMLAQUpProjRopeQuant = None
+        mxfp8_quantize_only = None
+        mxfp8_transpose_swizzle = None
+    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
@@ -69,17 +91,41 @@ if HAVE_TE:
     from megatron.core.post_training.modelopt.layers import Linear
 else:
     (
+        tex,
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
         Linear,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
-    ) = (None, None, None, None, None, None)
+        FusedMLAQUpProjFunction,
+        FusedMLAQUpProjRopeQuant,
+        mxfp8_quantize_only,
+        mxfp8_transpose_swizzle,
+        QuantizedTensor,
+        MXFP8Quantizer,
+    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
+
+
+class _QuantizeKVForFusedAttn(torch.autograd.Function):
+    """Bridge the autograd graph across mxfp8_quantize_only's tensor reconstruction."""
+
+    @staticmethod
+    def forward(ctx, key, value):
+        """Quantize the k anv v tensors"""
+        kq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        vq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        k_mx, v_mx = mxfp8_quantize_only([(key.contiguous(), kq), (value.contiguous(), vq)], "sbhd")
+        return k_mx, v_mx
+
+    @staticmethod
+    def backward(ctx, dk, dv):
+        """Attention returns bf16 tensors, so no need to quantize/unquantize in bwd"""
+        return dk, dv
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
@@ -144,6 +190,7 @@ class MultiLatentAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ) -> None:
         # TODO(nschank): Restructure so that the Attention initializer knows which specific
@@ -156,6 +203,7 @@ class MultiLatentAttention(Attention):
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
         self.config: MLATransformerConfig
@@ -173,6 +221,20 @@ class MultiLatentAttention(Attention):
             and "mla_up_proj" in self.config.recompute_modules
         )
         self.qkv_up_checkpoint = None
+
+        # Fused MLA Q up-proj+rope+quant via cuDNN gemm_proj_rope_mxfp8.
+        # The q_layernorm is absorbed into the fusion so that MXFP8 is produced in one step
+        # from the norm's FP32 accumulator, as TELayerNormColumnParallelLinear does; that
+        # requires the norm to exist and to be an RMSNorm (because currently it is only
+        # tested with DSv3 which uses RMSNorm)
+        self._use_fused_q_uproj = (
+            getattr(self.config, "use_fused_mla_q_uproj", False)
+            and FusedMLAQUpProjRopeQuant is not None
+            and FusedMLAQUpProjRopeQuant.is_supported()
+            and get_pg_size(self.tp_group) == 1
+            and self.config.qk_layernorm
+            and self.config.normalization == "RMSNorm"
+        )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
@@ -311,8 +373,12 @@ class MultiLatentAttention(Attention):
         sequence_len_offset: int | None = None,
         *,
         inference_params: BaseInferenceContext | None = None,
+        packed_sequence_cp_metadata=None,
     ):
         """Forward pass for multi-latent attention"""
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "MLA does not support packed-sequence chunkwise CP metadata."
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."
         assert (
@@ -340,7 +406,8 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+        qkv_linear_manager = off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear")
+        with qkv_linear_manager as hidden_states:
             query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
@@ -348,10 +415,7 @@ class MultiLatentAttention(Attention):
                 packed_seq_params,
                 inference_context=inference_context,
             )
-        if self.offload_qkv_linear:
-            query = off_interface.group_commit(
-                query, name="qkv_linear", forced_released_tensors=[hidden_states]
-            )
+        query = qkv_linear_manager.group_offload(query, forced_released_tensors=[hidden_states])
 
         # ===================================================
         # Adjust key, value for inference
@@ -371,26 +435,42 @@ class MultiLatentAttention(Attention):
 
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
+        core_attention_extra_kwargs = {}
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            core_attention_extra_kwargs = {"x": hidden_states, "qr": q_compressed}
+        if self._use_fused_q_uproj and self.training:
+            # Fused path fed pre-quantized MXFP8 q/k/v (is_input_fp8). Return bf16
+            # grads (skip attention's backward re-quantize) so the Q/KV backward
+            # paths receive plain bf16 gradients -- no swizzled-fp8 dequant needed.
+            core_attention_extra_kwargs["bf16_backward"] = True
+
         # ==================================
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
         needs_output_trim = False
+        orig_v_dim = None
+        padded_v_dim = None
         if self.checkpoint_core_attention and self.training:
+            assert not self._use_fused_q_uproj, (
+                "use_fused_mla_q_uproj is incompatible with checkpoint_core_attention: "
+                "bf16_backward is not threaded through the checkpointed attention path. "
+                "Disable one of them."
+            )
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                extra_kwargs = {}
-                if self.config.experimental_attention_variant == "dsa":
-                    # For dsa we need to pass in the original hidden states and the compressed
-                    # query representation.
-                    extra_kwargs["x"] = hidden_states
-                    extra_kwargs["qr"] = q_compressed
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
+                with core_attn_manager as query:
                     core_attn_out = self._run_core_attention(
                         query,
                         key,
@@ -398,7 +478,7 @@ class MultiLatentAttention(Attention):
                         attention_mask,
                         packed_seq_params=packed_seq_params,
                         attn_mask_type=attn_mask_type,
-                        **extra_kwargs,
+                        **core_attention_extra_kwargs,
                     )
             elif self.cache_mla_latents:
                 value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
@@ -419,15 +499,20 @@ class MultiLatentAttention(Attention):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
+                    inference_context.is_decode_only(),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
                 needs_output_trim = need_v_pad
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
+            forced = [
+                t
+                for t in [query, key, value]
+                if t is not None and not isinstance(t, QuantizedTensor)
+            ]
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=forced
+            )
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -458,12 +543,10 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
-        if self.offload_attn_proj:
-            output = off_interface.group_commit(
-                output, name="attn_proj", forced_released_tensors=[core_attn_out]
-            )
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
 
@@ -484,6 +567,7 @@ class MLASelfAttention(MultiLatentAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         if pg_collection is None:
@@ -498,13 +582,18 @@ class MLASelfAttention(MultiLatentAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
+
+        # Resolve which classes to use for Q and KV linear up projections and norms, based on
+        # QK-norm selection.
+        layer_classes = self._resolve_qk_norm_config(submodules)
 
         if self.config.q_lora_rank is None:
             # Not projecting query
             self.linear_q_proj = build_module(
-                submodules.linear_q_proj,
+                layer_classes["linear_q_proj"],
                 self.config.hidden_size,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -551,7 +640,7 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
             self.linear_q_up_proj = build_module(
-                submodules.linear_q_up_proj,
+                layer_classes["linear_q_up_proj"],
                 self.config.q_lora_rank,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -598,7 +687,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         self.linear_kv_up_proj = build_module(
-            submodules.linear_kv_up_proj,
+            layer_classes["linear_kv_up_proj"],
             self.config.kv_lora_rank,
             self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
@@ -613,17 +702,23 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is not None:
-            self.q_layernorm = submodules.q_layernorm(
+            self.q_layernorm = layer_classes["q_layernorm"](
                 hidden_size=self.config.q_lora_rank,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.kv_layernorm = submodules.kv_layernorm(
+        self.kv_layernorm = layer_classes["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
+
+    def _resolve_qk_norm_config(
+        self, submodules
+    ) -> dict[str, ModuleSpec | type | LayerNormBuilder]:
+        """Resolve which Q/KV norm and up-projection implementations to build."""
+        return QKNormConfigResolver(self.config, submodules).resolve()
 
     def _qkv_down_projection(self, hidden_states):
         """Unfused q/kv down projection path."""
@@ -718,8 +813,16 @@ class MLASelfAttention(MultiLatentAttention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
             else:
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+            rope_freqs_max_seqlen = (
+                max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                else None
+            )
         else:
             cu_seqlens_q = cu_seqlens_kv = None
+            rope_freqs_max_seqlen = None
 
         # =========================================
         # QKV down projection and layernorm
@@ -841,17 +944,57 @@ class MLASelfAttention(MultiLatentAttention):
             otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
             we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
             """
-            if self.config.q_lora_rank is not None:
-                # q_compressed: [num_tokens, q_lora_rank]
-                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
-            else:
-                # q_compressed: [num_tokens, hidden_size]
-                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_proj(q_compressed)
+            use_fused_q_uproj = (
+                self._use_fused_q_uproj
+                and self.config.apply_rope_fusion
+                and self.config.q_lora_rank is not None
+                and q_compressed.ndim == 3
+                and self.pg_collection.cp.size() == 1
+            )
 
-            # q: [num_tokens, n, q_head_dim]
-            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+            if use_fused_q_uproj:
+                b = q_compressed.shape[1]
+
+                # With sequence parallelism the input is sequence-split; gather to full
+                # sequence before the fused kernel, which owns the norm.
+                if self.config.sequence_parallel and get_pg_size(self.tp_group) > 1:
+                    q_compressed = gather_from_sequence_parallel_region(
+                        q_compressed, group=self.tp_group
+                    )
+                s = q_compressed.shape[0]
+
+                query = FusedMLAQUpProjFunction.apply(
+                    q_compressed,
+                    self.linear_q_up_proj.layer_norm_weight,
+                    self.linear_q_up_proj.weight,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.linear_q_up_proj.wgrad_store,
+                    getattr(self.linear_q_up_proj, "fuse_wgrad_accumulation", False),
+                    self.num_attention_heads_per_partition,
+                    self.q_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.qk_pos_emb_head_dim,
+                    s,
+                    b,
+                    self.tp_group,
+                    self.config.sequence_parallel,
+                    self.config.layernorm_epsilon,
+                    self.config.normalization,
+                    self.config.layernorm_zero_centered_gamma,
+                )
+            else:
+                if self.config.q_lora_rank is not None:
+                    # q_compressed: [num_tokens, q_lora_rank]
+                    # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                    q, _ = self.linear_q_up_proj(q_compressed)
+                else:
+                    # q_compressed: [num_tokens, hidden_size]
+                    # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                    q, _ = self.linear_q_proj(q_compressed)
+
+                # q: [num_tokens, n, q_head_dim]
+                q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
@@ -870,16 +1013,17 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.apply_rope_fusion:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
-                query = fused_apply_mla_rope_for_q(
-                    q,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    self.config.qk_head_dim,
-                    self.config.qk_pos_emb_head_dim,
-                    cu_seqlens_q,
-                    cp_rank,
-                    cp_size,
-                )
+                if not use_fused_q_uproj:
+                    query = fused_apply_mla_rope_for_q(
+                        q,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        cp_rank,
+                        cp_size,
+                    )
                 key, value = fused_apply_mla_rope_for_kv(
                     kv,
                     k_pos_emb,
@@ -892,6 +1036,10 @@ class MLASelfAttention(MultiLatentAttention):
                     cp_rank,
                     cp_size,
                 )
+                if use_fused_q_uproj:
+                    # Quantize K/V to MXFP8, then transpose+swizzle scales for all three
+                    key, value = _QuantizeKVForFusedAttn.apply(key, value)
+                    mxfp8_transpose_swizzle([query, key, value], "sbhd")
             else:
                 q_len = q.size()[0]
                 if inference_context is not None:
@@ -931,6 +1079,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -941,6 +1090,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
@@ -954,9 +1104,10 @@ class MLASelfAttention(MultiLatentAttention):
                     k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
                 key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
-            query = query.contiguous()
-            key = key.contiguous()
-            value = value.contiguous()
+            if not use_fused_q_uproj:
+                query = query.contiguous()
+                key = key.contiguous()
+                value = value.contiguous()
 
             return query, key, value
 
@@ -1229,6 +1380,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
@@ -1244,6 +1396,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
             pp_layer_offset=pp_layer_offset,
             name=name,
         )
@@ -1252,6 +1405,9 @@ class FusedMLASelfAttention(MLASelfAttention):
             "FusedMLASelfAttention requires q_lora_rank to be set; "
             "fallback to MLASelfAttention for q_lora_rank=None."
         )
+        # Resolve which linear class to use for Q and KV up projections,
+        # based on QK-norm selection.
+        layer_classes = self._resolve_qk_norm_config(submodules)
 
         qkv_down_proj_kwargs = {}
         if submodules.linear_qkv_down_proj in [TELinear]:
@@ -1287,7 +1443,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
 
         self.linear_q_up_proj = build_module(
-            submodules.linear_q_up_proj,
+            layer_classes["linear_q_up_proj"],
             self.config.q_lora_rank,
             self.config.num_attention_heads * self.q_head_dim,
             config=self.config,
@@ -1302,7 +1458,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
 
         self.linear_kv_up_proj = build_module(
-            submodules.linear_kv_up_proj,
+            layer_classes["linear_kv_up_proj"],
             self.config.kv_lora_rank,
             self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
             config=self.config,
@@ -1316,12 +1472,12 @@ class FusedMLASelfAttention(MLASelfAttention):
             name=(name + ".linear_kv_up_proj") if name is not None else None,
         )
 
-        self.q_layernorm = submodules.q_layernorm(
+        self.q_layernorm = layer_classes["q_layernorm"](
             hidden_size=self.config.q_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
         )
-        self.kv_layernorm = submodules.kv_layernorm(
+        self.kv_layernorm = layer_classes["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
@@ -1330,11 +1486,31 @@ class FusedMLASelfAttention(MLASelfAttention):
     def _qkv_down_projection(self, hidden_states):
         """Fused q/kv down projection path."""
         qkv, _ = self.linear_qkv_down_proj(hidden_states)
-        q_compressed, kv_combined = torch.split(
-            qkv,
-            [self.config.q_lora_rank, self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim],
-            dim=-1,
-        )
+
+        q_split = self.config.q_lora_rank
+        kv_split = self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim
+        tp_size = get_pg_size(self.tp_group)
+        is_tensor_parallel = tp_size > 1
+
+        if is_tensor_parallel:
+            assert q_split % tp_size == 0, (
+                "q_lora_rank must be divisible by tensor model parallel size when "
+                "using MLA down projection fusion"
+            )
+            assert kv_split % tp_size == 0, (
+                "kv_lora_rank + qk_pos_emb_head_dim must be divisible by tensor model "
+                "parallel size when using MLA down projection fusion"
+            )
+            q_split //= tp_size
+            kv_split //= tp_size
+
+        q_compressed, kv_combined = torch.split(qkv, [q_split, kv_split], dim=-1)
+
+        if is_tensor_parallel:
+            q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+            if self.config.sequence_parallel:
+                q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+
         return q_compressed, kv_combined
 
     def backward_dw(self) -> NoReturn:
@@ -1385,7 +1561,8 @@ class FusedMLASelfAttention(MLASelfAttention):
                 sharded_state_dict[kv_extra_key] = fused_obj
 
         for key in list(sharded_state_dict.keys()):
-            if key.startswith(fused_prefix):
+            suffix = key[len(fused_prefix) :] if key.startswith(fused_prefix) else ""
+            if key.startswith(fused_prefix) and not suffix.startswith("layer_norm_"):
                 del sharded_state_dict[key]
 
         fused_weight = self.linear_qkv_down_proj.weight
@@ -1429,8 +1606,12 @@ class FusedMLASelfAttention(MLASelfAttention):
 
         return sharded_state_dict
 
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        """Load state dict with automatic unfused->fused conversion."""
+    def _synthetic_state_dict_key_suffixes(self):
+        """Return source checkpoint keys used to locate this module in a state dict."""
+        return ("linear_q_down_proj.weight",)
+
+    def _synthesize_fused_qkv_down_weight(self, state_dict, prefix):
+        """Materialize fused qkv-down weight from old separate q/kv checkpoint keys."""
         q_key = f"{prefix}linear_q_down_proj.weight"
         kv_key = f"{prefix}linear_kv_down_proj.weight"
         fused_key = f"{prefix}linear_qkv_down_proj.weight"
@@ -1446,5 +1627,9 @@ class FusedMLASelfAttention(MLASelfAttention):
             del state_dict[kv_key]
             state_dict.pop(f"{prefix}linear_q_down_proj.bias", None)
             state_dict.pop(f"{prefix}linear_kv_down_proj.bias", None)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Load state dict with automatic unfused->fused conversion."""
+        self._synthesize_fused_qkv_down_weight(state_dict, prefix)
 
         return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)

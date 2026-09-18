@@ -108,6 +108,7 @@ class RouterReplay:
             []
         )  # List of tensors for backward pass replay
         self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph
+        self.layer_number: Optional[int] = None
         RouterReplay.global_router_replay_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor):

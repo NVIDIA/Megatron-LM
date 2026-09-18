@@ -7,9 +7,7 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Context Parallel Package
-
-## Context Parallelism Overview
+# Context Parallel Overview
 
 ```{figure} ../../images/context_parallel/CP_overview.png
 :alt: Diagram of a transformer layer with tensor parallelism 2 and context parallelism 2, showing CP and TP communication patterns around attention and other blocks.
@@ -40,4 +38,3 @@ CP addresses these tradeoffs. With CP, each GPU computes on part of the sequence
 CP support is included on the GPT code path. Other models that share that path, such as LLaMA, can use CP as well. CP works with TP (tensor model parallelism), PP (pipeline model parallelism), and DP (data parallelism). The total GPU count is TP × CP × PP × DP. CP also works with different attention variants, including MHA, MQA, and GQA, with unidirectional or bidirectional masking.
 
 Enable CP by setting `context_parallel_size=<CP_SIZE>` on the command line. The default `context_parallel_size` is 1, which disables CP. Running with CP requires Megatron Core (>=0.5.0) and Transformer Engine (>=1.1).
-

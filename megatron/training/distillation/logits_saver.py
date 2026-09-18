@@ -35,7 +35,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import zstandard
+
+try:
+    import zstandard
+
+    HAVE_ZSTANDARD = True
+except ImportError:
+    HAVE_ZSTANDARD = False
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -578,6 +584,12 @@ class LogitsSaverHooks:
         if msc_enabled:
             # NOTE: MSC is not enabled in the async saving process by default.
             MultiStorageClientFeature.enable()
+
+        if not HAVE_ZSTANDARD:
+            raise ImportError(
+                "zstandard is required to write batched logit tars. "
+                "Install via `pip install zstandard`."
+            )
 
         storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
         write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"

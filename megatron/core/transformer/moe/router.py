@@ -1,12 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -15,14 +20,17 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
+    compute_normalized_router_scores,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
+    qb_dual_update,
     router_gating_linear,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.transformer.moe.router_diagnostics import build_router_diagnostics
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -66,6 +74,10 @@ class Router(ABC, MegatronModule):
             )
         else:
             self.bias = None
+        if self.config.moe_router_skip_muon:
+            setattr(self.weight, 'use_muon', False)
+            if self.bias is not None:
+                setattr(self.bias, 'use_muon', False)
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -133,6 +145,8 @@ class Router(ABC, MegatronModule):
     def set_layer_number(self, layer_number: int):
         """Set the layer number for the router."""
         self.layer_number = layer_number
+        if getattr(self, "router_replay", None) is not None:
+            self.router_replay.layer_number = layer_number
 
 
 class TopKRouter(Router):
@@ -177,7 +191,9 @@ class TopKRouter(Router):
                 'local_tokens_per_expert',
                 torch.zeros(
                     self.config.num_moe_experts,
-                    dtype=torch.float32,
+                    # Keep token counts exact through accumulation and cross-rank reduction.
+                    # Float16Module leaves integer buffers in their original dtype.
+                    dtype=torch.int64,
                     device=torch.cuda.current_device(),
                 ),
                 persistent=False,
@@ -214,6 +230,41 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
+        # Quantile balancing replaces the aux loss with a per-expert bias `qb_beta`.
+        # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
+        # and reset each global batch.
+        if self.routing_type == "quantile_balancing":
+            assert not self.is_aux_loss_enabled(), (
+                "Quantile balancing handles load balance via the bias update; "
+                "aux losses must be disabled (set moe_aux_loss_coeff to 0)."
+            )
+            self.register_buffer(
+                'qb_beta',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+            self.register_buffer(
+                'qb_beta_accum',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_beta_count',
+                torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
+                persistent=False,
+            )
+        else:
+            self.qb_beta = None
+            self.qb_beta_accum = None
+            self.qb_beta_count = None
+
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
@@ -228,6 +279,13 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        # Keep the QB bias in fp32 for the same reason.
+        if hasattr(self, 'qb_beta') and self.qb_beta is not None:
+            if self.qb_beta.dtype != torch.float32:
+                self.qb_beta.data = self.qb_beta.data.to(torch.float32)
+        if hasattr(self, 'qb_beta_accum') and self.qb_beta_accum is not None:
+            if self.qb_beta_accum.dtype != torch.float32:
+                self.qb_beta_accum.data = self.qb_beta_accum.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -261,6 +319,81 @@ class TopKRouter(Router):
         map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
         scores = logits * map
         return scores, map
+
+    def quantile_balancing(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply quantile-balancing (QB) routing to the logits tensor.
+
+        Selects top-k experts per token using a dual coordinate-descent update on
+        a per-expert bias ``qb_beta``. Load balance is handled entirely by the bias
+        update; auxiliary losses must be disabled when QB is active.
+
+        Args:
+            logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Sparse routing probs and boolean
+            routing map, each shaped ``[num_tokens, num_experts]``.
+        """
+        assert (
+            not self.config.moe_router_fusion
+        ), "Quantile balancing routing does not support moe_router_fusion."
+        assert (
+            self.config.moe_router_num_groups is None and self.config.moe_router_group_topk is None
+        ), "Quantile balancing routing does not support group-limited routing."
+
+        local_num_tokens = logits.shape[0]
+        # Gather logits across TP/CP so the quantile sees a whole sequence's tokens.
+        # The DP reduction and qb_beta update run at the global-batch boundary in
+        # finalize_model_grads._update_router_qb_beta.
+        gather_group = self.tp_cp_group
+        gather_size = gather_group.size() if gather_group is not None else 1
+
+        should_update_beta = self.training and torch.is_grad_enabled()
+
+        with torch.no_grad():
+            logits_fp32 = logits.detach().to(dtype=torch.float32)
+
+            if gather_size > 1:
+                full_logits = torch.empty(
+                    (local_num_tokens * gather_size, self.config.num_moe_experts),
+                    dtype=logits_fp32.dtype,
+                    device=logits_fp32.device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    full_logits, logits_fp32.contiguous(), group=gather_group
+                )
+                gather_rank = torch.distributed.get_rank(group=gather_group)
+            else:
+                full_logits = logits_fp32
+                gather_rank = 0
+
+            # Route with the previous batch's qb_beta; in training, accumulate this
+            # microbatch's quantile for the next update.
+            full_indices, beta_local = qb_dual_update(
+                full_logits, self.topk, self.qb_beta, update_beta=should_update_beta
+            )
+            if should_update_beta:
+                self.qb_beta_accum.add_(beta_local)
+                self.qb_beta_count.add_(1)
+
+            # Take this rank's rows (all_gather orders rows by rank).
+            if gather_size > 1:
+                indices = full_indices[
+                    gather_rank * local_num_tokens : (gather_rank + 1) * local_num_tokens
+                ].contiguous()
+            else:
+                indices = full_indices
+
+        # QB only picks the experts; reuse the shared score function for the probs.
+        return topk_routing_with_score_function(
+            logits,
+            self.topk,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            fused=self.config.moe_router_fusion,
+            precomputed_indices=indices,
+        )
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
         """Return the aux loss coeff for the given auxiliary loss type.
@@ -312,7 +445,7 @@ class TopKRouter(Router):
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=aux_loss_coeff,
-            fused=self.config.moe_router_fusion,
+            fused=self.config.moe_router_aux_loss_fusion,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -364,7 +497,7 @@ class TopKRouter(Router):
                 topk=self.topk,
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
-                fused=self.config.moe_router_fusion,
+                fused=self.config.moe_router_aux_loss_fusion,
             )
             / bsz
         )
@@ -375,7 +508,9 @@ class TopKRouter(Router):
             aux_loss,
             "seq_load_balancing_loss",
             self.tp_cp_group,
-            valid_token_count=local_num_tokens,
+            # local_num_tokens is per-sequence (bsz folded into the expert dim above);
+            # * bsz recovers the micro-batch total, else per-token-loss scaling keeps a 1/MBS.
+            valid_token_count=local_num_tokens * bsz,
         )
         return probs
 
@@ -412,7 +547,7 @@ class TopKRouter(Router):
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
             moe_aux_loss_coeff=global_aux_loss_coeff,
-            fused=self.config.moe_router_fusion,
+            fused=self.config.moe_router_aux_loss_fusion,
         )
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -520,9 +655,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): The logits of the router.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape in [num_tokens]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [num_tokens]. True = padding,
+                                                   False = valid. Defaults to None.
 
         Returns:
             torch.Tensor: The logits after applying the z-loss.
@@ -553,6 +688,8 @@ class TopKRouter(Router):
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
+            # TODO: repeated-MTP z_loss is scaled after MoEAuxLossAutoScaler.apply(), so this
+            # adjusts logging only; move the scaling above the attach point if z_loss is used.
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
             # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
             # so the total loss is correct.
@@ -573,7 +710,11 @@ class TopKRouter(Router):
                 layer_number = self.layer_number
 
             get_moe_metrics_tracker().record(
-                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
+                "z_loss",
+                z_loss / moe_z_loss_coeff,
+                layer_number,
+                num_layers,
+                avg_group=self.tp_dp_cp_group,
             )
         return logits
 
@@ -609,7 +750,7 @@ class TopKRouter(Router):
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
+                    routing_map = routing_map & (~padding_mask).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -617,9 +758,8 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask of shape `[seq_length, bsz]`.
+                `True` marks padding. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -627,6 +767,22 @@ class TopKRouter(Router):
                 with shape [num_tokens, num_experts].
         """
         seq_length, bsz = logits.shape[:2]
+        observe_router_diagnostics = is_observing_tensor("router_diagnostics")
+        if self.training and observe_router_diagnostics:
+            # The compact summaries normalize within each sequence and cannot reconstruct a
+            # complete sequence after it has been partitioned across ranks.
+            partitioned_sequence_axes = []
+            if self.config.sequence_parallel and self.tp_group.size() > 1:
+                partitioned_sequence_axes.append("tensor")
+            if self.cp_group.size() > 1:
+                partitioned_sequence_axes.append("context")
+            if partitioned_sequence_axes:
+                raise NotImplementedError(
+                    "Router diagnostic observations require complete local sequences and do not "
+                    "yet support sequence partitioning across "
+                    + " and ".join(partitioned_sequence_axes)
+                    + " parallel ranks."
+                )
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Flatten padding_mask to [num_tokens] if provided
@@ -639,6 +795,11 @@ class TopKRouter(Router):
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
+        elif self.routing_type == "quantile_balancing":
+            assert (
+                padding_mask is None
+            ), "Quantile balancing routing does not support padding masks yet."
+            probs, routing_map = self.quantile_balancing(logits)
         else:
             probs, routing_map = topk_routing_with_score_function(
                 logits,
@@ -664,36 +825,65 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
-            # Calculate scores and routing_map for aux loss
-            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                self.score_function,
-                fused=self.config.moe_router_fusion,
-                padding_mask=padding_mask,
-            )
-            probs = self._apply_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_seq_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                seq_length,
-                bsz,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_global_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
+        # Reuse the unbiased aux-loss routing calculation for due router diagnostics.
+        aux_loss_enabled = self.is_aux_loss_enabled()
+        apply_aux_loss = torch.is_grad_enabled() and aux_loss_enabled
+        compute_aux_inputs = self.training and (observe_router_diagnostics or apply_aux_loss)
+        if compute_aux_inputs:
+            score_context = nullcontext() if apply_aux_loss else torch.no_grad()
+            with score_context:
+                routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                    logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_aux_loss_fusion,
+                    padding_mask=padding_mask,
+                )
+            if observe_router_diagnostics:
+                # Report the additive selection correction: QB subtracts beta from logits,
+                # whereas ordinary bias routing adds expert_bias to the routing scores.
+                selection_bias = (
+                    -self.qb_beta if self.routing_type == "quantile_balancing" else self.expert_bias
+                )
+                diagnostics = build_router_diagnostics(
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    routing_map,
+                    selection_bias,
+                    seq_length,
+                    bsz,
+                    padding_mask=padding_mask,
+                )
+                observe_tensor(
+                    self,
+                    "router_diagnostics",
+                    "router_diagnostics",
+                    diagnostics,
+                    tp_shard_dim=None,
+                    sequence_dim=None,
+                    batch_dim=0,
+                )
+            if apply_aux_loss:
+                probs = self._apply_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
+                probs = self._apply_seq_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    seq_length,
+                    bsz,
+                    with_padding_mask=padding_mask is not None,
+                )
+                probs = self._apply_global_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
@@ -710,17 +900,52 @@ class TopKRouter(Router):
         """
         Forward pass of the router.
 
+        Raw router observations exclude padding when a mask is supplied. Their shape is then
+        `[valid_tokens, num_experts]`, with sequence and batch populations both on dimension zero.
+        Without a mask, observations retain the original sequence and batch dimensions. Routing
+        itself always receives the full logits and the original mask.
+
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask of shape `[seq_length, bsz]`.
+                `True` marks padding. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+        observe_logits = is_observing_tensor("router_logits")
+        observe_scores = is_observing_tensor("router_scores")
+        if observe_logits or observe_scores:
+            with torch.no_grad():
+                observed_logits = logits.detach()
+                if padding_mask is not None:
+                    observed_logits = observed_logits[~padding_mask]
+                tp_shard_dim = 0 if self.config.sequence_parallel else None
+                batch_dim = 0 if padding_mask is not None else 1
+                if observe_logits:
+                    observe_tensor(
+                        self,
+                        "router_logits",
+                        "router_logits",
+                        observed_logits,
+                        tp_shard_dim=tp_shard_dim,
+                        sequence_dim=0,
+                        batch_dim=batch_dim,
+                    )
+                # Materialize the full decision distribution only for a due metric.
+                if observe_scores:
+                    scores = compute_normalized_router_scores(observed_logits, self.score_function)
+                    observe_tensor(
+                        self,
+                        "router_scores",
+                        "router_scores",
+                        scores,
+                        tp_shard_dim=tp_shard_dim,
+                        sequence_dim=0,
+                        batch_dim=batch_dim,
+                    )
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
@@ -797,6 +1022,7 @@ class InferenceTopKRouter(TopKRouter):
         fused,
         router_replay,
         dense_output,
+        precomputed_indices,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -810,12 +1036,23 @@ class InferenceTopKRouter(TopKRouter):
             fused=fused,
             router_replay=router_replay,
             dense_output=dense_output,
+            precomputed_indices=precomputed_indices,
         )
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
-        probs, top_indices = self._compiled_topk_routing(
+        # QB selects on (logits - qb_beta); at inference qb_beta is fixed, so it's per-token.
+        precomputed_indices = None
+        if self.qb_beta is not None:
+            precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+
+        routing = (
+            topk_routing_with_score_function
+            if is_batch_invariant_mode_enabled()
+            else self._compiled_topk_routing
+        )
+        probs, top_indices = routing(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -827,6 +1064,7 @@ class InferenceTopKRouter(TopKRouter):
             fused=self.config.moe_router_fusion,
             router_replay=self.router_replay,
             dense_output=True,
+            precomputed_indices=precomputed_indices,
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
