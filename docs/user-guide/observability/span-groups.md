@@ -88,3 +88,10 @@ iteration of each run has `nv.dl.training.iteration.is_first=true`.
 `nv.dl.training.iteration.skipped` and
 `nv.dl.training.optimizer.update_successful` distinguish attempted work from a
 successful optimizer update.
+
+## MCore detailed instrumentation
+
+`megatron.detail` owns the canonical `nv.mcore.microbatch.*`, `nv.mcore.p2p.*`,
+`nv.mcore.grad_sync.*`, and `nv.mcore.layer.*` operation spans. See
+[Pipeline and MCore instrumentation](pipeline-parallel.md) for their names and
+attributes.
