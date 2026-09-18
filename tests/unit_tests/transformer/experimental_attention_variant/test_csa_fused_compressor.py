@@ -463,6 +463,7 @@ class TestCompressorFusedIntegration:
         # Emphasize the first crossing group so losing the halo's wgrad cannot
         # hide under the tolerance for BF16 reduction-order differences.
         grad_out[torch.nonzero(canonical, as_tuple=True)[0][0]] *= 16
+        projection_runs = []
 
         def run(module, projected):
             x = x_base.detach().clone().requires_grad_(True)
@@ -472,6 +473,19 @@ class TestCompressorFusedIntegration:
             for linear in (module.linear_wkv, module.linear_wgate):
                 if fuse_wgrad:
                     linear.weight.main_grad = torch.zeros_like(linear.weight, dtype=torch.float32)
+            linears = (module.linear_wkv, module.linear_wgate)
+            projections = {linear: [] for linear in linears}
+
+            def capture_projection(linear, inputs, output):
+                call = {"input": inputs[0].detach(), "output": output[0].detach()}
+                projections[linear].append(call)
+
+                def capture_gradient(grad):
+                    call["grad"] = grad.detach()
+
+                output[0].register_hook(capture_gradient)
+
+            handles = [linear.register_forward_hook(capture_projection) for linear in linears]
             saved = []
 
             def pack(tensor):
@@ -500,10 +514,34 @@ class TestCompressorFusedIntegration:
                         pre_grouped_cu_seqlens_compressed=local_cuc,
                     )
             out.backward(grad_out)
-            weight_grads = [
-                (linear.weight.main_grad if fuse_wgrad else linear.weight.grad).clone()
-                for linear in (module.linear_wkv, module.linear_wgate)
-            ]
+            for handle in handles:
+                handle.remove()
+            for index, linear in enumerate(linears):
+                calls = projections[linear]
+                assert len(calls) == (2 if projected else 1)
+                partials = []
+                for call in calls:
+                    values, dy = call["input"], call["grad"]
+                    # CPU FP32 avoids TF32 in this independent wgrad reference.
+                    values = values.reshape(-1, values.shape[-1]).float().cpu()
+                    dy = dy.reshape(-1, dy.shape[-1]).float().cpu()
+                    partials.append(dy.T @ values)
+                expected_wgrad = sum(partials)
+                wgrad = linear.weight.main_grad if fuse_wgrad else linear.weight.grad
+                tolerance = 1e-3 + 1e-4 * expected_wgrad.abs()
+                if not fuse_wgrad:
+                    # Each GEMM rounds to BF16; the split path also rounds their
+                    # sum. Bound each rounding before cancellation of the terms.
+                    u = torch.finfo(torch.bfloat16).eps / 2
+                    tolerance += u * sum(part.abs() for part in partials)
+                    if projected:
+                        tolerance += u * sum(part.bfloat16().float() for part in partials).abs()
+                error = (wgrad.float().cpu() - expected_wgrad).abs()
+                assert torch.all(error <= tolerance), (
+                    f"Projection {index} wgrad exceeds FP32 reference tolerance: "
+                    f"max normalized error {(error / tolerance).max().item()}"
+                )
+            projection_runs.append([projections[linear] for linear in linears])
             compact_rows = layout.compact_to_source.numel()
             if projected:
                 assert not any(
@@ -516,7 +554,7 @@ class TestCompressorFusedIntegration:
                 assert any(ptr == compact.untyped_storage().data_ptr() for _, ptr in saved)
             if detach_input:
                 assert x.grad is None and boundary.grad is None
-            grads = weight_grads + [module.ape.grad, module.norm.weight.grad]
+            grads = [module.ape.grad, module.norm.weight.grad]
             if not detach_input:
                 grads += [x.grad, boundary.grad]
             return out.detach(), grads
@@ -524,8 +562,21 @@ class TestCompressorFusedIntegration:
         ref_out, ref_grads = run(reference, False)
         out, grads = run(actual, True)
         torch.testing.assert_close(out[canonical], ref_out[canonical], rtol=2e-2, atol=2e-2)
-        # Splitting BF16 wgrad changes its reduction order and, without fusion,
-        # rounds each partial gradient before accumulation. It is not bitwise.
+        # Different GEMM shapes can change BF16 projection rounding and hence dY.
+        # Compare those directly; each wgrad above uses its own actual dY oracle.
+        source = layout.compact_to_source
+        valid = source >= 0
+        used = torch.zeros(
+            local_rows + layout.boundary_rows, dtype=torch.bool, device=source.device
+        )
+        used[source[valid].long()] = True
+        for ref_calls, calls in zip(*projection_runs):
+            for key in ("output", "grad"):
+                values = torch.cat((calls[1][key], calls[0][key]))
+                if key == "grad":
+                    assert torch.count_nonzero(values[~used]) == 0
+                compact = values[source[valid].long()]
+                torch.testing.assert_close(compact, ref_calls[0][key][valid], rtol=3e-2, atol=5e-2)
         for result, expected in zip(grads, ref_grads):
             torch.testing.assert_close(result.float(), expected.float(), rtol=3e-2, atol=5e-2)
 
