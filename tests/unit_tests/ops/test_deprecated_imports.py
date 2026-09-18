@@ -14,7 +14,7 @@ from types import ModuleType
 import pytest
 
 from megatron.core.ops import _compat
-from tests.unit_tests.ops.deprecated_paths import FORWARDED, PACKAGE_MARKERS
+from tests.unit_tests.ops.deprecated_paths import FORWARDED
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -73,7 +73,9 @@ def test_forwarder_preserves_exports(old, targets, monkeypatch):
         getattr(module, 'missing_export')
 
 
-@pytest.mark.skipif("megatron.core.ssm.ops.mamba2" not in FORWARDED, reason="moved in a later PR of this stack")
+@pytest.mark.skipif(
+    "megatron.core.ssm.ops.mamba2" not in FORWARDED, reason="moved in a later PR of this stack"
+)
 def test_package_child_import_stays_lazy(monkeypatch):
     """Importing a deprecated child must not probe optional kernels in its parent."""
 
@@ -90,7 +92,9 @@ def test_package_child_import_stays_lazy(monkeypatch):
     assert child.__name__ == 'megatron.core.ssm.ops.mamba2.ssd_combined'
 
 
-@pytest.mark.skipif("megatron.core.ssm.ops" not in FORWARDED, reason="moved in a later PR of this stack")
+@pytest.mark.skipif(
+    "megatron.core.ssm.ops" not in FORWARDED, reason="moved in a later PR of this stack"
+)
 def test_old_ssm_entry_points_preserve_missing_dependency_behavior(monkeypatch):
     """The historical optional entry points still return None when kernels are absent."""
     from megatron.core.ops import ssm
@@ -107,7 +111,9 @@ def test_old_ssm_entry_points_preserve_missing_dependency_behavior(monkeypatch):
     assert old.causal_conv1d_varlen_fn is None
 
 
-@pytest.mark.skipif("megatron.core.ssm.gated_delta_net" not in FORWARDED, reason="moved in a later PR of this stack")
+@pytest.mark.skipif(
+    "megatron.core.ssm.gated_delta_net" not in FORWARDED, reason="moved in a later PR of this stack"
+)
 def test_gdn_package_exports_canonical_classes():
     """The historical GDN package exports both variants and the common submodule spec."""
     from megatron.core.ops.ssm.gated_delta.common import GatedDeltaNetSubmodules
@@ -171,28 +177,71 @@ def test_internal_imports_resolve_after_move():
 
 def test_in_tree_code_uses_canonical_imports():
     """Production code and tests must exercise implementations instead of the aliases."""
-    obsolete = tuple(name + '.' for name in PACKAGE_MARKERS)
+    # The stack moves one family at a time; unmoved modules retain their original paths.
+    obsolete = tuple(name + '.' for name in FORWARDED)
     violations = []
     for folder in ('megatron', 'tests', 'examples', 'tools'):
         for path in (REPO_ROOT / folder).rglob('*.py'):
             relative = path.relative_to(REPO_ROOT)
             if relative.parts[:3] == ('tests', 'unit_tests', 'ops'):
                 continue
-            module = '.'.join(relative.with_suffix('').parts)
-            if module.startswith(obsolete):
-                continue
+            package = '.'.join(relative.parent.parts)
             for node in ast.walk(ast.parse(path.read_text())):
                 names = []
                 if isinstance(node, ast.Import):
                     names = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    names = [node.module] + [f'{node.module}.{a.name}' for a in node.names]
-                if any(name in PACKAGE_MARKERS or name.startswith(obsolete) for name in names):
+                elif isinstance(node, ast.ImportFrom):
+                    module = '.' * node.level + (node.module or '')
+                    if node.level:
+                        module = importlib.util.resolve_name(module, package)
+                    names = [module] + [f'{module}.{a.name}' for a in node.names]
+                if any(name in FORWARDED or name.startswith(obsolete) for name in names):
                     violations.append(f'{relative}:{node.lineno}')
     assert not violations, '\n'.join(violations)
 
 
-@pytest.mark.skipif("megatron.core.ssm.ops.mamba2" not in FORWARDED, reason="moved in a later PR of this stack")
+@pytest.mark.parametrize(
+    'source,moved,rejected',
+    [
+        ('from megatron.core.ssm.mamba_layer import MambaLayer', True, False),
+        ('from .mlp_layer import MLPLayer', True, False),
+        (
+            'from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention',
+            True,
+            False,
+        ),
+        ('from megatron.core.ops.ssm.mamba2.mixer import MambaMixer', True, False),
+        ('import megatron.core.ssm.mamba_mixer', False, False),
+        ('import megatron.core.ssm.mamba_mixer', True, True),
+        ('from megatron.core.ssm import mamba_mixer', True, True),
+        ('from .mamba_mixer import MambaMixer', True, True),
+        ('from . import mamba_mixer', True, True),
+        ('from megatron.core.ssm.ops.mamba2 import ssd_combined', True, True),
+    ],
+)
+def test_canonical_import_check_tracks_partial_moves(
+    source, moved, rejected, tmp_path, monkeypatch
+):
+    """Allow later slices while detecting stale imports inside an unmoved SSM module."""
+    path = tmp_path / 'megatron/core/ssm/mamba_layer.py'
+    path.parent.mkdir(parents=True)
+    path.write_text(source + '\n')
+    forwarded = {
+        'megatron.core.ssm.mamba_mixer': ('megatron.core.ops.ssm.mamba2.mixer',),
+        'megatron.core.ssm.ops': ('megatron.core.ops.ssm',),
+    }
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], 'FORWARDED', forwarded if moved else {})
+    if rejected:
+        with pytest.raises(AssertionError, match='megatron/core/ssm/mamba_layer.py:1'):
+            test_in_tree_code_uses_canonical_imports()
+    else:
+        test_in_tree_code_uses_canonical_imports()
+
+
+@pytest.mark.skipif(
+    "megatron.core.ssm.ops.mamba2" not in FORWARDED, reason="moved in a later PR of this stack"
+)
 def test_batch_invariant_pins_canonical_mamba_kernels(monkeypatch):
     """Moving the SSM kernels must not disconnect batch-invariant autotuner pinning."""
     from megatron.core.ops.ssm.mamba2 import (
