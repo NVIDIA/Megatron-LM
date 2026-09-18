@@ -27,7 +27,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
     is_managed_by_layer_wise_optimizer,
 )
-from megatron.core.ssm.gated_delta_product import (
+from megatron.core.ops.ssm.gdp.mixer import (
     HAVE_EINOPS,
     HAVE_FLA,
     HAVE_MAMBA_SSM,

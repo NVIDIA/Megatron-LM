@@ -16,13 +16,10 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
-from megatron.core.ssm.gated_delta_product import (
-    GatedDeltaProductMixer,
-    GatedDeltaProductMixerSubmodules,
-)
+from megatron.core.ops.ssm.gated_delta import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer, GatedDeltaProductMixerSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,

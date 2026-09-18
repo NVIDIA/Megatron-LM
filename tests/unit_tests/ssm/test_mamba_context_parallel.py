@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core import parallel_state
-from megatron.core.ssm.mamba_context_parallel import MambaContextParallel
+from megatron.core.ops.ssm.mamba2.context_parallel import MambaContextParallel
 from tests.unit_tests.test_utilities import Utils
 
 
