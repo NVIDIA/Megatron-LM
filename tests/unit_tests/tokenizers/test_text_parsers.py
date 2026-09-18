@@ -28,9 +28,7 @@ from megatron.core.tokenizers.text.parsers.deepseek_r1_reasoning_parser import (
 from megatron.core.tokenizers.text.parsers.nemotron_v3_reasoning_parser import (
     NemotronV3ReasoningParser,
 )
-from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import (
-    _Qwen3CoderToolParser,
-)
+from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import _Qwen3CoderToolParser
 
 # (text, kwargs, expected_content, expected_info)
 # `kwargs` is expanded into `parse(text, **kwargs)`; the override flags reach the

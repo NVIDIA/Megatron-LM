@@ -209,9 +209,7 @@ class _Qwen3CoderToolParser:
     #     end-of-string terminator, so an unclosed parameter is dropped rather
     #     than salvaged.
     tool_call_parameter_regex = re.compile(
-        r"<\s*parameter\s*=\s*([^>]*)>"
-        r"(.*?)"
-        r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
+        r"<\s*parameter\s*=\s*([^>]*)>" r"(.*?)" r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
         re.DOTALL,
     )
 
