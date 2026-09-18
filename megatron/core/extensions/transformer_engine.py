@@ -168,14 +168,13 @@ class TEQuantizationRecipe:
     inherit_model_init_context: bool = False
     """
     Whether parameter storage should always inherit the enclosing model-init context.
-    Matching global and per-module MXFP8 policies also inherit automatically when
-    ``fp8_param`` is omitted.
+    Inference-optimized modules with matching global and per-module MXFP8 policies
+    also inherit automatically when no storage or inheritance option is specified.
     """
-    fp8_param: bool | None = None
+    fp8_param: bool = False
     """
-    Whether to cast initialized parameters to FP8. If omitted, parameter storage
-    remains BF16 except when a matching global MXFP8 parameter policy is active;
-    that targeted case inherits the enclosing model-init context automatically.
+    Whether to cast initialized parameters to FP8. Defaults to BF16 storage unless
+    ``inherit_model_init_context`` is enabled explicitly or resolved for inference.
     """
     fp4_param: bool = False
     """
@@ -183,7 +182,9 @@ class TEQuantizationRecipe:
     """
 
     @classmethod
-    def parse_from_config(cls, quant_config: Dict[Any, Any]) -> "TEQuantizationRecipe":
+    def parse_from_config(
+        cls, quant_config: Dict[Any, Any], *, auto_inherit_model_init_context: bool = False
+    ) -> "TEQuantizationRecipe":
         """
         Parse config from quantization dictionary.
         """
@@ -201,7 +202,20 @@ class TEQuantizationRecipe:
         for field in quant_config:
             if field not in class_keys:
                 raise ValueError(f"Field '{field}' not valid for this configuration.")
+        # Resolve inference defaults while omission is still distinguishable from
+        # explicit false. Only modify the constructor kwargs, not the shared recipe.
+        if (
+            auto_inherit_model_init_context
+            and quant_config.get("fp8_quantization_recipe") == Fp8Recipe.mxfp8
+            and not any(
+                field in quant_config
+                for field in ("fp8_param", "fp4_param", "inherit_model_init_context")
+            )
+        ):
+            kwargs["inherit_model_init_context"] = True
         instance = TEQuantizationRecipe(**kwargs)
+        if not isinstance(instance.fp8_param, bool):
+            raise ValueError("fp8_param must be a bool (true or false).")
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
         if (
@@ -236,9 +250,20 @@ class TEQuantizationParams:
     """
 
     @staticmethod
-    def parse_from_config(quant_config: QuantizationConfig) -> "TEQuantizationParams":
+    def parse_from_config(
+        quant_config: QuantizationConfig, *, model_config: TransformerConfig | None = None
+    ) -> "TEQuantizationParams":
         """Parses quantization config for a layer or throw an error."""
         config = quant_config.config
+        # Training retains its existing BF16 storage default. The optimized
+        # inference backend needs MXFP8 storage to select its MXFP8 kernels.
+        auto_inherit_model_init_context = (
+            model_config is not None
+            and model_config.transformer_impl == "inference_optimized"
+            and bool(model_config.fp8)
+            and model_config.fp8_recipe == Fp8Recipe.mxfp8
+            and model_config.fp8_param
+        )
         try:
             config_type = TransformerEngineConfigType(config[_TE_CONFIG_TYPE_KEY])
         except KeyError:
@@ -253,13 +278,17 @@ class TEQuantizationParams:
                 raise ValueError(
                     "TransformerEngine config dictionary must have 'training_recipe' key"
                 )
-            training_recipe = TEQuantizationRecipe.parse_from_config(config['training_recipe'])
+            training_recipe = TEQuantizationRecipe.parse_from_config(
+                config['training_recipe'],
+                auto_inherit_model_init_context=auto_inherit_model_init_context,
+            )
             if 'evaluation_recipe' not in config.keys():
                 evaluation_recipe = None
                 assert len(config.keys()) == 2
             else:
                 evaluation_recipe = TEQuantizationRecipe.parse_from_config(
-                    config['evaluation_recipe']
+                    config['evaluation_recipe'],
+                    auto_inherit_model_init_context=auto_inherit_model_init_context,
                 )
                 assert len(config.keys()) == 3
             return TEQuantizationParams(
@@ -269,10 +298,8 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
-def _get_fp8_model_init_for_quant_recipe(
-    qrecipe: TEQuantizationRecipe, *, auto_inherit_model_init_context: bool = False
-):
-    if qrecipe.inherit_model_init_context or auto_inherit_model_init_context:
+def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+    if qrecipe.inherit_model_init_context:
         # Preserve both the enclosing recipe and whether storage is enabled. In
         # particular, this lets the global first/last-layer BF16 policy remain in
         # control while a per-module recipe changes execution precision.
@@ -322,9 +349,7 @@ def _get_fp8_model_init_for_quant_recipe(
     )
 
 
-def _get_fp8_model_init_for_quant_params(
-    qparams: TEQuantizationParams | None, training: bool, config: TransformerConfig
-):
+def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
     if qparams is None:
         return nullcontext()
     elif not training and qparams.evaluation_recipe is not None:
@@ -332,20 +357,7 @@ def _get_fp8_model_init_for_quant_params(
     else:
         qrecipe = qparams.training_recipe
 
-    # A matching MXFP8 execution recipe should follow a global MXFP8 parameter
-    # policy when it does not make an explicit storage choice. This is narrow to
-    # MXFP8 and fp8_param=True: omitted recipe storage retains the legacy BF16
-    # behavior everywhere else, while explicit fp8_param=False remains an opt-out.
-    auto_inherit_model_init_context = (
-        qrecipe.fp8_param is None
-        and not qrecipe.fp4_param
-        and qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8
-        and getattr(config, "fp8_recipe", None) == Fp8Recipe.mxfp8
-        and bool(getattr(config, "fp8_param", False))
-    )
-    return _get_fp8_model_init_for_quant_recipe(
-        qrecipe, auto_inherit_model_init_context=auto_inherit_model_init_context
-    )
+    return _get_fp8_model_init_for_quant_recipe(qrecipe)
 
 
 def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
@@ -1366,7 +1378,7 @@ class TELinear(te.pytorch.Linear):
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
-            self.te_quant_params, torch.is_grad_enabled(), config
+            self.te_quant_params, torch.is_grad_enabled()
         )
         init_gtp_remat_context = _init_gtp_remat_context(
             self,
@@ -1418,7 +1430,9 @@ class TELinear(te.pytorch.Linear):
         if quantization_config is None:
             self.te_quant_params = None
         else:
-            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+            self.te_quant_params = TEQuantizationParams.parse_from_config(
+                quantization_config, model_config=self.config
+            )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1591,7 +1605,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
-            self.te_quant_params, torch.is_grad_enabled(), config
+            self.te_quant_params, torch.is_grad_enabled()
         )
         # Yield a separate gtp_output_size: the logical output_size is reused below for cpu-init
         # (divide(output_size, tp_size)), so it must stay unsharded.
@@ -1665,7 +1679,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         if quantization_config is None:
             self.te_quant_params = None
         else:
-            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+            self.te_quant_params = TEQuantizationParams.parse_from_config(
+                quantization_config, model_config=self.config
+            )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -2629,7 +2645,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
             self.finish_init(quant_config)
             init_quant_context = _get_fp8_model_init_for_quant_params(
-                self.te_quant_params, torch.is_grad_enabled(), config
+                self.te_quant_params, torch.is_grad_enabled()
             )
             init_gtp_remat_context = _init_gtp_remat_context(
                 self,
@@ -2832,7 +2848,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if quantization_config is None:
                 self.te_quant_params = None
             else:
-                self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+                self.te_quant_params = TEQuantizationParams.parse_from_config(
+                    quantization_config, model_config=self.config
+                )
 
         def will_execute_quantized(self, is_context_quantized: bool) -> bool:
             """Returns whether the module is configured to execute quantized."""

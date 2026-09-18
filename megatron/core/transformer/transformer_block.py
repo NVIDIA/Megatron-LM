@@ -364,9 +364,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 quantization_context = nullcontext()
 
             with quantization_context:
-                # Resolve per-module storage before TE allocates parameters, not
-                # only in GPTModel's post-construction finish_init pass. Avoid
-                # adding kwargs to custom layer specs when naming is unused.
+                # Pass names so per-module recipes choose storage before TE allocates
+                # parameters. GPTModel's later finish_init() sets quantization overrides
+                # but does not replace existing weights: under global MXFP8 storage,
+                # even BF16-selected modules would otherwise get MXFP8 parameters.
+                # Loading a BF16 checkpoint into those parameters would quantize its
+                # values; converting back to BF16 cannot recover the lost precision.
+                # HybridStack already passes names during construction. Keep unnamed
+                # custom layer specs unchanged by omitting the extra keyword argument.
                 layer_kwargs = (
                     {"name": f"{self.name}.layers.{layer_number - 1}"}
                     if self.name is not None
