@@ -746,6 +746,15 @@ class TENorm:
         return cast(LayerNormInterface, instance)
 
 
+def _install_recompute_gather_cache(config: TransformerConfig) -> None:
+    """With ``config.recompute_reuse_gathered_input``, make Transformer Engine's linears reuse the
+    all-gather of a recomputed input for the weight gradient (recompute_gather_cache.py)."""
+    if getattr(config, "recompute_reuse_gathered_input", False):
+        from megatron.core.tensor_parallel.recompute_gather_cache import install
+
+        install()
+
+
 class TELinear(te.pytorch.Linear):
     """Wrapper for the Transformer-Engine's `Linear` layer.
 
@@ -945,6 +954,7 @@ class TELinear(te.pytorch.Linear):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+        _install_recompute_gather_cache(config)
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -1316,6 +1326,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
+        _install_recompute_gather_cache(config)
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
