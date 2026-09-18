@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import torch.utils.deterministic
 
 from tools.determinism import capture_recipe
 from tools.determinism.capture_recipe import Inventory, install_bindings
@@ -31,7 +32,7 @@ def signature(phase="forward"):
         "implementation": "torch.compile:bias_swiglu",
         "phase": phase,
         "deterministic_algorithms": True,
-        "runtime": {},
+        "runtime": {"fill_uninitialized_memory": True},
         "inputs": [
             {"shape": [2, 4], "stride": [4, 1], "dtype": "torch.bfloat16", "requires_grad": True}
         ],
@@ -80,6 +81,117 @@ def test_matching_forward_evidence_preserves_recipe_replay_boundary():
     assert report["counts"][DETERMINISTIC] == 1
     assert report["recipe_status"] == "replay_required"
     assert report["operations"][0]["evidence"][0]["case_id"] == "test_swiglu[bf16]"
+
+
+@pytest.fixture
+def memory_fill():
+    previous = torch.utils.deterministic.fill_uninitialized_memory
+    yield
+    torch.utils.deterministic.fill_uninitialized_memory = previous
+
+
+@pytest.mark.parametrize("fill", [False, True])
+def test_capture_runtime_records_memory_fill_without_mutation(memory_fill, fill):
+    torch.utils.deterministic.fill_uninitialized_memory = fill
+    before = capture_recipe.runtime_signature(torch)
+    assert before["fill_uninitialized_memory"] is fill
+    assert torch.utils.deterministic.fill_uninitialized_memory is fill
+    torch.utils.deterministic.fill_uninitialized_memory = not fill
+    after = capture_recipe.runtime_signature(torch)
+    assert after["fill_uninitialized_memory"] is (not fill)
+    assert before != after
+
+
+@pytest.mark.parametrize("fill", [False, True])
+@pytest.mark.parametrize("status", [DETERMINISTIC, NONDETERMINISTIC])
+def test_memory_fill_match_requires_the_actual_boolean_setting(fill, status):
+    request, proof = inventory(), evidence(status, "forward")
+    request["operations"][0]["signature"]["runtime"]["fill_uninitialized_memory"] = fill
+    proof["cases"][0]["observations"][0]["signature"]["runtime"]["fill_uninitialized_memory"] = fill
+    assert build_report([request], [proof])["counts"][status] == 1
+    proof["cases"][0]["observations"][0]["signature"]["runtime"][
+        "fill_uninitialized_memory"
+    ] = not fill
+    assert build_report([request], [proof])["counts"][UNVERIFIED] == 1
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, 1])
+@pytest.mark.parametrize("status", [DETERMINISTIC, NONDETERMINISTIC])
+def test_legacy_or_non_boolean_memory_fill_cannot_supply_recipe_evidence(value, status):
+    request, proof = inventory(), evidence(status, "forward")
+    for item in (request["operations"][0], proof["cases"][0]["observations"][0]):
+        if value is None:
+            item["signature"]["runtime"].pop("fill_uninitialized_memory")
+        else:
+            item["signature"]["runtime"]["fill_uninitialized_memory"] = value
+    report = build_report([request], [proof])
+    assert report["counts"][UNVERIFIED] == 1
+    assert not report["operations"][0]["evidence"]
+    assert "memory-fill" in report["operations"][0]["reason"].lower()
+
+
+@pytest.mark.parametrize("missing_from", ["inventory", "evidence", "backward_runtime"])
+def test_memory_fill_missing_on_either_side_cannot_match(missing_from):
+    request, proof = inventory(), evidence()
+    if missing_from == "inventory":
+        request["operations"][0]["signature"]["runtime"].pop("fill_uninitialized_memory")
+    elif missing_from == "evidence":
+        proof["cases"][0]["observations"][0]["signature"]["runtime"].pop(
+            "fill_uninitialized_memory"
+        )
+    else:
+        request["operations"][0]["signature"]["backward_runtime"] = {}
+        proof["cases"][0]["observations"][0]["signature"]["backward_runtime"] = {}
+    assert build_report([request], [proof])["counts"][UNVERIFIED] == 1
+
+
+def test_backward_policy_change_is_not_relabelled_as_forward_policy(memory_fill):
+    torch.utils.deterministic.fill_uninitialized_memory = False
+    recorder = Inventory(torch, 10)
+    binding = {"target": "fixture:square", "op_id": "square", "implementation": "torch:square"}
+    wrapped = recorder.wrap(lambda x: x.square(), binding)
+    value = torch.ones(2, requires_grad=True)
+    output = wrapped(value)
+    torch.utils.deterministic.fill_uninitialized_memory = True
+    output.sum().backward(retain_graph=True)
+    rows = list(recorder.operations.values())
+    backward = next(row for row in rows if row["signature"]["phase"] == "forward_backward")
+    assert backward["signature"]["runtime"]["fill_uninitialized_memory"] is False
+    assert backward["signature"]["backward_runtime"]["fill_uninitialized_memory"] is True
+    # A second traversal under another policy must not disappear behind the
+    # duplicate-output hook guard from the first traversal.
+    torch.utils.deterministic.fill_uninitialized_memory = False
+    output.sum().backward()
+    rows = list(recorder.operations.values())
+    assert len(rows) == 3
+    assert sum("backward_runtime" not in row["signature"] for row in rows) == 2
+    request, proof = inventory(), evidence()
+    request["operations"] = rows
+    proof["cases"][0]["op_id"] = "square"
+    proof["cases"][0]["observations"][0]["signature"] = {
+        **rows[0]["signature"],
+        "phase": "forward_backward",
+    }
+    report = build_report([request], [proof])
+    assert report["counts"][DETERMINISTIC] == 2
+    assert report["counts"][UNVERIFIED] == 1
+
+
+def test_backward_policy_deduplicates_output_hooks_without_changing_gradients(memory_fill):
+    torch.utils.deterministic.fill_uninitialized_memory = False
+    recorder = Inventory(torch, 10)
+    binding = {"target": "fixture:outputs", "op_id": "outputs", "implementation": "torch:outputs"}
+    value = torch.ones(2, requires_grad=True)
+    outputs = recorder.wrap(lambda x: (x.square(), x + 1), binding)(value)
+    sum(output.sum() for output in outputs).backward(retain_graph=True)
+    assert torch.equal(value.grad, torch.full_like(value, 3))
+    assert len(recorder.operations) == 2
+    assert all(row["calls"] == 1 for row in recorder.operations.values())
+    torch.utils.deterministic.fill_uninitialized_memory = True
+    sum(output.sum() for output in outputs).backward()
+    assert torch.equal(value.grad, torch.full_like(value, 6))
+    assert len(recorder.operations) == 3
+    assert all(row["calls"] == 1 for row in recorder.operations.values())
 
 
 def test_model_output_gradient_report_is_not_operator_evidence():
@@ -396,7 +508,9 @@ class Tensor:
 
 
 def test_capture_preserves_result_records_backward_and_restores_binding(monkeypatch):
-    monkeypatch.setattr(capture_recipe, "runtime_signature", lambda torch: {})
+    monkeypatch.setattr(
+        capture_recipe, "runtime_signature", lambda torch: {"fill_uninitialized_memory": True}
+    )
     torch = SimpleNamespace(Tensor=Tensor, are_deterministic_algorithms_enabled=lambda: True)
     recorder = Inventory(torch, 10)
     module = ModuleType("fixture_kernel")
