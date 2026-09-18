@@ -788,6 +788,10 @@ class DynamicInferenceRequest(InferenceRequest):
     # match rather than computed. Accumulated across prefill chunks by the context,
     # which uses it to avoid rewriting KV into blocks that already hold it.
     num_matched_prefix_blocks: int = 0
+    # First block kept private after MTP declines a cached prefix block. Neither it nor
+    # its descendants may be registered or inherited by a later chunk: the request does
+    # not own the canonical ancestor. Persists across prefill chunks.
+    mtp_private_suffix_start: Optional[int] = None
     block_hash_salt: Optional[str] = None  # Media identity for multimodal KV safety.
 
     # Computed field - not passed by caller
@@ -835,6 +839,10 @@ class DynamicInferenceRequest(InferenceRequest):
     events: List[DynamicInferenceEvent] = field(default_factory=list)
     event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
     generated_tokens: List[int] = field(default_factory=list)
+    # Speculative decoding (e.g. MTP): tokens emitted for this request on each engine step --
+    # accepted drafts + 1 for a decode step, 1 for the prefill step. Sums to `generated_length`,
+    # so a client can reconstruct per-step acceptance lengths. Empty when spec decoding is off.
+    acceptance_step_lengths: List[int] = field(default_factory=list)
 
     def finalize_text(self, tokenizer: Any) -> "DynamicInferenceRequest":
         """Populate generated text by decoding the complete generated token stream.
@@ -1241,6 +1249,7 @@ class DynamicInferenceRequestRecord:
             generated_text=None,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
+            acceptance_step_lengths=merge_lists("acceptance_step_lengths"),
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
