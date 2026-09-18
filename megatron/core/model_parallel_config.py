@@ -352,7 +352,13 @@ class ModelParallelConfig:
     """
 
     delay_wgrad_compute: bool = False
-    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+    """Delay weight-gradient computation to overlap expert-parallel communication."""
+
+    delay_megamoe_wgrad: bool = False
+    """Delay MegaMoE expert weight-gradient computation to overlap pipeline P2P communication.
+
+    This requires ``moe_use_transformer_engine_fused_moe`` and ``overlap_p2p_comm``.
+    """
 
     overlap_dispatch_backward_with_experts_wgrad: bool = False
     """Delay the weight gradient computation for TE Grouped GEMM MoE experts.

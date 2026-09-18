@@ -1239,6 +1239,10 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
+        if self._fused_moe_ops is not None and self.config.delay_megamoe_wgrad:
+            self._backward_dw_fc2()
+            self._backward_dw_fc1()
+            return
         if self._with_fused_impl and self.linear_fc1.delay_wgrad_compute:
             ops = self._fused_ops
             if ops is not None:
@@ -1265,6 +1269,75 @@ class TEGroupedMLP(MegatronModule):
             return
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
+
+    def _backward_dw_fused_moe_linear(self, child_index: int, original_linear) -> bool:
+        """Drain one delayed linear from the fused MegaMoE Sequential."""
+        if self._fused_moe_ops is None or not self.linear_fc1.delay_wgrad_compute:
+            return False
+        (seq,) = self._fused_moe_ops
+        fused_children = list(seq.children())
+        assert len(fused_children) == 5, (
+            "expected dispatch, FC1, activation, FC2, and combine in fused MegaMoE ops"
+        )
+        fused_linear = fused_children[child_index]
+        wgrad_store = fused_linear.wgrad_store
+        if wgrad_store.context is None or wgrad_store.context.empty():
+            return False
+        fused_linear.backward_dw()
+        # Delayed work is owned by the GroupedLinear shell in the TE
+        # Sequential, while DDP registers hooks on the original module.
+        original_linear._trigger_wgrad_accumulation_and_reduce_hooks()
+        return True
+
+    def _backward_dw_fc2(self) -> bool:
+        """Drain one delayed MegaMoE FC2 wgrad, if one is queued."""
+        return self._backward_dw_fused_moe_linear(3, self.linear_fc2)
+
+    def _backward_dw_fc1(self) -> bool:
+        """Drain one delayed MegaMoE FC1 wgrad, if one is queued."""
+        return self._backward_dw_fused_moe_linear(1, self.linear_fc1)
+
+
+class DelayedMegaMoeWgradManager:
+    """Place delayed MegaMoE expert wgrads into pipeline P2P overlap windows."""
+
+    def __init__(self, model_chunks: List[torch.nn.Module]):
+        self._experts_by_chunk = [
+            list(
+                reversed(
+                    [
+                        module
+                        for module in model_chunk.modules()
+                        if isinstance(module, TEGroupedMLP)
+                        and module.config.delay_megamoe_wgrad
+                    ]
+                )
+            )
+            for model_chunk in model_chunks
+        ]
+        self._pending_forward_overlap = []
+
+    def on_backward_p2p_launched(self, model_chunk_id: int) -> None:
+        """Overlap the larger FC1 wgrad now and queue FC2 for the next forward P2P window."""
+        experts = self._experts_by_chunk[model_chunk_id]
+        for expert in experts:
+            expert._backward_dw_fc1()
+        self._pending_forward_overlap.append(model_chunk_id)
+
+    def on_forward_p2p_launched(self) -> None:
+        """Overlap the oldest queued FC2 wgrad with forward P2P."""
+        if not self._pending_forward_overlap:
+            return
+        model_chunk_id = self._pending_forward_overlap.pop(0)
+        for expert in self._experts_by_chunk[model_chunk_id]:
+            expert._backward_dw_fc2()
+
+    def flush(self) -> None:
+        """Finish FC2 wgrads that have no remaining forward P2P window."""
+        while self._pending_forward_overlap:
+            model_chunk_id = self._pending_forward_overlap.pop(0)
+            for expert in self._experts_by_chunk[model_chunk_id]:
+                expert._backward_dw_fc2()
 
 
 class InferenceGroupedMLP(TEGroupedMLP):

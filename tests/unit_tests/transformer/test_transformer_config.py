@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
+import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -209,6 +210,28 @@ def test_fused_moe_mxfp8_enables_mxfp8_wire_dtypes():
 def test_fused_moe_config_rejects_incompatible_modes(override, error):
     with pytest.raises(ValueError, match=error):
         _fused_moe_config(**override)
+
+
+def test_fused_moe_config_accepts_delayed_wgrad_with_p2p_overlap():
+    config = _fused_moe_config(
+        num_layers=4,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.bfloat16,
+        overlap_p2p_comm=True,
+        batch_p2p_comm=False,
+        gradient_accumulation_fusion=True,
+        delay_megamoe_wgrad=True,
+    )
+
+    assert config.delay_megamoe_wgrad
+    assert not config.delay_wgrad_compute
+    assert not config.overlap_moe_expert_parallel_comm
+
+
+def test_fused_moe_config_rejects_delayed_wgrad_without_p2p_overlap():
+    with pytest.raises(ValueError, match="requires interleaved pipeline parallelism"):
+        _fused_moe_config(delay_megamoe_wgrad=True)
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])

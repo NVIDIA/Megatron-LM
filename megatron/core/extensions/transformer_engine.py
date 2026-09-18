@@ -2481,6 +2481,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self.delay_wgrad_compute = (
                 self.config.delay_wgrad_compute
                 or self.config.overlap_dispatch_backward_with_experts_wgrad
+                or self.config.delay_megamoe_wgrad
             )
             if self.delay_wgrad_compute:
                 if is_te_min_version("2.3.0"):
