@@ -89,6 +89,7 @@ developer/submit
 developer/oncall
 developer/generate_docs
 developer/dsv4_cp_balanced_indexer
+developer/gdn_ew_fusion
 ```
 
 ```{toctree}
