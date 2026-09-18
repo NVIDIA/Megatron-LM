@@ -67,7 +67,7 @@ inputs:
     required: false
     default: ""
   unit_testmon_mode:
-    description: "Unit-test mode: full, enforce (restore only), or baseline (main producer; temporary PR #7454 validation)."
+    description: "Unit-test mode: full, enforce (restore only), or baseline (main producer only)."
     required: false
     default: "full"
   unit_testmon_target_branch:
@@ -133,16 +133,10 @@ runs:
         TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
         SUITE_TAG: ${{ inputs.tag }}
       run: |
-        [[ "$SOURCE_REPOSITORY" == "NVIDIA/Megatron-LM" ]]
-        if [[ "$SOURCE_REF" == "refs/heads/main" ]]; then
-          [[ "$SOURCE_EVENT" == "schedule" || "$SOURCE_EVENT" == "workflow_dispatch" || "$SOURCE_EVENT" == "push" ]]
-          [[ "$REQUESTED_SHA" == "$SOURCE_SHA" ]]
-        else
-          # Temporary exception: exercise the fix on this PR's resolved merge commit.
-          [[ "$SOURCE_REF" == "refs/heads/pull-request/7454" && "$SOURCE_EVENT" == "push" ]]
-        fi
+        [[ "$SOURCE_REPOSITORY" == "NVIDIA/Megatron-LM" && "$SOURCE_REF" == "refs/heads/main" ]]
+        [[ "$SOURCE_EVENT" == "schedule" || "$SOURCE_EVENT" == "workflow_dispatch" || "$SOURCE_EVENT" == "push" ]]
         [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
-        [[ -n "$REQUESTED_SHA" && "$(git rev-parse HEAD)" == "$REQUESTED_SHA" ]]
+        [[ "$REQUESTED_SHA" == "$SOURCE_SHA" && "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
 
     - name: Pull container
       shell: bash -x -e -u -o pipefail {0}
@@ -162,32 +156,15 @@ runs:
         TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
         SUITE_TAG: ${{ inputs.tag }}
         CONTAINER_IMAGE: ${{ inputs.container-image }}
-        SOURCE_REF: ${{ github.ref }}
-        SOURCE_EVENT: ${{ github.event_name }}
       run: |
         [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
         sudo rm -rf -- assets_dir/testmon
         IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE") || IMAGE_ID=unknown
         python tests/unit_tests/testmon_cache.py identity \
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
-          --output "$RUNNER_TEMP/unit-testmon-identity.json" > /dev/null
-        python - "$RUNNER_TEMP/unit-testmon-identity.json" <<'PY' | tee -a "$GITHUB_OUTPUT"
-        import json
-        import os
-        import sys
-        from pathlib import Path
+          --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
 
-        path = Path(sys.argv[1])
-        identity = json.loads(path.read_text())
-        # Keep PR validation databases out of the shared main namespace.
-        if os.environ["SOURCE_REF"] == "refs/heads/pull-request/7454" and os.environ["SOURCE_EVENT"] == "push":
-            identity["cache_prefix"] = identity["cache_prefix"].replace("-main-", "-pr-7454-", 1)
-            identity["source_ref"] = os.environ["SOURCE_REF"]
-            path.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
-        print(f"cache_prefix={identity['cache_prefix']}")
-        PY
-
-    # Only main publishes the shared namespace. Synthetic PR pushes can read caches
+    # Only main publishes this namespace. Synthetic PR pushes can read caches
     # from the default branch; the sentinel primary key is never saved.
     - name: Restore unit Testmon baseline
       id: restore-unit-testmon
@@ -358,7 +335,7 @@ runs:
       shell: bash -e -u -o pipefail {0}
       env:
         CACHE_DIR: assets_dir/testmon
-        SOURCE_SHA: ${{ inputs.sha }}
+        SOURCE_SHA: ${{ github.sha }}
         GENERATION: ${{ github.run_id }}-${{ github.run_attempt }}
       run: |
         sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
@@ -367,7 +344,7 @@ runs:
           --source-sha "$SOURCE_SHA" --generation "$GENERATION"
 
     - name: Save unit Testmon baseline
-      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && github.repository == 'NVIDIA/Megatron-LM' && ((github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')) || (github.ref == 'refs/heads/pull-request/7454' && github.event_name == 'push'))
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && github.repository == 'NVIDIA/Megatron-LM' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
       uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       with:
         path: assets_dir/testmon
@@ -435,8 +412,7 @@ runs:
         else
           IS_SUCCESS=false
         fi
-        if [[ "$MAIN_CONCLUSION" == "success" && "$TESTMON_MODE" == "baseline" \
-          && "$CACHE_PUBLICATION" != "success" ]]; then
+        if [[ "$TESTMON_MODE" == "baseline" && "$CACHE_PUBLICATION" != "success" ]]; then
           IS_SUCCESS=false
           EXIT_CODE="Testmon cache publication failed"
         fi

@@ -244,18 +244,9 @@ def _action_script(name):
     return next(step["run"] for step in action["runs"]["steps"] if step["name"] == name)
 
 
-@pytest.mark.parametrize(
-    "diagnostic,source_ref,source_event,namespace",
-    [
-        ("failed-inspection", "refs/heads/main", "schedule", "main"),
-        ("omitted-cli-option", "refs/heads/main", "schedule", "main"),
-        ("failed-inspection", "refs/heads/pull-request/7454", "push", "pr-7454"),
-        ("failed-inspection", "refs/heads/pull-request/7454", "workflow_dispatch", "main"),
-        ("failed-inspection", "refs/heads/pull-request/7455", "push", "main"),
-    ],
-)
-def test_identity_preserves_usable_cache_and_isolates_pr_generation(
-    generation, source_tree, tmp_path, diagnostic, source_ref, source_event, namespace
+@pytest.mark.parametrize("diagnostic", ["failed-inspection", "omitted-cli-option"])
+def test_identity_without_image_diagnostics_preserves_usable_cache(
+    generation, source_tree, tmp_path, diagnostic
 ):
     directory, producer = generation
     runtime_dir = tmp_path / "runtime"
@@ -276,9 +267,8 @@ def test_identity_preserves_usable_cache_and_isolates_pr_generation(
                 # Do not inspect Docker or delete anything; use only the temporary source tree.
                 'docker() { [[ "$1 $2" == "image inspect" ]]; return 1; }',
                 'sudo() { [[ "$*" == "rm -rf -- assets_dir/testmon" ]]; }',
-                'python() { if [[ "$1" == "-" ]]; then "$TEST_PYTHON" "$@"; else '
-                '[[ "$1" == "tests/unit_tests/testmon_cache.py" ]]; '
-                'shift; "$TEST_PYTHON" "$TESTMON_HELPER" "$@"; fi; }',
+                'python() { [[ "$1" == "tests/unit_tests/testmon_cache.py" ]]; '
+                'shift; "$TEST_PYTHON" "$TESTMON_HELPER" "$@"; }',
                 script,
             )
         ),
@@ -287,8 +277,6 @@ def test_identity_preserves_usable_cache_and_isolates_pr_generation(
             **os.environ,
             "TEST_PYTHON": sys.executable,
             "TESTMON_HELPER": str(HELPER),
-            "SOURCE_REF": source_ref,
-            "SOURCE_EVENT": source_event,
             "TARGET_BRANCH": "main",
             "SUITE_TAG": "latest",
             "BUCKET": BUCKET,
@@ -304,69 +292,33 @@ def test_identity_preserves_usable_cache_and_isolates_pr_generation(
     assert result.returncode == 0, result.stdout + result.stderr
     consumer = json.loads((runtime_dir / "unit-testmon-identity.json").read_text())
     assert consumer["image_id"] == "unknown"
-    assert consumer["cache_prefix"].startswith(f"unit-testmon-v{cache.SCHEMA}-{namespace}-")
+    assert consumer["cache_prefix"] == producer["cache_prefix"]
     assert consumer["compatibility"] == producer["compatibility"]
-    assert output.read_text().strip() == f"cache_prefix={consumer['cache_prefix']}"
-    if namespace == "main":
-        assert consumer["cache_prefix"] == producer["cache_prefix"]
-        assert consumer.get("source_ref", "refs/heads/main") == "refs/heads/main"
-        manifest = cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
-        assert manifest["source_sha"] == "b" * 40
-        assert _snapshot(directory) == before
-    else:
-        assert consumer["cache_prefix"] != producer["cache_prefix"]
-        assert consumer["source_ref"] == source_ref
-        with pytest.raises(ValueError, match="generation"):
-            cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
-        merge_sha = "c" * 40
-        cache.finalize(directory, consumer, merge_sha, "456-1")
-        manifest = cache.validate_cache(directory, consumer, consumer["cache_prefix"] + "456-1")
-        assert manifest["source_ref"] == source_ref
-        assert manifest["source_sha"] == merge_sha
-        with pytest.raises(ValueError, match="generation"):
-            cache.validate_cache(directory, producer, consumer["cache_prefix"] + "456-1")
-        # Even relabeling the PR cache key cannot make it a valid main baseline.
-        with pytest.raises(ValueError, match="source"):
-            cache.validate_cache(directory, producer, producer["cache_prefix"] + "456-1")
-        after = _snapshot(directory)
-        before.pop("manifest.json")
-        after.pop("manifest.json")
-        assert after == before
+    assert output.read_text().strip() == f"cache_prefix={producer['cache_prefix']}"
+    manifest = cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    assert manifest["source_sha"] == "b" * 40
+    assert _snapshot(directory) == before
 
 
 @pytest.mark.parametrize(
-    "mode,publication,main_conclusion,main_exit_code,expected_success,expected_exit_code",
+    "mode,publication,expected",
     [
-        ("baseline", "failure", "success", "0", "false", "Testmon cache publication failed"),
-        ("baseline", "skipped", "success", "0", "false", "Testmon cache publication failed"),
-        ("baseline", "success", "success", "0", "true", "0"),
-        ("enforce", "skipped", "success", "0", "true", "0"),
-        ("baseline", "skipped", "failure", "1", "false", "1"),
-        ("baseline", "skipped", "failure", "", "false", "failure"),
-        ("baseline", "skipped", "cancelled", "", "false", "cancelled"),
-        ("baseline", "skipped", "skipped", "", "false", "skipped"),
+        ("baseline", "failure", "false"),
+        ("baseline", "skipped", "false"),
+        ("baseline", "success", "true"),
+        ("enforce", "skipped", "true"),
     ],
 )
-def test_producer_result_preserves_test_failures_and_requires_cache_publication(
-    mode, publication, main_conclusion, main_exit_code, expected_success, expected_exit_code
-):
+def test_producer_result_requires_cache_publication(mode, publication, expected):
     script = _action_script("Check result")
     script = script[script.index('EXIT_CODE="${MAIN_EXIT_CODE') :]
     script = script.split('if [[ "$IS_SUCCESS" == "false"', 1)[0]
     result = subprocess.run(
-        [
-            "bash",
-            "-e",
-            "-u",
-            "-o",
-            "pipefail",
-            "-c",
-            script + 'printf "%s\\n%s\\n" "$IS_SUCCESS" "$EXIT_CODE"',
-        ],
+        ["bash", "-e", "-u", "-o", "pipefail", "-c", script + 'printf "%s" "$IS_SUCCESS"'],
         env={
             **os.environ,
-            "MAIN_EXIT_CODE": main_exit_code,
-            "MAIN_CONCLUSION": main_conclusion,
+            "MAIN_EXIT_CODE": "0",
+            "MAIN_CONCLUSION": "success",
             "TESTMON_MODE": mode,
             "CACHE_PUBLICATION": publication,
         },
@@ -374,7 +326,7 @@ def test_producer_result_preserves_test_failures_and_requires_cache_publication(
         text=True,
         check=True,
     )
-    assert result.stdout.splitlines() == [expected_success, expected_exit_code]
+    assert result.stdout == expected
 
 
 @pytest.mark.parametrize(
@@ -446,14 +398,6 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         assert "without recording or saving" in summary.read_text()
 
 
-PR_BASELINE_SOURCE = {
-    "SOURCE_REF": "refs/heads/pull-request/7454",
-    "SOURCE_EVENT": "push",
-    "REQUESTED_SHA": "c" * 40,
-    "CHECKED_OUT_SHA": "c" * 40,
-}
-
-
 @pytest.mark.parametrize(
     "override,allowed",
     [
@@ -462,23 +406,11 @@ PR_BASELINE_SOURCE = {
         ({"SOURCE_REPOSITORY": "fork/Megatron-LM"}, False),
         ({"SOURCE_EVENT": "pull_request"}, False),
         ({"REQUESTED_SHA": "c" * 40}, False),
-        ({"REQUESTED_SHA": "c" * 40, "CHECKED_OUT_SHA": "c" * 40}, False),
-        ({"CHECKED_OUT_SHA": "c" * 40}, False),
-        (PR_BASELINE_SOURCE, True),
-        ({**PR_BASELINE_SOURCE, "SOURCE_REF": "refs/heads/pull-request/7455"}, False),
-        ({**PR_BASELINE_SOURCE, "SOURCE_REPOSITORY": "fork/Megatron-LM"}, False),
-        ({**PR_BASELINE_SOURCE, "SOURCE_EVENT": "schedule"}, False),
-        ({**PR_BASELINE_SOURCE, "SOURCE_EVENT": "workflow_dispatch"}, False),
-        ({**PR_BASELINE_SOURCE, "SOURCE_EVENT": "pull_request"}, False),
-        ({**PR_BASELINE_SOURCE, "TARGET_BRANCH": "dev"}, False),
-        ({**PR_BASELINE_SOURCE, "SUITE_TAG": "legacy"}, False),
-        ({**PR_BASELINE_SOURCE, "CHECKED_OUT_SHA": "b" * 40}, False),
-        ({**PR_BASELINE_SOURCE, "REQUESTED_SHA": "", "CHECKED_OUT_SHA": ""}, False),
     ],
 )
 def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, allowed):
     fake_git = tmp_path / "git"
-    fake_git.write_text("#!/bin/sh\nprintf '%s\\n' \"$CHECKED_OUT_SHA\"\n")
+    fake_git.write_text("#!/bin/sh\nprintf '%s\\n' \"$SOURCE_SHA\"\n")
     fake_git.chmod(0o755)
     result = subprocess.run(
         [
@@ -498,7 +430,6 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
             "SOURCE_EVENT": "schedule",
             "SOURCE_SHA": "b" * 40,
             "REQUESTED_SHA": "b" * 40,
-            "CHECKED_OUT_SHA": "b" * 40,
             "TARGET_BRANCH": "main",
             "SUITE_TAG": "latest",
             **override,

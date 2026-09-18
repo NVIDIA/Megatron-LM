@@ -215,7 +215,7 @@ def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) 
         validate_phase(cache_dir, phase, check_runtime=False)
     manifest = {
         "schema": SCHEMA,
-        "source_ref": identity.get("source_ref", "refs/heads/main"),
+        "source_ref": "refs/heads/main",
         "source_sha": source_sha,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "generation": generation,
@@ -227,7 +227,7 @@ def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) 
 
 
 def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
-    """Require a compatible completed generation, including its source and cache key."""
+    """Require a compatible completed main generation, including a prefix cache match."""
     manifest = _read_json(cache_dir / "manifest.json")
     generation = manifest.get("generation", "")
     if not isinstance(generation, str) or not re.fullmatch(r"[0-9]+-[0-9]+", generation):
@@ -236,9 +236,9 @@ def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
         raise ValueError("restored Testmon key does not match its generation")
     if manifest.get("schema") != SCHEMA or manifest.get("identity") != identity["compatibility"]:
         raise ValueError("Testmon cache compatibility changed")
-    if manifest.get("source_ref") != identity.get(
-        "source_ref", "refs/heads/main"
-    ) or not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("source_sha", ""))):
+    if manifest.get("source_ref") != "refs/heads/main" or not re.fullmatch(
+        r"[0-9a-f]{40}", str(manifest.get("source_sha", ""))
+    ):
         raise ValueError("invalid Testmon baseline source")
     if not isinstance(manifest.get("created_at"), str):
         raise ValueError("missing Testmon baseline creation time")

@@ -5,26 +5,11 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import shutil
 import sys
 from importlib.metadata import distributions
 from pathlib import Path
-
-# Spawned workers re-execute this script after its directory leaves sys.path.
-# Load the sibling directly without running tests/unit_tests/__init__.py.
-_cache_spec = importlib.util.spec_from_file_location(
-    "testmon_cache", Path(__file__).with_name("testmon_cache.py")
-)
-if _cache_spec is None or _cache_spec.loader is None:
-    raise ImportError("Unable to load the Testmon cache helper")
-_cache = importlib.util.module_from_spec(_cache_spec)
-sys.modules[_cache_spec.name] = _cache
-_cache_spec.loader.exec_module(_cache)
-is_tracked_package = _cache.is_tracked_package
-record_phase = _cache.record_phase
-validate_phase = _cache.validate_phase
 
 PHASES = ("prod", "experimental")
 
@@ -63,6 +48,8 @@ def _copy_database(cache_dir: Path, phase: str, rank: int) -> Path:
 
 
 def _testmon_dependency_override() -> str:
+    from testmon_cache import is_tracked_package
+
     installed_packages = {
         name for distribution in distributions() if (name := distribution.metadata["Name"])
     }
@@ -71,6 +58,9 @@ def _testmon_dependency_override() -> str:
 
 
 def _run(args: argparse.Namespace) -> int:
+    # Spawned workers reload this script after its directory leaves sys.path.
+    from testmon_cache import record_phase, validate_phase
+
     try:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])

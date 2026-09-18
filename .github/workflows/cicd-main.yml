@@ -197,7 +197,6 @@ jobs:
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
-      unit_testmon_mode: ${{ steps.configure.outputs.unit_testmon_mode }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -346,15 +345,6 @@ jobs:
             UNIT_TESTMON_ELIGIBLE=true
           fi
 
-          UNIT_TESTMON_MODE=full
-          if [[ "$UNIT_TESTMON_ELIGIBLE" == "true" ]]; then
-            UNIT_TESTMON_MODE=enforce
-          fi
-          # Temporary validation of the baseline fix on PR #7454, without a label.
-          if [[ "$EVENT_NAME" == "push" && "$REF" == "refs/heads/pull-request/7454" ]]; then
-            UNIT_TESTMON_MODE=baseline
-          fi
-
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -366,7 +356,6 @@ jobs:
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
           echo "unit_testmon_eligible=$UNIT_TESTMON_ELIGIBLE" | tee -a $GITHUB_OUTPUT
-          echo "unit_testmon_mode=$UNIT_TESTMON_MODE" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -397,7 +386,6 @@ jobs:
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
           | \`unit_testmon_requested\` | \`$HAS_UNIT_TESTMON\` |
           | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
-          | \`unit_testmon_mode\` | \`$UNIT_TESTMON_MODE\` |
 
           ### Decision tree
 
@@ -830,7 +818,7 @@ jobs:
           is_unit_test: "true"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
-          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_mode }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
 
   cicd-parse-unit-tests-gb200:
@@ -920,7 +908,7 @@ jobs:
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
-          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_mode }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
 
   # Single source of truth for "should integration tests run?".
@@ -1340,8 +1328,7 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, configure]
-    # Baseline recording produces Testmon databases instead of coverage artifacts.
+    needs: [Nemo_CICD_Test]
     if: |
       (
         (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
@@ -1350,7 +1337,6 @@ jobs:
       )
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
-      && needs.configure.outputs.unit_testmon_mode != 'baseline'
     strategy:
       matrix:
         flag: [unit-test]
