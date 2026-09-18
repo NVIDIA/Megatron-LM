@@ -2821,7 +2821,7 @@ class TECudaGraphHelper:
             )
 
             # Keep activation offload disabled during both TE warmup and graph capture.
-            # The MUSA offload path uses a separate D2H stream, which cannot be left
+            # The CUDA offload path uses a separate D2H stream, which cannot be left
             # running when the graph capture stream is finalized.
             if self.config.fine_grained_activation_offloading:
                 kwargs['pre_warmup_hook'] = off_interface.disable_offload

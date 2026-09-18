@@ -451,7 +451,7 @@ class LocalCudaGraphOffloadGroup:
         return (
             torch.is_tensor(tensor)
             and not isinstance(tensor, torch.nn.Parameter)
-            and tensor.device.type == "musa"
+            and tensor.is_cuda
             and tensor.numel() >= self.min_tensor_size
             and not _te_do_not_offload(tensor)
             and not getattr(tensor, "_do_not_offload", False)
@@ -501,7 +501,7 @@ class LocalCudaGraphOffloadGroup:
 
     def allocate(self, manager=None, slot_bank=None, group_index=None):
         """Allocate fixed-address slots, optionally from a resident shared bank."""
-        from transformer_engine.pytorch.vmm_activation import MUSAActivationVMMAllocation
+        from transformer_engine.pytorch.vmm_activation import CUDAActivationVMMAllocation
 
         assert self.state == "discovering"
         self.slot_bank = slot_bank
@@ -519,7 +519,7 @@ class LocalCudaGraphOffloadGroup:
                     device,
                 )
             else:
-                allocation = MUSAActivationVMMAllocation(shape, stride, dtype, device)
+                allocation = CUDAActivationVMMAllocation(shape, stride, dtype, device)
             self.allocations.append(allocation)
             allocation.set_slot_id(
                 f"rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1}/"
@@ -620,7 +620,7 @@ class LocalCudaGraphOffloadGroup:
         """Replace provisional capture allocations with a shared resident bank."""
         if self.resident:
             return
-        from transformer_engine.pytorch.vmm_activation import MUSAActivationVMMAllocation
+        from transformer_engine.pytorch.vmm_activation import CUDAActivationVMMAllocation
 
         old_allocations = self.allocations
         self.allocations = []
@@ -653,7 +653,7 @@ class LocalCudaGraphOffloadGroup:
             host_tensor.copy_(device_tensor, non_blocking=False)
         self.capture_forward_runner = runner
         # Keep an explicit stream dependency even on backends where the
-        # synchronous copy currently happens to drain the stream.  MUSA graph
+        # synchronous copy currently happens to drain the stream.  CUDA graph
         # capture and the caller's stream are not assumed to be identical.
         self.capture_snapshot_event = torch.cuda.Event()
         self.capture_snapshot_event.record(torch.cuda.current_stream())
@@ -722,9 +722,9 @@ class LocalCudaGraphOffloadGroup:
             print(
                 f"[vmm-offload][rank={rank}] submit_d2h group={self.name} "
                 f"state={self.state} allocations={len(self.allocations)} "
-                f"bytes={self.logical_bytes} compute_stream={getattr(compute_stream, 'musa_stream', None)} "
-                f"d2h_stream={getattr(d2h_stream, 'musa_stream', None)} "
-                f"release_stream={getattr(release_stream, 'musa_stream', None)}",
+                f"bytes={self.logical_bytes} compute_stream={getattr(compute_stream, 'cuda_stream', None)} "
+                f"d2h_stream={getattr(d2h_stream, 'cuda_stream', None)} "
+                f"release_stream={getattr(release_stream, 'cuda_stream', None)}",
                 flush=True,
             )
         # Event-gated per-group release: fall back to the old shared-stream
@@ -802,7 +802,7 @@ class LocalCudaGraphOffloadGroup:
                 status = dict(context.status())
                 if status["done"] != 1:
                     # The allocation owns the context and provides the blocking
-                    # compatibility API without synchronizing a MUSA stream.
+                    # compatibility API without synchronizing a CUDA stream.
                     pass
         for allocation in self.allocations:
             allocation.wait_for_async_release()
@@ -1011,12 +1011,12 @@ class PipelineOffloadManager:
         self, bank, name, group_index, tensor_index, shape, stride, dtype, device
     ):
         """Get or create one descriptor-compatible allocation in a resident bank."""
-        from transformer_engine.pytorch.vmm_activation import MUSAActivationVMMAllocation
+        from transformer_engine.pytorch.vmm_activation import CUDAActivationVMMAllocation
 
         key = (name, group_index, tensor_index, tuple(shape), tuple(stride), dtype, device)
         allocations = self._local_graph_resident_slots[bank]
         if key not in allocations:
-            allocations[key] = MUSAActivationVMMAllocation(shape, stride, dtype, device)
+            allocations[key] = CUDAActivationVMMAllocation(shape, stride, dtype, device)
         return allocations[key]
 
     def local_graph_capture_snapshot(self, runner):
@@ -1235,9 +1235,9 @@ class PipelineOffloadManager:
                 f"[vmm-offload][rank={rank}] submit_graph_d2h "
                 f"runner_id={id(runner)} groups={[group.name for group in active_groups]} "
                 f"allocations={len(allocations)} "
-                f"compute_stream={getattr(compute_stream, 'musa_stream', None)} "
-                f"d2h_stream={getattr(self.d2h_stream, 'musa_stream', None)} "
-                f"release_stream={getattr(self._local_graph_release_stream, 'musa_stream', None)}",
+                f"compute_stream={getattr(compute_stream, 'cuda_stream', None)} "
+                f"d2h_stream={getattr(self.d2h_stream, 'cuda_stream', None)} "
+                f"release_stream={getattr(self._local_graph_release_stream, 'cuda_stream', None)}",
                 flush=True,
             )
 
@@ -1321,6 +1321,7 @@ class PipelineOffloadManager:
                 reload_event.record(self.h2d_stream)
             runner.local_graph_reload_event = reload_event
             runner.local_graph_reload_context = None
+            runner.local_graph_reload_state = "reload_pending"
         else:
             # Submit in backward consumption order. The last forward-offloaded
             # group has the latest release dependency, so waiting on it first
@@ -1432,6 +1433,11 @@ class PipelineOffloadManager:
         if compute_stream is None:
             compute_stream = torch.cuda.current_stream()
         if self._local_graph_ping_pong_enabled(runner):
+            # The backward-chain head has no predecessor replay to look-ahead
+            # from. Non-ping-pong wait_ready already lazy-submits; do the same
+            # here so the first resident H2D is issued before the wait.
+            if runner.local_graph_reload_event is None:
+                self.local_graph_backward_submit_reload(runner)
             if runner.local_graph_reload_event is None:
                 raise RuntimeError("local graph resident reload has no completion event")
             compute_stream.wait_event(runner.local_graph_reload_event)
@@ -1472,7 +1478,7 @@ class PipelineOffloadManager:
             # The remap worker only performs the VMM transition.  Submit the
             # H2D from this training thread so the memcpy is ordered with the
             # replay that consumes this slot.  launch_remap_slot_h2d waits for
-            # the worker's remap completion before issuing musaMemcpyAsync on
+            # the worker's remap completion before issuing cudaMemcpyAsync on
             # h2d_stream; the returned slot event is then propagated to both
             # streams before the allocation is adopted.
             launch_remap_slot_h2d(context, 0, self.h2d_stream)
@@ -1992,7 +1998,7 @@ class ChunkOffloadHandler:
         return (
             not isinstance(tensor, torch.nn.Parameter)
             and not torch_stray_tensor
-            and tensor.device.type in ("cuda", "musa")
+            and tensor.is_cuda
         )
 
     def tensor_push(self, tensor):

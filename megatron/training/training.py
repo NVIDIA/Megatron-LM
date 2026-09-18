@@ -1107,9 +1107,8 @@ def pretrain(
     timers = get_timers()
 
     if args.fine_grained_activation_offloading:
-        if os.getenv("ACCELERATOR_BACKEND", "").lower() != "musa":
-            from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
-            set_ideal_affinity_for_current_gpu()
+        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
+        set_ideal_affinity_for_current_gpu()
 
 
     if cfg_container.logger.log_progress:

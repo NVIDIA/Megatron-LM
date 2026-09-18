@@ -349,13 +349,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             weight = GTPEmbeddingWeight.apply(self.weight)
 
         # Get the embeddings.
-        # MUSA: F.embedding's backward (embedding_dense_backward) lowers to a
-        # thrust sort/unique that SYNCHRONIZES -- illegal inside graph capture
-        # ("unique_by_key: musaErrorStreamCaptureUnsupported", kills
-        # cuda_graph_impl=full_iteration; verified by miniexp/unique_bwd_probe).
-        # The index-based gather (weight[ids]) is numerically identical and its
-        # backward captures cleanly, so prefer it on MUSA.
-        if self.deterministic_mode or torch.musa.is_available():
+        if self.deterministic_mode or torch.cuda.is_available():
             output_parallel = weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
