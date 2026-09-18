@@ -15,6 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -335,7 +336,18 @@ class TestMoEModules:
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
-        "use_grouped_tensor", [False, True], ids=["multi-stream", "device-initiated"]
+        "use_grouped_tensor",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    not te_ext._TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+                    reason="Installed TE GroupedLinear does not expose use_grouped_tensor",
+                ),
+            ),
+        ],
+        ids=["multi-stream", "device-initiated"],
     )
     def test_te_grouped_mlp_replays_on_uneven_experts(self, use_grouped_tensor):
         self._init()
