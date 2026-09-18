@@ -1159,6 +1159,19 @@ class CompressorProjectionCompact(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, local_kv, local_score, boundary_kv, boundary_score, layout):
+        """Gather local and halo KV/gate rows into the shared CP compact layout.
+
+        Args:
+            ctx: Autograd context. Saves the inverse source-to-compact map.
+            local_kv: Local KV projection, shape ``(l_local, ...)``.
+            local_score: Local gate projection, same shape as ``local_kv``.
+            boundary_kv: Halo KV projection, shape ``(boundary_rows, ...)``.
+            boundary_score: Halo gate projection, same shape as ``boundary_kv``.
+            layout: Shared ``CPCompressorLayout`` with injective row maps.
+
+        Returns:
+            Compacted ``(kv, score)`` tensors of shape ``(compact_len, ...)``.
+        """
         tensors = (local_kv, local_score, boundary_kv, boundary_score)
         _require_cute("CP projection compaction requires CUDA and CuTeDSL.", *tensors)
         if (
@@ -1189,8 +1202,20 @@ class CompressorProjectionCompact(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_kv, grad_score):
-        # Keep PyTorch's materialized zero gradient if only one output is used.
-        # Every unused source row is explicitly zeroed by the inverse-map kernel.
+        """Scatter compact KV/gate gradients back to local and halo rows.
+
+        Unused source rows are explicitly zeroed. PyTorch still materializes a
+        zero gradient if only one output is used.
+
+        Args:
+            ctx: Autograd context with the saved inverse map.
+            grad_kv: Gradient of the compacted KV projection.
+            grad_score: Gradient of the compacted gate projection.
+
+        Returns:
+            Gradients for local KV, local score, boundary KV, boundary score,
+            and ``None`` for the layout.
+        """
         (inverse,) = ctx.saved_tensors
         local_kv = grad_kv.new_empty(ctx.local_shape)
         local_score = torch.empty_like(local_kv)
