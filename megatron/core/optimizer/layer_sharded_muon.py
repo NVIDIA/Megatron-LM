@@ -10,6 +10,8 @@ duplicated mode — and two reverse all_to_all stages scatter the result back to
 original shards. All collectives use the existing gtp_remat / tp process groups.
 """
 
+from __future__ import annotations
+
 import contextlib
 import dataclasses
 import enum
@@ -18,10 +20,6 @@ import math
 from typing import Any, Callable, Literal
 
 import torch
-from emerging_optimizers import triton_kernels
-from emerging_optimizers.orthogonalized_optimizers.muon import MuonScaleT, get_muon_scale_factor
-from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz
-from emerging_optimizers.utils import FP32MatmulPrecT, fp32_matmul_precision
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
@@ -40,6 +38,16 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+try:
+    from emerging_optimizers import triton_kernels
+    from emerging_optimizers.orthogonalized_optimizers.muon import MuonScaleT, get_muon_scale_factor
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz
+    from emerging_optimizers.utils import FP32MatmulPrecT, fp32_matmul_precision
+
+    HAVE_EMERGING_OPTIMIZERS = True
+except ImportError:
+    HAVE_EMERGING_OPTIMIZERS = False
 
 try:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
@@ -384,6 +392,11 @@ class LayerShardedMuon(TensorParallelMuon):
         pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
     ) -> None:
+        if not HAVE_EMERGING_OPTIMIZERS:
+            raise ImportError(
+                "LayerShardedMuon requires the emerging-optimizers package "
+                "(https://github.com/NVIDIA-NeMo/Emerging-Optimizers), which is not installed."
+            )
         if tp_mode == "layer_sharded":
             raise ValueError(
                 "LayerShardedMuon: 'layer_sharded' is a registry-level selector for "

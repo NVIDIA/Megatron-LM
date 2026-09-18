@@ -710,10 +710,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         collective: this code runs with rank-local inventory, which differs across
         pipeline and multimodal stages.
         """
-        try:
-            from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
-        except ImportError:  # emerging-optimizers absent: no LayerShardedMuon can exist
-            return
+        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
 
         dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
         expert_axes = (
