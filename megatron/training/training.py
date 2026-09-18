@@ -3279,11 +3279,7 @@ def training_log(
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
     # Count independent sequences; weight-sharding ranks may share a sequence through CP.
-    batch_size = (
-        args.micro_batch_size
-        * get_batch_parallel_size(args)
-        * get_num_microbatches()
-    )
+    batch_size = _get_global_batch_size_for_iteration(args)
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -3557,31 +3553,27 @@ def training_log(
             log_string += f' learning rate: {learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
 
-        # OTel: snapshot the accumulator state BEFORE it is torn down. The loop directly
-        # below zeroes each loss tensor when should_reset, and the should_reset block
-        # further down zeroes advanced/skipped/nan_iters -- so anything read after that
-        # point sees 0.0 loss and 0 skipped iterations on EVERY export, which is exactly
-        # what the metrics emission (further below, where the other emission inputs like
-        # `throughput` are in scope) used to do. Take the values here and emit them there.
-        # The .item() is a device sync, so it stays inside the telemetry guard and is not
-        # paid at all when telemetry is off -- the same guard the emission itself uses.
+        # OTel: snapshot host-native report values before the accumulators are reset.
+        # Loss tensors are materialized exactly once by the ordinary logging loop below;
+        # telemetry reuses those ``avg`` values and never reads a device scalar itself.
         _otel_telemetry_log = get_telemetry()
-        _otel_loss_snapshot = None
-        _otel_skipped_iters_snapshot = 0
+        _otel_is_reporter = False
         if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
-            _meta_keys = (advanced_iters_key, skipped_iters_key, nan_iters_key)
-            _loss_keys = [k for k in total_loss_dict if k not in _meta_keys]
-            if _loss_keys:
-                _otel_loss_snapshot = total_loss_dict[_loss_keys[0]].item() / float(
-                    max(1, total_loss_dict.get(advanced_iters_key, 1))
-                )
+            _otel_is_reporter = is_last_rank()
+        _otel_objective_snapshot = {}
+        _otel_skipped_iters_snapshot = 0
+        _otel_nan_iters_snapshot = 0
+        if _otel_is_reporter:
             _otel_skipped_iters_snapshot = int(total_loss_dict.get(skipped_iters_key, 0))
+            _otel_nan_iters_snapshot = int(total_loss_dict.get(nan_iters_key, 0))
 
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
                 avg = total_loss_dict[key].item() / float(
                     max(1, total_loss_dict[advanced_iters_key])
                 )
+                if _otel_is_reporter:
+                    _otel_objective_snapshot[key] = avg
                 if avg >= 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
@@ -3618,27 +3610,20 @@ def training_log(
         log_string += "".join(log_fragments)
         print_rank_last(log_string)
 
-        # OTel: emit training metrics at log interval (export rank only). Loss and
-        # skipped-iteration counts come from the snapshot taken above, before the
-        # accumulators were reset; everything else is still live at this point.
-        if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
-            from megatron.core.telemetry.training_metrics import record_training_metrics
-            _avg_loss = _otel_loss_snapshot
-            _tokens_per_sec = (
-                batch_size * args.seq_length / elapsed_time_per_iteration
-                if elapsed_time_per_iteration > 0 else None
-            )
-            _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
-            record_training_metrics(
-                meter=_otel_telemetry_log.meter,
-                step_duration_ms=elapsed_time_per_iteration * 1000.0,
-                loss=_avg_loss,
-                throughput_tflops=throughput if cfg.logger.log_throughput else None,
-                grad_norm=grad_norm,
+        # OTel: objective and numerics reports are events from the global last
+        # rank. Values come from ordinary host-side logging materialization.
+        if _otel_is_reporter:
+            _otel.add_training_report_events(
+                iteration,
+                _otel_objective_snapshot,
                 learning_rate=learning_rate,
-                skipped_iters=_otel_skipped_iters_snapshot,
-                tokens_per_sec=_tokens_per_sec,
-                memory_allocated_gb=_mem_gb,
+                global_batch_size=int(batch_size),
+                consumed_samples=int(args.consumed_train_samples),
+                grad_zeros=(int(num_zeros_in_grad) if num_zeros_in_grad is not None else None),
+                params_norm=params_norm,
+                skipped_iterations=_otel_skipped_iters_snapshot,
+                nan_iterations=_otel_nan_iters_snapshot,
+                loss_scale=(loss_scale if args.fp16 or args.loss_scale else None),
             )
 
         reported_memory_in_this_iteration = False
@@ -3696,6 +3681,13 @@ def _should_compute_params_norm(args, iteration, is_first_iteration):
             and iteration % cfg.logger.tensorboard_log_interval == 0
         )
     )
+
+
+def _get_global_batch_size_for_iteration(args, num_microbatches=None) -> int:
+    """Return Megatron's canonical global sample count for one iteration."""
+    if num_microbatches is None:
+        num_microbatches = get_num_microbatches()
+    return args.micro_batch_size * get_batch_parallel_size(args) * num_microbatches
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):

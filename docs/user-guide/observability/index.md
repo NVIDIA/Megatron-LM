@@ -9,7 +9,7 @@
 
 # Observability Overview
 
-Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) library, emitting **traces** at training-framework boundaries and **metrics** for loss, throughput, and gradient norm.
+Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) library, emitting **traces** at training-framework boundaries and span events for training reports.
 
 Telemetry exports to any OTLP-compatible backend (Jaeger, Grafana Tempo, W&B Weave, Honeycomb, Datadog, ...).
 
@@ -38,7 +38,9 @@ export MEGATRON_OTEL_SPAN_GROUPS=default   # coarse-grained; safe for production
 torchrun --nproc_per_node=8 pretrain_gpt.py ...
 ```
 
-With `default` span groups, Megatron emits a handful of coarse spans per iteration and a steady stream of training metrics. Switch to `per_step` for profiling individual steps, or `all` for fine-grained debugging.
+With `default` span groups, training reports attach to recording coarse spans.
+Switch to `per_step` for profiling individual steps, or `all` for fine-grained
+debugging. See [Training Signals](metrics.md) for report cadence and field semantics.
 
 ## What gets instrumented
 

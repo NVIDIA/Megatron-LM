@@ -110,6 +110,22 @@ GRAD_SYNC_SITE_INTERLEAVED_BACKWARD = "interleaved_backward"
 GRAD_SYNC_SITE_INTERLEAVED_COOLDOWN = "interleaved_cooldown"
 GRAD_SYNC_SITE_NON_INTERLEAVED_COOLDOWN = "non_interleaved_cooldown"
 
+EVENT_TRAINING_OBJECTIVE = "nv.dl.training.objective"
+EVENT_TRAINING_NUMERICS = "nv.dl.training.numerics"
+MEASUREMENT_DOMAIN = "nv.dl.measurement.domain"
+TRAINING_OBJECTIVE_NAME = "nv.dl.training.objective.name"
+TRAINING_OBJECTIVE_VALUE = "nv.dl.training.objective.value"
+TRAINING_OBJECTIVE_WEIGHT = "nv.dl.training.objective.weight"
+TRAINING_LEARNING_RATE = "nv.dl.training.learning_rate"
+TRAINING_GLOBAL_BATCH_SIZE = "nv.dl.training.global_batch_size"
+TRAINING_CONSUMED_SAMPLES = "nv.dl.training.consumed_samples"
+TRAINING_GRAD_ZEROS = "nv.dl.training.grad_zeros"
+TRAINING_PARAMS_NORM = "nv.dl.training.params_norm"
+TRAINING_SKIPPED_ITERATIONS = "nv.dl.training.skipped_iterations"
+TRAINING_NAN_ITERATIONS = "nv.dl.training.nan_iterations"
+TRAINING_LOSS_SCALE = "nv.dl.training.loss_scale"
+MEASUREMENT_DOMAIN_DP_MEAN = "dp_mean"
+
 try:
     from nemo.lens import SpanRegistry as _SpanRegistry
     from nemo.lens import is_span_group_enabled as _is_span_group_enabled
@@ -863,3 +879,125 @@ def set_current_span_attributes(attributes: dict, redact_keys=None) -> None:
         set_attributes(trace.get_current_span(), attributes, redact_keys=redact_keys)
     except Exception:
         logger.debug("Could not set current span attributes", exc_info=True)
+
+
+def add_span_event(
+    name: str, attributes: dict[str, Any] | None = None, *, span: Any | None = None
+) -> None:
+    """Add an event to a recording span without affecting Megatron execution.
+
+    An explicitly supplied recording span takes precedence. Otherwise the
+    current recording span is used. Callers must provide only already-
+    materialized OpenTelemetry-compatible host values.
+    """
+    if not _AVAILABLE:
+        return
+
+    target = None
+    if span is not None:
+        try:
+            if span.is_recording():
+                target = span
+        except Exception:
+            logger.debug("Could not inspect span for event %r", name, exc_info=True)
+
+    if target is None:
+        try:
+            from opentelemetry import trace
+
+            current = trace.get_current_span()
+            if current.is_recording():
+                target = current
+        except Exception:
+            logger.debug("Could not locate recording span for event %r", name, exc_info=True)
+            return
+
+    if target is None:
+        return
+    try:
+        target.add_event(name, attributes=attributes)
+    except Exception:
+        logger.debug("Could not add span event %r", name, exc_info=True)
+
+
+def add_training_objective_event(
+    training_step: int,
+    objective_name: str,
+    objective_value: float,
+    *,
+    weight: float | None = None,
+    span: Any | None = None,
+) -> None:
+    """Emit one already-materialized data-parallel-mean objective value."""
+    attributes = {
+        TRAINING_STEP: training_step,
+        TRAINING_OBJECTIVE_NAME: objective_name,
+        TRAINING_OBJECTIVE_VALUE: objective_value,
+        MEASUREMENT_DOMAIN: MEASUREMENT_DOMAIN_DP_MEAN,
+    }
+    if weight is not None:
+        attributes[TRAINING_OBJECTIVE_WEIGHT] = weight
+    add_span_event(EVENT_TRAINING_OBJECTIVE, attributes, span=span)
+
+
+def add_training_numerics_event(
+    training_step: int,
+    *,
+    learning_rate: float | None = None,
+    global_batch_size: int | None = None,
+    consumed_samples: int | None = None,
+    grad_zeros: int | None = None,
+    params_norm: float | None = None,
+    skipped_iterations: int | None = None,
+    nan_iterations: int | None = None,
+    loss_scale: float | None = None,
+    span: Any | None = None,
+) -> None:
+    """Emit one heterogeneous, already-materialized training numerics snapshot."""
+    attributes = {
+        TRAINING_STEP: training_step,
+        TRAINING_LEARNING_RATE: learning_rate,
+        TRAINING_GLOBAL_BATCH_SIZE: global_batch_size,
+        TRAINING_CONSUMED_SAMPLES: consumed_samples,
+        TRAINING_GRAD_ZEROS: grad_zeros,
+        TRAINING_PARAMS_NORM: params_norm,
+        TRAINING_SKIPPED_ITERATIONS: skipped_iterations,
+        TRAINING_NAN_ITERATIONS: nan_iterations,
+        TRAINING_LOSS_SCALE: loss_scale,
+    }
+    add_span_event(
+        EVENT_TRAINING_NUMERICS,
+        {key: value for key, value in attributes.items() if value is not None},
+        span=span,
+    )
+
+
+def add_training_report_events(
+    training_step: int,
+    objective_values: dict[str, float],
+    *,
+    learning_rate: float | None = None,
+    global_batch_size: int | None = None,
+    consumed_samples: int | None = None,
+    grad_zeros: int | None = None,
+    params_norm: float | None = None,
+    skipped_iterations: int | None = None,
+    nan_iterations: int | None = None,
+    loss_scale: float | None = None,
+    span: Any | None = None,
+) -> None:
+    """Emit one complete report from the trainer-selected logging boundary."""
+    for objective_name, objective_value in objective_values.items():
+        add_training_objective_event(training_step, objective_name, objective_value, span=span)
+    add_training_numerics_event(
+        training_step,
+        learning_rate=learning_rate,
+        global_batch_size=global_batch_size,
+        consumed_samples=consumed_samples,
+        grad_zeros=grad_zeros,
+        params_norm=params_norm,
+        skipped_iterations=skipped_iterations,
+        nan_iterations=nan_iterations,
+        loss_scale=loss_scale,
+        span=span,
+    )
