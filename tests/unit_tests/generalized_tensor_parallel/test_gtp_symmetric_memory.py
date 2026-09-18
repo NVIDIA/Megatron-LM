@@ -249,6 +249,29 @@ class TestRegisteredLIFOPool:
         pool.free(torch.empty(8, device="cuda"))
         assert not pool._free  # nothing entered the free lists
 
+    def test_has_free_reports_whether_alloc_would_grow_the_pool(self):
+        # has_free is what lets a caller tell "recycling a buffer" from "raising the
+        # high-water mark", so it must answer per bucket, not per pool.
+        pool = RegisteredLIFOPool()
+        group = _StubGroup()
+        assert not pool.has_free((8, 4), torch.bfloat16, group)  # empty bucket
+        buf = pool.alloc((8, 4), torch.bfloat16, "cuda", group)
+        assert not pool.has_free((8, 4), torch.bfloat16, group)  # checked out, not free
+        pool.free(buf)
+        assert pool.has_free((8, 4), torch.bfloat16, group)  # back on the free list
+
+    def test_has_free_keys_on_numel_dtype_and_group(self):
+        # Same keying as alloc: a free buffer must not be claimed to serve a different
+        # bucket, or the caller would skip the wait and then allocate anyway.
+        pool = RegisteredLIFOPool()
+        g1, g2 = _StubGroup("g1"), _StubGroup("g2")
+        pool.free(pool.alloc((8,), torch.bfloat16, "cuda", g1))
+        assert pool.has_free((8,), torch.bfloat16, g1)
+        assert pool.has_free((4, 2), torch.bfloat16, g1)  # 1-D key: same numel
+        assert not pool.has_free((8,), torch.float32, g1)  # different dtype
+        assert not pool.has_free((16,), torch.bfloat16, g1)  # different numel
+        assert not pool.has_free((8,), torch.bfloat16, g2)  # different group
+
     def test_capture_guard_raises_on_empty_bucket(self, monkeypatch):
         pool = RegisteredLIFOPool()
         group = _StubGroup()

@@ -210,6 +210,16 @@ class RegisteredLIFOPool:
         out._gtp_symm_group = group  # marks the buffer as pool-owned; free() keys on this
         return out
 
+    def has_free(
+        self, shape: torch.Size | tuple[int, ...], dtype: torch.dtype, group: dist.ProcessGroup
+    ) -> bool:
+        """True when ``alloc`` would pop rather than allocate.
+
+        Lets a caller tell "recycling" from "growing the pool" and wait for one of its own
+        in-flight buffers instead of raising the high-water mark.
+        """
+        return bool(self._free.get((int(math.prod(shape)), dtype, group.group_name)))
+
     def free(self, buf: torch.Tensor) -> None:
         """Return ``buf`` to its group's free list; no-op for untagged (foreign) buffers."""
         group = getattr(buf, "_gtp_symm_group", None)
