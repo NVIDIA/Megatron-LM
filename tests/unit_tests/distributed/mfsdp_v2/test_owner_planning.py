@@ -234,7 +234,7 @@ def _round_trip_group(this_rank=0):
     return _mock_group([(6, 3), (4, 2), (2, 2)], dp_size=3, this_rank=this_rank)
 
 
-def _per_rank_plans():
+def _per_rank_owner_layouts():
     """Build the round-trip group's `GroupOwnerLayout` once per rank (DP size 3)."""
     return [
         GroupOwnerLayout.from_group(_round_trip_group(this_rank=rank), cost_fn=ns_cost_fn(5))
@@ -245,22 +245,22 @@ def _per_rank_plans():
 def test_group_owner_layout_from_group_composes_the_steps():
     """`from_group` bundles the group, its mesh, the layouts, and the balanced owners."""
     group = _round_trip_group()
-    plan = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
-    assert plan.group is group
-    assert plan.mesh is group.mesh
+    owner_layout = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
+    assert owner_layout.group is group
+    assert owner_layout.mesh is group.mesh
     # Composition equivalence: the bundle is exactly the two steps composed.
-    assert plan.layouts == ParameterLayout.from_group(group)
-    assert plan.owners == assign_owner_work(plan.layouts, ns_cost_fn(5))
+    assert owner_layout.layouts == ParameterLayout.from_group(group)
+    assert owner_layout.owners == assign_owner_work(owner_layout.layouts, ns_cost_fn(5))
 
 
 def test_group_owner_layout_from_group_respects_eligible_fn():
     """`eligible_fn` filters participation; layouts and owners cover exactly those."""
     group = _round_trip_group()
-    plan = GroupOwnerLayout.from_group(
+    owner_layout = GroupOwnerLayout.from_group(
         group, cost_fn=ns_cost_fn(5), eligible_fn=lambda param: param.numel() >= 8
     )
-    assert list(plan.layouts) == [0, 1]
-    assert set(plan.owners) == {0, 1}
+    assert list(owner_layout.layouts) == [0, 1]
+    assert set(owner_layout.owners) == {0, 1}
 
 
 # ---------------------------------------------------------------------------
@@ -292,13 +292,17 @@ def test_pack_and_reconstruct_round_trip():
     """
     torch.manual_seed(0)
     dp_size = 3
-    per_rank_plan = _per_rank_plans()
-    # `this_rank` only enters via the mesh: every rank's plan agrees on layouts and owners. Least
-    # processing time over the boundary params:
+    per_rank_owner_layout = _per_rank_owner_layouts()
+    # `this_rank` only enters via the mesh: every rank's owner layout agrees on layouts and owners.
+    # Least processing time over the boundary params:
     #   tensor 0 → rank 0, tensor 1 → rank 1, tensor 2 → rank 2.
-    assert [plan.mesh.get_local_rank() for plan in per_rank_plan] == [0, 1, 2]
-    for plan in per_rank_plan:
-        assert plan.owners == {0: 0, 1: 1, 2: 2}
+    assert [owner_layout.mesh.get_local_rank() for owner_layout in per_rank_owner_layout] == [
+        0,
+        1,
+        2,
+    ]
+    for owner_layout in per_rank_owner_layout:
+        assert owner_layout.owners == {0: 0, 1: 1, 2: 2}
 
     fulls = {
         0: torch.arange(18, dtype=torch.float32),
@@ -308,14 +312,14 @@ def test_pack_and_reconstruct_round_trip():
 
     per_rank_send = []
     per_rank_gather = []
-    for rank, plan in enumerate(per_rank_plan):
+    for rank, owner_layout in enumerate(per_rank_owner_layout):
         local_shards = {}
-        for tensor_index, layout in plan.layouts.items():
+        for tensor_index, layout in owner_layout.layouts.items():
             offset = layout.rank_offset(rank)
             numel = layout.rank_numel(rank)
             if numel > 0:
                 local_shards[tensor_index] = fulls[tensor_index][offset : offset + numel].clone()
-        gather = OwnerGatherPlan.pack(plan, local_shards)
+        gather = OwnerGatherPlan.pack(owner_layout, local_shards)
         per_rank_send.append(gather.send_buffers)
         per_rank_gather.append(gather)
 
@@ -326,7 +330,7 @@ def test_pack_and_reconstruct_round_trip():
     # Rank 2 owns the non-boundary tensor 2 and receives nothing.
     assert per_rank_gather[2].recv_sizes == {}
     # Each owner reconstructs the full flat tensor from its own + received shard.
-    for tensor_index, owner in per_rank_plan[0].owners.items():
+    for tensor_index, owner in per_rank_owner_layout[0].owners.items():
         full = per_rank_gather[owner].reconstruct_full(tensor_index, recv[owner])
         assert full.ndim == 1
         torch.testing.assert_close(full, fulls[tensor_index], atol=0, rtol=0)
@@ -339,7 +343,7 @@ def test_pack_and_unpack_result_round_trip():
     """
     torch.manual_seed(1)
     dp_size = 3
-    per_rank_plan = _per_rank_plans()
+    per_rank_owner_layout = _per_rank_owner_layouts()
 
     # Results with arbitrary shapes.
     full_results = {
@@ -349,13 +353,13 @@ def test_pack_and_unpack_result_round_trip():
     }
     per_rank_send = []
     per_rank_scatter = []
-    for rank, plan in enumerate(per_rank_plan):
+    for rank, owner_layout in enumerate(per_rank_owner_layout):
         owned_results = {
             tensor_index: result
             for tensor_index, result in full_results.items()
-            if plan.owners[tensor_index] == rank
+            if owner_layout.owners[tensor_index] == rank
         }
-        scatter = OwnerScatterPlan.pack(plan, owned_results)
+        scatter = OwnerScatterPlan.pack(owner_layout, owned_results)
         per_rank_send.append(scatter.send_buffers)
         per_rank_scatter.append(scatter)
 
@@ -365,8 +369,8 @@ def test_pack_and_unpack_result_round_trip():
         received = per_rank_scatter[rank].unpack(recv[rank])
         for tensor_index, shard in received.items():
             # Only params this rank holds elements of but does NOT own are received.
-            assert per_rank_plan[rank].owners[tensor_index] != rank
-            layout = per_rank_plan[rank].layouts[tensor_index]
+            assert per_rank_owner_layout[rank].owners[tensor_index] != rank
+            layout = per_rank_owner_layout[rank].layouts[tensor_index]
             offset = layout.rank_offset(rank)
             numel = layout.rank_numel(rank)
             expected = full_results[tensor_index].flatten()[offset : offset + numel]
@@ -377,19 +381,19 @@ def test_pack_and_unpack_result_round_trip():
 
 
 def test_pack_with_no_eligible_params():
-    """A group with no eligible params packs to an empty plan."""
+    """A group with no eligible params packs to an empty owner layout."""
     group = _mock_group([(16,)], dp_size=2)  # 1D bias only.
-    plan = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
-    assert plan.layouts == {}
-    assert plan.owners == {}
+    owner_layout = GroupOwnerLayout.from_group(group, cost_fn=ns_cost_fn(5))
+    assert owner_layout.layouts == {}
+    assert owner_layout.owners == {}
 
-    gather = OwnerGatherPlan.pack(plan, {})
+    gather = OwnerGatherPlan.pack(owner_layout, {})
     assert gather.send_buffers == {}
     assert gather.recv_sizes == {}
     assert gather.own_shards == {}
     assert gather.recv_offsets == {}
 
-    scatter = OwnerScatterPlan.pack(plan, {})
+    scatter = OwnerScatterPlan.pack(owner_layout, {})
     assert scatter.send_buffers == {}
     assert scatter.recv_sizes == {}
     assert scatter.recv_offsets == {}
