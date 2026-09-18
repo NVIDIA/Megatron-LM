@@ -2,7 +2,11 @@
 # Portions Copyright (c) 2023 OpenGVLab and licensed under the MIT license found in LICENSE.
 
 import torch
-from einops import rearrange
+
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
 
 
 def patchify_image(x: torch.Tensor, patch_dim: int) -> torch.Tensor:

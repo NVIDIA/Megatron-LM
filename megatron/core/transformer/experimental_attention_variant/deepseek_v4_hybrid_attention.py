@@ -85,6 +85,17 @@ class DSv4HybridAttention(Attention):
         if pg_collection is None:
             raise ValueError("DSv4 hybrid attention requires an explicit ProcessGroupCollection.")
 
+        if config.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError(
+                "DSv4 attention requires experimental_attention_variant='dsv4_hybrid' "
+                "so the config validates and derives DSv4 projection dimensions."
+            )
+        assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
+        assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        assert (
+            config.transformer_impl == "transformer_engine"
+        ), "DSv4 HybridModel currently supports only the transformer-engine implementation."
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -126,6 +137,11 @@ class DSv4HybridAttention(Attention):
         self.softmax_scale = None
 
         ratio_idx = self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
+        if compress_ratio is None:
+            # HybridModel carries the C/H/W choice on each layer config. Keep the
+            # global ratio list as a fallback for the legacy D-symbol and direct
+            # DSv4 attention construction paths.
+            compress_ratio = getattr(self.config, "compress_ratio", None)
         if compress_ratio is None:
             if ratio_idx >= len(self.config.csa_compress_ratios):
                 layer_kind = "MTP" if is_mtp_layer else "decoder"
@@ -419,7 +435,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         is_mtp_layer: bool = False,
         compress_ratio: Optional[int] = None,
         name: str | None = None,
-    ):
+    ) -> None:
         super().__init__(
             config=config,
             submodules=submodules,
@@ -492,7 +508,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             config=self.config,
             eps=self.config.attention_latent_norm_epsilon,
         )
-
         self.q_layernorm = submodules.q_layernorm(
             hidden_size=self.config.q_lora_rank,
             config=self.config,

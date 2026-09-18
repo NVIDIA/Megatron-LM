@@ -94,6 +94,8 @@ class TextGenerationControllerTestBase:
         sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
         transformer_impl: str = None,
+        position_embedding_type: str = None,
+        mtp_use_repeated_layer: bool = False,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -130,6 +132,7 @@ class TextGenerationControllerTestBase:
             pipeline_model_parallel_size=pipeline_model_parallel_size,
             pipeline_dtype=dtype,
             mtp_num_layers=mtp_num_layers if mtp_num_layers > 0 else None,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
             sequence_parallel=sequence_parallel,
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
@@ -177,6 +180,8 @@ class TextGenerationControllerTestBase:
                     config=transformer_config, spec=layer_spec, use_transformer_engine=False
                 )
 
+            if position_embedding_type is None:
+                position_embedding_type = "none" if num_speculative_tokens else "learned_absolute"
             model = GPTModel(
                 config=transformer_config,
                 transformer_layer_spec=layer_spec,
@@ -186,6 +191,7 @@ class TextGenerationControllerTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
+                position_embedding_type=position_embedding_type,
             ).cuda()
 
         model.eval()
@@ -293,8 +299,13 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         max_tokens=32,
         request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
         kv_block_allocator=SimpleNamespace(enable_handoff_pinning=False),
+        block_size_tokens=2,
+        request_kv_length_offsets=torch.full((metadata_len,), 2, dtype=torch.int32),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    context.get_committed_kv_block_counts = lambda rows: (
+        DynamicInferenceContext.get_committed_kv_block_counts(context, rows)
+    )
     # Bind the real flags so the fake exercises the production no-op-filter gate.
     context.active_sampling_filter_flags = lambda count=None: (
         DynamicInferenceContext.active_sampling_filter_flags(context, count)
@@ -346,6 +357,23 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._async_sched_top_n_token_ids_cpu_buffer = None
     controller._async_sched_top_n_capacity = 0
     return controller
+
+
+@pytest.mark.parametrize("chunk_row", [2, -1], ids=["active", "hidden"])
+def test_partial_prefill_selected_token_uses_known_prompt_target(chunk_row):
+    """A visible chunk uses its next prompt token; a hidden chunk changes no row."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.chunked_prefill_request_id = 12
+    context.chunked_prefill_next_prompt_token = torch.tensor(42, dtype=torch.int64)
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=chunk_row)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda.copy_(torch.tensor([7, 8, 9], dtype=torch.int64))
+
+    controller._replace_partial_prefill_sample_with_prompt_token()
+
+    expected = [7, 8, 42] if chunk_row == 2 else [7, 8, 9]
+    assert controller._sampled_tokens_cuda.tolist() == expected
+    context.get_index_of_chunked_prefill_request.assert_called_once_with(safe=True)
 
 
 @pytest.mark.parametrize(
@@ -1088,6 +1116,64 @@ def test_finished_hybrid_handoff_detaches_live_ssm_slot():
 
 
 @pytest.mark.parametrize(
+    "committed_blocks,reserve_blocks",
+    [(2, 0), (1, 1), (1, 2)],
+    ids=["no-reserve", "one-reserve", "two-reserves"],
+)
+def test_finished_handoff_keeps_only_committed_blocks(committed_blocks, reserve_blocks):
+    """Handoff pins the committed main KV span, excluding all draft-only lookahead."""
+    context = _make_async_sched_context(total_request_count=2)
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor(
+        [
+            [10, 11, -1],
+            list(range(12, 12 + committed_blocks + reserve_blocks))
+            + [-1] * (3 - committed_blocks - reserve_blocks),
+        ],
+        dtype=torch.int32,
+    )
+    context.request_kv_length_offsets[1] = (committed_blocks - 1) * context.block_size_tokens
+    controller = _make_async_sched_controller(context)
+
+    blocks, _, _ = controller._collect_finished_handoff_state(
+        torch.tensor([1]), torch.tensor([91, 92]), None
+    )
+
+    expected = list(range(12, 12 + committed_blocks))
+    assert blocks == {11: expected}
+    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with(expected)
+
+
+@pytest.mark.parametrize("reserve_blocks", [1, 2])
+def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
+    """Routing reconstruction aborts on any block without stored routing.
+
+    The main model never writes into the reserve, so it has no routing, and
+    `reconstruct_routing_from_blocks` tests `routing is None` before its `remaining <= 0`
+    break. Shipping the reserve therefore turns the whole reconstruction into None and silently
+    drops `moe_topk_indices` from the response.
+    """
+    context = _make_async_sched_context(total_request_count=2)
+    context.kv_block_allocator = SimpleNamespace(block_routing=True, enable_handoff_pinning=False)
+    context.request_to_kv_block_ids = torch.tensor(
+        [[10, 11] + [-1] * (reserve_blocks - 1), list(range(12, 13 + reserve_blocks))],
+        dtype=torch.int32,
+    )
+    context.request_kv_length_offsets[1] = 0
+    context.get_max_sequence_lengths.return_value = torch.tensor([3, 3])
+    # No chunked request in flight, so no finished row is filtered back out.
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=-1)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda[:2] = torch.tensor([99, 99])
+
+    result = controller._dynamic_step_context_bookkeeping()
+
+    assert result["finished_routing_block_ids"] == {10: [10, 11], 11: [12]}
+
+
+@pytest.mark.parametrize(
     "termination_ids, stop_word_finished_ids",
     [([99, 99, 99], set()), ([99, 2, 99], set()), ([99, 99, 99], {11})],
 )
@@ -1804,46 +1890,101 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         InferenceMode.unset_active()
 
     @pytest.mark.internal
-    def test_async_sched_no_overlap_pauses_boundary_request(self):
-        """No-overlap uses real lifecycle bookkeeping before forwarding survivors."""
+    @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
+    def test_mtp_kv_cache_rejects_positional_embeddings(self, position_embedding_type):
+        with pytest.raises(
+            ValueError, match="MTP KV caching requires position_embedding_type='none'"
+        ):
+            self.setup_model(
+                torch.float32,
+                static=False,
+                num_speculative_tokens=2,
+                mtp_num_layers=1,
+                mtp_use_repeated_layer=True,
+                position_embedding_type=position_embedding_type,
+            )
+
+    @pytest.mark.internal
+    def test_mtp_kv_cache_rejects_mla_rotary_embeddings(self):
         self.setup_model(
-            torch.float32, batch_size=2, static=False, block_size_tokens=4, max_requests=2
+            torch.float32,
+            static=False,
+            num_speculative_tokens=2,
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=True,
+            position_embedding_type="none",
+        )
+        controller = self.text_generation_controller
+        assert controller.inference_wrapped_model.inference_context.enable_mtp_kv_cache
+        # MLA's position type is internal: the top-level "none" must not bypass the guard.
+        with mock.patch.object(controller.model_config, "multi_latent_attention", True):
+            with pytest.raises(ValueError, match="MTP KV caching does not support MLA"):
+                TextGenerationController(
+                    inference_wrapped_model=controller.inference_wrapped_model,
+                    tokenizer=self.mock_tokenizer,
+                )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "num_speculative_tokens,position_embedding_type",
+        [(2, "none"), (0, "none"), (0, "learned_absolute"), (0, "rope")],
+    )
+    def test_supported_mtp_and_position_embedding_combinations(
+        self, num_speculative_tokens, position_embedding_type
+    ):
+        self.setup_model(
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_speculative_tokens,
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=num_speculative_tokens > 0,
+            position_embedding_type=position_embedding_type,
+        )
+        assert self.text_generation_controller.num_speculative_tokens == num_speculative_tokens
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        assert context.enable_mtp_kv_cache == (num_speculative_tokens > 0)
+
+    @pytest.mark.internal
+    def test_async_sched_no_overlap_pauses_boundary_request(self):
+        """No-overlap reports the evicted, not resumed, boundary request."""
+        self.setup_model(
+            torch.float32, batch_size=4, static=False, block_size_tokens=4, max_requests=4
         )
         controller = self.text_generation_controller
         context = controller.inference_wrapped_model.inference_context
         context.reset()
 
-        active_slice = slice(0, 2)
-        context.total_request_count = 2
-        context.active_token_count = 2
-        context.request_ids[active_slice] = torch.tensor([10, 11], dtype=torch.int32)
+        active_slice = slice(0, 4)
+        context.total_request_count = 4
+        context.active_token_count = 4
+        context.request_ids[active_slice] = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
         context.request_in_prefill_status_tensor[active_slice] = 0
         context.request_query_lengths[active_slice] = 1
         context.request_output_lengths[active_slice] = 16
         context.request_kv_length_offsets[active_slice] = 3
         context.request_last_kv_block_offset[active_slice] = torch.tensor(
-            [context.block_size_tokens - 1, 0], dtype=torch.int32
+            [0, context.block_size_tokens - 1, 0, context.block_size_tokens - 1], dtype=torch.int32
         )
         context.request_metadata["termination_id"][active_slice] = 99
-        context.build_active_slices(2)
+        context.build_active_slices(4)
 
-        block_ids = context.kv_block_allocator.allocate_memory_blocks(2)
+        block_ids = context.kv_block_allocator.allocate_memory_blocks(4)
         context.request_to_kv_block_ids[active_slice, 0] = block_ids
         context.request_last_kv_block_id[active_slice] = block_ids
         context.request_kv_block_counts[active_slice] = 1
-        context.token_to_input_ids[active_slice] = torch.tensor([80, 81])
+        context.token_to_input_ids[active_slice] = torch.tensor([80, 81, 82, 83])
 
-        # Retain one paused request, but exhaust shared-pool capacity with real allocations.
+        # Eviction of one boundary request funds resumption of the other.
         alloc = context.kv_block_allocator
-        alloc.paused_limit = 1
+        alloc.paused_limit = 0
         filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
         assert filler_blocks is not None
         filler_blocks = filler_blocks.clone()
         assert alloc.get_allocatable_count() == 0
 
-        sampled_tokens = torch.tensor([90, 91], dtype=torch.int64)
+        sampled_tokens = torch.tensor([90, 91, 92, 93], dtype=torch.int64)
         controller._async_sched_logits = AsyncScheduleLogitsState(
-            is_valid=True, cuda_graph_request_count=2
+            is_valid=True, cuda_graph_request_count=4
         )
         controller._run_async_sched_sample = mock.Mock(
             return_value=SimpleNamespace(
@@ -1855,13 +1996,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 sample_cpu_ready_event=None,
             )
         )
-        forward_input_ids = torch.tensor([91])
-        forward_position_ids = torch.tensor([4])
+        forward_input_ids = torch.tensor([93, 90, 92])
+        forward_position_ids = torch.tensor([4, 4, 4])
 
         def initialize_survivor_forward():
-            assert context.paused_request_count == 1
-            assert context.request_ids[:2].tolist() == [10, 11]
-            assert context.token_to_input_ids[0].item() == 91
+            assert context.paused_request_count == 0
+            assert context.request_ids[:4].tolist() == [13, 10, 12, 11]
+            assert context.token_to_input_ids[:3].tolist() == [93, 90, 92]
             return forward_input_ids, forward_position_ids, None
 
         controller._dynamic_step_context_init = mock.Mock(side_effect=initialize_survivor_forward)
@@ -1871,15 +2012,16 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             controller._run_async_sched_step_no_overlap(schedule_waiting_requests=None)
         ).output
 
-        assert result["sample"].tolist() == [90, 91]
+        assert result["sample"].tolist() == [90, 91, 92, 93]
         assert result["finished_request_ids"].numel() == 0
-        assert result["newly_paused_request_ids"].flatten().tolist() == [10]
-        assert result["evict_request_ids"] is None
-        assert context.paused_request_count == 1
+        assert result["newly_paused_request_ids"].ndim == 1
+        assert result["newly_paused_request_ids"].tolist() == [11]
+        assert result["evict_request_ids"].tolist() == [11]
+        assert context.paused_request_count == 0
         active_request_ids = context.request_ids[
             context.paused_request_count : context.total_request_count
         ]
-        assert active_request_ids.tolist() == [11]
+        assert active_request_ids.tolist() == [13, 10, 12]
         controller._run_async_sched_forward.assert_called_once_with(
             forward_input_ids, forward_position_ids
         )
@@ -2562,6 +2704,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # No trailing EOD.
         assert detok(tokenizer, [1, 2, 3], remove_EOD=remove_EOD) == "T1 T2 T3"
+        self.mock_tokenizer.detokenize.assert_called_with([1, 2, 3], skip_special_tokens=True)
 
         # Single trailing EOD.
         result = detok(tokenizer, [1, 2, eod], remove_EOD=remove_EOD)
@@ -2882,7 +3025,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
-            hybrid_layer_pattern="***M" if is_hybrid_model else None,
+            hybrid_layer_pattern="***M/*/*/*" if is_hybrid_model else None,
         )
         self.text_generation_controller.num_speculative_tokens = 3
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -3330,7 +3473,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # The serial MTP path lives in the MTP mixin, so patch the SP collectives there.
-        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
+        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_controller_mixin"
         with (
             mock.patch(f"{mtp_module}.gather_from_sequence_parallel_region", mock_gather),
             mock.patch(
