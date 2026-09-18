@@ -1367,7 +1367,7 @@ def num_floating_point_operations(
         if mtp_num_layers is None:
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
-        return hybrid_flops(
+        return int(hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
@@ -1402,10 +1402,10 @@ def num_floating_point_operations(
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-        )
+        ))
     else:
         # Compute standard Transformer model FLOPs.
-        return transformer_flops()
+        return int(transformer_flops())
 
 
 def get_start_time_from_progress_log():

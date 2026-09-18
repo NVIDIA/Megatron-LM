@@ -375,6 +375,49 @@ class TestMoEModules:
             what=f"TEGroupedMLP[grouped_tensor={use_grouped_tensor}]",
         )
 
+    @pytest.mark.skipif(
+        not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 parameter storage needs Blackwell",
+    )
+    def test_vllm_mxfp8_weight_stacking_replays(self):
+        """The mixed-precision vLLM path builds canonical expert stacks bit-exactly."""
+        from types import SimpleNamespace
+
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        class GroupedMLPStub:
+            _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
+
+        seeded()
+        weights = tuple(torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4))
+
+        def build_stacks(*bf16_weights):
+            grouped = GroupedMLPStub()
+            grouped.num_local_experts = 2
+            grouped.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.VLLM
+            grouped.linear_fc1 = SimpleNamespace()
+            grouped.linear_fc2 = SimpleNamespace()
+            for linear, offset in ((grouped.linear_fc1, 0), (grouped.linear_fc2, 2)):
+                for expert in range(2):
+                    setattr(
+                        linear,
+                        f"weight{expert}",
+                        MXFP8Tensor.from_bf16(bf16_weights[offset + expert], backend="triton"),
+                    )
+            InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped)
+            return (
+                grouped._fc1_weight.data.view(torch.uint8),
+                grouped._fc1_weight.scale.view(torch.uint8),
+                grouped._fc2_weight.data.view(torch.uint8),
+                grouped._fc2_weight.scale.view(torch.uint8),
+            )
+
+        assert_replays_bit_exact(
+            build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
+        )
+
     def test_sequential_mlp_replays_on_uneven_experts(self):
         self._init()
         seeded()
