@@ -324,15 +324,47 @@ class QSAIndexer(MegatronModule):
                 selected_bits[start:end] = bits.to(torch.uint8)
             return selected_bits, True
 
+        n_docs = pooled_keys.shape[0]
+        k = min(self.block_topk, n_blocks_max)
+        # Many short packed documents make a GEMM and scatter per document slower than
+        # one batched GEMM. Permit a gathered-key path only when its query tile, including
+        # both the gathered source and fp32 copy, fits the same workspace budget. Long
+        # documents keep the shared-key path below and never expand keys per query.
+        # Require at least one average document per gathered tile so a few long
+        # documents do not trade their shared GEMMs for many gathered-key GEMMs.
+        gathered_bytes_per_query = (
+            n_blocks_max * D * (pooled_keys.element_size() + 4)
+            + n_blocks_max * (H * 4 + 8)
+            + H * D * 4
+            + nbytes * 4
+            + k * 32
+        )
+        gathered_tile = max(1, min(T, _QSA_SELECT_TILE_BYTES // gathered_bytes_per_query))
+        if n_docs >= 8 and gathered_tile >= min(T, 32) and T <= n_docs * gathered_tile:
+            for start in range(0, T, gathered_tile):
+                end = min(T, start + gathered_tile)
+                q_c = q[start:end].float()
+                k_c = pooled_keys[doc_ids[start:end].long()].float()
+                scores = torch.einsum("thd,tnd->thn", q_c, k_c)
+                scores = scores.relu_().sum(dim=1) / math.sqrt(D)
+                vis = block_ids.unsqueeze(0) < visible[start:end].unsqueeze(1)
+                scores.masked_fill_(~vis, float("-inf"))
+                top = torch.topk(scores, k=k, dim=-1)
+                valid = torch.isfinite(top.values)
+                blocks = top.indices.masked_fill(~valid, 0)
+                bit_val = ((1 << (blocks & 7)) * valid.to(blocks.dtype)).to(torch.int32)
+                bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
+                bits.scatter_add_(1, blocks >> 3, bit_val)
+                selected_bits[start:end] = bits.to(torch.uint8)
+            return selected_bits, False
+
         # doc_ids are monotone in the batch-major flattened layout, both for ordinary
         # batches and for THD packing after CP reconstruction. Empty packed documents give
         # equal adjacent offsets and need no work. One host transfer for the small offset
         # vector lets every document reuse its pooled keys across all of its query tiles.
-        n_docs = pooled_keys.shape[0]
         offsets = torch.searchsorted(
             doc_ids.contiguous(), torch.arange(n_docs + 1, device=q.device, dtype=doc_ids.dtype)
         ).tolist()
-        k = min(self.block_topk, n_blocks_max)
         for doc in range(n_docs):
             doc_start, doc_end = offsets[doc], offsets[doc + 1]
             if doc_start == doc_end:

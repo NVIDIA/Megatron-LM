@@ -88,6 +88,43 @@ def test_select_blocks_ties_do_not_depend_on_tile_size(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_select_blocks_many_short_packed_documents_use_bounded_tiles(monkeypatch, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    monkeypatch.setattr(qsa, "_QSA_SELECT_TILE_BYTES", 32 << 10)
+    lengths = [16 + (doc % 3) - 1 for doc in range(32)]
+    lengths[9] = 0
+    ratio, topk, heads, head_dim = 4, 2, 4, 8
+    doc_ids = torch.repeat_interleave(
+        torch.arange(len(lengths), dtype=torch.int32), torch.tensor(lengths)
+    )
+    positions = torch.cat([torch.arange(length, dtype=torch.int32) for length in lengths])
+    generator = torch.Generator().manual_seed(34)
+    query = torch.randint(-3, 4, (sum(lengths), heads, head_dim), generator=generator).float()
+    pooled = torch.randint(-3, 4, (len(lengths), 4, head_dim), generator=generator).float()
+    valid = torch.arange(4)[None, :] < (torch.tensor(lengths) // ratio)[:, None]
+    doc_ids, positions, query, pooled, valid = (
+        tensor.to(device) for tensor in (doc_ids, positions, query, pooled, valid)
+    )
+    expected = _reference_bits(query, pooled, doc_ids, positions, ratio, topk)
+
+    def fail_if_document_loop(*_args, **_kwargs):
+        raise AssertionError("short packed documents should use the tiled batched path")
+
+    monkeypatch.setattr(torch, "searchsorted", fail_if_document_loop)
+    actual, all_selected = qsa.QSAIndexer._select_blocks(
+        SimpleNamespace(compress_ratio=ratio, block_topk=topk),
+        query,
+        pooled,
+        valid,
+        doc_ids,
+        positions,
+    )
+    assert not all_selected
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("nblocks", [0, 3])
 def test_select_blocks_all_visible_path_is_tiled(monkeypatch, nblocks):
     monkeypatch.setattr(qsa, "_QSA_SELECT_TILE_BYTES", 64)
