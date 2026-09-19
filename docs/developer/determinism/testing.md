@@ -69,13 +69,12 @@ with no compute kernel). Exemptions are visible coverage debt, not silence.
 3. **Review**: the PR template checkbox and the `/claude review` prompt ask
    for the test explicitly.
 
-The kernel bucket runs in the H100 unit-test recipe
-(`tests/test_utils/recipes/h100/unit-tests.yaml`). Hardware-specific
-scheduling is exactly what these tests are meant to catch, so running the
-bucket on GB200/GB300-class runners as well (GB200 unit tests are selected by
-the `launch_on_gb200` marker) is a tracked follow-up; until then, reproduce
-findings on Blackwell hardware manually as described in
-[`status.md`](./status.md).
+The full kernel bucket runs in the H100 unit-test recipe. Dedicated GB200
+kernel and model buckets select a four-GPU subset with `launch_on_gb200`;
+larger configurations stay in the H100 matrix. Replay reports require real
+comparisons on every rank, and the GB200 model gate requires MXFP8 and NVFP4
+evidence explicitly. See [measured coverage](./coverage.md) for the selection,
+scope, and artifacts. Scheduling a test does not establish a hardware pass.
 
 Run the gate locally against `main`:
 
@@ -122,3 +121,50 @@ python3 tools/check_kernel_determinism_coverage.py --base-ref origin/main
      tests/unit_tests/determinism/kernels/test_my_family.py \
      tests/unit_tests/determinism/kernels/test_manifest.py
    ```
+
+## Author accuracy and sensitivity checks
+
+Repeatability alone cannot detect a consistently wrong kernel. For new or
+updated supported cases, also compare outputs and every input gradient against
+an independent implementation, with explicit dtype-specific `rtol` and `atol`.
+Use `tools.determinism.reference.assert_reference_close` with the replay's
+actual output/gradient dictionaries, an independently computed reference pair,
+`harness.replay_signature(inputs, backward=True)`, and a versioned reference ID.
+The signature must include the same explicit `configuration` as the replay.
+The helper records per-tensor error magnitudes, violations, and a sample;
+it rejects missing keys, incompatible shapes/dtypes, and nonfinite values.
+
+For reductions, supply explicit `ReductionReference` entries computed from
+independent terms, keyed by `gradient:<tensor name>`. Document any rounding before
+the sum and retain ideal values using `mathematical_reference`. Reduction checks
+apply both a component budget based on accumulation precision/length/conditioning
+and an L2 guard using the original tolerances; see the
+[accuracy policy](./coverage.md#independent-accuracy-and-sensitivity). These
+worst-case budgets are conservative and do not prove kernel correctness.
+Set `numerical_controls=True` to require out-of-budget perturbations to fail for
+every tensor. This exercises the numerical gate separately from byte sensitivity.
+
+Use `assert_replay_sensitivity` with the same actual pair and the real byte
+comparator. It first checks the unchanged baseline, then flips a bit separately
+in every output and gradient. All perturbations must be detected. This verifies
+comparator wiring; it does not replace scheduling contention or an observed
+atomic-race negative control. Synthetic perturbations never count as production
+nondeterminism evidence.
+
+Register each required parametrized pytest node ID in `KernelEntry.author_tests`.
+The H100 and GB200 kernel report gates require both checks for every listed
+case on every rank, matching the replay signature and tensor counts. Deleted,
+renamed, skipped, incomplete, or stale cases fail the gate. Adoption starts with
+biased SwiGLU, weighted SwiGLU, and weighted squared ReLU in FP32 and BF16;
+other entries retain their existing replay contract without an accuracy claim.
+See `test_mlp_activation_author_evidence` for the pilot implementation and
+[measured coverage](./coverage.md) for report semantics and validation limits.
+
+PR evidence should link the reference/replay artifacts and separate, uninstrumented
+forward/backward timings, with the source revision, hardware, inputs, software
+versions, and deterministic/default settings. The performance driver can join
+these artifacts using the shared local-activation contract; missing/mismatched
+phases remain unverified and unbudgeted timing rows cannot give a performance
+pass. Calibrated hardware budgets and broad CI enforcement remain follow-up work;
+these accuracy checks impose no performance threshold. Investigate a reference or historical-golden mismatch
+before accepting a changed baseline, even when same-implementation replay passes.

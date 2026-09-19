@@ -1,0 +1,355 @@
+---
+orphan: true
+---
+
+# Measured determinism coverage
+
+Kernel registration says where tests belong. Measured coverage says which
+declared cases actually completed a replay protocol on a particular revision,
+software stack, GPU, and rank count.
+
+The producer annotates local fused activations, TE normalization and attention,
+single-rank embedding accumulation, the MoE router GEMM, SSM decode, and explicit-group
+tensor/sequence-parallel collective mappings. These selected cases cover an
+incremental subset of manifest families, not every variant within them.
+The distributed cross-entropy test is not annotated: its process-group contract
+needs a separate adapter before its evidence can be reused by a recipe. Other kernel families
+remain visible in `inventory_without_declared_cases`; they are not included in
+the case percentage. This is incremental onboarding, not whole-model coverage.
+
+## Adding a case
+
+Mark a positive replay test with an operation ID from `kernels/manifest.py` and
+an implementation identifier that distinguishes backend and numerical variants:
+
+```python
+@pytest.mark.determinism_case(
+    op_id="fused_bias_swiglu", implementation="torch.compile:bias_swiglu"
+)
+def test_swiglu_replay():
+    # Construct representative inputs, then call the existing replay helper.
+    assert_replays_bit_exact(fn, inputs, replays=3, backward=True)
+```
+
+Parametrized tests declare separate cases. The harness records tensor shapes,
+strides, dtypes, gradient requirements, deterministic-algorithm mode, and the
+actual comparison protocol. Memory-fill policy
+(`torch.utils.deterministic.fill_uninitialized_memory`), autocast, TF32, and
+cuDNN settings are recorded at each call, and the run context includes GPU driver
+versions. Recording observes the fill flag without changing it. Older reports
+retain their original observations but do not establish the missing fill setting
+and cannot supply recipe matches that require it.
+Triton cache policy, cache directory, and all `TRITON_AUTOTUNE_BLOCK_*` overrides
+are recorded both at collection and at the replay call. A different policy or
+block override cannot reuse passing evidence. A cache path alone does not prove
+identical cache contents or selected configurations; SSM onboarding must also
+validate those before making a cross-process claim.
+A test-file mapping or a marker alone cannot pass.
+Do not annotate artificial negative controls as production operations.
+
+Module/closure tests pass explicit `configuration` to the harness for options
+outside the tensor arguments: normalization, attention backend, router dtype,
+embedding branch/group size, or the SSM policy override. These `test:`
+implementation IDs and configuration fields deliberately require an explicit
+recipe adapter; the current function-only inventory cannot reuse them from
+matching input shapes alone. Decode evidence is forward-only and includes
+the mutated state tensor; it makes no claim about an SSM training backward.
+
+The current protocol compares outputs and gradients within one process. It does
+not certify fresh-process dispatch, checkpoint restart, arbitrary shapes,
+unobserved internal kernels, or complete mutable training state. Correctness
+against an independent reference is a separate check.
+
+## Independent accuracy and sensitivity
+
+Kernel cases can emit `checks` alongside their replay `observations`. A reference
+check compares every output and input gradient against an independent graph.
+Its per-tensor diagnostics retain maximum absolute/relative error, the mixed
+`atol + rtol * abs(reference)` tolerance, violating/nonfinite counts, and a sample
+location. Zero references participate in the absolute tolerance; relative error
+excludes them and is null when there is no nonzero finite reference. Nonfinite
+values fail, even when they match. Failed checks retain their diagnostics.
+
+A sensitivity check first accepts the unchanged baseline, then requires the
+actual replay comparator to reject one bit flip separately in every output and
+gradient. This measures comparator wiring, not exposure to a real scheduling
+race. It does not emit synthetic `verified_nondeterministic` observations.
+
+`check_status` summarizes `reference` and `sensitivity` separately as `passed`,
+`failed`, or `not_verified`. A pass requires complete, clean, current replay
+evidence and checks for every replay signature on every required rank, with
+matching output/gradient counts. Unmatched checks cannot provide a pass. An
+observed, matching accuracy failure remains a failed reference check, even when
+pytest xfails; it never becomes a replay mismatch. Raw replay observations remain
+available, but a failed test phase makes the overall replay case unverified.
+
+Adapters can attach observed runtime fields with
+`tools.determinism.coverage.replay_configuration`. The active fields are included
+in replay, reference and sensitivity signatures, including nested scopes and
+failed checks. For example, an adapter that verifies the actual loaded backend
+binary can record its build identity once around all three checks. Different
+build identities still fail the exact-signature match; the context does not
+infer a dependency identity or make older incomplete evidence eligible.
+
+`author_requirements` lists the exact cases required by the manifest, including
+missing cases. `--require-author-checks` fails for any missing, failed or unverified
+requirement, and for an empty requirement set. Both GPU kernel recipes enable
+this gate. Legacy families with no `author_tests` remain replay-only; this is
+incremental onboarding, not an accuracy percentage for the repository.
+
+The first six required cases cover biased SwiGLU, weighted SwiGLU and weighted
+squared ReLU in BF16/FP32 with FP32 token weights, 4,096 tokens and FFN width
+8,192. The shared `tests/performance_tests/shell_test_utils/determinism/kernel_case.py`
+adapter generates native-dtype inputs from seed 1234 and uses all-ones upstream
+gradients, matching the timing driver. Author cases use strict Torch mode with
+warn-only disabled and restore prior settings after execution. A versioned
+`configuration.kernel_case` records the adapter source hash, exact input-byte
+fingerprints, complete positional arguments and actual GPU/software/runtime
+settings. Hashing occurs outside the timing intervals.
+
+The cases compare independent **FP64 eager autograd** outputs and every input
+gradient and inject both numerical and byte-comparator errors. Replays run with
+side-stream contention. Pointwise tolerances remain `rtol=0.02, atol=0.001` for
+BF16 and `rtol=atol=1e-6` for FP32, taken from existing weighted-fusion tests.
+The versioned `eager_fp64_autograd_staged_reductions:v2` reference explicitly
+rounds the per-token bias gradient to the input dtype **before** summation,
+matching the custom backward's interface. The report also retains errors against
+the ideal FP64 mathematical gradient; staging does not erase those differences.
+
+Reduction gradients require **both** a per-component bound and an L2 guard.
+For `n` independent terms, let `S = sum(abs(term))`, inflated for FP64 summation
+rounding, and `E = n*atol + rtol*S`. The component budget is
+`B = E + gamma32(n-1)*(S+E) + gamma64(n-1)*S`, plus
+`eps(output_dtype)*(abs(FP64_sum)+B)` for final casts, where
+`gamma(k)=k*u/(1-k*u)` and `u=eps/2`. This uses the conservative summation bound
+without assuming a compiler reduction tree; see
+[Higham's summation analysis, equation 2.6](https://nhigham.com/wp-content/uploads/2023/10/high93s.pdf).
+The additional guard requires
+`norm(actual-reference) <= atol*sqrt(component_count) + rtol*norm(reference)`.
+It retains the original tolerances and rejects systematic drift that the
+conservative component budget could admit. The report records term counts,
+precision, rounding, conditioning, component violations and both norm values.
+This is an explicit test policy, not a proof of intrinsic accuracy or a license
+to accept arbitrary per-component relative error near cancellation.
+
+Every tensor must reject a finite perturbation exceeding its numerical budget,
+including the smallest reference component. Missing controls cannot receive
+passing credit. Eighteen additional accuracy-only tests exercise two independent
+seeds, non-power-of-two widths, exact cancellation, and squared-ReLU dynamic
+range. They retain numerical checks in JUnit properties and do not add replay
+coverage credit. The revised policy still needs H100/GB200 validation and review
+before landing. CPU checks establish none of those hardware results.
+The companion performance
+driver joins this contract to separate forward/backward timings from the same
+clean source revision. A matched report still needs calibrated budgets and GPU
+validation before it can establish acceptable production overhead.
+
+## Tensor and sequence parallel collectives
+
+`test_collective_mappings.py` declares 48 cases: six public mappings, FP32/BF16,
+contiguous/strided tensors, and TP2/full-allocation groups. The cases exercise
+all-reduce in forward and backward, plus first/last-dimension all-gather and
+reduce-scatter with their backward counterparts. Explicit groups have at least
+two members. Their ordered global ranks, local group rank, NCCL version and
+configuration are recorded alongside input/upstream-gradient hashes and layouts.
+Rank-distinct random inputs include exact routing and cancellation sentinels.
+
+Each case completes three forward/backward executions before comparing results.
+This deferred comparison prevents a local mismatch from skipping a later
+collective and stranding peers. An operation/runtime failure can still require
+launcher cleanup. The harness clones explicit upstream gradients for every
+execution because all-reduce backward can mutate its gradient argument.
+
+Independent references use the materialized CPU input and upstream-gradient
+tensors from every rank, never the observed collective output. Copy/gather
+results must match bytes exactly. Reductions use CPU FP64 sums and the same
+componentwise-plus-L2 evaluation described above, with exact input terms (`E=0`)
+and `gamma` computed for the input dtype. The BF16 contract does not assume
+FP32 accumulation inside NCCL. The separate L2 guard uses
+`rtol=gamma_dtype(group_size-1)+eps(dtype)` and `atol=0`; these are declared
+test policies, not fitted tolerances. Every output/gradient also runs numerical
+and byte-comparator negative controls.
+
+The evidence establishes same-process replay for the tested allocation and
+explicit configuration. `NCCL_ALGO=Ring` does not pin physical reduction order
+across allocations. Multi-node, GTP, quantized and overlapped collectives remain
+separate requirements. The GTP manifest exemption is retained. These mapping
+checks have no paired timing adapter or calibrated performance budget, and are
+not added to the six activation `author_tests` that currently join replay,
+accuracy and performance evidence.
+
+## Running and reporting
+
+The dedicated H100 and GB200 kernel/model recipes enable collection and write reports beside
+the uploaded logs, including on test failure. For a local GPU run, use a fresh
+output directory for each launch:
+
+```bash
+export DETERMINISM_EVIDENCE_RUN_ID=my-run
+export CUDA_DEVICE_MAX_CONNECTIONS=1 NCCL_ALGO=Ring
+export CUBLAS_WORKSPACE_CONFIG=:4096:8 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+export MAMBA_DETERMINISTIC=1 CAUSAL_CONV1D_DETERMINISTIC=1
+uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest \
+  -p tools.determinism.pytest_plugin \
+  --determinism-branch-coverage \
+  --determinism-evidence-dir /tmp/my-run/shards \
+  tests/unit_tests/determinism/kernels/test_fused_activations.py
+python -m tools.determinism.coverage /tmp/my-run/shards \
+  --revision "$(git rev-parse HEAD)" --output /tmp/my-run/coverage.json
+```
+
+The report also writes `coverage.md`. Collection persists each rank's declared
+cases before execution and updates observations as comparisons finish. Reusing
+a directory with duplicate rank shards is rejected rather than silently picking
+the best retry.
+
+CI passes `--require-verified`: at least one selected case must have passing,
+nonempty comparisons on every required rank. Empty selections, all-skipped runs,
+and incomplete rank sets fail this gate while retaining available diagnostics.
+`--require-case '*pattern*'` additionally requires a nonempty matching selection
+and verified-deterministic status for every match. These are execution gates;
+they do not require all inventory families to be verified.
+
+## GB200 model replay
+
+The GB200 recipe has separate four-GPU kernel and model buckets, excluded from
+the general bucket. `launch_on_gb200` selects only compatible GPT/hybrid
+TP/PP/VPP/CP/EP/FSDP cells. Eight-GPU cells remain in the H100 matrix; FSDP cells
+require the exact world size so an `fsdp4` label cannot silently exercise eight
+shards. The model bucket also selects tensorwise/delayed FP8, MXFP8, and NVFP4.
+MXFP8 and NVFP4 each have a required-case gate: skipping either cannot pass.
+
+`determinism_model(model_id=...)` plus `--determinism-evidence-scope model`
+uses the same per-rank protocol with a distinct `model_determinism_replay`
+report kind. The recipe consumer rejects this kind as operator evidence.
+Models compare output and parameter-gradient bytes, including signed zeros
+and NaN payloads. Pipeline cells compare the final loss scalar broadcast to
+all ranks and each rank's parameter gradients, not every activation tensor.
+The report records actual comparison counts, skips, and Torch's warn-only
+setting. It does not certify full training state, fresh-process replay, or
+checkpoint restart.
+
+GB200 sets `CUDA_DEVICE_MAX_CONNECTIONS=32` before CUDA initialization to allow
+scheduling contention. The kernel bucket also runs the harness's injected
+signed-zero/NaN mismatch controls, which are excluded from production coverage.
+Collection and CPU contract checks do not establish GPU pass rates; the first
+protected-runner execution is required to validate this selection and runtime.
+
+## Python branch execution
+
+`--determinism-branch-coverage` records a coverage.py context for each declared
+test call. A branch receives `passing_replay: true` only when its supporting
+case has completed numerical replay on **every required rank**, including
+successful setup and teardown. Rank-specific branches can be observed on a
+subset of ranks; the report retains those ranks and the supporting case IDs.
+An unmarked pass, a call without comparisons, a skip, or a failed teardown
+cannot supply passing-replay branch credit. Fixtures execute outside the
+case context.
+
+The default denominator is all Python branches in `megatron/core`, including
+unexecuted source files. For a narrower explicit scope, repeat
+`--determinism-branch-source megatron/core/PATH.py` (directories also work).
+Publish this scope with the result: selecting a smaller scope changes the
+percentage. Coverage.py's branch exclusions apply; the catalog records the
+source hashes, coverage.py version and every included source/destination arc.
+Changed source during collection or differing rank catalogs cannot pass.
+
+The JSON `branches` view includes:
+
+| Field | Meaning |
+| --- | --- |
+| `counts.total` | Possible Python branch arcs in the declared source scope |
+| `counts.observed` | Arcs observed in any declared test call, including unverified cases |
+| `counts.passing_replay` | Arcs observed in cases with complete passing numerical replay |
+| `counts.uncovered_by_passing_replay` | Possible arcs without passing-replay support |
+| `counts.never_observed` | Possible arcs never observed in declared test calls |
+| `passing_replay_percent` | Passing-replay arcs / possible arcs; null for incomplete or empty measurement |
+| `files` | Every source hash, arc, supporting case, replay status and observing rank |
+
+This answers which **Python control-flow branches were exercised by passing
+replay tests**. It does not establish numerical correctness of each branch,
+compiled/Triton/CUDA branch coverage, full training-state determinism, or
+production performance. Measure performance without this instrumentation.
+
+The producer reuses an active coverage.py collector; it requires branch mode
+and rejects a competing `dynamic_context` policy. Without an active collector,
+it starts and stops its own collector. Ordinary CI coverage uses `branch=true`
+for all latest-revision shards so they remain combinable; legacy coverage is
+excluded from that combination. Raw coverage JSON is retained under `branch-data/`
+in the evidence directory. Standalone collection also writes a coverage database
+there; an active CI collector keeps its existing data-file location. Collection uses the documented
+[coverage.py context APIs](https://coverage.readthedocs.io/en/latest/contexts.html).
+`--require-branches` requires complete measurement and at least one branch
+associated with passing replay. It does not impose a percentage target.
+
+## Parallelism interactions
+
+Model tests declare their selected matrix through the pytest `parallelism`
+parameter, or a fixed marker such as
+`determinism_model(model_id="gpt-quantized", parallelism={"TP": 2})`.
+The axes are TP, PP, VPP, CP, EP and FSDP; omitted axes have size one. The
+runner separately records initialized group sizes at replay, propagates
+TP/PP/CP/EP into the model configuration, and records the actual DP group size
+for an FSDP-wrapped replay. An unwrapped DP group does not imply that these
+tests exercised DDP gradient synchronization.
+
+FSDP cells explicitly select Megatron-FSDP v1 `optim_grads_params`, including its
+required overlapped gather/reduce operations. The effective policy is recorded
+as `signature.fsdp`; `no_shard` cannot receive FSDP pair credit. Gradient
+capture waits for `finish_grad_sync` and compares the local optimizer gradient
+shards, without introducing a DTensor gather. Gradient buffers are cleared
+before both passes. Combined FSDP with PP or CP remains unsupported by this
+fixture and skips explicitly.
+
+The JSON `parallelism.rows` retains each plan, runtime match, status and reason.
+`parallelism.pairs` enumerates unique pairs of axis values **present in that
+selected matrix**, separately per model ID; it does not invent unsupported
+Cartesian combinations. All contributing selected cases, including model
+presets, must have matching runtime axes and passing replay for a pair to
+be deterministic. A passing GPT preset cannot hide a skipped Llama preset.
+Missing runtime fields or plans remain visible and unverified.
+`--require-parallelism` requires at least one model row with a matching,
+passing replay; it does not require the entire matrix to pass.
+
+GPT adds `cp2`, `tp2-cp2`, `pp2-cp2`, and `tp2-pp2-cp2`. Its inputs use
+Megatron's CP sharding helper for tokens, positions and causal-mask query
+rows. The first three fit four GPUs; the last requires eight. Hybrid and
+layer fixtures keep their existing matrix until they provide CP inputs.
+Static selection now includes **22 GPT, 5 hybrid and 4 quantized cases** on
+GB200. These are declared cases, not measured GPU passes. The H100 model
+bucket now produces the same model/branch views; Blackwell-only precision
+cases remain explicit skips there.
+
+Both supplementary views retain their own denominators. Neither changes
+the kernel D/N/U percentage below or makes model reports reusable as
+operator evidence by the recipe consumer.
+
+## Case status
+
+| Status | Meaning |
+| --- | --- |
+| `verified_deterministic` | Nonempty replay evidence passed, all required ranks completed, and source provenance is current and clean |
+| `verified_nondeterministic` | An explicit identical-input replay mismatch was observed |
+| `not_verified` | Missing replay/rank, skipped or failed setup/teardown, interrupted session, or stale/dirty source |
+
+Expected failures are classified using the typed replay observation. An xfail
+caused by a missing dependency is unverified. A numerical mismatch remains
+nondeterministic even if pytest expected it. An XPASS is eligible only when the
+underlying replay actually completed.
+
+For the declared selected cases, deterministic coverage is `D / (D + N + U)`;
+verification coverage is `(D + N) / (D + N + U)`. An empty denominator produces
+null percentages. Always publish the selected case list and the unannotated
+inventory alongside these metrics; narrowing test selection changes the scope.
+
+The JSON schema is versioned. Consumers must match source and environment
+context before reusing observations. The `implementation` identifier is an
+author-maintained dispatch contract, not automatic introspection into TE or
+compiled kernels.
+
+CPU contract tests can run without importing the GPU test conftest:
+
+```bash
+PYTHONPATH=. python -m pytest --confcutdir=tests/unit_tests/determinism_reporting \
+  tests/unit_tests/determinism_reporting/test_coverage_evidence.py
+```

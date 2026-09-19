@@ -182,6 +182,7 @@ runs:
       shell: bash -e -u -o pipefail {0}
       env:
         REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
+        TEST_CASE: ${{ inputs.test_case }}
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
@@ -212,6 +213,15 @@ runs:
             exit 2
             ;;
         esac
+        # Replay evidence requires complete current-run comparisons and branch contexts.
+        # Keep both selection and baseline tracing out of the dedicated evidence jobs.
+        if [[ "${TEST_CASE:-}" == "tests/unit_tests/determinism/kernels/**/*.py" \
+          || "${TEST_CASE:-}" == "tests/unit_tests/determinism/correctness/**/*.py" ]]; then
+          EFFECTIVE_MODE=full
+          if [[ "$REQUESTED_MODE" != "full" ]]; then
+            FALLBACK_REASON="determinism evidence requires exhaustive replay and branch collection"
+          fi
+        fi
         mkdir -p assets_dir/testmon
         : > assets_dir/testmon/summary.md
         echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
