@@ -1,17 +1,20 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Multimodal Sequence Parallel (SP) and Context Parallel (CP) functionality."""
 
+import logging
 import math
 
 import torch
 
+from megatron.core._rank_utils import log_single_rank
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_rank,
     get_context_parallel_world_size,
-    get_tensor_model_parallel_rank,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_padding(
@@ -438,9 +441,11 @@ def split_to_context_parallel_ranks_dynamic_res(
         patch_dim: Patch size of the vision backbone (e.g. 14 for SigLIP, 16 for
             many ViTs). Required because dummy padding tensors are sized in patch
             units and the default would silently mismatch some backbones.
-        dummy_image_size: Side length in pixels for context-parallel dummy images.
-            Defaults to one patch. Increase this when downstream compression (for
-            example pixel shuffle) requires a larger spatial grid.
+        dummy_image_size: Side length in pixels for dummy images used to prevent
+            empty CP shards, which the current vision path does not support.
+            Their outputs are discarded during gathering. Defaults to one patch;
+            use a larger grid when required by downstream compression, such as
+            2x2 patches for pixel shuffle or a native spatial merger.
         fp8_enabled: If True, pad each rank's local sequence to the FP8 multiple
             (16 by default; 32 for ``mxfp8``).
         fp8_recipe: Forwarded to :func:`get_padding` so the FP8 padding multiple
@@ -448,7 +453,8 @@ def split_to_context_parallel_ranks_dynamic_res(
         num_frames: Per-media frame count, required when ``temporal_patch_size > 1``.
         temporal_patch_size: Tubelet size for temporal compression.
         balance_by_tokens: Balance contiguous shards by post-compression vision tokens.
-        profile_partition: Log the selected per-rank token loads from TP=0/CP=0.
+        profile_partition: Log the selected per-rank token loads from CP=0.
+            The caller selects which TP ranks enable profiling.
 
     Returns:
         (local_t, local_imgs_sizes, local_packed_seq_params, has_padding,
@@ -467,6 +473,11 @@ def split_to_context_parallel_ranks_dynamic_res(
 
     cu_seqlens = global_packed_seq_params.cu_seqlens_q
 
+    # Pad otherwise-empty CP shards because the current vision path assumes
+    # at least one image/tubelet (e.g. RADIO concatenates per-image tensors).
+    # Dummy inputs keep those ranks on the normal encoder/projector path;
+    # their outputs are discarded during the CP gather.
+    # This is separate from FP8 alignment padding.
     num_imgs = len(global_imgs_sizes)
     if use_tubelet_aware_split:
         T = temporal_patch_size
@@ -485,6 +496,9 @@ def split_to_context_parallel_ranks_dynamic_res(
         f"{int(global_t.shape[2])} (patch_dim={patch_dim})."
     )
 
+    # Dummy images must form a valid patch grid for downstream processing.
+    # One patch suffices by default; pixel shuffle and native spatial mergers
+    # each require a 2x2 grid, so the caller increases dummy_image_size accordingly.
     if dummy_image_size is None:
         dummy_image_size = patch_dim
     dummy_image_size = int(dummy_image_size)
@@ -537,6 +551,8 @@ def split_to_context_parallel_ranks_dynamic_res(
     num_padded_ranks = num_padded_imgs
 
     if use_tubelet_aware_split:
+        # Balance vision-token counts across contiguous shards without splitting
+        # tubelets, whose frames must stay together for temporal compression.
         if balance_by_tokens:
             split_points = _compute_token_balanced_split_points(
                 seqlens,
@@ -580,6 +596,8 @@ def split_to_context_parallel_ranks_dynamic_res(
         ub = split_points[cp_rank + 1]
         local_num_frames = _split_num_frames(num_frames_list, lb, ub)
     else:
+        # Balance by vision-token count rather than image count because
+        # different image resolutions produce different numbers of tokens.
         if balance_by_tokens:
             split_points = _compute_token_balanced_split_points(seqlens, cp_size)
             lb = split_points[cp_rank]
@@ -593,7 +611,7 @@ def split_to_context_parallel_ranks_dynamic_res(
             split_points = [rank * seq_per_rank for rank in range(cp_size)] + [total_frames]
         local_num_frames = None
 
-    if profile_partition and cp_rank == 0 and get_tensor_model_parallel_rank() == 0:
+    if profile_partition and cp_rank == 0:
         partition_loads = _vision_cp_partition_loads(
             seqlens,
             split_points,
@@ -601,17 +619,20 @@ def split_to_context_parallel_ranks_dynamic_res(
             temporal_patch_size=temporal_patch_size,
         )
         mean_load = sum(partition_loads) / len(partition_loads)
-        # Keep this opt-in profile output visible independently of logging configuration.
-        print(  # pylint: disable=bad-builtin
+        # Preserve diagnostics for each selected DP replica, not just global rank 0.
+        global_rank = torch.distributed.get_rank()
+        log_single_rank(
+            logger,
+            logging.INFO,
             "VISION_CP_PARTITION_PROFILE "
             f"mode={'token_balanced' if balance_by_tokens else 'legacy'} "
-            f"global_rank={torch.distributed.get_rank()} "
+            f"global_rank={global_rank} "
             f"min_tokens={min(partition_loads)} "
             f"max_tokens={max(partition_loads)} "
             f"mean_tokens={mean_load:.3f} "
             f"max_over_mean={max(partition_loads) / mean_load:.6f} "
             f"loads={','.join(str(load) for load in partition_loads)}",
-            flush=True,
+            rank=global_rank,
         )
 
     seqlens_local = torch.cat([torch.tensor([0], device=seqlens.device), seqlens[lb:ub]])
@@ -683,8 +704,9 @@ def split_to_context_parallel_ranks_dynamic_res(
         )
 
     assert lb < ub and local_imgs_sizes.numel() > 0, (
-        "Context-parallel split produced an empty local shard: "
-        f"cp_rank={cp_rank}, cp_size={cp_size}, lb={lb}, ub={ub}, "
+        "Context-parallel split produced an empty local vision shard: "
+        f"cp_rank={cp_rank}, cp_size={cp_size}, "
+        f"frame_index_range=[{lb}, {ub}) (start inclusive, end exclusive), "
         f"num_padded_imgs={num_padded_imgs}, split_points={split_points}, "
         f"temporal_patch_size={temporal_patch_size}"
     )

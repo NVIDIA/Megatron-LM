@@ -39,6 +39,103 @@ def test_forward_rejects_invalid_video_frame_partitions(imgs_sizes, num_frames, 
         _minimal_llava_forward(model, imgs_sizes=imgs_sizes, num_frames=num_frames)
 
 
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("conv_merging", [False, True])
+@pytest.mark.parametrize("balance_by_tokens", [False, True])
+def test_forward_video_accounts_for_native_merging(
+    monkeypatch, cp_size, conv_merging, balance_by_tokens
+):
+    """Count merged frame tokens and provide merger-compatible CP dummy images."""
+    from megatron.core.models.multimodal import context_parallel, llava_model
+
+    patch_dim = 2
+    num_frames = 2
+    tokens_per_frame = 1 if conv_merging else 4
+    total_tokens = num_frames * tokens_per_frame
+    vision_sizes = []
+    gathered_padding = []
+
+    class _VisionModel(torch.nn.Module):
+        dynamic_resolution = True
+        class_token_len = 0
+
+        def __init__(self):
+            super().__init__()
+            self.patch_dim = patch_dim
+
+        def forward(self, images, *, imgs_sizes, packed_seq_params):
+            vision_sizes.extend(imgs_sizes.tolist())
+            patch_hw = imgs_sizes // patch_dim
+            if conv_merging:
+                assert torch.all(patch_hw % 2 == 0), "native merger requires a 2x2 patch grid"
+                patch_hw = patch_hw // 2
+            token_count = int(patch_hw.prod(dim=-1).sum())
+            return torch.ones(1, token_count, 2)
+
+    def gather(local_embeddings, num_padded_ranks):
+        gathered_padding.append(num_padded_ranks)
+        assert local_embeddings.shape[0] == (1 if cp_size > num_frames else tokens_per_frame)
+        return torch.ones(total_tokens, 1, 2)
+
+    monkeypatch.setattr(context_parallel, "get_context_parallel_world_size", lambda: cp_size)
+    # For CP=4, the last rank owns a dummy image; for CP=2 it owns a real frame.
+    monkeypatch.setattr(context_parallel, "get_context_parallel_rank", lambda: cp_size - 1)
+    monkeypatch.setattr(llava_model, "gather_from_context_parallel_ranks_dynamic_res", gather)
+
+    model = object.__new__(LLaVAModel)
+    torch.nn.Module.__init__(model)
+    model.add_encoder = True
+    model.add_decoder = True
+    model.pre_process = False
+    model.temporal_patch_dim = 1
+    model.patch_dim = patch_dim
+    model.vision_model = _VisionModel()
+    model.vision_projection = torch.nn.Identity()
+    model.language_model = lambda **kwargs: kwargs["decoder_input"]
+    model.image_token_index = -200
+    model.context_parallel_lm = cp_size
+    model.sequence_parallel_lm = False
+    model.use_loss_scaling = False
+    model._drop_vision_class_token = True
+    model._pixel_shuffle = False
+    model._conv_merging = conv_merging
+    model._tile_tags = None
+    model._vision_fp8 = False
+    model._vision_fp8_recipe = None
+    model._vision_projection_fp8 = False
+    model._balance_vision_context_parallel_by_tokens = balance_by_tokens
+    model._profile_vision_context_parallel_partition = False
+    captured = {}
+
+    def preprocess(image_embeddings, *args, **kwargs):
+        captured["media_token_counts"] = kwargs["media_token_counts"]
+        assert image_embeddings.shape == (total_tokens, 1, 2)
+        return image_embeddings, None, None, None, None
+
+    model._preprocess_data = preprocess
+    model._process_embedding_token_parallel = lambda *args: args
+
+    output, loss_mask = _minimal_llava_forward(
+        model,
+        input_ids=torch.tensor([[1, model.image_token_index]], dtype=torch.long),
+        images=torch.ones(1, num_frames * 4, 3 * patch_dim**2),
+        imgs_sizes=torch.tensor([[4, 4]] * num_frames, dtype=torch.int32),
+        num_frames=[num_frames],
+    )
+
+    assert captured["media_token_counts"].tolist() == [total_tokens]
+    assert output.shape == (total_tokens, 1, 2)
+    assert loss_mask is None
+    if cp_size == 1:
+        assert vision_sizes == [[4, 4], [4, 4]]
+        assert gathered_padding == []
+    else:
+        dummy_size = 2 * patch_dim if conv_merging else patch_dim
+        expected_size = dummy_size if cp_size > num_frames else 4
+        assert vision_sizes == [[expected_size, expected_size]]
+        assert gathered_padding == [max(0, cp_size - num_frames)]
+
+
 def test_forward_temporal_video_groups_tubelet_counts_per_placeholder():
     vision_model = object.__new__(RADIOViTModel)
     torch.nn.Module.__init__(vision_model)

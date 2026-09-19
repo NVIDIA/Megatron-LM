@@ -8,6 +8,8 @@
 * ``vocab_parallel_cross_entropy``: the unfused path deterministic mode relies on.
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
   with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
+* ``ColumnParallelLinear`` with BF16 inputs and FP32 output: Transformer Engine
+  ``general_gemm`` forward plus the corresponding input- and weight-gradient paths.
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
   (causal and padding CUDA kernels).
 """
@@ -18,6 +20,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fusions import fused_layer_norm
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
@@ -143,6 +146,28 @@ class TestTensorParallelLayers:
             contention=True,
             what=f"{layer} linear[fusion={grad_accum_fusion}]",
         )
+
+    @pytest.mark.skipif(
+        te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+    )
+    def test_column_parallel_linear_fp32_output_replays(self):
+        """Replay the mixed-output GEMM used by FP32 language-model logits."""
+        seeded()
+        config = _config(hidden_size=512, num_attention_heads=8)
+        module = ColumnParallelLinear(
+            512,
+            1024,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            output_dtype=torch.float32,
+        ).cuda()
+        x = torch.randn(2048, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        outputs, _ = assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
+        )
+        assert outputs["out[0]"].dtype is torch.float32
 
 
 # --- apex fused layer norm ------------------------------------------------------------------

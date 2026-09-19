@@ -31,7 +31,12 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
+from megatron.core.utils import (
+    deprecate_inference_params,
+    get_pg_rank,
+    is_te_min_version,
+    log_single_rank,
+)
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -1331,11 +1336,7 @@ class LLaVAModel(MegatronModule):
                     num_frames = [int(value) for value in num_frames]
                 if any(value <= 0 for value in num_frames):
                     raise ValueError("num_frames entries must be positive.")
-                expected_frames = (
-                    len(imgs_sizes) - int(dataset_has_pad_img)
-                    if imgs_sizes is not None
-                    else len(num_image_tiles)
-                )
+                expected_frames = len(imgs_sizes) - int(dataset_has_pad_img)
                 if sum(num_frames) != expected_frames:
                     raise ValueError(
                         "num_frames must partition imgs_sizes exactly: "
@@ -1363,6 +1364,8 @@ class LLaVAModel(MegatronModule):
                 dummy_image_size = self.vision_model.patch_dim
                 if self._pixel_shuffle:
                     dummy_image_size *= 2
+                if self._conv_merging:
+                    dummy_image_size *= 2
                 (
                     vision_images,
                     imgs_sizes,
@@ -1381,7 +1384,10 @@ class LLaVAModel(MegatronModule):
                     num_frames=num_frames,
                     temporal_patch_size=self.temporal_patch_dim,
                     balance_by_tokens=self._balance_vision_context_parallel_by_tokens,
-                    profile_partition=self._profile_vision_context_parallel_partition,
+                    profile_partition=(
+                        self._profile_vision_context_parallel_partition
+                        and get_pg_rank(self.pg_collection.tp) == 0
+                    ),
                 )
                 if local_num_frames is not None:
                     num_frames = local_num_frames.tolist()
@@ -1555,6 +1561,8 @@ class LLaVAModel(MegatronModule):
                         frame_token_counts = frame_token_counts + class_token_len
                     if self._pixel_shuffle:
                         frame_token_counts = frame_token_counts // 4
+                    if self._conv_merging:
+                        frame_token_counts = frame_token_counts // 4
                     media_token_counts = _align_temporal_token_counts_to_placeholders(
                         frame_token_counts, num_frames, input_ids, self.image_token_index
                     )
@@ -1634,6 +1642,8 @@ class LLaVAModel(MegatronModule):
                                 getattr(self.vision_model, "class_token_len", 0)
                             )
                         if self._pixel_shuffle:
+                            frame_token_counts = frame_token_counts // 4
+                        if self._conv_merging:
                             frame_token_counts = frame_token_counts // 4
                         media_token_counts = _align_temporal_token_counts_to_placeholders(
                             frame_token_counts, global_num_frames, input_ids, self.image_token_index
@@ -1898,14 +1908,14 @@ def _precalculate_loss_weights(boundaries, labels):
     """Precompute packed-sample loss weights before context-parallel sharding."""
     weights = torch.zeros(labels.shape[0], dtype=torch.float32, device=labels.device)
     valid_counts = []
+    boundaries = boundaries.tolist()
 
     for start, end in zip(boundaries[:-1], boundaries[1:]):
-        start = int(start.item())
-        end = min(int(end.item()), labels.shape[0])
+        end = min(end, labels.shape[0])
         valid = labels[start:end] != IGNORE_INDEX
         count = valid.sum()
         if count > 0:
-            weights[start:end][valid] = count.float().rsqrt()
+            weights[start:end] = torch.where(valid, count.float().rsqrt(), weights.new_zeros(()))
             valid_counts.append(count)
 
     if not valid_counts:
