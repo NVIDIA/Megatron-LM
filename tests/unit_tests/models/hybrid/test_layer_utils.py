@@ -10,6 +10,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSA2LayerConfig,
     CSALayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
@@ -21,6 +22,7 @@ _EXPECTED_LAYER_CONFIG_TYPES = [
     (layer_utils.Symbols.ATTENTION, AttentionLayerConfig),
     (layer_utils.Symbols.DS_ATTENTION, DSALayerConfig),
     (layer_utils.Symbols.CSA, CSALayerConfig),
+    (layer_utils.Symbols.CSA2, CSA2LayerConfig),
     (layer_utils.Symbols.HCA, CSALayerConfig),
     (layer_utils.Symbols.MLA, MLALayerConfig),
     (layer_utils.Symbols.WINDOW, CSALayerConfig),
@@ -63,6 +65,7 @@ class TestSymbols:
         assert layer_utils.Symbols.name_sorted_valid_layer_symbols() == [
             layer_utils.Symbols.ATTENTION,
             layer_utils.Symbols.CSA,
+            layer_utils.Symbols.CSA2,
             layer_utils.Symbols.DS_ATTENTION,
             layer_utils.Symbols.GDN,
             layer_utils.Symbols.HCA,
@@ -78,6 +81,7 @@ class TestSymbols:
             AttentionLayerConfig,
             DSALayerConfig,
             CSALayerConfig,
+            CSA2LayerConfig,
             MLALayerConfig,
         }
 
