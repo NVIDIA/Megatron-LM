@@ -13,4 +13,8 @@ Supported execution is FP32/BF16 training with TP=CP=PP=1 and expert/data parall
 
 Run focused tests with `NVIDIA_TF32_OVERRIDE=0 uv run python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest --experimental -q tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py tests/unit_tests/transformer/test_single_pass_mhc.py tests/unit_tests/models/test_deepseek_v41.py tests/unit_tests/determinism/kernels/test_deepseek_v41_kernels.py`.
 
-This composition is text-backbone-only. Pass `engram_config=None`, `vision_config=None`, and `dspark_config=None` when importing the released HF config. Conditional components are separate extensions.
+## Engram
+
+Trainable V4.1 Engram uses compressed-token hashing, distinct-prime buckets and context-aware mHC gates before attention. The obsolete short convolution is omitted. Supply the released tokenizer or a matching compressed token map before model construction. Row-sharded lookup and its parity tests are adapted from [#7231](https://github.com/NVIDIA/Megatron-LM/pull/7231), by Li Tao: variable-size all-to-all supports duplicate rows, empty peer splits and uneven tables without replicating the table. Checkpoints retain exact logical rows. Shard initialization preserves replicated RNG state. Run the distributed lookup tests with two or four torchrun ranks: `tests/unit_tests/models/test_engram_distributed_embedding.py`.
+
+Disable `vision_config` and `dspark_config` for this text-plus-Engram composition.

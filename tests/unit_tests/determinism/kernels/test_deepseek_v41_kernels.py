@@ -2,6 +2,7 @@
 
 import torch
 
+from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_attention_spec,
 )
@@ -33,3 +34,21 @@ def test_csa2_module_replay(groups):
         assert_module_replays_bit_exact(
             layer, (torch.randn(9, 2, 32, device="cuda", requires_grad=True), None)
         )
+
+
+def test_engram_duplicate_rows_replay(groups):
+    seeded()
+    config = tiny_config()
+    config.deterministic_mode = True
+    module = EPShardedMultiTableEmbedding(
+        config,
+        (11, 13),
+        8,
+        config.init_method,
+        ep_group=groups.ep,
+        tp_group=groups.tp,
+        expt_dp_group=groups.expt_dp,
+    ).cuda()
+    ids = torch.tensor([[[1, 3], [1, 3], [5, 2], [1, 3]]], device="cuda")
+    with deterministic_algorithms(True):
+        assert_module_replays_bit_exact(module, (ids,))

@@ -67,6 +67,7 @@ class DeepSeekV41Block(MegatronModule):
         self.mlp = moe_spec(
             config=config, layer_number=self.layer_number, pg_collection=pg_collection
         )
+        self.engram = None
 
     def forward(self, hidden_states, previous_mix, state, attention_mask=None, padding_mask=None):
         """Carry the last FFN mix and shared CSA2 tensors without storing either on the layer."""
@@ -153,6 +154,8 @@ class DeepSeekV41Stack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout=None,
         cp_layout_plan=None,
+        engram_hashes=None,
+        token_mask=None,
     ):
         """Return normalized backbone hidden states."""
         if inference_context is not None or packed_seq_params is not None:
@@ -165,6 +168,8 @@ class DeepSeekV41Stack(MegatronModule):
         )
         state, previous_mix = (CSA2State(), None)
         for _i, layer in enumerate(self.layers):
+            if layer.engram is not None:
+                hidden_states = layer.engram(hidden_states, engram_hashes, token_mask)
             hidden_states, previous_mix = layer(
                 hidden_states, previous_mix, state, attention_mask, padding_mask
             )

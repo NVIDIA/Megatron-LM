@@ -104,6 +104,13 @@ C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="engram_embedding",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=(K + "test_deepseek_v41_kernels.py",),
+        kind="torch-op",
+        notes="Sorted embedding backward and repeated-token draft embeddings; EP collectives have separate multi-rank parity coverage.",
+    ),
+    KernelEntry(
         name="deepseek_v41_csa2",
         sources=("megatron/core/transformer/experimental_attention_variant/csa2.py",),
         tests=(K + "test_deepseek_v41_kernels.py",),
