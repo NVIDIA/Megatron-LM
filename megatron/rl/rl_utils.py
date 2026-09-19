@@ -45,6 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -3018,6 +3019,18 @@ def megatron_rl_inference_mode(
     model_core = unwrap_model(model[0])
     with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
+    if training_model is None and optimizer is not None:
+        # Complete parameter sync before inference bypasses training forward hooks.
+        with torch.no_grad(), nvtx_range("rl/synchronize-inference-parameters", time=True):
+            optimizer.prepare_model_params_for_param_sync()
+            for model_chunk in model:
+                # Ordinary DDP already has complete parameters.
+                if (
+                    isinstance(model_chunk, DistributedDataParallel)
+                    and model_chunk.ddp_config.param_sync_via_bucket_group
+                ):
+                    model_chunk.start_param_sync(force_sync=True)
+
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
