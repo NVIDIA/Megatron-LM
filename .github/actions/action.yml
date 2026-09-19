@@ -464,6 +464,29 @@ runs:
           exit 1
         fi
 
+    - name: Record determinism artifact provenance
+      id: determinism-artifact
+      if: >-
+        always() && inputs.tag == 'latest' &&
+        (inputs.test_case == 'tests/unit_tests/determinism/kernels/**/*.py' ||
+         inputs.test_case == 'determinism_kernel_perf' ||
+         inputs.test_case == 'determinism_collective_perf')
+      shell: bash -e -u -o pipefail {0}
+      env:
+        LOG_BASE: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}
+        TEST_CASE: ${{ inputs.test_case }}
+        PLATFORM: ${{ inputs.platform }}
+        PRODUCER_OUTCOME: ${{ steps.run-main-script.outcome }}
+        PRODUCER_EXIT_CODE: ${{ steps.run-main-script.outputs.exit_code }}
+      run: |
+        NAME=$(python3 tests/performance_tests/shell_test_utils/determinism/ci_artifacts.py stamp \
+          --repository "$GITHUB_REPOSITORY" --revision "$(git rev-parse HEAD)" \
+          --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+          --platform "$PLATFORM" --test-case "$TEST_CASE" \
+          --outcome "$PRODUCER_OUTCOME" --exit-code "$PRODUCER_EXIT_CODE" \
+          --output "$LOG_BASE")
+        echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
     - name: Upload coverage
       id: upload-coverage
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -497,7 +520,7 @@ runs:
       if: always()
       continue-on-error: true
       with:
-        name: ${{ steps.check.outputs.logs_report }}
+        name: ${{ steps.determinism-artifact.outputs.name || steps.check.outputs.logs_report }}
         path: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}
         include-hidden-files: true
 
@@ -510,6 +533,6 @@ runs:
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: ${{ always() && steps.upload-logs.outcome == 'failure' }}
       with:
-        name: ${{ steps.check.outputs.logs_report }}-retry
+        name: ${{ steps.determinism-artifact.outputs.name || steps.check.outputs.logs_report }}-retry
         path: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}
         include-hidden-files: true

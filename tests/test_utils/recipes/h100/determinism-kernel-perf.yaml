@@ -7,7 +7,7 @@ spec:
   model: gpt
   nodes: 1
   build: mcore-pyt-{environment}
-  gpus: 8
+  gpus: 1
   platforms: dgx_h100
   script_setup: |
     unset https_proxy
@@ -29,38 +29,16 @@ spec:
     rm -f "${{HOME}}/.netrc"
     unset RO_API_TOKEN
     set -euo pipefail
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
     cd /opt/megatron-lm
-    export DETERMINISM_PERF_RECIPE={perf_recipe}
-    export DETERMINISM_PERF_GPUS={gpus}
-    bash tests/performance_tests/shell_test_utils/determinism/perf_breakdown.sh \
-      "{assets_dir}/logs/perf-leaderboards" \
-      "{assets_dir}/logs"
+    uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/kernel_leaderboard.py \
+      --output "{assets_dir}/logs/kernel-leaderboard"
 
 products:
-  # Routed through the integration-tests matrix (scope: mr-github) — picked
-  # up automatically by ``generate_jet_trigger_job.py``'s recipe glob, no
-  # changes needed in ``.github/workflows/cicd-main.yml``.
-  - test_case: [determinism_perf]
+  # Report-only pilot; calibration is required before imposing per-kernel budgets.
+  - test_case: [determinism_kernel_perf]
     products:
       - environment: [dev]
-        perf_recipe: [dense]
-        scope: [mr-github]
-        platforms: [dgx_h100]
-        n_repeat: [1]
-        time_limit: [3600]
-  - test_case: [determinism_perf_moe]
-    products:
-      - environment: [dev]
-        perf_recipe: [moe]
-        scope: [L1]
-        cadence: [nightly]
-        platforms: [dgx_h100]
-        n_repeat: [1]
-        time_limit: [3600]
-  - test_case: [determinism_perf_hybrid]
-    products:
-      - environment: [dev]
-        perf_recipe: [hybrid]
         scope: [L1]
         cadence: [nightly]
         platforms: [dgx_h100]
