@@ -268,6 +268,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         if local_grad.shape != mom_local.shape:
             local_grad = local_grad.reshape(mom_local.shape)
 
+        # In-place through the persistent `main_grad` view (`l2` mutates the grad
+        # buffer): safe under the zero_grad contract — main_grad is overwritten or
+        # zeroed before each step's accumulation (reduce_partial_gradients), so the
+        # decay term cannot leak into the next step.
         self._inner._apply_weight_decay_inplace(p_local, local_grad, lr, group["weight_decay"])
         mom_local.lerp_(local_grad, 1 - group["momentum"])
         if self._inner.nesterov:
@@ -333,19 +337,27 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         else:
             loss = None
 
-        touched: set[FsdpParameterGroup] = set()
+        # Insertion-ordered: both loops below post P2P ops and collectives whose
+        # order must match on every rank — NCCL matches P2P FIFO per peer pair
+        # (tags unsupported), and `sync_model_weight_from_main_weight` is a
+        # collective on the shared mesh. Set iteration order is id-hash dependent
+        # and can differ across ranks; the param list is rank-identical.
+        touched: dict[FsdpParameterGroup, None] = {}
         temporaries: list[Any] = []
         for torch_group in self.param_groups:
             self._init_group(torch_group)
             lr = torch_group["lr"]
-            params = {p for p in torch_group["params"] if p.grad is not None}
+            params = [p for p in torch_group["params"] if p.grad is not None]
             if not params:
                 continue
+            # Membership by identity: tensor `==` is elementwise, so `in` on a
+            # tensor list could raise for multi-element params.
+            grad_bearing = set(params)
             fsdp_groups: dict[FsdpParameterGroup, None] = {}
             for param in params:
                 fsdp_group = _fsdp_group_of(param)
                 fsdp_groups[fsdp_group] = None
-                touched.add(fsdp_group)
+                touched[fsdp_group] = None
             for fsdp_group in fsdp_groups:
                 owner_layout = self._owner_layouts.get(fsdp_group)
                 if owner_layout is None:
@@ -357,7 +369,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                         eligible_fn=lambda _param: True,
                     )
                 active_indices = [
-                    i for i, fp in enumerate(fsdp_group.fsdp_parameters) if fp.sharded in params
+                    i
+                    for i, fp in enumerate(fsdp_group.fsdp_parameters)
+                    if fp.sharded in grad_bearing
                 ]
                 active = GroupOwnerLayout(
                     group=fsdp_group,
