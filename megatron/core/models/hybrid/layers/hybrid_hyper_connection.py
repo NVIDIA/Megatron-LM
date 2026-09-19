@@ -139,7 +139,7 @@ class HyperConnectionHybridLayer(MegatronModule):
 
         mlp_kwargs = (
             cross_layer_state.mlp_kwargs(layer.layer_number)
-            if hasattr(cross_layer_state, "mlp_kwargs")
+            if cross_layer_state is not None and hasattr(cross_layer_state, "mlp_kwargs")
             else {}
         )
         output_with_bias, residual = layer._forward_mlp_output_with_bias(
