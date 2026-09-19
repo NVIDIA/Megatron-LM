@@ -393,12 +393,12 @@ class InferenceClient:
             # dropped its mapping, so recording the id would leak an entry
             # nothing ever removes and the ABORT_REQUEST send would be wasted.
             return
-        self.aborted_request_ids.add(request_id)
         if stream is not None:
             stream.finish()
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
+        self.aborted_request_ids.add(request_id)
         payload = [Headers.ABORT_REQUEST.value, request_id]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 

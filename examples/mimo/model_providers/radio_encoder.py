@@ -81,8 +81,21 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     config.moe_router_fusion = False
     config.moe_permute_fusion = False
     config.moe_shared_expert_overlap = False
+    config.moe_shortcut_connection = False
+    config.moe_shortcut_parallel = False
+    config.moe_shortcut_post_norm = False
     config.is_hybrid_model = False
     config.use_fused_weighted_squared_relu = False
+    if config.recompute_modules is not None:
+        config.recompute_modules = [
+            module
+            for module in config.recompute_modules
+            if module != "shortcut_pre_mlp_layernorm"
+        ]
+    if getattr(config, "offload_modules", None) is not None:
+        config.offload_modules = [
+            module for module in config.offload_modules if module != "shortcut_post_norm"
+        ]
 
 
 def _disable_gtp(config: TransformerConfig) -> None:

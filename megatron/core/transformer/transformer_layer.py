@@ -1717,6 +1717,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
         elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
+            # Owned by the model-level graph `_setup_mtp_cuda_graphs` installs; a nested
+            # per-layer graph can be neither captured nor replayed ("Cannot prepare for
+            # replay during capturing stage").
+            and not self.is_mtp_layer
             and kwargs['attention_mask'] is None
             and (
                 (kwargs.get('inference_context') is not None)

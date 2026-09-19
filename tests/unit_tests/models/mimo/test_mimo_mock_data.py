@@ -143,8 +143,7 @@ def test_cp_replicas_share_batches_without_merging_data_lanes(adapter, cp_size, 
             pg = topology.module_pgs["language"]
             pg.cp = _group(rank=cp_rank, size=cp_size)
             pg.dp_cp_gtp_remat = _group(
-                rank=lane * cp_size + cp_rank,
-                size=args.mimo_llm_dp * gtp_size * cp_size,
+                rank=lane * cp_size + cp_rank, size=args.mimo_llm_dp * gtp_size * cp_size
             )
             loaders = adapter.build_train_valid_test_data_loaders(args, topology)
             assert all(loader.batch_size == args.micro_batch_size for loader in loaders)
