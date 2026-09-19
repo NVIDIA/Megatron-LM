@@ -2,7 +2,6 @@
 
 """V4.1 layer composition and forward-local shared attention state."""
 
-import torch
 from torch import nn
 
 from megatron.core.extensions.transformer_engine import TENorm

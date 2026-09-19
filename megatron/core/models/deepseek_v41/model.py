@@ -29,7 +29,7 @@ class DeepSeekV41Model(HybridModel):
             hybrid_layer_pattern="VE" * len(config.csa_compress_ratios),
             position_embedding_type="none",
             pg_collection=pg_collection,
-            **kwargs
+            **kwargs,
         )
 
     def forward(self, input_ids, position_ids, attention_mask=None, **kwargs):
