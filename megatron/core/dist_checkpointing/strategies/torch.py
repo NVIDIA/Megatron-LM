@@ -289,13 +289,15 @@ def mcore_to_pyt_state_dict(
                 if sh_ten.allow_shape_mismatch and is_loading:
                     sh_ten.data.zero_()
 
-        is_pre_mcore_014_sh_ten = (
-            sh_tens[0].prepend_axis_num or sh_tens[0].flattened_range is not None
+        # Prepended-axis tensors (e.g. per-expert MoE weights) are eligible for the
+        # checkpointable path as well: each prepended axis has extent one within a local
+        # shard, which DCP metadata can describe directly. Routing them there avoids the
+        # legacy conversion, whose cost grows with the number of fragments across all
+        # logical axes instead of with the number of locally held shards.
+        use_checkpointable_path = is_torch_min_version("2.6a0") and all(
+            sh_ten.flattened_range is None for sh_ten in sh_tens
         )
-        if (
-            not is_pre_mcore_014_sh_ten or not sh_tens[0].has_regular_grid
-        ) and is_torch_min_version("2.6a0"):
-            assert sh_tens[0].flattened_range is None
+        if use_checkpointable_path:
             if len(sh_tens) > 1:
                 return LocalShardsContainer(
                     [CheckpointableShardedTensor.from_sh_ten(sh_ten) for sh_ten in sh_tens]
