@@ -10,13 +10,54 @@ from megatron.core.models.engram.distributed_embedding import EPShardedMultiTabl
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_attention_spec,
 )
+from megatron.core.transformer.hyper_connection import HyperConnectionModule, SinglePassMHCState
 from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     deterministic_algorithms,
     seeded,
 )
 from tests.unit_tests.models.test_deepseek_v41 import groups, tiny_config
+
+
+class _SinglePassBranch(torch.nn.Module):
+    """One residual branch plus final contraction, including parameter gradients."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.mhc = HyperConnectionModule(config, 1)
+
+    def forward(self, hidden, previous):
+        """Recreate transient state on every replay."""
+        state = SinglePassMHCState(previous)
+        branch, residual_mix, output_mix, residual = self.mhc(
+            hidden, mhc_state=state, return_residual=True
+        )
+        output = self.mhc.fused_h_res_h_post_bda(
+            residual_mix, residual, output_mix, (branch, None), 0.0, True, False
+        )
+        return state.contract(output, self.mhc.n)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_single_pass_mhc_replay(groups, fused):
+    seeded()
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=2,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        use_fused_mhc=fused,
+    )
+    module = _SinglePassBranch(config).cuda()
+    inputs = (
+        torch.randn(9, 2, 64, device="cuda", requires_grad=True),
+        torch.randn(9, 2, 4, device="cuda", requires_grad=True),
+    )
+    with deterministic_algorithms(True):
+        assert_module_replays_bit_exact(module, inputs)
 
 
 def test_csa2_module_replay(groups):

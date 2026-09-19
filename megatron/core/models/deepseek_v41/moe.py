@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.transformer.module import mark_keep_in_fp32
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import Router
 
 
@@ -87,3 +88,15 @@ def multimodal_moe_forward(moe, hidden_states, image_mask, padding_mask=None):
     output, bias = moe.routed_experts_compute(dispatched, probs)
     output = moe.combine(output)
     return moe.postprocess(output, shared), bias
+
+
+class ModalityMoELayer(MoELayer):
+    """The normal MoE layer with an explicit per-forward modality input."""
+
+    def forward(self, hidden_states, intermediate_tensors=None, padding_mask=None, image_mask=None):
+        """Dispatch using modality-specific biases without retaining the mask on a module."""
+        if image_mask is None:
+            return super().forward(hidden_states, intermediate_tensors, padding_mask)
+        if intermediate_tensors is not None:
+            raise NotImplementedError("Modality routing requires an unsplit MoE forward")
+        return multimodal_moe_forward(self, hidden_states, image_mask, padding_mask)

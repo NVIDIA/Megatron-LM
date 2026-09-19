@@ -387,10 +387,10 @@ class TransformerConfig(ModelParallelConfig):
     """Attention architecture. V4.1 uses CSA2 with explicit cross-layer sharing."""
 
     csa2_kv_source_layers: list[int] | None = None
-    """Zero-based logical attention layers producing global KV and indexer K."""
+    """Zero-based stack layer indices producing global KV and indexer K."""
 
     csa2_index_source_layers: list[int] | None = None
-    """Zero-based logical attention layers computing new sparse indices."""
+    """Zero-based stack layer indices computing new sparse indices."""
 
     csa2_candidate_source_layer: int | None = None
     """Full layer producing the hierarchical candidate pool; None disables it."""
@@ -1245,6 +1245,12 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     enable_mhc_connections: bool = False
     """Enable mHC residual connections."""
+
+    mhc_single_pass: bool = False
+    """Use the preceding sublayer's input mix and the final mix for output contraction."""
+
+    mhc_epsilon: float = 1e-6
+    """Positive stabilizer for single-pass mHC input and Sinkhorn coefficients."""
 
     mhc_num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
@@ -2396,6 +2402,24 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
                 "recompute_modules with selective recompute to reduce activation memory."
             )
+
+        if self.mhc_single_pass:
+            if self.moe_shortcut_connection:
+                raise NotImplementedError("Single-pass mHC does not yet support shortcut MoE")
+            if self.tensor_model_parallel_size != 1 or self.context_parallel_size != 1:
+                raise NotImplementedError("Single-pass mHC currently requires TP=CP=1")
+            if not self.enable_mhc_connections:
+                raise ValueError("mhc_single_pass requires enable_mhc_connections=True")
+            if type(self.mhc_num_residual_streams) is not int or self.mhc_num_residual_streams < 1:
+                raise ValueError("mhc_num_residual_streams must be a positive integer")
+            if not math.isfinite(self.mhc_epsilon) or self.mhc_epsilon <= 0:
+                raise ValueError("mhc_epsilon must be positive and finite")
+            if self.cuda_graph_impl != "none" or self.mtp_num_layers:
+                raise NotImplementedError("Single-pass mHC does not yet support CUDA graphs or MTP")
+            if self.virtual_pipeline_model_parallel_size or self.sequence_parallel:
+                raise NotImplementedError(
+                    "Single-pass mHC does not yet support VPP or sequence parallelism"
+                )
 
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")

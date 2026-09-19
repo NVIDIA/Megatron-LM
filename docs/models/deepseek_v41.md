@@ -46,6 +46,35 @@ parity tests are by Li Tao. Adapted DeepSeek code carries its MIT notice in
   `select_verification_length` accepts measured verification costs and conditional
   acceptance probabilities; it does not invent a serving-throughput model.
 
+## Shared layers
+
+CSA2 uses the ordinary `HybridModel` / `HybridStack` with the static
+`hybrid_csa2_stack_spec` from `megatron.core.models.hybrid.hybrid_layer_specs`.
+The `V` symbol selects CSA2; it can be composed with dense MLPs (`V-`), experts
+(`VE`), or other supported layers. `CSA2HybridAdapter` owns the forward-local
+sharing lifecycle. It does not replace the stack or own parameters.
+
+Single-pass mHC is independently available through `TransformerConfig` with
+`enable_mhc_connections=True, mhc_single_pass=True`. `HyperConnectionModule`,
+`HyperConnectionHybridLayer`, and `HyperConnectionTransformerLayer` share the
+same `SinglePassMHCState` interface. Ordinary attention/MLP HybridModels can use
+it with `hybrid_stack_spec`, without CSA2 or a DeepSeek model class.
+
+Schedules use **zero-based stack layer indices**, including intervening MLPs
+or experts. For `V-V-V-`, an example is ratios `[2, 0, 2, 0, 2, 0]`, KV sources
+`[0]`, and index sources `[0, 4]`. Non-attention positions have ratio zero.
+`DeepSeekV41Config.from_hf` translates the released logical-block schedule into
+this indexing. `DeepSeekV41Model` composes the conditional components around this standard stack.
+Pass explicit process groups and enable experimental APIs with
+`megatron.core.config.ENABLE_EXPERIMENTAL = True`. Use reduced dimensions for
+initial checks; the released model is large.
+
+The standard training parser exposes `--mhc-single-pass`, `--mhc-epsilon`,
+`--dsv4-version v4.1`, and the `--csa2-*` schedule fields. Select
+`--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_csa2_stack_spec`
+with `pretrain_hybrid.py` and an explicit `--hybrid-layer-pattern`.
+
+
 ## Library use
 
 ```python
@@ -120,6 +149,7 @@ NVIDIA_TF32_OVERRIDE=0 uv run python -m torch.distributed.run \
   tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py \
   tests/unit_tests/transformer/test_single_pass_mhc.py \
   tests/unit_tests/models/test_deepseek_v41.py \
+  tests/unit_tests/models/test_csa2_hybrid.py \
   tests/unit_tests/models/test_deepseek_v41_components.py \
   tests/unit_tests/determinism/kernels/test_deepseek_v41_kernels.py
 
@@ -130,3 +160,12 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
 The strict FP32 attention oracle disables TF32 across both torch and TE to avoid
 comparing different GEMM precision policies. BF16 paths are tested independently.
 See `examples/deepseek_v41/README.md` for the training/performance harness.
+
+
+The backbone and DSpark both use the standard `HybridStack`. The drafter selects
+a static attention spec with explicit context-window and parallel-block inputs;
+its layer loop and single-pass mHC are shared with other models. This refactor
+uses standard split-layer checkpoint keys (for example,
+`decoder.layers.2.inner_layer.self_attention` for logical attention block 1).
+Checkpoints from the earlier bespoke-stack prototype need key conversion before
+loading into this layout.

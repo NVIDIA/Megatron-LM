@@ -198,8 +198,8 @@ def main():
     schedule = get_forward_backward_func()
     rows = []
     probes = {
-        "backbone": raw.decoder.layers[0].attention.linear_q_down_proj.weight,
-        "engram": raw.decoder.layers[config.engram_config.layer_ids[0]]
+        "backbone": raw.decoder.layers[0].inner_layer.self_attention.linear_q_down_proj.weight,
+        "engram": raw.decoder.layers[2 * config.engram_config.layer_ids[0]]
         .engram.embed.tables[0]
         .weight,
         "vision": raw.vision.patch_embed.proj.weight,
@@ -268,7 +268,7 @@ def main():
             median_ms=statistics.median(r["milliseconds"] for r in rows[2:] or rows),
             torch=torch.__version__,
             gpu=torch.cuda.get_device_name(),
-            logical_depth=len(raw.decoder.layers),
+            logical_depth=len(raw.decoder.layers) // 2,
             parameter_updates=updates,
             components=["CSA2", "single-pass mHC", "Engram", "vision", "DSpark"],
         )

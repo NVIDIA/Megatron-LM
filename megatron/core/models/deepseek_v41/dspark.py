@@ -8,16 +8,26 @@ in deepseek-ai/DeepSpec. All inputs shared with the backbone are detached.
 """
 
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.extensions.transformer_engine import TENorm
-from megatron.core.models.deepseek_v41.stack import DeepSeekV41Block, ShardedLayerList
+from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
+from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
+    csa2_attention_spec,
+    csa2_layer_spec,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-from megatron.core.transformer.single_pass_mhc import contract_streams
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 
 
 def _rotate(x, positions, dim, base, inverse=False):
@@ -85,6 +95,110 @@ def draft_attention(attention, draft, context, anchors, block_size):
     return attention.linear_proj(output)[0]
 
 
+class DSparkSelfAttention(DSv4HybridSelfAttention):
+    """Shared DSv4 projections with DSpark's context-window and parallel-block attention."""
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        *,
+        draft_context,
+        draft_anchors,
+        draft_block_size,
+        **kwargs,
+    ):
+        """Use the draft's explicit context without retaining activations on the module."""
+        return (
+            draft_attention(self, hidden_states, draft_context, draft_anchors, draft_block_size),
+            None,
+        )
+
+
+@dataclass
+class DSparkLayerState:
+    """Read-only conditioning inputs shared by the draft layers of one forward."""
+
+    context: torch.Tensor
+    anchors: torch.Tensor
+    block_size: int
+    attention_layer_ids: frozenset[int]
+
+    def attention_kwargs(self, layer_number: int) -> dict:
+        """Only draft attention layers consume the conditioning inputs."""
+        if layer_number - 1 not in self.attention_layer_ids:
+            return {}
+        return {
+            "draft_context": self.context,
+            "draft_anchors": self.anchors,
+            "draft_block_size": self.block_size,
+        }
+
+    def mlp_kwargs(self, layer_number: int) -> dict:
+        """Draft expert layers need no additional inputs."""
+        return {}
+
+
+class DSparkHybridAdapter:
+    """Validate the draft state while reusing the standard stack and mHC loop."""
+
+    def __init__(
+        self,
+        config,
+        *,
+        layer_type_list,
+        pp_layer_offset,
+        pre_process,
+        post_process,
+        is_mtp_layer,
+        pg_collection,
+    ):
+        if not pre_process or not post_process or pp_layer_offset or is_mtp_layer:
+            raise NotImplementedError(
+                "DSpark requires a complete draft stack on one pipeline stage"
+            )
+        self.attention_layer_ids = frozenset(
+            i for i, symbol in enumerate(layer_type_list) if symbol == "+"
+        )
+
+    def prepare_forward(self, hidden_states, packed_seq_params, inference_context, context):
+        """Require explicit per-forward conditioning data and unpacked training inputs."""
+        if packed_seq_params is not None or inference_context is not None:
+            raise NotImplementedError("DSpark currently supports unpacked training")
+        state = context.cross_layer_state
+        if (
+            not isinstance(state, DSparkLayerState)
+            or state.attention_layer_ids != self.attention_layer_ids
+        ):
+            raise ValueError("DSpark requires matching conditioning state in the forward context")
+        return context
+
+    def before_layer(self, layer, hidden_states, context):
+        """No draft-specific residual preprocessing is required."""
+        return hidden_states
+
+    def finalize_forward(self, output, context):
+        """Leave final head normalization to the drafter."""
+        return output
+
+
+_dspark_layer_spec = replace(
+    csa2_layer_spec,
+    submodules=replace(
+        csa2_layer_spec.submodules,
+        self_attention=replace(csa2_attention_spec, module=DSparkSelfAttention),
+    ),
+)
+dspark_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=replace(
+        hybrid_stack_spec.submodules,
+        mla_layer=_dspark_layer_spec,
+        forward_adapter=DSparkHybridAdapter,
+    ),
+)
+
+
 @dataclass
 class DSparkOutput:
     """Teacher-forced draft logits, confidence logits, and next-token supervision."""
@@ -115,7 +229,7 @@ class DSpark(MegatronModule):
         self.noise_token_id = options.noise_token_id
         self.target_layer_ids = tuple(options.target_layer_ids)
         if not self.target_layer_ids or any(
-            i < 0 or i >= len(config.csa_compress_ratios) for i in self.target_layer_ids
+            i < 0 or i >= (config.num_layers // 2) for i in self.target_layer_ids
         ):
             raise ValueError("DSpark target layers must identify existing backbone blocks")
         self.main_proj = nn.Linear(
@@ -126,7 +240,7 @@ class DSpark(MegatronModule):
         )
         self.main_norm = TENorm(config, config.hidden_size, eps=config.layernorm_epsilon)
         draft_config = copy(config)
-        draft_config.num_layers = options.num_layers
+        draft_config.num_layers = 2 * options.num_layers
         draft_config.csa_compress_ratios = [0] * draft_config.num_layers
         draft_config.csa2_kv_source_layers = draft_config.csa2_index_source_layers = []
         draft_config.csa2_candidate_source_layer = None
@@ -134,12 +248,12 @@ class DSpark(MegatronModule):
         draft_config.num_moe_experts = options.n_routed_experts
         draft_config.moe_router_topk = options.num_experts_per_tok
         draft_config.vision_config = None
-        self.layers = ShardedLayerList(
-            (
-                DeepSeekV41Block(draft_config, i, pg_collection)
-                for i in range(draft_config.num_layers)
-            ),
-            pg_collection.tp,
+        self.decoder = build_module(
+            dspark_stack_spec,
+            config=draft_config,
+            pg_collection=pg_collection,
+            layer_config_list=validate_segment_layers("+E" * options.num_layers, draft_config),
+            post_layer_norm=False,
         )
         self.norm = TENorm(config, config.hidden_size, eps=config.layernorm_epsilon)
         rank = options.markov_rank
@@ -174,22 +288,19 @@ class DSpark(MegatronModule):
         noise_ids = torch.full_like(previous_ids, self.noise_token_id)
         noise_ids[..., 0] = previous_ids[..., 0]
         hidden = F.embedding(noise_ids.flatten(1), embedding_weight.detach()).transpose(0, 1)
-        n = self.config.mhc_num_residual_streams
-        hidden = hidden.unsqueeze(-2).expand(*hidden.shape[:-1], n, -1).flatten(-2)
         context = self.main_norm(self.main_proj(features.detach()))
-        previous_mix = None
-        for layer in self.layers:
-            branch, next_mix, post, residual = layer.attention_mhc(hidden, previous_mix)
-            branch = draft_attention(
-                layer.attention, layer.attention_norm(branch), context, anchors, self.block_size
-            )
-            hidden = layer.attention_mhc.combine(branch, hidden, post, residual)
-            branch, previous_mix, post, residual = layer.ffn_mhc(hidden, next_mix)
-            branch, bias = layer.mlp(layer.ffn_norm(branch))
-            if bias is not None:
-                branch = branch + bias
-            hidden = layer.ffn_mhc.combine(branch, hidden, post, residual)
-        hidden = contract_streams(hidden, previous_mix, n)
+        hidden = self.decoder(
+            hidden,
+            attention_mask=None,
+            forward_context=HybridStackForwardContext(
+                cross_layer_state=DSparkLayerState(
+                    context,
+                    anchors,
+                    self.block_size,
+                    self.decoder.forward_adapter.attention_layer_ids,
+                )
+            ),
+        )
         base = F.linear(self.norm(hidden), output_weight.detach()).transpose(0, 1)
         base = base.reshape(batch, num_anchors, self.block_size, -1)
         markov = self.markov_embed(previous_ids)
