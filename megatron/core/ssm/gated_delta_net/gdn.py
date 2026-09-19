@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -66,12 +67,46 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
-
-        if self.config.deterministic_mode:
-            self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
-            self.gated_delta_rule = chunk_gated_delta_rule
         self.chunk_size = 64
+
+        backend = self.config.gdn_kernel_backend
+        if backend is None:
+            # Unset: follow the deterministic-mode contract, mirroring the default where
+            # deterministic mode uses the torch-native kernel and FLA otherwise.
+            backend = "torch" if self.config.deterministic_mode else "fla"
+        if self.config.deterministic_mode and backend != "torch":
+            raise ValueError(
+                "deterministic_mode=True requires gdn_kernel_backend='torch' for " "Gated DeltaNet."
+            )
+
+        if backend == "torch":
+            self.gdn_backend = "torch"
+            self.gated_delta_rule = torch_chunk_gated_delta_rule
+            return
+
+        if backend == "fla":
+            self.gdn_backend = "fla"
+            self.gated_delta_rule = chunk_gated_delta_rule
+            return
+
+        if not HAVE_TE_GDN:
+            raise ImportError(
+                "gdn_kernel_backend='transformer_engine' requires TransformerEngine's "
+                "GatedDeltaNetAttention (GDN) support."
+            )
+
+        # Q/K are expanded to the value-head count by
+        # `_prepare_input_for_gated_delta_rule`, so this DPA instance operates on
+        # the local head shard produced by the TP/CP all-to-all plumbing above.
+        self.gdn_backend = "transformer_engine"
+        num_local_heads = self.num_v_heads_local_tp // self.cp_size
+        self.core_attention = TEGatedDeltaNetAttention(
+            num_attention_heads=num_local_heads,
+            qk_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            layer_number=self.layer_number,
+        )
+        self.gated_delta_rule = self.core_attention
 
     @jit_fuser
     def _compute_gates(
