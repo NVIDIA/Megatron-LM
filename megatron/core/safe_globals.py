@@ -4,6 +4,7 @@ import io
 import pickle
 import threading
 from argparse import Namespace
+from collections import defaultdict
 from io import BytesIO
 from pathlib import PosixPath
 from signal import Signals
@@ -27,6 +28,10 @@ from megatron.core.transformer.enums import (
 )
 
 SAFE_GLOBALS = [
+    # Legacy optimizer checkpoints serialize optimizer.state as defaultdict(dict),
+    # requiring both the container and its default factory for weights-only loads.
+    dict,
+    defaultdict,
     SimpleNamespace,
     PosixPath,
     _reconstruct,
@@ -45,6 +50,9 @@ SAFE_GLOBALS = [
     RerunState,
     BytesIO,
     Signals,
+    torch.optim.Adam,
+    torch.optim.AdamW,
+    torch.optim.SGD,
     torch._C.Generator,  # Needed for torch ckpt format loading after weights_only default change
 ]
 
