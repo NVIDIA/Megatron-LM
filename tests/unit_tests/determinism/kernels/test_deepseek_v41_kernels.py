@@ -3,6 +3,9 @@
 import pytest
 import torch
 
+from megatron.core.transformer.experimental_attention_variant import (
+    deepseek_v4_hybrid_attention as dsv4_attention,
+)
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_attention_spec,
 )
@@ -56,7 +59,13 @@ def test_single_pass_mhc_replay(groups, fused):
         assert_module_replays_bit_exact(module, inputs)
 
 
-def test_csa2_module_replay(groups):
+def test_csa2_module_replay(groups, monkeypatch):
+    """Replay the shared DSv4 projection path with V4.1's weightless query norm disabled."""
+
+    def unexpected_query_norm(*args, **kwargs):
+        pytest.fail("V4.1 must not apply the V4 per-head query RMS normalization")
+
+    monkeypatch.setattr(dsv4_attention, "_q_rms_norm", unexpected_query_norm)
     seeded()
     config = tiny_config(
         num_layers=1,
