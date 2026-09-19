@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.config import (
     CheckpointConfig,
@@ -274,6 +274,38 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | None:
+    """Build the optional nested wide-residual config from flat training arguments."""
+
+    num_streams = getattr(args, 'wide_residual_num_streams', None)
+    control_defaults = {
+        'wide_residual_streamwise_sigmoid_init_scale': 0.01,
+        'wide_residual_learned_retention': False,
+        'wide_residual_retention_init': 0.999,
+        'wide_residual_retention_max_forget': 0.10,
+    }
+    if num_streams is None:
+        nondefault_controls = [
+            name
+            for name, default in control_defaults.items()
+            if getattr(args, name, default) != default
+        ]
+        if nondefault_controls:
+            options = ', '.join('--' + name.replace('_', '-') for name in nondefault_controls)
+            raise ValueError(f'{options} require --wide-residual.')
+        return None
+
+    return WideResidualConfig(
+        num_streams=num_streams,
+        streamwise_sigmoid_init_scale=getattr(
+            args, 'wide_residual_streamwise_sigmoid_init_scale', 0.01
+        ),
+        learned_retention=getattr(args, 'wide_residual_learned_retention', False),
+        retention_init=getattr(args, 'wide_residual_retention_init', 0.999),
+        retention_max_forget=getattr(args, 'wide_residual_retention_max_forget', 0.10),
+    )
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -364,6 +396,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
 
     kw_args['moe_latent_size'] = args.moe_latent_size
+
+    wide_residual = _wide_residual_config_from_args(args)
+    if wide_residual is not None or 'wide_residual' not in kw_args:
+        kw_args['wide_residual'] = wide_residual
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
