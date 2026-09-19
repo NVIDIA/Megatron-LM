@@ -1,21 +1,25 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
-import warnings
 import logging
+import warnings
 from copy import deepcopy
 
 import torch
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
-from layer_specs import (get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te,
-                         get_hybrid_layer_spec_te)
+from layer_specs import (
+    get_hybrid_layer_spec_te,
+    get_layer_spec,
+    get_layer_spec_te,
+    get_mlp_module_spec,
+    get_norm_mlp_module_spec_te,
+)
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
-from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.transformer.spec_utils import import_module
+from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.utils import log_single_rank
-
 
 
 def model_provider(
@@ -54,17 +58,24 @@ def model_provider(
             max_num_image_embeddings //= 4
             num_image_embeddings //= 4
     else:
+        temporal_patch_dim = getattr(args, 'video_temporal_patch_size', 1)
+        if temporal_patch_dim != 1:
+            raise NotImplementedError(
+                "Temporal compression currently requires --dynamic-resolution. "
+                f"Found --video-temporal-patch-size={temporal_patch_dim}."
+            )
+
         num_image_embeddings = get_num_image_embeddings(
-            args.img_h,
-            args.img_w,
-            args.patch_dim,
-            args.vision_model_type,
-            args.disable_vision_class_token,
-            1,
-            args.pixel_shuffle,
-            args.use_tile_tags,
-            args.max_num_tiles,
-            args.tokenizer_prompt_format
+            img_h=args.img_h,
+            img_w=args.img_w,
+            patch_dim=args.patch_dim,
+            vision_model_type=args.vision_model_type,
+            disable_vision_class_token=args.disable_vision_class_token,
+            class_token_len=getattr(args, 'class_token_len', None) or 1,
+            pixel_shuffle=args.pixel_shuffle,
+            use_tile_tags=args.use_tile_tags,
+            max_num_tiles=args.max_num_tiles,
+            tokenizer_type=args.tokenizer_prompt_format,
         )
         old_seq_length = args.seq_length
         args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -95,10 +106,18 @@ def model_provider(
     base_config = config or core_transformer_config_from_args(get_args())
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
-    base_config.calculate_per_token_loss = True
+    base_config.calculate_per_token_loss = not getattr(args, "no_calculate_per_token_loss", False)
+
+    if getattr(args, "no_calculate_per_token_loss", False):
+        assert not args.use_loss_scaling, (
+            "--no-calculate-per-token-loss and --use-loss-scaling cannot be used together"
+        )
 
     language_config = deepcopy(base_config)
-    language_config = get_language_model_config(language_config)
+    language_config = get_language_model_config(
+        language_config,
+        enable_fusions=args.enable_fusions,
+    )
 
     if language_model_type.startswith("hf://"):
         assert args.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
@@ -113,7 +132,9 @@ def model_provider(
         padding = args.context_parallel_size > 1 and args.sequence_parallel
         if args.spec is not None:
             language_transformer_layer_spec = import_module(args.spec)
-        elif args.language_model_type.startswith(('nemotron5-hybrid', 'nemotron6-moe')):
+        elif args.language_model_type.startswith(
+            ('nemotron5-hybrid', 'nemotron6-moe', 'nemotron6-super')
+        ):
             language_transformer_layer_spec = get_hybrid_layer_spec_te(
                 config=language_config, padding=padding
             )
@@ -134,7 +155,7 @@ def model_provider(
         )
 
     vision_config = deepcopy(base_config)
-    vision_config = get_vision_model_config(vision_config)
+    vision_config = get_vision_model_config(vision_config, enable_fusions=args.enable_fusions)
     # Most ViT checkpoints use bias in linear layers; override --disable-bias-linear.
     # Pixtral (both sizes) uses no bias — config.py already sets add_bias_linear=False.
     if vision_model_type not in ("pixtral-vit", "pixtral-vit-large"):
@@ -181,7 +202,9 @@ def model_provider(
     vision_projection_config = deepcopy(base_config)
 
     vision_projection_config = get_vision_projection_config(
-        vision_projection_config, language_config.hidden_size
+        vision_projection_config,
+        language_config.hidden_size,
+        enable_fusions=args.enable_fusions,
     )
 
     # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
@@ -189,28 +212,37 @@ def model_provider(
     vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
 
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
-    vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
+    vision_config.num_layers_in_first_pipeline_stage = None
+    vision_config.num_layers_in_last_pipeline_stage = None
 
-    # ``get_*_module_spec_te`` returns ``functools.partial(MLP.as_mlp_submodule,
-    # submodules=...)`` (see PR #3435). Pull the submodules out of the partial's
-    # bound kwargs so the vision projection sees an ``MLPSubmodules`` value.
+    # The projector consumes the MLP submodules rather than the enclosing ModuleSpec.
     if vision_projection_config.normalization:
-        vision_projection_layer_spec = get_norm_mlp_module_spec_te().keywords["submodules"]
+        vision_projection_layer_spec = get_norm_mlp_module_spec_te().submodules
     else:
-        vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).keywords["submodules"]
+        vision_projection_layer_spec = get_mlp_module_spec(use_te=use_te).submodules
 
     # Toggle --recompute* for the vision and language model separately.
     if args.recompute_vision:
-        if vision_config.recompute_method is not None and vision_config.recompute_granularity is not None:
-            vision_config.recompute_num_layers = vision_config.num_layers
+        vision_config.recompute_num_layers = (
+            args.recompute_vision_num_layers
+            if args.recompute_vision_num_layers > 0
+            else vision_config.num_layers
+        )
+        if args.recompute_granularity_vision is not None:
+            vision_config.recompute_granularity = args.recompute_granularity_vision
+        if args.recompute_method_vision is not None:
+            vision_config.recompute_method = args.recompute_method_vision
     else:
         vision_config.recompute_granularity = None
         vision_config.recompute_method = None
         vision_config.recompute_num_layers = None
 
-    vision_projection_config.recompute_granularity = None
-    vision_projection_config.recompute_method = None
-    vision_projection_config.recompute_num_layers = None
+    if args.recompute_vision_projection:
+        vision_projection_config.recompute_granularity = "full"
+    else:
+        vision_projection_config.recompute_granularity = None
+        vision_projection_config.recompute_method = None
+        vision_projection_config.recompute_num_layers = None
 
     # TODO: Vision model and projection do not use SP/CP yet.
     vision_config.sequence_parallel = False
@@ -222,8 +254,7 @@ def model_provider(
     vision_projection_config.tp_comm_overlap = False
 
     tokenizer = get_tokenizer()
-    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
-    assert image_token_index is not None, f"IMAGE_TOKEN={IMAGE_TOKEN} needs to be added using the --special-tokens arg."
+    image_token_index = tokenizer.image_token_index
 
     tile_tags = _get_tile_tags(args, tokenizer)
 
@@ -239,6 +270,7 @@ def model_provider(
         vision_projection_layer_spec=vision_projection_layer_spec,
         vision_projection_type=args.vision_projection_type,
         allow_missing_vision_projection_checkpoint=args.allow_missing_vision_projection_checkpoint,
+        allow_llm_only_checkpoint=args.allow_llm_only_checkpoint,
         parallel_output=parallel_output,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         language_position_embedding_type=args.position_embedding_type,
@@ -269,6 +301,18 @@ def model_provider(
         radio_interpolate_only_cpe=getattr(args, "radio_interpolate_only_cpe", False),
         radio_cpe_aspect_ratio_select=getattr(args, "radio_cpe_aspect_ratio_select", False),
         radio_disable_cpe=getattr(args, "radio_disable_cpe", False),
+        use_loss_scaling=args.use_loss_scaling,
+        temporal_patch_dim=getattr(args, "video_temporal_patch_size", 1),
+        separate_video_embedder=getattr(args, "separate_video_embedder", False),
+        temporal_ckpt_compat=getattr(
+            args, "allow_checkpoint_without_temporal_compression", False
+        ),
+        balance_vision_context_parallel_by_tokens=getattr(
+            args, "balance_vision_context_parallel_by_tokens", False
+        ),
+        profile_vision_context_parallel_partition=getattr(
+            args, "profile_vision_context_parallel_partition", False
+        ),
         vp_stage=vp_stage,
         pg_collection=pg_collection,
     )
@@ -276,7 +320,8 @@ def model_provider(
     model.freeze(
         freeze_language_model=args.freeze_LM,
         freeze_vision_model=args.freeze_ViT,
-        freeze_vision_projection=False,
+        freeze_vision_projection=args.freeze_vision_projection,
+        unfreeze_router=args.unfreeze_router,
     )
 
     return model
