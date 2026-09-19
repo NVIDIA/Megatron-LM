@@ -4239,6 +4239,7 @@ def save_checkpoint_and_time(
         ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
         tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
         pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
+        cp_group = getattr(ckpt_pgc, "cp", None) if ckpt_pgc is not None else None
         dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
         # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
         dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
@@ -4275,6 +4276,7 @@ def save_checkpoint_and_time(
                 dp_gtp_remat_group=dp_gtp_remat_group,
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
+                cp_group=cp_group,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
