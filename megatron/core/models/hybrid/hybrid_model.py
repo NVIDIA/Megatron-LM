@@ -29,6 +29,7 @@ from megatron.core.transformer.chunk_cuda_graph import (
     build_postprocess_block,
 )
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -233,6 +234,23 @@ def _postprocess_after_decoder(
             # then back to [S', B, H] for the output layer.
             reshaped = hidden_states.squeeze(1).unsqueeze(0)
             hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+    if (
+        labels is not None
+        and not in_inference_mode
+        and model.config.cross_entropy_loss_fusion
+        and model.config.cross_entropy_fusion_impl == "linear"
+    ):
+        # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
+        # materialised, so the loss comes straight out of the output layer. muP logit scaling
+        # does not apply on this path, as in GPTModel.
+        return model.output_layer(
+            hidden_states,
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            output_cross_entropy_loss=True,
+            labels=labels,
+        )
 
     logits, _ = model.output_layer(
         hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
@@ -584,9 +602,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             self._setup_mtp_cuda_graphs()
 
-        # Output
+        # Output. LinearCrossEntropyModule is a ColumnParallelLinear that can also fuse the LM head
+        # with the cross-entropy loss (`--cross-entropy-fusion-impl linear`), as in GPTModel.
         if post_process or self.mtp_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            self.output_layer = LinearCrossEntropyModule(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
