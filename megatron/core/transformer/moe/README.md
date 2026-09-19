@@ -370,7 +370,7 @@ A new output-discarding checkpointing method is also supported. This method disc
 * `moe_act`: Recompute the GroupedMLP activation function.
 * `layernorm`: Recompute the input_layernorm and pre_mlp_layernorm (when they are not `IdentityOp`).
 * `mla_up_proj`: Recompute the MLA up projection and RoPE applying parts.
-* `core_attn`: Recompute the core attention submodule (uses standard checkpointing rather than output-discarding).
+* `core_attn`: Recompute the core attention submodule (uses output-discarding checkpointing).
 * `mlp`: Recompute the dense MLP submodule (uses standard checkpointing rather than output-discarding) which is useful for hybrid-models like DeepSeek-V3.
 * `moe`: Recompute the MoE layer submodule (uses standard checkpointing rather than output-discarding).
 
