@@ -4,7 +4,6 @@
 
 from dataclasses import replace
 
-import torch
 from torch import nn
 
 from megatron.core.extensions.transformer_engine import TENorm
