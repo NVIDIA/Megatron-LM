@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import warnings
 from unittest.mock import MagicMock, patch
 
@@ -188,9 +189,10 @@ class _SaveOutputForBackward(torch.autograd.Function):
         return saved_output
 
 
-def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleaving=False):
+def _test_fused_mla_rope_inplace(
+    input_format, inverse=False, remove_interleaving=False, num_heads=32
+):
     assert fused_mla_rope_inplace is not None
-    num_heads = 32
     q_dim = 128
     emb_dim = 64
     dtype = torch.bfloat16
@@ -284,9 +286,8 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
     )
 
 
-def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
+def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False, num_heads=32):
     assert fused_mla_rope_kv_split is not None
-    num_heads = 32
     k_dim = 128
     v_dim = 128
     emb_dim = 64
@@ -606,3 +607,89 @@ class TestApplyRotaryPosEmbMlaFusionConflict:
             call_kw = unfused_spy.call_args[1]
             assert call_kw["mla_rotary_interleaved"] is True
         assert out.shape == t.shape
+
+
+@contextlib.contextmanager
+def _pin_block_h(block_h):
+    """Pin the autotuned ``BLOCK_H`` so a chosen head tiling is exercised deterministically."""
+    import triton
+
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as rope_kernels
+
+    kernel_names = (
+        "_mla_rope_fwd_inplace_kernel",
+        "_mla_rope_bwd_inplace_kernel",
+        "_mla_rope_fwd_kv_split_kernel",
+        "_mla_rope_bwd_kv_split_kernel",
+    )
+    saved = {}
+    for name in kernel_names:
+        kernel = getattr(rope_kernels, name)
+        saved[name] = (kernel.configs, dict(kernel.cache))
+        kernel.configs = [triton.Config({"BLOCK_H": block_h})]
+        kernel.cache.clear()
+    try:
+        yield
+    finally:
+        for name in kernel_names:
+            kernel = getattr(rope_kernels, name)
+            configs, cache = saved[name]
+            kernel.configs = configs
+            kernel.cache.clear()
+            kernel.cache.update(cache)
+
+
+def _test_inplace_stays_inside_allocation(num_heads, block_h):
+    assert fused_mla_rope_inplace is not None
+    nope_dim = 128
+    emb_dim = 64
+    seqlen = 64
+    batch_size = 1
+    dtype = torch.bfloat16
+    sentinel = -1.0
+
+    # Add a guard region after the input to detect writes past the final head, sized to the
+    # farthest a phantom lane in the last (partial) head tile can reach.
+    numel = seqlen * batch_size * num_heads * (nope_dim + emb_dim)
+    padded_heads = (num_heads + block_h - 1) // block_h * block_h
+    guard_numel = (padded_heads - num_heads) * (nope_dim + emb_dim)
+    storage = torch.full((numel + guard_numel,), sentinel, dtype=dtype, device='cuda')
+    fwd_input = storage[:numel].view(seqlen, batch_size, num_heads, nope_dim + emb_dim)
+    fwd_input.normal_()
+
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    freqs, mscale = yarn_rope(seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    with _pin_block_h(block_h):
+        fused_mla_rope_inplace(fwd_input, cos, sin, nope_dim, emb_dim)
+    torch.cuda.synchronize()
+
+    clobbered = int((storage[numel:] != sentinel).sum().item())
+    assert clobbered == 0, (
+        f"{clobbered} element(s) written past the end of a "
+        f"[{seqlen}, {batch_size}, {num_heads}, {nope_dim + emb_dim}] tensor "
+        f"with BLOCK_H={block_h}"
+    )
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestFusedMLARopePartialHeadBlock:
+    """Test partial head tiles, e.g. 12 heads with BLOCK_H=8."""
+
+    @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+    def test_inplace_forward_backward(self, input_format):
+        with _pin_block_h(8):
+            _test_fused_mla_rope_inplace(input_format, num_heads=12)
+
+    @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+    def test_kv_split_forward_backward(self, input_format):
+        with _pin_block_h(8):
+            _test_fused_mla_rope_kv_split(input_format, num_heads=12)
+
+    def test_inplace_does_not_write_past_allocation(self):
+        _test_inplace_stays_inside_allocation(num_heads=12, block_h=8)
