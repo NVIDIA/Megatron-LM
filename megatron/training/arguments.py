@@ -3722,7 +3722,7 @@ def _add_experimental_attention_variant_args(parser):
         default=None,
         help='Per-layer compress ratios for compressed sparse attention. '
              'Accepts a Python list expression such as "[0,0,4,128,4,128]" or '
-             '"([0]+[4,128]*2)*3". Valid values are 0, 4, and 128, and the '
+             '"([0]+[4,128]*2)*3". V4 accepts 0, 4, and 128; V4.1 accepts 0, 1, and 2. The '
              'decoder uses the first num-layers entries. MTP layers use the tail; '
              'HybridModel patterns need one tail entry per inner MTP layer.',
     )
@@ -3792,7 +3792,7 @@ def _add_experimental_args(parser):
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+                       '* (attention), D (dsa), V (CSA2), - (mlp), E (moe). Use | to define pipeline '
                        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
                        'Use / to separate MTP patterns. '
                        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
