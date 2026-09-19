@@ -691,6 +691,10 @@ class HybridStack(MegatronModule):
                             layer_config, layer.layer_number - 1
                         )
                         with inner_quant_context:
+                            if self.forward_adapter is not None:
+                                hidden_states = self.forward_adapter.before_layer(
+                                    layer, hidden_states, forward_context
+                                )
                             if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
                                     hidden_states=hidden_states,

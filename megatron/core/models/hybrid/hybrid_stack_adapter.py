@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from torch import Tensor
+from torch.nn import Module
 
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -36,6 +37,12 @@ class HybridStackForwardAdapter(Protocol):
         context: HybridStackForwardContext,
     ) -> HybridStackForwardContext:
         """Initialize or validate the caller's per-forward state before the layer loop."""
+        ...
+
+    def before_layer(
+        self, layer: Module, hidden_states: Tensor, context: HybridStackForwardContext
+    ) -> Tensor:
+        """Apply a layer-owned input extension before executing the residual branch."""
         ...
 
     def finalize_forward(

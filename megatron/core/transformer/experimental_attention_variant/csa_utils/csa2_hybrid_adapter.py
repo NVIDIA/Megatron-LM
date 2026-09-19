@@ -46,6 +46,10 @@ class CSA2HybridAdapter:
             raise TypeError("CSA2 layers require CSA2State in the forward context")
         return context
 
+    def before_layer(self, layer, hidden_states, context):
+        """CSA2 itself requires no residual preprocessing."""
+        return hidden_states
+
     def finalize_forward(self, output, context: HybridStackForwardContext):
         """Keep the ordinary HybridStack output contract."""
         return output
