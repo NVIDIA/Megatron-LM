@@ -410,6 +410,13 @@ it** — a different collective over a different process group, so enable either
   via the `DistributedWeight.grad_buffer` protocol, Megatron-native linears via an `out=` matmul
   (when the wgrad dtype matches `main_grad`). The untied embedding's wgrad is materialized by
   `F.embedding`'s own backward and pays one copy into the buffer.
+- **The pool never shrinks**, so it is permanently sized by the *peak* number of send buffers live
+  at once. A weight with several backwards per iteration (MTP's repeated block) can reach its next
+  wgrad while its previous send is still in flight, which would raise that peak for good — every
+  buffer the pool holds is live at the peak, whatever its size. Instead `get_wgrad_tensor` waits
+  out its own reduce-scatter and reuses the buffer, giving up one overlap to avoid a permanent
+  allocation. The wait is skipped under CUDA-graph capture, where the branch would bake into the
+  graph.
 - **FP32-accumulation interplay.** A registered pool takes precedence over §2.6 on its group:
   NVLS symmetric reduce-scatters accumulate in fp32 in-switch (NCCL's `multimem.ld_reduce` uses
   `.acc::f32` for bf16), so the group keeps the symmetric reduce-scatter and the fp32-accum
