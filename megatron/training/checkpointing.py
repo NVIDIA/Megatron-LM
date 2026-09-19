@@ -206,11 +206,18 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
-    _compare('experimental_attention_variant', default=None)
-    _compare('dsa_indexer_mode', default='standard')
-    _compare('dsa_indexer_n_heads', default=None)
-    _compare('dsa_indexer_head_dim', default=None)
-    _compare('dsa_indexer_topk', default=None)
+    # --dsa-reset-indexer-on-load exists to convert a checkpoint that has no indexer
+    # into a DSA run, re-initialising the indexer from the loaded weights. A dense
+    # checkpoint records experimental_attention_variant=None and no dsa_indexer_*
+    # values, so comparing them against the runtime's would reject exactly the
+    # conversion the flag requests. The indexer is being rebuilt, not resumed, so
+    # its geometry is not required to match. Every non-indexer comparison still runs.
+    if not getattr(args, 'dsa_reset_indexer_on_load', False):
+        _compare('experimental_attention_variant', default=None)
+        _compare('dsa_indexer_mode', default='standard')
+        _compare('dsa_indexer_n_heads', default=None)
+        _compare('dsa_indexer_head_dim', default=None)
+        _compare('dsa_indexer_topk', default=None)
     if not getattr(args, 'no_load_optim', False) and not getattr(args, 'finetune', False):
         def _dsa_trainability_mode(namespace):
             if getattr(namespace, 'dsa_train_indexer_only', False):
