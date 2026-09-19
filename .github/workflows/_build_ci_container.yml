@@ -287,7 +287,7 @@ jobs:
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Login to ECR
-        if: inputs.is-maintainer
+        if: inputs.is-maintainer && matrix.cloud == 'aws-h100'
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
         env:
           AWS_REGION: ${{ matrix.cloud == 'gb-gpu' && 'us-east-2' || 'us-east-1' }}
