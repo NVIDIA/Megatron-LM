@@ -108,6 +108,64 @@ def test_selected_id_qsa_rejects_empty_and_duplicate_complete_block_routes():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_selected_id_qsa_accepts_noncontiguous_invalid_slots():
+    """Padding holes and the p=R-1/R boundary preserve the same exact mask."""
+    ids, positions, mask = _routes([[17, 28]], topk=3, ratio=4, seed=73)
+    generator = torch.Generator().manual_seed(79)
+    shuffled = ids.clone()
+    for row in range(ids.shape[1]):
+        order = torch.randperm(ids.shape[-1], generator=generator).to(ids.device)
+        shuffled[0, row] = ids[0, row, order]
+    assert (shuffled[0, 3] >= 0).sum() == 1
+    assert (shuffled[0, 4] >= 0).sum() == 1
+    torch.manual_seed(83)
+    q = torch.randn(1, 4, 45, 32, device="cuda", requires_grad=True)
+    k = torch.randn(1, 2, 45, 32, device="cuda", requires_grad=True)
+    v = torch.randn(1, 2, 45, 32, device="cuda", requires_grad=True)
+    out = qsa_sparse_attention_id(q, k, v, shuffled, positions, validate=True)
+    rq, rk, rv = (x.detach().clone().requires_grad_() for x in (q, k, v))
+    expected = _dense_reference(rq, rk, rv, mask, 32**-0.5)
+    torch.testing.assert_close(out, expected, atol=3e-4, rtol=3e-4)
+    grad = torch.randn_like(out)
+    for actual, reference in zip(
+        torch.autograd.grad(out, (q, k, v), grad), torch.autograd.grad(expected, (rq, rk, rv), grad)
+    ):
+        torch.testing.assert_close(actual, reference, atol=5e-4, rtol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_selected_id_qsa_released_geometry_sparse_row_matches_dense_gradients():
+    """BF16 D256, 24Q/2KV, K512 and S>2051 exercise real QSA sparse rows."""
+    seq_len, ratio, topk, dim = 2064, 4, 512, 256
+    positions = torch.arange(seq_len, device="cuda", dtype=torch.int32).unsqueeze(0)
+    visible = (positions + 1) // ratio
+    slot = torch.arange(topk, device="cuda", dtype=torch.int32)
+    candidate = visible.unsqueeze(-1) - slot - 1
+    ids = torch.where(candidate >= 0, candidate, -1).contiguous()
+    assert int(ids[0, -1, topk - 1]) > 0
+    keys = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+    complete = (keys[None, None, :] // ratio >= visible.unsqueeze(-1) - topk) & (
+        keys[None, None, :] // ratio < visible.unsqueeze(-1)
+    )
+    tail = keys[None, None, :] >= visible.unsqueeze(-1) * ratio
+    causal = keys[None, None, :] <= positions.unsqueeze(-1)
+    mask = (complete | tail) & causal
+    torch.manual_seed(89)
+    q = torch.randn(1, 24, seq_len, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 2, seq_len, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 2, seq_len, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    out = qsa_sparse_attention_id(q, k, v, ids, positions, ratio=ratio, validate=True)
+    rq, rk, rv = (x.detach().clone().requires_grad_() for x in (q, k, v))
+    expected = _dense_reference(rq, rk, rv, mask, dim**-0.5)
+    torch.testing.assert_close(out.float(), expected.float(), atol=7e-2, rtol=7e-2)
+    grad = torch.randn_like(out)
+    for actual, reference in zip(
+        torch.autograd.grad(out, (q, k, v), grad), torch.autograd.grad(expected, (rq, rk, rv), grad)
+    ):
+        torch.testing.assert_close(actual.float(), reference.float(), atol=8e-2, rtol=8e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_selected_id_qsa_finite_difference():
     ids, positions, _ = _routes([[8]], topk=2, ratio=4, seed=5)
     torch.manual_seed(47)

@@ -1,11 +1,90 @@
 # QSA selected-ID sparse kernel: isolated prototype
 
-This branch contains a standalone Triton forward/backward kernel for QSA
-core attention. It consumes a compact list of document-relative selected
-complete-block IDs per query and includes the last incomplete block directly.
-It is **not connected to `qsa.py` or Relax training**, and no 256K attention
-or RL step has been run. Keep it isolated until the indexer output contract,
-CP reconstruction, packed layouts, and real-model training are reviewed.
+This branch contains a Triton forward/backward kernel for QSA core attention.
+It consumes compact document-relative selected complete-block IDs and includes
+the last incomplete block directly. It is now connected to `qsa.py` through
+the **default-off** `id_sparse` backend. A synthetic single-QSA-layer 256K
+forward/backward has run; Relax training and full-model 256K have not.
+Keep this branch isolated until real-model training and long-CP behavior are
+reviewed.
+
+## Current integration and scale gates (2026-09-20)
+
+The `QSAIndexer` emits IDs directly when `id_sparse` is selected, without
+first materializing a bitset. The default Flex and explicit dense-masked
+paths still emit bits. Packed THD uses document-relative positions; CP2
+reconstructs full hidden, selected IDs and Q/K/V in causal order, performs a
+differentiable K/V gather, and splits output back to local zigzag order.
+
+On two H800 ranks, BF16 `Hq=24, Hkv=2, D=256, K=512, R=4, S=2064`, with
+packed documents of 2056 and 8 tokens and per-token synthetic mRoPE64,
+both dense-masked and ID paths completed forward/backward. The first document
+has 514 complete blocks, so selection is genuinely sparse. With identical
+weights, inputs and a rank-0-only loss, CP2 reconstructed outputs were
+bit-equal to CP1 for both backends. CP2 reconstructed hidden gradients differed
+from CP1 by at most 0.001953 (dense) and 0.0078125 (ID); the sum of the two
+CP2 QKV-weight gradients differed from CP1 by relative L2 0.001917 (dense)
+and 0.001916 (ID), with no element outside `0.08 + 0.08*|reference|`.
+Rank 1 had zero upstream gradient, zero Q/gate weight gradients and nonzero
+K/V gradients, confirming the remote K/V path. Recomputing the whole QSA
+attention call with `torch.utils.checkpoint(..., use_reentrant=False)` also
+passed on both ranks. This is a single-layer model-path gate, not a trained VL
+model or a TP4/EP8 gate.
+
+For the same synthetic packed single-document layer on one H800, measured
+one-shot times and PyTorch CUDA peak memory were:
+
+| Tokens | Route seconds | Forward seconds | Backward seconds | Peak allocated GiB | Peak reserved GiB |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16,384 | 0.499 | 2.183 | 1.561 | 2.318 | 3.193 |
+| 65,536 | 0.662 | 3.167 | 5.887 | 8.782 | 12.107 |
+| 262,144 | 2.236 | 8.829 | 27.131 | 34.648 | 48.027 |
+
+All three runs had finite outputs and hidden gradients. The route tensor at
+256K is `[262144,512]` int32, exactly 512 MiB. These times are single runs
+with an uncontrolled Triton compilation/cache state, not throughput or
+production training measurements. The script allocates the model and inputs
+before resetting peak statistics; `initial_allocated_gib` in each log records
+that baseline. Run it with:
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=1 QSA_BENCH_SEQ_LEN=262144 \
+  python tests/unit_tests/transformer/experimental_attention_variant/bench_qsa_id_layer.py
+```
+
+The 256K run repeated with this script: route 2.227 s, forward 7.015 s,
+backward 26.280 s, peak allocated 34.648 GiB and reserved 48.027 GiB.
+All four parameter-gradient tensors present were finite and nonzero. The
+three indexer parameters had no gradient, consistent with the current
+no-grad discrete selection and frozen-indexer RL recipe; this is a
+training-objective gap, not evidence that the indexer trains.
+
+The CP1/CP2 comparison is reproducible through `QSA_CP_SAVE_DIR`: run the
+`cp1_real` test on one GPU, `cp2_real` under two-rank torchrun, then run
+`saved_real_geometry_parity` with the same directory. The latter checks the
+QKV weight SHA, both complete outputs and hidden gradients, and the summed
+CP2 weight gradient. Each saved run uses fixed model/data seeds.
+
+```bash
+QSA_CP_SAVE_DIR=/tmp/qsa-cp-parity CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. \
+  python -m pytest -q tests/unit_tests/transformer/experimental_attention_variant/test_qsa_id_cp.py \
+  -k cp1_real --override-ini addopts=''
+QSA_CP_SAVE_DIR=/tmp/qsa-cp-parity CUDA_VISIBLE_DEVICES=1,0 PYTHONPATH=. \
+  python -m torch.distributed.run --standalone --nproc-per-node=2 --module pytest -q \
+  tests/unit_tests/transformer/experimental_attention_variant/test_qsa_id_cp.py \
+  -k cp2_real --override-ini addopts=''
+QSA_CP_SAVE_DIR=/tmp/qsa-cp-parity PYTHONPATH=. python -m pytest -q \
+  tests/unit_tests/transformer/experimental_attention_variant/test_qsa_id_cp.py \
+  -k saved_real_geometry_parity --override-ini addopts=''
+```
+
+The 256K measurement is limited to **one QSA layer, CP1, one document**, with
+synthetic mRoPE. The current CP path still reconstructs full S activations on
+each rank, and `_pool_keys` allocates `[n_docs,max_doc_blocks,D]`, which can
+approach quadratic memory for mixed long/short packed documents. Indexer
+routes are discrete/no-grad: the RL recipe still freezes the indexer; training
+it needs a separately reviewed sparse-KL auxiliary objective. Full 8L VL
+training, long CP, optimizer/checkpoint and Relax RL gates remain open.
 
 ## Kernel contract
 
@@ -79,39 +158,32 @@ PYTHONPATH=.:tests/unit_tests/transformer/experimental_attention_variant \
 | 8,192 | 128 | strided | 36.4 | 40.12 | 16 |
 | 16,384 | 128 | strided | 74.2 | 80.25 | 32 |
 
-At 256K, the selected-ID input alone is exactly 512 MiB for one batch row
-with 512 int32 IDs per token. Multiplying the 16K D128 measured values by
-16 gives roughly 1.19 seconds and 1.25 GiB extra memory, **only as a naive
-linear arithmetic projection**. It is not a bound or a measured 256K result:
-cache behavior, atomic contention, actual model heads/dimensions,
-indexer scoring/top-k, CP gathering, activation storage, optimizer state,
-and RL orchestration can dominate or change scaling. The current QSA
-indexer emits a bitset, not IDs; at 256K that bitset itself is about 2 GiB
-per batch row, so this kernel alone does not unlock 256K training.
+The historical standalone-kernel estimate from 16K D128 was roughly 1.19
+seconds and 1.25 GiB of extra memory at 256K. The integrated D256/Hq24 layer
+measurement above supersedes that projection; its much larger activation
+cost shows why the standalone estimate cannot represent model training.
 
 ## Integration boundary and next gate
 
-The current `qsa.py` `_select_blocks` already obtains compact `top.indices`
-and `valid` for each tiled query batch, then scatters them to `selected_bits`.
-The narrow producer change is to retain those int32 IDs with `-1` invalid
-slots and preserve the existing bitset only for Flex/dense fallbacks. Avoid
+`qsa.py` `_select_blocks` obtains compact `top.indices` and `valid` for each
+tiled query batch. The opt-in producer retains those int32 IDs with `-1`
+invalid slots; the default Flex/dense paths still scatter a bitset. Avoid
 unpacking a 256K bitset into a token-by-block or token-by-token matrix.
-The new kernel must receive the same full-sequence selection and full Q/K/V
-order after CP zigzag reconstruction; `QSACoreAttention.forward` already
+The new kernel receives the same full-sequence selection and full Q/K/V
+order after CP zigzag reconstruction; `QSACoreAttention.forward`
 gathers differentiable full K/V and splits output back to CP-local tokens.
-Packed THD should map to `[1,H,S,D]` and use document-relative `positions`.
+Packed THD maps to `[1,H,S,D]` and uses document-relative `positions`.
 
-The CPU probe below checks that retained IDs reproduce the current bitset
-and exact mask for packed/unpacked layouts, including short documents,
-partial tails and all-selected rows. Remaining gates are comparison with
-the existing Flex/dense paths on GPU, CP2 remote dK/dV, selective activation
-recompute, model optimizer steps and save/resume.
-The selected-ID path should be opt-in until those gates pass; dense/Flex
-fallback behavior and QSA indexer freezing remain explicit.
+The CPU probe below checks that retained IDs reproduce the bitset and exact
+mask for packed/unpacked layouts, including short documents, partial tails
+and all-selected rows. GPU dense-masked comparison, CP2 remote K/V gradients
+and full-call activation recompute have since passed as described above.
+Model optimizer steps and save/resume remain open. The ID path remains
+opt-in; dense/Flex fallback behavior and QSA indexer freezing stay explicit.
 
 ### CPU producer-contract probe after the kernel commit
 
-The follow-up candidate adds `output_format="ids"` to
+The integrated opt-in producer adds `output_format="ids"` to
 `QSAIndexer._select_blocks`. It returns the already-computed `top.indices`
 as padded int32 IDs, avoiding the bitset allocation and int32 scatter in
 that mode. Existing callers keep the default `output_format="bits"` and
@@ -126,15 +198,15 @@ and many short documents can therefore have near-quadratic pooling memory
 despite compact selected IDs. This probe does not establish arbitrary packed
 256K support.
 
-The proposed opt-in model wiring should choose the output format before
+The opt-in model wiring chooses the output format before
 `QSAIndexer.forward`: `flex` and `dense_masked` use bits, while `id_sparse`
-uses IDs. Add an optional ID field to `QSASelection` and pass the same
-document-relative positions. For packed THD, reshape full-sequence Q/K/V
+uses IDs. It adds an optional ID field to `QSASelection` and passes the same
+document-relative positions. For packed THD, it reshapes full-sequence Q/K/V
 to `[1,H,S,D]` and IDs to `[1,S,K]`; for BSHD, permute to `[B,H,S,D]`.
-Under CP, retain the existing full-sequence zigzag reconstruction for
+Under CP, it retains the existing full-sequence zigzag reconstruction for
 selection and Q/K/V, differentiable KV gather, and local output split.
-The CPU test establishes ordering and mask equivalence only; a CP2 GPU
-gradient test remains required.
+The CPU test establishes ordering and mask equivalence; the CP2 GPU gradient
+test described above checks the model-path attention integration.
 
 Preserve the current all-selected dense paths when sparse forcing is off.
 `flex` and `dense_masked` remain explicit fallback choices that build bits.

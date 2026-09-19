@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Experimental selected-ID QSA GQA kernel; isolated prototype, not wired into QSA.
+"""Experimental selected-ID QSA GQA kernel; opt-in QSA backend in an isolated prototype.
 
 ``block_ids[b, q, :]`` contains distinct, document-relative complete block IDs,
 with ``-1`` for invalid slots. ``positions[b, q]`` is the query's document-relative

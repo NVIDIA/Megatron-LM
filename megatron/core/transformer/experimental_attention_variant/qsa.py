@@ -71,7 +71,8 @@ class QSASelection:
     Attributes:
         doc_ids: [b, s] int32 document id of every token (packed sequences) or the batch row.
         positions: [b, s] int32 position of every token inside its document.
-        selected_bits: Flat uint8 bitset ``[b * s * nbytes]`` over document-relative block ids:
+        selected_bits: Flat uint8 bitset ``[b * s * nbytes]`` over document-relative block ids,
+            or None for the opt-in selected-ID backend:
             for query ``(b, q)`` bit ``j`` of byte ``(b * s + q) * nbytes + i`` is set when block
             ``8 * i + j`` is selected. Flat so that the FlexAttention mask kernel indexes a 1-D
             buffer (its row stride is passed as a tensor scalar to avoid recompiling per shape).
@@ -80,15 +81,17 @@ class QSASelection:
         compress_ratio: Tokens per block.
         all_selected: True when every query selected all of its visible complete blocks, i.e.
             the attention pattern is plain causal attention.
+        selected_ids: Optional ``[b * s, K]`` int32 document-relative complete block IDs.
     """
 
     doc_ids: Tensor
     positions: Tensor
-    selected_bits: Tensor
+    selected_bits: Optional[Tensor]
     bits_per_row: int
     bits_per_row_t: Tensor
     compress_ratio: int
     all_selected: bool
+    selected_ids: Optional[Tensor] = None
 
 
 @dataclass
@@ -423,6 +426,7 @@ class QSAIndexer(MegatronModule):
         hidden_states: Tensor,
         rotary_pos_emb: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams] = None,
+        output_format: str = "bits",
     ) -> QSASelection:
         """Compute the block selection.
 
@@ -430,6 +434,7 @@ class QSAIndexer(MegatronModule):
             hidden_states: [s, b, H] layer input (sequence-parallel-sharded when SP is on).
             rotary_pos_emb: [max_s, 1, 1, rot_dim] rotary frequencies of the attention layer.
             packed_seq_params: THD packing parameters.
+            output_format: ``bits`` for Flex/dense or ``ids`` for the opt-in Triton backend.
 
         Returns:
             :class:`QSASelection` over the full (gathered) sequence.
@@ -525,18 +530,29 @@ class QSAIndexer(MegatronModule):
                     pooled, rotary_pos_emb, rope_block_positions.reshape(-1), batch_indices
                 )
                 pooled = pooled.view(n_docs, n_blocks_max, D)
-            selected_bits, all_selected = self._select_blocks(
-                q_flat.detach(), pooled, block_valid, doc_flat, pos_flat, None if is_thd else s
+            selection, all_selected = self._select_blocks(
+                q_flat.detach(),
+                pooled,
+                block_valid,
+                doc_flat,
+                pos_flat,
+                None if is_thd else s,
+                output_format=output_format,
             )
-        nbytes = selected_bits.shape[1]
+        selected_ids = selection if output_format == "ids" else None
+        selected_bits = selection if output_format == "bits" else None
+        nbytes = selected_bits.shape[1] if selected_bits is not None else 0
         return QSASelection(
             doc_ids=doc_ids,
             positions=positions,
-            selected_bits=selected_bits.reshape(-1).contiguous(),
+            selected_bits=(
+                selected_bits.reshape(-1).contiguous() if selected_bits is not None else None
+            ),
             bits_per_row=nbytes,
-            bits_per_row_t=torch.tensor(nbytes, device=selected_bits.device, dtype=torch.int64),
+            bits_per_row_t=torch.tensor(nbytes, device=selection.device, dtype=torch.int64),
             compress_ratio=self.compress_ratio,
             all_selected=all_selected,
+            selected_ids=selected_ids.contiguous() if selected_ids is not None else None,
         )
 
 
@@ -621,6 +637,39 @@ class QSACoreAttention(torch.nn.Module):
     def set_selection(self, selection: Optional[QSASelection]) -> None:
         """Register the block selection consumed by the next forward call."""
         self._selection = selection
+
+    def _id_sparse_forward(
+        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
+    ) -> Tensor:
+        """Run the experimental selected-ID kernel on the current full-sequence order."""
+        from megatron.core.transformer.experimental_attention_variant.qsa_id_sparse import (
+            qsa_sparse_attention_id,
+        )
+
+        if selection.selected_ids is None:
+            raise RuntimeError("QSA selected-ID backend requires compact block IDs")
+        if is_thd:
+            q = query.unsqueeze(0).transpose(1, 2)
+            k = key.unsqueeze(0).transpose(1, 2)
+            v = value.unsqueeze(0).transpose(1, 2)
+        else:
+            q = query.permute(1, 2, 0, 3)
+            k = key.permute(1, 2, 0, 3)
+            v = value.permute(1, 2, 0, 3)
+        b, hq, s, d = q.shape
+        ids = selection.selected_ids.view(b, s, -1)
+        out = qsa_sparse_attention_id(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            ids.contiguous(),
+            selection.positions.contiguous(),
+            ratio=selection.compress_ratio,
+            scale=self.softmax_scale,
+        )
+        if is_thd:
+            return out.transpose(1, 2).squeeze(0).reshape(s, hq * d)
+        return out.permute(2, 0, 1, 3).reshape(s, b, hq * d)
 
     def _flex_forward(
         self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
@@ -789,8 +838,9 @@ class QSACoreAttention(torch.nn.Module):
         # sequence -- the per-token RoPE the owning attention applied already uses each token's
         # correct global position, so it stays aligned after the gather -- run the sparse kernel
         # over the full sequence with the full-seq selection, then split the output back to the
-        # local slice. Numerically exact vs CP=1; the sparse kernel is O(global_s^2) here, so the
-        # block-sparse triton kernel remains the long-seq production follow-up. For CP>1,
+        # local slice. Numerically exact vs CP=1; Flex's coarse block-mask construction can
+        # allocate O(global_s^2), while the opt-in ID backend stores O(global_s * K) routes.
+        # Both still reconstruct full-sequence activations on every CP rank. For CP>1,
         # the all-selected dense TE kernel returns NaN gradients with packed padding-causal
         # attention, so short sequences use the explicit gather + masked SDPA path too.
         if cp_size > 1:
@@ -811,6 +861,8 @@ class QSACoreAttention(torch.nn.Module):
             out = self._all_selected_cp_forward(query, key, value, packed_seq_params)
         elif self.sparse_backend == "dense_masked":
             out = self._dense_masked_forward(query, key, value, selection, is_thd)
+        elif self.sparse_backend == "id_sparse":
+            out = self._id_sparse_forward(query, key, value, selection, is_thd)
         else:
             out = self._flex_forward(query, key, value, selection, is_thd)
         if cp_size > 1:
@@ -894,7 +946,10 @@ class QwenSparseSelfAttention(SelfAttention):
             raise NotImplementedError(
                 "QwenSparseSelfAttention does not support inference contexts yet."
             )
-        selection = self.indexer(hidden_states, rotary_pos_emb, packed_seq_params)
+        output_format = "ids" if self.core_attention.sparse_backend == "id_sparse" else "bits"
+        selection = self.indexer(
+            hidden_states, rotary_pos_emb, packed_seq_params, output_format=output_format
+        )
         self.core_attention.set_selection(selection)
         return super().forward(
             hidden_states,
