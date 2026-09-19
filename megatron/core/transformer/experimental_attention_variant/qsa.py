@@ -282,6 +282,7 @@ class QSAIndexer(MegatronModule):
         block_valid: Tensor,
         doc_ids: Tensor,
         positions: Tensor,
+        uniform_doc_len: Optional[int] = None,
     ) -> Tuple[Tensor, bool]:
         """Top-k complete blocks per query.
 
@@ -290,6 +291,7 @@ class QSAIndexer(MegatronModule):
             pooled_keys: [n_docs, n_blocks_max, D] normalized + rotated block keys.
             block_valid: [n_docs, n_blocks_max].
             doc_ids / positions: [T] int32.
+            uniform_doc_len: Length of each document in the non-THD batch layout.
 
         Returns:
             ``(selected_bits [T, nbytes] uint8, all_selected)``.
@@ -326,7 +328,7 @@ class QSAIndexer(MegatronModule):
 
         n_docs = pooled_keys.shape[0]
         k = min(self.block_topk, n_blocks_max)
-        # Many short packed documents make a GEMM and scatter per document slower than
+        # Multiple short packed documents make a GEMM and scatter per document slower than
         # one batched GEMM. Permit a gathered-key path only when its query tile, including
         # both the gathered source and fp32 copy, fits the same workspace budget. Long
         # documents keep the shared-key path below and never expand keys per query.
@@ -340,7 +342,7 @@ class QSAIndexer(MegatronModule):
             + k * 32
         )
         gathered_tile = max(1, min(T, _QSA_SELECT_TILE_BYTES // gathered_bytes_per_query))
-        if n_docs >= 8 and gathered_tile >= min(T, 32) and T <= n_docs * gathered_tile:
+        if n_docs > 1 and gathered_tile >= min(T, 32) and T <= n_docs * gathered_tile:
             for start in range(0, T, gathered_tile):
                 end = min(T, start + gathered_tile)
                 q_c = q[start:end].float()
@@ -358,13 +360,18 @@ class QSAIndexer(MegatronModule):
                 selected_bits[start:end] = bits.to(torch.uint8)
             return selected_bits, False
 
-        # doc_ids are monotone in the batch-major flattened layout, both for ordinary
-        # batches and for THD packing after CP reconstruction. Empty packed documents give
-        # equal adjacent offsets and need no work. One host transfer for the small offset
-        # vector lets every document reuse its pooled keys across all of its query tiles.
-        offsets = torch.searchsorted(
-            doc_ids.contiguous(), torch.arange(n_docs + 1, device=q.device, dtype=doc_ids.dtype)
-        ).tolist()
+        # A single document or a non-THD batch has offsets known from tensor shapes.
+        # For packed long documents, doc_ids are monotone after CP reconstruction;
+        # empty documents give equal adjacent offsets and need no work.
+        if n_docs == 1:
+            offsets = (0, T)
+        elif uniform_doc_len is not None:
+            assert T == n_docs * uniform_doc_len
+            offsets = tuple(doc * uniform_doc_len for doc in range(n_docs + 1))
+        else:
+            offsets = torch.searchsorted(
+                doc_ids.contiguous(), torch.arange(n_docs + 1, device=q.device, dtype=doc_ids.dtype)
+            ).tolist()
         for doc in range(n_docs):
             doc_start, doc_end = offsets[doc], offsets[doc + 1]
             if doc_start == doc_end:
@@ -495,7 +502,7 @@ class QSAIndexer(MegatronModule):
                 )
                 pooled = pooled.view(n_docs, n_blocks_max, D)
             selected_bits, all_selected = self._select_blocks(
-                q_flat.detach(), pooled, block_valid, doc_flat, pos_flat
+                q_flat.detach(), pooled, block_valid, doc_flat, pos_flat, None if is_thd else s
             )
         nbytes = selected_bits.shape[1]
         return QSASelection(

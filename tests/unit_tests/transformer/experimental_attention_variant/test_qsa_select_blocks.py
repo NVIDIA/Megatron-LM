@@ -125,6 +125,55 @@ def test_select_blocks_many_short_packed_documents_use_bounded_tiles(monkeypatch
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "doc_count,length,workspace,uniform",
+    [
+        (1, 37, 64, False),
+        (2, 16, 32 << 10, False),
+        (7, 16, 32 << 10, False),
+        (2, 64, 4 << 10, True),
+    ],
+)
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_select_blocks_avoids_offset_sync_for_known_document_layouts(
+    monkeypatch, doc_count, length, workspace, uniform, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    monkeypatch.setattr(qsa, "_QSA_SELECT_TILE_BYTES", workspace)
+    ratio, topk, heads, head_dim = 4, 2, 2, 4
+    nblocks = length // ratio
+    doc_ids = torch.arange(doc_count, dtype=torch.int32).repeat_interleave(length).to(device)
+    positions = torch.arange(length, dtype=torch.int32).repeat(doc_count).to(device)
+    generator = torch.Generator().manual_seed(35)
+    query = (
+        torch.randint(-3, 4, (doc_count * length, heads, head_dim), generator=generator)
+        .float()
+        .to(device)
+    )
+    pooled = (
+        torch.randint(-3, 4, (doc_count, nblocks, head_dim), generator=generator).float().to(device)
+    )
+    valid = torch.ones(doc_count, nblocks, dtype=torch.bool, device=device)
+    expected = _reference_bits(query, pooled, doc_ids, positions, ratio, topk)
+
+    def fail_if_offset_sync(*_args, **_kwargs):
+        raise AssertionError("offset search would require an additional GPU-to-CPU sync")
+
+    monkeypatch.setattr(torch, "searchsorted", fail_if_offset_sync)
+    actual, all_selected = qsa.QSAIndexer._select_blocks(
+        SimpleNamespace(compress_ratio=ratio, block_topk=topk),
+        query,
+        pooled,
+        valid,
+        doc_ids,
+        positions,
+        length if uniform else None,
+    )
+    assert not all_selected
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("nblocks", [0, 3])
 def test_select_blocks_all_visible_path_is_tiled(monkeypatch, nblocks):
     monkeypatch.setattr(qsa, "_QSA_SELECT_TILE_BYTES", 64)
