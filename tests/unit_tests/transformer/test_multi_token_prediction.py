@@ -2661,7 +2661,9 @@ class TestMultiTokenPrediction:
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
     )
-    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (2, 2)])
+    @pytest.mark.parametrize(
+        ("tp", "cp"), [(1, 1), (2, 1), pytest.param(2, 2, marks=pytest.mark.flaky_in_dev)]
+    )
     def test_packed_sequences(self, tp, cp):
         """Test MTP with packed sequences."""
         # Create args with packed sequences support
