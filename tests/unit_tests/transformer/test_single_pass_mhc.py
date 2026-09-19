@@ -49,3 +49,32 @@ def test_entry_selects_first_stream_and_exit_uses_last_mix():
     torch.testing.assert_close(SinglePassMHCState(mix).contract(x, 3), x[..., -4:])
     with pytest.raises(ValueError, match="preceding"):
         SinglePassMHCState(mix[:, :, :2]).contract(x, 3)
+
+
+@pytest.mark.parametrize("backend", ["none", "native", "triton"])
+def test_fp32_mixing_is_preserved_under_outer_autocast(backend):
+    """AMP must not round the residual-mixing matmul to BF16 for FP32 activations."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=2,
+        enable_mhc_connections=True,
+        mhc_single_pass=True,
+        use_fused_mhc=backend != "none",
+        mhc_fused_backend="auto" if backend == "none" else backend,
+    )
+    module = HyperConnectionModule(config, 1).cuda()
+    x = torch.randn(5, 2, 64, device="cuda")
+    previous = torch.randn(5, 2, 4, device="cuda")
+    outputs = []
+    for enabled in (False, True):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=enabled):
+            state = SinglePassMHCState(previous)
+            branch, residual_mix, post, residual = module(x, mhc_state=state, return_residual=True)
+            outputs.append(
+                module.fused_h_res_h_post_bda(
+                    residual_mix, residual, post, (branch, None), 0.0, False, False
+                )
+            )
+    assert all(output.dtype == torch.float32 for output in outputs)
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=1e-5, atol=1e-6)
