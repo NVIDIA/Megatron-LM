@@ -58,6 +58,9 @@ REQUEST_FIELD_POLICY = {
     "ttft": "checkpoint:reset / merge:first-populated",
     "events": "checkpoint:new-segment / merge:concatenate",
     "event_add_engine": "checkpoint:preserve-original / merge:drop / wire:drop",
+    "offload_params": "checkpoint:share / merge:first / wire:drop",
+    "payload_offloaded": "checkpoint:reset / merge:reset / wire:set-by-serialize",
+    "payload_stage_metadata": "checkpoint:reset / merge:reset / wire:set-by-serialize",
 }
 
 SAMPLING_FIELD_POLICY = {
