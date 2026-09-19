@@ -1289,3 +1289,39 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
 
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload ordering.")
+def test_inline_reload_is_ordered_after_the_groups_offload():
+    """The inline ``tensor_pop`` reload must wait on its group's D2H, not race it: a backward
+    that reaches a group before any prefetch ran used to enqueue the H2D with no edge at all."""
+    off_interface.reset_instance()
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        handler = ChunkOffloadHandler(
+            min_offloaded_tensor_size=0, cpu_tensor_pool=manager.cpu_tensor_pool
+        )
+        name = "fused_group_mlp"
+        handler.on_group_start_forward(name)
+        tensor = torch.randn(4 * 1024 * 1024, device="cuda")
+        tensor_tag = handler.tensor_push(tensor)
+        assert not isinstance(tensor_tag, torch.Tensor), "tensor was not managed by the handler"
+        group = handler.offload_groups[0]
+
+        # Stall d2h_stream so this group's D2H provably has not run when the pop below fires.
+        with torch.cuda.stream(handler.d2h_stream):
+            torch.cuda._sleep(1_000_000_000)
+        handler.on_group_commit_forward(name, [])
+        assert isinstance(group._tensors[tensor_tag], tuple), "the group was not offloaded"
+        assert not group._offload_event.query(), "the d2h_stream stall did not take effect"
+
+        reloaded = handler.tensor_pop(tensor_tag)
+        torch.cuda.current_stream().synchronize()
+        assert group._offload_event.query(), (
+            "the inline reload finished before this group's D2H did: the H2D read the pinned "
+            "buffer before the D2H filled it"
+        )
+        assert torch.equal(reloaded, tensor), "the inline reload returned the wrong values"
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
