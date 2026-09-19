@@ -22,5 +22,6 @@ See the [Megatron Bridge supported models list](https://github.com/NVIDIA-NeMo/M
 
 llms
 multimodal
+deepseek_v41
 ../llama_mistral
 ```
