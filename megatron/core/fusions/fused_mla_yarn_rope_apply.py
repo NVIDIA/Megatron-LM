@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -25,6 +26,89 @@ if not HAVE_TRITON:
     triton.autotune = null_decorator
     triton.heuristics = null_decorator
     tl = MagicMock()
+
+
+_VMM_SCRATCH_BUFFERS = {}
+
+
+def _capture_vmm_output(
+    reference: torch.Tensor, shape, slot: str = "default"
+) -> Optional[torch.Tensor]:
+    """Return reusable VMM scratch storage for serialized MLA layer graphs."""
+    if (
+        os.getenv("NVTE_MXFP8_VMM_LOCALIZATION", "0") != "1"
+        or len(shape) != 4
+        or shape[1] != 1
+        or shape[0] % 256 != 0
+    ):
+        return None
+    from transformer_engine.pytorch.tensor.localized_mxfp8 import (
+        _get_localization_context,
+        is_mxfp8_vmm_workspace_iteration_active,
+    )
+
+    device_index = reference.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    _get_localization_context(device_index)
+    if hasattr(reference, "_nvte_vmm_allocator") and tuple(reference.shape) == tuple(shape):
+        return reference
+
+    from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
+
+    key = (device_index, slot, tuple(shape), reference.dtype)
+    root = _VMM_SCRATCH_BUFFERS.get(key)
+    if root is None:
+        allocator = VMMRowSplitAllocator(reference.device)
+        root = allocator.allocate(tuple(shape), reference.dtype)
+        _VMM_SCRATCH_BUFFERS[key] = root
+    if (
+        not torch.cuda.is_current_stream_capturing()
+        and not is_mxfp8_vmm_workspace_iteration_active()
+    ):
+        return None
+
+    # Each invocation gets independent autograd metadata while all serialized
+    # layer graphs use one graph-stable physical allocation for this role.
+    output = torch.empty(0, dtype=root.dtype, device=root.device)
+    output.set_(root.untyped_storage(), 0, tuple(shape), root.stride())
+    output = output.detach()
+    output._nvte_vmm_allocator = root._nvte_vmm_allocator
+    return output
+
+
+def clear_mla_vmm_scratch_buffers() -> None:
+    """Release scratch storage after every CUDA graph using it is reset."""
+    allocators = {
+        id(tensor._nvte_vmm_allocator): tensor._nvte_vmm_allocator
+        for tensor in _VMM_SCRATCH_BUFFERS.values()
+    }
+    for allocator in allocators.values():
+        allocator.close()
+    _VMM_SCRATCH_BUFFERS.clear()
+
+
+def _localization_streams(tensor: torch.Tensor):
+    """Return the two green streams for a VMM-backed SBHD tensor."""
+    if not hasattr(tensor, "_nvte_vmm_allocator"):
+        return None
+    from transformer_engine.pytorch.tensor.localized_mxfp8 import _get_localization_context
+
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _get_localization_context(device_index)[2]
+
+
+def _fork_localized_streams(streams, device):
+    """Fork the current stream to two green streams for graph-safe launches."""
+    parent_stream = torch.cuda.current_stream(device)
+    fork_event = torch.cuda.Event(enable_timing=False)
+    join_events = tuple(torch.cuda.Event(enable_timing=False) for _ in streams)
+    fork_event.record(parent_stream)
+    for stream in streams:
+        stream.wait_event(fork_event)
+    return parent_stream, fork_event, join_events
 
 
 @triton.jit
@@ -256,6 +340,51 @@ def _mla_rope_bwd_inplace_kernel(
     tl.store(DO + x_2_off, x_2, mask=mask)
 
 
+def fused_mla_rope_q_backward_inplace(
+    dq: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    nope_dim: int,
+    emb_dim: int,
+    *,
+    remove_interleaving: bool = False,
+) -> torch.Tensor:
+    """Run the SBHD Q RoPE backward kernel in-place."""
+    if dq.ndim != 4:
+        raise ValueError("fused_mla_rope_q_backward_inplace currently supports SBHD tensors")
+    seqlen, batch_size, nheads, headdim = dq.shape
+    if headdim != nope_dim + emb_dim:
+        raise ValueError(f"Expected Q head dimension {nope_dim + emb_dim}, got {headdim}")
+    if not dq.is_contiguous():
+        raise ValueError("dQ must be contiguous")
+    if not cos.is_contiguous() or not sin.is_contiguous():
+        raise ValueError("cos and sin must be contiguous")
+
+    dq_3d = dq.view(seqlen * batch_size, nheads, headdim)
+    grid = lambda META: (dq_3d.shape[0], triton.cdiv(nheads, META["BLOCK_H"]))
+    _mla_rope_bwd_inplace_kernel[grid](
+        dq_3d,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        nheads,
+        batch_size,
+        None,
+        None,
+        None,
+        dq_3d.stride(0),
+        dq_3d.stride(1),
+        cos.stride(0),
+        sin.stride(0),
+        0,
+        1,
+        INVERSE=False,
+        REMOVE_INTERLEAVING=remove_interleaving,
+    )
+    return dq
+
+
 class _FusedMLARoPEInplace(torch.autograd.Function):
     """
     Autograd function for applying RoPE inplace to the trailing emb_dim
@@ -293,10 +422,14 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         max_seqlen = None
         batch_size = None
         seq_num = None
+        localization_streams = None
+        localization_allocator = getattr(q, "_nvte_vmm_allocator", None)
         if cu_seqlens_q is None:
             # sbhd
             assert position_ids is None
             max_seqlen, batch_size, nheads, headdim = q.shape
+            if batch_size == 1:
+                localization_streams = _localization_streams(q)
             q = q.view(-1, nheads, headdim)
             total_seqlen = q.shape[0]
         else:
@@ -312,26 +445,67 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         assert emb_dim % 4 == 0
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_fwd_inplace_kernel[grid](
-            q,
-            cos,
-            sin,
-            nope_dim,
-            emb_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            cu_seqlens_q,
-            position_ids,
-            q.stride(0),
-            q.stride(1),
-            cos.stride(0),
-            sin.stride(0),
-            cp_rank,
-            cp_size,
-            INVERSE=inverse,
-            REMOVE_INTERLEAVING=remove_interleaving,
-        )
+        if localization_streams is None:
+            _mla_rope_fwd_inplace_kernel[grid](
+                q,
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                cu_seqlens_q,
+                position_ids,
+                q.stride(0),
+                q.stride(1),
+                cos.stride(0),
+                sin.stride(0),
+                cp_rank,
+                cp_size,
+                INVERSE=inverse,
+                REMOVE_INTERLEAVING=remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, q.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_q = q[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_fwd_inplace_kernel[local_grid](
+                        local_q,
+                        local_cos,
+                        local_sin,
+                        nope_dim,
+                        emb_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        None,
+                        local_q.stride(0),
+                        local_q.stride(1),
+                        local_cos.stride(0),
+                        local_sin.stride(0),
+                        0,
+                        1,
+                        INVERSE=inverse,
+                        REMOVE_INTERLEAVING=remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_events = (fork_event, *join_events)
         ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
         ctx.has_position_ids = position_ids is not None
         ctx.nope_dim = nope_dim
@@ -344,6 +518,8 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         ctx.cp_size = cp_size
         if cu_seqlens_q is None:
             q = q.view(max_seqlen, batch_size, nheads, headdim)
+            if localization_allocator is not None:
+                q._nvte_vmm_allocator = localization_allocator
         return q
 
     @staticmethod
@@ -363,8 +539,17 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         max_seqlen = None
         batch_size = None
         seq_num = None
+        grad_root = None
+        localization_streams = None
         if ctx.cu_seqlens_q is None:
             max_seqlen, batch_size, nheads, headdim = grad.shape
+            grad_root = _capture_vmm_output(grad, grad.shape, "q_backward")
+            if grad_root is not None:
+                if grad_root.data_ptr() != grad.data_ptr():
+                    grad_root.copy_(grad)
+                grad = grad_root
+                if batch_size == 1:
+                    localization_streams = _localization_streams(grad_root)
             grad = grad.contiguous().view(-1, nheads, headdim)
             total_seqlen = grad.shape[0]
         else:
@@ -375,28 +560,72 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         assert grad.stride(-1) == 1
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_bwd_inplace_kernel[grid](
-            grad,
-            cos,
-            sin,
-            ctx.nope_dim,
-            ctx.emb_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            ctx.cu_seqlens_q,
-            position_ids,
-            grad.stride(0),
-            grad.stride(1),
-            cos.stride(0),
-            sin.stride(0),
-            ctx.cp_rank,
-            ctx.cp_size,
-            INVERSE=ctx.inverse,
-            REMOVE_INTERLEAVING=ctx.remove_interleaving,
-        )
+        if localization_streams is None:
+            _mla_rope_bwd_inplace_kernel[grid](
+                grad,
+                cos,
+                sin,
+                ctx.nope_dim,
+                ctx.emb_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                ctx.cu_seqlens_q,
+                position_ids,
+                grad.stride(0),
+                grad.stride(1),
+                cos.stride(0),
+                sin.stride(0),
+                ctx.cp_rank,
+                ctx.cp_size,
+                INVERSE=ctx.inverse,
+                REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, grad.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_grad = grad[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_bwd_inplace_kernel[local_grid](
+                        local_grad,
+                        local_cos,
+                        local_sin,
+                        ctx.nope_dim,
+                        ctx.emb_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        None,
+                        local_grad.stride(0),
+                        local_grad.stride(1),
+                        local_cos.stride(0),
+                        local_sin.stride(0),
+                        0,
+                        1,
+                        INVERSE=ctx.inverse,
+                        REMOVE_INTERLEAVING=ctx.remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_bwd_events = (fork_event, *join_events)
         if ctx.cu_seqlens_q is None:
-            grad = grad.view(max_seqlen, batch_size, nheads, headdim)
+            if grad_root is None:
+                grad = grad.view(max_seqlen, batch_size, nheads, headdim)
+            else:
+                grad = grad_root
         return grad, None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -725,6 +954,84 @@ def _mla_rope_bwd_kv_split_kernel(
         tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2 + 1, x_2)
 
 
+def fused_mla_rope_kv_backward_out(
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    emb_dim: int,
+    k_dim: int,
+    v_dim: int,
+    *,
+    out_kv: torch.Tensor,
+    out_k_pos_emb: torch.Tensor,
+    remove_interleaving: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the SBHD KV RoPE backward kernel into caller-provided buffers."""
+    if dk.ndim != 4 or dv.ndim != 4:
+        raise ValueError("fused_mla_rope_kv_backward_out currently supports SBHD tensors")
+    seqlen, batch_size, nheads, key_dim = dk.shape
+    expected_dv_shape = (seqlen, batch_size, nheads, v_dim)
+    expected_kv_shape = (seqlen, batch_size, nheads, k_dim + v_dim)
+    expected_emb_shape = (seqlen, batch_size, 1, emb_dim)
+    if key_dim != k_dim + emb_dim or tuple(dv.shape) != expected_dv_shape:
+        raise ValueError(
+            f"Expected dK/dV shapes ending in {k_dim + emb_dim}/{v_dim}, "
+            f"got {tuple(dk.shape)}/{tuple(dv.shape)}"
+        )
+    for name, tensor, shape in (
+        ("out_kv", out_kv, expected_kv_shape),
+        ("out_k_pos_emb", out_k_pos_emb, expected_emb_shape),
+    ):
+        if (
+            tuple(tensor.shape) != shape
+            or tensor.dtype != dk.dtype
+            or tensor.device != dk.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must have shape {shape}, dtype {dk.dtype}, "
+                f"device {dk.device}, and contiguous layout"
+            )
+    if not dk.is_contiguous() or not dv.is_contiguous():
+        raise ValueError("dK and dV must be contiguous")
+    if not cos.is_contiguous() or not sin.is_contiguous():
+        raise ValueError("cos and sin must be contiguous")
+
+    total_seqlen = seqlen * batch_size
+    dk_3d = dk.view(total_seqlen, nheads, key_dim)
+    dv_3d = dv.view(total_seqlen, nheads, v_dim)
+    out_kv_3d = out_kv.view(total_seqlen, nheads, k_dim + v_dim)
+    out_emb_3d = out_k_pos_emb.view(total_seqlen, 1, emb_dim)
+    grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+    _mla_rope_bwd_kv_split_kernel[grid](
+        dk_3d,
+        dv_3d,
+        out_kv_3d,
+        out_emb_3d,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        nheads,
+        batch_size,
+        None,
+        None,
+        dk_3d.stride(0),
+        dk_3d.stride(1),
+        dv_3d.stride(0),
+        dv_3d.stride(1),
+        out_kv_3d.stride(0),
+        out_kv_3d.stride(1),
+        out_emb_3d.stride(0),
+        0,
+        1,
+        REMOVE_INTERLEAVING=remove_interleaving,
+    )
+    return out_kv, out_k_pos_emb
+
+
 class _FusedMLARoPEKVSplit(torch.autograd.Function):
     """
     Autograd function for applying RoPE to MLA's key and value.
@@ -746,6 +1053,8 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         cp_size,
         rotary_interleaved=False,
         remove_interleaving=False,
+        out_key=None,
+        out_value=None,
     ):
         """
         Forward function for _FusedMLARoPEKVSplit.
@@ -779,35 +1088,120 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         assert sin.is_contiguous()
         assert emb_dim % 4 == 0
 
-        o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
-        o_value = kv.new_empty(total_seqlen, nheads, v_dim)
+        if (out_key is None) != (out_value is None):
+            raise ValueError("out_key and out_value must either both be provided or both be None")
+        if cu_seqlens_kv is None:
+            key_shape = (max_seqlen, batch_size, nheads, emb_dim + k_dim)
+            value_shape = (max_seqlen, batch_size, nheads, v_dim)
+        else:
+            key_shape = (total_seqlen, nheads, emb_dim + k_dim)
+            value_shape = (total_seqlen, nheads, v_dim)
+        if out_key is None:
+            out_key = kv.new_empty(key_shape)
+            out_value = kv.new_empty(value_shape)
+        else:
+            for name, out, shape in (
+                ("out_key", out_key, key_shape),
+                ("out_value", out_value, value_shape),
+            ):
+                if (
+                    tuple(out.shape) != shape
+                    or out.dtype != kv.dtype
+                    or out.device != kv.device
+                    or not out.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must have shape {shape}, dtype {kv.dtype}, "
+                        f"device {kv.device}, and contiguous layout"
+                    )
+                if out.requires_grad:
+                    raise ValueError(f"{name} must not require gradients")
+            # Forward-only callers may provide partition views into persistent
+            # VMM outputs. PyTorch only permits multiple modified view inputs
+            # when no autograd graph is being constructed.
+            if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+                ctx.mark_dirty(out_key, out_value)
+        localization_streams = None
+        if cu_seqlens_kv is None and batch_size == 1:
+            localization_streams = _localization_streams(out_key)
+        o_key = out_key.view(total_seqlen, nheads, emb_dim + k_dim)
+        o_value = out_value.view(total_seqlen, nheads, v_dim)
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_fwd_kv_split_kernel[grid](
-            kv,
-            k_pos_emb,
-            o_key,
-            o_value,
-            cos,
-            sin,
-            emb_dim,
-            k_dim,
-            v_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            cu_seqlens_kv,
-            kv.stride(0),
-            kv.stride(1),
-            k_pos_emb.stride(0),
-            o_key.stride(0),
-            o_key.stride(1),
-            o_value.stride(0),
-            o_value.stride(1),
-            cp_rank,
-            cp_size,
-            REMOVE_INTERLEAVING=remove_interleaving,
-        )
+        if localization_streams is None:
+            _mla_rope_fwd_kv_split_kernel[grid](
+                kv,
+                k_pos_emb,
+                o_key,
+                o_value,
+                cos,
+                sin,
+                emb_dim,
+                k_dim,
+                v_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                cu_seqlens_kv,
+                kv.stride(0),
+                kv.stride(1),
+                k_pos_emb.stride(0),
+                o_key.stride(0),
+                o_key.stride(1),
+                o_value.stride(0),
+                o_value.stride(1),
+                cp_rank,
+                cp_size,
+                REMOVE_INTERLEAVING=remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, kv.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_kv = kv[row_start:row_end]
+                local_k_pos_emb = k_pos_emb[row_start:row_end]
+                local_key = o_key[row_start:row_end]
+                local_value = o_value[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_fwd_kv_split_kernel[local_grid](
+                        local_kv,
+                        local_k_pos_emb,
+                        local_key,
+                        local_value,
+                        local_cos,
+                        local_sin,
+                        emb_dim,
+                        k_dim,
+                        v_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        local_kv.stride(0),
+                        local_kv.stride(1),
+                        local_k_pos_emb.stride(0),
+                        local_key.stride(0),
+                        local_key.stride(1),
+                        local_value.stride(0),
+                        local_value.stride(1),
+                        0,
+                        1,
+                        REMOVE_INTERLEAVING=remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_events = (fork_event, *join_events)
         ctx.save_for_backward(cos, sin)
         ctx.remove_interleaving = remove_interleaving
         ctx.rotary_interleaved = rotary_interleaved
@@ -817,10 +1211,7 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         ctx.cu_seqlens_kv = cu_seqlens_kv
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
-        if cu_seqlens_kv is None:
-            o_key = o_key.view(max_seqlen, -1, nheads, emb_dim + k_dim)
-            o_value = o_value.view(max_seqlen, -1, nheads, v_dim)
-        return o_key, o_value
+        return out_key, out_value
 
     @staticmethod
     def backward(ctx, dk, dv):
@@ -836,9 +1227,20 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         max_seqlen = None
         batch_size = None
         seq_num = None
+        d_kv_root = None
         if ctx.cu_seqlens_kv is None:
             # sbhd
             max_seqlen, batch_size, nheads, _ = dk.shape
+            d_kv_root = _capture_vmm_output(
+                dk,
+                (
+                    max_seqlen,
+                    batch_size,
+                    nheads,
+                    ctx.k_dim + ctx.v_dim,
+                ),
+                "kv_backward",
+            )
             dk = dk.contiguous().view(-1, nheads, ctx.emb_dim + ctx.k_dim)
             dv = dv.contiguous().view(-1, nheads, ctx.v_dim)
             total_seqlen = dk.shape[0]
@@ -849,39 +1251,112 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         assert dk.stride(-1) == 1
         assert dv.stride(-1) == 1
 
-        d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
+        if d_kv_root is None:
+            d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
+        else:
+            d_kv = d_kv_root.view(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
         d_emb = dk.new_empty(total_seqlen, 1, ctx.emb_dim)
+        localization_streams = (
+            _localization_streams(d_kv_root) if d_kv_root is not None and batch_size == 1 else None
+        )
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
-        _mla_rope_bwd_kv_split_kernel[grid](
-            dk,
-            dv,
+        if localization_streams is None:
+            _mla_rope_bwd_kv_split_kernel[grid](
+                dk,
+                dv,
+                d_kv,
+                d_emb,
+                cos,
+                sin,
+                ctx.emb_dim,
+                ctx.k_dim,
+                ctx.v_dim,
+                nheads,
+                batch_size,
+                seq_num,
+                ctx.cu_seqlens_kv,
+                dk.stride(0),
+                dk.stride(1),
+                dv.stride(0),
+                dv.stride(1),
+                d_kv.stride(0),
+                d_kv.stride(1),
+                d_emb.stride(0),
+                ctx.cp_rank,
+                ctx.cp_size,
+                REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            )
+        else:
+            parent_stream, fork_event, join_events = _fork_localized_streams(
+                localization_streams, dk.device
+            )
+            rows_per_domain = total_seqlen // len(localization_streams)
+            for domain, stream in enumerate(localization_streams):
+                row_start = domain * rows_per_domain
+                row_end = row_start + rows_per_domain
+                local_dk = dk[row_start:row_end]
+                local_dv = dv[row_start:row_end]
+                local_d_kv = d_kv[row_start:row_end]
+                local_d_emb = d_emb[row_start:row_end]
+                local_cos = cos[row_start:row_end]
+                local_sin = sin[row_start:row_end]
+                local_grid = lambda META: (
+                    rows_per_domain,
+                    triton.cdiv(nheads, META["BLOCK_H"]),
+                )
+                with torch.cuda.stream(stream):
+                    _mla_rope_bwd_kv_split_kernel[local_grid](
+                        local_dk,
+                        local_dv,
+                        local_d_kv,
+                        local_d_emb,
+                        local_cos,
+                        local_sin,
+                        ctx.emb_dim,
+                        ctx.k_dim,
+                        ctx.v_dim,
+                        nheads,
+                        1,
+                        None,
+                        None,
+                        local_dk.stride(0),
+                        local_dk.stride(1),
+                        local_dv.stride(0),
+                        local_dv.stride(1),
+                        local_d_kv.stride(0),
+                        local_d_kv.stride(1),
+                        local_d_emb.stride(0),
+                        0,
+                        1,
+                        REMOVE_INTERLEAVING=ctx.remove_interleaving,
+                    )
+                join_events[domain].record(stream)
+            for event in join_events:
+                parent_stream.wait_event(event)
+            ctx.localization_bwd_events = (fork_event, *join_events)
+        if ctx.cu_seqlens_kv is None:
+            if d_kv_root is None:
+                d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
+            else:
+                d_kv = d_kv_root
+            d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
+        return (
             d_kv,
             d_emb,
-            cos,
-            sin,
-            ctx.emb_dim,
-            ctx.k_dim,
-            ctx.v_dim,
-            nheads,
-            batch_size,
-            seq_num,
-            ctx.cu_seqlens_kv,
-            dk.stride(0),
-            dk.stride(1),
-            dv.stride(0),
-            dv.stride(1),
-            d_kv.stride(0),
-            d_kv.stride(1),
-            d_emb.stride(0),
-            ctx.cp_rank,
-            ctx.cp_size,
-            REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
-        if ctx.cu_seqlens_kv is None:
-            d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
-            d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
-        return d_kv, d_emb, None, None, None, None, None, None, None, None, None, None
 
 
 def fused_mla_rope_kv_split(
@@ -897,6 +1372,8 @@ def fused_mla_rope_kv_split(
     cp_size: int = 1,
     rotary_interleaved: bool = False,
     remove_interleaving: bool = False,
+    out_key: Optional[torch.Tensor] = None,
+    out_value: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused function for applying RoPE to MLA's key and value.
@@ -915,6 +1392,8 @@ def fused_mla_rope_kv_split(
         cu_seqlens_kv: [seq_num + 1] accumulated sequence lengths for thd format
         rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
         remove_interleaving: if True, output RoPE dims in non-interleaved layout
+        out_key/out_value: optional persistent output buffers. Both must be provided
+            together and match the returned key/value shapes.
 
     Returns:
         key: [seq_len, batch_size, head_num, emb_dim + k_dim]
@@ -934,6 +1413,8 @@ def fused_mla_rope_kv_split(
         cp_size,
         rotary_interleaved,
         remove_interleaving,
+        out_key,
+        out_value,
     )
 
 
@@ -954,6 +1435,14 @@ def fused_apply_mla_rope_for_q(
     :func:`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
     its original mutation behavior and does not add a clone to the hot path.
     """
+    localized_q = _capture_vmm_output(t, t.shape, "q_forward")
+    if localized_q is not None:
+        # The profiled Q kernel is in-place. Preserve its API while moving the
+        # producer output into VMM; replacing this copy with Q-up GEMM out=
+        # support is the next optimization step.
+        if localized_q.data_ptr() != t.data_ptr():
+            localized_q.copy_(t)
+        t = localized_q
     return fused_mla_rope_inplace(
         t,
         cos,
@@ -979,8 +1468,18 @@ def fused_apply_mla_rope_for_kv(
     cp_rank: int = 0,
     cp_size: int = 1,
     rotary_interleaved: bool = False,
+    out_key: Optional[torch.Tensor] = None,
+    out_value: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compatible name for the MLA key/value split RoPE API."""
+    if out_key is None and out_value is None and cu_seqlens_kv is None and kv.ndim == 4:
+        seqlen, batch_size, nheads, _ = kv.shape
+        out_key = _capture_vmm_output(
+            kv, (seqlen, batch_size, nheads, emb_dim + k_dim), "key_forward"
+        )
+        out_value = _capture_vmm_output(
+            kv, (seqlen, batch_size, nheads, v_dim), "value_forward"
+        )
     return fused_mla_rope_kv_split(
         kv,
         k_pos_emb,
@@ -993,4 +1492,6 @@ def fused_apply_mla_rope_for_kv(
         cp_rank=cp_rank,
         cp_size=cp_size,
         rotary_interleaved=rotary_interleaved,
+        out_key=out_key,
+        out_value=out_value,
     )
