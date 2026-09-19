@@ -2053,7 +2053,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, h_res, h_post = self.self_attention_hyper_connection(
-            hidden_states, mhc_recompute_manager=self._mhc_recompute_manager, mhc_state=mhc_state
+            hidden_states,
+            mhc_recompute_manager=self._mhc_recompute_manager,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
@@ -2157,7 +2159,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post = self.mlp_hyper_connection(
-            hidden_states, mhc_recompute_manager=self._mhc_recompute_manager, mhc_state=mhc_state
+            hidden_states,
+            mhc_recompute_manager=self._mhc_recompute_manager,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
 
