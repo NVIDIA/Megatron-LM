@@ -157,8 +157,9 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
   -m pytest --experimental -q tests/unit_tests/models/test_engram_distributed_embedding.py
 ```
 
-The strict FP32 attention oracle disables TF32 across both torch and TE to avoid
-comparing different GEMM precision policies. BF16 paths are tested independently.
+The strict FP32 attention oracle uses an IEEE projection backend and disables
+PyTorch TF32, keeping algebra checks independent of cached vendor GEMM policies.
+BF16 oracle and fused-kernel cases use the real Transformer Engine projections.
 See `examples/deepseek_v41/README.md` for the training/performance harness.
 
 
