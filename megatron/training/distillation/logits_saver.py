@@ -62,6 +62,7 @@ from megatron.training.distillation.utils import (
     get_current_iteration,
     is_remote_storage_path,
     open_logit_file,
+    pad_and_stack_cu_seqlens,
     quarantine_contained_tars,
     reassemble_cp_sequence,
     storage_glob_with_caching,
@@ -253,6 +254,9 @@ class LogitsSaverHooks:
                 "mbs_save": int(args.micro_batch_size),
                 "dp_size_save": int(self.dp_size),
                 "gbs_save": int(args.global_batch_size),
+                # Recorded so the loader can tell whether this tar was
+                # written by a CP-aware (cu_seqlens-persisting) saver.
+                "cp_size_save": int(self.cp_size),
             },
         }
         self._meta_bytes: bytes = json.dumps(
@@ -261,6 +265,11 @@ class LogitsSaverHooks:
 
         # Hook states – store already-processed top-K results (not full logits)
         self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        # Parallel to _accumulated_results (same append-guard, same length):
+        # each microbatch's document boundaries, set by set_current_cu_seqlens()
+        # just before the forward pass that _forward_hook fires on.
+        self._accumulated_cu_seqlens: List[Optional[torch.Tensor]] = []
+        self._pending_cu_seqlens: Optional[torch.Tensor] = None
         self._hook_handles: List[Any] = []
         self._loss_overrides: List[Tuple[torch.nn.Module, Any]] = []
 
@@ -283,6 +292,20 @@ class LogitsSaverHooks:
         # Register as the active saver so checkpoint code can flush
         global _ACTIVE_LOGITS_SAVER
         _ACTIVE_LOGITS_SAVER = self
+
+    def set_current_cu_seqlens(self, cu_seqlens_padded: Optional[torch.Tensor]) -> None:
+        """Record the document boundaries for the microbatch about to run.
+
+        Call this from ``forward_step``, immediately before invoking the
+        model, with the same ``cu_seqlens_padded`` (falling back to
+        ``cu_seqlens`` if padded is unavailable) that the batch dict already
+        carries -- i.e. the *global, un-CP-sharded* per-document boundaries
+        Megatron-Core's own CP partitioning consumes (see
+        ``_get_batch_on_this_cp_rank_per_document_balancing``). ``None`` for
+        unpacked (non-SFT) runs. Consumed once by the next ``_forward_hook``
+        invocation and not needed again until the following microbatch.
+        """
+        self._pending_cu_seqlens = cu_seqlens_padded
 
     def _forward_hook(
         self,
@@ -308,10 +331,12 @@ class LogitsSaverHooks:
                 result = self._process_single_microbatch(logits)
             if result is not None:
                 self._accumulated_results.append(result)
+                self._accumulated_cu_seqlens.append(self._pending_cu_seqlens)
 
             if len(self._accumulated_results) == get_num_microbatches():
                 self._save_accumulated_log_probs()
                 self._accumulated_results.clear()
+                self._accumulated_cu_seqlens.clear()
 
             self._curr_mtp_passes = 0
         else:
@@ -371,14 +396,21 @@ class LogitsSaverHooks:
 
         all_values = []
         all_indices = []
+        all_cu_seqlens = []
+        any_cu_seqlens = False
 
-        for values, indices in self._accumulated_results:
-            gathered = self._gather_full_cp_microbatch(values, indices)
+        for (values, indices), cu_seqlens in zip(
+            self._accumulated_results, self._accumulated_cu_seqlens
+        ):
+            gathered = self._gather_full_cp_microbatch(values, indices, cu_seqlens)
             if gathered is None:
                 continue
             full_values, full_indices = gathered
             all_values.append(full_values.cpu())
             all_indices.append(full_indices.cpu())
+            if cu_seqlens is not None:
+                any_cu_seqlens = True
+            all_cu_seqlens.append(cu_seqlens)
 
         if self.cp_rank != 0:
             self._topp_kept_counts.clear()
@@ -392,7 +424,25 @@ class LogitsSaverHooks:
             # rather than packed per-microbatch and concatenated after.
             indices_tensor = torch.cat(all_indices, dim=1)
             indices_low_tensor, bit_17_tensor = v2_pack_indices(indices_tensor)
-            self._buffer_iteration(values_tensor, indices_low_tensor, bit_17_tensor)
+            # Document boundaries, if this run has any (--sft), stacked into
+            # one (samples_per_dp_per_iter, max_boundaries) tensor matching
+            # the values/indices monolith's sample dim. --sft is a run-wide
+            # flag, so every accumulated microbatch should uniformly carry
+            # (or uniformly lack) cu_seqlens; a mix indicates a bug upstream
+            # in set_current_cu_seqlens() call sites.
+            if any_cu_seqlens:
+                if any(c is None for c in all_cu_seqlens):
+                    raise RuntimeError(
+                        "Some but not all accumulated microbatches carried "
+                        "cu_seqlens this iteration; set_current_cu_seqlens() "
+                        "must be called consistently for every microbatch."
+                    )
+                cu_seqlens_padded_tensor = pad_and_stack_cu_seqlens(all_cu_seqlens).cpu()
+            else:
+                cu_seqlens_padded_tensor = None
+            self._buffer_iteration(
+                values_tensor, indices_low_tensor, bit_17_tensor, cu_seqlens_padded_tensor
+            )
 
         if self._topp_kept_counts:
             # Log the average number of top-P kept tokens per microbatch to tensorboard
@@ -479,6 +529,7 @@ class LogitsSaverHooks:
         self,
         values: torch.Tensor,
         indices: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Gather CP-local top-K tensors and reconstruct full sequence order on CP rank 0.
 
@@ -486,6 +537,13 @@ class LogitsSaverHooks:
         (= ``effective_k = min(self.k, global_vocab_size)``) because
         :meth:`_apply_topp_truncation` masks rather than truncates, so no
         inter-rank K coordination is required before the gather.
+
+        *cu_seqlens*, when not ``None``, is this microbatch's global
+        (un-CP-sharded) document boundaries -- see
+        :meth:`set_current_cu_seqlens` -- and is passed through to
+        :func:`reassemble_cp_sequence` so the reconstruction inverts the
+        real per-document zigzag CP partitioning instead of assuming a
+        single whole-sequence zigzag.
         """
         if self.cp_size == 1:
             return values, indices
@@ -504,8 +562,8 @@ class LogitsSaverHooks:
             return None
 
         return (
-            reassemble_cp_sequence(values_gather_list),
-            reassemble_cp_sequence(indices_gather_list),
+            reassemble_cp_sequence(values_gather_list, cu_seqlens=cu_seqlens),
+            reassemble_cp_sequence(indices_gather_list, cu_seqlens=cu_seqlens),
         )
 
     def _compute_global_topk(
@@ -645,6 +703,7 @@ class LogitsSaverHooks:
         values_tensor: torch.Tensor,
         indices_low_tensor: torch.Tensor,
         bit_17_tensor: torch.Tensor,
+        cu_seqlens_padded_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Serialize a per-iteration monolith and buffer for async flush.
 
@@ -657,6 +716,11 @@ class LogitsSaverHooks:
         - ``bit_17``: 1-D uint8 tensor, the 17th bit of every index in
           ``indices_low`` bit-packed via ``numpy.packbits`` (see
           :func:`~megatron.training.distillation.utils.v2_pack_indices`)
+        - ``cu_seqlens_padded``: optional ``(samples_per_dp_per_iter,
+          max_boundaries)`` int tensor of per-sample document boundaries
+          (only present for ``--sft`` / packed runs); ``None`` otherwise.
+          Consumed by the loader to do document-aware CP reslicing (see
+          :func:`~megatron.training.distillation.utils.slice_tensor_for_cp_rank`).
         - ``format_version``: integer payload-format identifier
 
         Storing one monolith per iteration (rather than a list of per-mb
@@ -678,6 +742,7 @@ class LogitsSaverHooks:
             'values': values_tensor,
             'indices_low': indices_low_tensor,
             'bit_17': bit_17_tensor,
+            'cu_seqlens_padded': cu_seqlens_padded_tensor,
             'format_version': LOGPROBS_FORMAT_VERSION,
         }, buffer)
         data = buffer.getvalue()

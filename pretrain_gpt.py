@@ -320,6 +320,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         batch = get_batch(data_iterator, vp_stage)
 
+        # Only populated by the has_cu_seqlens (--sft) 10-tuple branch below;
+        # stays None for the 6-/7-tuple (unpacked) batch shapes.
+        cu_seqlens = None
+        cu_seqlens_padded = None
+
         if len(batch) == 7:
             (
                 tokens,
@@ -373,6 +378,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     cp_group=hybrid_cp_group,
                     tokens_per_sample=args.seq_length,
                 )
+
+        # Offline logits KD: record this microbatch's global (un-CP-sharded)
+        # document boundaries so the saver can persist them alongside the
+        # logits _forward_hook is about to capture -- required for
+        # document-aware CP reassembly of packed (--sft) sequences.
+        from megatron.training.distillation.logits_saver import get_logits_saver
+
+        saver = get_logits_saver()
+        if saver is not None:
+            saver.set_current_cu_seqlens(
+                cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+            )
 
     timers('batch-generator').stop()
 

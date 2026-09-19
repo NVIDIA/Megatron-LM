@@ -104,6 +104,7 @@ from megatron.training.distillation.utils import (
     get_current_iteration,
     is_remote_storage_path,
     iter_logprobs_tar_entries,
+    pad_and_stack_cu_seqlens,
     peek_first_logprobs_metadata,
     slice_tensor_for_cp_rank,
     sorted_batched_tars,
@@ -174,8 +175,9 @@ class StudentLogitsCapture:
 # ---------------------------------------------------------------------------
 
 
-# Per-(d_save) cache entry: (i_save, values_monolith, indices_monolith).
-_StreamCacheEntry = Tuple[int, torch.Tensor, torch.Tensor]
+# Per-(d_save) cache entry: (i_save, values_monolith, indices_monolith,
+# cu_seqlens_padded_monolith).
+_StreamCacheEntry = Tuple[int, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
 
 
 class TeacherTarDataset(torch.utils.data.IterableDataset):
@@ -255,6 +257,16 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             )
         self._meta = meta
         self._plan = self._build_plan(meta, dp_size=dp_size)
+
+        # Whether this load run needs document-aware CP reslicing -- mirrors
+        # training.py's has_cu_seqlens formula (training.py:3059) combined
+        # with cp_size > 1. When True, a decoded payload missing
+        # cu_seqlens_padded means it was written before the CP+packing fix
+        # and can't be correctly resharded; see _decode_entry.
+        args = get_args()
+        self._requires_cu_seqlens = self.cp_size > 1 and (
+            getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
+        )
 
         if decode_lookahead is None:
             # When each load step consumes >1 saved iters, scale the lookahead
@@ -356,7 +368,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
     def _decode_entry(self, entry: V2LogprobsTarEntry) -> _StreamCacheEntry:
         """Decode one tar payload into a monolithic ``(values, indices)`` pair."""
-        values, indices = decode_logprobs_payload(entry.data)
+        values, indices, cu_seqlens_padded = decode_logprobs_payload(entry.data)
         span = entry.end_sample - entry.start_sample
         if span != self._plan.gbs_save:
             raise RuntimeError(
@@ -365,8 +377,19 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 "This indicates a corrupt shard or one written by a "
                 "different run/config."
             )
+        if cu_seqlens_padded is None and self._requires_cu_seqlens:
+            raise ValueError(
+                f"Cached-logits payload for global samples "
+                f"[{entry.start_sample}, {entry.end_sample}) has no "
+                "cu_seqlens_padded, but this run uses packed sequences "
+                f"(--sft) with context-parallel size {self.cp_size} > 1, "
+                "which requires document-aware CP resharding to align "
+                "teacher/student token positions correctly. This tar was "
+                "likely written before the CP+packing fix landed; "
+                "regenerate the teacher cache."
+            )
         i_save = entry.start_sample // self._plan.gbs_save
-        return i_save, values, indices
+        return i_save, values, indices, cu_seqlens_padded
 
     def _iter_entries_parallel(
         self, pool: concurrent.futures.ThreadPoolExecutor, entries: Iterator[Any]
@@ -493,19 +516,33 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     # ------------------------------------------------------------------
 
     def _slice_cp_sequences(
-        self, values_list: List[torch.Tensor], indices_list: List[torch.Tensor]
+        self,
+        values_list: List[torch.Tensor],
+        indices_list: List[torch.Tensor],
+        cu_seqlens_list: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Extract this CP rank's zigzag sequence slice from full-CP tensors."""
+        """Extract this CP rank's zigzag sequence slice from full-CP tensors.
+
+        *cu_seqlens_list*, when given, has one entry per load microbatch
+        step (parallel to *values_list*/*indices_list*) with that step's
+        per-sample document boundaries -- see
+        :func:`~megatron.training.distillation.utils.slice_tensor_for_cp_rank`.
+        ``None`` entries (or an entirely ``None`` list, e.g. from
+        :class:`LegacyTeacherTarDataset`, which never has cu_seqlens) fall
+        back to the whole-sequence zigzag.
+        """
         if self.cp_size <= 1:
             return values_list, indices_list
+        if cu_seqlens_list is None:
+            cu_seqlens_list = [None] * len(values_list)
         return (
             [
-                slice_tensor_for_cp_rank(values, self.cp_rank, self.cp_size)
-                for values in values_list
+                slice_tensor_for_cp_rank(values, self.cp_rank, self.cp_size, cu_seqlens=cu_seqlens)
+                for values, cu_seqlens in zip(values_list, cu_seqlens_list)
             ],
             [
-                slice_tensor_for_cp_rank(indices, self.cp_rank, self.cp_size)
-                for indices in indices_list
+                slice_tensor_for_cp_rank(indices, self.cp_rank, self.cp_size, cu_seqlens=cu_seqlens)
+                for indices, cu_seqlens in zip(indices_list, cu_seqlens_list)
             ],
         )
 
@@ -514,20 +551,25 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         i_load: int,
         cache: Dict[int, Optional[_StreamCacheEntry]],
         streams: Dict[int, Iterator[_StreamCacheEntry]],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Assemble one load iteration's ``(values_list, indices_list)``.
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[Optional[torch.Tensor]]]:
+        """Assemble one load iteration's ``(values_list, indices_list, cu_seqlens_list)``.
 
         For each load microbatch step, walks the
         :class:`LogprobsReshardPlan`-supplied sources, advances the
         appropriate per-d_save stream until the right saved iteration is
         cached, slices the monolith, and (in the rare cross-boundary case)
-        concatenates a handful of slices.
+        concatenates a handful of slices. Per-sample ``cu_seqlens_padded``
+        rows are sliced/concatenated in lockstep with the value/index rows
+        (same ``row_start:row_end`` range, since resharding never splits a
+        sample's own document layout across a boundary).
         """
         values_list: List[torch.Tensor] = []
         indices_list: List[torch.Tensor] = []
+        cu_seqlens_list: List[Optional[torch.Tensor]] = []
         for m_load in range(self._plan.num_mb_load):
             slices_v: List[torch.Tensor] = []
             slices_i: List[torch.Tensor] = []
+            slices_cu: List[Optional[torch.Tensor]] = []
             for src in self._plan.sources_for_microbatch(i_load, m_load, self.dp_rank):
                 entry = cache.get(src.d_save)
                 while entry is None or entry[0] < src.iter_save:
@@ -546,9 +588,10 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                         f"Expected save iteration {src.iter_save} from saved "
                         f"dp_rank={src.d_save}, got {entry[0]}."
                     )
-                _, v_mon, i_mon = entry
+                _, v_mon, i_mon, cu_mon = entry
                 slices_v.append(v_mon[:, src.row_start : src.row_end])
                 slices_i.append(i_mon[:, src.row_start : src.row_end])
+                slices_cu.append(cu_mon[src.row_start : src.row_end] if cu_mon is not None else None)
 
             # The saver guarantees a single uniform K across all saved
             # microbatches / iterations (= effective_k), so the slices
@@ -561,9 +604,25 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 v = torch.cat(slices_v, dim=1)
                 i = torch.cat(slices_i, dim=1)
 
+            if any(c is not None for c in slices_cu):
+                if any(c is None for c in slices_cu):
+                    raise RuntimeError(
+                        "Some but not all cached-logits sources for load "
+                        f"iteration {i_load}, microbatch {m_load} carry "
+                        "cu_seqlens_padded; the saved tars appear to mix "
+                        "packed and unpacked data."
+                    )
+                # Row widths (max document count) can differ across saved
+                # iterations; pad_and_stack_cu_seqlens right-pads to a
+                # common width before concatenating along the sample dim.
+                cu = slices_cu[0] if len(slices_cu) == 1 else pad_and_stack_cu_seqlens(slices_cu)
+            else:
+                cu = None
+
             values_list.append(v)
             indices_list.append(i)
-        return values_list, indices_list
+            cu_seqlens_list.append(cu)
+        return values_list, indices_list, cu_seqlens_list
 
     # ------------------------------------------------------------------
     #  Main iteration entry point
@@ -581,10 +640,14 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             i_load = self.start_iteration
             while True:
                 try:
-                    values_list, indices_list = self._build_load_iteration(i_load, cache, streams)
+                    values_list, indices_list, cu_seqlens_list = self._build_load_iteration(
+                        i_load, cache, streams
+                    )
                 except StopIteration:
                     return
-                values_list, indices_list = self._slice_cp_sequences(values_list, indices_list)
+                values_list, indices_list = self._slice_cp_sequences(
+                    values_list, indices_list, cu_seqlens_list
+                )
                 yield i_load, values_list, indices_list
                 i_load += 1
 
@@ -772,8 +835,9 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
 
     def _decode_entry(self, entry: LogprobsTarEntry):
         # decode_logprobs_payload dispatches on format_version; for the v1
-        # tars this dataset handles, it returns lists.
-        values_list, indices_list = decode_logprobs_payload(entry.data)
+        # tars this dataset handles, it returns lists and no cu_seqlens
+        # (v1 never carries it -- see the class docstring).
+        values_list, indices_list, _ = decode_logprobs_payload(entry.data)
         return entry.iteration, values_list, indices_list
 
     def _discover_shards(self, already_processed: set, dp_save: int) -> List[str]:

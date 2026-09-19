@@ -351,6 +351,21 @@ def forward_step(data_iterator, model: HybridModel):
         if cu_seqlens is not None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
+        # Offline logits KD: record this microbatch's global (un-CP-sharded)
+        # document boundaries so the saver can persist them alongside the
+        # logits _forward_hook is about to capture -- required for
+        # document-aware CP reassembly of packed (--sft) sequences. cu_seqlens
+        # (unpadded) is left in place of cu_seqlens_padded above cp_size == 1,
+        # where the batch dict never populates the padded variant.
+        from megatron.training.distillation.logits_saver import get_logits_saver
+
+        saver = get_logits_saver()
+        if saver is not None:
+            cu_seqlens_padded = batch.get("cu_seqlens_padded")
+            saver.set_current_cu_seqlens(
+                cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+            )
+
     timers('batch-generator').stop()
 
     with stimer:

@@ -337,52 +337,176 @@ def v2_sorted_batched_tars(paths: List[str]) -> List[str]:
     return [path for _, path in keyed]
 
 
-def slice_tensor_for_cp_rank(tensor: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
-    """Return this CP rank's zigzag sequence slice from a full sequence tensor."""
+def _document_zigzag_index(
+    cu_seqlens: torch.Tensor, cp_rank: int, cp_size: int, device: torch.device
+) -> torch.Tensor:
+    """Build the flat index tensor for one CP rank's per-document zigzag partition.
+
+    Mirrors ``_get_batch_on_this_cp_rank_per_document_balancing``'s semantics
+    (``megatron/core/utils.py``): each ``[cu_seqlens[i], cu_seqlens[i+1])``
+    document is independently split into ``2 * cp_size`` equal chunks, and
+    this rank gets chunks ``[cp_rank]`` and ``[2*cp_size-cp_rank-1]`` from
+    every document, concatenated in document order. Zero-length "documents"
+    (``end <= start``, from right-padding a batch of cu_seqlens rows to a
+    common width) contribute nothing.
+    """
+    num_chunks = 2 * cp_size
+    boundaries = cu_seqlens.tolist()
+    pieces: List[torch.Tensor] = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if end <= start:
+            continue
+        doc_len = end - start
+        if doc_len % num_chunks != 0:
+            raise ValueError(
+                f"Document length ({doc_len}) in range [{start}, {end}) must be "
+                f"divisible by 2 * CP size ({num_chunks}) for per-document CP zigzag."
+            )
+        chunk_size = doc_len // num_chunks
+        chunks = torch.arange(start, end, device=device).view(num_chunks, chunk_size)
+        pieces.append(chunks[cp_rank])
+        pieces.append(chunks[num_chunks - cp_rank - 1])
+    if not pieces:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return torch.cat(pieces)
+
+
+def pad_and_stack_cu_seqlens(cu_seqlens_list: List[torch.Tensor]) -> torch.Tensor:
+    """Stack per-microbatch ``cu_seqlens_padded`` rows into one 2-D tensor.
+
+    Each element of *cu_seqlens_list* is a ``(mbs_i, len_i)`` tensor (the
+    dataloader's own per-microbatch layout, see
+    ``get_batch_on_this_tp_rank``'s ``(micro_batch_size, padded_len)``
+    convention). Rows are right-padded to the widest ``len_i`` by repeating
+    each row's own final boundary -- the same "trailing padding" convention
+    Megatron's own ``cu_seqlens_padded`` already uses internally, so a
+    right-padded document is naturally zero-length and skipped by
+    :func:`_document_zigzag_index`.
+    """
+    max_len = max(t.size(1) for t in cu_seqlens_list)
+    rows = []
+    for t in cu_seqlens_list:
+        if t.size(1) < max_len:
+            pad = t[:, -1:].expand(t.size(0), max_len - t.size(1))
+            t = torch.cat([t, pad], dim=1)
+        rows.append(t)
+    return torch.cat(rows, dim=0)
+
+
+def slice_tensor_for_cp_rank(
+    tensor: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    cu_seqlens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return this CP rank's zigzag sequence slice from a full sequence tensor.
+
+    With *cu_seqlens* ``None`` (unpacked runs), partitions the whole
+    sequence as one zigzag chunk set. With *cu_seqlens* given, partitions
+    each document independently instead, matching Megatron-Core's real
+    per-document zigzag CP partitioning under packed/SFT data (see
+    :func:`_document_zigzag_index`).
+
+    *cu_seqlens*, when given, is either a 1-D tensor (one document layout
+    shared by the whole tensor) or a 2-D ``(batch, num_boundaries)`` tensor
+    giving each element along *tensor*'s dim-1 (sample) axis its own
+    document layout -- required whenever different samples in the same
+    saved iteration were packed differently.
+    """
     if cp_size <= 1:
         return tensor
 
-    num_cp_chunks = 2 * cp_size
-    if tensor.size(0) % num_cp_chunks != 0:
-        raise ValueError(
-            f"Sequence length ({tensor.size(0)}) must be divisible by "
-            f"2 * CP size ({num_cp_chunks}) for CP zigzag slicing."
+    if cu_seqlens is None:
+        num_cp_chunks = 2 * cp_size
+        if tensor.size(0) % num_cp_chunks != 0:
+            raise ValueError(
+                f"Sequence length ({tensor.size(0)}) must be divisible by "
+                f"2 * CP size ({num_cp_chunks}) for CP zigzag slicing."
+            )
+        chunk_size = tensor.size(0) // num_cp_chunks
+        view_shape = (2 * cp_size, chunk_size, *tensor.shape[1:])
+        chunks = tensor.view(*view_shape)
+        index = torch.tensor(
+            [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long, device=tensor.device
         )
-    chunk_size = tensor.size(0) // num_cp_chunks
-    view_shape = (2 * cp_size, chunk_size, *tensor.shape[1:])
-    chunks = tensor.view(*view_shape)
-    index = torch.tensor(
-        [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long, device=tensor.device
-    )
-    local = chunks.index_select(0, index)
-    return local.reshape(2 * chunk_size, *tensor.shape[1:]).contiguous()
+        local = chunks.index_select(0, index)
+        return local.reshape(2 * chunk_size, *tensor.shape[1:]).contiguous()
+
+    if cu_seqlens.dim() == 1:
+        index = _document_zigzag_index(cu_seqlens, cp_rank, cp_size, tensor.device)
+        return tensor.index_select(0, index).contiguous()
+
+    if tensor.dim() < 2 or cu_seqlens.size(0) != tensor.size(1):
+        raise ValueError(
+            f"cu_seqlens batch dim ({cu_seqlens.size(0)}) must match tensor's "
+            f"sample dim ({tensor.shape[1] if tensor.dim() > 1 else 'N/A'})."
+        )
+    per_sample = []
+    for b in range(tensor.size(1)):
+        index = _document_zigzag_index(cu_seqlens[b], cp_rank, cp_size, tensor.device)
+        per_sample.append(tensor[:, b].index_select(0, index))
+    return torch.stack(per_sample, dim=1).contiguous()
 
 
-def reassemble_cp_sequence(local_tensors: List[torch.Tensor]) -> torch.Tensor:
-    """Reassemble CP-rank zigzag sequence shards into full sequence order."""
+def reassemble_cp_sequence(
+    local_tensors: List[torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """Reassemble CP-rank zigzag sequence shards into full sequence order.
+
+    With *cu_seqlens* ``None`` (unpacked runs), inverts the whole-sequence
+    zigzag. With *cu_seqlens* given (see :func:`slice_tensor_for_cp_rank`
+    for its shape conventions), inverts the per-document zigzag instead.
+    """
     cp_size = len(local_tensors)
     if cp_size == 1:
         return local_tensors[0]
 
     first = local_tensors[0]
-    if first.size(0) % 2 != 0:
-        raise ValueError(
-            f"Local CP sequence length ({first.size(0)}) must be divisible by 2 "
-            "to reassemble zigzag CP shards."
-        )
-    chunk_size = first.size(0) // 2
-    chunks: List[Optional[torch.Tensor]] = [None] * (2 * cp_size)
     for cp_rank, tensor in enumerate(local_tensors):
         if tensor.shape != first.shape:
             raise ValueError(
                 f"All CP shards must have matching shapes; got {tensor.shape} "
                 f"for rank {cp_rank}, expected {first.shape}."
             )
-        local_chunks = tensor.view(2, chunk_size, *tensor.shape[1:])
-        chunks[cp_rank] = local_chunks[0]
-        chunks[2 * cp_size - cp_rank - 1] = local_chunks[1]
 
-    return torch.cat([chunk for chunk in chunks if chunk is not None], dim=0).contiguous()
+    if cu_seqlens is None:
+        if first.size(0) % 2 != 0:
+            raise ValueError(
+                f"Local CP sequence length ({first.size(0)}) must be divisible by 2 "
+                "to reassemble zigzag CP shards."
+            )
+        chunk_size = first.size(0) // 2
+        chunks: List[Optional[torch.Tensor]] = [None] * (2 * cp_size)
+        for cp_rank, tensor in enumerate(local_tensors):
+            local_chunks = tensor.view(2, chunk_size, *tensor.shape[1:])
+            chunks[cp_rank] = local_chunks[0]
+            chunks[2 * cp_size - cp_rank - 1] = local_chunks[1]
+
+        return torch.cat([chunk for chunk in chunks if chunk is not None], dim=0).contiguous()
+
+    full_seq_len = first.size(0) * cp_size
+
+    if cu_seqlens.dim() == 1:
+        out = torch.empty((full_seq_len, *first.shape[1:]), dtype=first.dtype, device=first.device)
+        for cp_rank, tensor in enumerate(local_tensors):
+            index = _document_zigzag_index(cu_seqlens, cp_rank, cp_size, first.device)
+            out.index_copy_(0, index, tensor)
+        return out.contiguous()
+
+    if first.dim() < 2 or cu_seqlens.size(0) != first.size(1):
+        raise ValueError(
+            f"cu_seqlens batch dim ({cu_seqlens.size(0)}) must match tensor's "
+            f"sample dim ({first.shape[1] if first.dim() > 1 else 'N/A'})."
+        )
+    batch = first.size(1)
+    out = torch.empty(
+        (full_seq_len, batch, *first.shape[2:]), dtype=first.dtype, device=first.device
+    )
+    for b in range(batch):
+        for cp_rank, tensor in enumerate(local_tensors):
+            index = _document_zigzag_index(cu_seqlens[b], cp_rank, cp_size, first.device)
+            out[:, b].index_copy_(0, index, tensor[:, b])
+    return out.contiguous()
 
 
 def unpack_indices(low_bits: torch.Tensor, bit_17: torch.Tensor) -> torch.Tensor:
@@ -672,20 +796,24 @@ def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
     return _broadcast_without_pp(peek)
 
 
-def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
+def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tensor]]:
     """Decode one zstd-compressed cached-logits payload.
 
     Dispatches on the payload's ``format_version`` field:
 
-    * v2 (``format_version >= 2``): returns ``(values, indices)`` as
-      monolithic per-iteration tensors of shape
-      ``(seq, samples_per_dp_per_iter, K)``.  Slicing along the sample
-      dim is a zero-copy view, which keeps pinned-memory transfers
-      efficient.
-    * v1 (legacy, no ``format_version``): returns
-      ``(values_list, indices_list)`` mirroring the original saved
-      list-of-microbatches structure.  The v1 branch is slated for
-      removal alongside :class:`LegacyTeacherTarDataset`.
+    * v2 (``format_version >= 2``): returns ``(values, indices,
+      cu_seqlens_padded)``. ``values``/``indices`` are monolithic
+      per-iteration tensors of shape ``(seq, samples_per_dp_per_iter, K)``;
+      slicing along the sample dim is a zero-copy view, which keeps
+      pinned-memory transfers efficient. ``cu_seqlens_padded`` is a
+      ``(samples_per_dp_per_iter, max_boundaries)`` int tensor of
+      per-sample document boundaries when the saving run had any
+      (``--sft``), else ``None``.
+    * v1 (legacy, no ``format_version``): returns ``(values_list,
+      indices_list, None)`` mirroring the original saved
+      list-of-microbatches structure. The v1 branch is slated for removal
+      alongside :class:`LegacyTeacherTarDataset`, and never carries
+      ``cu_seqlens_padded``.
 
     Each caller knows which format its tars are in (the loader factory
     inspects ``_meta.json`` up-front) and can treat the return type as
@@ -702,12 +830,12 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
     if tensors.get("format_version", 1) >= 2:
         values = tensors["values"]
         indices = v2_unpack_indices(tensors["indices_low"], tensors["bit_17"])
-        return values, indices
+        return values, indices, tensors.get("cu_seqlens_padded")
     # ---- v1 LEGACY (remove with LegacyTeacherTarDataset) ----
     indices_list = [
         unpack_indices(low, bit17) for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
     ]
-    return tensors["values"], indices_list
+    return tensors["values"], indices_list, None
 
 
 def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
@@ -821,8 +949,8 @@ def load_log_probs_from_tar(tar_path: str, iteration: int):
 
     *iteration* is the zero-indexed count of saved iterations (the Nth
     iteration this DP rank flushed), matching the pre-v2 numbering scheme.
-    Returns ``(values, indices)`` as tensors for v2 tars or as lists of
-    per-microbatch tensors for v1 tars.
+    Returns ``(values, indices, cu_seqlens_padded)`` -- see
+    :func:`decode_logprobs_payload`.
 
     Peeks the tar's ``_meta.json`` to detect ``format_version`` and picks
     the matching entry iterator.  v2 tars are keyed on disk by global
