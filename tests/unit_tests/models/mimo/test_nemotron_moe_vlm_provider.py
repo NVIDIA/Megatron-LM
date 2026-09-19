@@ -167,6 +167,36 @@ def test_build_communicator_wires_bridge_receive_shape(
         assert shape_fns is None
 
 
+@pytest.mark.parametrize("skip_shape_exchange", [False, True])
+def test_llm_only_communicator_has_no_encoder_bridges(monkeypatch, skip_shape_exchange):
+    import examples.mimo.model_providers.nemotron_moe_vlm as provider
+
+    language_grid = object()
+    topology = SimpleNamespace(grids={MIMO_LANGUAGE_MODULE_KEY: language_grid})
+    language_config = SimpleNamespace(hidden_size=2688, params_dtype=torch.bfloat16)
+    # No vision configuration is needed when the topology contains only the LLM.
+    args = SimpleNamespace(mimo_llm_only=True, mimo_bridge_skip_shape_exchange=skip_shape_exchange)
+    monkeypatch.setattr(
+        provider,
+        "language_model_spec",
+        lambda args, pg_collection, grid: SimpleNamespace(params={"config": language_config}),
+    )
+    communicator_cls = provider.MultiModulePipelineCommunicator
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(communicator_cls, "_build_rank_module_info_map", lambda self: None)
+
+    communicator = build_nemotron_communicator(args, topology)
+
+    assert communicator.module_to_grid_map == topology.grids
+    assert communicator.topology == {MIMO_LANGUAGE_MODULE_KEY: []}
+    assert communicator.config is language_config
+    assert communicator.bridge_comms == []
+    assert communicator.module_output_ndim == {}
+    assert communicator.bridge_comm_dtypes == {}
+    assert communicator.bridge_recv_shape_fns == {}
+    assert communicator.bridge_requires_backward == {}
+
+
 # --- Config parity gate (requires torch; runs in CI) ----------------------
 
 pytest.importorskip("torch")
