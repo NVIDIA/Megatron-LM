@@ -17,6 +17,7 @@ from modelopt.torch.export import import_mcore_gpt_from_hf
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -77,13 +78,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args.model_type = model_type
     pre_process = mpu.is_pipeline_first_stage()
     post_process = mpu.is_pipeline_last_stage()
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     if args.init_model_with_meta_device:
         with torch.device("meta"):
-            model = model_provider_func(pre_process=pre_process, post_process=post_process)
+            model = model_provider_func(
+                pre_process=pre_process, post_process=post_process, pg_collection=pg_collection
+            )
         to_empty_if_meta(model, device="cuda")
     else:
-        model = model_provider_func(pre_process=pre_process, post_process=post_process)
+        model = model_provider_func(
+            pre_process=pre_process, post_process=post_process, pg_collection=pg_collection
+        )
 
     model.model_type = model_type
     return [model]

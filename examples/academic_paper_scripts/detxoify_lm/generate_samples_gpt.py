@@ -6,24 +6,27 @@
 import json
 import os
 import sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
-import torch
-from megatron.training import get_args
-from megatron.training import get_tokenizer
-from megatron.training import print_rank_0
-from megatron.training.checkpointing import load_checkpoint
-from megatron.core import mpu
-from megatron.training.arguments import parse_and_validate_args
-from megatron.training.initialize import initialize_megatron
-from megatron.training import get_model
-from megatron.inference.text_generation import generate_and_post_process
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt import GPTModel
 from typing import Union
+
+import torch
+
+from megatron.core import mpu
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import import_module
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
+from megatron.inference.text_generation import generate_and_post_process
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.initialize import initialize_megatron
+
 
 def model_provider(pre_process=True, post_process=True) -> GPTModel:
     """Builds the model.
@@ -74,7 +77,8 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         parallel_output=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent
+        rotary_percent=args.rotary_percent,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     return model

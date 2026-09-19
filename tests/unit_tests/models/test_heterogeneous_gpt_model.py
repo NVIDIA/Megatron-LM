@@ -9,6 +9,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
@@ -73,6 +74,7 @@ def heterogeneous_gpt_model(request, tmp_path):
         vocab_size=128256,
         position_embedding_type="rope",
         max_sequence_length=4,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
 
