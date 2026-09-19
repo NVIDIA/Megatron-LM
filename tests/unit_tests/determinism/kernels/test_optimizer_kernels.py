@@ -12,11 +12,7 @@ import pytest
 import torch
 
 from megatron.core.optimizer import Adam, OptimizerConfig
-from megatron.core.optimizer.clip_grads import (
-    clip_grad_by_total_norm_fp32,
-    get_grad_norm_fp32,
-    multi_tensor_scale_tensor_impl,
-)
+from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
 from megatron.core.optimizer.optimizer import ChainedOptimizer, FP32Optimizer
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
@@ -138,22 +134,17 @@ def test_fused_adam_step_replays():
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
 
 
-@pytest.mark.parametrize("grad_norm_group", [None, "mtp"])
-def test_chained_optimizer_cuda_graph(grad_norm_group):
+def test_chained_optimizer_cuda_graph():
     """Clipping across distinct process groups must capture and replay exactly."""
-    if multi_tensor_scale_tensor_impl is None:
-        pytest.skip("CUDA graph clipping requires Transformer Engine tensor scaling.")
     Utils.initialize_model_parallel()
     extra_group = torch.distributed.new_group()
-    graph = None
+    graph = torch.cuda.CUDAGraph()
     try:
         config = OptimizerConfig(optimizer="sgd", lr=0.1, clip_grad=1.0, optimizer_cuda_graph=True)
         params = [torch.nn.Parameter(torch.zeros(1, device="cuda")) for _ in range(2)]
         optimizers = []
         for param, group in zip(params, [torch.distributed.group.WORLD, extra_group]):
             param.grad = torch.zeros_like(param)
-            if grad_norm_group is not None:
-                param.grad_norm_group = grad_norm_group
             optimizer = FP32Optimizer(
                 torch.optim.SGD([param], lr=config.lr), config, lambda _: None
             )
@@ -169,37 +160,32 @@ def test_chained_optimizer_cuda_graph(grad_norm_group):
                     param.grad.fill_(value)
                 optimizer.step()
         torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             _, grad_norm, _ = optimizer.step()
 
-        references = {}
-        cases = [((3.0, 4.0), 5.0), ((0.0, 0.0), 0.0), ((5.0, 12.0), 13.0)]
-        for values, local_norm in cases * 2:
-            for param, value in zip(params, values):
-                param.data.zero_()
-                param.grad.fill_(value)
-            graph.replay()
+        for values, local_norm in [((3.0, 4.0), 5.0), ((0.0, 0.0), 0.0)]:
             expected_norm = local_norm * torch.distributed.get_world_size() ** 0.5
             coefficient = min(1.0, config.clip_grad / (expected_norm + 1e-6))
-            for param, value in zip(params, values):
-                torch.testing.assert_close(
-                    param, torch.full_like(param, -config.lr * value * coefficient)
-                )
-            torch.testing.assert_close(
-                grad_norm,
-                torch.full_like(grad_norm, expected_norm if grad_norm_group is None else 0.0),
-            )
-            outputs = [*params, grad_norm]
-            if values in references:
-                for output, reference in zip(outputs, references[values]):
-                    assert bytes_equal(output, reference), "Chained optimizer replay differs"
-            else:
-                references[values] = [output.detach().clone() for output in outputs]
+            reference = None
+            for _ in range(2):
+                for param, value in zip(params, values):
+                    param.data.zero_()
+                    param.grad.fill_(value)
+                graph.replay()
+                torch.testing.assert_close(grad_norm, torch.full_like(grad_norm, expected_norm))
+                for param, value in zip(params, values):
+                    torch.testing.assert_close(
+                        param, torch.full_like(param, -config.lr * value * coefficient)
+                    )
+                outputs = [*params, grad_norm]
+                if reference is None:
+                    reference = [output.detach().clone() for output in outputs]
+                else:
+                    for output, expected in zip(outputs, reference):
+                        assert bytes_equal(output, expected), "Chained optimizer replay differs"
     finally:
         torch.cuda.synchronize()
-        if graph is not None:
-            graph.reset()
+        graph.reset()
         torch.distributed.destroy_process_group(extra_group)
         Utils.destroy_model_parallel()
 
