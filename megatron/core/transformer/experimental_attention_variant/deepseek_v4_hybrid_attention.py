@@ -151,7 +151,7 @@ class DSv4HybridAttention(Attention):
                     f"{ratio_idx + 1} entries, got {len(self.config.csa_compress_ratios)}."
                 )
             compress_ratio = self.config.csa_compress_ratios[ratio_idx]
-        use_compressed_yarn = compress_ratio > 1
+        use_compressed_yarn = compress_ratio > (0 if config.dsv4_version == "v4.1" else 1)
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
@@ -270,6 +270,7 @@ class DSv4HybridAttention(Attention):
         sequence_len_offset=None,
         *,
         inference_params=None,
+        csa2_state=None,
     ):
         """Forward pass for DeepSeek-v4 Hybrid Attention"""
         assert (
@@ -287,6 +288,8 @@ class DSv4HybridAttention(Attention):
         assert (
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
+        if self.config.dsv4_version == "v4.1" and packed_seq_params is not None:
+            raise NotImplementedError("CSA2 currently supports unpacked sequences only")
         assert (
             packed_seq_params is None
         ), "Packed sequence is not supported for DSv4HybridAttention."
@@ -321,6 +324,7 @@ class DSv4HybridAttention(Attention):
                 packed_seq_params=None,
                 x=hidden_states,
                 qr=q_compressed,
+                **({"csa2_state": csa2_state} if self.config.dsv4_version == "v4.1" else {}),
             )
         core_attn_out = core_attn_manager.group_offload(
             core_attn_out, forced_released_tensors=[query, key, value]
@@ -600,7 +604,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            if self.config.dsv4_version != "v4.1":
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             kv, _ = self.linear_kv_proj(kv_compressed)
             kv = self.kv_layernorm(kv)

@@ -103,6 +103,13 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="deepseek_v41_csa2",
+        sources=("megatron/core/transformer/experimental_attention_variant/csa2.py",),
+        tests=(K + "test_deepseek_v41_kernels.py",),
+        kind="dispatch",
+        notes="Native attention replay; cuDNN/FlashMLA kernels are reused from the existing CSA backend.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
@@ -170,6 +177,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+            K + "test_deepseek_v41_kernels.py",
         ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "

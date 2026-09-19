@@ -11,3 +11,8 @@ class CSALayerConfig(MLATransformerConfig):
 
     compress_ratio: int = 0
     """Token compression ratio for this attention layer."""
+
+
+@dataclass(kw_only=True)
+class CSA2LayerConfig(MLATransformerConfig):
+    """A CSA2 attention branch in the V4.1 stack, with a logical source schedule."""

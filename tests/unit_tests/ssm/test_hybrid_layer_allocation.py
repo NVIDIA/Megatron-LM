@@ -26,6 +26,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSA2LayerConfig,
     CSALayerConfig,
 )
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
@@ -38,6 +39,7 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
     Symbols.ATTENTION: AttentionLayerConfig,
     Symbols.DS_ATTENTION: DSALayerConfig,
     Symbols.CSA: CSALayerConfig,
+    Symbols.CSA2: CSA2LayerConfig,
     Symbols.HCA: CSALayerConfig,
     Symbols.MLA: MLALayerConfig,
     Symbols.WINDOW: CSALayerConfig,
@@ -460,6 +462,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_all_layer_types(self):
@@ -475,6 +478,7 @@ class TestGetHybridLayerCounts:
             '-': 1,
             'E': 1,
             'W': 0,
+            'V': 0,
         }
         assert get_hybrid_layer_counts("MGD-E") == {
             '*': 0,
@@ -487,6 +491,7 @@ class TestGetHybridLayerCounts:
             '-': 1,
             'E': 1,
             'W': 0,
+            'V': 0,
         }
         assert get_hybrid_layer_counts("MG+-E") == {
             '*': 0,
@@ -499,6 +504,7 @@ class TestGetHybridLayerCounts:
             '-': 1,
             'E': 1,
             'W': 0,
+            'V': 0,
         }
 
     def test_with_pipes(self):
@@ -514,6 +520,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
             '*': 1,
@@ -526,6 +533,7 @@ class TestGetHybridLayerCounts:
             '-': 4,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_with_mtp(self):
@@ -541,6 +549,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_with_pipes_and_mtp(self):
@@ -557,6 +566,7 @@ class TestGetHybridLayerCounts:
             '-': 4,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_moe_pattern(self):
@@ -571,6 +581,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 2,
             'W': 0,
+            'V': 0,
         }
 
     def test_mtp_with_attention(self):
@@ -586,6 +597,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_gdn_pattern(self):
@@ -600,6 +612,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_gdn_hybrid_pattern(self):
@@ -615,6 +628,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_dsa_pattern(self):
@@ -629,6 +643,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_mla_pattern(self):
@@ -643,6 +658,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
     def test_empty_pattern(self):
@@ -657,6 +673,7 @@ class TestGetHybridLayerCounts:
             '-': 0,
             'E': 0,
             'W': 0,
+            'V': 0,
         }
 
 
