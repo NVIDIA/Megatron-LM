@@ -306,12 +306,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
-            hybrid_submodules = hybrid_stack_spec.submodules
-            mtp_block_spec = hybrid_submodules.mtp_block_spec
+            decoder_submodules = hybrid_stack_spec.submodules
+            mtp_block_spec = decoder_submodules.mtp_block_spec
             assert mtp_block_spec is not None, (
                 "MTP pattern specified but mtp_block_spec is None in hybrid_stack_spec.submodules. "
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
+            mtp_stack_submodules = decoder_submodules.mtp_stack_submodules or decoder_submodules
 
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
@@ -320,7 +321,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 vp_stage=self.vp_stage,
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
-                hybrid_submodules=hybrid_submodules,
+                hybrid_submodules=mtp_stack_submodules,
                 name="mtp",
             )
             self._setup_mtp_cuda_graphs()

@@ -501,6 +501,9 @@ def _get_wide_residual_hybrid_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
             mlp_layer=layer_spec(WideResidualTransformerLayer, submodules.mlp_layer),
             moe_layer=layer_spec(WideResidualTransformerLayer, submodules.moe_layer),
             mtp_block_spec=submodules.mtp_block_spec,
+            # MTP consumes ordinary-width decoder readout and embedding activations. Keep its
+            # complete layer selection static as well, but use the ordinary layer classes.
+            mtp_stack_submodules=submodules,
         ),
     )
 

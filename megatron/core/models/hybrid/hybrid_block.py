@@ -81,6 +81,7 @@ class HybridStackSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
+    mtp_stack_submodules: Optional["HybridStackSubmodules"] = None
 
 
 class HybridStack(MegatronModule):
@@ -162,7 +163,9 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
-        self.uses_wide_residual_stream = self.config.wide_residual is not None
+        # MTP consumes the decoder readout and shifted-token embedding at hidden_size.
+        # Its auxiliary stack therefore remains ordinary width when the decoder is wide.
+        self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
         boundary_layout = (
             self.config.linear_cp_layout if boundary_layout is None else boundary_layout
         )
@@ -226,6 +229,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
@@ -277,6 +281,7 @@ class HybridStack(MegatronModule):
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -304,6 +309,7 @@ class HybridStack(MegatronModule):
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,

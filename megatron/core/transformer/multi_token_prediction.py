@@ -1545,6 +1545,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         Concatenate the tokens before sending to transformer layer.
         """
+        decoder_input = decoder_input.to(dtype=self.config.params_dtype)
+        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         decoder_input = apply_module(self.enorm)(decoder_input)
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
         if self.mhc_enabled:
@@ -1683,6 +1685,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
 
         # Layer norm before shared head layer.
+        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.final_layernorm)(hidden_states)
         # TENorm produces a "viewed" tensor. This will result in schedule.py's
         # deallocate_output_tensor() throwing an error, so a viewless tensor is

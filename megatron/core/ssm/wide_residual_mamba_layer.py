@@ -20,7 +20,13 @@ class WideResidualMambaLayer(MambaLayer):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ) -> None:
+        if is_mtp_layer:
+            raise ValueError(
+                "MTP auxiliary stacks must use ordinary-width MambaLayer, not "
+                "WideResidualMambaLayer."
+            )
         super().__init__(
             config=config,
             submodules=submodules,
@@ -28,6 +34,7 @@ class WideResidualMambaLayer(MambaLayer):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if config.wide_residual is None:
