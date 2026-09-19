@@ -2052,8 +2052,10 @@ def dsa_min_memory_gqa(
     softmax_scale: float,
     loss_coeff: float,
     use_indexer_rope: bool,
-    query_chunk_size: Optional[int],
-    key_chunk_size: Optional[int],
+    # Default to None: the tile sizes are no longer configurable, so production callers
+    # let _plan_execution choose. Tests still pass explicit sizes to exercise tiling.
+    query_chunk_size: Optional[int] = None,
+    key_chunk_size: Optional[int] = None,
     cache_routing: bool = False,
     cache_indexer_k: bool = False,
     cache_selected_scores: bool = False,
