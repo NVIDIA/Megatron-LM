@@ -36,6 +36,7 @@ class _DifferentiableEngramAllToAll(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, group, input_: Tensor, output_splits: list[int], input_splits: list[int]):
+        """Exchange owner embeddings while retaining peer splits for the reverse exchange."""
         ctx.group = group
         ctx.output_splits = output_splits
         ctx.input_splits = input_splits
@@ -50,6 +51,7 @@ class _DifferentiableEngramAllToAll(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
+        """Return embedding gradients to the owners using the reversed peer splits."""
         message = "engram.lookup.return-a2a.backward"
         nvtx_range_push(message)
         try:
@@ -66,6 +68,7 @@ class _DeterministicEmbedding(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, weight: Tensor, row_ids: Tensor) -> Tensor:
+        """Gather requested rows and save their IDs for deterministic accumulation."""
         ctx.save_for_backward(row_ids)
         ctx.weight_shape = weight.shape
         ctx.weight_dtype = weight.dtype
@@ -73,6 +76,7 @@ class _DeterministicEmbedding(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None]:
+        """Sum duplicate-row gradients in sorted order and write each unique row once."""
         message = "engram.embedding.backward"
         nvtx_range_push(message)
         try:
