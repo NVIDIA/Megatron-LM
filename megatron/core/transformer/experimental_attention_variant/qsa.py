@@ -99,6 +99,8 @@ class QSASelection:
     selected_ids: Optional[Tensor] = None
     index_query: Optional[Tensor] = None
     compressed_key: Optional[Tensor] = None
+    compact_block_prefix: Optional[Tensor] = None
+    compact_block_starts: Optional[Tensor] = None
 
 
 def _stage2_packed_lengths(
@@ -320,6 +322,66 @@ class QSAIndexer(MegatronModule):
             .expand(n_docs, -1)
         )
         return pooled, block_positions, block_valid
+
+    def _select_mixed_packed_ids(
+        self,
+        q: Tensor,
+        raw_keys: Tensor,
+        doc_ids: Tensor,
+        positions: Tensor,
+        rotary_pos_emb: Tensor,
+        packed_seq_params: PackedSeqParams,
+        max_doc_len: int,
+        is_absolute_mrope: bool,
+    ) -> Tuple[Tensor, bool, Tensor, Tensor, Tensor]:
+        """Route mixed packed documents through a differentiable compact key pool.
+
+        Hard TopK remains detached; Stage-2 can differentiate selected scores
+        through the compact keys when its auxiliary coefficient is positive.
+        """
+        from megatron.core.transformer.experimental_attention_variant.qsa_id_mixed_router import (
+            pool_complete_blocks,
+            select_document_local_ids,
+        )
+
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        pooled, prefix, counts, block_doc, block_relative, block_valid = pool_complete_blocks(
+            raw_keys, doc_ids, positions, num_docs=cu.numel() - 1, ratio=self.compress_ratio
+        )
+        starts = cu[:-1].to(device=block_relative.device, dtype=torch.long)
+        block_starts = torch.where(
+            block_valid,
+            starts[block_doc] + block_relative.long() * self.compress_ratio,
+            torch.zeros_like(block_relative, dtype=torch.long),
+        )
+        if pooled.numel() > 0:
+            pooled = self.k_layernorm(pooled)
+            rope_positions = block_relative.long() * self.compress_ratio
+            if is_absolute_mrope and rotary_pos_emb.shape[0] == q.shape[0]:
+                rope_positions = rope_positions + starts[block_doc]
+            rope_positions = torch.where(
+                block_valid, rope_positions, torch.zeros_like(rope_positions)
+            ).clamp_max(rotary_pos_emb.shape[0] - 1)
+            pooled = self._rope_at_positions(pooled, rotary_pos_emb, rope_positions)
+        selected_ids = select_document_local_ids(
+            q.detach(),
+            pooled.detach(),
+            doc_ids,
+            positions,
+            prefix,
+            counts,
+            ratio=self.compress_ratio,
+            topk=self.block_topk,
+        )
+        return (
+            selected_ids,
+            max_doc_len // self.compress_ratio <= self.block_topk,
+            pooled,
+            prefix,
+            block_starts,
+        )
 
     @torch.no_grad()
     def _select_blocks(
@@ -568,41 +630,58 @@ class QSAIndexer(MegatronModule):
         doc_flat = doc_ids.reshape(-1)
         pos_flat = positions.reshape(-1)
 
+        compact_block_prefix = None
+        compact_block_starts = None
         with nullcontext() if use_loss else torch.no_grad():
-            pooled, block_positions, block_valid = self._pool_keys(
-                keys_flat if use_loss else keys_flat.detach(), doc_flat, pos_flat, max_doc_len
-            )
-            n_docs, n_blocks_max, D = pooled.shape
-            if n_blocks_max > 0:
-                pooled = self.k_layernorm(pooled.reshape(-1, D))
-                rope_block_positions = block_positions
-                if is_absolute_mrope and is_thd and rotary_pos_emb.shape[0] == s:
-                    cu = packed_seq_params.cu_seqlens_q_padded
-                    if cu is None:
-                        cu = packed_seq_params.cu_seqlens_q
-                    starts = cu[:-1].to(device=block_positions.device, dtype=torch.long)
-                    ends = cu[1:].to(device=block_positions.device, dtype=torch.long)
-                    rope_block_positions = (block_positions + starts[:, None]).clamp_max(
-                        ends[:, None] - 1
+            if is_thd and output_format == "ids" and packed_seq_params.cu_seqlens_q.numel() > 2:
+                selection, all_selected, pooled, compact_block_prefix, compact_block_starts = (
+                    self._select_mixed_packed_ids(
+                        q_flat,
+                        keys_flat if use_loss else keys_flat.detach(),
+                        doc_flat,
+                        pos_flat,
+                        rotary_pos_emb,
+                        packed_seq_params,
+                        max_doc_len,
+                        is_absolute_mrope,
                     )
-                batch_indices = None
-                if is_absolute_mrope and not is_thd and b > 1:
-                    batch_indices = torch.arange(n_docs, device=pooled.device).repeat_interleave(
-                        n_blocks_max
-                    )
-                pooled = self._rope_at_positions(
-                    pooled, rotary_pos_emb, rope_block_positions.reshape(-1), batch_indices
                 )
-                pooled = pooled.view(n_docs, n_blocks_max, D)
-            selection, all_selected = self._select_blocks(
-                q_flat.detach(),
-                pooled,
-                block_valid,
-                doc_flat,
-                pos_flat,
-                None if is_thd else s,
-                output_format=output_format,
-            )
+                D = pooled.shape[-1]
+            else:
+                pooled, block_positions, block_valid = self._pool_keys(
+                    keys_flat if use_loss else keys_flat.detach(), doc_flat, pos_flat, max_doc_len
+                )
+                n_docs, n_blocks_max, D = pooled.shape
+                if n_blocks_max > 0:
+                    pooled = self.k_layernorm(pooled.reshape(-1, D))
+                    rope_block_positions = block_positions
+                    if is_absolute_mrope and is_thd and rotary_pos_emb.shape[0] == s:
+                        cu = packed_seq_params.cu_seqlens_q_padded
+                        if cu is None:
+                            cu = packed_seq_params.cu_seqlens_q
+                        starts = cu[:-1].to(device=block_positions.device, dtype=torch.long)
+                        ends = cu[1:].to(device=block_positions.device, dtype=torch.long)
+                        rope_block_positions = (block_positions + starts[:, None]).clamp_max(
+                            ends[:, None] - 1
+                        )
+                    batch_indices = None
+                    if is_absolute_mrope and not is_thd and b > 1:
+                        batch_indices = torch.arange(
+                            n_docs, device=pooled.device
+                        ).repeat_interleave(n_blocks_max)
+                    pooled = self._rope_at_positions(
+                        pooled, rotary_pos_emb, rope_block_positions.reshape(-1), batch_indices
+                    )
+                    pooled = pooled.view(n_docs, n_blocks_max, D)
+                selection, all_selected = self._select_blocks(
+                    q_flat.detach(),
+                    pooled,
+                    block_valid,
+                    doc_flat,
+                    pos_flat,
+                    None if is_thd else s,
+                    output_format=output_format,
+                )
         selected_ids = selection if output_format == "ids" else None
         selected_bits = selection if output_format == "bits" else None
         nbytes = selected_bits.shape[1] if selected_bits is not None else 0
@@ -619,6 +698,8 @@ class QSAIndexer(MegatronModule):
             selected_ids=selected_ids.contiguous() if selected_ids is not None else None,
             index_query=q_flat if use_loss else None,
             compressed_key=pooled.reshape(-1, D) if use_loss else None,
+            compact_block_prefix=compact_block_prefix if use_loss else None,
+            compact_block_starts=compact_block_starts if use_loss else None,
         )
 
 
@@ -755,27 +836,31 @@ class QSACoreAttention(torch.nn.Module):
             positions = selection.positions.reshape(-1).index_select(0, rows).long()
             query_valid_rows = positions < valid_lengths[doc_ids]
             ids = ids.masked_fill(~query_valid_rows[:, None], -1)
-            n_docs = valid_lengths.numel()
-            blocks_per_doc = selection.compressed_key.shape[0] // n_docs
+            document_starts = physical_cu[:-1].index_select(0, doc_ids)
+            if selection.compact_block_prefix is not None:
+                if selection.compact_block_starts is None:
+                    raise RuntimeError("compact QSA Stage-2 routes require block starts")
+                block_starts = selection.compact_block_starts
+                block_ids = torch.where(
+                    ids >= 0, ids + selection.compact_block_prefix[doc_ids][:, None].long(), -1
+                )
+            else:
+                n_docs = valid_lengths.numel()
+                blocks_per_doc = selection.compressed_key.shape[0] // n_docs
+                # Unused slots in the rectangular pooled table are harmless but must
+                # have an in-bounds dummy start for the helper's metadata validation.
+                block_offsets = (
+                    torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)
+                    * selection.compress_ratio
+                )
+                block_starts = (
+                    (physical_cu[:-1, None] + block_offsets[None, :])
+                    .reshape(-1)
+                    .clamp_max(s - selection.compress_ratio)
+                )
+                block_ids = torch.where(ids >= 0, ids + doc_ids[:, None] * blocks_per_doc, -1)
         else:
             blocks_per_doc = selection.compressed_key.shape[0] // b
-        if blocks_per_doc == 0:
-            return output
-        if is_thd:
-            doc_base = doc_ids
-            document_starts = physical_cu[:-1].index_select(0, doc_ids)
-            # Unused slots in the rectangular pooled table are harmless but must
-            # have an in-bounds dummy start for the helper's metadata validation.
-            block_offsets = (
-                torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)
-                * selection.compress_ratio
-            )
-            block_starts = (
-                (physical_cu[:-1, None] + block_offsets[None, :])
-                .reshape(-1)
-                .clamp_max(s - selection.compress_ratio)
-            )
-        else:
             doc_base = torch.arange(b, device=query.device, dtype=torch.long)[:, None]
             doc_base = doc_base.expand(-1, local_positions.numel()).reshape(-1)
             document_starts = doc_base * s
@@ -786,7 +871,9 @@ class QSACoreAttention(torch.nn.Module):
                 * selection.compress_ratio
             ).reshape(-1)
             positions = selection.positions.index_select(1, local_positions).reshape(-1).long()
-        block_ids = torch.where(ids >= 0, ids + doc_base[:, None] * blocks_per_doc, -1)
+            block_ids = torch.where(ids >= 0, ids + doc_base[:, None] * blocks_per_doc, -1)
+        if selection.compressed_key.shape[0] == 0:
+            return output
         local_query = query.index_select(0, local_positions)
         index_query = selection.index_query.index_select(0, rows)
         teacher_query = local_query if is_thd else local_query.transpose(0, 1).reshape(-1, hq, d)
