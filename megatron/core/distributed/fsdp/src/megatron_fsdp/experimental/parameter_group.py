@@ -221,13 +221,17 @@ class FsdpParameterGroup:
             block_size=block_size,
         )
         for index, parameter in enumerate(parameters):
+            # TE can preserve the values from before MXFP8 quantization. Use them
+            # to initialize optimizer weights without quantization error, then
+            # release TE's extra copy. Otherwise initialize from the parameter.
             get_high_precision_init_val = getattr(parameter, "get_high_precision_init_val", None)
             if get_high_precision_init_val:
                 initial_value = get_high_precision_init_val()
                 parameter.clear_high_precision_init_val()
             else:
                 initial_value = parameter
-            self.main_weight.copy_from(index, initial_value)
+            # Convert MXFP8 tensors to ordinary tensors before copying their owned slice.
+            self.main_weight.copy_from(index, initial_value.to(dtype=main_weight_dtype))
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
@@ -240,7 +244,7 @@ class FsdpParameterGroup:
             self.model_weight = self.main_weight
         else:
             with self._symmetric_memory_context():
-                if HAVE_TE and self.dtype == torch.uint8:
+                if self.dtype == torch.uint8:
                     self.model_weight = QuantizedDBuffer(
                         self.mesh, model_weight_placements, tensor_shapes, self.main_weight.device
                     )
@@ -260,15 +264,7 @@ class FsdpParameterGroup:
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         with self._symmetric_memory_context():
-            if HAVE_TE and isinstance(self.model_weight, QuantizedDBuffer):
-                self._unsharded_model_weight = QuantizedDBuffer(
-                    self.mesh,
-                    [Replicate()] * self.mesh.ndim,
-                    tensor_shapes,
-                    self.main_weight.device,
-                )
-            else:
-                assert isinstance(self.model_weight, DBuffer)
+            if isinstance(self.model_weight, DBuffer):
                 self._unsharded_model_weight = DBuffer.empty(
                     mesh=self.mesh,
                     placements=[Replicate()] * self.mesh.ndim,
@@ -276,6 +272,13 @@ class FsdpParameterGroup:
                     dtype=self.dtype,
                     device=self.main_weight.device,
                     block_size=block_size,
+                )
+            else:
+                self._unsharded_model_weight = QuantizedDBuffer(
+                    self.mesh,
+                    [Replicate()] * self.mesh.ndim,
+                    tensor_shapes,
+                    self.main_weight.device,
                 )
 
         self.main_grad = None
@@ -366,11 +369,11 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
-        if HAVE_TE and isinstance(self.post_optimizer_model_weight, QuantizedDBuffer):
-            self.post_optimizer_model_weight.quantize_(self.main_weight)
-        else:
+        if isinstance(self.post_optimizer_model_weight, DBuffer):
             assert isinstance(self.model_weight, DBuffer)
             self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        else:
+            self.post_optimizer_model_weight.quantize_(self.main_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
@@ -390,9 +393,9 @@ class FsdpParameterGroup:
             with self._symmetric_memory_context():
                 unsharded_model_weight.reallocate_storage()
             preserved_tensors = (
-                tuple(plane.local_buffer for plane in unsharded_model_weight.planes)
-                if HAVE_TE and isinstance(unsharded_model_weight, QuantizedDBuffer)
-                else unsharded_model_weight.local_buffer
+                unsharded_model_weight.local_buffer
+                if isinstance(unsharded_model_weight, DBuffer)
+                else tuple(plane.local_buffer for plane in unsharded_model_weight.planes)
             )
             # This buffer backs unsharded Parameters whose views may be saved by autograd.
             # Autograd records a tensor's version counter when saving it for backward, and

@@ -630,9 +630,8 @@ def _specialize_placements(
 ) -> tuple[Placement, ...]:
     """Specialize public placements for one homogeneous parameter group.
 
-    Today every parameter group maps Torch's user-facing ``Shard(0)`` to the
-    DBuffer-specific ``Flat`` format. This dtype-homogeneous group boundary is
-    where MXFP8 groups will instead select ``BlockAtomic``.
+    Map Torch's user-facing ``Shard(0)`` to ``BlockAtomic`` for MXFP8 groups
+    and ``Flat`` for ordinary floating-point groups.
     """
     if group_dtype not in (torch.uint8, torch.float32, torch.bfloat16, torch.float16):
         raise NotImplementedError(f"Unsupported group dtype: {group_dtype}.")
@@ -641,7 +640,12 @@ def _specialize_placements(
             raise NotImplementedError(
                 "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
             )
-    placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else Flat()
+    if group_dtype == torch.uint8:
+        from transformer_engine.pytorch.constants import MXFP8_BLOCK_SCALING_SIZE
+
+        placement_type = BlockAtomic(MXFP8_BLOCK_SCALING_SIZE)
+    else:
+        placement_type = Flat()
     return tuple(
         placement_type if type(placement) is Shard else placement for placement in placements
     )

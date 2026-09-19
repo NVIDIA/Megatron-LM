@@ -294,7 +294,7 @@ class DBuffer:
             A DBuffer whose real local storage matches ``placements``. Ranges
             corresponding to meta tensors are left uninitialized.
         """
-        tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
+        tensors = tuple(tensors)
         if not tensors:
             raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
 
@@ -325,7 +325,7 @@ class DBuffer:
         owned_range = self._get_owned_range(index)
         if owned_range is None or tensor.is_meta:
             return
-        tensor = tensor.detach().to(device=self.device, dtype=self.dtype).contiguous()
+        tensor = tensor.detach().contiguous()
         source_slice = tensor.view(-1).narrow(
             0, owned_range.tensor_relative_offset, owned_range.numel
         )
