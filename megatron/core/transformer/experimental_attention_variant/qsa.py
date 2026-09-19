@@ -29,6 +29,7 @@ import functools
 import math
 import os
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -46,6 +47,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
+from megatron.core.transformer.experimental_attention_variant.qsa_stage2_loss import (
+    qsa_stage2_sparse_kl,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -92,6 +97,8 @@ class QSASelection:
     compress_ratio: int
     all_selected: bool
     selected_ids: Optional[Tensor] = None
+    index_query: Optional[Tensor] = None
+    compressed_key: Optional[Tensor] = None
 
 
 @dataclass
@@ -449,6 +456,16 @@ class QSAIndexer(MegatronModule):
             )
         local_seq_len = hidden_states.shape[0]
         cp_size = get_pg_size(self.pg_collection.cp)
+        use_loss = (
+            output_format == "ids"
+            and self.training
+            and torch.is_grad_enabled()
+            and self.config.qsa_indexer_loss_coeff > 0
+        )
+        if use_loss and local_seq_len * cp_size * hidden_states.shape[1] > 4096:
+            raise NotImplementedError(
+                "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
+            )
         if cp_size > 1:
             # Rebuild the full sequence (true causal order) so the block selection sees every
             # key of the sequence, exactly as in the CP=1 case. The owning
@@ -469,11 +486,17 @@ class QSAIndexer(MegatronModule):
         # full-sequence queries as if they were still rank-local.
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         s, b, _ = hidden_states.shape
+        if use_loss and s * b > 4096:
+            raise NotImplementedError(
+                "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
+            )
         with torch.no_grad():
             doc_ids, positions, max_doc_len = _sequence_layout(
                 b, s, packed_seq_params, hidden_states.device
             )
-        qk, _ = self.index_qk_proj(hidden_states)  # [s, b, (H+1)*D]
+        # The auxiliary KL must update the indexer without adding a second
+        # gradient path into the backbone's layer input.
+        qk, _ = self.index_qk_proj(hidden_states.detach() if use_loss else hidden_states)
         q, raw_keys = torch.split(
             qk, [self.n_heads * self.head_dim, self.kv_heads * self.head_dim], dim=-1
         )
@@ -504,9 +527,9 @@ class QSAIndexer(MegatronModule):
         doc_flat = doc_ids.reshape(-1)
         pos_flat = positions.reshape(-1)
 
-        with torch.no_grad():
+        with nullcontext() if use_loss else torch.no_grad():
             pooled, block_positions, block_valid = self._pool_keys(
-                keys_flat.detach(), doc_flat, pos_flat, max_doc_len
+                keys_flat if use_loss else keys_flat.detach(), doc_flat, pos_flat, max_doc_len
             )
             n_docs, n_blocks_max, D = pooled.shape
             if n_blocks_max > 0:
@@ -553,6 +576,8 @@ class QSAIndexer(MegatronModule):
             compress_ratio=self.compress_ratio,
             all_selected=all_selected,
             selected_ids=selected_ids.contiguous() if selected_ids is not None else None,
+            index_query=q_flat if use_loss else None,
+            compressed_key=pooled.reshape(-1, D) if use_loss else None,
         )
 
 
@@ -637,6 +662,82 @@ class QSACoreAttention(torch.nn.Module):
     def set_selection(self, selection: Optional[QSASelection]) -> None:
         """Register the block selection consumed by the next forward call."""
         self._selection = selection
+
+    def _attach_indexer_loss(
+        self,
+        output: Tensor,
+        query: Tensor,
+        key: Tensor,
+        selection: QSASelection,
+        packed_seq_params: Optional[PackedSeqParams],
+        cp_size: int,
+    ) -> Tensor:
+        """Use only this CP rank's query rows against the global selected routes."""
+        if (
+            selection.index_query is None
+            or selection.compressed_key is None
+            or selection.selected_ids is None
+        ):
+            raise RuntimeError("QSA Stage-2 KL requires differentiable indexer projections")
+        if packed_seq_params is not None:
+            raise NotImplementedError(
+                "QSA Stage-2 KL requires unpadded SBHD until packed key masking is proven"
+            )
+        s, b, hq, d = query.shape
+        if s * b > 4096:
+            raise NotImplementedError(
+                "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
+            )
+        if self.config.attention_dropout != 0:
+            raise NotImplementedError("QSA Stage-2 KL requires attention_dropout=0")
+        if self.config.tensor_model_parallel_size > 1 and self.pg_collection.tp is None:
+            raise RuntimeError("QSA Stage-2 KL requires an explicit TP process group")
+        if cp_size > 1:
+            from megatron.core.ssm.mamba_context_parallel import split_tensor_cp
+
+            local_positions = split_tensor_cp(
+                torch.arange(s, device=query.device, dtype=torch.long), packed_seq_params, dim=0
+            )
+        else:
+            local_positions = torch.arange(s, device=query.device, dtype=torch.long)
+        rows = (
+            torch.arange(b, device=query.device, dtype=torch.long)[:, None] * s
+            + local_positions[None, :]
+        ).reshape(-1)
+        ids = selection.selected_ids.index_select(0, rows).long()
+        blocks_per_doc = selection.compressed_key.shape[0] // b
+        if blocks_per_doc == 0:
+            return output
+        doc_base = torch.arange(b, device=query.device, dtype=torch.long)[:, None]
+        doc_base = doc_base.expand(-1, local_positions.numel()).reshape(-1)
+        block_ids = torch.where(ids >= 0, ids + doc_base[:, None] * blocks_per_doc, -1)
+        block_starts = (
+            torch.arange(b, device=query.device, dtype=torch.long)[:, None] * s
+            + torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)[None, :]
+            * selection.compress_ratio
+        ).reshape(-1)
+        local_query = query.index_select(0, local_positions)
+        index_query = selection.index_query.index_select(0, rows)
+        positions = selection.positions.index_select(1, local_positions).reshape(-1).long()
+        teacher_query = local_query.transpose(0, 1).reshape(-1, hq, d)
+        teacher_key = key.transpose(0, 1).reshape(-1, key.shape[-2], d)
+        loss = qsa_stage2_sparse_kl(
+            index_query,
+            selection.compressed_key,
+            block_ids,
+            block_starts,
+            teacher_query,
+            teacher_key,
+            doc_base * s,
+            positions,
+            compress_ratio=selection.compress_ratio,
+            loss_coeff=self.config.qsa_indexer_loss_coeff,
+            softmax_scale=self.softmax_scale,
+            calculate_per_token_loss=self.config.calculate_per_token_loss,
+            query_chunk_size=8,
+            tp_group=self.pg_collection.tp,
+        )
+        return DSAIndexerLossAutoScaler.apply(output, loss)
 
     def _id_sparse_forward(
         self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
@@ -819,8 +920,11 @@ class QSACoreAttention(torch.nn.Module):
                 "QwenSparseSelfAttention must run the indexer first."
             )
         cp_size = get_pg_size(self.pg_collection.cp)
+        use_loss = (
+            self.training and torch.is_grad_enabled() and self.config.qsa_indexer_loss_coeff > 0
+        )
         if selection.all_selected and not self.config.qsa_force_sparse and cp_size == 1:
-            return self.dense_core_attention(
+            out = self.dense_core_attention(
                 query,
                 key,
                 value,
@@ -829,6 +933,11 @@ class QSACoreAttention(torch.nn.Module):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
+            if use_loss:
+                out = self._attach_indexer_loss(
+                    out, query, key, selection, packed_seq_params, cp_size
+                )
+            return out
         assert attention_bias is None, "QSA does not support attention bias"
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         # The sparse (FlexAttention) and dense-masked (SDPA) paths run their kernel directly on
@@ -867,6 +976,8 @@ class QSACoreAttention(torch.nn.Module):
             out = self._flex_forward(query, key, value, selection, is_thd)
         if cp_size > 1:
             out = split_tensor_cp(out, packed_seq_params, dim=0)
+        if use_loss:
+            out = self._attach_indexer_loss(out, query, key, selection, packed_seq_params, cp_size)
         return out
 
 
@@ -946,6 +1057,21 @@ class QwenSparseSelfAttention(SelfAttention):
             raise NotImplementedError(
                 "QwenSparseSelfAttention does not support inference contexts yet."
             )
+        use_loss = (
+            self.training and torch.is_grad_enabled() and self.config.qsa_indexer_loss_coeff > 0
+        )
+        if use_loss and self.core_attention.sparse_backend != "id_sparse":
+            raise NotImplementedError("QSA Stage-2 KL requires MCORE_QSA_SPARSE_BACKEND=id_sparse")
+        if use_loss and packed_seq_params is not None:
+            raise NotImplementedError("QSA Stage-2 KL does not support packed/padded keys yet")
+        if use_loss and self.config.attention_dropout != 0:
+            raise NotImplementedError("QSA Stage-2 KL requires attention_dropout=0")
+        if (
+            use_loss
+            and self.config.tensor_model_parallel_size > 1
+            and self.pg_collection.tp is None
+        ):
+            raise RuntimeError("QSA Stage-2 KL requires an explicit TP process group")
         output_format = "ids" if self.core_attention.sparse_backend == "id_sparse" else "bits"
         selection = self.indexer(
             hidden_states, rotary_pos_emb, packed_seq_params, output_format=output_format
