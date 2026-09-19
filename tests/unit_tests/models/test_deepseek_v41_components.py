@@ -1,12 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Numerical and boundary checks for released V4.1 conditional components."""
+
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.distributed.finalize_model_grads import _update_router_expert_bias
+from megatron.core.models.deepseek_v41.dspark import DSparkOutput, select_verification_length
 from megatron.core.models.deepseek_v41.engram import EngramHasher
-from megatron.core.models.deepseek_v41.moe import ModalityRouter
+from megatron.core.models.deepseek_v41.moe import ModalityBalance, ModalityRouter
 from megatron.core.models.deepseek_v41.vision import Aligner, get_vision_cos_sin
 from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
 from tests.unit_tests.models.test_deepseek_v41 import groups, tiny_config
@@ -20,10 +25,10 @@ def test_hashes_match_integer_oracle_and_reset_at_image_boundary():
     hashes = hasher(tokens, valid)
     expected = torch.empty_like(hashes)
     for position in range(tokens.shape[1]):
-        history, blocked = ([], False)
+        history, blocked = [], False
         for shift in range(options.max_ngram_size):
             source = position - shift
-            blocked = blocked or source < 0 or (not valid[0, max(source, 0)])
+            blocked = blocked or source < 0 or not valid[0, max(source, 0)]
             history.append(hasher.pad_id if blocked else int(tokens[0, source]))
         for layer in range(len(options.layer_ids)):
             rolling = history[0] * int(hasher.multipliers[layer, 0])
@@ -87,3 +92,34 @@ def test_modality_biases_select_experts_without_changing_weights(groups):
     torch.testing.assert_close(probs.sum(-1).float(), torch.full((2,), 1.5, device="cuda"))
     assert router.text_balance.local_tokens_per_expert.tolist() == [1, 1, 0, 0]
     assert router.image_balance.local_tokens_per_expert.tolist() == [0, 0, 1, 1]
+
+
+def test_mixed_backbone_and_draft_expert_counts_update_independently(groups):
+    modules = torch.nn.ModuleList([ModalityBalance(4), ModalityBalance(2)]).cuda()
+    modules[0].local_tokens_per_expert.copy_(torch.tensor([4, 0, 0, 0], device="cuda"))
+    modules[1].local_tokens_per_expert.copy_(torch.tensor([0, 3], device="cuda"))
+    config = tiny_config()
+    _update_router_expert_bias([modules], config, groups.tp_dp_cp)
+    rate = config.moe_router_bias_update_rate
+    torch.testing.assert_close(
+        modules[0].expert_bias, torch.tensor([-rate, rate, rate, rate], device="cuda")
+    )
+    torch.testing.assert_close(modules[1].expert_bias, torch.tensor([rate, -rate], device="cuda"))
+
+
+def test_dspark_confidence_targets_use_distribution_overlap():
+    logits = torch.tensor([[[[0.4, -0.3], [0.2, 0.8]]]], requires_grad=True)
+    confidence = torch.zeros(1, 1, 2, requires_grad=True)
+    teacher = torch.tensor([[[[0.3, -0.2], [0.1, 1.0]]]], requires_grad=True)
+    result = DSparkOutput(logits, confidence, torch.tensor([[[0, 1]]]))
+    loss = result.loss(teacher, ce_weight=0, l1_weight=0)
+    overlap = torch.minimum(logits.softmax(-1), teacher.softmax(-1)).sum(-1).detach()
+    expected = F.binary_cross_entropy_with_logits(confidence, overlap)
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert teacher.grad is None
+    torch.testing.assert_close(confidence.grad, (0.5 - overlap) / 2)
+    torch.testing.assert_close(
+        select_verification_length(torch.tensor([[0.9, 0.1]]), torch.tensor([1.0, 2.0])),
+        torch.tensor([1]),
+    )

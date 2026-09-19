@@ -358,17 +358,21 @@ def _update_router_expert_bias(
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return
-    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
-    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
-    stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert,
-        stacked_expert_bias,
-        config.moe_router_bias_update_rate,
-        tp_dp_cp_group=tp_dp_cp_group,
-    )
-
-    for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
-        expert_bias.copy_(updated_expert_bias)
+    # Backbone and draft networks may use different numbers of routed experts.
+    # Batch only compatible vectors, preserving a deterministic collective order.
+    groups = {}
+    for counts, bias in zip(tokens_per_expert_list, expert_bias_list):
+        groups.setdefault(tuple(bias.shape), []).append((counts, bias))
+    for shape in sorted(groups):
+        entries = groups[shape]
+        updated = get_updated_expert_bias(
+            torch.stack([counts for counts, _ in entries]),
+            torch.stack([bias for _, bias in entries]),
+            config.moe_router_bias_update_rate,
+            tp_dp_cp_group=tp_dp_cp_group,
+        )
+        for (_, bias), value in zip(entries, updated):
+            bias.copy_(value)
 
 
 def _update_router_qb_beta(

@@ -2,9 +2,10 @@
 
 """Conditional-memory integration with the standard HybridStack layer loop."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 
+import torch
 from torch import Tensor
 
 from megatron.core.models.deepseek_v41.moe import ModalityMoELayer, ModalityRouter
@@ -24,6 +25,10 @@ class DeepSeekV41ForwardContext(HybridStackForwardContext):
     engram_hashes: Tensor | None = None
     token_mask: Tensor | None = None
     image_mask: Tensor | None = None
+    return_target_hidden: bool = False
+    target_layer_ids: tuple[int, ...] = ()
+    target_stack_layer_ids: frozenset[int] = frozenset()
+    target_hidden: list[Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -45,6 +50,7 @@ class DeepSeekV41Adapter(CSA2HybridAdapter):
 
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
+        self.num_streams = config.mhc_num_residual_streams if config.enable_mhc_connections else 1
         self.moe_layer_ids = frozenset(
             i for i, symbol in enumerate(kwargs["layer_type_list"]) if symbol == "E"
         )
@@ -55,6 +61,7 @@ class DeepSeekV41Adapter(CSA2HybridAdapter):
             context = DeepSeekV41ForwardContext(
                 cross_layer_state=context.cross_layer_state, mhc_state=context.mhc_state
             )
+        context.target_stack_layer_ids = frozenset(2 * i for i in context.target_layer_ids)
         if context.cross_layer_state is None:
             context.cross_layer_state = MultimodalCSA2State(
                 attention_layer_ids=self.attention_layer_ids,
@@ -70,7 +77,18 @@ class DeepSeekV41Adapter(CSA2HybridAdapter):
             if context.engram_hashes is None:
                 raise ValueError("Engram layers require hash addresses in the forward context")
             hidden_states = engram(hidden_states, context.engram_hashes, context.token_mask)
+        if layer.layer_number - 1 in context.target_stack_layer_ids:
+            context.target_hidden.append(
+                hidden_states.unflatten(-1, (self.num_streams, -1)).mean(-2).detach()
+            )
         return hidden_states
+
+    def finalize_forward(self, output, context):
+        """Return optional detached teacher features without keeping them on the adapter."""
+        if context.return_target_hidden:
+            features = torch.cat(context.target_hidden, -1) if context.target_hidden else None
+            return output, features
+        return output
 
 
 deepseek_v41_stack_spec = replace(

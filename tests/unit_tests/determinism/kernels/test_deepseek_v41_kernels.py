@@ -1,8 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Bit-exact replay of V4.1 attention, conditional-memory lookup and draft heads."""
+
 import pytest
 import torch
 
+from megatron.core.models.deepseek_v41.dspark import DSpark
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention as dsv4_attention,
@@ -156,3 +159,28 @@ def test_engram_duplicate_rows_replay(groups):
     ids = torch.tensor([[[1, 3], [1, 3], [5, 2], [1, 3]]], device="cuda")
     with deterministic_algorithms(True):
         assert_module_replays_bit_exact(module, (ids,))
+
+
+def test_dspark_embedding_and_markov_replay(groups):
+    seeded()
+    config = tiny_config(all_components=True)
+
+    class DraftWithConfidence(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.draft = DSpark(config, 128, groups)
+
+        def forward(self, tokens, features, anchors, embedding, head):
+            result = self.draft(tokens, features, anchors, embedding, head)
+            return result.logits + result.confidence.unsqueeze(-1)
+
+    module = DraftWithConfidence().cuda()
+    inputs = (
+        torch.full((1, 17), 5, device="cuda", dtype=torch.long),
+        torch.randn(17, 1, 64, device="cuda"),
+        torch.tensor([[8]], device="cuda"),
+        torch.randn(128, 32, device="cuda"),
+        torch.randn(128, 32, device="cuda"),
+    )
+    with deterministic_algorithms(True):
+        assert_module_replays_bit_exact(module, inputs)
