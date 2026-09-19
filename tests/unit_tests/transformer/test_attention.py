@@ -335,12 +335,15 @@ class TestClipQK:
         # current_max_attn_logits should be reset
         assert attention.core_attention.current_max_attn_logits is None
 
-    def test_clip_qk_mixed_logits(self):
-        """Test clip_qk with mixed logits (some above, some below threshold)."""
+    @pytest.mark.parametrize("num_attention_heads", [4, 8])
+    @pytest.mark.parametrize("logits", [(200.0, -8.0, 0.0, 50.0), (200.0, -8.0, -0.0, 100.0)])
+    def test_clip_qk_mixed_logits(self, num_attention_heads, logits):
+        """Clipping one query group preserves groups at or below the threshold."""
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
-            num_attention_heads=4,
+            num_attention_heads=num_attention_heads,
+            num_query_groups=4,
             use_cpu_initialization=True,
             qk_clip=True,
             qk_clip_threshold=100.0,
@@ -353,20 +356,20 @@ class TestClipQK:
         )
         attention.cuda()
 
-        # Save original weights
-        original_weight = attention.linear_qkv.weight.data.clone()
-
-        # Set mixed current_max_attn_logits (some above, some below threshold)
+        weight = attention.linear_qkv.weight
+        weight.main_param = weight.detach().float().clone()
+        expected_weight = weight.detach().clone()
+        expected_groups = expected_weight.view(4, -1, expected_weight.shape[-1])
+        qk_rows = (attention.query_projection_size + attention.kv_projection_size) // 4
+        expected_groups[0, :qk_rows].mul_(0.5**0.5)
         attention.core_attention.current_max_attn_logits = torch.tensor(
-            [80.0, 150.0, 90.0, 200.0], device='cuda'
-        )
+            logits, device='cuda'
+        ).repeat_interleave(num_attention_heads // 4)
 
-        # Call clip_qk
         attention.clip_qk()
 
-        # Weights should be updated since at least one head exceeds threshold
-        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
-        # current_max_attn_logits should be reset
+        torch.testing.assert_close(weight, expected_weight)
+        torch.testing.assert_close(weight.main_param, expected_weight.float())
         assert attention.core_attention.current_max_attn_logits is None
 
 

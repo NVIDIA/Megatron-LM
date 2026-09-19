@@ -1346,11 +1346,14 @@ class TestMLAClipQK:
         # current_max_attn_logits should be reset
         assert attention.core_attention.current_max_attn_logits is None
 
-    def test_clip_qk_mixed_logits(self):
-        """Test clip_qk with mixed logits (some above, some below threshold)."""
+    @pytest.mark.parametrize("q_lora_rank", [None, 32])
+    @pytest.mark.parametrize("logits", [(200.0, -8.0, 0.0, 50.0), (200.0, -8.0, -0.0, 100.0)])
+    def test_clip_qk_mixed_logits(self, q_lora_rank, logits):
+        """Clipping one head preserves the other heads and every value projection."""
         if not is_te_min_version("1.10.0"):
             pytest.skip("MLA requires TransformerEngine >= 1.10.0")
 
+        self.transformer_config.q_lora_rank = q_lora_rank
         attention = MLASelfAttention(
             self.transformer_config,
             get_mla_self_attn_submodules(),
@@ -1359,28 +1362,30 @@ class TestMLAClipQK:
         )
         attention.cuda()
 
-        # Save original weights
-        if self.transformer_config.q_lora_rank is None:
-            original_q_weight = attention.linear_q_proj.weight.data.clone()
-        else:
-            original_q_weight = attention.linear_q_up_proj.weight.data.clone()
-        original_kv_weight = attention.linear_kv_up_proj.weight.data.clone()
-
-        # Set mixed current_max_attn_logits (some above, some below threshold)
-        attention.core_attention.current_max_attn_logits = torch.tensor(
-            [80.0, 150.0, 90.0, 200.0], device='cuda'
+        q_weight = (
+            attention.linear_q_proj.weight
+            if q_lora_rank is None
+            else attention.linear_q_up_proj.weight
         )
+        kv_weight = attention.linear_kv_up_proj.weight
+        q_weight.main_param = q_weight.detach().float().clone()
+        kv_weight.main_param = kv_weight.detach().float().clone()
+        expected_q_weight = q_weight.detach().clone()
+        expected_kv_weight = kv_weight.detach().clone()
+        qk_head_dim = self.transformer_config.qk_head_dim
+        expected_q_heads = expected_q_weight.view(4, -1, expected_q_weight.shape[-1])
+        expected_kv_heads = expected_kv_weight.view(4, -1, expected_kv_weight.shape[-1])
+        expected_q_heads[0, :qk_head_dim].mul_(0.5**0.5)
+        expected_q_heads[0, qk_head_dim:].mul_(0.5)
+        expected_kv_heads[0, :qk_head_dim].mul_(0.5**0.5)
+        attention.core_attention.current_max_attn_logits = torch.tensor(logits, device='cuda')
 
-        # Call clip_qk
         attention.clip_qk()
 
-        # Weights should be updated since at least one head exceeds threshold
-        if self.transformer_config.q_lora_rank is None:
-            assert not torch.equal(attention.linear_q_proj.weight.data, original_q_weight)
-        else:
-            assert not torch.equal(attention.linear_q_up_proj.weight.data, original_q_weight)
-        assert not torch.equal(attention.linear_kv_up_proj.weight.data, original_kv_weight)
-        # current_max_attn_logits should be reset
+        torch.testing.assert_close(q_weight, expected_q_weight)
+        torch.testing.assert_close(kv_weight, expected_kv_weight)
+        torch.testing.assert_close(q_weight.main_param, expected_q_weight.float())
+        torch.testing.assert_close(kv_weight.main_param, expected_kv_weight.float())
         assert attention.core_attention.current_max_attn_logits is None
 
     def test_clip_qk_with_absorption_raises_error(self):
