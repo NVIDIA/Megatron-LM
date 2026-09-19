@@ -2185,16 +2185,24 @@ class ChainedOptimizer(MegatronOptimizer):
         so we need to align the step across param groups before saving and after loading.
         """
 
+        # Go through the ``param_groups`` property rather than ``.optimizer``: a
+        # chained member can itself be a ChainedOptimizer. LayerWiseDistributedOptimizer
+        # subclasses one and holds more than one inner optimizer whenever the model
+        # mixes optimizers, muon plus AdamW for instance, and ``.optimizer`` asserts on
+        # those. The property aggregates the same param_group dicts, so the writes below
+        # still land on the real groups.
         steps = []
-        for param_group in self.param_groups:
-            if len(param_group['params']) > 0 and 'step' in param_group:
-                steps.append(param_group['step'])
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.param_groups:
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    steps.append(param_group['step'])
         steps = list(set(steps))
         assert len(steps) <= 1, f"steps: {steps}"
         step = steps[0] if len(steps) == 1 else None
-        for param_group in self.param_groups:
-            if len(param_group['params']) > 0 and 'step' in param_group:
-                param_group['step'] = step
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.param_groups:
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    param_group['step'] = step
 
         return step
 

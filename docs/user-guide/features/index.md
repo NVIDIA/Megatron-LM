@@ -20,6 +20,7 @@ moe
 engram
 megatron_fsdp
 dist_optimizer
+checkpoint-merge
 optimizer_cpu_offload
 paged_stash
 tokenizers

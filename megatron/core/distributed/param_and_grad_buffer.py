@@ -4,7 +4,6 @@ import fnmatch
 import functools
 import logging
 import math
-import warnings
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
@@ -20,6 +19,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
+from .._rank_utils import warn_single_rank
 from ..fp4_utils import (
     get_nvfp4_rowwise_packed_shape,
     is_grouped_nvfp4tensor,
@@ -39,7 +39,7 @@ from ..fp8_utils import (
     post_all_gather_processing,
 )
 from ..optimizer.param_layout import pad_bucket_end, pad_param_start
-from ..utils import is_torch_min_version, log_on_each_pipeline_stage
+from ..utils import is_torch_min_version
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
@@ -612,7 +612,9 @@ class _ParamAndGradBucketGroup:
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
-                    warnings.warn(
+                    # Registration order versus forward order is a property of the model,
+                    # so every rank hits this together and one report is enough.
+                    warn_single_rank(
                         "The next bucket's parameter all-gather operation has already been "
                         "dispatched. This may be caused by a mismatch between the order of "
                         "parameter registration and forward pass execution, which will "
@@ -1114,6 +1116,20 @@ class _ParamAndGradBuffer:
             self.dp_cp_group = pg_collection.dp_cp
             self.tp_group = pg_collection.tp
 
+        # Pick the single rank per module that logs this buffer's layout. Every GTP-remat
+        # peer holds a replica of the buffer, so requiring tp and dp_cp rank 0 alone still
+        # leaves one emitter per weight shard. Both GTP axes are absent when GTP-remat is
+        # inactive, and a MIMO vision encoder owns neither.
+        log_dedup_groups = [
+            self.tp_group,
+            self.dp_cp_group,
+            getattr(pg_collection, 'gtp_remat', None),
+            getattr(pg_collection, 'expt_gtp_remat', None),
+        ]
+        self.is_buffer_log_rank = all(
+            group.rank() == 0 for group in log_dedup_groups if group is not None
+        )
+
         self.ddp_config = ddp_config
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
@@ -1435,16 +1451,11 @@ class _ParamAndGradBuffer:
             promote_main_grads_to_higher_precision = False
             for param_name_pattern in ddp_config.param_name_patterns_for_fp32_local_accumulation:
                 if fnmatch.fnmatch(param_name, param_name_pattern) or param_name_pattern == 'all':
-                    log_on_each_pipeline_stage(
-                        logger,
-                        logging.INFO,
-                        (
+                    if self.is_buffer_log_rank:
+                        logger.info(
                             f"Matched {param_name} with '{param_name_pattern}'; promoting "
                             f"main_grad.type from {param.main_grad.dtype} to torch.float32!"
-                        ),
-                        tp_group=self.tp_group,
-                        dp_cp_group=self.dp_cp_group,
-                    )
+                        )
                     promote_main_grads_to_higher_precision = True
                     break
             if promote_main_grads_to_higher_precision:
@@ -1476,11 +1487,7 @@ class _ParamAndGradBuffer:
                 _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
             )
         # Log buckets for all PP stages.
-        if (
-            logger.isEnabledFor(logging.INFO)
-            and self.tp_group.rank() == 0
-            and self.dp_cp_group.rank() == 0
-        ):
+        if logger.isEnabledFor(logging.INFO) and self.is_buffer_log_rank:
             log_strs = []
             log_strs.append(
                 f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"

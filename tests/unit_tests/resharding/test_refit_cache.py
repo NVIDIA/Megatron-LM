@@ -486,7 +486,6 @@ class TestSetupMxfp8TransformOnPlan:
             captured["backend"] = backend
             return {}
 
-        monkeypatch.setattr(refit, "_should_quantize_param", lambda _param: True)
         monkeypatch.setattr(refit, "quantize_params_to_mxfp8", _quantize)
 
         plan = ReshardPlan(send_ops=[], recv_ops=[])

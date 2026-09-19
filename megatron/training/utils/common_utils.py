@@ -90,6 +90,7 @@ def calc_params_l2_norm(
     *,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
     return_squared_tensor=False,
+    trainable_only=False,
 ):
     """Calculate the parameter L2 norm using global, single-model, or multi-module groups."""
     if not isinstance(model, list):
@@ -112,6 +113,8 @@ def calc_params_l2_norm(
         for model_chunk in model:
             model_chunk.stop_communication()
             for name, param in model_chunk.named_parameters():
+                if trainable_only and not param.requires_grad:
+                    continue
                 if not hasattr(param, "_local_tensor"):
                     raise RuntimeError(
                         f"Megatron FSDP requires parameters are PyTorch DTensor. "
@@ -159,6 +162,9 @@ def calc_params_l2_norm(
 
     for model_chunk in model:
         for param in model_chunk.parameters():
+            if trainable_only and not param.requires_grad:
+                continue
+
             is_gtp = getattr(param, 'is_gtp_weight_remat', False)
 
             # Filter TP duplicates. GTP_remat params are always unique across TP ranks
@@ -279,11 +285,20 @@ def _calc_mimo_params_l2_norm(
         if name not in pg_collection.keys():
             continue
 
+        module_chunks_on_rank = [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks]
+        # With PP > 1, all stages must enter the module collectives even if one stage
+        # owns no trainable parameters. A PP=1 module can be skipped locally.
+        if pg_collection[name].pp.size() == 1 and not any(
+            param.requires_grad for module in module_chunks_on_rank for param in module.parameters()
+        ):
+            continue
+
         module_norm_sq = calc_params_l2_norm(
-            [_get_mimo_module(model_chunk, name) for model_chunk in model_chunks],
+            module_chunks_on_rank,
             force_create_fp32_copy,
             pg_collection=pg_collection[name],
             return_squared_tensor=True,
+            trainable_only=True,
         )
         norm_sq[index].copy_(module_norm_sq.reshape(()))
 

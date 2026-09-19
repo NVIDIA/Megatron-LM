@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1409,3 +1410,63 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             use_gloo_process_groups=True,  # Should be False when using custom groups
             pg_collection=pg_collection_complete,
         )
+
+
+def _chain_member(param_groups):
+    """A MegatronOptimizer whose ``param_groups`` come from the given raw groups.
+
+    ``MegatronOptimizer.param_groups`` just forwards to ``self.optimizer.param_groups``,
+    so a namespace is enough and no real torch optimizer (or CUDA) is needed.
+    """
+    member = object.__new__(DistributedOptimizer)
+    member.is_stub_optimizer = False
+    member.optimizer = SimpleNamespace(param_groups=param_groups)
+    return member
+
+
+def _chain(*members):
+    chain = object.__new__(ChainedOptimizer)
+    chain.chained_optimizers = list(members)
+    return chain
+
+
+def test_synchronize_steps_with_nested_chained_optimizer():
+    """``_synchronize_steps`` must tolerate a member that is itself a ChainedOptimizer.
+
+    ``LayerWiseDistributedOptimizer`` subclasses ChainedOptimizer and holds more than one
+    inner optimizer whenever the model mixes optimizers, muon plus AdamW for instance, so
+    it presents to an outer chain as a nested ChainedOptimizer. Reaching through
+    ``.optimizer`` asserts on those; going through ``param_groups`` does not.
+    """
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 3}])
+    expert = _chain_member([{'params': [param], 'step': 3}])
+    # TE FusedAdam does not accumulate 'step' for empty param groups, which is the
+    # case _synchronize_steps exists to paper over; it must stay untouched.
+    empty = _chain_member([{'params': [], 'step': 99}])
+    nested = _chain(expert, empty)
+    outer = _chain(dense, nested)
+
+    # The bug this guards: the nested chain has >1 inner optimizer, so the
+    # ``.optimizer`` shortcut the old implementation used is not available.
+    with pytest.raises(AssertionError, match="more than one optimizer"):
+        nested.optimizer
+
+    step = outer._synchronize_steps()
+
+    assert step == 3
+    assert dense.param_groups[0]['step'] == 3
+    assert expert.param_groups[0]['step'] == 3
+    assert empty.param_groups[0]['step'] == 99
+
+
+def test_synchronize_steps_aligns_lagging_group():
+    """A group missing 'step' is left alone; populated groups converge on the one value."""
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 7}])
+    expert = _chain_member([{'params': [param]}])  # no 'step' yet
+    outer = _chain(dense, _chain(expert))
+
+    assert outer._synchronize_steps() == 7
+    assert dense.param_groups[0]['step'] == 7
+    assert 'step' not in expert.param_groups[0]
