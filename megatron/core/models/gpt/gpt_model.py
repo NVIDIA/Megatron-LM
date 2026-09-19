@@ -958,8 +958,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         # Old GPT checkpoints only stored the output layer weight key. So we remove the
         # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
+        data = output_extra_state.data if output_extra_state is not None else None
+        assert data is None or (
+            data.numel() == 0 if isinstance(data, torch.Tensor) else not data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict
