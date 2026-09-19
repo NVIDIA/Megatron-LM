@@ -417,6 +417,10 @@ if __name__ == "__main__":
         "--reset-attention-mask is not supported in RL training: "
         "the forward pass masks via PackedSeqParams and never consumes a dense attention mask."
     )
+    if args.batch_invariant_mode and args.rank == 0:
+        print(
+            "WARNING: batch-invariant mode is enabled, so logprobs are not computed vocab-parallel"
+        )
     if is_hybrid_model(args):
         model_cfg = hybrid_config_from_args(args)
     else:
