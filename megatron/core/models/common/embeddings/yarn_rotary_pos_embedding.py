@@ -63,7 +63,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         correction_range_round_to_int: bool = True,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        # Match RotaryEmbedding: only a rotary_percent fraction of kv_channels is rotated.
         self.dim = kv_channels
+        if rotary_percent < 1.0:
+            self.dim = int(kv_channels * rotary_percent)
         self.rotary_base = rotary_base
         self.scaling_factor = scaling_factor
         self.original_max_position_embeddings = original_max_position_embeddings
