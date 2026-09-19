@@ -30,7 +30,10 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import (
+    LOCAL_GRAPH_ACTIVATION_OFFLOAD_MODULES,
+    TransformerConfig,
+)
 from megatron.core.utils import (
     get_attr_wrapped_model,
     get_torch_version,
@@ -489,6 +492,7 @@ class _CudagraphGlobalRecord:
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
     _saved_tensors_observer = None
+    backward_runners: list = []
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -527,7 +531,46 @@ class _CudagraphGlobalRecord:
     @classmethod
     def record_bwd_graph(cls, runner):
         """Record a bwd graph to 'cudagraph_record"""
+        # The autograd node is created by this runner's forward invocation.
+        # Preserve that identity explicitly; resident banks may be reused by a
+        # later forward runner before this bwd graph is captured.
+        runner.local_graph_forward_runner = runner
         cls.cudagraph_record.append((runner, "bwd"))
+
+    @classmethod
+    def _link_backward_runners(cls):
+        """Link runners in the backward order observed by autograd and the schedule."""
+        cls.backward_runners = [g[0] for g in cls.cudagraph_record if g[1] == "bwd"]
+        local_graph_offload_index = 0
+        for runner in cls.backward_runners:
+            runner.next_bwd_runner = None
+            runner.prev_bwd_runner = None
+            uses_local_offload = getattr(
+                runner, "_uses_local_graph_activation_offload", lambda: False
+            )()
+            runner.local_graph_slot_bank = (
+                local_graph_offload_index % 2
+                if uses_local_offload and os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_PING_PONG", "1") != "0"
+                else None
+            )
+            if uses_local_offload:
+                local_graph_offload_index += 1
+        for runner, next_runner in zip(cls.backward_runners, cls.backward_runners[1:]):
+            runner.next_bwd_runner = next_runner
+            next_runner.prev_bwd_runner = runner
+        # The head of the backward chain is consumed first, yet no earlier
+        # backward replay exists to look ahead from. Mark it so its reload can
+        # be dispatched right after its forward D2H instead of inside its own
+        # backward() host wait (which would absorb the whole RemapWorker latency
+        # including the muMemSetAccess DMA-drain).
+        for runner in cls.backward_runners:
+            runner.is_first_bwd_runner = False
+            # A bwd graph is captured from this runner's forward graph state.
+            # Keep that association explicit even when adjacent runners share
+            # a resident ping-pong bank.
+            runner.local_graph_forward_runner = runner
+        if cls.backward_runners:
+            cls.backward_runners[0].is_first_bwd_runner = True
 
     @classmethod
     def create_cudagraphs(cls):
@@ -560,6 +603,17 @@ class _CudagraphGlobalRecord:
                 base_module = g[0].base_module
                 has_te_modules = has_te_modules or any(
                     [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
+                )
+
+        # Persist the actual autograd/schedule backward order before the global
+        # creation record is cleared. Local activation reload uses only the
+        # immediate successor, bounding look-ahead physical backing to one runner.
+        cls._link_backward_runners()
+
+        for runner in cls.backward_runners:
+            if runner.local_graph_offload_groups:
+                runner._local_graph_offload_manager().prepare_local_graph_ping_pong(
+                    runner, runner.local_graph_slot_bank
                 )
 
         progress_bar = enumerate(cls.cudagraph_record)
@@ -698,10 +752,17 @@ def delete_cuda_graphs():
         runner.bwd_graph = None
         runner.mempool = None
 
+    for runner in _CudagraphGlobalRecord.backward_runners:
+        runner.next_bwd_runner = None
+        runner.local_graph_reload_state = None
+        runner.is_first_bwd_runner = False
+        runner.local_graph_forward_runner = runner
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _CudagraphGlobalRecord.backward_runners = []
     _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
@@ -804,6 +865,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
+        if runner.local_graph_offload_groups:
+            offload_manager = runner._local_graph_offload_manager()
+            replay_stream = runner.stream if runner.use_stream else torch.cuda.current_stream()
+            offload_manager.local_graph_forward_wait_ready(runner, replay_stream)
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
@@ -811,6 +876,27 @@ class _CudagraphReplayNode(torch.autograd.Function):
             torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
         else:
             runner.fwd_graph.replay()
+        if runner.local_graph_offload_groups:
+            with torch.cuda.stream(replay_stream):
+                runner.fwd_graph_replay_complete_event.record(replay_stream)
+            offload_manager.local_graph_forward_replay(
+                runner, runner.fwd_graph_replay_complete_event
+            )
+            # The backward-chain head has no predecessor replay to submit its
+            # reload from.  Dispatching here (at the last forward replay) put
+            # the RemapWorker's muMemSetAccess in flight while the
+            # ReleaseWorker was still unmapping the forward D2H burst — two
+            # worker threads contending on the driver at the same moment.
+            # Default now defers the head's remap submission to its own
+            # backward, where local_graph_backward_wait_ready() lazy-submits
+            # it after the forward releases have drained; set
+            # LOCAL_GRAPH_HEAD_RELOAD_AT_FORWARD=1 to restore the old
+            # forward-time dispatch.
+            if (
+                runner.is_first_bwd_runner
+                and int(os.environ.get("LOCAL_GRAPH_HEAD_RELOAD_AT_FORWARD", "0"))
+            ):
+                offload_manager.local_graph_backward_submit_reload(runner)
         return runner.fwd_graph_output_surface
 
     @staticmethod
@@ -835,6 +921,18 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
+        offload_manager = None
+        next_runner = runner.next_bwd_runner
+        if runner.local_graph_offload_groups:
+            offload_manager = runner._local_graph_offload_manager()
+            replay_stream = runner.stream if runner.use_stream else torch.cuda.current_stream()
+            offload_manager.local_graph_backward_wait_ready(runner, replay_stream)
+        if next_runner is not None and next_runner.local_graph_offload_groups:
+            if offload_manager is None:
+                offload_manager = next_runner._local_graph_offload_manager()
+            # Submit the next runner's H2D now so it overlaps this graph
+            # replay; the next graph installs waits only for its own slots.
+            offload_manager.local_graph_backward_submit_reload(next_runner)
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
@@ -844,6 +942,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
             runner.bwd_graph.replay()
 
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
+        if runner.local_graph_offload_groups:
+            offload_manager.local_graph_backward_mark_consumed(
+                runner, runner.bwd_graph_replay_complete_event
+            )
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
         runner.status = _GraphStatus.FWD_READY
@@ -901,7 +1003,15 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.fwd_graph = None
         self.bwd_graph = None
+        self.fwd_graph_replay_complete_event = torch.cuda.Event()
         self.bwd_graph_replay_complete_event = torch.cuda.Event()
+        self.local_graph_offload_groups = []
+        self.next_bwd_runner = None
+        self.local_graph_slot_bank = None
+        self.local_graph_reload_state = None
+        self.local_graph_reload_event = None
+        self.is_first_bwd_runner = False
+        self.local_graph_forward_runner = self
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
@@ -1038,6 +1148,25 @@ class _CudaGraphRunner(torch.nn.Module):
             self.base_module.__class__.__name__,
             tuple(self.fwd_graph_input_kwarg_metas["hidden_states"].shape),
         )
+
+    def _uses_local_graph_activation_offload(self):
+        """Whether this runner captures a whole layer with local Graph activation offload."""
+        config = getattr(self.base_module, "config", None)
+        return bool(
+            config is not None
+            and config.cuda_graph_impl == "local"
+            and not config.cuda_graph_modules
+            and config.fine_grained_activation_offloading
+            and set(config.offload_modules or []) <= LOCAL_GRAPH_ACTIVATION_OFFLOAD_MODULES
+        )
+
+    @staticmethod
+    def _local_graph_offload_manager():
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        return PipelineOffloadManager.get_instance()
 
     def get_quantization_context(self):
         """Return appropriate quantization context (FP8 or FP4) in cudagraph mode."""
@@ -1255,37 +1384,60 @@ class _CudaGraphRunner(torch.nn.Module):
 
         ctx = torch.no_grad() if not self.grad_enabled else nullcontext()
         with ctx:
+            local_offload_manager = None
+            local_offload_was_enabled = False
+            if self._uses_local_graph_activation_offload():
+                local_offload_manager = self._local_graph_offload_manager()
+                local_offload_was_enabled = local_offload_manager.do_offload
+                local_offload_manager.disable_offload()
+
             # warmup again as case graph capture mode may execute a different codepath
             _set_warmup_start()
-            for _ in range(self.num_warmup_steps):
-                with self.get_quantization_context():
+            for warmup_index in range(self.num_warmup_steps):
+                discovering_local_slots = (
+                    local_offload_manager is not None
+                    and warmup_index == self.num_warmup_steps - 1
+                )
+                if discovering_local_slots:
+                    local_offload_manager.begin_local_graph_discovery(self)
+                try:
+                    with self.get_quantization_context():
 
-                    def clone_ten(ten):
-                        if not torch.is_tensor(ten):
-                            return ten
-                        return torch.clone(ten).detach().requires_grad_(ten.requires_grad)
+                        def clone_ten(ten):
+                            if not torch.is_tensor(ten):
+                                return ten
+                            return torch.clone(ten).detach().requires_grad_(ten.requires_grad)
 
-                    warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
-                    warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
-                    warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
+                        warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
+                        warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
+                        warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
 
-                if self.grad_enabled:
-                    warmup_outputs = self.get_tensors(warmup_outputs)
-                    warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
-                    input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
-                    torch.autograd.grad(
-                        outputs=warmup_outputs,
-                        inputs=tuple(i for i in input_tensors if i.requires_grad),
-                        grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
-                        only_inputs=True,
-                        allow_unused=True,
-                    )
+                    if self.grad_enabled:
+                        warmup_outputs = self.get_tensors(warmup_outputs)
+                        warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
+                        input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
+                        torch.autograd.grad(
+                            outputs=warmup_outputs,
+                            inputs=tuple(i for i in input_tensors if i.requires_grad),
+                            grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
+                            only_inputs=True,
+                            allow_unused=True,
+                        )
 
-                if self.gtp_remat:
-                    wait_async_comms(GTPChain.GRAPHED.value)
-                    self._sync_against_side_streams(self.bwd_side_streams)
+                    if self.gtp_remat:
+                        wait_async_comms(GTPChain.GRAPHED.value)
+                        self._sync_against_side_streams(self.bwd_side_streams)
+                except Exception:
+                    if discovering_local_slots:
+                        local_offload_manager.end_local_graph_discovery(success=False)
+                    raise
+                else:
+                    if discovering_local_slots:
+                        local_offload_manager.end_local_graph_discovery()
 
             _set_warmup_end()
+            if local_offload_manager is not None and local_offload_was_enabled:
+                local_offload_manager.enable_offload()
 
             with self.get_quantization_context():
                 torch.cuda.synchronize()
@@ -1302,30 +1454,43 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
-                with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
-                ):
+                if local_offload_manager is not None:
+                    local_offload_manager.begin_local_graph_capture(self)
 
-                    self._sync_against_side_streams(self.fwd_side_streams)
+                try:
+                    with torch.cuda.graph(
+                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    ):
 
-                    fwd_graph_outputs = self.func(
-                        *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
-                    )
+                        self._sync_against_side_streams(self.fwd_side_streams)
 
-                    if self.gtp_remat:
-                        # Forward only issues AG prefetches (no wgrad RS), so drain AG and skip RS.
-                        wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
+                        fwd_graph_outputs = self.func(
+                            *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
+                        )
 
-                    if self.fwd_side_streams:
-                        self._wait_side_streams(self.fwd_side_streams)
+                        if self.gtp_remat:
+                            # Forward only issues AG prefetches (no wgrad RS), so drain AG and skip RS.
+                            wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
 
-                    if self.use_stream:
-                        self.fwd_completion_event.record()
+                        if self.fwd_side_streams:
+                            self._wait_side_streams(self.fwd_side_streams)
 
-                # Unfreeze GC.
+                        if self.use_stream:
+                            self.fwd_completion_event.record()
+                except Exception:
+                    if local_offload_manager is not None:
+                        local_offload_manager.end_local_graph_capture(success=False)
+                    raise
+                else:
+                    if local_offload_manager is not None:
+                        local_offload_manager.end_local_graph_capture()
+                        local_offload_manager.local_graph_capture_snapshot(self)
+                finally:
+                    # A failed graph capture must not leave GC frozen.
+                    if FREEZE_GC:
+                        gc.unfreeze()
+
                 if FREEZE_GC:
-                    gc.unfreeze()
-
                     # gc.collect() drops references to unreachable tensors created during capture,
                     # returning their storage to the allocator to avoid a slowdown during replay.
                     # However, it forces expensive global garbage collection, so must be done
@@ -1421,11 +1586,22 @@ class _CudaGraphRunner(torch.nn.Module):
                     out_grad = alloc_tensor_from_graph_mempool(o)
             self.static_grad_outputs.append(out_grad)
 
+        # Shared ping-pong slots may have been overwritten while later forward
+        # graphs were captured. Restore this runner before capturing its consumers.
+        if self.local_graph_offload_groups:
+            self._local_graph_offload_manager().local_graph_capture_restore(
+                self, self.local_graph_forward_runner
+            )
+
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
             gc.freeze()
 
+        manager = self._local_graph_offload_manager() if self.local_graph_offload_groups else None
+        if manager is not None:
+            manager.begin_local_graph_consumer_capture(self)
         with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+
 
             self._sync_against_side_streams(self.bwd_side_streams)
 
@@ -1482,6 +1658,9 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.
                 self.bwd_completion_event.record()
+
+        if manager is not None:
+            manager.end_local_graph_consumer_capture(self)
 
         # Unfreeze GC.
         if FREEZE_GC:
@@ -2641,12 +2820,11 @@ class TECudaGraphHelper:
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            # TE CUDA graph warmup should establish graph state without launching
-            # activation D2H copies; the post-warmup hook restores offloading for
-            # the measured/replay iterations.
+            # Keep activation offload disabled during both TE warmup and graph capture.
+            # The CUDA offload path uses a separate D2H stream, which cannot be left
+            # running when the graph capture stream is finalized.
             if self.config.fine_grained_activation_offloading:
                 kwargs['pre_warmup_hook'] = off_interface.disable_offload
-                kwargs['post_warmup_hook'] = off_interface.enable_offload
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()

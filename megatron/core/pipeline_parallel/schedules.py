@@ -328,17 +328,24 @@ def forward_step_calc_loss(
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
-                if not config.calculate_per_token_loss:
+                if not config.calculate_per_token_loss and not getattr(
+                    output_tensor, '_is_loss_head_final', False
+                ):
                     # Protect against division by zero when all tokens are masked
                     #   in a microbatch.
-                    output_tensor /= torch.clamp(num_tokens, min=1)
-                    output_tensor /= num_microbatches
+                    # NOTE: non-inplace: with the graphed loss head the loss
+                    # scalar is the output of _CudagraphRecordNode (a cudagraph
+                    # buffer view); inplace div on it is rejected by autograd.
+                    # When _is_loss_head_final is set the normalization was
+                    # already computed inside the loss-head cuda graph.
+                    output_tensor = output_tensor / torch.clamp(num_tokens, min=1)
+                    output_tensor = output_tensor / num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
                 assert len(outputs) == 2
                 output_tensor, loss_reduced = outputs
-                output_tensor *= cp_group_size
-                output_tensor /= num_microbatches
+                output_tensor = output_tensor * cp_group_size
+                output_tensor = output_tensor / num_microbatches
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)

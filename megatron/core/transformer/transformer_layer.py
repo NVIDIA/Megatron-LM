@@ -1538,6 +1538,12 @@ class MoETransformerLayer(TransformerLayer):
 
         super().__init__(*args, **kwargs)
 
+        # GraphableMegatronModule invokes this override before TransformerLayer
+        # has built ``mlp``. Finish MoE-specific graph manager construction only
+        # after the full layer (including its MoELayer) is initialized.
+        if self.config.cuda_graph_impl == "local":
+            self.create_mcore_cudagraph_manager(self.config)
+
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """
         Controls whether the full-layer cudagraph_manager captures the entire forward call
@@ -1598,26 +1604,47 @@ class MoETransformerLayer(TransformerLayer):
         """
         Initializes the CUDA graph manager(s) for the MoE layer.
 
-        Unlike the standard layer which typically uses a single manager, this method
-        can configure multiple graph managers if partial CUDA graphs are enabled via
-        `cuda_graph_modules`. This allows capturing the static parts of the MoE pass
-        while leaving the expert computation to execute eagerly.
+        Partial MoE graphs use dedicated managers for attention, router, and
+        postprocess. No layer-level manager is installed in that mode, because
+        it would capture the eager expert dispatch between the MoE phases.
         """
 
         assert self.config.cuda_graph_impl == "local"
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
+        # The base GraphableMegatronModule initializer calls this hook before
+        # TransformerLayer has constructed the MLP. The subclass calls it again
+        # after initialization from __init__.
+        if not hasattr(self, "mlp"):
+            return
+
+        partial_moe = (
+            CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            or CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
+        )
+
+        if partial_moe:
+            # The base initializer may have registered an attention manager using
+            # the generic layer path. It would wrap the whole TransformerLayer,
+            # so replace it with a manager bound only to _forward_attention.
+            self._modules.pop("cudagraph_manager", None)
+            if (
+                CudaGraphModule.attn in self.config.cuda_graph_modules
+                and not hasattr(self, "cudagraph_manager_attn")
+            ):
+                self.cudagraph_manager_attn = CudaGraphManager(
+                    config, self, function_name="_forward_attention"
+                )
+            self.transition_cudagraph_scope("partial")
+            return
+
         if (
             not self.config.cuda_graph_modules
             and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
         ) or CudaGraphModule.moe in self.config.cuda_graph_modules:
-            self.cudagraph_manager = CudaGraphManager(config)
-        elif (
-            CudaGraphModule.moe_router in self.config.cuda_graph_modules
-            or CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
-        ):
-            self.transition_cudagraph_scope('partial')
+            if not hasattr(self, "cudagraph_manager"):
+                self.cudagraph_manager = CudaGraphManager(config)
 
     def _resolve_token_dispatcher_attr(self, attr_name: str) -> tuple[Any, str]:
         parent_attr_name, _, leaf_attr_name = attr_name.rpartition('.')

@@ -349,7 +349,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             weight = GTPEmbeddingWeight.apply(self.weight)
 
         # Get the embeddings.
-        if self.deterministic_mode:
+        if self.deterministic_mode or torch.cuda.is_available():
             output_parallel = weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function

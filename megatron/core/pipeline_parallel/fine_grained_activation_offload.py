@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
@@ -13,6 +15,23 @@ DEBUG_RANK = 0
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+try:
+    from transformer_engine.pytorch.vmm_activation import (
+        launch_remap_slot_h2d,
+        release_hooks_after,
+        remap_and_copy_slot_after,
+        remap_only_slot_after,
+        wait_remap_slot_on_stream,
+        wait_until_remap_slot_submitted,
+    )
+except ImportError:
+    release_hooks_after = None  # eager-only fallback; local graph paths require TE
+    remap_and_copy_slot_after = None
+    remap_only_slot_after = None
+    launch_remap_slot_h2d = None
+    wait_remap_slot_on_stream = None
+    wait_until_remap_slot_submitted = None
 
 
 def debug_rank(message):
@@ -397,6 +416,452 @@ class OffloadTensorGroup:
         self.total_tensor_count += 1
 
 
+class LocalCudaGraphOffloadGroup:
+    """Fixed-address VMM slots for one local-graph activation group."""
+
+    def __init__(self, name: str, min_tensor_size: int):
+        self.name = name
+        self.min_tensor_size = min_tensor_size
+        self.descriptors = []
+        self.allocations = []
+        self.device_tensors = []
+        self.host_tensors = []
+        self.capture_index = 0
+        self.capture_slots = []
+        self.consumer_slots = []
+        self.capture_epoch = 0
+        self.capture_group_index = None
+        self.state = "discovering"
+
+        self.d2h_event = torch.cuda.Event()
+        self.h2d_event = torch.cuda.Event()
+        # Async release/remap contexts returned by the per-slot host functions.
+        self.release_context = None
+        self.release_contexts = []
+        self.remap_context = None
+        self.slot_bank = None
+        self.resident = False
+        # Build-time ownership of the resident bank.  The backward graph must
+        # restore the values captured by this exact forward runner, not merely
+        # whichever runner most recently used the same ping-pong bank.
+        self.capture_forward_runner = None
+        self.capture_snapshot_event = None
+
+    def _eligible(self, tensor):
+        return (
+            torch.is_tensor(tensor)
+            and not isinstance(tensor, torch.nn.Parameter)
+            and tensor.is_cuda
+            and tensor.numel() >= self.min_tensor_size
+            and not _te_do_not_offload(tensor)
+            and not getattr(tensor, "_do_not_offload", False)
+        )
+
+    @staticmethod
+    def _descriptor(tensor):
+        return (
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.device,
+        )
+
+    def discover_tensor(self, tensor):
+        """Record an eligible saved-tensor descriptor without changing eager autograd."""
+        if self._eligible(tensor):
+            self.descriptors.append(self._descriptor(tensor))
+        return tensor
+
+    def load_tensor(self, tensor):
+        """Record the activation slot consumed by backward replay."""
+        if self._eligible(tensor):
+            slot = next(
+                (item for item in self.device_tensors if item.data_ptr() == tensor.data_ptr()),
+                None,
+            )
+            if slot is not None:
+                slot_index = self.device_tensors.index(slot)
+                self.consumer_slots.append(slot_index)
+                context = PipelineOffloadManager.get_instance()._local_graph_consumer_context
+                if context is not None:
+                    context["slots"].append({
+                        "group_index": getattr(self, "capture_group_index", None),
+                        "slot_index": slot_index,
+                        "vmm_address": tensor.data_ptr(),
+                    })
+                runner = getattr(self, "capture_runner", None)
+                PipelineOffloadManager._local_graph_debug(
+                    f"consume rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1} "
+                    f"runner_id={id(runner) if runner is not None else None} "
+                    f"group_index={getattr(self, 'capture_group_index', None)} "
+                    f"group={self.name} slot={slot_index} "
+                    f"vmm_va={hex(tensor.data_ptr())} epoch={self.capture_epoch}"
+                )
+        return tensor
+
+    def allocate(self, manager=None, slot_bank=None, group_index=None):
+        """Allocate fixed-address slots, optionally from a resident shared bank."""
+        from transformer_engine.pytorch.vmm_activation import CUDAActivationVMMAllocation
+
+        assert self.state == "discovering"
+        self.slot_bank = slot_bank
+        self.resident = slot_bank is not None
+        for tensor_index, (shape, stride, dtype, device) in enumerate(self.descriptors):
+            if self.resident:
+                allocation = manager.local_graph_resident_allocation(
+                    slot_bank,
+                    self.name,
+                    group_index,
+                    tensor_index,
+                    shape,
+                    stride,
+                    dtype,
+                    device,
+                )
+            else:
+                allocation = CUDAActivationVMMAllocation(shape, stride, dtype, device)
+            self.allocations.append(allocation)
+            allocation.set_slot_id(
+                f"rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1}/"
+                f"group={group_index if group_index is not None else 'na'}/slot={tensor_index}/"
+                f"va=0x{allocation.address:x}"
+            )
+            self.device_tensors.append(allocation.tensor)
+            # Host storage remains runner-local even when the GPU slot is shared.
+            self.host_tensors.append(
+                torch.empty_strided(shape, stride, dtype=dtype, device="cpu", pin_memory=True)
+            )
+        self.state = "mapped"
+
+    def begin_capture(self):
+        """Reset ordered descriptor consumption before forward graph capture."""
+        assert self.state == "mapped"
+        self.capture_index = 0
+        self.capture_slots = []
+        self.consumer_slots = []
+        self.capture_epoch += 1
+
+    def save_tensor(self, tensor):
+        """Capture a D2D write and save the matching VMM tensor for backward."""
+        if not self._eligible(tensor):
+            return tensor
+        if self.capture_index >= len(self.descriptors):
+            raise RuntimeError(f"{self.name}: capture saved more tensors than discovery")
+        descriptor = self._descriptor(tensor)
+        expected = self.descriptors[self.capture_index]
+        if descriptor != expected:
+            raise RuntimeError(
+                f"{self.name}: activation descriptor drift at slot {self.capture_index}: "
+                f"expected={expected}, actual={descriptor}"
+            )
+        slot_tensor = self.device_tensors[self.capture_index]
+        slot_tensor.copy_(tensor)
+        self.capture_slots.append(
+            {
+                "slot_index": self.capture_index,
+                "descriptor": descriptor,
+                "vmm_address": int(slot_tensor.data_ptr()),
+                "aligned_bytes": self.allocations[self.capture_index].aligned_bytes,
+            }
+        )
+        PipelineOffloadManager._local_graph_debug(
+            f"capture group={self.name} slot={self.capture_index} "
+            f"source={hex(tensor.data_ptr())} vmm_va={hex(slot_tensor.data_ptr())} "
+            f"shape={tuple(tensor.shape)} stride={tuple(tensor.stride())} dtype={tensor.dtype} "
+            f"aligned_bytes={self.allocations[self.capture_index].aligned_bytes}"
+        )
+        self.capture_index += 1
+        return slot_tensor
+
+    def finish_capture(self):
+        """Ensure capture consumed exactly the descriptors discovered during warmup."""
+        if self.capture_index != len(self.descriptors):
+            raise RuntimeError(
+                f"{self.name}: capture consumed {self.capture_index}/{len(self.descriptors)} slots"
+            )
+
+    @property
+    def logical_bytes(self):
+        return sum(tensor.numel() * tensor.element_size() for tensor in self.device_tensors)
+
+    @property
+    def physical_bytes(self):
+        return sum(allocation.aligned_bytes for allocation in self.allocations)
+
+    def _debug_slot_state(self, stage):
+        """Log VMM and tensor storage state at resident-slot checkpoints."""
+        if os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_DEBUG") != "1":
+            return
+        slots = []
+        for index, (allocation, tensor, host_tensor) in enumerate(
+            zip(self.allocations, self.device_tensors, self.host_tensors)
+        ):
+            try:
+                device_storage_bytes = tensor.untyped_storage().nbytes()
+            except Exception:  # pragma: no cover - backend diagnostic only
+                device_storage_bytes = "unavailable"
+            try:
+                allocation_info = allocation.info()
+            except Exception as exc:  # pragma: no cover - backend diagnostic only
+                allocation_info = f"error={type(exc).__name__}: {exc}"
+            slots.append(
+                f"slot={index} device_shape={tuple(tensor.shape)} "
+                f"device_numel={tensor.numel()} device_ptr={hex(tensor.data_ptr())} "
+                f"device_storage_bytes={device_storage_bytes} "
+                f"host_shape={tuple(host_tensor.shape)} host_numel={host_tensor.numel()} "
+                f"allocation={allocation_info}"
+            )
+        PipelineOffloadManager._local_graph_debug(
+            f"checkpoint={stage} group={self.name} bank={self.slot_bank} state={self.state} "
+            + " | ".join(slots)
+        )
+
+    def rebind_resident(self, manager, slot_bank, group_index):
+        """Replace provisional capture allocations with a shared resident bank."""
+        if self.resident:
+            return
+        from transformer_engine.pytorch.vmm_activation import CUDAActivationVMMAllocation
+
+        old_allocations = self.allocations
+        self.allocations = []
+        self.device_tensors = []
+        self.resident = True
+        self.slot_bank = slot_bank
+        for tensor_index, (shape, stride, dtype, device) in enumerate(self.descriptors):
+            allocation = manager.local_graph_resident_allocation(
+                slot_bank, self.name, group_index, tensor_index, shape, stride, dtype, device
+            )
+            self.allocations.append(allocation)
+            allocation.set_slot_id(
+                f"rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1}/"
+                f"group={group_index if group_index is not None else 'na'}/slot={tensor_index}/"
+                f"va=0x{allocation.address:x}"
+            )
+            self.device_tensors.append(allocation.tensor)
+        self._debug_slot_state("after_resident_rebind")
+        for allocation in old_allocations:
+            allocation.close()
+
+    def capture_snapshot(self, runner=None):
+        """Preserve values and ownership for this runner's later bwd capture."""
+        if not self.resident:
+            return
+        self._debug_slot_state("before_capture_snapshot")
+        # This copy is intentionally synchronous: it establishes the host
+        # snapshot before another forward is allowed to reuse the bank.
+        for host_tensor, device_tensor in zip(self.host_tensors, self.device_tensors):
+            host_tensor.copy_(device_tensor, non_blocking=False)
+        self.capture_forward_runner = runner
+        # Keep an explicit stream dependency even on backends where the
+        # synchronous copy currently happens to drain the stream.  CUDA graph
+        # capture and the caller's stream are not assumed to be identical.
+        self.capture_snapshot_event = torch.cuda.Event()
+        self.capture_snapshot_event.record(torch.cuda.current_stream())
+        self._debug_slot_state("after_capture_snapshot")
+
+    def capture_restore(self, forward_runner=None):
+        """Restore the exact forward snapshot before capturing its bwd graph."""
+        if not self.resident:
+            return
+        if self.capture_forward_runner is not forward_runner:
+            raise RuntimeError(
+                f"{self.name}: backward capture is bound to the wrong forward runner "
+                f"(expected={id(self.capture_forward_runner)}, actual={id(forward_runner)})"
+            )
+        if self.capture_snapshot_event is not None:
+            torch.cuda.current_stream().wait_event(self.capture_snapshot_event)
+        self._debug_slot_state("before_capture_restore")
+        for device_tensor, host_tensor in zip(self.device_tensors, self.host_tensors):
+            device_tensor.copy_(host_tensor, non_blocking=False)
+        self._debug_slot_state("after_capture_restore")
+
+    def enqueue_resident_d2h(self, d2h_stream, compute_stream):
+        """Save a resident slot without releasing its fixed mapping."""
+        if self.state != "mapped":
+            raise RuntimeError(f"{self.name}: cannot save resident slots in state {self.state}")
+        d2h_stream.wait_stream(compute_stream)
+        with torch.cuda.stream(d2h_stream):
+            for host_tensor, device_tensor in zip(self.host_tensors, self.device_tensors):
+                host_tensor.copy_(device_tensor, non_blocking=True)
+        self.state = "resident_d2h_pending"
+
+    def enqueue_resident_h2d(self, h2d_stream):
+        """Restore host values into an always-mapped resident slot."""
+        if self.state not in ("resident_d2h_pending", "mapped"):
+            raise RuntimeError(f"{self.name}: cannot reload resident slots in state {self.state}")
+        with torch.cuda.stream(h2d_stream):
+            for device_tensor, host_tensor in zip(self.device_tensors, self.host_tensors):
+                device_tensor.copy_(host_tensor, non_blocking=True)
+        self.state = "resident_reload_pending"
+
+    def adopt_resident_reload(self):
+        """Mark a resident reload consumable after its stream wait is installed."""
+        if self.state != "resident_reload_pending":
+            raise RuntimeError(f"{self.name}: resident reload is in state {self.state}")
+        self.state = "mapped"
+
+    def enqueue_d2h(
+        self, d2h_stream, compute_stream, release_stream=None, graph_done_event=None
+    ):
+        """Queue this group's D2H copies and hand off release to a stream host func.
+
+        The copies run on ``d2h_stream`` (ordered behind the producing compute
+        via ``wait_stream``) and an event records the burst's completion. The
+        release host func is gated ONLY on that event: it is enqueued on
+        ``release_stream`` after a ``wait_event(d2h_event)``, so the worker
+        unmaps this group as soon as ITS OWN copies finish - not when every
+        later group's D2H on the shared stream also completes. Driver calls
+        still run on the resident worker thread, not the callback thread.
+        """
+        if not self.device_tensors:
+            return
+        if self.state != "mapped":
+            raise RuntimeError(f"{self.name}: cannot offload slots in state {self.state}")
+        if os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_DEBUG") == "1":
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(
+                f"[vmm-offload][rank={rank}] submit_d2h group={self.name} "
+                f"state={self.state} allocations={len(self.allocations)} "
+                f"bytes={self.logical_bytes} compute_stream={getattr(compute_stream, 'cuda_stream', None)} "
+                f"d2h_stream={getattr(d2h_stream, 'cuda_stream', None)} "
+                f"release_stream={getattr(release_stream, 'cuda_stream', None)}",
+                flush=True,
+            )
+        # Event-gated per-group release: fall back to the old shared-stream
+        # placement only when no dedicated release stream was provided.
+        if release_stream is not None:
+            with torch.cuda.stream(d2h_stream):
+                if graph_done_event is not None:
+                    d2h_stream.wait_event(graph_done_event)
+                else:
+                    d2h_stream.wait_stream(compute_stream)
+                previous_slot_event = None
+                for slot_index, (host_tensor, device_tensor) in enumerate(
+                    zip(self.host_tensors, self.device_tensors)
+                ):
+                    if previous_slot_event is not None:
+                        d2h_stream.wait_event(previous_slot_event)
+                    host_tensor.copy_(device_tensor, non_blocking=True)
+                    slot_done = torch.cuda.Event()
+                    slot_done.record(d2h_stream)
+                    previous_slot_event = slot_done
+                    PipelineOffloadManager._local_graph_debug(
+                        f"d2h_slot_submit ts_ns={time.time_ns()} "
+                        f"group={self.name} slot={slot_index}"
+                    )
+                self.d2h_event.record(d2h_stream)
+            with torch.cuda.stream(release_stream):
+                release_stream.wait_event(self.d2h_event)
+                self.release_contexts = []
+                for allocation in self.allocations:
+                    self.release_contexts.append(allocation.release_hook_after(release_stream))
+                self.release_context = self.release_contexts[-1] if self.release_contexts else None
+        else:
+            d2h_stream.wait_stream(compute_stream)
+            with torch.cuda.stream(d2h_stream):
+                for host_tensor, device_tensor in zip(self.host_tensors, self.device_tensors):
+                    host_tensor.copy_(device_tensor, non_blocking=True)
+                self.d2h_event.record(d2h_stream)
+                self.release_contexts = []
+                for allocation in self.allocations:
+                    self.release_contexts.append(allocation.release_hook_after(d2h_stream))
+                self.release_context = self.release_contexts[-1] if self.release_contexts else None
+        self.state = "d2h_pending"
+
+    def try_release(self):
+        """Adopt the worker's release if it already finished; never blocks."""
+        if self.state != "d2h_pending":
+            return False
+        if not self._release_context_done():
+            return False
+        return self._adopt_released()
+
+    def wait_and_release(self):
+        """Wait for the async release then adopt the unmapped state; backward time."""
+        # Already released by a forward-time drain: nothing to wait for.
+        if self.state == "unmapped":
+            return False
+        if self.state != "d2h_pending":
+            raise RuntimeError(f"{self.name}: cannot release slots in state {self.state}")
+        self._wait_release_context()
+        return self._adopt_released()
+
+    def _release_context_done(self):
+        """Whether every per-slot release request finished on the worker."""
+        contexts = self.release_contexts
+        if contexts:
+            return all(dict(context.status())["done"] == 1 for context in contexts)
+        if self.release_context is None:
+            return all(allocation.async_release_done() for allocation in self.allocations)
+        return dict(self.release_context.status())["done"] == 1
+
+    def _wait_release_context(self):
+        """Block until every per-slot release request finishes."""
+        if self.release_contexts:
+            for context in self.release_contexts:
+                status = dict(context.status())
+                if status["done"] != 1:
+                    # The allocation owns the context and provides the blocking
+                    # compatibility API without synchronizing a CUDA stream.
+                    pass
+        for allocation in self.allocations:
+            allocation.wait_for_async_release()
+
+    def _adopt_released(self):
+        """Apply the worker-completed release to this group's bookkeeping."""
+        contexts = self.release_contexts
+        self.release_contexts = []
+        if contexts:
+            for context in contexts:
+                status = dict(context.status())
+                if status["error"]:
+                    raise RuntimeError(
+                        f"{self.name}: async release failed on worker: MUresult {status['error_code']}"
+                    )
+        elif self.release_context is not None:
+            status = dict(self.release_context.status())
+            if status["error"]:
+                raise RuntimeError(
+                    f"{self.name}: async release failed on worker: MUresult {status['error_code']}"
+                )
+        self.release_context = None
+        for allocation in self.allocations:
+            if not allocation.async_release_done():
+                allocation.wait_for_async_release()
+        self.state = "unmapped"
+        PipelineOffloadManager._local_graph_debug(
+            f"release group={self.name} logical_bytes={self.logical_bytes} "
+            f"physical_bytes={self.physical_bytes}"
+        )
+        return True
+    def prepare_remap(self, remap_context):
+        """Bind a slot request context to this group's bookkeeping."""
+        if not self.device_tensors:
+            return False
+        if self.state not in ("d2h_pending", "unmapped", "remap_pending"):
+            raise RuntimeError(f"{self.name}: cannot prepare reload in state {self.state}")
+        self.remap_context = remap_context
+        self.state = "remap_pending"
+        return True
+
+    def adopt_reload_submission(self):
+        """Compatibility adoption for callers submitting a complete context."""
+        if self.state != "remap_pending":
+            raise RuntimeError(f"{self.name}: cannot adopt reload in state {self.state}")
+        if self.remap_context is not None:
+            for allocation in self.allocations:
+                allocation.adopt_async_remap()
+            status = dict(self.remap_context.status())
+            if status["error"]:
+                raise RuntimeError(
+                    f"{self.name}: async reload failed on worker: error {status['error_code']}"
+                )
+        self.remap_context = None
+        self.release_context = None
+        self.state = "mapped"
+        return True
+
+
 class PipelineOffloadManager:
     """
     Singleton manager for coordinating activation offloading across pipeline stages.
@@ -449,6 +914,26 @@ class PipelineOffloadManager:
         # Index of the current forward chunk in the cached chunks forward.
         self._cached_chunks_index_forward = 0
 
+        # Whole-layer local CUDA graph capture records fixed activation slots here. These are
+        # separate from eager chunk state because schedule reset runs before graph creation.
+        self._local_graph_capture_runner = None
+        self._local_graph_mode = None
+        self._local_graph_capture_groups = []
+        self._local_graph_capture_group = None
+        self._local_graph_group_index = 0
+        self._local_graph_saved_tensors_hooks = None
+        self._local_graph_d2h_bytes = 0
+        self._local_graph_h2d_bytes = 0
+        self._local_graph_resident_slots = [{}, {}]
+        self._local_graph_bank_d2h_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._local_graph_bank_d2h_recorded = [False, False]
+        self._local_graph_bank_consumed_events = [None, None]
+        # Dedicated stream for the graph-level release host func. Putting the
+        # host func on the shared d2h stream would serialize the next graph's
+        # D2H copies behind this graph's unmap callback.
+        self._local_graph_release_stream = torch.cuda.Stream()
+        self._local_graph_consumer_context = None
+
         self.do_offload = True
 
         # Do not offload the last X groups so that the reloading won't block the computing stream.
@@ -488,6 +973,565 @@ class PipelineOffloadManager:
     def cpu_tensor_pool(self):
         """Get the shared CPU tensor pool."""
         return self._cpu_tensor_pool
+
+    @property
+    def in_local_graph_capture(self):
+        """Whether a whole-layer local graph is currently recording activation slots."""
+        return self._local_graph_capture_runner is not None
+
+    @staticmethod
+    def _local_graph_debug(message):
+        if os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_DEBUG") != "1":
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        print(f"[local-full-graph-offload][rank={rank}] {message}", flush=True)
+
+    @staticmethod
+    def _local_graph_group_bytes(groups):
+        return sum(group.logical_bytes for group in groups)
+
+    @staticmethod
+    def _local_graph_ping_pong_enabled(runner=None):
+        """Whether this runner uses resident slots for local Graph CPU offload."""
+        if runner is None:
+            return False
+        enabled = getattr(runner, "local_graph_slot_bank", None) is not None
+        if enabled and not getattr(runner, "local_graph_offload_groups", []):
+            # During discovery, groups are not attached until allocation completes.
+            enabled = True
+        return enabled
+
+    def prepare_local_graph_ping_pong(self, runner, slot_bank):
+        """Rebind provisional runner slots to the selected resident bank."""
+        runner.local_graph_slot_bank = slot_bank
+        for group_index, group in enumerate(runner.local_graph_offload_groups):
+            group.rebind_resident(self, slot_bank, group_index)
+
+    def local_graph_resident_allocation(
+        self, bank, name, group_index, tensor_index, shape, stride, dtype, device
+    ):
+        """Get or create one descriptor-compatible allocation in a resident bank."""
+        from transformer_engine.pytorch.vmm_activation import CUDAActivationVMMAllocation
+
+        key = (name, group_index, tensor_index, tuple(shape), tuple(stride), dtype, device)
+        allocations = self._local_graph_resident_slots[bank]
+        if key not in allocations:
+            allocations[key] = CUDAActivationVMMAllocation(shape, stride, dtype, device)
+        return allocations[key]
+
+    def local_graph_capture_snapshot(self, runner):
+        """Preserve the values belonging to this forward runner."""
+        if not self._local_graph_ping_pong_enabled(runner):
+            return
+        for group in runner.local_graph_offload_groups:
+            group.capture_snapshot(runner)
+        # The next runner may reuse this bank immediately during its warmup.
+        # Drain every device stream here, not just the current stream, so a
+        # side-stream producer cannot still touch the old bank while the next
+        # graph is being prepared.
+        torch.cuda.synchronize()
+
+    def local_graph_capture_restore(self, runner, forward_runner=None):
+        """Restore the forward runner explicitly bound to this bwd runner."""
+        if not self._local_graph_ping_pong_enabled(runner):
+            return
+        if forward_runner is None:
+            forward_runner = runner
+        if forward_runner is not runner:
+            raise RuntimeError("local graph bwd runner must use its own forward snapshot")
+        for group in runner.local_graph_offload_groups:
+            group.capture_restore(forward_runner)
+
+    def begin_local_graph_discovery(self, runner):
+        """Discover saved activation descriptors during the final eager warmup."""
+        assert not self.in_local_graph_capture, "Nested local graph offload discovery"
+        self._local_graph_capture_runner = runner
+        self._local_graph_mode = "discovery"
+        self._local_graph_capture_groups = []
+        self._local_graph_capture_group = None
+        self._local_graph_group_index = 0
+
+    def end_local_graph_discovery(self, success=True):
+        """Allocate fixed-address slots after descriptor discovery."""
+        runner = self._local_graph_capture_runner
+        if runner is None or self._local_graph_mode != "discovery":
+            return
+        assert self._local_graph_capture_group is None, "Unclosed discovery group"
+        groups = list(self._local_graph_capture_groups)
+        if success:
+            slot_bank = (
+                runner.local_graph_slot_bank
+                if self._local_graph_ping_pong_enabled(runner)
+                else None
+            )
+            for group_index, group in enumerate(groups):
+                group.allocate(self, slot_bank, group_index)
+            runner.local_graph_offload_groups = groups
+            self._local_graph_debug(
+                f"discovered groups={len(groups)} logical_bytes={self._local_graph_group_bytes(groups)} "
+                f"physical_bytes={sum(group.physical_bytes for group in groups)}"
+            )
+        else:
+            runner.local_graph_offload_groups = []
+        self._local_graph_capture_runner = None
+        self._local_graph_mode = None
+        self._local_graph_capture_groups = []
+        self._local_graph_group_index = 0
+
+    def begin_local_graph_capture(self, runner):
+        """Bind graph capture to slots allocated during descriptor discovery."""
+        assert not self.in_local_graph_capture, "Nested local CUDA graph offload capture"
+        groups = getattr(runner, "local_graph_offload_groups", [])
+        self._local_graph_capture_runner = runner
+        self._local_graph_mode = "capture"
+        self._local_graph_capture_groups = groups
+        self._local_graph_group_index = 0
+        runner.local_graph_capture_epoch = getattr(runner, "local_graph_capture_epoch", 0) + 1
+        runner.local_graph_capture_metadata = {
+            "epoch": runner.local_graph_capture_epoch,
+            "rank": torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+            "runner_id": id(runner),
+            "groups": [],
+            "consumer_slots": [],
+        }
+        for group_index, group in enumerate(groups):
+            group.capture_runner = runner
+            group.capture_group_index = group_index
+        self._local_graph_capture_group = None
+
+    def end_local_graph_capture(self, success=True):
+        """Validate capture-time descriptor consumption and retain runner slots."""
+        runner = self._local_graph_capture_runner
+        if runner is None or self._local_graph_mode != "capture":
+            return
+        assert self._local_graph_capture_group is None, "Unclosed local graph offload group"
+        groups = self._local_graph_capture_groups
+        if success:
+            if self._local_graph_group_index != len(groups):
+                raise RuntimeError(
+                    f"local graph capture consumed {self._local_graph_group_index}/{len(groups)} groups"
+                )
+            for group_index, group in enumerate(groups):
+                group.finish_capture()
+                metadata = getattr(runner, "local_graph_capture_metadata", None)
+                if metadata is not None:
+                    metadata["groups"].append(
+                        {
+                            "group_index": group_index,
+                            "name": group.name,
+                            "slots": list(group.capture_slots),
+                        }
+                    )
+            self._local_graph_debug(
+                f"captured groups={len(groups)} bytes={self._local_graph_group_bytes(groups)} "
+                f"consumer_slots={runner.local_graph_capture_metadata['consumer_slots']}"
+            )
+        else:
+            runner.local_graph_offload_groups = []
+        self._local_graph_capture_runner = None
+        self._local_graph_mode = None
+        self._local_graph_capture_groups = []
+        self._local_graph_group_index = 0
+
+    def local_graph_group_start(self, name, min_tensor_size):
+        """Open saved-tensor hooks for one discovery or capture group."""
+        assert self.in_local_graph_capture
+        assert self._local_graph_capture_group is None, "Overlapping local graph offload groups"
+        if self._local_graph_mode == "discovery":
+            group = LocalCudaGraphOffloadGroup(name, min_tensor_size)
+            pack_hook = group.discover_tensor
+        else:
+            if self._local_graph_group_index >= len(self._local_graph_capture_groups):
+                raise RuntimeError(f"capture produced unexpected activation group {name}")
+            group = self._local_graph_capture_groups[self._local_graph_group_index]
+            if group.name != name or group.min_tensor_size != min_tensor_size:
+                raise RuntimeError(
+                    f"local graph activation group drift: expected={group.name}, actual={name}"
+                )
+            pack_hook = group.save_tensor
+        self._local_graph_capture_group = group
+        self._local_graph_saved_tensors_hooks = saved_tensors_hooks(pack_hook, group.load_tensor)
+        self._local_graph_saved_tensors_hooks.__enter__()
+
+    def local_graph_group_context_exit(self):
+        """Close the current group's saved-tensor hooks."""
+        if self._local_graph_saved_tensors_hooks is not None:
+            self._local_graph_saved_tensors_hooks.__exit__(None, None, None)
+            self._local_graph_saved_tensors_hooks = None
+
+    def local_graph_group_commit(self, name):
+        """Commit one ordered discovery or capture group."""
+        group = self._local_graph_capture_group
+        assert group is not None and group.name == name
+        assert self._local_graph_saved_tensors_hooks is None, "Offload context must exit before commit"
+        if self._local_graph_mode == "discovery":
+            self._local_graph_capture_groups.append(group)
+        else:
+            group.finish_capture()
+        self._local_graph_group_index += 1
+        self._local_graph_capture_group = None
+
+    def local_graph_forward_wait_ready(self, runner, replay_stream):
+        """Fence reuse of a resident bank until its preceding D2H finishes."""
+        if not self._local_graph_ping_pong_enabled(runner):
+            return False
+        bank = runner.local_graph_slot_bank
+        if self._local_graph_bank_d2h_recorded[bank]:
+            replay_stream.wait_event(self._local_graph_bank_d2h_events[bank])
+        consumed_event = self._local_graph_bank_consumed_events[bank]
+        if consumed_event is not None:
+            replay_stream.wait_event(consumed_event)
+        return True
+
+    def local_graph_forward_replay(self, runner, graph_done_event=None):
+        """Enqueue D2H only after the replay completion fence."""
+        compute_stream = torch.cuda.current_stream()
+        groups = getattr(runner, "local_graph_offload_groups", [])
+        active_groups = [group for group in groups if group.device_tensors]
+        step_bytes = self._local_graph_group_bytes(groups)
+        self._local_graph_d2h_bytes += step_bytes
+        if not active_groups:
+            self._local_graph_debug(f"d2h bytes={step_bytes} total_d2h={self._local_graph_d2h_bytes}")
+            return
+        if self._local_graph_ping_pong_enabled(runner):
+            bank = runner.local_graph_slot_bank
+            for group in active_groups:
+                group.enqueue_resident_d2h(self.d2h_stream, compute_stream)
+            with torch.cuda.stream(self.d2h_stream):
+                self._local_graph_bank_d2h_events[bank].record(self.d2h_stream)
+            self._local_graph_bank_d2h_recorded[bank] = True
+        else:
+            # After this graph's forward replay, offload every slot in every
+            # group that belongs to the graph as one D2H burst and one batched
+            # release host func. Per-slot host funcs previously unmapped each
+            # allocation independently as soon as its own copy finished.
+            self._enqueue_graph_groups_offload(
+                runner, active_groups, compute_stream, graph_done_event
+            )
+            self.drain_pending_d2h(runner)
+
+    def _enqueue_graph_groups_offload(self, runner, active_groups, compute_stream, graph_done_event):
+        """D2H then batch-release every slot owned by this graph's offload groups."""
+        if release_hooks_after is None:
+            raise RuntimeError(
+                "TE release_hooks_after is required to batch-offload local graph activation slots"
+            )
+        allocations = []
+        for group in active_groups:
+            if group.state != "mapped":
+                raise RuntimeError(f"{group.name}: cannot offload slots in state {group.state}")
+            allocations.extend(group.allocations)
+        if not allocations:
+            return
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        self._local_graph_debug(
+            f"d2h_submit_begin ts_ns={time.time_ns()} rank={rank} "
+            f"runner_id={id(runner)} groups={[group.name for group in active_groups]} "
+            f"slots={len(allocations)}"
+        )
+        if os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_DEBUG") == "1":
+            print(
+                f"[vmm-offload][rank={rank}] submit_graph_d2h "
+                f"runner_id={id(runner)} groups={[group.name for group in active_groups]} "
+                f"allocations={len(allocations)} "
+                f"compute_stream={getattr(compute_stream, 'cuda_stream', None)} "
+                f"d2h_stream={getattr(self.d2h_stream, 'cuda_stream', None)} "
+                f"release_stream={getattr(self._local_graph_release_stream, 'cuda_stream', None)}",
+                flush=True,
+            )
+
+        with torch.cuda.stream(self.d2h_stream):
+            if graph_done_event is not None:
+                self.d2h_stream.wait_event(graph_done_event)
+            else:
+                self.d2h_stream.wait_stream(compute_stream)
+            for group in active_groups:
+                for slot_index, (host_tensor, device_tensor) in enumerate(
+                    zip(group.host_tensors, group.device_tensors)
+                ):
+                    host_tensor.copy_(device_tensor, non_blocking=True)
+                    self._local_graph_debug(
+                        f"d2h_slot_submit ts_ns={time.time_ns()} "
+                        f"group={group.name} slot={slot_index}"
+                    )
+                group.d2h_event.record(self.d2h_stream)
+
+        with torch.cuda.stream(self._local_graph_release_stream):
+            self._local_graph_release_stream.wait_event(active_groups[-1].d2h_event)
+            batch_context = release_hooks_after(allocations, self._local_graph_release_stream)
+
+        for group in active_groups:
+            group.release_contexts = [batch_context]
+            group.release_context = batch_context
+            group.state = "d2h_pending"
+
+        self._local_graph_debug(
+            f"d2h_submit_return ts_ns={time.time_ns()} rank={rank} "
+            f"runner_id={id(runner)} slots={len(allocations)}"
+        )
+
+
+    def drain_pending_d2h(self, runner):
+        """Release VMM backing for groups whose D2H already completed; never blocks."""
+        groups = getattr(runner, "local_graph_offload_groups", [])
+        released = sum(1 for group in groups if group.try_release())
+        if released:
+            self._local_graph_debug(f"lazy released groups={released}")
+
+    @staticmethod
+    def _local_graph_active_groups(runner):
+        groups = getattr(runner, "local_graph_offload_groups", [])
+        return [group for group in reversed(groups) if group.device_tensors]
+
+    def local_graph_backward_prepare(self, runner, block_until_submitted=True):
+        """Submit one runner's resident reload or VMM remap/H2D batch.
+
+        With ``block_until_submitted=True`` (per-runner slot path default) the
+        call additionally blocks until the RemapWorker finished the VMM
+        transition and submitted the H2D — see the call site in
+        ``Graphed.backward`` for why this runs before the predecessor's
+        replay. The forward-time priming of the backward-chain head passes
+        ``False`` because its release dependency (the forward D2H burst) is
+        still in flight there; blocking would serialize the offload copies.
+        """
+        active_groups = self._local_graph_active_groups(runner)
+        if not active_groups:
+            return False
+        state = getattr(runner, "local_graph_reload_state", None)
+        if state == "reload_pending":
+            return True
+        if state is not None:
+            raise RuntimeError(f"cannot prepare local graph runner in reload state {state}")
+        if self._local_graph_ping_pong_enabled(runner):
+            bank = runner.local_graph_slot_bank
+            # Before the first backward use, do not overwrite this bank until
+            # its final forward D2H has saved the activation currently in it.
+            if self._local_graph_bank_d2h_recorded[bank]:
+                self.h2d_stream.wait_event(self._local_graph_bank_d2h_events[bank])
+            # Later uses wait until the prior backward graph reading this bank
+            # has completed. Adjacent runners use the opposite bank and overlap.
+            consumed_event = self._local_graph_bank_consumed_events[bank]
+            if consumed_event is not None:
+                self.h2d_stream.wait_event(consumed_event)
+            for group in active_groups:
+                group.enqueue_resident_h2d(self.h2d_stream)
+            reload_event = torch.cuda.Event()
+            with torch.cuda.stream(self.h2d_stream):
+                reload_event.record(self.h2d_stream)
+            runner.local_graph_reload_event = reload_event
+            runner.local_graph_reload_context = None
+            runner.local_graph_reload_state = "reload_pending"
+        else:
+            # Submit in backward consumption order. The last forward-offloaded
+            # group has the latest release dependency, so waiting on it first
+            # makes every earlier dependency a fast path.
+            # Non-ping-pong reload is deliberately deferred until this runner is
+            # consumed.  Creating one batch context here used to enqueue every
+            # slot early, allowing fast ranks to reload the whole runner long
+            # before graph replay.  Keep the slot/group description on the
+            # runner; submit each group from local_graph_backward_wait_ready().
+            runner.local_graph_reload_context = None
+            runner.local_graph_reload_groups = tuple(active_groups)
+            runner.local_graph_reload_slot_count = sum(
+                len(group.allocations) for group in active_groups
+            )
+            runner.local_graph_reload_state = "reload_deferred"
+        return True
+
+    def local_graph_backward_submit_reload(self, runner):
+        """Submit the next runner's H2D requests without gating its compute stream."""
+        if self._local_graph_ping_pong_enabled(runner):
+            return self.local_graph_backward_prepare(runner)
+        if getattr(runner, "local_graph_reload_state", None) == "reload_submitted":
+            return True
+        if getattr(runner, "local_graph_reload_state", None) is None:
+            self.local_graph_backward_prepare(runner)
+        if getattr(runner, "local_graph_reload_state", None) != "reload_deferred":
+            return False
+        active_groups = self._local_graph_active_groups(runner)
+        observed = getattr(runner, "local_graph_consumer_slots", ())
+        slot_plan = {}
+        for group_index, slot_index, vmm_address in observed:
+            if group_index >= len(runner.local_graph_offload_groups):
+                slot_plan = {}
+                break
+            group = runner.local_graph_offload_groups[group_index]
+            if slot_index >= len(group.allocations) or group.allocations[slot_index].tensor.data_ptr() != vmm_address:
+                slot_plan = {}
+                break
+            slot_plan.setdefault(id(group), set()).add(slot_index)
+        valid = bool(slot_plan) and all(id(group) in slot_plan for group in active_groups)
+        if not valid:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            raise RuntimeError(
+                f"invalid local graph consumer slots: rank={rank} "
+                f"runner_id={id(runner)} observed={observed} "
+                f"active_groups={[group.name for group in active_groups]}"
+            )
+        runner.local_graph_reload_slot_plan = {
+            id(group): sorted(slot_plan[id(group)]) for group in active_groups
+        }
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        self._local_graph_debug(
+            f"reload_submit_plan rank={rank} runner_id={id(runner)} "
+            f"consumer_slots={observed} active_groups="
+            f"{[(group.name, id(group)) for group in active_groups]} "
+            f"slot_plan={runner.local_graph_reload_slot_plan}"
+        )
+        runner.local_graph_reload_slots = []
+        runner.local_graph_reload_slot_map = {}
+        for group_index, slot_index, vmm_address in observed:
+            group = runner.local_graph_offload_groups[group_index]
+            key = (group_index, slot_index)
+            if key in runner.local_graph_reload_slot_map:
+                raise RuntimeError(
+                    f"duplicate local graph consumer slot: runner_id={id(runner)} "
+                    f"group_index={group_index} slot_index={slot_index}"
+                )
+            runner.local_graph_reload_slot_map[key] = len(runner.local_graph_reload_slots)
+            runner.local_graph_reload_slots.append((group_index, slot_index, vmm_address))
+        runner.local_graph_reload_contexts = {}
+        for group_index, slot_index, _ in runner.local_graph_reload_slots:
+            group = runner.local_graph_offload_groups[group_index]
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            self._local_graph_debug(
+                f"reload_submit_slot rank={rank} runner_id={id(runner)} "
+                f"position={runner.local_graph_reload_slot_map[(group_index, slot_index)]} "
+                f"group_index={group_index} group={group.name} slot={slot_index}"
+            )
+            allocation = group.allocations[slot_index]
+            # Remap-only submission: the worker performs the VMM transition but
+            # does NOT submit H2D yet; that happens at replay time so the copy
+            # and the graph launch are issued together.
+            reload_context = remap_only_slot_after(
+                allocation, group.host_tensors[slot_index], self.h2d_stream
+            )
+            group.prepare_remap(reload_context)
+            runner.local_graph_reload_contexts[(group_index, slot_index)] = reload_context
+        runner.local_graph_reload_state = "reload_submitted"
+        return True
+
+
+        if not getattr(runner, "local_graph_reload_groups", None):
+            return False
+        if self._local_graph_ping_pong_enabled(runner):
+            return False
+        # Each group is adopted immediately after its own request is consumed;
+        # there is no batch remap context left to drain here.
+        runner.local_graph_reload_context = None
+        runner.local_graph_reload_groups = None
+        runner.local_graph_reload_event = None
+        runner.local_graph_reload_state = None
+        return True
+
+    def local_graph_backward_wait_ready(self, runner, compute_stream=None):
+        """Wait only for this runner's consumer slots."""
+        active_groups = self._local_graph_active_groups(runner)
+        if not active_groups:
+            return False
+        if compute_stream is None:
+            compute_stream = torch.cuda.current_stream()
+        if self._local_graph_ping_pong_enabled(runner):
+            # The backward-chain head has no predecessor replay to look-ahead
+            # from. Non-ping-pong wait_ready already lazy-submits; do the same
+            # here so the first resident H2D is issued before the wait.
+            if runner.local_graph_reload_event is None:
+                self.local_graph_backward_submit_reload(runner)
+            if runner.local_graph_reload_event is None:
+                raise RuntimeError("local graph resident reload has no completion event")
+            compute_stream.wait_event(runner.local_graph_reload_event)
+            for group in active_groups:
+                group.adopt_resident_reload()
+            runner.local_graph_reload_event = None
+            runner.local_graph_reload_state = None
+            return True
+        if wait_remap_slot_on_stream is None or launch_remap_slot_h2d is None:
+            raise RuntimeError("TE per-slot remap wait API is unavailable")
+        if getattr(runner, "local_graph_reload_state", None) != "reload_submitted":
+            self.local_graph_backward_submit_reload(runner)
+        contexts = getattr(runner, "local_graph_reload_contexts", {})
+        reload_slots = getattr(runner, "local_graph_reload_slots", ())
+        # Two-position H2D pipeline: runner K's copies gate on the completion
+        # event of the graph two execution-positions earlier (K+2), never on
+        # the immediate predecessor.  By Backward(N)'s replay moment the gate
+        # (Backward(N+2)) has long completed, so slot(N)'s H2D overlaps the
+        # still-running Backward(N+1) instead of serializing behind it.
+        previous_runner = getattr(runner, "prev_bwd_runner", None)
+        pre_previous_runner = getattr(previous_runner, "prev_bwd_runner", None) if previous_runner is not None else None
+        gate_event = (
+            getattr(pre_previous_runner, "bwd_graph_replay_complete_event", None)
+            if pre_previous_runner is not None and not self._local_graph_ping_pong_enabled(runner)
+            else None
+        )
+        if gate_event is not None:
+            self.h2d_stream.wait_event(gate_event)
+            self._local_graph_debug(
+                f"h2d_gate rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1} "
+                f"runner_id={id(runner)} gate_runner_id={id(pre_previous_runner)}"
+            )
+        for group_index, slot_index, _ in reload_slots:
+            group = runner.local_graph_offload_groups[group_index]
+            context = contexts.get((group_index, slot_index))
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            h2d_begin = time.time_ns()
+            # The remap worker only performs the VMM transition.  Submit the
+            # H2D from this training thread so the memcpy is ordered with the
+            # replay that consumes this slot.  launch_remap_slot_h2d waits for
+            # the worker's remap completion before issuing cudaMemcpyAsync on
+            # h2d_stream; the returned slot event is then propagated to both
+            # streams before the allocation is adopted.
+            launch_remap_slot_h2d(context, 0, self.h2d_stream)
+            wait_remap_slot_on_stream(context, 0, self.h2d_stream)
+            wait_remap_slot_on_stream(context, 0, compute_stream)
+            self._local_graph_debug(
+                f"h2d_launch rank={rank} runner_id={id(runner)} "
+                f"position={runner.local_graph_reload_slot_map.get((group_index, slot_index), -1)} "
+                f"group_index={group_index} group={group.name} slot={slot_index} "
+                f"h2d_submit_ns={time.time_ns() - h2d_begin}"
+            )
+            group.allocations[slot_index].adopt_async_remap()
+        for group in active_groups:
+            group.state = "mapped"
+        runner.local_graph_reload_state = None
+        runner.local_graph_reload_contexts = None
+        runner.local_graph_reload_slots = None
+        runner.local_graph_reload_slot_map = None
+        runner.local_graph_reload_groups = None
+        return True
+
+    def begin_local_graph_consumer_capture(self, runner):
+        """Collect saved-tensor slots while capturing one backward graph."""
+        if self._local_graph_consumer_context is not None:
+            raise RuntimeError("Nested local graph consumer capture")
+        self._local_graph_consumer_context = {"runner": runner, "slots": []}
+
+    def end_local_graph_consumer_capture(self, runner, success=True):
+        """Publish the consumer batch captured by one backward graph."""
+        context = self._local_graph_consumer_context
+        self._local_graph_consumer_context = None
+        if context is None:
+            return
+        if success:
+            runner.local_graph_consumer_slots = tuple(
+                (item["group_index"], item["slot_index"], item["vmm_address"])
+                for item in context["slots"]
+            )
+            self._local_graph_debug(
+                f"consumer_batch rank={torch.distributed.get_rank() if torch.distributed.is_initialized() else -1} "
+                f"runner_id={id(runner)} slots={runner.local_graph_consumer_slots}"
+            )
+
+    def local_graph_backward_mark_consumed(self, runner, consumed_event):
+        """Publish when a resident bank may be overwritten by a later reload."""
+        if not self._local_graph_ping_pong_enabled(runner):
+            return False
+        self._local_graph_bank_consumed_events[runner.local_graph_slot_bank] = consumed_event
+        return True
+
+    def local_graph_backward_replay(self, runner):
+        """Compatibility fallback for callers without look-ahead scheduling."""
+        self.local_graph_backward_wait_ready(runner)
 
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
@@ -954,7 +1998,7 @@ class ChunkOffloadHandler:
         return (
             not isinstance(tensor, torch.nn.Parameter)
             and not torch_stray_tensor
-            and tensor.device.type == "cuda"
+            and tensor.is_cuda
         )
 
     def tensor_push(self, tensor):
@@ -1047,7 +2091,6 @@ class ChunkOffloadHandler:
                 # Only reload if tensor was offloaded (stored as tuple)
                 if isinstance(state, tuple):
                     recovered_tensor = self.reload(state)
-                    debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                     group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
         self._groups_to_reload.pop()
@@ -1197,8 +2240,12 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_backward {self}")
-        # Wait for compute to finish before starting reload
-        self.h2d_stream.wait_stream(torch.cuda.current_stream())
+        # Fence H2D submission with a point event from the current compute
+        # stream, rather than waiting on the stream as a whole.  This keeps
+        # later graph work from becoming an implicit dependency of this reload.
+        compute_ready = torch.cuda.Event()
+        compute_ready.record(torch.cuda.current_stream())
+        self.h2d_stream.wait_event(compute_ready)
         self.bulk_reload()
 
 
@@ -1346,10 +2393,11 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
         """Record the backward event and wait for the h2d stream on cuda graph stream."""
         debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
         mgr = PipelineOffloadManager.get_instance()
-        # This event connects TE's graph stream with the reload stream so
-        # backward consumers do not race H2D reloads launched outside the graph.
+        # Record the graph-stream position for offload bookkeeping, but do not
+        # wait on the whole H2D stream here. Each consumed slot installs its
+        # own completion-event dependency in local_graph_backward_wait_ready();
+        # waiting on h2d_stream globally would also wait for later layers.
         torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
-        torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
         return (grad_output,)
 
 
@@ -1360,18 +2408,29 @@ class FineGrainedActivationOffloadingInterface:
         self.offload = offload
         self.tensor = tensor
         self.name = name
+        self._local_graph_capture = False
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         if self.offload:
-            self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
-            PipelineOffloadManager.get_instance().__enter__()
+            manager = PipelineOffloadManager.get_instance()
+            if manager.in_local_graph_capture:
+                self._local_graph_capture = True
+                min_tensor_size = manager._local_graph_capture_runner.base_module.config.min_offloaded_tensor_size
+                manager.local_graph_group_start(self.name, min_tensor_size)
+            else:
+                self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
+                manager.__enter__()
         return self.tensor
 
     def __exit__(self, *args: Any):
         """Exit context manager to disable activation offloading hooks."""
         if self.offload:
-            PipelineOffloadManager.get_instance().__exit__()
+            manager = PipelineOffloadManager.get_instance()
+            if self._local_graph_capture:
+                manager.local_graph_group_context_exit()
+            else:
+                manager.__exit__()
 
     @staticmethod
     def cuda_graph_stream():
@@ -1412,6 +2471,10 @@ class FineGrainedActivationOffloadingInterface:
     def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
         """Group offload the tensors."""
         if self.offload:
+            manager = PipelineOffloadManager.get_instance()
+            if self._local_graph_capture:
+                manager.local_graph_group_commit(self.name)
+                return tensor
             return fine_grained_offloading_group_offload(
                 tensor, self.name, forced_released_tensors, delay_offload
             )
