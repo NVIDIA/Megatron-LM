@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from functools import partial
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from examples.mimo.model_providers import MimoProvider
 from examples.mimo.model_providers.radio_encoder import (
@@ -257,6 +260,7 @@ def language_model_spec(
             "position_embedding_type": "none",
             "share_embeddings_and_output_weights": False,
             "scatter_embedding_sequence_parallel": False,
+            "logit_dtype": args.logit_dtype,
             "pg_collection": pg_collection,
         },
     )
@@ -331,18 +335,45 @@ def nemotron_special_token_ids(args: argparse.Namespace) -> dict[str, int]:
     return {RADIO_ENCODER_MODULE_NAME: args.image_token_id}
 
 
+def _nemotron_bridge_recv_shape(
+    batch: dict, image_token_id: int, hidden_size: int
+) -> tuple[int, int]:
+    """Derive the local projected-vision receive shape from language input IDs."""
+    input_ids = batch.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        raise TypeError("bridge receive shape requires tensor batch['input_ids']")
+    if input_ids.ndim != 2:
+        raise ValueError(f"expected 2D batch['input_ids'], got shape {tuple(input_ids.shape)}")
+    return int((input_ids == image_token_id).sum().item()), hidden_size
+
+
 def build_nemotron_communicator(
     args: argparse.Namespace, topology: "HeteroTopology"
 ) -> MultiModulePipelineCommunicator:
     """Wire the RADIO-encoder -> language cross-grid pipeline communicator."""
     language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
     language_config = language_model_spec(args, None, language_grid).params["config"]
+    bridge_recv_shape_fns = None
+    if getattr(args, "mimo_bridge_skip_shape_exchange", False):
+        bridge_hidden_size = int(args.hidden_size)
+        if getattr(args, "mimo_run_input_projections_on_llm_ranks", False):
+            vision_config = radio_vision_config(args, args.mimo_encoder_tp, 1)
+            bridge_hidden_size = _vision_projection_input_size(args, vision_config)
+        bridge_recv_shape_fns = {
+            RADIO_ENCODER_MODULE_NAME: partial(
+                _nemotron_bridge_recv_shape,
+                image_token_id=int(args.image_token_id),
+                hidden_size=bridge_hidden_size,
+            )
+        }
     return MultiModulePipelineCommunicator(
         topology.grids,
         {RADIO_ENCODER_MODULE_NAME: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []},
         language_config,
         dim_mapping={"s": 0, "h": 2, "b": 1},
         module_output_ndim={RADIO_ENCODER_MODULE_NAME: 2},
+        bridge_recv_shape_fns=bridge_recv_shape_fns,
+        bridge_comm_dtypes={RADIO_ENCODER_MODULE_NAME: language_config.params_dtype},
     )
 
 
