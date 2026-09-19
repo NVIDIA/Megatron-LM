@@ -26,6 +26,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
     validate_segment_layers,
 )
+from megatron.core.models.hybrid.hybrid_stack_adapter import (
+    HybridStackForwardAdapter,
+    HybridStackForwardContext,
+)
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import (
@@ -42,6 +46,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    SinglePassMHCState,
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
@@ -67,6 +72,8 @@ class HybridStackSubmodules:
     gdn2_layer: ModuleSpec | None = None
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    csa2_layer: ModuleSpec | type | None = None
+    forward_adapter: ModuleSpec | type[HybridStackForwardAdapter] | None = None
     csa_layer: ModuleSpec | type | None = None
     csa_qk_layernorm_layer: ModuleSpec | type | None = None
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -196,6 +203,24 @@ class HybridStack(MegatronModule):
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
             )
+        self.forward_adapter = None
+        if submodules.forward_adapter is not None:
+            self.forward_adapter = build_module(
+                submodules.forward_adapter,
+                config=config,
+                layer_type_list=self.layer_type_list,
+                pp_layer_offset=pp_layer_offset,
+                pre_process=pre_process,
+                post_process=post_process,
+                is_mtp_layer=is_mtp_layer,
+                pg_collection=pg_collection,
+            )
+        if (
+            any(type(c) is layer_utils.CSA2LayerConfig for c in layer_config_list)
+            and self.forward_adapter is None
+        ):
+            raise ValueError("CSA2 layers require a forward adapter; use hybrid_csa2_stack_spec")
+
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
@@ -234,6 +259,19 @@ class HybridStack(MegatronModule):
                 elif type(layer_config) is layer_utils.DSALayerConfig:
                     layer = build_module(
                         submodules.dsa_layer,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif type(layer_config) is layer_utils.CSA2LayerConfig:
+                    if submodules.csa2_layer is None:
+                        raise ValueError("CSA2 layers require a csa2_layer module spec")
+                    layer = build_module(
+                        submodules.csa2_layer,
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -346,7 +384,12 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+        if (
+            self.config.enable_mhc_connections
+            and not self.config.mhc_single_pass
+            and self.post_process
+            and not self.is_mtp_layer
+        ):
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -466,6 +509,7 @@ class HybridStack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        forward_context: HybridStackForwardContext | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -517,6 +561,14 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        forward_context = forward_context or HybridStackForwardContext()
+        if self.forward_adapter is not None:
+            forward_context = self.forward_adapter.prepare_forward(
+                hidden_states, packed_seq_params, inference_context, forward_context
+            )
+        if self.config.mhc_single_pass and forward_context.mhc_state is None:
+            forward_context.mhc_state = SinglePassMHCState()
 
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
@@ -655,6 +707,12 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                                if forward_context.cross_layer_state is not None:
+                                    layer_kwargs["cross_layer_state"] = (
+                                        forward_context.cross_layer_state
+                                    )
+                                if forward_context.mhc_state is not None:
+                                    layer_kwargs["mhc_state"] = forward_context.mhc_state
                                 hidden_states, _ = layer(**layer_kwargs)
                             elif layer_cp_metadata is not None:
                                 hidden_states = layer(
@@ -690,14 +748,19 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if forward_context.mhc_state is not None:
+                hidden_states = forward_context.mhc_state.contract(
+                    hidden_states, self.config.mhc_num_residual_streams
+                )
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -709,9 +772,10 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        if mhc_multistream is not None:
-            return hidden_states, mhc_multistream
-        return hidden_states
+        output = (hidden_states, mhc_multistream) if mhc_multistream is not None else hidden_states
+        if self.forward_adapter is not None:
+            return self.forward_adapter.finalize_forward(output, forward_context)
+        return output
 
     def sharded_state_dict(
         self,

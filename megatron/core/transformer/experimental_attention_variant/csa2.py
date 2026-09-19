@@ -50,6 +50,7 @@ class CSA2State:
     forward, including when another microbatch's backward is still outstanding.
     """
 
+    attention_layer_ids: frozenset[int] | None = None
     global_kv: torch.Tensor | None = None
     indexer_k: torch.Tensor | None = None
     global_indices: torch.Tensor | None = None
@@ -62,6 +63,15 @@ class CSA2State:
     device: torch.device | None = None
     dtype: torch.dtype | None = None
     last_layer: int | None = None
+
+    def attention_kwargs(self, layer_number: int) -> dict:
+        """Supply shared state only to the participating attention layers."""
+        if (
+            self.attention_layer_ids is not None
+            and layer_number - 1 not in self.attention_layer_ids
+        ):
+            return {}
+        return {"csa2_state": self}
 
     def validate_forward(self, layer_idx: int, query: torch.Tensor) -> None:
         """Reject reuse across forwards or incompatible sequence/batch layouts."""

@@ -21,7 +21,16 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 impo
 
 def tiny_config(dtype=torch.float32, *, all_components=False, **overrides):
     """Keep every attention role while reducing width, experts and memory table rows."""
-    values = dict(num_layers=12, dsa_indexer_loss_coeff=0.01, moe_token_dispatcher_type="alltoall")
+    values = dict(
+        num_layers=12,
+        mhc_single_pass=True,
+        csa_compress_ratios=[r for ratio in (0, 2, 2, 1, 1, 1) for r in (ratio, 0)],
+        csa2_kv_source_layers=[2, 6],
+        csa2_index_source_layers=[2, 6, 8],
+        csa2_candidate_source_layer=6,
+        dsa_indexer_loss_coeff=0.01,
+        moe_token_dispatcher_type="alltoall",
+    )
     values.update(overrides)
     config = DeepSeekV41Config.from_config(_make_config(params_dtype=dtype, **values))
     return config
@@ -47,7 +56,9 @@ def test_two_pending_microbatches_and_causality(groups):
     torch.testing.assert_close(first[:, :10], second[:, :10], atol=2e-06, rtol=2e-05)
     (first.square().mean() + second.square().mean()).backward()
     assert (
-        model.decoder.layers[1].attention.core_attention.compressor.linear_wkv.weight.grad
+        model.decoder.layers[
+            2
+        ].inner_layer.self_attention.core_attention.compressor.linear_wkv.weight.grad
         is not None
     )
 

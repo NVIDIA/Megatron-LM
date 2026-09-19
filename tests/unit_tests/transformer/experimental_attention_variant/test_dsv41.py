@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 
-def test_factory_selects_csa2():
+def test_factory_selects_csa2(monkeypatch):
     """The public attention factory must not instantiate a V4 compressor for V4.1."""
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
     from megatron.core.transformer.experimental_attention_variant import (
@@ -19,7 +19,11 @@ def test_factory_selects_csa2():
         CompressedSparseAttention2,
     )
 
-    spec = specs.get_dsv4_hybrid_module_spec_for_backend(_make_config(), TESpecProvider())
+    backend = TESpecProvider()
+    projection = object()
+    monkeypatch.setattr(backend, "linear", lambda: projection)
+    spec = specs.get_dsv4_hybrid_module_spec_for_backend(_make_config(), backend)
+    assert spec.submodules.linear_q_down_proj is projection
     assert spec.submodules.core_attention.func is CompressedSparseAttention2
 
 
@@ -87,3 +91,44 @@ def _make_config(
     )
     values.update(overrides)
     return MLATransformerConfig(**values)
+
+
+def test_v41_cli_fields():
+    """The standard parser exposes the shared mHC and CSA2 configuration fields."""
+    from argparse import ArgumentParser
+
+    from megatron.training.arguments import _add_network_size_args
+
+    parser = ArgumentParser()
+    _add_network_size_args(parser)
+    args = parser.parse_args(
+        [
+            "--dsv4-version",
+            "v4.1",
+            "--mhc-single-pass",
+            "--mhc-epsilon",
+            "1e-6",
+            "--csa2-kv-source-layers",
+            "0",
+            "2",
+            "--csa2-index-source-layers",
+            "0",
+            "2",
+            "4",
+            "--csa2-candidate-source-layer",
+            "2",
+            "--csa2-candidate-topk-blocks",
+            "2",
+            "--csa2-candidate-block-size",
+            "8",
+        ]
+    )
+    assert args.mhc_single_pass and args.mhc_epsilon == 1e-6
+    assert args.dsv4_version == "v4.1"
+    assert args.csa2_kv_source_layers == [0, 2]
+    assert args.csa2_index_source_layers == [0, 2, 4]
+    assert (
+        args.csa2_candidate_source_layer,
+        args.csa2_candidate_topk_blocks,
+        args.csa2_candidate_block_size,
+    ) == (2, 2, 8)

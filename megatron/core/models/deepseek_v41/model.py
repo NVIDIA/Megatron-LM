@@ -2,7 +2,7 @@
 
 """DeepSeek-V4.1 model using HybridModel's embedding, head and checkpoint interface."""
 
-from megatron.core.models.deepseek_v41.stack import deepseek_v41_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_csa2_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 
 
@@ -23,10 +23,10 @@ class DeepSeekV41Model(HybridModel):
             raise ValueError("The released V4.1 architecture uses untied embedding/output weights")
         super().__init__(
             config=config,
-            hybrid_stack_spec=deepseek_v41_stack_spec,
+            hybrid_stack_spec=hybrid_csa2_stack_spec,
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
-            hybrid_layer_pattern="VE" * len(config.csa_compress_ratios),
+            hybrid_layer_pattern=config.hybrid_pattern,
             position_embedding_type="none",
             pg_collection=pg_collection,
             **kwargs,

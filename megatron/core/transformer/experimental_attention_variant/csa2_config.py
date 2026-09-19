@@ -22,7 +22,7 @@ def validate_csa2_config(config) -> None:
     if config.dsa_kernel_backend == "cudnn" and config.params_dtype != torch.bfloat16:
         raise ValueError("Fused CSA2 attention requires BF16 parameters")
     if config.attention_dropout or config.hidden_dropout:
-        raise ValueError("The released V4.1 architecture uses zero dropout")
+        raise ValueError("CSA2 currently requires zero attention and hidden dropout")
     if config.csa_dense_mode or config.qk_clip:
         raise ValueError("CSA2 does not use dense CSA or QK clipping")
     if config.add_bias_linear or config.qk_l2_norm or config.dsa_indexer_rotate_activation:
@@ -34,15 +34,27 @@ def validate_csa2_config(config) -> None:
     for name in ("layernorm_epsilon", "csa_compress_rotary_base"):
         if not math.isfinite(getattr(config, name)) or getattr(config, name) <= 0:
             raise ValueError(f"CSA2 requires positive finite {name}")
+    if config.moe_shortcut_connection:
+        raise NotImplementedError("CSA2 does not yet support shortcut MoE")
+    if config.pipeline_model_parallel_size != 1 or config.virtual_pipeline_model_parallel_size:
+        raise NotImplementedError("CSA2 currently requires PP=1 and no VPP")
+    if config.recompute_granularity is not None or config.cuda_graph_impl != "none":
+        raise NotImplementedError("CSA2 cross-layer state currently requires eager execution")
+    if (
+        config.overlap_moe_expert_parallel_comm
+        or config.delay_wgrad_compute
+        or config.fine_grained_activation_offloading
+    ):
+        raise NotImplementedError("CSA2 does not yet support layer overlap or activation offload")
     ratios = config.csa_compress_ratios
     if not ratios or any(type(r) is not int or r not in (0, 1, 2) for r in ratios):
-        raise ValueError("CSA2 requires one ratio (0, 1, or 2) per logical attention layer")
-    if config.num_layers not in (len(ratios), 2 * len(ratios)):
-        raise ValueError("CSA2 ratios must match the logical backbone depth")
+        raise ValueError("CSA2 requires one ratio (0, 1, or 2) per stack layer")
+    if config.num_layers != len(ratios):
+        raise ValueError("CSA2 ratios must contain exactly num_layers entries")
     for name in ("csa2_kv_source_layers", "csa2_index_source_layers"):
         sources = getattr(config, name)
         if sources is None or any(type(i) is not int or not 0 <= i < len(ratios) for i in sources):
-            raise ValueError(f"{name} must contain zero-based logical attention layer IDs")
+            raise ValueError(f"{name} must contain zero-based stack layer IDs")
         if sources != sorted(set(sources)) or any(ratios[i] == 0 for i in sources):
             raise ValueError(f"{name} must be strictly increasing and exclude SWA layers")
     if not set(config.csa2_kv_source_layers).issubset(config.csa2_index_source_layers):
