@@ -1179,3 +1179,63 @@ class TestAbstractTokenizerSpecialIdAliases:
         assert tok.cls_id == 5
         assert tok.sep_id == 6
         assert tok.mask_id == 7
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_load_generation_config_resolves_hub_model_id(tmp_path, monkeypatch):
+    """Regression for a review comment on the multi-EOS PR: `tokenizer_path` can be
+    a Hub model id, not just a local directory. The old `os.path.join` +
+    `os.path.isfile` check only ever resolved a local directory, silently finding
+    nothing for a Hub id -- generation_config.json (and therefore the multi-EOS
+    termination set) was dead code for any Hub-id-based model. This verifies the
+    fix actually resolves via HF's cached_file helper rather than a local path.
+    """
+    from megatron.core.tokenizers.text.libraries import huggingface_tokenizer as hf_mod
+
+    gc_path = tmp_path / "generation_config.json"
+    gc_path.write_text(json.dumps({"eos_token_id": [2, 11], "temperature": 0.6}))
+
+    seen_args = {}
+
+    def fake_cached_file(path_or_repo_id, filename, **kwargs):
+        # A real Hub id, e.g. "org/model-name" -- not a local path that
+        # os.path.isfile could ever have found.
+        seen_args["path_or_repo_id"] = path_or_repo_id
+        seen_args["filename"] = filename
+        assert kwargs.get("_raise_exceptions_for_missing_entries") is False
+        return str(gc_path)
+
+    monkeypatch.setattr(hf_mod, "cached_file", fake_cached_file)
+
+    result = hf_mod._load_generation_config("org/some-hub-model-id")
+
+    assert seen_args["path_or_repo_id"] == "org/some-hub-model-id"
+    assert seen_args["filename"] == "generation_config.json"
+    assert result == {"eos_token_id": [2, 11], "temperature": 0.6}
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_load_generation_config_missing_file_returns_none(monkeypatch):
+    from megatron.core.tokenizers.text.libraries import huggingface_tokenizer as hf_mod
+
+    monkeypatch.setattr(
+        hf_mod,
+        "cached_file",
+        lambda path_or_repo_id, filename, **kwargs: None,
+    )
+
+    assert hf_mod._load_generation_config("org/some-hub-model-id-without-one") is None
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_load_generation_config_unreadable_file_degrades_gracefully(monkeypatch):
+    from megatron.core.tokenizers.text.libraries import huggingface_tokenizer as hf_mod
+
+    def raising_cached_file(path_or_repo_id, filename, **kwargs):
+        raise OSError("network error")
+
+    monkeypatch.setattr(hf_mod, "cached_file", raising_cached_file)
+
+    # Must not raise -- graceful degradation to None, same as the pre-existing
+    # behavior for a missing/unreadable local file.
+    assert hf_mod._load_generation_config("org/unreachable-model") is None

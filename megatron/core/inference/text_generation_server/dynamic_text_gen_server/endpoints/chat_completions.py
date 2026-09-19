@@ -31,6 +31,11 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
+    generation_config_sampling_defaults,
+    log_sampling_defaults_once,
+    resolve_sampling_default,
+)
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
@@ -1016,13 +1021,37 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
+            # For a field the request omits: an explicitly configured server default
+            # wins, then the model's generation_config.json, then the previous
+            # hardcoded fallback.
+            gen_defaults = generation_config_sampling_defaults(tokenizer)
+            cfg = current_app.config
             temperature = float(
                 _get_non_none(
-                    req, "temperature", current_app.config.get('default_temperature', 1.0)
+                    req,
+                    "temperature",
+                    resolve_sampling_default(
+                        cfg, gen_defaults, "temperature", 'default_temperature', 1.0
+                    ),
                 )
             )
-            top_p = float(_get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0)))
-            top_k = int(_get_non_none(req, "top_k", current_app.config.get('default_top_k', 0)))
+            top_p = float(
+                _get_non_none(
+                    req,
+                    "top_p",
+                    resolve_sampling_default(cfg, gen_defaults, "top_p", 'default_top_p', 1.0),
+                )
+            )
+            top_k = int(
+                _get_non_none(
+                    req,
+                    "top_k",
+                    resolve_sampling_default(cfg, gen_defaults, "top_k", 'default_top_k', 0),
+                )
+            )
+            log_sampling_defaults_once(
+                tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
+            )
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
