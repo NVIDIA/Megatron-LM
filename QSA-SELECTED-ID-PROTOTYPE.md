@@ -101,13 +101,48 @@ order after CP zigzag reconstruction; `QSACoreAttention.forward` already
 gathers differentiable full K/V and splits output back to CP-local tokens.
 Packed THD should map to `[1,H,S,D]` and use document-relative `positions`.
 
-Before wiring it into the model, prove on CPU that retained IDs reproduce
-the current bitset and exact mask for packed/unpacked layouts, including
-short documents, partial tails and all-selected rows. Then compare this
-kernel against the existing Flex/dense paths on GPU, verify CP2 remote
-dK/dV, selective activation recompute, model optimizer steps and save/resume.
+The CPU probe below checks that retained IDs reproduce the current bitset
+and exact mask for packed/unpacked layouts, including short documents,
+partial tails and all-selected rows. Remaining gates are comparison with
+the existing Flex/dense paths on GPU, CP2 remote dK/dV, selective activation
+recompute, model optimizer steps and save/resume.
 The selected-ID path should be opt-in until those gates pass; dense/Flex
 fallback behavior and QSA indexer freezing remain explicit.
+
+### CPU producer-contract probe after the kernel commit
+
+The follow-up candidate adds `output_format="ids"` to
+`QSAIndexer._select_blocks`. It returns the already-computed `top.indices`
+as padded int32 IDs, avoiding the bitset allocation and int32 scatter in
+that mode. Existing callers keep the default `output_format="bits"` and
+their original return contract. The CPU probe calls both modes on the same
+scores, rebuilds the bitset from IDs, and compares the exact token mask in
+single-document, packed, uniform batch, all-selected, partial-tail, and
+ratios 2/4/8 cases. This still computes tiled indexer scores over the
+compressed key sequence; only the selected output storage is O(S*K).
+The existing `_pool_keys` workspace remains `[n_docs, max_doc_len/R, D]`
+plus validity metadata. A packed batch containing one very long document
+and many short documents can therefore have near-quadratic pooling memory
+despite compact selected IDs. This probe does not establish arbitrary packed
+256K support.
+
+The proposed opt-in model wiring should choose the output format before
+`QSAIndexer.forward`: `flex` and `dense_masked` use bits, while `id_sparse`
+uses IDs. Add an optional ID field to `QSASelection` and pass the same
+document-relative positions. For packed THD, reshape full-sequence Q/K/V
+to `[1,H,S,D]` and IDs to `[1,S,K]`; for BSHD, permute to `[B,H,S,D]`.
+Under CP, retain the existing full-sequence zigzag reconstruction for
+selection and Q/K/V, differentiable KV gather, and local output split.
+The CPU test establishes ordering and mask equivalence only; a CP2 GPU
+gradient test remains required.
+
+Preserve the current all-selected dense paths when sparse forcing is off.
+`flex` and `dense_masked` remain explicit fallback choices that build bits.
+An `id_sparse` runtime kernel error should fail the step rather than silently
+allocate the quadratic dense mask. The selected IDs stay hard/no-grad;
+Q/K/V gradients flow through the new autograd function, while training the
+indexer requires a separate KL auxiliary loss. Deterministic tie-breaking
+for `torch.topk` routes is another prerequisite for multi-rank recompute.
 
 Design references: [official Triton fused-attention tutorial](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)
 for online softmax and backward derivatives; [TileLang DeepSeek-V3.2 sparse
@@ -115,3 +150,19 @@ MLA examples](https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_v3
 for selected-index KV loading and atomic sparse gradients. Those MLA
 kernels use different attention layouts and were not copied into this GQA
 prototype.
+
+### Public upstream follow-up found after this prototype
+
+The separate [Megatron-LM QSA reference PR #7234](https://github.com/NVIDIA/Megatron-LM/pull/7234)
+at `9e17c43032b2d8df3b4156d9bbe2be1b7d6e29a9` defines stable
+score-descending/block-ID-ascending TopK and an indexer-only KL reference;
+it deliberately excludes fused kernels and THD/TP/CP. The author's public
+[QSA development branch](https://github.com/AllenFeiZZ/Megatron-LM/tree/codex/qsa-sparse-gqa)
+at `a904109c3a67a0c0535262ce4eb02bd83d933d6b` does contain TileLang
+forward/backward, streaming indexer, deterministic radix TopK, sparse KL,
+and THD/CP tests. Its self-reported
+[implementation status](https://github.com/AllenFeiZZ/Megatron-LM/blob/a904109c3a67a0c0535262ce4eb02bd83d933d6b/QSA_IMPLEMENTATION_STATUS.md)
+explicitly leaves whole-model 256K benchmark and convergence open. This
+branch is a stronger production candidate than the slow Triton prototype
+here, but its alternate QSA module, CP layout, RoPE and training hooks need
+reconciliation with our pinned MCore and multimodal path before adoption.

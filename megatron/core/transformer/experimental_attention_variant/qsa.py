@@ -283,6 +283,7 @@ class QSAIndexer(MegatronModule):
         doc_ids: Tensor,
         positions: Tensor,
         uniform_doc_len: Optional[int] = None,
+        output_format: str = "bits",
     ) -> Tuple[Tensor, bool]:
         """Top-k complete blocks per query.
 
@@ -292,39 +293,54 @@ class QSAIndexer(MegatronModule):
             block_valid: [n_docs, n_blocks_max].
             doc_ids / positions: [T] int32.
             uniform_doc_len: Length of each document in the non-THD batch layout.
+            output_format: ``bits`` retains the existing Flex mask contract;
+                ``ids`` retains ``top.indices`` without building a bitset.
 
         Returns:
-            ``(selected_bits [T, nbytes] uint8, all_selected)``.
+            ``(selection, all_selected)``; selection is either
+            ``selected_bits [T, nbytes] uint8`` or ``selected_ids [T, K] int32``.
         """
         T, H, D = q.shape
         R = self.compress_ratio
         n_blocks_max = pooled_keys.shape[1]
+        if output_format not in ("bits", "ids"):
+            raise ValueError(f"unsupported QSA selection format: {output_format}")
         # One extra (always clear) bit for the incomplete tail block: the mask kernels look up
         # ``position // R`` for every key, including keys of the block that is still open.
         nbytes = (n_blocks_max + 1 + 7) // 8
-        # The mask consumes bytes. Keep only the final byte tensor for the whole sequence;
-        # scatter accumulation in int32 is bounded to one tile below.
-        selected_bits = torch.empty(T, nbytes, dtype=torch.uint8, device=q.device)
+        # Retain compact TopK IDs directly for the selected-ID kernel. This
+        # avoids the O(T * n_blocks_max) bitset, including at long lengths.
+        if output_format == "ids":
+            selected = torch.full((T, self.block_topk), -1, dtype=torch.int32, device=q.device)
+        else:
+            selected = torch.empty(T, nbytes, dtype=torch.uint8, device=q.device)
         visible = ((positions.long() + 1) // R).clamp_max(n_blocks_max)  # complete blocks per query
         all_selected = bool((visible <= self.block_topk).all().item())
         block_ids = torch.arange(n_blocks_max, device=q.device)
         # Bound scores, converted queries and the temporary scatter buffer together. The
-        # output byte tensor remains O(T * n_blocks_max / 8), rather than four times larger.
-        bytes_per_query = 4 * (n_blocks_max * H + H * D + nbytes)
+        # selected-ID output remains O(T * block_topk) when requested.
+        output_bytes = 4 * self.block_topk if output_format == "ids" else nbytes
+        bytes_per_query = 4 * (n_blocks_max * H + H * D + output_bytes)
         tile = max(1, min(T, _QSA_SELECT_TILE_BYTES // max(1, bytes_per_query)))
         if all_selected or n_blocks_max == 0:
             # Every visible block is selected: the pattern is plain causal attention. Still
-            # materialize the bitset so the sparse kernels (qsa_force_sparse) see it.
+            # materialize the requested output so forced sparse runs see the selection.
             for start in range(0, T, tile):
                 end = min(T, start + tile)
+                if output_format == "ids":
+                    ids = torch.arange(self.block_topk, device=q.device, dtype=torch.int32)
+                    selected[start:end] = torch.where(
+                        ids[None, :] < visible[start:end, None], ids[None, :], -1
+                    )
+                    continue
                 bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
                 if n_blocks_max > 0:
                     vis = (block_ids.unsqueeze(0) < visible[start:end].unsqueeze(1)).to(torch.int32)
                     weights = (1 << (block_ids & 7)).to(torch.int32).unsqueeze(0)
                     byte_idx = (block_ids >> 3).unsqueeze(0).expand(end - start, -1)
                     bits.scatter_add_(1, byte_idx, vis * weights)
-                selected_bits[start:end] = bits.to(torch.uint8)
-            return selected_bits, True
+                selected[start:end] = bits.to(torch.uint8)
+            return selected, True
 
         n_docs = pooled_keys.shape[0]
         k = min(self.block_topk, n_blocks_max)
@@ -338,7 +354,7 @@ class QSAIndexer(MegatronModule):
             n_blocks_max * D * (pooled_keys.element_size() + 4)
             + n_blocks_max * (H * 4 + 8)
             + H * D * 4
-            + nbytes * 4
+            + output_bytes * 4
             + k * 32
         )
         gathered_tile = max(1, min(T, _QSA_SELECT_TILE_BYTES // gathered_bytes_per_query))
@@ -353,12 +369,15 @@ class QSAIndexer(MegatronModule):
                 scores.masked_fill_(~vis, float("-inf"))
                 top = torch.topk(scores, k=k, dim=-1)
                 valid = torch.isfinite(top.values)
+                if output_format == "ids":
+                    selected[start:end, :k] = top.indices.masked_fill(~valid, -1).to(torch.int32)
+                    continue
                 blocks = top.indices.masked_fill(~valid, 0)
                 bit_val = ((1 << (blocks & 7)) * valid.to(blocks.dtype)).to(torch.int32)
                 bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
                 bits.scatter_add_(1, blocks >> 3, bit_val)
-                selected_bits[start:end] = bits.to(torch.uint8)
-            return selected_bits, False
+                selected[start:end] = bits.to(torch.uint8)
+            return selected, False
 
         # A single document or a non-THD batch has offsets known from tensor shapes.
         # For packed long documents, doc_ids are monotone after CP reconstruction;
@@ -386,14 +405,17 @@ class QSAIndexer(MegatronModule):
                 scores.masked_fill_(~vis, float("-inf"))
                 top = torch.topk(scores, k=k, dim=-1)
                 valid = torch.isfinite(top.values)
+                if output_format == "ids":
+                    selected[start:end, :k] = top.indices.masked_fill(~valid, -1).to(torch.int32)
+                    continue
                 blocks = top.indices.masked_fill(~valid, 0)  # compact [t, k] block IDs
                 byte_idx = blocks >> 3
                 # Top-k blocks are distinct; summing their bit values is equivalent to OR.
                 bit_val = ((1 << (blocks & 7)) * valid.to(blocks.dtype)).to(torch.int32)
                 bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
                 bits.scatter_add_(1, byte_idx, bit_val)
-                selected_bits[start:end] = bits.to(torch.uint8)
-        return selected_bits, False
+                selected[start:end] = bits.to(torch.uint8)
+        return selected, False
 
     # ------------------------------------------------------------------ forward
     def forward(
