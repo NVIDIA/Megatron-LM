@@ -30,7 +30,7 @@ import math
 import os
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple, Union
 
 import torch
@@ -1104,21 +1104,40 @@ class QSACoreAttention(torch.nn.Module):
         attn_mask_type: Optional[AttnMaskType] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        qsa_selection: Optional[QSASelection] = None,
+        qsa_index_query: Optional[Tensor] = None,
+        qsa_compressed_key: Optional[Tensor] = None,
     ) -> Tensor:
         """Attention over the selected tokens.
 
         ``query``/``key``/``value`` are ``[s, b, h, d]`` (sbhd) or ``[t, h, d]`` (thd); the output
         is ``[s, b, h*d]`` / ``[t, h*d]`` like the backend core attention.
         """
-        # Keep the selection registered: selective `core_attn` recompute re-runs this forward
-        # in the backward pass with the same tensors, and the next attention forward always
-        # registers a fresh selection before reaching here.
-        selection = self._selection
+        # Selective core-attention checkpointing may recompute an older microbatch after a
+        # newer forward has replaced the module field. Its invocation carries the original
+        # selection and differentiable indexer tensors explicitly through checkpoint inputs.
+        selection = qsa_selection if qsa_selection is not None else self._selection
         if selection is None:
             raise RuntimeError(
                 "QSACoreAttention.forward called without a block selection; "
                 "QwenSparseSelfAttention must run the indexer first."
             )
+        if qsa_selection is not None:
+            if (qsa_index_query is None) != (qsa_compressed_key is None) or (
+                self.training
+                and torch.is_grad_enabled()
+                and self.config.qsa_indexer_loss_coeff > 0
+                and qsa_index_query is None
+            ):
+                raise RuntimeError(
+                    "selective QSA checkpoint omitted differentiable indexer tensors"
+                )
+            selection = replace(
+                selection, index_query=qsa_index_query, compressed_key=qsa_compressed_key
+            )
+        elif qsa_index_query is not None or qsa_compressed_key is not None:
+            raise RuntimeError("selective QSA checkpoint tensors require a bound selection")
         cp_size = get_pg_size(self.pg_collection.cp)
         use_loss = (
             self.training and torch.is_grad_enabled() and self.config.qsa_indexer_loss_coeff > 0
@@ -1234,6 +1253,66 @@ class QwenSparseSelfAttention(SelfAttention):
             config=config,
             layer_number=layer_number,
             pg_collection=self.pg_collection,
+        )
+
+    def _checkpointed_attention_forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        rotary_pos_emb=None,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        core_attention_extra_kwargs=None,
+    ):
+        """Bind this microbatch's selection without capturing indexer graphs in the closure."""
+        from megatron.core import tensor_parallel
+
+        if core_attention_extra_kwargs:
+            raise NotImplementedError("QSA selective checkpoint does not accept extra core kwargs")
+        selection = self.core_attention._selection
+        if selection is None:
+            raise RuntimeError("selective QSA checkpoint requires a registered selection")
+        metadata = replace(selection, index_query=None, compressed_key=None)
+        mask_type = attn_mask_type if attn_mask_type is not None else self.attn_mask_type
+        mask_type_tensor = torch.tensor([mask_type.value], dtype=torch.int)
+
+        def custom_forward(
+            query,
+            key,
+            value,
+            attention_mask,
+            _rotary_pos_emb,
+            mask_type_arg,
+            index_query,
+            compressed_key,
+        ):
+            return self._run_core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=AttnMaskType(mask_type_arg.item()),
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                qsa_selection=metadata,
+                qsa_index_query=index_query,
+                qsa_compressed_key=compressed_key,
+            )
+
+        return tensor_parallel.checkpoint(
+            custom_forward,
+            False,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            mask_type_tensor,
+            selection.index_query,
+            selection.compressed_key,
         )
 
     def forward(
