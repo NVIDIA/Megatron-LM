@@ -212,8 +212,8 @@ class TestClipQK:
         with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
             attention.clip_qk()
 
-    def test_clip_qk_none_logits_raises_error(self):
-        """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
+    def test_clip_qk_uninitialized_logits_raises_error(self):
+        """Test that clip_qk requires accumulated attention logits."""
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -229,7 +229,7 @@ class TestClipQK:
             layer_number=1,
         )
 
-        with pytest.raises(ValueError, match="current_max_attn_logits is None"):
+        with pytest.raises(ValueError, match="No attention logits have been accumulated"):
             attention.clip_qk()
 
     def test_clip_qk_below_threshold_no_update(self):
@@ -264,7 +264,10 @@ class TestClipQK:
         # Weights should not be updated
         assert torch.equal(attention.linear_qkv.weight.data, original_weight)
         # current_max_attn_logits should be reset
-        assert attention.core_attention.current_max_attn_logits is None
+        torch.testing.assert_close(
+            attention.core_attention.current_max_attn_logits,
+            torch.full_like(attention.core_attention.current_max_attn_logits, float("-inf")),
+        )
 
     def test_clip_qk_above_threshold_updates_weights(self):
         """Test that weights are updated when max logits exceed threshold."""
@@ -298,7 +301,10 @@ class TestClipQK:
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
         # current_max_attn_logits should be reset
-        assert attention.core_attention.current_max_attn_logits is None
+        torch.testing.assert_close(
+            attention.core_attention.current_max_attn_logits,
+            torch.full_like(attention.core_attention.current_max_attn_logits, float("-inf")),
+        )
 
     def test_clip_qk_gqa_configuration(self):
         """Test clip_qk with GQA (Grouped Query Attention) configuration."""
@@ -333,41 +339,116 @@ class TestClipQK:
         # Weights should be updated
         assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
         # current_max_attn_logits should be reset
-        assert attention.core_attention.current_max_attn_logits is None
+        torch.testing.assert_close(
+            attention.core_attention.current_max_attn_logits,
+            torch.full_like(attention.core_attention.current_max_attn_logits, float("-inf")),
+        )
 
     def test_clip_qk_mixed_logits(self):
-        """Test clip_qk with mixed logits (some above, some below threshold)."""
+        """Replay training microbatches and consume each step's attention statistics."""
         transformer_config = TransformerConfig(
             num_layers=2,
-            hidden_size=128,
+            hidden_size=256,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
             qk_clip=True,
-            qk_clip_threshold=100.0,
+            qk_clip_threshold=10.0,
             qk_clip_alpha=0.5,
         )
         attention = SelfAttention(
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).cuda()
+        reference = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).cuda()
+        with torch.no_grad():
+            attention.linear_qkv.weight.view(4, 3, 64, 256).mul_(
+                torch.tensor([1.0, 8.0, 2.0, 16.0], device="cuda").view(4, 1, 1, 1)
+            )
+        reference.load_state_dict(attention.state_dict())
+        optimizer = torch.optim.SGD(attention.parameters(), lr=1e-3)
+        reference_optimizer = torch.optim.SGD(reference.parameters(), lr=1e-3)
+        static_input = torch.randn(
+            128, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
-        attention.cuda()
-
-        # Save original weights
-        original_weight = attention.linear_qkv.weight.data.clone()
-
-        # Set mixed current_max_attn_logits (some above, some below threshold)
-        attention.core_attention.current_max_attn_logits = torch.tensor(
-            [80.0, 150.0, 90.0, 200.0], device='cuda'
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                optimizer.zero_grad(set_to_none=True)
+                static_input.grad = None
+                warmup_output, warmup_bias = attention(static_input, attention_mask=None)
+                if warmup_bias is not None:
+                    warmup_output = warmup_output + warmup_bias
+                warmup_output.float().square().mean().backward()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        optimizer.zero_grad(set_to_none=False)
+        static_input.grad.zero_()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_output, captured_bias = attention(static_input, attention_mask=None)
+            if captured_bias is not None:
+                captured_output = captured_output + captured_bias
+            captured_output.float().square().mean().backward()
+        max_logits = attention.core_attention.current_max_attn_logits
+        max_logits.fill_(float("-inf"))
+        buffer_address = max_logits.data_ptr()
+        input_batches = (
+            (torch.randn_like(static_input), torch.randn_like(static_input) * 0.002),
+            (torch.randn_like(static_input) * 1e-5, torch.randn_like(static_input) * 2e-5),
         )
-
-        # Call clip_qk
-        attention.clip_qk()
-
-        # Weights should be updated since at least one head exceeds threshold
-        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
-        # current_max_attn_logits should be reset
-        assert attention.core_attention.current_max_attn_logits is None
+        for step, microbatches in enumerate(input_batches):
+            optimizer.zero_grad(set_to_none=False)
+            reference_optimizer.zero_grad(set_to_none=True)
+            for inputs in microbatches:
+                with torch.no_grad():
+                    static_input.copy_(inputs)
+                static_input.grad.zero_()
+                graph.replay()
+                reference_input = inputs.detach().requires_grad_(True)
+                reference_output, reference_bias = reference(reference_input, attention_mask=None)
+                if reference_bias is not None:
+                    reference_output = reference_output + reference_bias
+                reference_output.float().square().mean().backward()
+                torch.testing.assert_close(captured_output, reference_output)
+                torch.testing.assert_close(static_input.grad, reference_input.grad)
+                torch.testing.assert_close(
+                    attention.core_attention.current_max_attn_logits,
+                    reference.core_attention.current_max_attn_logits,
+                )
+            torch.testing.assert_close(
+                (max_logits > transformer_config.qk_clip_threshold).any().item(), step == 0
+            )
+            torch.testing.assert_close(
+                (max_logits < transformer_config.qk_clip_threshold).any().item(), True
+            )
+            for parameter, reference_parameter in zip(
+                attention.parameters(), reference.parameters()
+            ):
+                torch.testing.assert_close(parameter.grad, reference_parameter.grad)
+            optimizer.step()
+            reference_optimizer.step()
+            with torch.no_grad():
+                attention.clip_qk()
+                reference.clip_qk()
+            for parameter, reference_parameter in zip(
+                attention.parameters(), reference.parameters()
+            ):
+                torch.testing.assert_close(parameter, reference_parameter)
+            torch.testing.assert_close(
+                attention.core_attention.current_max_attn_logits.data_ptr(), buffer_address
+            )
+            torch.testing.assert_close(max_logits, torch.full_like(max_logits, float("-inf")))
 
 
 @pytest.mark.parametrize("output_gate", [False, True])

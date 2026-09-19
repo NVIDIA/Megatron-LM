@@ -2801,6 +2801,10 @@ class TECudaGraphHelper:
 
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
+            for module in model_chunk.modules():
+                max_logits = getattr(module, "current_max_attn_logits", None)
+                if max_logits is not None:
+                    max_logits.fill_(float("-inf"))
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
