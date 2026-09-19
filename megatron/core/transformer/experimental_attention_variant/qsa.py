@@ -453,9 +453,11 @@ class QSAIndexer(MegatronModule):
             from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp
 
             hidden_states = reconstruct_tensor_cp(hidden_states, packed_seq_params, dim=0)
-            if is_absolute_mrope and rotary_pos_emb.shape[0] == local_seq_len:
-                # VL mRoPE is a frequency for each CP-local token, rather than a
-                # position table. Rebuild it in the same order as hidden_states.
+            is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+            if (is_absolute_mrope or not is_thd) and rotary_pos_emb.shape[0] == local_seq_len:
+                # Non-packed RoPE and VL mRoPE arrive in CP-local zigzag order.
+                # Rebuild frequencies in the same full order as hidden_states.
+                # Packed standard RoPE instead uses a max-document-length table.
                 rotary_pos_emb = reconstruct_tensor_cp(rotary_pos_emb, packed_seq_params, dim=0)
         # The indexer sees the full sequence after CP reconstruction. The public RoPE
         # helper treats cp_group=None as the global CP group, so it would remap these
