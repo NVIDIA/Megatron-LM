@@ -1,6 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
 
+# Apply policy before Core/TE imports can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
+
 import os
 from functools import partial
 from typing import List, Optional, Tuple, Union
