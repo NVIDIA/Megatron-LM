@@ -32,6 +32,7 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
     ArgumentGroupFactory,
+    _default_config_from_args,
     core_transformer_config_from_args,
 )
 from megatron.training.global_vars import set_global_variables
@@ -457,14 +458,13 @@ def validate_args(args, defaults={}):
     )
     args.data_parallel_size = args.world_size // total_model_size
 
-    if args.refit_execution_batch_bytes is not None:
-        assert args.refit_execution_batch_bytes > 0, (
-            '--refit-execution-batch-bytes must be a positive integer'
-        )
+    from megatron.training.config import RLConfig
+
+    rl_cfg = _default_config_from_args(RLConfig, args)
+    args.rl_generation_lag = rl_cfg.rl_generation_lag
+    args.grpo_samples_per_iteration = rl_cfg.grpo_samples_per_iteration
 
     if args.perform_rl_step:
-        assert args.refit_method != 'nccl_m2n', 'nccl_m2n is unsupported by the built-in RL loop'
-
         # ----------------------------------------------------------------
         # CUDA graphs
         #
@@ -513,69 +513,11 @@ def validate_args(args, defaults={}):
                     "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
                 )
 
-        # Offload mode requires CG persistence: CG recapture runs dummy forward
-        # passes that corrupt the preserved KV data.
-        assert (
-            (not args.rl_kv_cache_management_mode == "offload") or (args.rl_persist_cuda_graphs)
-        ), "--rl-kv-cache-management-mode=offload requires --rl-persist-cuda-graphs"
-
         # There's no need to manually offload the KV cache with UVM.
         assert not (
             args.inference_dynamic_batching_unified_memory_level > 0
             and args.rl_kv_cache_management_mode == "offload"
         ), "--rl-kv-cache-management-mode=offload is incompatible with UVM"
-        # We currently cannot recapture CGs in offload mode.
-        assert not(
-            not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
-        ), "Cannot recapture CUDA graphs while offloading KV cache."
-
-        # Validate inference model offloading - requires either UVM or torch_memory_saver
-        if args.rl_offload_inference_model_weights_when_idle:
-            if args.rl_inference_model_unified_memory_level != 1:
-                # Not using UVM, so we need torch_memory_saver
-                try:
-                    from torch_memory_saver import torch_memory_saver
-                except ImportError:
-                    raise AssertionError(
-                        "To use --rl-offload-inference-model-weights-when-idle without UVM "
-                        "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
-                        "installed. See https://github.com/fzyzcjy/torch_memory_saver."
-                    )
-
-        if args.rl_max_inflight_requests is not None:
-            requests_per_batch = args.grpo_prompts_per_step * args.grpo_group_size
-            assert args.rl_generation_lag is None, \
-                "--rl-generation-lag and --rl-max-inflight-requests are mutually exclusive."
-            assert args.rl_max_inflight_requests >= 1, \
-                f"--rl-max-inflight-requests ({args.rl_max_inflight_requests}) must be >= 1."
-            if args.rl_max_inflight_requests > requests_per_batch:
-                assert args.rl_partial_rollouts, \
-                    f"--rl-max-inflight-requests above one training batch " \
-                    f"({requests_per_batch} requests) requires --rl-partial-rollouts."
-            # Total in-flight requests = (lag + 1) trainer batches of P * G requests each.
-            args.rl_generation_lag = args.rl_max_inflight_requests / requests_per_batch - 1
-        if args.rl_generation_lag is None:
-            # With --rl-partial-rollouts the lag is autotuned from engine capacity
-            # at inference launch; otherwise generation is fully synchronous.
-            if not args.rl_partial_rollouts:
-                args.rl_generation_lag = 0
-        else:
-            assert args.rl_generation_lag >= -1, \
-                f"--rl-generation-lag ({args.rl_generation_lag}) must be >= -1."
-            if args.rl_generation_lag > 0:
-                assert args.rl_partial_rollouts, \
-                    "--rl-generation-lag requires --rl-partial-rollouts."
-        assert args.rl_submission_granularity == "B" or args.rl_partial_rollouts, \
-            f"--rl-submission-granularity {args.rl_submission_granularity} requires " \
-            "--rl-partial-rollouts."
-        assert args.rl_consumption_granularity != "R", \
-            "--rl-consumption-granularity R is not currently supported."
-        assert not (
-            args.rl_submission_granularity == "B"
-            and args.rl_consumption_granularity == "G"
-        ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
-
-        args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
@@ -2806,192 +2748,10 @@ def _add_regularization_args(parser):
 
 
 def _add_rl_args(parser):
-    group = parser.add_argument_group(title='rl')
-    group.add_argument('--perform-rl-step', action='store_true',
-                       help="Use the RL training step.")
-    group.add_argument('--rl-prompts-per-eval', type=int, default=32,
-                       help='Number of prompts to evaluate for for each RL task.'
-                        'This evaluation can be very expensive when using environments'
-                        'that evaluate pass@k so we default to a lower number.')
-    # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
-    group.add_argument('--grpo-prompts-per-step', type=int, default=32,
-                       help="Number of GRPO groups (G in the paper).")
-    group.add_argument('--grpo-group-size', type=int, default=2,
-                       help="Number of samples per a GRPO group.")
-    group.add_argument('--rl-generation-lag', type=float, default=None,
-                       help='Number of trainer batches of rollout generation lag to allow '
-                            'The number of in-flight trainer batches is this value plus one. '
-                            'May be fractional or negative; the minimum of -1 keeps a single unit '
-                            'of generation work in flight. If omitted, the lag is autotuned to the '
-                            'inference engine\'s request capacity when --rl-partial-rollouts is '
-                            'set, and is 0 otherwise. '
-                            'Requires --rl-partial-rollouts when greater than 0. '
-                            'Mutually exclusive with --rl-max-inflight-requests.')
-    group.add_argument('--rl-max-inflight-requests', type=int, default=None,
-                       help='Maximum number of inference requests RL generation may keep inflight: '
-                            'equivalent to (--rl-generation-lag + 1) training batches '
-                            'of grpo_prompts_per_step * grpo_group_size requests each. '
-                            'Requires --rl-partial-rollouts when above one training batch; '
-                            'mutually exclusive with --rl-generation-lag.')
-    # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
-    group.add_argument('--rl-submission-granularity', type=str,
-                       default="B",
-                       choices=["R", "G", "B"],
-                       help='Granularity for submitting rollout generation work. '
-                            'R submits individual rollouts independently while still yielding '
-                            'complete rollout groups to training. '
-                            'G submits one rollout group at a time. '
-                            'B submits grpo_prompts_per_step rollout groups together.')
-    group.add_argument('--rl-consumption-granularity', type=str,
-                       default="B",
-                       choices=["R", "G", "B"],
-                       help='Granularity for consuming generated rollout groups. '
-                            'G consumes groups as they complete. '
-                            'B consumes complete trainer batches in submission order. '
-                            'R is not currently supported.')
-    group.add_argument('--rl-durable-rollout-bank', action='store_true',
-                       help='Persist completed rollout groups to a durable, write-through '
-                            'ledger so they survive a SIGKILL (the SLURM time limit) and are '
-                            'restored at restart instead of regenerated. No-op when unset.')
-    group.add_argument('--rl-rollout-bank-dir', type=str, default=None,
-                       help='Directory for the durable rollout bank (on Lustre). Defaults to '
-                            '<save>/rollout_bank so the bank stays coupled to the checkpoint.')
-    group.add_argument('--rl-rollout-bank-max-bytes', type=int, default=0,
-                       help='Soft cap (bytes) on the rollout bank size; 0 = unbounded. On '
-                            'exceed, a warning is logged. Compaction occurs at the next checkpoint '
-                            'regardless of the cap and never blocks generation.')
-    group.add_argument('--grpo-iterations', type=int, default=2,
-                       help="Number of iterations per a GRPO implementation.")
-    # As in DAPO, we keep upper/lower eps different.
-    # To have a vanilla GRPO, set them to be the same.
-    group.add_argument('--grpo-clamp-eps-lower', type=float, default=0.01,
-                       help="Lower GRPO clipping bound.")
-    group.add_argument('--grpo-clamp-eps-upper', type=float, default=0.01,
-                       help="Upper GRPO clipping bound. In vanilla implementation, equals to the lower one.")
-    group.add_argument('--grpo-kl-beta', type=float, default=0.001,
-                       help="KL term weight in the GRPO loss.")
-    group.add_argument('--grpo-entropy-term-weight', type=float, default=0.0,
-                       help="Entropy term weight in GRPO loss.")
-    group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
-                       help="Filter groups with same reward.")
-    group.add_argument('--langrl-env-config', type=str, default=None,
-                       help="Path to YAML config file for RL environment configuration.")
-    group.add_argument('--rl-default-temperature', type=float, default=1.0,
-                       help="Default temperature for model inference.")
-    group.add_argument('--rl-default-top-p', type=float, default=0,
-                       help="Default top-p for model inference.")
-    group.add_argument('--rl-default-top-k', type=int, default=-1,
-                       help="Default top-k for model inference.")
-    group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
-                       help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
-    group.add_argument('--rl-kv-cache-management-mode', type=str, default='persist',
-                       choices=['persist', 'offload', 'recompute'],
-                       help='KV cache management mode during RL training: '
-                            'persist: leave KV cache in GPU memory (default), '
-                            'offload: offload KV cache to CPU during training, '
-                            'recompute: deallocate KV cache and recompute from scratch each cycle')
-    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                       help='Persist CUDA graphs when the inference engine is suspended. '
-                            'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
-    group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
-                       help='Allow inference to continue generating rollouts while training updates '
-                            'the policy weights. This enables off-policy training where rollouts may '
-                            'be generated with a stale version of the policy. Use '
-                            '--rl-generation-lag to control the degree of staleness.')
-    group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                       help='If set, use inference logprobs in importance sampling correction of the loss.')
-    group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
-                       help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
-    group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                       help='Enable sequence packing')
-    group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
-                       help='Maximum number of sequences that can be packed into a single bin. ')
-    group.add_argument('--rl-sequence-packing-algo', type=str, default='fifo',
-                       choices=['fifo', 'round-robin'],
-                       help='Algorithm for distributing packed bins across ranks. '
-                            'fifo: first-in-first-out sequential distribution, '
-                            'round-robin: distribute bins cyclically across ranks for better load balancing')
-    group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
-                       default=False,
-                       help='If set, do not toggle CUDA graphs on/off between inference and training phases.')
-    group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
-                       help='Degree of tensor model parallelism for inference for RL.')
-    group.add_argument(
-        '--rl-inference-pipeline-model-parallel-size',
-        type=int,
-        default=None,
-        help='Degree of pipeline model parallelism for inference for RL.',
-    )
-    group.add_argument(
-        '--rl-inference-expert-model-parallel-size',
-        type=int,
-        default=None,
-        help='Degree of expert model parallelism for inference for RL.',
-    )
-    group.add_argument(
-        '--rl-inference-expert-tensor-model-parallel-size',
-        type=int,
-        default=None,
-        help='Degree of expert tensor model parallelism for inference for RL. '
-             'For MoE models, this controls the TP size for expert layers specifically. '
-             'Defaults to training expert_tensor_parallel_size if not specified.',
-    )
-    group.add_argument(
-        '--rl-inference-model-unified-memory-level',
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help=(
-            'Allocate the separate RL inference model parameters from a unified virtual memory (UVM) '
-            'CUDA mempool. Level 0 disables UVM (default). Level 1 enables UVM allocation so the '
-            'inference model weights can be prefetched to CPU when idle while keeping CUDA-graph-safe '
-            'device pointers.'
-        ),
-    )
-    group.add_argument(
-        '--rl-offload-inference-model-weights-when-idle',
-        action=argparse.BooleanOptionalAction,
-        required=False,
-        default=False,
-        help=(
-            'When using a separate RL inference model, offload its weights to CPU when not doing rollout '
-            'inference, and restore to GPU right before inference. Works with two backends: '
-            '1) UVM (when --rl-inference-model-unified-memory-level=1), or '
-            '2) torch_memory_saver (when UVM is not enabled; requires torch_memory_saver to be installed).'
-        ),
-    )
-    group.add_argument('--refit-method', type=str, default='gloo',
-                       choices=['nccl', 'nccl_m2n', 'gloo', 'nvshmem', 'nixl'],
-                       help=('Method to refit model weights. '
-                             'nccl: use NCCLCopyService; '
-                             'nccl_m2n: use the official NCCL M2N API from a non-RL '
-                             'launcher such as the ReFIT benchmark; '
-                             'gloo: use GlooCopyService over CPU; '
-                             'nvshmem: use NVSHMEMCopyService; '
-                             'nixl: use NixlCopyService.'))
-    group.add_argument(
-        '--refit-execution-batch-bytes',
-        type=int,
-        default=None,
-        help=(
-            'Optional soft per-rank byte limit for ReFIT execution staging. '
-            'The default None preserves one model-wide generic submission and '
-            "NCCL M2N's existing 256 MiB default."
-        ),
-    )
-    group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
-                       'the first swap of model weights.')
+    from megatron.training.config import RLConfig
 
-    group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                        help='Skip BOS token at the beginning of the sequences. Default is False.')
-    group.add_argument('--rl-profile', action='store_true', default=False,
-                        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).')
-    group.add_argument('--rl-profile-dir', type=str, default=None,
-                        help='Directory to write RL profiling data. Defaults to {save}/profiles.')
-    group.add_argument('--rl-inference-parsers', nargs='*', default=[],
-                       help='List of response parsers to enable for RL inference '
-                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
+    rl_factory = ArgumentGroupFactory(RLConfig)
+    rl_factory.build_group(parser, "rl")
     return parser
 
 def _add_training_args(parser):

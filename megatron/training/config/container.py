@@ -23,6 +23,7 @@ from megatron.training.config.resilience_config import (
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
+from megatron.training.config.rl_config import RLConfig
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
@@ -254,6 +255,7 @@ class PretrainConfigContainer(ConfigContainerBase):
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+    rl: RLConfig = field(default_factory=RLConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
