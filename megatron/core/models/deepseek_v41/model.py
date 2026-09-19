@@ -22,7 +22,7 @@ class DeepSeekV41Model(HybridModel):
         pg_collection,
         token_map=None,
         tokenizer=None,
-        **kwargs
+        **kwargs,
     ) -> None:
         if any(
             (getattr(config, name, None) is not None for name in ("vision_config", "dspark_config"))
@@ -55,7 +55,7 @@ class DeepSeekV41Model(HybridModel):
             hybrid_layer_pattern="VE" * len(config.csa_compress_ratios),
             position_embedding_type="none",
             pg_collection=pg_collection,
-            **kwargs
+            **kwargs,
         )
         self.engram_hash = hasher
         if hasher is not None:
@@ -79,7 +79,7 @@ class DeepSeekV41Model(HybridModel):
         labels=None,
         padding_mask=None,
         packed_seq_params=None,
-        **kwargs
+        **kwargs,
     ):
         """Return per-token losses or batch-major logits for unpacked training sequences."""
         if packed_seq_params is not None or kwargs:
