@@ -640,12 +640,7 @@ def _specialize_placements(
             raise NotImplementedError(
                 "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
             )
-    if group_dtype == torch.uint8:
-        from transformer_engine.pytorch.constants import MXFP8_BLOCK_SCALING_SIZE
-
-        placement_type = BlockAtomic(MXFP8_BLOCK_SCALING_SIZE)
-    else:
-        placement_type = Flat()
+    placement_type = BlockAtomic(32) if group_dtype == torch.uint8 else Flat()
     return tuple(
         placement_type if type(placement) is Shard else placement for placement in placements
     )

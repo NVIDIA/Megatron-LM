@@ -224,18 +224,16 @@ class FsdpParameterGroup:
             block_size=block_size,
         )
         for index, parameter in enumerate(parameters):
-            # TE can preserve the values from before MXFP8 quantization. Use them
-            # to initialize optimizer weights without quantization error, then
-            # release TE's extra copy. MXFP8 parameters require these values.
-            get_high_precision_init_val = getattr(parameter, "get_high_precision_init_val", None)
-            initial_value = get_high_precision_init_val() if get_high_precision_init_val else None
-            if initial_value is not None:
+            if self.dtype == torch.uint8:
+                # Use preserved values to initialize optimizer weights without
+                # MXFP8 quantization error, then release TE's extra copy.
+                initial_value = parameter.get_high_precision_init_val()
+                if initial_value is None:
+                    raise ValueError(
+                        "MXFP8 parameters require preserved high-precision initialization values. "
+                        "Use quantized_model_init(preserve_high_precision_init_val=True)."
+                    )
                 parameter.clear_high_precision_init_val()
-            elif self.dtype == torch.uint8:
-                raise ValueError(
-                    "MXFP8 parameters require preserved high-precision initialization values. "
-                    "Use quantized_model_init(preserve_high_precision_init_val=True)."
-                )
             else:
                 initial_value = parameter
             self.main_weight.copy_from(index, initial_value)
