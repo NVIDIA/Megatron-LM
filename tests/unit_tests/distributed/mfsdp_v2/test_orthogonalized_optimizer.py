@@ -48,31 +48,6 @@ except Exception:  # pragma: no cover
 _require_emerging_optimizers()
 
 
-@pytest.fixture(scope="function")
-def distributed_setup():
-    """Same as the bucket conftest fixture but pins to `local_rank % device_count`."""
-    import os
-
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
-    os.environ.pop("NCCL_MAXNCHANNELS", None)
-    os.environ.pop("NCCL_NVLS_ENABLE", None)
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank % torch.cuda.device_count())
-        device = torch.device("cuda", torch.cuda.current_device())
-    else:
-        device = torch.device("cpu")
-    yield DistributedSetup(rank=rank, world_size=world_size, device=device)
-    if dist.is_initialized():
-        if device.type == "cuda":
-            dist.barrier(device_ids=[device.index])
-        else:
-            dist.barrier()
-
-
 # ---------------------------------------------------------------------------
 # Distributed tests: full optimizer step numerics
 # ---------------------------------------------------------------------------
