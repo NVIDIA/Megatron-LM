@@ -58,6 +58,8 @@ try:
 except ImportError:  # pragma: no cover
     HAVE_FLEX_ATTENTION = False
 
+_QSA_SELECT_TILE_BYTES = 64 << 20
+
 
 @dataclass
 class QSASelection:
@@ -298,42 +300,61 @@ class QSAIndexer(MegatronModule):
         # One extra (always clear) bit for the incomplete tail block: the mask kernels look up
         # ``position // R`` for every key, including keys of the block that is still open.
         nbytes = (n_blocks_max + 1 + 7) // 8
-        selected_bits = torch.zeros(T, nbytes, dtype=torch.int32, device=q.device)
+        # The mask consumes bytes. Keep only the final byte tensor for the whole sequence;
+        # scatter accumulation in int32 is bounded to one tile below.
+        selected_bits = torch.empty(T, nbytes, dtype=torch.uint8, device=q.device)
         visible = ((positions.long() + 1) // R).clamp_max(n_blocks_max)  # complete blocks per query
         all_selected = bool((visible <= self.block_topk).all().item())
         block_ids = torch.arange(n_blocks_max, device=q.device)
+        # Bound scores, converted queries and the temporary scatter buffer together. The
+        # output byte tensor remains O(T * n_blocks_max / 8), rather than four times larger.
+        bytes_per_query = 4 * (n_blocks_max * H + H * D + nbytes)
+        tile = max(1, min(T, _QSA_SELECT_TILE_BYTES // max(1, bytes_per_query)))
         if all_selected or n_blocks_max == 0:
             # Every visible block is selected: the pattern is plain causal attention. Still
             # materialize the bitset so the sparse kernels (qsa_force_sparse) see it.
-            if n_blocks_max > 0:
-                vis = (block_ids.unsqueeze(0) < visible.unsqueeze(1)).to(
-                    torch.int32
-                )  # [T, n_blocks]
-                weights = (
-                    (torch.ones_like(block_ids) << (block_ids & 7)).to(torch.int32).unsqueeze(0)
-                )
-                byte_idx = (block_ids >> 3).unsqueeze(0).expand(T, -1)
-                selected_bits.scatter_add_(1, byte_idx, (vis * weights).to(torch.int32))
-            return selected_bits.to(torch.uint8), True
-        chunk = max(1, min(T, (256 << 20) // max(1, n_blocks_max * H * 4)))  # ~256MB of scores
-        for start in range(0, T, chunk):
-            end = min(T, start + chunk)
-            q_c = q[start:end].float()  # [t, H, D]
-            k_c = pooled_keys[doc_ids[start:end].long()].float()  # [t, n_blocks_max, D]
-            scores = torch.einsum("thd,tnd->thn", q_c, k_c).relu_().sum(dim=1) / math.sqrt(D)
-            vis = block_ids.unsqueeze(0) < visible[start:end].unsqueeze(1)
-            scores = scores.masked_fill(~vis, float("-inf"))
-            k = min(self.block_topk, n_blocks_max)
-            top = torch.topk(scores, k=k, dim=-1)
-            valid = torch.isfinite(top.values)
-            blocks = top.indices.masked_fill(~valid, 0)
-            byte_idx = blocks >> 3
-            # Distinct blocks of one query never share a bit, so summing the bit values ORs them.
-            bit_val = ((torch.ones_like(blocks) << (blocks & 7)) * valid.to(blocks.dtype)).to(
-                torch.int32
-            )
-            selected_bits[start:end].scatter_add_(1, byte_idx, bit_val)
-        return selected_bits.to(torch.uint8), False
+            for start in range(0, T, tile):
+                end = min(T, start + tile)
+                bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
+                if n_blocks_max > 0:
+                    vis = (block_ids.unsqueeze(0) < visible[start:end].unsqueeze(1)).to(torch.int32)
+                    weights = (1 << (block_ids & 7)).to(torch.int32).unsqueeze(0)
+                    byte_idx = (block_ids >> 3).unsqueeze(0).expand(end - start, -1)
+                    bits.scatter_add_(1, byte_idx, vis * weights)
+                selected_bits[start:end] = bits.to(torch.uint8)
+            return selected_bits, True
+
+        # doc_ids are monotone in the batch-major flattened layout, both for ordinary
+        # batches and for THD packing after CP reconstruction. Empty packed documents give
+        # equal adjacent offsets and need no work. One host transfer for the small offset
+        # vector lets every document reuse its pooled keys across all of its query tiles.
+        n_docs = pooled_keys.shape[0]
+        offsets = torch.searchsorted(
+            doc_ids.contiguous(), torch.arange(n_docs + 1, device=q.device, dtype=doc_ids.dtype)
+        ).tolist()
+        k = min(self.block_topk, n_blocks_max)
+        for doc in range(n_docs):
+            doc_start, doc_end = offsets[doc], offsets[doc + 1]
+            if doc_start == doc_end:
+                continue
+            key_t = pooled_keys[doc].float().T  # shared [D, n_blocks_max] GEMM operand
+            for start in range(doc_start, doc_end, tile):
+                end = min(doc_end, start + tile)
+                q_c = q[start:end].float().reshape(-1, D)  # [t * H, D]
+                scores = (q_c @ key_t).view(end - start, H, n_blocks_max)
+                scores = scores.relu_().sum(dim=1) / math.sqrt(D)
+                vis = block_ids.unsqueeze(0) < visible[start:end].unsqueeze(1)
+                scores.masked_fill_(~vis, float("-inf"))
+                top = torch.topk(scores, k=k, dim=-1)
+                valid = torch.isfinite(top.values)
+                blocks = top.indices.masked_fill(~valid, 0)  # compact [t, k] block IDs
+                byte_idx = blocks >> 3
+                # Top-k blocks are distinct; summing their bit values is equivalent to OR.
+                bit_val = ((1 << (blocks & 7)) * valid.to(blocks.dtype)).to(torch.int32)
+                bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
+                bits.scatter_add_(1, byte_idx, bit_val)
+                selected_bits[start:end] = bits.to(torch.uint8)
+        return selected_bits, False
 
     # ------------------------------------------------------------------ forward
     def forward(
