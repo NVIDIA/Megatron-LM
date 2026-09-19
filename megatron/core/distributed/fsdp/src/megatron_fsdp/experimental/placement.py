@@ -15,8 +15,11 @@
 """DBuffer placement definitions.
 
 DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
-types directly. ``Flat`` and ``BlockAtomic`` are DBuffer-specific dim-0
-``Shard`` placements whose local storage is part of one flattened buffer.
+types directly. ``Flat``, ``BlockAtomic``, and ``TensorAtomic`` are
+DBuffer-specific dim-0 ``Shard`` placements whose local storage is part of one
+flattened buffer. ``Flat`` and ``BlockAtomic`` split the flattened buffer into
+equal-size per-rank shards; ``TensorAtomic`` instead assigns every logical
+tensor as a whole to one owner rank, so per-rank shards may differ in size.
 
 =============  =============  ====================
 Source         Destination    DBuffer operation
@@ -29,11 +32,12 @@ sharded        ``Replicate``  ``allgather()``
 """
 
 from collections.abc import Iterable
+from typing import TypeAlias
 
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "Flat", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "Flat", "TensorAtomic", "PlacementReference", "changed_mesh_axis"]
 
 
 class Flat(Shard):
@@ -43,8 +47,16 @@ class Flat(Shard):
         super().__init__(0)
 
     def __eq__(self, other: object) -> bool:
-        # PyTorch Shard.__eq__ compares only dim, so distinguish Flat from BlockAtomic.
-        return isinstance(other, Shard) and other.dim == 0 and not isinstance(other, BlockAtomic)
+        # PyTorch Shard.__eq__ compares only dim, so distinguish Flat from BlockAtomic
+        # and TensorAtomic.
+        return (
+            isinstance(other, Shard)
+            and other.dim == 0
+            and not isinstance(other, (BlockAtomic, TensorAtomic))
+        )
+
+    def __hash__(self) -> int:
+        return hash((Flat, 0))
 
 
 class BlockAtomic(Shard):
@@ -62,6 +74,39 @@ class BlockAtomic(Shard):
 
     def __repr__(self) -> str:
         return f"BlockAtomic(block_size={self.block_size})"
+
+    def __hash__(self) -> int:
+        return hash((BlockAtomic, self.block_size))
+
+
+class TensorAtomic(Shard):
+    """Dim-0 shard placement that assigns each logical tensor as a whole to one rank.
+
+    Args:
+        tensor_to_owner_rank: Mapping from logical tensor index (its position in
+            the DBuffer's ``tensor_shapes``) to the data-parallel rank that owns
+            it. Every tensor index in ``range(num_tensors)`` must appear exactly
+            once, and every rank must be in ``[0, dp_size)``.
+    """
+
+    def __init__(self, tensor_to_owner_rank: dict[int, int]) -> None:
+        super().__init__(0)
+        self.tensor_to_owner_rank = tensor_to_owner_rank
+
+    def __eq__(self, other: object) -> bool:
+        # PyTorch Shard.__eq__ compares only dim, so compare the owner assignment too.
+        return (
+            isinstance(other, TensorAtomic)
+            and self.tensor_to_owner_rank == other.tensor_to_owner_rank
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"TensorAtomic({', '.join(f'{k}->{v}' for k, v in self.tensor_to_owner_rank.items())})"
+        )
+
+    def __hash__(self) -> int:
+        return hash((TensorAtomic, tuple(sorted(self.tensor_to_owner_rank.items()))))
 
 
 def changed_mesh_axis(
@@ -81,3 +126,6 @@ def changed_mesh_axis(
             )
         changed_axis = axis
     return changed_axis
+
+
+PlacementReference: TypeAlias = Flat | BlockAtomic | TensorAtomic

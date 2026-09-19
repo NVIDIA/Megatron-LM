@@ -24,13 +24,13 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
 from .module_utils import copy_parameter_attributes, get_parameter_owner
-from .placement import BlockAtomic
+from .placement import BlockAtomic, Flat, PlacementReference, TensorAtomic
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -100,6 +100,9 @@ class FsdpParameterGroup:
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
+    # The single Shard placement that every DBuffer in this group plans its
+    # GlobalLayout against.
+    layout_reference: PlacementReference
 
     def __init__(
         self,
@@ -193,17 +196,24 @@ class FsdpParameterGroup:
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         tensor_shapes = tuple(parameter.shape for parameter in parameters)
-        block_size = 1
-        for placements in (model_weight_placements, main_grad_placements, main_weight_placements):
-            for placement in placements:
-                if isinstance(placement, BlockAtomic):
-                    block_size = math.lcm(block_size, placement.block_size)
+        self.layout_reference = self._resolve_layout_reference(
+            self.mesh, model_weight_placements, main_grad_placements, main_weight_placements
+        )
+        # TensorAtomic produces non-uniform per-rank shards, but the NCCL
+        # symmetric-memory all-gather / reduce-scatter kernels only support the
+        # equal-size *_into_tensor collectives.
+        if use_symmetric_memory and isinstance(self.layout_reference, TensorAtomic):
+            raise ValueError(
+                "Symmetric-memory collectives require uniform shards; "
+                "TensorAtomic is not supported."
+            )
+
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameters),
             mesh=self.mesh,
             placements=main_weight_placements,
-            block_size=block_size,
+            reference=self.layout_reference,
         )
 
         if use_symmetric_memory:
@@ -227,7 +237,7 @@ class FsdpParameterGroup:
                     tensor_shapes=tensor_shapes,
                     dtype=self.dtype,
                     device=self.main_weight.device,
-                    block_size=block_size,
+                    reference=self.layout_reference,
                 )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         # Cast into the preallocated optimizer-layout view on the current stream.
@@ -243,7 +253,7 @@ class FsdpParameterGroup:
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
-                block_size=block_size,
+                reference=self.layout_reference,
             )
 
         self.main_grad = None
@@ -264,13 +274,51 @@ class FsdpParameterGroup:
             tensor_shapes=self.main_weight.layout.tensor_shapes,
             dtype=grad_dtype,
             device=self.main_weight.device,
-            block_size=block_size,
+            reference=self.layout_reference,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
         assert self.main_grad.layout == self.main_weight.layout, (
             "main_grad is built from main_weight tensor shapes on the same mesh, "
             "and DBuffer layouts are deterministic from those shapes and mesh size."
         )
+
+    def _resolve_layout_reference(
+        self, mesh: DeviceMesh, *placement_lists: tuple[Placement, ...]
+    ) -> PlacementReference:
+        """Pick the single layout reference shared by every DBuffer in a parameter group.
+
+        All buffers in a group (model weight, main weight, main grad, and their
+        views) must be planned against one ``GlobalLayout`` so that views and
+        collectives between them are aligned. This method derives that common
+        reference from the Shard placements requested for each buffer.
+
+        Args:
+            mesh: Data-parallel device mesh the buffers are distributed over.
+            *placement_lists: The per-buffer placement tuples (model weight, main
+                grad, main weight).
+
+        Returns:
+            ``TensorAtomic`` if any placement is ``TensorAtomic``; otherwise
+            ``BlockAtomic`` with the LCM of all requested block sizes, or ``Flat``
+            when no ``BlockAtomic`` placement is present.
+        """
+        shards = [p for placements in placement_lists for p in placements if isinstance(p, Shard)]
+        tensor_atomics = [p for p in shards if isinstance(p, TensorAtomic)]
+        if not tensor_atomics:
+            # Flat and BlockAtomic layouts are compatible as long as the layout is
+            # planned with the LCM of every requested block size.
+            block_size = math.lcm(1, *(p.block_size for p in shards if isinstance(p, BlockAtomic)))
+            return BlockAtomic(block_size) if block_size > 1 else Flat()
+
+        if mesh.ndim != 1:
+            raise ValueError("TensorAtomic requires a 1-D data-parallel mesh.")
+        if len(tensor_atomics) != len(shards):
+            raise ValueError("TensorAtomic cannot be mixed with Flat or BlockAtomic placements.")
+        if any(p != tensor_atomics[0] for p in tensor_atomics):
+            raise ValueError(
+                "All TensorAtomic placements in one parameter group must be identical."
+            )
+        return tensor_atomics[0]
 
     def _build_fsdp_parameters(
         self, parameter_to_fqns: dict[nn.Parameter, list[str]]
@@ -395,7 +443,7 @@ class FsdpParameterGroup:
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
-                block_size=self.main_weight.layout.block_size,
+                reference=self.layout_reference,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:

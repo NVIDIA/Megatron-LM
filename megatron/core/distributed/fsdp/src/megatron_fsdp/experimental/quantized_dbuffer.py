@@ -56,7 +56,7 @@ def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
             offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
         ),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        block_size=data_layout.block_size,
+        reference=data_layout.reference,
     )
 
 
@@ -138,7 +138,12 @@ class QuantizedDBuffer:
             )
         placements = tuple(placements)
         self.rowwise_data = DBuffer.empty(
-            mesh, placements, tensor_shapes, torch.uint8, device, block_size=_MXFP8_BLOCK_SIZE
+            mesh,
+            placements,
+            tensor_shapes,
+            torch.uint8,
+            device,
+            reference=BlockAtomic(_MXFP8_BLOCK_SIZE),
         )
         self.columnwise_data = DBuffer(
             mesh, placements, self.rowwise_data.layout, torch.uint8, device
