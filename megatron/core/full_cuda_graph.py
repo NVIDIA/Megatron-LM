@@ -93,6 +93,17 @@ def clone_tensors_in_struct(tgt, src):
     else:
         raise Exception(f"Expect top-level as container type but got: {type(src)}")
 
+def copy_container_shell(src):
+    """Copy only containers, preserving tensor objects."""
+    if isinstance(src, tuple):
+        return tuple(copy_container_shell(i) for i in src)
+    elif isinstance(src, list):
+        return list(copy_container_shell(i) for i in src)
+    elif isinstance(src, dict):
+        return {k: copy_container_shell(src[k]) for k in src}
+    else:
+        return src
+
 
 # Class to copy dataloader output to static CUDA tensors for CUDA graph input. This
 # maintains separate static buffers for training and validation CUDA graphs.
@@ -132,7 +143,7 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        return copy_container_shell(StaticBufferLoader.static_buffers[stage][microbatch])
 
 
 class FullCudaGraphWrapper:
