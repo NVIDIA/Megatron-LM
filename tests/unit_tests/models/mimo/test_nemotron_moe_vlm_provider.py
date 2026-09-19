@@ -516,3 +516,46 @@ def test_language_rank_placement_uses_language_parallelism():
 
 # A full model instantiation (constructing MambaModel / RADIOEncoderWrapper) needs
 # TE + a distributed init and is left to the cog functional check.
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("use_groups", [False, True])
+def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
+    from types import SimpleNamespace
+
+    from examples.mimo.model_providers import nemotron_moe_vlm as provider
+
+    # Deliberately disagree with the grid to catch inheritance of stock CP.
+    args = SimpleNamespace(
+        mimo_llm_ep=1, mimo_llm_expt_tp=1, vocab_size=64, seq_length=32, hybrid_layer_pattern="*"
+    )
+    monkeypatch.setattr(
+        provider,
+        "_base_config",
+        lambda args: SimpleNamespace(context_parallel_size=8, calculate_per_token_loss=True),
+    )
+    grid = SimpleNamespace(shape=[1, cp_size, 1], dim_names=["tp", "cp", "pp"])
+    groups = None
+    if use_groups:
+        groups = SimpleNamespace(
+            **{
+                name: SimpleNamespace(size=lambda size=size: size, rank=lambda: 0)
+                for name, size in {"tp": 1, "cp": cp_size, "pp": 1, "ep": 1, "expt_tp": 1}.items()
+            }
+        )
+        monkeypatch.setattr(provider, "get_pg_size", lambda pg: pg.size())
+        monkeypatch.setattr(provider, "get_pg_rank", lambda pg: pg.rank())
+    spec = provider.language_model_spec(args, groups, grid)
+    assert spec.params["config"].context_parallel_size == cp_size
+
+
+def test_encoder_and_projection_do_not_inherit_language_cp():
+    from examples.mimo.model_providers.nemotron_moe_vlm import nemotron_projection_config
+    from examples.mimo.model_providers.radio_encoder import radio_vision_config
+
+    args = _parse_validate(_build_argv(*_PRESET_20L))
+    args.context_parallel_size = 2
+    vision = radio_vision_config(args, tp_size=1, pp_size=1)
+    projection = nemotron_projection_config(args, tp_size=1, projection_input_size=5120)
+    assert vision.context_parallel_size == 1
+    assert projection.context_parallel_size == 1
