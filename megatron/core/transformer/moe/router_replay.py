@@ -25,6 +25,37 @@ class RouterReplay:
     # Static variable to hold all router instances, one per MoE layer.
     global_router_replay_instances: List['RouterReplay'] = []
 
+    # MTP-layer routers register here too (whenever moe_enable_routing_replay is
+    # on), but their forward only runs during inference if speculative decoding
+    # via MTP is enabled (num_speculative_tokens > 0) -- otherwise their slot in
+    # global_router_replay_instances never gets recorded. exclude_mtp_layers
+    # (default True, matching nemo_rl's own default) controls whether
+    # replay_instances() filters those out; flip it off if MTP participates in
+    # inference and its routing should be captured/replayed too.
+    exclude_mtp_layers: bool = True
+
+    @staticmethod
+    def set_exclude_mtp_layers(value: bool) -> None:
+        """Sets whether MTP-layer routers are excluded from replay_instances()."""
+        RouterReplay.exclude_mtp_layers = value
+
+    @staticmethod
+    def replay_instances() -> List['RouterReplay']:
+        """Instances that actually participate in inference-time capture.
+
+        Excludes MTP-layer routers when exclude_mtp_layers is set (the
+        default), since those never record during ordinary inference and
+        would otherwise leave a permanently-unrecorded slot in every
+        step's routing data.
+        """
+        if not RouterReplay.exclude_mtp_layers:
+            return list(RouterReplay.global_router_replay_instances)
+        return [
+            router
+            for router in RouterReplay.global_router_replay_instances
+            if not router.is_mtp_layer
+        ]
+
     @staticmethod
     def set_replay_data(all_layers_topk_indices: List[torch.Tensor]):
         """
@@ -44,12 +75,11 @@ class RouterReplay:
     @staticmethod
     def get_recorded_data() -> List[torch.Tensor]:
         """
-        Collects the recorded topk indices from all RouterReplay instances.
+        Collects the recorded topk indices from all inference-participating
+        RouterReplay instances (see replay_instances()).
         :return: A list of tensors, each containing the recorded topk indices for a layer.
         """
-        return [
-            router.get_recorded_indices() for router in RouterReplay.global_router_replay_instances
-        ]
+        return [router.get_recorded_indices() for router in RouterReplay.replay_instances()]
 
     @staticmethod
     def clear_global_indices():
@@ -82,12 +112,13 @@ class RouterReplay:
             static_buffer: Tensor of shape [max_tokens, num_layers, topk].
                           Each layer's RouterReplay gets a slice [:, layer_idx, :].
         """
-        num_layers = len(RouterReplay.global_router_replay_instances)
+        instances = RouterReplay.replay_instances()
+        num_layers = len(instances)
         assert static_buffer.shape[1] == num_layers, (
             f"Buffer has {static_buffer.shape[1]} layers but there are "
-            f"{num_layers} RouterReplay instances."
+            f"{num_layers} inference-participating RouterReplay instances."
         )
-        for layer_idx, router_instance in enumerate(RouterReplay.global_router_replay_instances):
+        for layer_idx, router_instance in enumerate(instances):
             # Each layer gets a view of shape [max_tokens, topk]
             router_instance.set_static_buffer(static_buffer[:, layer_idx, :])
 
@@ -97,8 +128,14 @@ class RouterReplay:
         for router in RouterReplay.global_router_replay_instances:
             router.clear_static_buffer()
 
-    def __init__(self):
-        """Initializes a RouterReplay instance for a specific layer."""
+    def __init__(self, is_mtp_layer: bool = False):
+        """Initializes a RouterReplay instance for a specific layer.
+
+        Args:
+            is_mtp_layer: Whether the owning Router belongs to an MTP layer
+                rather than the main decoder stack (see exclude_mtp_layers).
+        """
+        self.is_mtp_layer = is_mtp_layer
         self.target_topk_idx: Optional[torch.Tensor] = None  # Target topk indices for replay
         self.recorded_topk_idx: Optional[torch.Tensor] = None  # Recorded topk indices for replay
         self.router_replay_action: Optional[RouterReplayAction] = (

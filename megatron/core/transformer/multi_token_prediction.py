@@ -2356,7 +2356,14 @@ class MultiTokenPredictionBlock(MegatronModule):
         def build_layer_with_pattern(
             layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
         ):
-            """Build layer using pattern-based approach (new Mamba path)."""
+            """Build layer using pattern-based approach (new Mamba path).
+
+            layer_spec resolves to MultiTokenPredictionLayer here, which does
+            NOT accept is_mtp_layer as an external constructor kwarg -- it
+            always hardcodes is_mtp_layer=True itself when building its own
+            inner HybridStack/TransformerLayer, so nothing needs passing
+            through from this call site.
+            """
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
