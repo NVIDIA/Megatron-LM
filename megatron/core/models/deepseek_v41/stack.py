@@ -2,10 +2,13 @@
 
 """V4.1 layer composition and forward-local shared attention state."""
 
+from dataclasses import replace
+
 import torch
 from torch import nn
 
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.models.deepseek_v41.moe import ModalityRouter, multimodal_moe_forward
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
@@ -64,12 +67,24 @@ class DeepSeekV41Block(MegatronModule):
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
         )
+        if getattr(config, "vision_config", None):
+            moe_spec.keywords["submodules"] = replace(
+                moe_spec.keywords["submodules"], router=ModalityRouter
+            )
         self.mlp = moe_spec(
             config=config, layer_number=self.layer_number, pg_collection=pg_collection
         )
         self.engram = None
 
-    def forward(self, hidden_states, previous_mix, state, attention_mask=None, padding_mask=None):
+    def forward(
+        self,
+        hidden_states,
+        previous_mix,
+        state,
+        attention_mask=None,
+        padding_mask=None,
+        image_mask=None,
+    ):
         """Carry the last FFN mix and shared CSA2 tensors without storing either on the layer."""
         branch, next_mix, post, residual = self.attention_mhc(hidden_states, previous_mix)
         branch, bias = self.attention(self.attention_norm(branch), attention_mask, csa2_state=state)
@@ -78,7 +93,10 @@ class DeepSeekV41Block(MegatronModule):
         hidden_states = self.attention_mhc.combine(branch, hidden_states, post, residual)
         branch, following_mix, post, residual = self.ffn_mhc(hidden_states, next_mix)
         branch = self.ffn_norm(branch)
-        branch, bias = self.mlp(branch, padding_mask=padding_mask)
+        if image_mask is not None:
+            branch, bias = multimodal_moe_forward(self.mlp, branch, image_mask, padding_mask)
+        else:
+            branch, bias = self.mlp(branch, padding_mask=padding_mask)
         if bias is not None:
             branch = branch + bias
         return (self.ffn_mhc.combine(branch, hidden_states, post, residual), following_mix)
@@ -156,6 +174,7 @@ class DeepSeekV41Stack(MegatronModule):
         cp_layout_plan=None,
         engram_hashes=None,
         token_mask=None,
+        image_mask=None,
     ):
         """Return normalized backbone hidden states."""
         if inference_context is not None or packed_seq_params is not None:
@@ -171,7 +190,7 @@ class DeepSeekV41Stack(MegatronModule):
             if layer.engram is not None:
                 hidden_states = layer.engram(hidden_states, engram_hashes, token_mask)
             hidden_states, previous_mix = layer(
-                hidden_states, previous_mix, state, attention_mask, padding_mask
+                hidden_states, previous_mix, state, attention_mask, padding_mask, image_mask
             )
         hidden_states = self.final_norm(contract_streams(hidden_states, previous_mix, n))
         hidden_states = make_viewless_tensor(
