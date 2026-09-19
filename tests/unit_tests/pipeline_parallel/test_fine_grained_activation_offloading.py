@@ -1841,3 +1841,127 @@ def test_mhc_recompute_with_non_conflicting_offload_modules():
 
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_mode_serves_one_handler_per_capture_forward():
+    """Chunk-granularity CUDA graphs drive the offload manager in block-capture mode.
+
+    Warm-up records two virtual pipeline stages (two ``mlp`` groups on stage 0; two ``mlp``
+    groups and a ``post`` group on stage 1). In block-capture mode every capture-time decoder
+    forward gets a fresh handler cloned from its stage's warm-up template (same names and
+    policy flags, never the pooled host buffers), the post-process callable continues that
+    handler once, a repeated post-process call (Transformer Engine warms every callable up
+    several times) resumes a fresh handler at the decoder's last group, reloads stay inside the
+    handler, and the gradients equal the offload-free reference.
+    """
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        PipelineOffloadManager,
+        fine_grained_offloading_group_offload,
+        fine_grained_offloading_group_start,
+    )
+
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(3)]
+
+    def group(x, name, weight):
+        x = fine_grained_offloading_group_start(x, name)
+        with PipelineOffloadManager.get_instance():
+            y = torch.nn.functional.gelu(torch.nn.functional.linear(x, weight))
+        return fine_grained_offloading_group_offload(y, name)
+
+    def decoder(x):
+        return group(group(x, "mlp", weights[0]), "mlp", weights[1])
+
+    def reference(x, with_post):
+        x = x.detach().clone().requires_grad_()
+        w = [weight.detach() for weight in weights]
+        y = torch.nn.functional.gelu(torch.nn.functional.linear(x, w[0]))
+        y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[1]))
+        if with_post:
+            y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[2]))
+        y.sum().backward()
+        return x.grad
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        # Warm-up iteration: the eager model forward opens one handler per virtual stage; the
+        # manager queues the backward handlers when the last virtual stage opens, and the
+        # interleaved schedule runs the backwards in reverse stage order.
+        off_interface.reset()
+        inputs = [torch.randn(8, 64, device=device, requires_grad=True) for _ in range(2)]
+        outputs = []
+        for vp_stage in range(2):
+            off_interface.init_chunk_handler(
+                pp_rank=0,
+                vp_size=2,
+                vp_stage=vp_stage,
+                min_offloaded_tensor_size=1,
+                delta_offload_bytes_across_pp_ranks=0,
+                activation_offload_fraction=1.0,
+            )
+            out = decoder(inputs[vp_stage])
+            if vp_stage == 1:
+                out = group(out, "post", weights[2])
+            outputs.append(out)
+        for out in reversed(outputs):
+            out.sum().backward()
+        off_interface.reset()  # closes the warm-up and fixes the policy
+        assert not manager._is_warmup
+        templates = list(manager._cached_chunks_forward)
+        template = next(chunk for chunk in templates if chunk.vpp_rank == 1)
+        assert [g._name for g in template.offload_groups] == ["mlp", "mlp", "post"]
+
+        off_interface.enter_block_capture(keep_last_group=True)
+        # Capture-time decoder forward of stage 1: a fresh handler cloned from the template.
+        off_interface.begin_block_capture_chunk(1)
+        handler = manager.cur_forward_chunk()
+        assert handler not in templates and handler.vpp_rank == 1
+        assert manager.pop_forward_chunk("mlp") is handler
+        assert [g._name for g in handler.offload_groups] == ["mlp", "mlp", "post"]
+        # Warm-up policy flags, minus the last group of every name (keep_last_group=True: kept
+        # resident so that no backward graph starts with a synchronous reload).
+        expected_flags = [g.offload for g in template.offload_groups]
+        for last in (1, 2):
+            expected_flags[last] = False
+        assert [g.offload for g in handler.offload_groups] == expected_flags
+        assert not any(g.use_cpu_pool for g in handler.offload_groups)
+        x = torch.randn(8, 64, device=device, requires_grad=True)
+        hidden = decoder(x)
+        off_interface.end_block_capture_chunk()
+        assert manager._block_capture_decoder_end[1] == 2
+        offloaded = [g for g in handler.offload_groups if g.offload]
+        assert offloaded, "the warm-up policy should offload at least one group"
+        assert len(handler._block_capture_host_buffers) > 0
+
+        # The post-process callable continues the decoder's handler once ...
+        off_interface.begin_block_capture_chunk(1, continue_current=True)
+        assert manager.cur_forward_chunk() is handler
+        out = group(hidden, "post", weights[2])
+        # ... and a repeated post-process call resumes a fresh handler at the decoder's end.
+        off_interface.begin_block_capture_chunk(1, continue_current=True)
+        fresh = manager.cur_forward_chunk()
+        assert fresh is not handler and fresh.vpp_rank == 1
+        assert fresh._offloaded_group_index == 2
+        hidden_again = hidden.detach().clone().requires_grad_()
+        out_again = group(hidden_again, "post", weights[2])
+
+        out.sum().backward()
+        out_again.sum().backward()
+        assert not handler._groups_to_reload and not handler._reloading_group
+        assert not fresh._groups_to_reload and not fresh._reloading_group
+        torch.cuda.synchronize()
+        assert torch.equal(x.grad, reference(x, with_post=True))
+        ref_hidden = hidden.detach().clone().requires_grad_()
+        torch.nn.functional.gelu(
+            torch.nn.functional.linear(ref_hidden, weights[2].detach())
+        ).sum().backward()
+        assert torch.equal(hidden_again.grad, ref_hidden.grad)
+        off_interface.exit_block_capture()
+        assert manager.cur_forward_chunk() is None
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()

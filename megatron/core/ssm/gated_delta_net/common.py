@@ -500,6 +500,11 @@ class _GDNBase(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
+        if torch.cuda.is_current_stream_capturing():
+            # The checks below read device values on the host; the geometry was already validated
+            # by the eager warm-up steps that precede a CUDA graph capture.
+            return cu_seqlens
+
         total_cu = cu_seqlens[-1].cpu().item()
         if total_cu != total_seq_len:
             raise ValueError(

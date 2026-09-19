@@ -2042,6 +2042,15 @@ def validate_args(args, defaults={}):
             '--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload).'
         )
 
+    # The optimizer step graph replays fixed device addresses; offloaded optimizer state moves
+    # between host and device between steps and cannot be captured.
+    if args.optimizer_cuda_graph:
+        assert not (
+            args.optimizer_cpu_offload
+            or args.chunked_optimizer_state_offload
+            or args.offload_optimizer_states
+        ), "--optimizer-cuda-graph requires the optimizer state to stay resident on the GPU."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (

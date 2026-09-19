@@ -28,6 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
@@ -134,6 +135,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             and config.recompute_granularity == "selective"
             and "mhc" in (config.recompute_modules or [])
             and not uses_mhc_recompute_attn_cuda_graph_split(config)
+            # Chunk capture records producer, checkpoint registration, recompute and consumer
+            # of the whole HybridStack as one graph, so the per-layer concern below does not apply.
+            and not (
+                config.cuda_graph_impl == "transformer_engine"
+                and getattr(config, 'cuda_graph_granularity', 'layer') == "chunk"
+            )
         ):
             # Warn rather than reject: this combination was constructible before the
             # attention-only split existed and nothing here is known to be wrong, it
@@ -927,7 +934,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         return hidden_states
 
 
-class HybridStack(MegatronModule):
+class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
     """
     Constructor for the HybridStack class.
 
@@ -954,6 +961,11 @@ class HybridStack(MegatronModule):
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers. Defaults to the standard config semantics.
     """
+
+    def create_mcore_cudagraph_manager(self, config):
+        """The stack is graphed as a whole only through Transformer Engine (chunk granularity);
+        the local CUDA graph implementation keeps graphing its layers."""
+        return None
 
     def __init__(
         self,
