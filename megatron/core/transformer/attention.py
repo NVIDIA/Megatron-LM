@@ -2092,8 +2092,9 @@ class SelfAttention(Attention):
                 self.num_query_groups_per_partition,
             ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
                 but {grouped_max_attn_logits.shape}"
-            self.qk_clip_balancing_eta = torch.clamp(
-                self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
+            self.qk_clip_balancing_eta = (
+                self.config.qk_clip_threshold
+                / grouped_max_attn_logits.clamp_min(self.config.qk_clip_threshold)
             ).view(self.num_query_groups_per_partition, 1, 1)
             assert torch.all(self.qk_clip_balancing_eta <= 1.0)
 
