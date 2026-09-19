@@ -1355,17 +1355,18 @@ class _DeepepManager(_DispatchManager):
             # Convert the format of routing map from multihot to indices.
             self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
         else:
-            # Dense top-k indices. This method runs inside the torch.compile'd
-            # dispatch_preprocess(), so it must stay free of differentiable compute: the flex
-            # router already selected the matching [num_tokens, topk] weights (TopKRouter.routing)
-            # and they are stored as is. Full-width probs (direct callers) are gathered here.
+            # Dense top-k indices come with the already-selected [num_tokens, topk] weights
+            # (TopKRouter.routing); the layout is a contract, not inferred from the width, which
+            # is ambiguous when topk == num_experts. This method runs inside the torch.compile'd
+            # dispatch_preprocess(), so it must stay free of differentiable compute (no gather).
             self.token_indices = routing_map.reshape(num_tokens, -1).contiguous()
             if self.token_indices.dtype != torch.int64:
                 self.token_indices = self.token_indices.to(torch.int64)
-            if probs.shape[-1] == self.token_indices.shape[-1]:
-                self.token_probs = probs
-            else:
-                self.token_probs = probs.gather(1, self.token_indices)
+            assert probs.shape[-1] == self.token_indices.shape[-1], (
+                "dense routing indices require probs selected at those indices, got probs "
+                f"{tuple(probs.shape)} for indices {tuple(self.token_indices.shape)}"
+            )
+            self.token_probs = probs
         # Mask the indices of dropped tokens with -1
         if self.capacity_factor is not None:
             mask = self.token_probs == 0
@@ -1682,18 +1683,19 @@ class _NCCLEPManager(_DispatchManager):
             # Convert the multihot routing map to (topk weights, topk indices).
             self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
         else:
-            # Dense top-k indices (TE's direct output). This method runs inside the
-            # torch.compile'd dispatch_preprocess(), so it must stay free of differentiable
-            # compute: the flex router already selected the matching [num_tokens, topk] weights
-            # (TopKRouter.routing) and they are stored as is. Full-width probs (direct callers)
-            # are gathered here.
+            # Dense top-k indices (TE's direct output) come with the already-selected
+            # [num_tokens, topk] weights (TopKRouter.routing); the layout is a contract, not
+            # inferred from the width, which is ambiguous when topk == num_experts. This method
+            # runs inside the torch.compile'd dispatch_preprocess(), so it must stay free of
+            # differentiable compute (no gather).
             self.token_indices = routing_map.reshape(num_tokens, -1).contiguous()
             if self.token_indices.dtype != torch.int64:
                 self.token_indices = self.token_indices.to(torch.int64)
-            if probs.shape[-1] == self.token_indices.shape[-1]:
-                self.token_probs = probs
-            else:
-                self.token_probs = probs.gather(1, self.token_indices)
+            assert probs.shape[-1] == self.token_indices.shape[-1], (
+                "dense routing indices require probs selected at those indices, got probs "
+                f"{tuple(probs.shape)} for indices {tuple(self.token_indices.shape)}"
+            )
+            self.token_probs = probs
         self.num_local_tokens = num_tokens
 
     def _ensure_bootstrap(self):

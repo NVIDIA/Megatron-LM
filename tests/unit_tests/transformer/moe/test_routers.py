@@ -268,6 +268,44 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+    @pytest.mark.parametrize("topk", [2, 4])
+    def test_router_diagnostics_accept_dense_routing_indices(self, backend, topk):
+        """Flex deepep/ncclep return dense [num_tokens, topk] indices; the diagnostics need the
+        bool [num_tokens, num_experts] map (topk == num_experts used to misread ids as flags)."""
+        self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = False  # torch.topk path, no TE needed
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = backend
+        self.router.config.moe_router_topk = topk
+        self.router.topk = topk
+        self.router.tp_group = _ProcessGroup(1)
+        num_experts = self.router.config.num_moe_experts
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+        observed = []
+
+        with capture_tensor_observations(
+            lambda *args: observed.append(args), frozenset({"router_diagnostics"})
+        ):
+            probs, routing_map = self.router(hidden_states)
+
+        assert routing_map.dtype == torch.int64 and routing_map.shape == (64, topk)
+        assert probs.shape == (64, topk)
+        assert len(observed) == 1
+        diagnostics = observed[0][3]
+        assert diagnostics.shape == (2, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, num_experts)
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.VALID_TOKEN_COUNT, 0],
+            torch.full((2,), 32.0, device="cuda"),
+        )
+        # Without expert bias the unbiased aux-loss top-k equals the dispatched top-k.
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.AUX_ACTUAL_OVERLAP, 0],
+            torch.ones(2, device="cuda"),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
         ("sequence_parallel", "tp_size", "cp_size", "unsupported_axis"),
         ((True, 2, 1, "tensor"), (False, 1, 2, "context")),

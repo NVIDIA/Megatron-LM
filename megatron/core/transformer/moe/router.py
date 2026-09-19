@@ -943,10 +943,25 @@ class TopKRouter(Router):
                 selection_bias = (
                     -self.qb_beta if self.routing_type == "quantile_balancing" else self.expert_bias
                 )
+                actual_routing_map = routing_map
+                if actual_routing_map.dtype != torch.bool:
+                    # Dense top-k indices [num_tokens, topk] (flex dispatcher backends): the
+                    # diagnostics need the [num_tokens, num_experts] bool map. Invalid routes
+                    # (-1, padding rows) are dropped; scatter_add keeps duplicates deterministic.
+                    valid = actual_routing_map >= 0
+                    actual_routing_map = (
+                        torch.zeros_like(scores_for_aux_loss, dtype=torch.int32)
+                        .scatter_add_(
+                            1,
+                            actual_routing_map.long().masked_fill(~valid, 0),
+                            valid.to(torch.int32),
+                        )
+                        .bool()
+                    )
                 diagnostics = build_router_diagnostics(
                     scores_for_aux_loss,
                     routing_map_for_aux_loss,
-                    routing_map,
+                    actual_routing_map,
                     selection_bias,
                     seq_length,
                     bsz,

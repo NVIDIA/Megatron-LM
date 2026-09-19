@@ -698,26 +698,35 @@ def test_dense_required_manager_accepts_dense_indices(monkeypatch, manager_cls, 
     expected_probs = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
     # The flex router hands these managers the already-selected [num_tokens, topk] weights
     # (TopKRouter.routing); setup_metadata runs inside the compiled dispatch_preprocess and must
-    # store them without any gather. Full-width probs (direct callers) are still gathered.
-    probs = expected_probs.clone() if dense_probs else full_probs
-
+    # store them without any gather. Full-width probs are a contract violation, not a fallback.
     monkeypatch.setattr(
         torch, "topk", lambda *args, **kwargs: pytest.fail("dense routing must not call torch.topk")
     )
-    if dense_probs:
-        monkeypatch.setattr(
-            torch.Tensor,
-            "gather",
-            lambda *args, **kwargs: pytest.fail("dense probs must be stored without a gather"),
-        )
+    monkeypatch.setattr(
+        torch.Tensor,
+        "gather",
+        lambda *args, **kwargs: pytest.fail("dense probs must be stored without a gather"),
+    )
+    if not dense_probs:
+        with pytest.raises(AssertionError, match="probs selected at those indices"):
+            manager.setup_metadata(dense_indices, full_probs)
+        return
+
+    probs = expected_probs.clone()
     manager.setup_metadata(dense_indices, probs)
 
     assert manager.token_indices.dtype == torch.int64
     assert torch.equal(manager.token_indices, dense_indices.long())
     torch.testing.assert_close(manager.token_probs, expected_probs)
-    if dense_probs:
-        # Stored without a copy (reshape may return a new view object of the same storage).
-        assert manager.token_probs.data_ptr() == probs.data_ptr()
+    # Stored without a copy (reshape may return a new view object of the same storage).
+    assert manager.token_probs.data_ptr() == probs.data_ptr()
+
+    # topk == num_experts: the width no longer identifies the layout; compact weights are taken
+    # in index order, never reinterpreted as full-width probabilities in expert order.
+    manager.num_experts = 2
+    manager.router_topk = 2
+    manager.setup_metadata(torch.tensor([[1, 0]]), torch.tensor([[0.8, 0.2]]))
+    torch.testing.assert_close(manager.token_probs, torch.tensor([[0.8, 0.2]]))
 
 
 @pytest.mark.parametrize("explicit_dense_routing", [False, True])

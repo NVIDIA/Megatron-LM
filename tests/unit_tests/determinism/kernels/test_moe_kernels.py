@@ -333,6 +333,35 @@ class TestMoEModules:
             router, (hidden,), replays=3, what=f"TopKRouter[{balancing}]"
         )
 
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+    @pytest.mark.parametrize("expert_bias", [False, True], ids=["no_bias", "bias"])
+    def test_topk_router_dense_indices_replays(self, backend, expert_bias):
+        """Flex deepep/ncclep routers return dense [tokens, topk] indices with the selected
+        weights (router-side top-k/gather) and count expert loads from the indices."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="aux_loss",
+            # Expert bias is only permitted with the sigmoid / sqrtsoftplus score functions.
+            moe_router_score_function="sigmoid" if expert_bias else "softmax",
+            moe_router_enable_expert_bias=expert_bias,
+            moe_router_fusion=False,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend=backend,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs, routing_map = router(hidden)
+        assert routing_map.dtype == torch.int64 and routing_map.shape == probs.shape
+        assert_module_replays_bit_exact(
+            router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
+        )
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_grouped_mlp_replays_on_uneven_experts(self):
         self._init()
