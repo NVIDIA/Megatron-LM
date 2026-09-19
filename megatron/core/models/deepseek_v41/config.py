@@ -149,11 +149,13 @@ class DeepSeekV41Config(MLATransformerConfig):
             beta_slow=rope.get("beta_slow", 1),
             mscale=0,
             mscale_all_dim=0,
-            csa_compress_ratios=list(text["compress_ratios"][:depth]),
+            csa_compress_ratios=[
+                value for ratio in text["compress_ratios"][:depth] for value in (ratio, 0)
+            ],
             csa_window_size=text["sliding_window"],
-            csa2_kv_source_layers=list(text["kv_source_layer_ids"]),
-            csa2_index_source_layers=list(text["index_source_layer_ids"]),
-            csa2_candidate_source_layer=text["candidate_source_layer_id"],
+            csa2_kv_source_layers=[2 * i for i in text["kv_source_layer_ids"]],
+            csa2_index_source_layers=[2 * i for i in text["index_source_layer_ids"]],
+            csa2_candidate_source_layer=2 * text["candidate_source_layer_id"],
             csa2_candidate_topk_blocks=text["candidate_topk_blocks"],
             csa2_candidate_block_size=text["candidate_block_size"],
             dsa_indexer_n_heads=text["index_n_heads"],
@@ -162,6 +164,8 @@ class DeepSeekV41Config(MLATransformerConfig):
             dsa_indexer_rotate_activation=False,
             dsa_kernel_backend="none",
             enable_mhc_connections=True,
+            mhc_single_pass=True,
+            mhc_epsilon=text.get("hc_eps", 1e-6),
             mhc_num_residual_streams=text["hc_mult"],
             mhc_sinkhorn_iterations=text["hc_sinkhorn_iters"],
             num_moe_experts=text["n_routed_experts"],
@@ -212,4 +216,4 @@ class DeepSeekV41Config(MLATransformerConfig):
     @property
     def hybrid_pattern(self) -> str:
         """The exact attention/MoE composition for the backbone (DSpark is separate)."""
-        return "VE" * len(self.csa_compress_ratios)
+        return "VE" * (self.num_layers // 2)

@@ -9,13 +9,17 @@ from torch import nn
 
 from megatron.core.models.deepseek_v41.engram import Engram, EngramHasher
 from megatron.core.models.deepseek_v41.engram_hash import build_compressed_token_map
+from megatron.core.models.deepseek_v41.hybrid_adapter import (
+    DeepSeekV41ForwardContext,
+    deepseek_v41_multimodal_stack_spec,
+    deepseek_v41_stack_spec,
+)
 from megatron.core.models.deepseek_v41.image_processing import (
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,
     IMAGE_START,
 )
-from megatron.core.models.deepseek_v41.stack import deepseek_v41_stack_spec
 from megatron.core.models.deepseek_v41.vision import Aligner, ViT
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 
@@ -52,7 +56,7 @@ class DeepSeekV41Model(HybridModel):
             hasher = EngramHasher(config.engram_config, token_map)
             ids = hasher.layout.layer_ids
             if len(set(ids)) != len(ids) or any(
-                (i < 0 or i >= len(config.csa_compress_ratios) for i in ids)
+                (i < 0 or i >= (config.num_layers // 2) for i in ids)
             ):
                 raise ValueError("Engram layers must be distinct zero-based backbone blocks")
         if getattr(config, "vision_config", None):
@@ -61,10 +65,14 @@ class DeepSeekV41Model(HybridModel):
                 raise ValueError("Vision heads require a dimension divisible by four for 2D RoPE")
         super().__init__(
             config=config,
-            hybrid_stack_spec=deepseek_v41_stack_spec,
+            hybrid_stack_spec=(
+                deepseek_v41_multimodal_stack_spec
+                if config.vision_config
+                else deepseek_v41_stack_spec
+            ),
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
-            hybrid_layer_pattern="VE" * len(config.csa_compress_ratios),
+            hybrid_layer_pattern=config.hybrid_pattern,
             position_embedding_type="none",
             pg_collection=pg_collection,
             **kwargs,
@@ -72,7 +80,7 @@ class DeepSeekV41Model(HybridModel):
         self.engram_hash = hasher
         if hasher is not None:
             for i in self.engram_hash.layout.layer_ids:
-                self.decoder.layers[i].engram = Engram(
+                self.decoder.layers[2 * i].engram = Engram(
                     config, self.engram_hash.layout, i, pg_collection
                 )
         self.vision = None
@@ -148,9 +156,11 @@ class DeepSeekV41Model(HybridModel):
             hidden,
             attention_mask,
             padding_mask=padding_mask,
-            engram_hashes=hashes,
-            token_mask=~image_mask,
-            image_mask=image_mask if self.vision is not None else None,
+            forward_context=DeepSeekV41ForwardContext(
+                engram_hashes=hashes,
+                token_mask=~image_mask,
+                image_mask=image_mask if self.vision is not None else None,
+            ),
         )
 
     def forward(
