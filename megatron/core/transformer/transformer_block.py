@@ -27,6 +27,7 @@ from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    SinglePassMHCState,
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
@@ -636,6 +637,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
 
+        shared_state_kwargs = {}
+        mhc_state = SinglePassMHCState() if self.config.mhc_single_pass else None
+        if mhc_state is not None:
+            shared_state_kwargs["mhc_state"] = mhc_state
+        if (
+            self.config.experimental_attention_variant == "dsv4_hybrid"
+            and self.config.dsv4_version == "v4.1"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+
+            shared_state_kwargs["cross_layer_state"] = CSA2State()
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -753,6 +766,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
+                            **shared_state_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
@@ -774,8 +788,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Only contract if the final layer norm is in this stage
         if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.mhc_num_residual_streams
+            hidden_states = (
+                mhc_state.contract(hidden_states, self.mhc_num_residual_streams)
+                if mhc_state is not None
+                else HyperConnectionModule.output_contract(
+                    hidden_states, self.mhc_num_residual_streams
+                )
             )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.

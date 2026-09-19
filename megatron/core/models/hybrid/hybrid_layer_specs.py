@@ -1,4 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+from dataclasses import replace
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -42,6 +43,12 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressorSubmodules,
     CSAIndexer,
     CSAIndexerSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
+    csa2_layer_spec,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
+    CSA2HybridAdapter,
 )
 from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
@@ -137,6 +144,7 @@ def _get_gated_delta_product_mamba_layer_spec(in_proj, out_proj):
 hybrid_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
+        csa2_layer=csa2_layer_spec,
         mamba_layer=ModuleSpec(
             module=MambaLayer,
             submodules=MambaLayerSubmodules(
@@ -591,3 +599,10 @@ gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 # Preserve the existing --spec import path; C/H/W use the standard static stack spec.
 hybrid_dsv4_stack_spec = hybrid_stack_spec
+
+
+# CSA2 shares the ordinary HybridStack and its static layer specs.
+hybrid_csa2_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=replace(hybrid_stack_spec.submodules, forward_adapter=CSA2HybridAdapter),
+)

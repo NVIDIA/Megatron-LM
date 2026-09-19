@@ -15,4 +15,4 @@ class CSALayerConfig(MLATransformerConfig):
 
 @dataclass(kw_only=True)
 class CSA2LayerConfig(MLATransformerConfig):
-    """A CSA2 attention branch in the V4.1 stack, with a logical source schedule."""
+    """A CSA2 attention layer, with sharing sources indexed in the enclosing stack."""

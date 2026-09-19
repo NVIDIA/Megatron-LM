@@ -6,7 +6,10 @@ import torch
 
 from megatron.core.models.deepseek_v41.engram import Engram, EngramHasher
 from megatron.core.models.deepseek_v41.engram_hash import build_compressed_token_map
-from megatron.core.models.deepseek_v41.stack import deepseek_v41_stack_spec
+from megatron.core.models.deepseek_v41.hybrid_adapter import (
+    DeepSeekV41ForwardContext,
+    deepseek_v41_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 
 
@@ -44,7 +47,7 @@ class DeepSeekV41Model(HybridModel):
             hasher = EngramHasher(config.engram_config, token_map)
             ids = hasher.layout.layer_ids
             if len(set(ids)) != len(ids) or any(
-                (i < 0 or i >= len(config.csa_compress_ratios) for i in ids)
+                (i < 0 or i >= (config.num_layers // 2) for i in ids)
             ):
                 raise ValueError("Engram layers must be distinct zero-based backbone blocks")
         super().__init__(
@@ -52,7 +55,7 @@ class DeepSeekV41Model(HybridModel):
             hybrid_stack_spec=deepseek_v41_stack_spec,
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
-            hybrid_layer_pattern="VE" * len(config.csa_compress_ratios),
+            hybrid_layer_pattern=config.hybrid_pattern,
             position_embedding_type="none",
             pg_collection=pg_collection,
             **kwargs,
@@ -60,7 +63,7 @@ class DeepSeekV41Model(HybridModel):
         self.engram_hash = hasher
         if hasher is not None:
             for i in self.engram_hash.layout.layer_ids:
-                self.decoder.layers[i].engram = Engram(
+                self.decoder.layers[2 * i].engram = Engram(
                     config, self.engram_hash.layout, i, pg_collection
                 )
 
@@ -68,7 +71,12 @@ class DeepSeekV41Model(HybridModel):
         """Embed tokens and apply n-gram memory before the selected attention branches."""
         hidden = self.embedding(input_ids, position_ids)
         hashes = self.engram_hash(input_ids) if self.engram_hash is not None else None
-        return self.decoder(hidden, attention_mask, padding_mask=padding_mask, engram_hashes=hashes)
+        return self.decoder(
+            hidden,
+            attention_mask,
+            padding_mask=padding_mask,
+            forward_context=DeepSeekV41ForwardContext(engram_hashes=hashes),
+        )
 
     def forward(
         self,
