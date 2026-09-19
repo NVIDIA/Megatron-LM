@@ -106,38 +106,57 @@ class QSASelection:
 def _stage2_packed_lengths(
     packed_seq_params: PackedSeqParams, *, total_tokens: int, device: torch.device
 ) -> Tuple[Tensor, Tensor]:
-    """Return physical document starts and independently supplied true lengths.
+    """Return physical starts and true lengths from producer-owned CPU metadata.
 
     THD cu_seqlens can contain only physical padding boundaries in VL training.
     Stage-2 must never infer real lengths from those boundaries or token values.
     A zero valid length is allowed for a final, padding-only THD segment.
+    The immutable CPU layout is validated once per packed batch. It must be
+    built from the same source lengths as the attention's device cu_seqlens.
     """
-    lengths = getattr(packed_seq_params, "qsa_stage2_valid_lengths", None)
+    layout = getattr(packed_seq_params, "qsa_stage2_layout_cpu", None)
     physical_cu = packed_seq_params.cu_seqlens_q_padded
     if physical_cu is None:
         physical_cu = packed_seq_params.cu_seqlens_q
-    if not isinstance(lengths, Tensor):
-        raise ValueError("THD QSA Stage-2 KL requires qsa_stage2_valid_lengths")
+    if not isinstance(layout, tuple) or len(layout) != 2:
+        raise ValueError("THD QSA Stage-2 KL requires qsa_stage2_layout_cpu")
+    starts_cpu, lengths_cpu = layout
+    if not isinstance(starts_cpu, tuple) or not isinstance(lengths_cpu, tuple):
+        raise ValueError("qsa_stage2_layout_cpu must contain immutable tuples")
     if not isinstance(physical_cu, Tensor) or physical_cu.ndim != 1 or physical_cu.numel() < 2:
         raise ValueError("THD QSA Stage-2 KL requires physical query cu_seqlens")
-    if lengths.ndim != 1 or lengths.numel() != physical_cu.numel() - 1:
-        raise ValueError("qsa_stage2_valid_lengths must cover every physical THD segment")
-    if lengths.dtype not in (torch.int32, torch.int64) or physical_cu.dtype not in (
-        torch.int32,
-        torch.int64,
-    ):
+    if len(starts_cpu) != physical_cu.numel() or len(lengths_cpu) != len(starts_cpu) - 1:
+        raise ValueError("qsa_stage2_layout_cpu must cover every physical THD segment")
+    if physical_cu.dtype not in (torch.int32, torch.int64):
         raise ValueError("THD QSA Stage-2 metadata must have integer dtype")
-    physical_cu = physical_cu.to(device=device, dtype=torch.long)
-    lengths = lengths.to(device=device, dtype=torch.long)
-    physical_lengths = physical_cu[1:] - physical_cu[:-1]
+    cached = getattr(packed_seq_params, "_qsa_stage2_layout_cache", None)
+    if cached is not None and cached[:3] == (layout, total_tokens, device):
+        if cached[3] is not physical_cu or cached[4] != physical_cu._version:
+            raise ValueError("THD QSA Stage-2 device cu_seqlens changed without a new CPU layout")
+        return cached[5], cached[6]
+    if any(type(value) is not int for value in starts_cpu + lengths_cpu):
+        raise ValueError("qsa_stage2_layout_cpu must contain Python integers")
     if (
-        bool((physical_cu[0] != 0).item())
-        or bool((physical_cu[-1] != total_tokens).item())
-        or bool((physical_lengths <= 0).any().item())
-        or bool(((lengths < 0) | (lengths > physical_lengths)).any().item())
+        starts_cpu[0] != 0
+        or starts_cpu[-1] != total_tokens
+        or any(
+            end <= start or valid < 0 or valid > end - start
+            for start, end, valid in zip(starts_cpu[:-1], starts_cpu[1:], lengths_cpu)
+        )
     ):
-        raise ValueError("qsa_stage2_valid_lengths exceed physical THD boundaries")
-    return physical_cu, lengths
+        raise ValueError("qsa_stage2_layout_cpu exceeds physical THD boundaries")
+    starts = torch.tensor(starts_cpu, device=device, dtype=torch.long)
+    lengths = torch.tensor(lengths_cpu, device=device, dtype=torch.long)
+    packed_seq_params._qsa_stage2_layout_cache = (
+        layout,
+        total_tokens,
+        device,
+        physical_cu,
+        physical_cu._version,
+        starts,
+        lengths,
+    )
+    return starts, lengths
 
 
 @dataclass
@@ -157,7 +176,11 @@ class QwenSparseSelfAttentionSubmodules(SelfAttentionSubmodules):
 
 
 def _sequence_layout(
-    batch_size: int, seq_len: int, packed_seq_params: Optional[PackedSeqParams], device
+    batch_size: int,
+    seq_len: int,
+    packed_seq_params: Optional[PackedSeqParams],
+    device,
+    stage2_max_doc_len: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, int]:
     """Document ids and in-document positions for every token.
 
@@ -168,13 +191,20 @@ def _sequence_layout(
         cu = packed_seq_params.cu_seqlens_q
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu = packed_seq_params.cu_seqlens_q_padded
-        cu = cu.to(device=device, dtype=torch.long)
+        if stage2_max_doc_len is not None:
+            cu = packed_seq_params._qsa_stage2_layout_cache[5]
+        else:
+            cu = cu.to(device=device, dtype=torch.long)
         starts = cu[:-1]
         arange = torch.arange(seq_len, device=device, dtype=torch.long)
         doc = torch.searchsorted(starts, arange, right=True) - 1
         doc = doc.clamp_min(0)
         positions = arange - starts[doc]
-        max_doc_len = int((cu[1:] - cu[:-1]).max().item())
+        max_doc_len = (
+            int((cu[1:] - cu[:-1]).max().item())
+            if stage2_max_doc_len is None
+            else stage2_max_doc_len
+        )
         return doc.unsqueeze(0).to(torch.int32), positions.unsqueeze(0).to(torch.int32), max_doc_len
     arange = torch.arange(seq_len, device=device, dtype=torch.int32)
     positions = arange.unsqueeze(0).expand(batch_size, -1).contiguous()
@@ -565,9 +595,14 @@ class QSAIndexer(MegatronModule):
             raise NotImplementedError(
                 "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
             )
+        stage2_max_doc_len = None
         if use_loss and packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             _stage2_packed_lengths(
                 packed_seq_params, total_tokens=local_seq_len * cp_size, device=hidden_states.device
+            )
+            starts_cpu = packed_seq_params.qsa_stage2_layout_cpu[0]
+            stage2_max_doc_len = max(
+                end - start for start, end in zip(starts_cpu[:-1], starts_cpu[1:])
             )
         if cp_size > 1:
             # Rebuild the full sequence (true causal order) so the block selection sees every
@@ -595,7 +630,7 @@ class QSAIndexer(MegatronModule):
             )
         with torch.no_grad():
             doc_ids, positions, max_doc_len = _sequence_layout(
-                b, s, packed_seq_params, hidden_states.device
+                b, s, packed_seq_params, hidden_states.device, stage2_max_doc_len
             )
         # The auxiliary KL must update the indexer without adding a second
         # gradient path into the backbone's layer input.

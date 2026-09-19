@@ -95,6 +95,7 @@ def test_qsa_stage2_tp2_packed_teacher_uses_explicit_group_and_aligned_rows():
             max_seqlen_kv=16,
         )
         packed.qsa_stage2_valid_lengths = torch.tensor([9, 14], device="cuda", dtype=torch.int32)
+        packed.qsa_stage2_layout_cpu = ((0, 16, 32), (9, 14))
         torch.manual_seed(97)
         hidden = torch.randn(32, 1, config.hidden_size, dtype=torch.bfloat16).cuda()
         grad = _indexer_grad(attention, hidden, _rotary(config, 16).cuda(), packed)
@@ -124,6 +125,7 @@ def test_qsa_stage2_cp2_packed_per_token_sum_matches_cp1_with_padding(absolute_m
         max_seqlen_kv=16,
     )
     packed.qsa_stage2_valid_lengths = torch.tensor([9, 14], device="cuda", dtype=torch.int32)
+    packed.qsa_stage2_layout_cpu = ((0, 16, 32), (9, 14))
     torch.manual_seed(93)
     global_hidden = torch.randn(32, 1, 64, dtype=torch.bfloat16).cuda()
     try:

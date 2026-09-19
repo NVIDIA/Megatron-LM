@@ -17,12 +17,75 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
+from megatron.core.transformer.experimental_attention_variant.qsa import (
+    _sequence_layout,
+    _stage2_packed_lengths,
+)
 from megatron.core.transformer.spec_utils import build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_qsa import (
     _make_config,
     _rotary,
 )
+
+
+def test_qsa_stage2_packed_cpu_layout_validates_without_tensor_scalar_read(monkeypatch):
+    cu = torch.tensor([0, 16, 32], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+    packed.qsa_stage2_layout_cpu = ((0, 16, 32), (9, 14))
+
+    def unexpected_item(*_args, **_kwargs):
+        raise AssertionError("Stage-2 metadata read a tensor scalar")
+
+    monkeypatch.setattr(torch.Tensor, "item", unexpected_item)
+    first = _stage2_packed_lengths(packed, total_tokens=32, device=cu.device)
+    second = _stage2_packed_lengths(packed, total_tokens=32, device=cu.device)
+    assert first[0] is second[0] and first[1] is second[1]
+    assert torch.equal(first[0], cu.long())
+    assert torch.equal(first[1], torch.tensor([9, 14]))
+    doc_ids, positions, max_doc_len = _sequence_layout(1, 32, packed, cu.device, 16)
+    assert max_doc_len == 16
+    assert torch.equal(doc_ids[0, 16:], torch.ones(16, dtype=torch.int32))
+    assert torch.equal(positions[0, 16:], torch.arange(16, dtype=torch.int32))
+
+    packed.qsa_stage2_layout_cpu = ((0, 16, 32), (13, 2))
+    changed = _stage2_packed_lengths(packed, total_tokens=32, device=cu.device)
+    assert not torch.equal(changed[1], first[1])
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_qsa_stage2_packed_cpu_layout_rejects_device_cu_mutation(in_place):
+    cu = torch.tensor([0, 16, 32], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+    packed.qsa_stage2_layout_cpu = ((0, 16, 32), (9, 14))
+    _stage2_packed_lengths(packed, total_tokens=32, device=cu.device)
+    if in_place:
+        cu[1] = 15
+    else:
+        packed.cu_seqlens_q = cu.clone()
+    with pytest.raises(ValueError, match="device cu_seqlens changed"):
+        _stage2_packed_lengths(packed, total_tokens=32, device=cu.device)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        None,
+        ((0, 16, 32), (9,)),
+        ((0, 16, 31), (9, 14)),
+        ((0, 16, 32), (17, 14)),
+        ((0, 16, 16), (9, 0)),
+        ((0, 16, 32), (9, -1)),
+        ((0, 16, 32), (True, 14)),
+    ],
+)
+def test_qsa_stage2_packed_cpu_layout_rejects_invalid_metadata(layout):
+    cu = torch.tensor([0, 16, 32], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+    if layout is not None:
+        packed.qsa_stage2_layout_cpu = layout
+    with pytest.raises(ValueError, match="qsa_stage2_layout_cpu"):
+        _stage2_packed_lengths(packed, total_tokens=32, device=cu.device)
 
 
 def test_qsa_stage2_gdn_registers_aux_scale_only_when_enabled():
@@ -161,7 +224,7 @@ def test_qsa_stage2_rejects_packed_without_explicit_real_lengths_before_indexer_
 
         monkeypatch.setattr(attention.indexer.index_qk_proj, "forward", unexpected)
         monkeypatch.setattr(attention.core_attention, "forward", unexpected)
-        with pytest.raises(ValueError, match="qsa_stage2_valid_lengths"):
+        with pytest.raises(ValueError, match="qsa_stage2_layout_cpu"):
             attention(
                 hidden,
                 attention_mask=None,
@@ -197,6 +260,7 @@ def test_qsa_stage2_packed_padding_excluded_and_main_gradients_unchanged():
             max_seqlen_kv=16,
         )
         packed.qsa_stage2_valid_lengths = torch.tensor([9, 14], device="cuda", dtype=torch.int32)
+        packed.qsa_stage2_layout_cpu = ((0, 16, 32), (9, 14))
         torch.manual_seed(91)
         hidden = torch.randn(32, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
         valid = torch.zeros(32, device="cuda", dtype=torch.bool)
@@ -233,8 +297,10 @@ def test_qsa_stage2_packed_padding_excluded_and_main_gradients_unchanged():
             return output.detach(), grads
 
         del packed.qsa_stage2_valid_lengths
+        del packed.qsa_stage2_layout_cpu
         baseline, base_grads = run(0.0, hidden)
         packed.qsa_stage2_valid_lengths = torch.tensor([9, 14], device="cuda", dtype=torch.int32)
+        packed.qsa_stage2_layout_cpu = ((0, 16, 32), (9, 14))
         actual, grads = run(0.7, hidden)
         assert torch.equal(actual, baseline)
         for got, expected in zip(grads[:2], base_grads[:2]):
@@ -294,6 +360,7 @@ def test_qsa_stage2_distinguishes_real_lengths_with_same_physical_cu_and_zero_ta
             packed.qsa_stage2_valid_lengths = torch.tensor(
                 real_lengths, device="cuda", dtype=torch.int32
             )
+            packed.qsa_stage2_layout_cpu = ((0, 16, 32, 36), tuple(real_lengths))
             output = attention(
                 hidden, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
             )[0]

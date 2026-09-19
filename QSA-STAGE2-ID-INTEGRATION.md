@@ -15,14 +15,23 @@ and the same full-sequence selection.
 
 Supported prototype boundary: SBHD or THD with at most 4096 total physical
 query tokens per batch, `attention_dropout=0`, and an explicit TP process group
-when TP>1. THD Stage-2 requires a separate
-`packed_seq_params.qsa_stage2_valid_lengths` integer tensor: one true token
-length per physical `cu_seqlens_q_padded` segment, with `0` for a trailing
-padding-only segment. The original THD cu fields remain physical, preserving
-the main attention/CP route. The KL excludes invalid query rows and all
+when TP>1. THD Stage-2 requires producer-owned immutable CPU metadata
+`packed_seq_params.qsa_stage2_layout_cpu=(physical_cu, valid_lengths)`, with
+both entries tuples of Python integers. `physical_cu` starts at zero and ends
+at the full physical token count; `valid_lengths` has one true token length per
+physical segment, with `0` for a trailing padding-only segment. The producer
+must construct this metadata from the same source lengths as the device cu
+fields; MCore cannot compare device cu values to CPU values without a GPU sync.
+MCore rejects a replaced or mutated device cu on a cached packed object, but
+does not check the device values against CPU values on the first use. The older
+`qsa_stage2_valid_lengths` device tensor remains available for producer
+compatibility; this Stage-2 loss consumes only the CPU tuple as its source of
+true lengths.
+The original THD cu fields remain physical, preserving the main attention/CP
+route. The KL excludes invalid query rows and all
 selected/tail teacher keys for those rows. Real causal queries cannot select
 padding keys because each selected block and tail ends no later than that
-query. Missing or inconsistent true lengths fail before indexer projection;
+query. Missing or structurally invalid CPU lengths fail before indexer projection;
 physical zero-length segments are rejected. Longer batches fail before
 projection or core attention. `coeff=0` keeps the original forward path and
 selection format and does not require the new metadata.
@@ -52,11 +61,15 @@ Validation gates before production use:
   The short-geometry THD route keeps the rectangular pooled-key table. It
   cannot be merged directly with the separate mixed-document compact router:
   that route needs differentiable pooled keys and a per-document block prefix
-  carried into KL. The current metadata validator synchronizes device scalars
-  per layer and needs a producer-side/cached validation path before throughput
-  claims.
+  carried into KL. The CPU layout is validated once per packed object and its
+  device tensors are cached; the Stage-2 length check and THD max-document
+  calculation no longer read GPU scalars. Other pre-existing syncs remain:
+  `_pool_keys` reads `doc_ids.max()`, `_select_blocks` reads `all_selected`,
+  and `qsa_stage2_sparse_kl` reads several dynamic validity predicates.
+  Throughput still needs measurement and further sync removal.
 - No Bridge/Relax coefficient transport, optimizer membership, checkpoint
   save/resume, full-model training step, or 256K execution is established.
-  Current Relax VL CP2 packed parameters contain only physical cu boundaries;
-  an upstream producer must attach the independent true lengths. Dynamic CP,
+  The current Relax Stage-2 producer supplies only a device true-length tensor;
+  its separate CPU layout proposal must be integrated before using this MCore
+  commit. Dynamic CP,
   MTP, and mixed-document compact routing have no Stage-2 acceptance yet.
