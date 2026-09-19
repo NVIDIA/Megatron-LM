@@ -363,6 +363,7 @@ class QSAIndexer(MegatronModule):
         packed_seq_params: PackedSeqParams,
         max_doc_len: int,
         is_absolute_mrope: bool,
+        stage2_physical_cu: Optional[Tensor] = None,
     ) -> Tuple[Tensor, bool, Tensor, Tensor, Tensor]:
         """Route mixed packed documents through a differentiable compact key pool.
 
@@ -380,7 +381,11 @@ class QSAIndexer(MegatronModule):
         pooled, prefix, counts, block_doc, block_relative, block_valid = pool_complete_blocks(
             raw_keys, doc_ids, positions, num_docs=cu.numel() - 1, ratio=self.compress_ratio
         )
-        starts = cu[:-1].to(device=block_relative.device, dtype=torch.long)
+        starts = (
+            stage2_physical_cu[:-1]
+            if stage2_physical_cu is not None
+            else cu[:-1].to(device=block_relative.device, dtype=torch.long)
+        )
         block_starts = torch.where(
             block_valid,
             starts[block_doc] + block_relative.long() * self.compress_ratio,
@@ -596,8 +601,9 @@ class QSAIndexer(MegatronModule):
                 "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
             )
         stage2_max_doc_len = None
+        stage2_physical_cu = None
         if use_loss and packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
-            _stage2_packed_lengths(
+            stage2_physical_cu, _ = _stage2_packed_lengths(
                 packed_seq_params, total_tokens=local_seq_len * cp_size, device=hidden_states.device
             )
             starts_cpu = packed_seq_params.qsa_stage2_layout_cpu[0]
@@ -679,6 +685,7 @@ class QSAIndexer(MegatronModule):
                         packed_seq_params,
                         max_doc_len,
                         is_absolute_mrope,
+                        stage2_physical_cu,
                     )
                 )
                 D = pooled.shape[-1]

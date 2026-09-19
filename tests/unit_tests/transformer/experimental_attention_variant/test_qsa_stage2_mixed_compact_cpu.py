@@ -71,7 +71,7 @@ def test_qsa_stage2_mixed_compact_kl_uses_physical_doc_starts_and_prefix(monkeyp
         max_seqlen_q=20,
         max_seqlen_kv=20,
     )
-    packed.qsa_stage2_valid_lengths = torch.tensor([5, 18, 0, 2], dtype=torch.int32)
+    packed.qsa_stage2_layout_cpu = ((0, 8, 28, 29, 32), (5, 18, 0, 2))
     raw = torch.randn(total, 3, requires_grad=True)
     pooled, prefix, _, block_doc, block_relative, valid = pool_complete_blocks(
         raw, doc, pos, num_docs=len(lengths), ratio=ratio
