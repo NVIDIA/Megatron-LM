@@ -6,6 +6,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.models.hybrid import engram_context_provider_spec
 from model_provider import count_parameters_in_layer
 
 
@@ -43,6 +44,9 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         rotary_base=args.rotary_base,
         pg_collection=pg_collection,
         vp_stage=vp_stage,
+        token_context_provider_spec=engram_context_provider_spec(
+            config, args.hybrid_layer_pattern, getattr(args, 'engram_pad_id', None)
+        ),
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):

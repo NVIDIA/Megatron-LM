@@ -47,6 +47,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
 
     if split == Split.valid and args.full_validation:
+        dataset = PaddedEvaluationDataset(dataset, mpu.get_data_parallel_world_size())
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
             data_parallel_rank=mpu.get_data_parallel_rank(),
@@ -245,6 +246,26 @@ class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
             for i in range(self.num_micro_batches):
                 global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
             yield global_batch_idx
+
+
+class PaddedEvaluationDataset(Dataset):
+    """Equalize full-validation rank lengths using samples with zero loss weight."""
+
+    def __init__(self, dataset, data_parallel_size):
+        self.dataset = dataset
+        self.size = (
+            (len(dataset) + data_parallel_size - 1) // data_parallel_size * data_parallel_size
+        )
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, index):
+        if index < len(self.dataset):
+            return self.dataset[index]
+        sample = dict(self.dataset[0])
+        sample['loss_mask'] = torch.zeros_like(sample['loss_mask'])
+        return sample
 
 
 class MegatronFullValidationSampler:

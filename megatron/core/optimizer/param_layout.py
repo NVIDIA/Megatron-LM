@@ -11,9 +11,14 @@ buffers consume the resulting layouts without any optimizer-specific knowledge.
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from megatron.core.distributed.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
 
 
 def pad_to_divisor(value: int, divisor: int) -> int:
@@ -58,12 +63,34 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        optimizer_sharding_group: Explicit replica group for synchronous FP32 gradient
+            buffers and native sharded optimizer state. None preserves ordinary grouping.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    optimizer_sharding_group: Optional[torch.distributed.ProcessGroup] = None
+
+    def get_ddp_config(
+        self, default: "DistributedDataParallelConfig"
+    ) -> "DistributedDataParallelConfig":
+        """Use synchronous FP32 buffers for an explicit optimizer replica group.
+
+        Such parameters already accumulate scaled gradients in ``main_grad``. Their
+        replica group sums those gradients and shards native optimizer state; it is
+        independent of the model's ordinary and expert data-parallel groups.
+        """
+        if self.optimizer_sharding_group is None:
+            return default
+        from megatron.core.distributed.distributed_data_parallel_config import (
+            DistributedDataParallelConfig,
+        )
+
+        return DistributedDataParallelConfig(
+            use_distributed_optimizer=True, grad_reduce_in_fp32=True
+        )
 
 
 @dataclass

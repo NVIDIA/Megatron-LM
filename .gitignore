@@ -11,6 +11,7 @@ logs
 local/
 .gitmodules
 wandb/
+.wandb.env
 onelogger.log
 onelogger.err
 .venv
@@ -26,3 +27,11 @@ docs/apidocs
 # Git worktrees
 .worktrees/
 .claude/worktrees/
+
+# Local Engram experiment configuration and outputs.
+/examples/engram/local_data.sh
+/examples/engram/checkpoints/
+/examples/engram/tensorboard/
+/examples/engram/wandb/
+/examples/engram/.wandb.env
+/examples/engram/*.env

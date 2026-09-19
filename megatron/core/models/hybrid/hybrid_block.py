@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import warnings
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
@@ -104,6 +105,8 @@ class HybridStack(MegatronModule):
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
         boundary_layout (CPLayout, optional): CP layout at the stack boundary.
+        layer_spec_overrides (Mapping[int, ModuleSpec], optional): Specs replacing individual
+            layers, indexed by their zero-based global position in the hybrid pattern.
     """
 
     def __init__(
@@ -122,6 +125,7 @@ class HybridStack(MegatronModule):
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
         boundary_layout: CPLayout | None = None,
+        layer_spec_overrides: Mapping[int, ModuleSpec] | None = None,
     ) -> None:
         """
         Args:
@@ -196,6 +200,11 @@ class HybridStack(MegatronModule):
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
             )
+        layer_spec_overrides = dict(layer_spec_overrides or {})
+        local_positions = range(pp_layer_offset, pp_layer_offset + len(self.layer_config_list))
+        if any(position not in local_positions for position in layer_spec_overrides):
+            raise ValueError('Layer spec overrides must address positions in this pipeline segment')
+
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
@@ -222,7 +231,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     layer = build_module(
-                        submodules.attention_layer,
+                        layer_spec_overrides.get(layer_number - 1, submodules.attention_layer),
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -466,6 +475,7 @@ class HybridStack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        token_context: Tensor | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -481,6 +491,7 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            token_context (Tensor, optional): Explicit microbatch context for consumer layers.
         Returns:
             Tensor: the output tensor.
         """
@@ -593,6 +604,7 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    token_context=token_context,
                 )
             else:
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
@@ -614,6 +626,11 @@ class HybridStack(MegatronModule):
                         else None
                     )
 
+                    context_kwargs = (
+                        {'token_context': token_context}
+                        if getattr(layer, 'accepts_token_context', False)
+                        else {}
+                    )
                     if isinstance(layer, ShortcutMoEBlock):
                         hidden_states = layer(
                             hidden_states=hidden_states,
@@ -648,6 +665,7 @@ class HybridStack(MegatronModule):
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=padding_mask,
+                                    **context_kwargs,
                                 )
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
@@ -663,6 +681,7 @@ class HybridStack(MegatronModule):
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
                                     packed_sequence_cp_metadata=layer_cp_metadata,
+                                    **context_kwargs,
                                 )
                             else:  # MambaLayer, Expert, or MLP
                                 hidden_states = layer(
@@ -670,6 +689,7 @@ class HybridStack(MegatronModule):
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
+                                    **context_kwargs,
                                 )
 
                         if isinstance(hidden_states, tuple):
