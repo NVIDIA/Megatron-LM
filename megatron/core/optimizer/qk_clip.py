@@ -32,21 +32,19 @@ def clip_qk(model, log_max_only=False) -> float:
                         op=torch.distributed.ReduceOp.MAX,
                         group=parallel_state.get_data_parallel_group(with_context_parallel=True),
                     )
+                    layer_max_attention_logit = torch.max(
+                        transformer_layer.self_attention.core_attention.current_max_attn_logits
+                    ).item()
+                    if layer_max_attention_logit == float("-inf"):
+                        continue
                     log_max_attention_logit = max(
-                        log_max_attention_logit,
-                        torch.max(
-                            transformer_layer.self_attention.core_attention.current_max_attn_logits
-                        ).item(),
+                        log_max_attention_logit, layer_max_attention_logit
                     )
                     if not log_max_only:
                         transformer_layer.self_attention.clip_qk()
                     else:
-                        # When qk-clip is disabled, clip_qk() is not called and
-                        # would otherwise never reset current_max_attn_logits.
-                        # Reset it here so the logged value reflects the current
-                        # step and stale references are not retained.
-                        transformer_layer.self_attention.core_attention.current_max_attn_logits = (
-                            None
+                        transformer_layer.self_attention.core_attention.current_max_attn_logits.fill_(
+                            float("-inf")
                         )
 
     return log_max_attention_logit
