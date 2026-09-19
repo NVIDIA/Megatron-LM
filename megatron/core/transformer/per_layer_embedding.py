@@ -433,12 +433,14 @@ class PerLayerEmbedding(MegatronModule):
                     hidden_states, group=self.tp_group
                 )
                 sp_replicated = True
-            hidden_states = reconstruct_tensor_cp(hidden_states, self._cp_packed_seq_params, dim=0)
+            hidden_states = reconstruct_tensor_cp(
+                hidden_states, self._cp_packed_seq_params, dim=0, differentiable=True
+            )
         elif cp_size > 1:
             # Gather the full sequence (true causal order) so the causal dilated conv reads
             # across CP-rank boundaries; every rank redundantly computes the full layer, then
             # the output is split back to this rank's CP-local slice. No-op when CP size is 1.
-            hidden_states = reconstruct_tensor_cp(hidden_states, None, dim=0)
+            hidden_states = reconstruct_tensor_cp(hidden_states, None, dim=0, differentiable=True)
         s_local, batch_size, hc_hidden_size = hidden_states.shape
         n, C = self.n, self.hidden_size
         dtype = hidden_states.dtype

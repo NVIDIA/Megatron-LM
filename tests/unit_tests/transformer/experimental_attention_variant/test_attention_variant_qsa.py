@@ -7,12 +7,17 @@ The indexer reference is a port of the HuggingFace ``Qwen4ExpTextQSAIndexer.forw
 
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rope_utils import (
+    _apply_rotary_pos_emb_bshd,
+    apply_rotary_pos_emb,
+)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_qsa_module_spec_for_backend,
 )
@@ -20,7 +25,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.experimental_attention_variant.qsa import (
+    QSAIndexer,
     QwenSparseSelfAttention,
+    _full_sequence_indexer_rope,
+    _sequence_layout,
     build_qsa_dense_mask,
 )
 from megatron.core.transformer.spec_utils import build_module
@@ -57,6 +65,21 @@ def _make_config(**overrides):
 ROTARY_PERCENT = 0.5  # rot_dim = 8 of the 16-dim heads (Qwen4-Exp: 64 of 256)
 
 
+def test_mrope_pooled_keys_use_each_batch_rows_frequencies():
+    """A second batch row must not inherit the first row's mRoPE frequencies."""
+    indexer = SimpleNamespace(rotary_interleaved=False)
+    keys = torch.arange(1, 33, dtype=torch.float32).view(4, 8)
+    freqs = torch.zeros(2, 2, 1, 4)
+    freqs[:, 1] = math.pi / 2
+    positions = torch.tensor([0, 1, 0, 1])
+    batch_indices = torch.tensor([0, 0, 1, 1])
+
+    actual = QSAIndexer._rope_at_positions(indexer, keys, freqs, positions, batch_indices)
+    expected = keys.clone()
+    expected[2:, :4] = torch.cat((-keys[2:, 2:4], keys[2:, :2]), dim=-1)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=1e-6)
+
+
 def _rotary(config, seq_len):
     rope = RotaryEmbedding(
         kv_channels=config.kv_channels, rotary_percent=ROTARY_PERCENT, rotary_base=10000
@@ -72,6 +95,65 @@ def _hf_rope(x, freqs):
     x1, x2 = x_rot.chunk(2, dim=-1)
     rotated = torch.cat([-x2, x1], dim=-1)
     return torch.cat([x_rot * cos + rotated * sin, x_pass], dim=-1)
+
+
+def test_mrope_thd_cp_uses_local_absolute_frequencies():
+    """Both zigzag CP slices must match full-sequence per-token mRoPE exactly."""
+
+    class CPGroup:
+        def __init__(self, rank):
+            self._rank = rank
+
+        def size(self):
+            return 2
+
+        def rank(self):
+            return self._rank
+
+    generator = torch.Generator().manual_seed(11)
+    query = torch.randn(56, 2, 16, generator=generator)
+    freqs = torch.randn(56, 1, 1, 8, generator=generator)
+    config = SimpleNamespace(
+        apply_rope_fusion=False, mrope_section=[2, 1, 1], rotary_interleaved=False
+    )
+    cu_seqlens = torch.tensor([0, 56], dtype=torch.int32)
+    full = _apply_rotary_pos_emb_bshd(query.unsqueeze(1), freqs).squeeze(1)
+
+    for rank, indices in enumerate((list(range(14)) + list(range(42, 56)), list(range(14, 42)))):
+        local = apply_rotary_pos_emb(
+            query[indices],
+            freqs[indices],
+            config,
+            cu_seqlens=cu_seqlens,
+            cp_group=CPGroup(rank),
+            max_seqlen=56,
+        )
+        torch.testing.assert_close(local, full[indices], atol=0, rtol=0)
+
+
+def test_cp_reconstructed_indexer_rope_resets_at_packed_document_boundary():
+    """Full text queries must match CP=1 THD RoPE, including the second document."""
+
+    class CP1Group:
+        def size(self):
+            return 1
+
+        def rank(self):
+            return 0
+
+    generator = torch.Generator().manual_seed(12)
+    query = torch.randn(56, 1, 2, 16, generator=generator)
+    freqs = torch.randn(32, 1, 1, 8, generator=generator)
+    cu_seqlens = torch.tensor([0, 24, 56], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens)
+    _, positions, _ = _sequence_layout(1, 56, packed, query.device)
+    config = SimpleNamespace(apply_rope_fusion=False, mrope_section=None, rotary_interleaved=False)
+
+    expected = apply_rotary_pos_emb(
+        query.squeeze(1), freqs, config, cu_seqlens=cu_seqlens, cp_group=CP1Group(), max_seqlen=32
+    ).unsqueeze(1)
+    actual = _full_sequence_indexer_rope(query, freqs, positions, True, False, False)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def _zero_centered_rmsnorm(x, weight, eps):

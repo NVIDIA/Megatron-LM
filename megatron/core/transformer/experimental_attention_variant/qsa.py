@@ -36,7 +36,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.models.common.embeddings.rope_utils import _rotate_half, apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import (
+    _apply_rotary_pos_emb_bshd,
+    _rotate_half,
+    apply_rotary_pos_emb,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
@@ -132,6 +136,22 @@ def _sequence_layout(
     return doc, positions, seq_len
 
 
+def _full_sequence_indexer_rope(
+    q: Tensor,
+    freqs: Tensor,
+    positions: Tensor,
+    is_thd: bool,
+    is_absolute_mrope: bool,
+    rotary_interleaved: bool,
+) -> Tensor:
+    """Rotate CP-reconstructed queries without remapping them as CP-local tokens."""
+    if is_thd and not is_absolute_mrope:
+        # Standard packed RoPE resets at each document boundary. VL mRoPE already
+        # provides one frequency per token in the reconstructed physical order.
+        freqs = freqs.index_select(0, positions.reshape(-1).long())
+    return _apply_rotary_pos_emb_bshd(q, freqs, rotary_interleaved=rotary_interleaved)
+
+
 class QSAIndexer(MegatronModule):
     """Weight-light MQA indexer selecting the key blocks every query attends to.
 
@@ -194,12 +214,17 @@ class QSAIndexer(MegatronModule):
             setattr(param, "average_gradients_across_tp_domain", True)
 
     # ------------------------------------------------------------------ helpers
-    def _rope_at_positions(self, x: Tensor, freqs: Tensor, positions: Tensor) -> Tensor:
+    def _rope_at_positions(
+        self, x: Tensor, freqs: Tensor, positions: Tensor, batch_indices: Optional[Tensor] = None
+    ) -> Tensor:
         """Rotate ``x`` [N, D] with the frequencies of ``positions`` [N] (first ``rot_dim``
         dims)."""
-        freqs = freqs.reshape(freqs.shape[0], -1)  # [max_s, rot_dim]
-        rot_dim = freqs.shape[-1]
-        f = freqs[positions.long()]  # [N, rot_dim]
+        if freqs.shape[1] > 1:
+            assert batch_indices is not None, "batched mRoPE requires per-key batch indices"
+            f = freqs[positions.long(), batch_indices.long(), 0]  # [N, rot_dim]
+        else:
+            f = freqs.reshape(freqs.shape[0], -1)[positions.long()]
+        rot_dim = f.shape[-1]
         x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
         cos_ = torch.cos(f).to(x.dtype)
         sin_ = torch.sin(f).to(x.dtype)
@@ -330,10 +355,12 @@ class QSAIndexer(MegatronModule):
         assert rotary_pos_emb is not None, "QSA requires rotary position embeddings"
         if isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = rotary_pos_emb[0]
+        is_absolute_mrope = getattr(self.config, "mrope_section", None) is not None
         if self.config.sequence_parallel and get_pg_size(self.pg_collection.tp) > 1:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, group=self.pg_collection.tp
             )
+        local_seq_len = hidden_states.shape[0]
         cp_size = get_pg_size(self.pg_collection.cp)
         if cp_size > 1:
             # Rebuild the full sequence (true causal order) so the block selection sees every
@@ -344,10 +371,13 @@ class QSAIndexer(MegatronModule):
             from megatron.core.ssm.mamba_context_parallel import reconstruct_tensor_cp
 
             hidden_states = reconstruct_tensor_cp(hidden_states, packed_seq_params, dim=0)
-        # Under CP the hidden (and thus q) is the full gathered sequence, so apply rotary as
-        # in the CP=1 case; the owning attention's own CP all-gather produces the same
-        # full-sequence rotary, keeping the selection aligned with q/k/v.
-        rope_cp_group = None if cp_size > 1 else self.pg_collection.cp
+            if is_absolute_mrope and rotary_pos_emb.shape[0] == local_seq_len:
+                # VL mRoPE is a frequency for each CP-local token, rather than a
+                # position table. Rebuild it in the same order as hidden_states.
+                rotary_pos_emb = reconstruct_tensor_cp(rotary_pos_emb, packed_seq_params, dim=0)
+        # The indexer sees the full sequence after CP reconstruction. The public RoPE
+        # helper treats cp_group=None as the global CP group, so it would remap these
+        # full-sequence queries as if they were still rank-local.
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         s, b, _ = hidden_states.shape
         with torch.no_grad():
@@ -362,17 +392,23 @@ class QSAIndexer(MegatronModule):
             q.reshape(s, b, self.n_heads, self.head_dim).reshape(-1, self.head_dim)
         )
         q = q.view(s, b, self.n_heads, self.head_dim)
-        if is_thd:
+        if cp_size > 1:
+            q = _full_sequence_indexer_rope(
+                q, rotary_pos_emb, positions, is_thd, is_absolute_mrope, self.rotary_interleaved
+            )
+        elif is_thd:
             q = apply_rotary_pos_emb(
                 q.squeeze(1),
                 rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=packed_seq_params.cu_seqlens_q,
-                cp_group=rope_cp_group,
+                cp_group=self.pg_collection.cp,
                 max_seqlen=packed_seq_params.max_seqlen_q,
             ).unsqueeze(1)
         else:
-            q = apply_rotary_pos_emb(q, rotary_pos_emb, config=self.config, cp_group=rope_cp_group)
+            q = apply_rotary_pos_emb(
+                q, rotary_pos_emb, config=self.config, cp_group=self.pg_collection.cp
+            )
         # Flatten [s, b] -> [b*s] token order (batch-major) to match doc_ids/positions [b, s].
         q_flat = q.transpose(0, 1).reshape(b * s, self.n_heads, self.head_dim)
         keys_flat = raw_keys.transpose(0, 1).reshape(b * s, self.head_dim)
@@ -386,8 +422,23 @@ class QSAIndexer(MegatronModule):
             n_docs, n_blocks_max, D = pooled.shape
             if n_blocks_max > 0:
                 pooled = self.k_layernorm(pooled.reshape(-1, D))
+                rope_block_positions = block_positions
+                if is_absolute_mrope and is_thd and rotary_pos_emb.shape[0] == s:
+                    cu = packed_seq_params.cu_seqlens_q_padded
+                    if cu is None:
+                        cu = packed_seq_params.cu_seqlens_q
+                    starts = cu[:-1].to(device=block_positions.device, dtype=torch.long)
+                    ends = cu[1:].to(device=block_positions.device, dtype=torch.long)
+                    rope_block_positions = (block_positions + starts[:, None]).clamp_max(
+                        ends[:, None] - 1
+                    )
+                batch_indices = None
+                if is_absolute_mrope and not is_thd and b > 1:
+                    batch_indices = torch.arange(n_docs, device=pooled.device).repeat_interleave(
+                        n_blocks_max
+                    )
                 pooled = self._rope_at_positions(
-                    pooled, rotary_pos_emb, block_positions.reshape(-1)
+                    pooled, rotary_pos_emb, rope_block_positions.reshape(-1), batch_indices
                 )
                 pooled = pooled.view(n_docs, n_blocks_max, D)
             selected_bits, all_selected = self._select_blocks(
@@ -544,12 +595,71 @@ class QSACoreAttention(torch.nn.Module):
         if rep > 1:
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask.unsqueeze(1), scale=self.softmax_scale
-        )
+        # cuDNN SDPA cannot reliably initialize its frontend for packed CP masks.
+        with torch.nn.attention.sdpa_kernel(
+            [
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                torch.nn.attention.SDPBackend.MATH,
+            ]
+        ):
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask.unsqueeze(1), scale=self.softmax_scale
+            )
         if is_thd:
             return out.transpose(1, 2).squeeze(0).reshape(s, hq * d)
         return out.permute(2, 0, 1, 3).reshape(s, b, hq * d)
+
+    def _all_selected_cp_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tensor:
+        """Causal attention without a quadratic mask for CP-reconstructed Q/K/V."""
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            from flash_attn import flash_attn_varlen_func
+
+            cu_q = packed_seq_params.cu_seqlens_q_padded
+            cu_kv = packed_seq_params.cu_seqlens_kv_padded
+            if cu_q is None:
+                cu_q = packed_seq_params.cu_seqlens_q
+            if cu_kv is None:
+                cu_kv = packed_seq_params.cu_seqlens_kv
+            out = flash_attn_varlen_func(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                cu_q,
+                cu_kv,
+                packed_seq_params.max_seqlen_q or query.shape[0],
+                packed_seq_params.max_seqlen_kv or key.shape[0],
+                softmax_scale=self.softmax_scale,
+                causal=True,
+            )
+            return out.reshape(out.shape[0], -1)
+
+        # Each batch row is a separate document in the non-THD layout.
+        q = query.permute(1, 2, 0, 3)
+        k = key.permute(1, 2, 0, 3)
+        v = value.permute(1, 2, 0, 3)
+        with torch.nn.attention.sdpa_kernel(
+            [
+                torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                torch.nn.attention.SDPBackend.MATH,
+            ]
+        ):
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                scale=self.softmax_scale,
+                enable_gqa=q.shape[1] != k.shape[1],
+            )
+        return out.permute(2, 0, 1, 3).reshape(query.shape[0], query.shape[1], -1)
 
     def forward(
         self,
@@ -575,7 +685,8 @@ class QSACoreAttention(torch.nn.Module):
                 "QSACoreAttention.forward called without a block selection; "
                 "QwenSparseSelfAttention must run the indexer first."
             )
-        if selection.all_selected and not self.config.qsa_force_sparse:
+        cp_size = get_pg_size(self.pg_collection.cp)
+        if selection.all_selected and not self.config.qsa_force_sparse and cp_size == 1:
             return self.dense_core_attention(
                 query,
                 key,
@@ -595,10 +706,9 @@ class QSACoreAttention(torch.nn.Module):
         # correct global position, so it stays aligned after the gather -- run the sparse kernel
         # over the full sequence with the full-seq selection, then split the output back to the
         # local slice. Numerically exact vs CP=1; the sparse kernel is O(global_s^2) here, so the
-        # block-sparse triton kernel remains the long-seq production follow-up. The all-selected
-        # dense path above delegates to ``dense_core_attention`` (which carries
-        # ``cp_comm_type``) and is already CP-aware, so it is left untouched.
-        cp_size = get_pg_size(self.pg_collection.cp)
+        # block-sparse triton kernel remains the long-seq production follow-up. For CP>1,
+        # the all-selected dense TE kernel returns NaN gradients with packed padding-causal
+        # attention, so short sequences use the explicit gather + masked SDPA path too.
         if cp_size > 1:
             from megatron.core.ssm.mamba_context_parallel import (
                 reconstruct_tensor_cp,
@@ -606,9 +716,16 @@ class QSACoreAttention(torch.nn.Module):
             )
 
             query = reconstruct_tensor_cp(query, packed_seq_params, dim=0)
-            key = reconstruct_tensor_cp(key, packed_seq_params, dim=0)
-            value = reconstruct_tensor_cp(value, packed_seq_params, dim=0)
-        if self.sparse_backend == "dense_masked":
+            # Only local query outputs survive the split. Remote keys/values, however,
+            # contribute to those outputs and need a summed backward across CP ranks.
+            kv_heads = key.shape[-2]
+            kv = reconstruct_tensor_cp(
+                torch.cat((key, value), dim=-2), packed_seq_params, dim=0, differentiable=True
+            )
+            key, value = kv.split(kv_heads, dim=-2)
+        if selection.all_selected and not self.config.qsa_force_sparse and cp_size > 1:
+            out = self._all_selected_cp_forward(query, key, value, packed_seq_params)
+        elif self.sparse_backend == "dense_masked":
             out = self._dense_masked_forward(query, key, value, selection, is_thd)
         else:
             out = self._flex_forward(query, key, value, selection, is_thd)

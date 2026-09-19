@@ -402,6 +402,19 @@ def apply_rotary_pos_emb(
                     interleaved=config.rotary_interleaved,
                 )
     # use unfused implementation
+    if cu_seqlens is not None and config.mrope_section is not None and freqs.shape[0] == t.shape[0]:
+        # VL mRoPE supplies one absolute frequency per local packed token. The
+        # THD position-table path below would remap CP positions a second time
+        # and clamp valid global positions into the local table.
+        return _apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1),
+            freqs,
+            rotary_interleaved=config.rotary_interleaved,
+            mla_rotary_interleaved=mla_rotary_interleaved,
+            mscale=mscale,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
+        ).squeeze(1)
     if cu_seqlens is None:
         return _apply_rotary_pos_emb_bshd(
             t,

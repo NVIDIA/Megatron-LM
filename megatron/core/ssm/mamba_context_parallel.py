@@ -435,7 +435,10 @@ def _redo_attention_load_balancing(
 
 
 def reconstruct_tensor_cp(
-    tensor: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None, dim: int = 0
+    tensor: torch.Tensor,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+    dim: int = 0,
+    differentiable: bool = False,
 ) -> torch.Tensor:
     """All-gather a context-parallel-sharded tensor and undo the zigzag load balancing.
 
@@ -443,10 +446,9 @@ def reconstruct_tensor_cp(
     modules that need global context — the QSA indexer block selection and the PLE n-gram
     hashing plus its causal dilated conv — can run on the gathered tensor exactly as in the
     CP=1 case. The local rank's own slice is re-pinned into the gathered buffer so the local
-    autograd graph is preserved; under the replicate-then-split pattern each rank redundantly
-    computes the full layer, so every rank's own rows receive their gradient from its own
-    backward (cross-rank gradients land on detached slots and are correctly recomputed on the
-    owning rank), with no backward collective and therefore no deadlock.
+    autograd graph is preserved by default. Attention must pass ``differentiable=True``:
+    its local queries attend to remote keys/values, whose gradients must be summed across
+    ranks in the gather's reduce-scatter backward.
     """
     from megatron.core import parallel_state
 
@@ -462,11 +464,18 @@ def reconstruct_tensor_cp(
         tensor = tensor.transpose(0, dim).contiguous()
 
     tensor = tensor.contiguous()
-    output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
-    torch.distributed.all_gather(output_list, tensor, group=cp_group)
-    # Re-pin the local slot with the original tensor so the local autograd graph survives.
-    output_list[cp_rank] = tensor
-    gathered = torch.cat(output_list, dim=0)
+    if differentiable:
+        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+        gathered = gather_from_sequence_parallel_region(
+            tensor, tensor_parallel_output_grad=True, group=cp_group
+        )
+    else:
+        output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(output_list, tensor, group=cp_group)
+        # Preserve the local autograd graph for existing replicated computations.
+        output_list[cp_rank] = tensor
+        gathered = torch.cat(output_list, dim=0)
 
     gathered = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
 
