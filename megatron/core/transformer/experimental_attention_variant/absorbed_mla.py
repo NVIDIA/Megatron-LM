@@ -20,6 +20,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -192,7 +193,11 @@ class AbsorbedMLASelfAttention(Attention):
         self.cache_mla_latents = self.config.cache_mla_latents
         assert not self.cache_mla_latents, "cache_mla_latents is not supported for AbsorbedMLA"
 
-        if self.config.rope_type == "rope":
+        # NoPE has no positional slice to embed or rotate.
+        self.use_rope = self.config.qk_pos_emb_head_dim > 0
+        if not self.use_rope:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -416,29 +421,36 @@ class AbsorbedMLASelfAttention(Attention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
-        )
-
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
-        else:
-            if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
-                )
-                rotary_pos_emb = None
-                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_apply_mla_rope_for_q is not None
-                    and fused_apply_mla_rope_for_kv is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
+        if self.use_rope:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, None, hidden_states, self.config, packed_seq_params
+            )
+            if self.config.rope_type == "rope":
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                if self.config.apply_rope_fusion:
+                    rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                        rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                    )
+                    rotary_pos_emb = None
+                    assert (
+                        inference_context is None
+                    ), "Inference with MLA RoPE fusion is not supported"
+                    assert (
+                        fused_apply_mla_rope_for_q is not None
+                        and fused_apply_mla_rope_for_kv is not None
+                    ), "Fused MLA RoPE apply is not imported successfully"
+                else:
+                    rotary_pos_emb, mscale = self.rotary_pos_emb(
+                        rotary_seq_len, packed_seq=packed_seq
+                    )
+        else:
+            # NoPE: no rotary embedding; q_absorbed/kv_compressed carry no pos slice.
+            rotary_pos_emb = None
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -468,7 +480,11 @@ class AbsorbedMLASelfAttention(Attention):
             #     q_compressed: [s, b, q_lora_rank / TP]
             # elif linear_q_down_proj is Linear:
             #     q_compressed: [s / TP, b, q_lora_rank]
-            q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            if self.config.mla_disable_attention_fp8:
+                with get_fp8_disabled_context(self.config):
+                    q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            else:
+                q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
             # When output is sharded (ColumnParallelLinear), two things are needed to be
             # identical to a normal Linear.
@@ -489,7 +505,11 @@ class AbsorbedMLASelfAttention(Attention):
         #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
         # elif linear_kv_down_proj is Linear:
         #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        if self.config.mla_disable_attention_fp8:
+            with get_fp8_disabled_context(self.config):
+                kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        else:
+            kv_combined, _ = self.linear_kv_down_proj(hidden_states)
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
@@ -547,7 +567,11 @@ class AbsorbedMLASelfAttention(Attention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
+                if self.config.mla_disable_attention_fp8:
+                    with get_fp8_disabled_context(self.config):
+                        q, _ = self.linear_q_up_proj(q_compressed)
+                else:
+                    q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
@@ -558,10 +582,20 @@ class AbsorbedMLASelfAttention(Attention):
 
             # [num_tokens, kv_lora_rank] -> [num_tokens, 1, kv_lora_rank]
             kv_compressed = torch.unsqueeze(kv_compressed, -2)
-            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             k_up_weight, _ = self._get_kv_up_weights()
+
+            if not self.use_rope:
+                q_absorbed = torch.einsum("...nd,ndk->...nk", q, k_up_weight)
+                q_absorbed = q_absorbed.contiguous()
+                assert q_absorbed.size(-1) == self.config.kv_lora_rank
+                assert q_absorbed.is_contiguous()
+                assert kv_compressed.is_contiguous()
+                # CheckpointWithoutOutput discards output storage; do not alias its saved input.
+                return q_absorbed, kv_compressed.clone()
+
+            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             if self.config.apply_rope_fusion:
                 # q_no_pe: [num_tokens, n, qk_head_dim]
@@ -911,7 +945,11 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        if self.config.mla_disable_attention_fp8:
+            with get_fp8_disabled_context(self.config):
+                output, bias = self.linear_proj(core_attn_out)
+        else:
+            output, bias = self.linear_proj(core_attn_out)
 
         return output, bias
 
