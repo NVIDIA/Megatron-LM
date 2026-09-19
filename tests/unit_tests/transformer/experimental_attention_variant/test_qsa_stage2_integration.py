@@ -2,6 +2,8 @@
 
 """Small CUDA gate for the opt-in QSA Stage-2 indexer training path."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -10,6 +12,9 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_qsa_module_spec_for_backend,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.schedules import (
+    _get_experimental_attention_variant_loss_scale_func,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.spec_utils import build_module
@@ -18,6 +23,33 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_attention_
     _make_config,
     _rotary,
 )
+
+
+def test_qsa_stage2_gdn_registers_aux_scale_only_when_enabled():
+    disabled = SimpleNamespace(
+        experimental_attention_variant="gdn",
+        qsa_indexer_loss_coeff=0.0,
+        experimental_attention_variant_loss_scale_func=None,
+    )
+    enabled = SimpleNamespace(
+        experimental_attention_variant="gdn",
+        qsa_indexer_loss_coeff=0.7,
+        experimental_attention_variant_loss_scale_func=None,
+    )
+    assert _get_experimental_attention_variant_loss_scale_func(disabled) is None
+    hook = _get_experimental_attention_variant_loss_scale_func(enabled)
+    assert hook is DSAIndexerLossAutoScaler.set_loss_scale
+    old_scale = DSAIndexerLossAutoScaler.main_loss_backward_scale
+    saved_scale = old_scale.clone() if old_scale is not None else None
+    try:
+        hook(torch.tensor(0.25))
+        main = torch.ones(2, requires_grad=True)
+        auxiliary = torch.ones((), requires_grad=True)
+        DSAIndexerLossAutoScaler.apply(main, auxiliary).sum().backward()
+        torch.testing.assert_close(main.grad, torch.ones_like(main))
+        torch.testing.assert_close(auxiliary.grad, torch.tensor(0.25))
+    finally:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = saved_scale
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -100,19 +132,36 @@ def test_qsa_stage2_id_sparse_trains_both_indexer_projections_without_main_kl_gr
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_qsa_stage2_rejects_packed_keys_before_indexer_forward():
+def test_qsa_stage2_rejects_packed_without_explicit_real_lengths_before_indexer_forward(
+    monkeypatch,
+):
     Utils.initialize_model_parallel(1, 1)
     try:
-        config = _make_config(qsa_indexer_loss_coeff=0.7)
+        config = _make_config(qsa_indexer_loss_coeff=0.7, attention_dropout=0.0)
         attention = (
             build_module(get_qsa_module_spec_for_backend(config), config=config, layer_number=1)
             .cuda()
             .train()
         )
         attention.core_attention.sparse_backend = "id_sparse"
-        packed = PackedSeqParams(qkv_format="thd")
+        cu = torch.tensor([0, 8], device="cuda", dtype=torch.int32)
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=cu,
+            cu_seqlens_kv_padded=cu,
+            max_seqlen_q=8,
+            max_seqlen_kv=8,
+        )
         hidden = torch.randn(8, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        with pytest.raises(NotImplementedError, match="packed/padded keys"):
+
+        def unexpected(*_args, **_kwargs):
+            raise AssertionError("missing metadata reached the indexer projection or core")
+
+        monkeypatch.setattr(attention.indexer.index_qk_proj, "forward", unexpected)
+        monkeypatch.setattr(attention.core_attention, "forward", unexpected)
+        with pytest.raises(ValueError, match="qsa_stage2_valid_lengths"):
             attention(
                 hidden,
                 attention_mask=None,
@@ -120,6 +169,146 @@ def test_qsa_stage2_rejects_packed_keys_before_indexer_forward():
                 packed_seq_params=packed,
             )
     finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qsa_stage2_packed_padding_excluded_and_main_gradients_unchanged():
+    Utils.initialize_model_parallel(1, 1)
+    DSAIndexerLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    try:
+        config = _make_config(
+            qsa_indexer_loss_coeff=0.0, qsa_force_sparse=True, attention_dropout=0.0
+        )
+        attention = (
+            build_module(get_qsa_module_spec_for_backend(config), config=config, layer_number=1)
+            .cuda()
+            .train()
+        )
+        attention.core_attention.sparse_backend = "id_sparse"
+        physical_cu = torch.tensor([0, 16, 32], device="cuda", dtype=torch.int32)
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=physical_cu,
+            cu_seqlens_kv=physical_cu,
+            cu_seqlens_q_padded=physical_cu,
+            cu_seqlens_kv_padded=physical_cu,
+            max_seqlen_q=16,
+            max_seqlen_kv=16,
+        )
+        packed.qsa_stage2_valid_lengths = torch.tensor([9, 14], device="cuda", dtype=torch.int32)
+        torch.manual_seed(91)
+        hidden = torch.randn(32, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        valid = torch.zeros(32, device="cuda", dtype=torch.bool)
+        valid[:9] = True
+        valid[16:30] = True
+        upstream = torch.randn(32, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        upstream[~valid] = 0
+        freqs = _rotary(config, 16).cuda()
+        qk_weight = attention.indexer.index_qk_proj.weight
+
+        def run(coeff, input_hidden, use_reentrant=False):
+            config.qsa_indexer_loss_coeff = coeff
+            state = input_hidden.detach().clone().requires_grad_()
+
+            def forward(x):
+                return attention(
+                    x, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
+                )[0]
+
+            output = (
+                checkpoint(forward, state, use_reentrant=True) if use_reentrant else forward(state)
+            )
+            if use_reentrant:
+                attention.zero_grad(set_to_none=True)
+                output.backward(upstream)
+                grads = (state.grad, attention.linear_qkv.weight.grad, qk_weight.grad)
+            else:
+                grads = torch.autograd.grad(
+                    output,
+                    (state, attention.linear_qkv.weight, qk_weight),
+                    grad_outputs=upstream,
+                    allow_unused=True,
+                )
+            return output.detach(), grads
+
+        del packed.qsa_stage2_valid_lengths
+        baseline, base_grads = run(0.0, hidden)
+        packed.qsa_stage2_valid_lengths = torch.tensor([9, 14], device="cuda", dtype=torch.int32)
+        actual, grads = run(0.7, hidden)
+        assert torch.equal(actual, baseline)
+        for got, expected in zip(grads[:2], base_grads[:2]):
+            assert torch.equal(got, expected)
+        assert base_grads[2] is None
+        assert grads[2] is not None and torch.isfinite(grads[2]).all()
+        query_width = config.qsa_indexer_n_heads * config.qsa_indexer_head_dim
+        assert grads[2][:query_width].float().abs().sum() > 0
+        assert grads[2][query_width:].float().abs().sum() > 0
+
+        recomputed, recomputed_grads = run(0.7, hidden, use_reentrant=True)
+        assert torch.equal(recomputed, actual)
+        for got, expected in zip(recomputed_grads, grads):
+            torch.testing.assert_close(got.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+        perturbed = hidden.clone()
+        perturbed[~valid] = torch.randn_like(perturbed[~valid]) * 100
+        _, perturbed_grads = run(0.7, perturbed)
+        torch.testing.assert_close(perturbed_grads[2].float(), grads[2].float(), rtol=0, atol=0)
+    finally:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qsa_stage2_distinguishes_real_lengths_with_same_physical_cu_and_zero_tail():
+    Utils.initialize_model_parallel(1, 1)
+    DSAIndexerLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    try:
+        config = _make_config(
+            qsa_indexer_loss_coeff=0.7,
+            qsa_force_sparse=True,
+            calculate_per_token_loss=True,
+            attention_dropout=0.0,
+        )
+        attention = (
+            build_module(get_qsa_module_spec_for_backend(config), config=config, layer_number=1)
+            .cuda()
+            .train()
+        )
+        attention.core_attention.sparse_backend = "id_sparse"
+        physical_cu = torch.tensor([0, 16, 32, 36], device="cuda", dtype=torch.int32)
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=physical_cu,
+            cu_seqlens_kv=physical_cu,
+            cu_seqlens_q_padded=physical_cu,
+            cu_seqlens_kv_padded=physical_cu,
+            max_seqlen_q=16,
+            max_seqlen_kv=16,
+        )
+        torch.manual_seed(103)
+        hidden = torch.randn(36, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        freqs = _rotary(config, 16).cuda()
+
+        def grad(real_lengths):
+            packed.qsa_stage2_valid_lengths = torch.tensor(
+                real_lengths, device="cuda", dtype=torch.int32
+            )
+            output = attention(
+                hidden, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
+            )[0]
+            result = torch.autograd.grad(
+                output, attention.indexer.index_qk_proj.weight, grad_outputs=torch.ones_like(output)
+            )[0]
+            assert torch.isfinite(result).all()
+            return result.detach().float()
+
+        first = grad([9, 3, 0])
+        second = grad([13, 2, 0])
+        assert not torch.equal(first, second)
+        assert first.abs().sum() > 0 and second.abs().sum() > 0
+    finally:
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
         Utils.destroy_model_parallel()
 
 

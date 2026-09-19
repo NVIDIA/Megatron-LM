@@ -64,6 +64,7 @@ def _teacher_chunk(
     document_starts: torch.Tensor,
     query_positions: torch.Tensor,
     valid: torch.Tensor,
+    query_valid_rows: Optional[torch.Tensor],
     *,
     compress_ratio: int,
     softmax_scale: Optional[float],
@@ -85,6 +86,8 @@ def _teacher_chunk(
     tail_offsets = torch.arange(compress_ratio - 1, device=query.device)
     tail_ids = tail_start.unsqueeze(-1) + tail_offsets
     tail_valid = tail_ids <= document_starts.unsqueeze(-1) + query_positions.unsqueeze(-1)
+    if query_valid_rows is not None:
+        tail_valid = tail_valid & query_valid_rows.unsqueeze(-1)
     token_ids = torch.cat((selected_ids, tail_ids), dim=-1)
     route_valid = torch.cat((selected_valid, tail_valid), dim=-1)
     gathered = key.detach()[token_ids.clamp(0, key.size(0) - 1)]
@@ -226,6 +229,7 @@ def qsa_stage2_sparse_kl(
             document_starts[start:end],
             query_positions[start:end],
             chunk_valid,
+            query_valid_rows[start:end] if query_valid_rows is not None else None,
             compress_ratio=compress_ratio,
             softmax_scale=softmax_scale,
             tp_group=tp_group,

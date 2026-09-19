@@ -101,6 +101,43 @@ class QSASelection:
     compressed_key: Optional[Tensor] = None
 
 
+def _stage2_packed_lengths(
+    packed_seq_params: PackedSeqParams, *, total_tokens: int, device: torch.device
+) -> Tuple[Tensor, Tensor]:
+    """Return physical document starts and independently supplied true lengths.
+
+    THD cu_seqlens can contain only physical padding boundaries in VL training.
+    Stage-2 must never infer real lengths from those boundaries or token values.
+    A zero valid length is allowed for a final, padding-only THD segment.
+    """
+    lengths = getattr(packed_seq_params, "qsa_stage2_valid_lengths", None)
+    physical_cu = packed_seq_params.cu_seqlens_q_padded
+    if physical_cu is None:
+        physical_cu = packed_seq_params.cu_seqlens_q
+    if not isinstance(lengths, Tensor):
+        raise ValueError("THD QSA Stage-2 KL requires qsa_stage2_valid_lengths")
+    if not isinstance(physical_cu, Tensor) or physical_cu.ndim != 1 or physical_cu.numel() < 2:
+        raise ValueError("THD QSA Stage-2 KL requires physical query cu_seqlens")
+    if lengths.ndim != 1 or lengths.numel() != physical_cu.numel() - 1:
+        raise ValueError("qsa_stage2_valid_lengths must cover every physical THD segment")
+    if lengths.dtype not in (torch.int32, torch.int64) or physical_cu.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("THD QSA Stage-2 metadata must have integer dtype")
+    physical_cu = physical_cu.to(device=device, dtype=torch.long)
+    lengths = lengths.to(device=device, dtype=torch.long)
+    physical_lengths = physical_cu[1:] - physical_cu[:-1]
+    if (
+        bool((physical_cu[0] != 0).item())
+        or bool((physical_cu[-1] != total_tokens).item())
+        or bool((physical_lengths <= 0).any().item())
+        or bool(((lengths < 0) | (lengths > physical_lengths)).any().item())
+    ):
+        raise ValueError("qsa_stage2_valid_lengths exceed physical THD boundaries")
+    return physical_cu, lengths
+
+
 @dataclass
 class QSAIndexerSubmodules:
     """Submodules of the QSA indexer."""
@@ -466,6 +503,10 @@ class QSAIndexer(MegatronModule):
             raise NotImplementedError(
                 "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
             )
+        if use_loss and packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            _stage2_packed_lengths(
+                packed_seq_params, total_tokens=local_seq_len * cp_size, device=hidden_states.device
+            )
         if cp_size > 1:
             # Rebuild the full sequence (true causal order) so the block selection sees every
             # key of the sequence, exactly as in the CP=1 case. The owning
@@ -679,11 +720,12 @@ class QSACoreAttention(torch.nn.Module):
             or selection.selected_ids is None
         ):
             raise RuntimeError("QSA Stage-2 KL requires differentiable indexer projections")
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "QSA Stage-2 KL requires unpadded SBHD until packed key masking is proven"
-            )
-        s, b, hq, d = query.shape
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if is_thd:
+            s, hq, d = query.shape
+            b = 1
+        else:
+            s, b, hq, d = query.shape
         if s * b > 4096:
             raise NotImplementedError(
                 "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
@@ -705,22 +747,50 @@ class QSACoreAttention(torch.nn.Module):
             + local_positions[None, :]
         ).reshape(-1)
         ids = selection.selected_ids.index_select(0, rows).long()
-        blocks_per_doc = selection.compressed_key.shape[0] // b
+        if is_thd:
+            physical_cu, valid_lengths = _stage2_packed_lengths(
+                packed_seq_params, total_tokens=s, device=query.device
+            )
+            doc_ids = selection.doc_ids.reshape(-1).index_select(0, rows).long()
+            positions = selection.positions.reshape(-1).index_select(0, rows).long()
+            query_valid_rows = positions < valid_lengths[doc_ids]
+            ids = ids.masked_fill(~query_valid_rows[:, None], -1)
+            n_docs = valid_lengths.numel()
+            blocks_per_doc = selection.compressed_key.shape[0] // n_docs
+        else:
+            blocks_per_doc = selection.compressed_key.shape[0] // b
         if blocks_per_doc == 0:
             return output
-        doc_base = torch.arange(b, device=query.device, dtype=torch.long)[:, None]
-        doc_base = doc_base.expand(-1, local_positions.numel()).reshape(-1)
+        if is_thd:
+            doc_base = doc_ids
+            document_starts = physical_cu[:-1].index_select(0, doc_ids)
+            # Unused slots in the rectangular pooled table are harmless but must
+            # have an in-bounds dummy start for the helper's metadata validation.
+            block_offsets = (
+                torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)
+                * selection.compress_ratio
+            )
+            block_starts = (
+                (physical_cu[:-1, None] + block_offsets[None, :])
+                .reshape(-1)
+                .clamp_max(s - selection.compress_ratio)
+            )
+        else:
+            doc_base = torch.arange(b, device=query.device, dtype=torch.long)[:, None]
+            doc_base = doc_base.expand(-1, local_positions.numel()).reshape(-1)
+            document_starts = doc_base * s
+            query_valid_rows = None
+            block_starts = (
+                torch.arange(b, device=query.device, dtype=torch.long)[:, None] * s
+                + torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)[None, :]
+                * selection.compress_ratio
+            ).reshape(-1)
+            positions = selection.positions.index_select(1, local_positions).reshape(-1).long()
         block_ids = torch.where(ids >= 0, ids + doc_base[:, None] * blocks_per_doc, -1)
-        block_starts = (
-            torch.arange(b, device=query.device, dtype=torch.long)[:, None] * s
-            + torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)[None, :]
-            * selection.compress_ratio
-        ).reshape(-1)
         local_query = query.index_select(0, local_positions)
         index_query = selection.index_query.index_select(0, rows)
-        positions = selection.positions.index_select(1, local_positions).reshape(-1).long()
-        teacher_query = local_query.transpose(0, 1).reshape(-1, hq, d)
-        teacher_key = key.transpose(0, 1).reshape(-1, key.shape[-2], d)
+        teacher_query = local_query if is_thd else local_query.transpose(0, 1).reshape(-1, hq, d)
+        teacher_key = key if is_thd else key.transpose(0, 1).reshape(-1, key.shape[-2], d)
         loss = qsa_stage2_sparse_kl(
             index_query,
             selection.compressed_key,
@@ -728,12 +798,13 @@ class QSACoreAttention(torch.nn.Module):
             block_starts,
             teacher_query,
             teacher_key,
-            doc_base * s,
+            document_starts,
             positions,
             compress_ratio=selection.compress_ratio,
             loss_coeff=self.config.qsa_indexer_loss_coeff,
             softmax_scale=self.softmax_scale,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
+            query_valid_rows=query_valid_rows,
             query_chunk_size=8,
             tp_group=self.pg_collection.tp,
         )
@@ -1062,8 +1133,6 @@ class QwenSparseSelfAttention(SelfAttention):
         )
         if use_loss and self.core_attention.sparse_backend != "id_sparse":
             raise NotImplementedError("QSA Stage-2 KL requires MCORE_QSA_SPARSE_BACKEND=id_sparse")
-        if use_loss and packed_seq_params is not None:
-            raise NotImplementedError("QSA Stage-2 KL does not support packed/padded keys yet")
         if use_loss and self.config.attention_dropout != 0:
             raise NotImplementedError("QSA Stage-2 KL requires attention_dropout=0")
         if (
