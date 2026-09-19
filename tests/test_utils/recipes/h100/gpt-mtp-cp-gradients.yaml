@@ -1,0 +1,48 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}_{platforms}'
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 2
+  n_repeat: 1
+  platforms: dgx_h100
+  time_limit: 900
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
+  script: |-
+    set -euo pipefail
+    cd /opt/megatron-lm
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+    export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0 NVTE_UNFUSED_ATTN=0
+    uv run --no-sync python -m torch.distributed.run \
+      --standalone --nproc-per-node=2 \
+      --log-dir={assets_dir}/logs --redirects=3 --tee=3 \
+      -m tests.functional_tests.test_cases.gpt.gpt_mtp_cp_gradients.test_gradients \
+      --output={assets_dir}/gradient_comparison.json
+products:
+  - test_case: [gpt_mtp_cp_gradients]
+    products:
+      - environment: [dev, lts]
+        scope: [mr-github]
+        platforms: [dgx_h100]
