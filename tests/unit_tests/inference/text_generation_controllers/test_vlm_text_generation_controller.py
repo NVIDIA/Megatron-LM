@@ -356,7 +356,9 @@ def test_llava_text_forward_embeds_generated_image_token_as_text():
         )
 
     assert result is output
-    assert embedding.call_args.kwargs["input_ids"] is tokens
+    embedded_input_ids = embedding.call_args.kwargs["input_ids"]
+    assert torch.equal(embedded_input_ids, tokens)
+    assert embedded_input_ids is not tokens
     model.forward_lm_only.assert_called_once()
 
 
