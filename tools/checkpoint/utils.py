@@ -68,3 +68,53 @@ class _ConverterFakeProcessGroup:
 
     def set_size(self, size):
         self._size = size
+
+
+def initialize_checkpoint_converter_fake_process_groups(
+    parallel_state, tensor_parallel_size, pipeline_parallel_size, expert_parallel_size
+):
+    """Initialize the process-group globals used by checkpoint converters.
+
+    Checkpoint conversion runs in one process and does not call
+    ``initialize_model_parallel``. Model construction still resolves the full
+    ``ProcessGroupCollection``, so populate its parallel-state dependencies with
+    lightweight groups that report the requested target sizes.
+
+    GTP rematerialization is not active during conversion. Its data-parallel
+    groups therefore alias the corresponding non-GTP groups, matching
+    ``initialize_model_parallel`` when the GTP axes have size one.
+    """
+    fake_tp_group = _ConverterFakeProcessGroup(size=tensor_parallel_size)
+    fake_pp_group = _ConverterFakeProcessGroup(size=pipeline_parallel_size)
+    fake_ep_group = _ConverterFakeProcessGroup(size=expert_parallel_size)
+    fake_dp_group = _ConverterFakeProcessGroup(size=1)
+    fake_expert_dp_group = _ConverterFakeProcessGroup(size=1)
+    fake_expert_tp_group = _ConverterFakeProcessGroup(size=tensor_parallel_size)
+    fake_expert_tp_ep_group = _ConverterFakeProcessGroup(
+        size=tensor_parallel_size * expert_parallel_size
+    )
+    fake_expert_tp_ep_pp_group = _ConverterFakeProcessGroup(
+        size=tensor_parallel_size * expert_parallel_size * pipeline_parallel_size
+    )
+    fake_model_parallel_group = _ConverterFakeProcessGroup(
+        size=tensor_parallel_size * pipeline_parallel_size
+    )
+
+    parallel_state._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+    parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
+    parallel_state._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+    parallel_state._DATA_PARALLEL_GROUP = fake_dp_group
+    parallel_state._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+    parallel_state._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+    parallel_state._DATA_PARALLEL_GROUP_WITH_GTP_REMAT = fake_dp_group
+    parallel_state._DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = fake_dp_group
+    parallel_state._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = fake_dp_group
+    parallel_state._EXPERT_DATA_PARALLEL_GROUP = fake_expert_dp_group
+    parallel_state._EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = fake_expert_dp_group
+    parallel_state._INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT = (
+        fake_expert_dp_group
+    )
+    parallel_state._EXPERT_TENSOR_PARALLEL_GROUP = fake_expert_tp_group
+    parallel_state._EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = fake_expert_tp_ep_group
+    parallel_state._EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = fake_expert_tp_ep_pp_group
+    parallel_state._MODEL_PARALLEL_GROUP = fake_model_parallel_group
