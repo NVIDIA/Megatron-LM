@@ -27,8 +27,10 @@ from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
 
 # Layer symbols that may precede a shortcut MoE
@@ -170,6 +172,45 @@ class ShortcutMoEBlock(MegatronModule):
         self.off_interface = _get_offloading_interface()
         self.shortcut_pre_mlp_layernorm_checkpoint = None
 
+        attn_is_mtp = bool(getattr(attn_layer, "is_mtp_layer", False))
+        moe_is_mtp = bool(getattr(moe_layer, "is_mtp_layer", False))
+        if attn_is_mtp != moe_is_mtp:
+            raise ValueError("A ShortcutMoE pair must agree on whether it belongs to MTP.")
+        self.is_mtp_layer = moe_is_mtp
+        if not self.is_mtp_layer and (
+            (attn_layer.config.wide_residual is None) != (moe_layer.config.wide_residual is None)
+        ):
+            raise ValueError(
+                "A ShortcutMoE pair must agree on whether it carries a wide residual stream."
+            )
+
+        self.shortcut_residual_read = None
+        if moe_layer.config.wide_residual is not None and not self.is_mtp_layer:
+            self.shortcut_residual_read = StreamwiseSigmoidWideResidualRead(
+                config=moe_layer.config,
+                layer_number=moe_layer.layer_number,
+                branch_name="shortcut_routed",
+            )
+            outer_connection = moe_layer._get_mlp_residual_connection()
+            if outer_connection is None:
+                raise ValueError(
+                    "A wide-residual shortcut read requires an outer MoE residual connection."
+                )
+            if (
+                self.shortcut_residual_read.residual_stream_hidden_size
+                != outer_connection.residual_stream_hidden_size
+            ):
+                raise ValueError(
+                    "The shortcut read and outer MoE residual connection must consume the "
+                    "same residual-stream width."
+                )
+            predecessor_stream_width = getattr(attn_layer, "residual_stream_hidden_size", None)
+            if predecessor_stream_width != self.shortcut_residual_read.residual_stream_hidden_size:
+                raise ValueError(
+                    "The shortcut predecessor and routed read must carry the same "
+                    "residual-stream width."
+                )
+
         shortcut_norm_spec = TENorm
         self.shortcut_pre_mlp_layernorm = build_module(
             shortcut_norm_spec,
@@ -191,30 +232,69 @@ class ShortcutMoEBlock(MegatronModule):
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
 
-    def _moe_router_preprocess(self, shortcut_hidden, padding_mask=None, packed_seq_params=None):
+    def _read_shortcut_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        recompute_context: ResidualStreamRecomputeContext | None,
+    ) -> torch.Tensor:
+        """Read the pair input used only by shortcut routing."""
+
+        if self.shortcut_residual_read is None:
+            return hidden_states
+        if recompute_context is not None:
+            return recompute_context.checkpoint(
+                apply_module(self.shortcut_residual_read), hidden_states
+            )
+        return apply_module(self.shortcut_residual_read)(hidden_states)
+
+    def _moe_router_preprocess(
+        self,
+        shortcut_hidden,
+        padding_mask=None,
+        packed_seq_params=None,
+        recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
-        if self.recompute_shortcut_pre_mlp_layernorm:
+        if recompute_context is not None:
+            shortcut_input = recompute_context.checkpoint(
+                apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
+            )
+        elif self.recompute_shortcut_pre_mlp_layernorm:
             self.shortcut_pre_mlp_layernorm_checkpoint = CheckpointWithoutOutput()
             shortcut_input = self.shortcut_pre_mlp_layernorm_checkpoint.checkpoint(
                 apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
             )
         else:
             shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
+        if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            self.off_interface.mark_not_offload(shortcut_input)
         shortcut_input, padding_mask, _ = self.moe_layer._maybe_unflatten_for_moe(
             shortcut_input, padding_mask, packed_seq_params
         )
         probs, routing_map = self.moe_layer.mlp.route(shortcut_input, padding_mask)
         return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map)
 
-    def _moe_shared_experts(self, hidden_states, padding_mask=None, packed_seq_params=None):
+    def _moe_shared_experts(
+        self,
+        hidden_states,
+        padding_mask=None,
+        packed_seq_params=None,
+        recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
         """Run the paired MoE layer's pre-MLP norm and shared experts.
 
         Returns:
             `(shared_expert_output, moe_unflatten_mbs, residual, mlp_state)`.
         """
-        pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
-            hidden_states
-        )
+        if recompute_context is None:
+            pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
+                hidden_states
+            )
+        else:
+            pre_mlp_output, residual, mlp_state = self.moe_layer._pre_mlp_layernorm_and_residual(
+                hidden_states, residual_stream_recompute_context=recompute_context
+            )
         pre_mlp_output, _, moe_unflatten_mbs = self.moe_layer._maybe_unflatten_for_moe(
             pre_mlp_output, padding_mask, packed_seq_params
         )
@@ -229,20 +309,40 @@ class ShortcutMoEBlock(MegatronModule):
         packed_seq_params=None,
         moe_unflatten_mbs=None,
         mlp_state=(),
+        recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
         post_norm_input = output
         post_norm_manager = self.off_interface(
-            self.offload_shortcut_post_norm, post_norm_input, "shortcut_post_norm"
+            self.offload_shortcut_post_norm and recompute_context is None,
+            post_norm_input,
+            "shortcut_post_norm",
         )
         with post_norm_manager as post_norm_input:
-            output = self.shortcut_post_norm(post_norm_input)
+            if recompute_context is not None and not isinstance(
+                self.shortcut_post_norm, IdentityOp
+            ):
+                output = recompute_context.checkpoint(
+                    apply_module(self.shortcut_post_norm), post_norm_input
+                )
+            else:
+                output = apply_module(self.shortcut_post_norm)(post_norm_input)
         output = post_norm_manager.group_offload(output, forced_released_tensors=[post_norm_input])
+        if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            self.off_interface.mark_not_offload(output)
         output = self.moe_layer._maybe_reflatten_from_moe(
             output, packed_seq_params, moe_unflatten_mbs
         )
-        output = self.moe_layer._apply_mlp_bda_step((output, None), residual, mlp_state)
+        if recompute_context is None:
+            output = self.moe_layer._apply_mlp_bda_step((output, None), residual, mlp_state)
+        else:
+            output = self.moe_layer._apply_mlp_bda_step(
+                (output, None),
+                residual,
+                mlp_state,
+                residual_stream_recompute_context=recompute_context,
+            )
         return output[0] if isinstance(output, tuple) else output
 
     def _launch_dispatch(
@@ -301,8 +401,19 @@ class ShortcutMoEBlock(MegatronModule):
         quant_context_factory,
         cp_layout_state=None,
         packed_sequence_cp_metadata=None,
+        attn_recompute_context: ResidualStreamRecomputeContext | None = None,
+        moe_recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Run the eager schedule with each physical layer's quantization context."""
+
+        if (attn_recompute_context is None) != (moe_recompute_context is None):
+            raise ValueError("Shortcut replay requires contexts for both layers in the pair.")
+        if attn_recompute_context is not None:
+            assert moe_recompute_context is not None
+            if attn_recompute_context.manager is not moe_recompute_context.manager:
+                raise ValueError("A shortcut pair must share one residual replay manager.")
+            if attn_recompute_context.is_block_end:
+                raise ValueError("A residual replay block cannot end inside a ShortcutMoE pair.")
 
         attn_config = self.attn_layer.config
         moe_config = self.moe_layer.config
@@ -320,23 +431,32 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the moe_router
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            route_input, route_probs = self._moe_router_preprocess(
+            moe_hidden_states = self._read_shortcut_hidden(
+                moe_hidden_states, recompute_context=attn_recompute_context
+            )
+            route_kwargs = dict(
                 shortcut_hidden=moe_hidden_states,
                 padding_mask=padding_mask,
                 packed_seq_params=moe_packed_seq_params,
             )
+            if attn_recompute_context is not None:
+                route_kwargs["recompute_context"] = attn_recompute_context
+            route_input, route_probs = self._moe_router_preprocess(**route_kwargs)
             if self.overlap_mode:
                 self.route_ready_event.record(torch.cuda.current_stream())
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            paired_state = self.attn_layer.forward_pre_attn_and_core_attn(
+            attn_pre_kwargs = dict(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             )
+            if attn_recompute_context is not None:
+                attn_pre_kwargs["residual_stream_recompute_context"] = attn_recompute_context
+            paired_state = self.attn_layer.forward_pre_attn_and_core_attn(**attn_pre_kwargs)
 
         # Launch the dispatch, experts, and combine
         with quant_context_factory(moe_config, self.moe_layer_idx):
@@ -360,7 +480,12 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the output layer of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
-            attn_layer_output = self.attn_layer.forward_post_core_attn(*paired_state)
+            if attn_recompute_context is None:
+                attn_layer_output = self.attn_layer.forward_post_core_attn(*paired_state)
+            else:
+                attn_layer_output = self.attn_layer.forward_post_core_attn(
+                    *paired_state, residual_stream_recompute_context=attn_recompute_context
+                )
             if isinstance(attn_layer_output, tuple):
                 attn_layer_output = attn_layer_output[0]
 
@@ -371,26 +496,32 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the moe shared experts and combine attn and moe layer outputs
         with quant_context_factory(moe_config, self.moe_layer_idx):
+            shared_expert_kwargs = dict(
+                hidden_states=attn_layer_output,
+                padding_mask=padding_mask,
+                packed_seq_params=moe_packed_seq_params,
+            )
+            if moe_recompute_context is not None:
+                shared_expert_kwargs["recompute_context"] = moe_recompute_context
             shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
-                self._moe_shared_experts(
-                    attn_layer_output,
-                    padding_mask=padding_mask,
-                    packed_seq_params=moe_packed_seq_params,
-                )
+                self._moe_shared_experts(**shared_expert_kwargs)
             )
             if self.overlap_mode:
                 combined_output = self._wait_combine(combined_output)
 
             # Ensure the combine autograd node is scheduled first before shared_experts
             set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
-            output = self._postprocess(
-                mlp_residual,
-                combined_output,
-                shared_expert_output,
+            postprocess_kwargs = dict(
+                residual=mlp_residual,
+                combined_output=combined_output,
+                shared_expert_output=shared_expert_output,
                 packed_seq_params=moe_packed_seq_params,
                 moe_unflatten_mbs=moe_unflatten_mbs,
                 mlp_state=mlp_state,
             )
+            if moe_recompute_context is not None:
+                postprocess_kwargs["recompute_context"] = moe_recompute_context
+            output = self._postprocess(**postprocess_kwargs)
         if cp_layout_state is not None:
             output = cp_layout_state.finalize_layer(self.moe_local_idx, output)
         return output
