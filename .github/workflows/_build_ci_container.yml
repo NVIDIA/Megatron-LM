@@ -87,18 +87,11 @@ jobs:
           REGISTRY_AWS: ${{ inputs.registry-aws }}
           REGISTRY_GB_GPU: ${{ inputs.registry-gb200 }}
         run: |
-          BUILD_RUNNER="$SELECTED_RUNNER"
-          if [ "$IS_MAINTAINER" = "true" ]; then
-            BUILD_RUNNER=nvidia-ci-aws-cpu
-          fi
-
-          AWS_H100=$(jq -nc --arg build_runner "$BUILD_RUNNER" --arg registry "$REGISTRY_AWS" \
-            --arg runner "$SELECTED_RUNNER" \
-            '{"build_runner": $build_runner, "cloud": "aws-h100", "platform": "linux/amd64", "region": "us-east-1", "registry": $registry, "runner": $runner}')
+          AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
+            '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
           if [ "$IS_MAINTAINER" = "true" ] && [ "$ENABLE_GB_TESTING" = "true" ]; then
-            GB_GPU=$(jq -nc --arg build_runner "$BUILD_RUNNER" --arg registry "$REGISTRY_GB_GPU" \
-              --arg runner "$SELECTED_RUNNER_GB_GPU" \
-              '{"build_runner": $build_runner, "cloud": "gb-gpu", "platform": "linux/arm64", "region": "us-east-2", "registry": $registry, "runner": $runner}')
+            GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
+              '{"cloud": "gb-gpu", "registry": $registry, "runner": $runner}')
             MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
               '{"include": [$aws, $gb_gpu]}')
           else
@@ -112,8 +105,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
-    # Keep matrix.runner for downstream GPU tests and isolate external Dockerfiles on ephemeral runners.
-    runs-on: ${{ matrix.build_runner }}
+    runs-on: ${{ inputs.is-maintainer && 'nvidia-ci-aws-cpu' || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
       contents: read
@@ -230,7 +222,7 @@ jobs:
           PR_NUMBER: ${{ steps.cache_keys.outputs.pr-number }}
           DEFAULT_CACHE_KEY: ${{ steps.cache_keys.outputs.key }}
           PUBLISH_TARGET_CACHE: ${{ inputs.publish-target-cache }}
-          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.cloud == 'gb-gpu' && 'arm64' || 'amd64' }}
         run: |
           # These inputs can invalidate the expensive dependency and native-extension layers.
           # README and downloaded assets remain BuildKit-validated late layers, but do not
@@ -260,12 +252,6 @@ jobs:
               uv.lock
             )
           fi
-
-          case "$TARGET_PLATFORM" in
-            linux/amd64) TARGET_ARCH=amd64 ;;
-            linux/arm64) TARGET_ARCH=arm64 ;;
-            *) echo "Unsupported build platform: $TARGET_PLATFORM" >&2; exit 1 ;;
-          esac
 
           BUILD_HASH=$(
             {
@@ -301,19 +287,22 @@ jobs:
           echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Login to ECR
-        if: matrix.build_runner == 'nvidia-ci-aws-cpu'
+        if: inputs.is-maintainer
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
         env:
-          AWS_REGION: ${{ matrix.region }}
-
-      - name: Set up QEMU
-        if: matrix.platform == 'linux/arm64'
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
-        with:
-          platforms: arm64
+          AWS_REGION: ${{ matrix.cloud == 'gb-gpu' && 'us-east-2' || 'us-east-1' }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Verify ARM64 emulation
+        if: matrix.cloud == 'gb-gpu'
+        shell: bash
+        run: |
+          docker buildx build --no-cache --progress=plain --platform linux/arm64 - <<'EOF'
+          FROM busybox:1.37.0
+          RUN test "$(uname -m)" = aarch64
+          EOF
 
       - name: Select cache donor
         id: cache_from
@@ -348,7 +337,7 @@ jobs:
           sbom: false
           push: true
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ matrix.cloud == 'gb-gpu' && 'linux/arm64' || 'linux/amd64' }}
           target: main
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
