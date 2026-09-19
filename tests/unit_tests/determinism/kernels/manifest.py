@@ -104,6 +104,13 @@ C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="deepseek_v41_modality_routing",
+        sources=("megatron/core/models/deepseek_v41/moe.py",),
+        tests=(K + "test_deepseek_v41_kernels.py",),
+        kind="dispatch",
+        notes="Mixed text/image routes through shared mHC/MLP interfaces, including parameter gradients.",
+    ),
+    KernelEntry(
         name="engram_embedding",
         sources=("megatron/core/models/engram/distributed_embedding.py",),
         tests=(K + "test_deepseek_v41_kernels.py",),
