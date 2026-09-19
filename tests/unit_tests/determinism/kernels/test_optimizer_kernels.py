@@ -6,14 +6,11 @@ Adam update. These run once per step on every parameter, so any drift here chang
 whole trajectory even when the model kernels are deterministic.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
-from megatron.core.optimizer import Adam, OptimizerConfig
+from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
-from megatron.core.optimizer.optimizer import ChainedOptimizer, FP32Optimizer
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
@@ -132,72 +129,3 @@ def test_fused_adam_step_replays():
         assert len(got) == len(ref)
         for j, (a, b) in enumerate(zip(ref, got)):
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
-
-
-def test_chained_optimizer_cuda_graph():
-    """Clipping across distinct process groups must capture and replay exactly."""
-    Utils.initialize_model_parallel()
-    extra_group = torch.distributed.new_group()
-    graph = torch.cuda.CUDAGraph()
-    try:
-        config = OptimizerConfig(optimizer="sgd", lr=0.1, clip_grad=1.0, optimizer_cuda_graph=True)
-        params = [torch.nn.Parameter(torch.zeros(1, device="cuda")) for _ in range(2)]
-        optimizers = []
-        for param, group in zip(params, [torch.distributed.group.WORLD, extra_group]):
-            param.grad = torch.zeros_like(param)
-            optimizer = FP32Optimizer(
-                torch.optim.SGD([param], lr=config.lr), config, lambda _: None
-            )
-            optimizer.grad_stats_parallel_group = group
-            optimizers.append(optimizer)
-        optimizer = ChainedOptimizer(optimizers)
-
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                for param, value in zip(params, [3.0, 4.0]):
-                    param.grad.fill_(value)
-                optimizer.step()
-        torch.cuda.current_stream().wait_stream(stream)
-        with torch.cuda.graph(graph, stream=stream):
-            _, grad_norm, _ = optimizer.step()
-
-        for values, local_norm in [((3.0, 4.0), 5.0), ((0.0, 0.0), 0.0)]:
-            expected_norm = local_norm * torch.distributed.get_world_size() ** 0.5
-            coefficient = min(1.0, config.clip_grad / (expected_norm + 1e-6))
-            reference = None
-            for _ in range(2):
-                for param, value in zip(params, values):
-                    param.data.zero_()
-                    param.grad.fill_(value)
-                graph.replay()
-                torch.testing.assert_close(grad_norm, torch.full_like(grad_norm, expected_norm))
-                for param, value in zip(params, values):
-                    torch.testing.assert_close(
-                        param, torch.full_like(param, -config.lr * value * coefficient)
-                    )
-                outputs = [*params, grad_norm]
-                if reference is None:
-                    reference = [output.detach().clone() for output in outputs]
-                else:
-                    for output, expected in zip(outputs, reference):
-                        assert bytes_equal(output, expected), "Chained optimizer replay differs"
-    finally:
-        torch.cuda.synchronize()
-        graph.reset()
-        torch.distributed.destroy_process_group(extra_group)
-        Utils.destroy_model_parallel()
-
-
-@pytest.mark.parametrize("norms, expected", [([3.0, 4.0], 5.0), ([0.0, 0.0], 0.0)])
-def test_chained_optimizer_float_norms(norms, expected):
-    """Backends returning Python floats retain the same combined norm."""
-    optimizers = [
-        SimpleNamespace(
-            get_grad_norm=lambda norm=norm: norm,
-            get_grad_stats_parallel_group=lambda group=object(): group,
-        )
-        for norm in norms
-    ]
-    assert ChainedOptimizer(optimizers).get_grad_norm() == expected

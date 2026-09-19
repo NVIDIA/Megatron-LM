@@ -1878,10 +1878,7 @@ class ChainedOptimizer(MegatronOptimizer):
             )
         else:
             grad_norms = [optimizer.get_grad_norm() for optimizer in self.chained_optimizers]
-            if isinstance(grad_norms[0], torch.Tensor):
-                grad_norm = torch.stack(grad_norms).square().sum(dim=0).sqrt()
-            else:
-                grad_norm = math.sqrt(sum(norm**2 for norm in grad_norms))
+            grad_norm = sum(norm**2 for norm in grad_norms) ** 0.5
         return grad_norm
 
     @torch.no_grad()
@@ -1948,9 +1945,7 @@ class ChainedOptimizer(MegatronOptimizer):
                     grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
                 )
                 group_norms.append(norm)
-            if isinstance(group_norms[0], torch.Tensor):
-                return torch.stack(group_norms).square().sum(dim=0).sqrt()
-            return math.sqrt(sum(norm**2 for norm in group_norms))
+            return sum(norm**2 for norm in group_norms) ** 0.5
 
     @torch.no_grad()
     def _compute_grad_norms_by_group(self) -> Dict[str, float]:
