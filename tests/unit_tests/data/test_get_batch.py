@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import pretrain_gpt
 import pretrain_hybrid
 from megatron.core import mpu
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
@@ -23,7 +24,6 @@ from megatron.core.utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
-from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -165,7 +165,8 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024, 4096])
-def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
+@pytest.mark.parametrize("pretrain_module", [pretrain_gpt, pretrain_hybrid])
+def test_sft_batch(tp_size, pp_size, cp_size, seq_length, pretrain_module):
     if tp_size * pp_size * cp_size > torch.cuda.device_count():
         pytest.skip(
             f"Skipping test because tp_size * pp_size * cp_size > torch.cuda.device_count() ({tp_size * pp_size * cp_size} > {torch.cuda.device_count()})"
@@ -187,7 +188,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
     if mpu.get_tensor_model_parallel_rank() == 0:
         data_iterator, num_real_tokens = create_sft_data_iterator(seq_length)
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = pretrain_module.get_batch(data_iterator)
     assert set(cp_batch.batches_by_layout) == {args.linear_cp_layout}
     batch = cp_batch.get_batch()
     (
@@ -201,11 +202,33 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         max_seqlen,
         position_ids,
         tokens,
-    ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
+    ) = [batch[key] for key in pretrain_module.BATCH_KEYS]
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
-    seq_len_per_rank = seq_length // cp_size
+    expects_padded_cu_seqlens = pretrain_module is pretrain_gpt and cp_size > 1
+    if expects_padded_cu_seqlens:
+        assert cu_seqlens_padded is not None
+        sequence_lengths = cu_seqlens[0, 1:] - cu_seqlens[0, :-1]
+        cp_alignment = 2 * cp_size
+        padded_sequence_lengths = (
+            torch.div(sequence_lengths + cp_alignment - 1, cp_alignment, rounding_mode="floor")
+            * cp_alignment
+        )
+        local_padded_tokens = padded_sequence_lengths.sum() // cp_size
+        tp_padding = torch.remainder(-local_padded_tokens, tp_size)
+        padded_sequence_lengths[-1] += tp_padding * cp_size
+        expected_cu_seqlens_padded = torch.cat(
+            (
+                torch.zeros_like(cu_seqlens[0, :1]),
+                padded_sequence_lengths.cumsum(0, dtype=torch.int32),
+            )
+        )
+        torch.testing.assert_close(cu_seqlens_padded[0], expected_cu_seqlens_padded)
+        seq_len_per_rank = expected_cu_seqlens_padded[-1].item() // cp_size
+    else:
+        assert cu_seqlens_padded is None
+        seq_len_per_rank = seq_length // cp_size
 
     if pp_size == 1:
         # Single pipeline stage: all tensors present
@@ -218,7 +241,6 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert attention_mask is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
-        assert cu_seqlens_padded is None
 
         assert tokens.shape == (
             1,
@@ -266,7 +288,6 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert attention_mask is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
-        assert cu_seqlens_padded is None
 
         assert tokens.shape == (
             1,
@@ -302,7 +323,6 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert attention_mask is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
-        assert cu_seqlens_padded is None
 
         assert labels.shape == (
             1,
@@ -341,7 +361,6 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
 
         assert cu_seqlens is not None
         assert max_seqlen is not None
-        assert cu_seqlens_padded is None
 
         assert cu_seqlens.dim() == 2
         assert cu_seqlens.shape[0] == 1
@@ -531,7 +550,8 @@ def test_flatten_batch_for_packed_sequences_padded_cu_seqlens(micro_batch_size, 
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024])
-def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
+@pytest.mark.parametrize("pretrain_module", [pretrain_gpt, pretrain_hybrid])
+def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length, pretrain_module):
     if tp_size * pp_size * cp_size > torch.cuda.device_count():
         pytest.skip(
             f"Skipping test because tp_size * pp_size * cp_size > torch.cuda.device_count() "
@@ -556,7 +576,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
     if mpu.get_tensor_model_parallel_rank() == 0:
         data_iterator, _ = create_sft_data_iterator(seq_length)
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = pretrain_module.get_batch(data_iterator)
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -569,7 +589,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         max_seqlen,
         position_ids,
         tokens,
-    ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
+    ) = [batch[key] for key in pretrain_module.BATCH_KEYS]
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -881,7 +901,8 @@ def test_metadata_only_cp_batch_skips_sharding():
     assert cp_batch.get_packed_seq_params("zigzag") is not None
 
 
-def test_get_batch_builds_required_cp_layouts():
+@pytest.mark.parametrize("pretrain_module", [pretrain_gpt, pretrain_hybrid])
+def test_get_batch_builds_required_cp_layouts(pretrain_module):
     cp_size = 4
     seq_length = 16
     if int(os.environ.get("WORLD_SIZE", "1")) < cp_size:
@@ -907,7 +928,7 @@ def test_get_batch_builds_required_cp_layouts():
     }
     data_iterator = iter([batch]) if mpu.get_tensor_model_parallel_rank() == 0 else None
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = pretrain_module.get_batch(data_iterator)
     local_tokens = cp_batch.get_batch()["tokens"]
 
     cp_rank = mpu.get_context_parallel_rank()
@@ -926,11 +947,16 @@ def test_get_batch_builds_required_cp_layouts():
         device="cuda",
     )
     global_tokens = tokens.cuda()
-    torch.testing.assert_close(local_tokens, global_tokens.index_select(1, contiguous_indices))
-    assert set(cp_batch.batches_by_layout) == {"contiguous", "zigzag"}
-    torch.testing.assert_close(
-        cp_batch.get_batch("zigzag")["tokens"], global_tokens.index_select(1, zigzag_indices)
-    )
+    if pretrain_module is pretrain_gpt:
+        torch.testing.assert_close(local_tokens, global_tokens.index_select(1, zigzag_indices))
+        assert set(cp_batch.batches_by_layout) == {"zigzag"}
+        assert cp_batch.thd_plan is None
+    else:
+        torch.testing.assert_close(local_tokens, global_tokens.index_select(1, contiguous_indices))
+        assert set(cp_batch.batches_by_layout) == {"contiguous", "zigzag"}
+        torch.testing.assert_close(
+            cp_batch.get_batch("zigzag")["tokens"], global_tokens.index_select(1, zigzag_indices)
+        )
 
 
 @pytest.mark.parametrize(
@@ -990,7 +1016,8 @@ def create_pretrain_data_iterator(
     return iter([batch])
 
 
-def test_sequence_packing_batch_uses_context_parallel_batch_interface():
+@pytest.mark.parametrize("pretrain_module", [pretrain_gpt, pretrain_hybrid])
+def test_sequence_packing_batch_uses_context_parallel_batch_interface(pretrain_module):
     tokens = torch.tensor([[1, 2]])
     labels = torch.tensor([[2, 3]])
     loss_mask = torch.ones(1, 2)
@@ -1012,19 +1039,20 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        attention_cp_layout="zigzag",
     )
 
     with (
-        patch.object(pretrain_hybrid, "get_args", return_value=args),
-        patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
-        patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
+        patch.object(pretrain_module, "get_args", return_value=args),
+        patch.object(pretrain_module, "core_transformer_config_from_args", return_value=config),
+        patch.object(pretrain_module, "mtp_on_this_rank_func", return_value=True),
         patch.object(
-            pretrain_hybrid,
+            pretrain_module,
             "get_batch_on_this_rank_for_sequence_packing",
             return_value=scheduler_batch,
         ),
     ):
-        cp_batch = get_batch(None)
+        cp_batch = pretrain_module.get_batch(None)
 
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
@@ -1070,7 +1098,7 @@ def test_pretrain_batch(
             create_attention_mask=create_attention_mask,
         )
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = pretrain_hybrid.get_batch(data_iterator)
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -1279,7 +1307,8 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
 @pytest.mark.parametrize("cp_size", [2, 4, 8])
 @pytest.mark.parametrize("seq_length", [1024])
 @pytest.mark.parametrize("create_attention_mask", [False])
-def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
+@pytest.mark.parametrize("pretrain_module", [pretrain_gpt, pretrain_hybrid])
+def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask, pretrain_module):
     if tp_size * cp_size > torch.cuda.device_count():
         pytest.skip(
             f"Skipping test because tp_size * cp_size > torch.cuda.device_count() ({tp_size * cp_size} > {torch.cuda.device_count()})"
@@ -1301,7 +1330,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     if mpu.get_tensor_model_parallel_rank() == 0:
         data_iterator = create_hybrid_cp_data_iterator(seq_length, cp_size=cp_size)
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = pretrain_module.get_batch(data_iterator)
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -1314,7 +1343,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         max_seqlen,
         position_ids,
         tokens,
-    ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
+    ) = [batch[key] for key in pretrain_module.BATCH_KEYS]
 
     # Presence checks
     assert tokens is not None
@@ -1441,7 +1470,10 @@ def create_inter_document_masking_data_iterator(seq_length: int = 1024, micro_ba
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024])
-def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_length):
+@pytest.mark.parametrize("pretrain_module", [pretrain_gpt, pretrain_hybrid])
+def test_inter_document_masking_multi_mbs_batch(
+    tp_size, micro_batch_size, seq_length, pretrain_module
+):
     """Verify cu_seqlens is correctly broadcast and merged when mbs > 1 with TP > 1.
 
     Regression test: the receiver in get_batch_on_this_tp_rank used to allocate
@@ -1474,7 +1506,7 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
             seq_length, micro_batch_size=micro_batch_size
         )
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = pretrain_module.get_batch(data_iterator)
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -1487,7 +1519,7 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         max_seqlen,
         position_ids,
         tokens,
-    ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
+    ) = [batch[key] for key in pretrain_module.BATCH_KEYS]
 
     total_tokens = micro_batch_size * seq_length
 
