@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import logging
 import math
 import os
 import random
@@ -45,9 +46,13 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
+    FinishedRequestRecord,
+    RequestPayloadStageResult,
+    RequestPromptPreparationResult,
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
+    unwrap_serialized_tensors,
 )
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -542,6 +547,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
         msgpack.packb([submit, 17, params.serialize(), media_meta], use_bin_type=True),
         msgpack.packb([10, 99], use_bin_type=True),
         b"not-a-msgpack-payload",
+        msgpack.packb(None, use_bin_type=True),
     ]
     engine.socket_for_receiving_requests = mock.Mock()
     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
@@ -558,7 +564,11 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.add_request.assert_called_once()
     args, kwargs = engine.add_request.call_args
     assert args[:2] == (17, [10, 99])
-    assert kwargs == {"media_cache_key": "shared-image", "media_tokens_preexpanded": True}
+    assert kwargs == {
+        "offload_params": None,
+        "media_cache_key": "shared-image",
+        "media_tokens_preexpanded": True,
+    }
 
 
 def teardown_module(module):
@@ -1369,8 +1379,9 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
         dynamic_engine.msgpack.packb([submit, 42, params.serialize(), None], use_bin_type=True),
         dynamic_engine.msgpack.packb([3, 4], use_bin_type=True),
         dynamic_engine.msgpack.packb(None, use_bin_type=True),
+        dynamic_engine.msgpack.packb(None, use_bin_type=True),
     ]
-    engine.add_request = lambda *_: engine._handle_failed_request(42)
+    engine.add_request = lambda *_, **__: engine._handle_failed_request(42)
     socket = engine.socket_for_receiving_requests = mock.Mock()
     socket.recv_multipart.side_effect = [message, dynamic_engine.zmq.Again]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
@@ -1878,6 +1889,290 @@ def test_streaming_partials_are_sent():
     assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
     assert partial["prompt_log_probs"] == request.prompt_log_probs
     assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
+
+
+class _RecordingStager:
+    """RequestPayloadStager test double: keeps every staged (uid, payload)."""
+
+    def __init__(self):
+        self.staged = []
+
+    def stage(self, uid, payload, *, finished_metadata, offload_params=None):
+        self.staged.append((uid, payload))
+        self.finished_metadata = finished_metadata
+        self.offload_params = offload_params
+        return RequestPayloadStageResult()
+
+
+def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tokens=False):
+    request = DynamicInferenceRequest(
+        request_id=1,
+        uid=uid,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=2,
+            termination_id=0,
+            return_log_probs=True,
+            streaming=streaming,
+            return_prompt_tokens=return_prompt_tokens,
+        ),
+        generated_tokens=[10, 11],
+    )
+    request.status = status
+    request.generated_log_probs = log_probs
+    return request
+
+
+@pytest.mark.parametrize(
+    ("with_stager", "streaming", "expected_offloaded"),
+    [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_payload_offload_stages_only_eligible_completed_replies(
+    with_stager, streaming, expected_offloaded
+):
+    """A stager offloads completed non-streaming replies only.
+
+    Failed and streaming requests are neither staged nor stripped, and replies are untouched
+    without a stager. An offloaded reply never carries the prompt tensors, even when the
+    request opted into return_prompt_tokens (the stager holds the prompt ids); a reply that
+    is not offloaded still honours the opt-in. The ledger is a separate mechanism and stays
+    off here.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = False
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = _RecordingStager() if with_stager else None
+    engine.socket_for_receiving_requests = mock.Mock()
+    completed = _reply_request(
+        "chatcmpl-ok",
+        Status.COMPLETED,
+        [-0.5, -0.25],
+        streaming=streaming,
+        return_prompt_tokens=True,
+    )
+    failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+
+    engine._send_requests_to_coordinator([completed, failed])
+
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+    header, _ = msgpack.unpackb(frames[0], raw=False)
+    ok_wire, failed_wire = [msgpack.unpackb(frame, raw=False) for frame in frames[1:]]
+    assert header == Headers.ENGINE_REPLY.value
+    assert failed_wire["payload_offloaded"] is False
+    assert engine.local_metadata_ledger == {}
+    assert ok_wire["payload_offloaded"] is expected_offloaded
+    if expected_offloaded:
+        ((uid, payload),) = engine.payload_stager.staged
+        assert uid == "chatcmpl-ok"
+        assert payload.prompt_token_ids == [1, 2, 3]
+        assert payload.generated_token_ids == [10, 11]
+        assert payload.generated_log_probs == [-0.5, -0.25]
+        assert ok_wire["payload_offloaded"] is True and ok_wire["generated_log_probs"] is None
+        for prompt_field in ("prompt_tokens", "compact_prompt_tokens", "remaining_prompt_tokens"):
+            assert ok_wire[prompt_field] is None, prompt_field
+    else:
+        assert not getattr(engine.payload_stager, "staged", [])
+        assert ok_wire["generated_log_probs"] == [-0.5, -0.25]
+        assert ok_wire["payload_stage_metadata"] == {}
+        unwrapped = unwrap_serialized_tensors(ok_wire)
+        assert unwrapped["prompt_tokens"] == [1, 2, 3]
+        assert unwrapped["remaining_prompt_tokens"] == [1, 2, 3]
+    # prompt_length is always reported; generated token ids stay on the wire, and the drop is
+    # wire-only: the request keeps its prompt and log probs.
+    assert ok_wire["prompt_length"] == 3
+    assert ok_wire["generated_tokens"] == [10, 11]
+    assert completed.generated_log_probs == [-0.5, -0.25]
+    assert completed.prompt_tokens.tolist() == [1, 2, 3]
+
+
+def test_finished_request_record_is_built_once_for_ledger_and_stager():
+    """With both the ledger and a stager on, one FinishedRequestRecord per completed request
+    is shared by both; failed requests build none."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = True
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = _RecordingStager()
+    engine.socket_for_receiving_requests = mock.Mock()
+    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
+    failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+
+    with mock.patch.object(
+        FinishedRequestRecord, "from_request", wraps=FinishedRequestRecord.from_request
+    ) as from_request:
+        engine._send_requests_to_coordinator([completed, failed])
+
+    from_request.assert_called_once_with(completed)
+    record = engine.local_metadata_ledger["chatcmpl-ok"]
+    assert record is engine.payload_stager.finished_metadata
+    assert record.num_evictions == 0
+    ((uid, _),) = engine.payload_stager.staged
+    assert uid == "chatcmpl-ok"
+
+
+def _submit_request_message(request_id, sampling_params, prompt, offload_params):
+    """A SUBMIT_REQUEST as the coordinator forwards it: metadata, prompt, media, offload."""
+    return [
+        msgpack.packb([Headers.SUBMIT_REQUEST.value, request_id, sampling_params, None]),
+        msgpack.packb(prompt, use_bin_type=True),
+        msgpack.packb(None, use_bin_type=True),
+        msgpack.packb(offload_params, use_bin_type=True),
+    ]
+
+
+def test_engine_prepares_prompt_before_model_parallel_broadcast():
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            metadata = dict(offload_params or {})
+            metadata["prepared"] = True
+            return RequestPromptPreparationResult(prompt=[1, 2, *prompt], offload_params=metadata)
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    sampling_params = SamplingParams(temperature=0.5).serialize()
+    message = _submit_request_message(
+        17, sampling_params, [3, 4], {"ng_capture": {"rollout_id": "r0"}}
+    )
+
+    prepared = engine._prepare_submit_request_message(message)
+
+    # Only the prompt and offload frames are rewritten; the metadata frame is
+    # the very object that came off the wire, never repacked.
+    assert prepared[0] is message[0]
+    assert msgpack.unpackb(prepared[1], raw=False) == [1, 2, 3, 4]
+    assert prepared[2] is message[2]
+    assert msgpack.unpackb(prepared[3], raw=False) == {
+        "ng_capture": {"rollout_id": "r0"},
+        "prepared": True,
+    }
+
+
+def test_engine_skips_prompt_preparation_without_offload_params():
+    """A None offload frame passes through with no frame decoded and no preparer call."""
+
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            raise AssertionError("preparer must not run without offload params")
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    undecodable = b"\xc1not-valid-msgpack"
+    message = [undecodable, undecodable, undecodable, msgpack.packb(None, use_bin_type=True)]
+
+    assert engine._prepare_submit_request_message(message) is message
+
+
+@pytest.mark.parametrize("bad_output", ["numpy_prompt", "tensor_in_params"])
+def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_output):
+    """An unserializable preparer result fails the request instead of killing rank 0."""
+    import numpy as np
+
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            if bad_output == "numpy_prompt":
+                return RequestPromptPreparationResult(
+                    prompt=[np.int64(1), *prompt], offload_params=offload_params
+                )
+            return RequestPromptPreparationResult(
+                prompt=prompt,
+                offload_params={**(offload_params or {}), "embedding": torch.tensor([1.0])},
+            )
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    sampling_params = SamplingParams(temperature=0.5).serialize()
+    original_params = {"ng_capture": {"rollout_id": "r0"}}
+    message = _submit_request_message(17, sampling_params, [3, 4], original_params)
+
+    prepared = engine._prepare_submit_request_message(message)
+    offload_params = msgpack.unpackb(prepared[3], raw=False)
+
+    assert prepared[0] is message[0]
+    assert msgpack.unpackb(prepared[1], raw=False) == [3, 4]
+    assert prepared[2] is message[2]
+    assert offload_params["ng_capture"] == {"rollout_id": "r0"}
+    assert offload_params[dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param(
+            [
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 41, {}, None, {"k": "v"}]),
+                msgpack.packb([1], use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+            ],
+            id="offload_params_in_metadata",
+        ),
+        pytest.param(
+            [
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 41, {}, None]),
+                msgpack.packb([1], use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+            ],
+            id="missing_offload_frame",
+        ),
+    ],
+)
+def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
+    """A malformed SUBMIT_REQUEST is dropped, and the next request in the batch still admits.
+
+    schedule_requests runs the same broadcast list on every MP rank, so raising
+    here would take the whole engine down for one version-skewed client, while a
+    drop is collective: every rank skips the same message.
+    """
+    params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
+    good = _submit_request_message(42, params.serialize(), [3, 4], {"ng_capture": {"r": "0"}})
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = None
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine.add_request = mock.Mock()
+    engine._fail_submission = mock.Mock()
+    socket = engine.socket_for_receiving_requests = mock.Mock()
+    socket.recv_multipart.side_effect = [malformed, good, dynamic_engine.zmq.Again]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        assert engine.schedule_requests() == 2
+
+    assert "dropping malformed SUBMIT_REQUEST" in caplog.text
+    engine._fail_submission.assert_not_called()
+    engine.add_request.assert_called_once()
+    args, kwargs = engine.add_request.call_args
+    assert args[0] == 42 and args[1] == [3, 4]
+    assert kwargs == {"offload_params": {"ng_capture": {"r": "0"}}}
+    # Both messages, dropped or not, were still broadcast to the other MP ranks.
+    broadcast = engine.model_parallel_publisher_socket.send_multipart.call_args.args[0]
+    assert msgpack.unpackb(broadcast[1], raw=False) == [len(malformed), len(good)]
+
+
+def test_handle_failed_request_releases_vlm_request_data():
+    """Media registered before admission is dropped when the request fails."""
+    request = DynamicInferenceRequest(
+        request_id=42,
+        prompt_tokens=torch.tensor([3, 4]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    entry = types.SimpleNamespace(record=record)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {42: entry}
+    engine.failed_request_ids = []
+    engine.rank, engine.use_coordinator = 1, False
+    engine.context = mock.Mock()
+    engine._complete_request = mock.Mock(return_value=record[-1])
+
+    engine._handle_failed_request(42)
+
+    engine.context.remove_vlm_request_data.assert_called_once_with(42)
+    engine._complete_request.assert_called_once_with(entry)
+    assert (record[-1].status, engine.failed_request_ids) == (Status.FAILED, [42])
 
 
 def test_streaming_partials_buffer_until_token_interval():
@@ -4802,6 +5097,67 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ledger = engine.local_metadata_ledger
         assert list(ledger.keys()) == [finished_request.uid]
         assert ledger[finished_request.uid].policy_epoch == [(0, 3)]
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_payload_offload_mode(self):
+        """With a stager attached, a finished request's per-token payload is staged, keyed by
+        the response uid, and dropped from the reply sent to the coordinator."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 4
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+        engine.payload_stager = _RecordingStager()
+
+        engine._add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.ones(
+                    PROMPT_LEN, dtype=torch.int64, device=torch.cuda.current_device()
+                ),
+                # The RL client shape: return_log_probs is the compute trigger;
+                # under offload the values are staged, not sent.
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=NUM_TOKENS,
+                    termination_id=-1,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=True,
+                ),
+            )
+        )
+        finished_requests = []
+        while engine.has_unfinished_requests():
+            finished_requests.extend(engine.step_modern()["finished_requests"])
+        finished = finished_requests[0]
+
+        # The staged payload is the exact per-token data of the request, keyed by its uid.
+        ((uid, payload),) = engine.payload_stager.staged
+        assert uid == finished.uid
+        assert payload.prompt_token_ids == finished.prompt_tokens.tolist()
+        assert payload.generated_token_ids == list(finished.generated_tokens)
+        assert len(payload.generated_log_probs) == len(payload.generated_token_ids)
+
+        # The reply drops the staged payload and marks the takeover; token ids stay.
+        engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+        frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+        header, _ = msgpack.unpackb(frames[0], raw=False)
+        wire = msgpack.unpackb(frames[1], raw=False)
+        assert header == Headers.ENGINE_REPLY.value
+        assert wire["uid"] == finished.uid and wire["payload_offloaded"] is True
+        assert wire["generated_log_probs"] is None and wire["routing_indices"] is None
+        assert wire["generated_tokens"] == list(finished.generated_tokens)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
