@@ -233,6 +233,10 @@ class CrossLayerState(Protocol):
         """Return the arguments understood by this state's attention implementation."""
         ...
 
+    def mlp_kwargs(self, layer_number: int) -> dict[str, Any]:
+        """Return optional MLP arguments; attention-only states use the empty default."""
+        return {}
+
 
 class MlpInterface(Protocol):
     """Interface for MLP implementations in the transformer layer."""
@@ -994,12 +998,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
+            state = kwargs.get("cross_layer_state")
+            mlp_kwargs = state.mlp_kwargs(self.layer_number) if hasattr(state, "mlp_kwargs") else {}
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
                 output = self._forward_mlp(
                     hidden_states,
                     kwargs.get("inference_context", None),
                     padding_mask=kwargs.get("padding_mask", None),
                     packed_seq_params=kwargs.get("packed_seq_params", None),
+                    **({"mlp_kwargs": mlp_kwargs} if mlp_kwargs else {}),
                     **(
                         {"mhc_state": kwargs["mhc_state"]}
                         if kwargs.get("mhc_state") is not None
@@ -1091,6 +1098,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         packed_seq_params=None,
+        mlp_kwargs: dict[str, Any] | None = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
         pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
@@ -1107,7 +1115,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            **({"mlp_kwargs": mlp_kwargs} if mlp_kwargs else {}),
         )
 
         if moe_unflatten_mbs is not None:
@@ -1125,6 +1137,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         packed_seq_params=None,
+        mlp_kwargs: dict[str, Any] | None = None,
         mhc_state: SinglePassMHCState | None = None,
     ) -> Tensor | list[Tensor | None]:
         """
@@ -1152,7 +1165,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            **({"mlp_kwargs": mlp_kwargs} if mlp_kwargs else {}),
         )
 
         if moe_unflatten_mbs is not None:
@@ -1186,6 +1203,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual: Tensor,
         padding_mask: Tensor | None,
         inference_context: BaseInferenceContext | None,
+        mlp_kwargs: dict[str, Any] | None = None,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1216,6 +1234,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
+
+        if mlp_kwargs and (
+            self.recompute_mlp
+            or should_chunk_mlp_for_prefill
+            or should_chunk_mlp_for_training
+            or using_fused_tp_inference_kernel
+        ):
+            raise NotImplementedError("MLP context inputs require unchunked eager execution")
 
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
@@ -1264,7 +1290,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **(mlp_kwargs or {})
             )
 
         nvtx_range_pop(suffix="mlp")

@@ -73,6 +73,10 @@ class CSA2State:
             return {}
         return {"csa2_state": self}
 
+    def mlp_kwargs(self, layer_number: int) -> dict:
+        """CSA2 itself supplies no MLP inputs."""
+        return {}
+
     def validate_forward(self, layer_idx: int, query: torch.Tensor) -> None:
         """Reject reuse across forwards or incompatible sequence/batch layouts."""
         if self.last_layer is not None and layer_idx <= self.last_layer:
