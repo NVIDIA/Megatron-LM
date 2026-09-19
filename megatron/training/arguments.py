@@ -2534,12 +2534,6 @@ def _add_network_size_args(parser):
         "use_te_rng_tracker",
         "log_max_attention_logit",
         "barrier_with_L1_time",
-        "rope_type",
-        "rotary_base",
-        "rotary_percent",
-        "rotary_seq_len_interpolation_factor",
-        "use_rope_scaling",
-        "rope_scaling_factor",
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
