@@ -69,7 +69,11 @@ class HyperConnectionHybridLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
-                cross_layer_state=cross_layer_state,
+                **(
+                    {"cross_layer_state": cross_layer_state}
+                    if cross_layer_state is not None
+                    else {}
+                ),
             )
         else:
             # Mamba-like layers only consume the common HybridStack arguments.
@@ -129,7 +133,11 @@ class HyperConnectionHybridLayer(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
-                    cross_layer_state=cross_layer_state,
+                    **(
+                        {"cross_layer_state": cross_layer_state}
+                        if cross_layer_state is not None
+                        else {}
+                    ),
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -175,7 +183,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             hidden_states,
             mhc_recompute_manager=mhc_recompute_manager,
             return_residual=True,
-            mhc_state=mhc_state,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,
