@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.language_module import language_module as language_module_module
 from megatron.core.tensor_parallel import cross_entropy as cross_entropy_module
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
@@ -103,3 +104,35 @@ def test_vocab_parallel_cross_entropy():
     ).cuda()
     assert torch.equal(torch.round(expected_output), torch.round(output))
     Utils.destroy_model_parallel()
+
+
+def test_vocab_parallel_label_smoothing_matches_dense_loss_and_gradient():
+    Utils.initialize_model_parallel(2, 1)
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        for smoothing in (0.0, 0.1):
+            for scale in (1.0, 1000.0):
+                torch.manual_seed(7)
+                logits = torch.randn(6, 8, device="cuda") * scale
+                target = torch.tensor([0, 7, 2, 4, 1, 6], device="cuda")
+                local = logits.chunk(2, dim=-1)[tp_rank].clone().requires_grad_()
+                loss = vocab_parallel_cross_entropy(local, target, smoothing, tp_group)
+                loss.mean().backward()
+
+                dense = logits.double().requires_grad_()
+                log_probs = dense.log_softmax(dim=-1)
+                target_log_probs = log_probs.gather(-1, target[:, None]).squeeze(-1)
+                expected = (
+                    -(1 - smoothing) * target_log_probs
+                    - smoothing * (log_probs.sum(dim=-1) - target_log_probs) / 7
+                )
+                expected.mean().backward()
+
+                assert torch.isfinite(loss).all()
+                torch.testing.assert_close(loss.double(), expected, atol=3e-4, rtol=2e-6)
+                torch.testing.assert_close(
+                    local.grad.double(), dense.grad.chunk(2, dim=-1)[tp_rank], atol=1e-7, rtol=2e-6
+                )
+    finally:
+        Utils.destroy_model_parallel()

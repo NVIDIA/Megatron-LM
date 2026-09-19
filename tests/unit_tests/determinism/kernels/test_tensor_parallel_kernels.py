@@ -89,10 +89,14 @@ class TestTensorParallelLayers:
             )
 
     @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
-    def test_vocab_parallel_cross_entropy_replays(self, label_smoothing):
+    @pytest.mark.parametrize("logit_scale", [1.0, 1000.0])
+    def test_vocab_parallel_cross_entropy_replays(self, label_smoothing, logit_scale):
+        """Replay smoothing with ordinary logits and softmax-underflow inputs."""
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        logits = torch.randn(4096, 32768, device="cuda", dtype=torch.float32, requires_grad=True)
+        logits = (
+            torch.randn(4096, 32768, device="cuda", dtype=torch.float32) * logit_scale
+        ).requires_grad_()
         target = torch.randint(0, 32768 * tp_group.size(), (4096,), device="cuda")
         assert_replays_bit_exact(
             lambda l, t: vocab_parallel_cross_entropy(l, t, label_smoothing, tp_group),
