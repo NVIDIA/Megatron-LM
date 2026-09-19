@@ -99,7 +99,7 @@ class DeepSeekV41Block(MegatronModule):
             branch, bias = self.mlp(branch, padding_mask=padding_mask)
         if bias is not None:
             branch = branch + bias
-        return (self.ffn_mhc.combine(branch, hidden_states, post, residual), following_mix)
+        return self.ffn_mhc.combine(branch, hidden_states, post, residual), following_mix
 
 
 class DeepSeekV41Stack(MegatronModule):
@@ -172,11 +172,13 @@ class DeepSeekV41Stack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout=None,
         cp_layout_plan=None,
+        return_target_hidden=False,
+        target_layer_ids=(),
         engram_hashes=None,
         token_mask=None,
         image_mask=None,
     ):
-        """Return normalized backbone hidden states."""
+        """Return normalized backbone hidden states and optionally detached DSpark features."""
         if inference_context is not None or packed_seq_params is not None:
             raise NotImplementedError("V4.1 stack currently accepts full, unpacked sequences")
         if isinstance(hidden_states, WrappedTensor):
@@ -185,10 +187,12 @@ class DeepSeekV41Stack(MegatronModule):
         hidden_states = (
             hidden_states.unsqueeze(-2).expand(*hidden_states.shape[:-1], n, -1).flatten(-2)
         )
-        state, previous_mix = (CSA2State(), None)
-        for _i, layer in enumerate(self.layers):
+        state, previous_mix, targets = CSA2State(), None, []
+        for i, layer in enumerate(self.layers):
             if layer.engram is not None:
                 hidden_states = layer.engram(hidden_states, engram_hashes, token_mask)
+            if i in target_layer_ids:
+                targets.append(hidden_states.unflatten(-1, (n, -1)).mean(-2).detach())
             hidden_states, previous_mix = layer(
                 hidden_states, previous_mix, state, attention_mask, padding_mask, image_mask
             )
@@ -196,6 +200,8 @@ class DeepSeekV41Stack(MegatronModule):
         hidden_states = make_viewless_tensor(
             hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+        if return_target_hidden:
+            return hidden_states, torch.cat(targets, -1) if targets else None
         return hidden_states
 
 

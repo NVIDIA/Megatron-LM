@@ -2,11 +2,13 @@
 
 """DeepSeek-V4.1 model using HybridModel's embedding, head and checkpoint interface."""
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 
+from megatron.core.models.deepseek_v41.dspark import DSpark, DSparkOutput
 from megatron.core.models.deepseek_v41.engram import Engram, EngramHasher
 from megatron.core.models.deepseek_v41.engram_hash import build_compressed_token_map
 from megatron.core.models.deepseek_v41.image_processing import (
@@ -20,8 +22,17 @@ from megatron.core.models.deepseek_v41.vision import Aligner, ViT
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 
 
+@dataclass
+class DeepSeekV41TrainingOutput:
+    """Separate backbone and draft objectives; the draft objective never trains the backbone."""
+
+    backbone: torch.Tensor
+    draft: DSparkOutput
+    draft_loss: torch.Tensor
+
+
 class DeepSeekV41Model(HybridModel):
-    """V4.1 multimodal backbone with conditional memory and per-modality routing."""
+    """Compose the V4.1 backbone, conditional memory, vision encoder and draft model."""
 
     def __init__(
         self,
@@ -32,12 +43,8 @@ class DeepSeekV41Model(HybridModel):
         pg_collection,
         token_map=None,
         tokenizer=None,
-        **kwargs
+        **kwargs,
     ) -> None:
-        if any((getattr(config, name, None) is not None for name in ("dspark_config",))):
-            raise NotImplementedError(
-                "This composition does not include the requested conditional modules"
-            )
         if kwargs.get("share_embeddings_and_output_weights", False):
             raise ValueError("The released V4.1 architecture uses untied embedding/output weights")
         hasher = None
@@ -52,13 +59,22 @@ class DeepSeekV41Model(HybridModel):
             hasher = EngramHasher(config.engram_config, token_map)
             ids = hasher.layout.layer_ids
             if len(set(ids)) != len(ids) or any(
-                (i < 0 or i >= len(config.csa_compress_ratios) for i in ids)
+                i < 0 or i >= len(config.csa_compress_ratios) for i in ids
             ):
                 raise ValueError("Engram layers must be distinct zero-based backbone blocks")
         if getattr(config, "vision_config", None):
             v = config.vision_config
-            if v.hidden_size % v.num_attention_heads or v.hidden_size // v.num_attention_heads % 4:
+            if (
+                v.hidden_size % v.num_attention_heads
+                or (v.hidden_size // v.num_attention_heads) % 4
+            ):
                 raise ValueError("Vision heads require a dimension divisible by four for 2D RoPE")
+        if getattr(config, "dspark_config", None):
+            d = config.dspark_config
+            if not 0 <= d.noise_token_id < vocab_size:
+                raise ValueError("DSpark noise token must belong to the model vocabulary")
+            if d.target_layer_ids != sorted(set(d.target_layer_ids)):
+                raise ValueError("DSpark target layers must be strictly increasing")
         super().__init__(
             config=config,
             hybrid_stack_spec=deepseek_v41_stack_spec,
@@ -67,7 +83,7 @@ class DeepSeekV41Model(HybridModel):
             hybrid_layer_pattern="VE" * len(config.csa_compress_ratios),
             position_embedding_type="none",
             pg_collection=pg_collection,
-            **kwargs
+            **kwargs,
         )
         self.engram_hash = hasher
         if hasher is not None:
@@ -98,6 +114,29 @@ class DeepSeekV41Model(HybridModel):
                 if config.perform_initialization:
                     config.init_method(parameter)
                 self.register_parameter(name, parameter)
+        self.dspark = None
+        if getattr(config, "dspark_config", None) and config.dspark_config.num_layers:
+            self.dspark = DSpark(config, vocab_size, pg_collection)
+        self._draft_only_training = False
+
+    def freeze_backbone_for_draft_training(self) -> None:
+        """Freeze backbone weights and routing biases before constructing the draft optimizer."""
+        if self.dspark is None:
+            raise ValueError("Draft-only training requires a DSpark configuration")
+        self._draft_only_training = True
+        for name, parameter in self.named_parameters():
+            if not name.startswith("dspark."):
+                parameter.requires_grad_(False)
+        self.train(self.training)
+
+    def train(self, mode: bool = True):
+        """Keep the frozen backbone in eval mode during a dedicated DSpark stage."""
+        super().train(mode)
+        if mode and getattr(self, "_draft_only_training", False):
+            for name, module in self.named_children():
+                if name != "dspark":
+                    module.eval()
+        return self
 
     def encode_image(self, image):
         """Encode an ImageInput while retaining gradients through the ViT and projector."""
@@ -110,9 +149,16 @@ class DeepSeekV41Model(HybridModel):
         )
 
     def forward_features(
-        self, input_ids, position_ids, *, images=None, attention_mask=None, padding_mask=None
+        self,
+        input_ids,
+        position_ids,
+        *,
+        images=None,
+        attention_mask=None,
+        padding_mask=None,
+        target_layer_ids=(),
     ):
-        """Return backbone hidden states with conditional memory and image inputs."""
+        """Return backbone hidden states and optional detached DSpark target features."""
         hidden = self.embedding(input_ids, position_ids)
         image_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         if images is not None:
@@ -148,6 +194,8 @@ class DeepSeekV41Model(HybridModel):
             hidden,
             attention_mask,
             padding_mask=padding_mask,
+            return_target_hidden=True,
+            target_layer_ids=target_layer_ids,
             engram_hashes=hashes,
             token_mask=~image_mask,
             image_mask=image_mask if self.vision is not None else None,
@@ -163,21 +211,44 @@ class DeepSeekV41Model(HybridModel):
         images=None,
         padding_mask=None,
         packed_seq_params=None,
-        **kwargs
+        draft_anchor_positions=None,
+        **kwargs,
     ):
-        """Return per-token losses or batch-major logits for unpacked training sequences."""
+        """Training forward returning token losses or batch-major vocabulary logits."""
         if packed_seq_params is not None or kwargs:
-            raise NotImplementedError("V4.1 currently supports unpacked training forwards")
-        hidden = self.forward_features(
+            raise NotImplementedError("V4.1 currently supports full, unpacked training forwards")
+        if draft_anchor_positions is not None and self.dspark is None:
+            raise ValueError("Draft anchors require a DSpark configuration")
+        target_layers = self.dspark.target_layer_ids if draft_anchor_positions is not None else ()
+        with torch.set_grad_enabled(torch.is_grad_enabled() and not self._draft_only_training):
+            hidden, features = self.forward_features(
+                input_ids,
+                position_ids,
+                images=images,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                target_layer_ids=target_layers,
+            )
+            logits, _ = self.output_layer(hidden)
+            backbone = (
+                self.compute_language_model_loss(labels, logits)
+                if labels is not None
+                else logits.transpose(0, 1).contiguous()
+            )
+        if draft_anchor_positions is None:
+            return backbone
+        draft = self.dspark(
             input_ids,
-            position_ids,
-            images=images,
-            attention_mask=attention_mask,
-            padding_mask=padding_mask,
+            features,
+            draft_anchor_positions,
+            self.embedding.word_embeddings.weight,
+            self.output_layer.weight,
         )
-        logits, _ = self.output_layer(hidden)
-        return (
-            self.compute_language_model_loss(labels, logits)
-            if labels is not None
-            else logits.transpose(0, 1).contiguous()
+        positions = draft_anchor_positions[..., None] + torch.arange(
+            self.dspark.block_size, device=input_ids.device
         )
+        teacher = logits.transpose(0, 1).gather(
+            1, positions.flatten(1)[..., None].expand(-1, -1, logits.shape[-1])
+        )
+        teacher = teacher.reshape(*positions.shape, logits.shape[-1])
+        return DeepSeekV41TrainingOutput(backbone, draft, draft.loss(teacher))

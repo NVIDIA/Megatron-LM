@@ -111,6 +111,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Sorted embedding backward and repeated-token draft embeddings; EP collectives have separate multi-rank parity coverage.",
     ),
     KernelEntry(
+        name="deepseek_v41_draft_embeddings",
+        sources=("megatron/core/models/deepseek_v41/dspark.py",),
+        tests=(K + "test_deepseek_v41_kernels.py",),
+        kind="torch-op",
+        notes="Bit-exact repeated-token embedding and Markov-head backward replay.",
+    ),
+    KernelEntry(
         name="deepseek_v41_csa2",
         sources=("megatron/core/transformer/experimental_attention_variant/csa2.py",),
         tests=(K + "test_deepseek_v41_kernels.py",),
