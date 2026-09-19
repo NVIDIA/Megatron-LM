@@ -4328,8 +4328,9 @@ def save_checkpoint_and_time(
             _exposed_save_span.end()
 
 
-def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
-    from megatron.core.process_groups_config import ProcessGroupCollection
+def _run_gpu_sniff_test(
+    tag, span_name='megatron.train.sniff_test', pg_collection: ProcessGroupCollection | None = None
+):
     from megatron.training.gpu_sniff_test import run_gpu_sniff_test
 
     # Two call sites with distinct span names (span_name): the once-at-start
@@ -4337,9 +4338,11 @@ def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
     # --gpu-sniff-test-interval 'megatron.train.sniff_test' runs in the step
     # loop. The tag attribute additionally records which invocation this is.
     with _otel_managed_span('job', span_name, is_goodput_span=True, **{'megatron.sniff_test.tag': tag}):
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['ep', 'dp', 'tp'],
-        )
+        if pg_collection is None:
+            # Compatibility for callers without an explicit model topology.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['ep', 'dp', 'tp']
+            )
         print_datetime(f'running GPU sniff test ({tag})')
         timers = get_timers()
         timers('gpu-sniff-test', log_level=0).start(barrier=True)
@@ -4415,7 +4418,10 @@ def post_training_step_callbacks(
         args.gpu_sniff_test_interval is not None
         and iteration % args.gpu_sniff_test_interval == 0
     ):
-        _run_gpu_sniff_test(f'iteration {iteration:7d}')
+        _run_gpu_sniff_test(
+            f'iteration {iteration:7d}',
+            pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+        )
 
     # Manual garbage collection. With --manual-gc the interpreter's automatic
     # collector is off; this synchronous full collection is the only GC. With
@@ -4775,7 +4781,11 @@ def train(
 
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
-        _run_gpu_sniff_test('before training', span_name='megatron.startup.sniff_test')
+        _run_gpu_sniff_test(
+            'before training',
+            span_name='megatron.startup.sniff_test',
+            pg_collection=model_pg_collection,
+        )
 
     # Initialize router trace if requested.  The tracer attaches forward hooks
     # to all TopKRouter modules and writes one JSONL record per (iteration,
