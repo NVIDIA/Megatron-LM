@@ -284,7 +284,18 @@ class LogitsSaverHooks:
         # completion queue only reports "done", never "failed", so this is the
         # only channel by which a dead/broken worker becomes visible to the main
         # process. Checked once per iteration by check_logits_saver_failure().
-        self._failure_event: "mp.synchronize.Event" = mp.Event()
+        #
+        # Must be a Manager-backed proxy, not a raw mp.Event(): the async
+        # checkpoint request is handed off via Queue.put() to an already
+        # -running PersistentAsyncCaller worker
+        # (megatron/core/dist_checkpointing/strategies/async_utils.py), not
+        # inherited at Process.start() time. Raw multiprocessing
+        # Event/Lock/Condition objects can only be shared by inheritance and
+        # raise "Condition objects should only be shared between processes
+        # through inheritance" if pickled through a queue afterward; a
+        # Manager().Event() proxy communicates with a separate manager server
+        # process instead, so it is safely picklable/shareable this way.
+        self._failure_event: "mp.managers.EventProxy" = mp.Manager().Event()
 
         # Create save directory if needed
         storage_makedirs(self.save_dir, exist_ok=True)
@@ -757,7 +768,7 @@ class LogitsSaverHooks:
     def take_pending_data(
         self,
     ) -> Tuple[
-        str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool, List[str], "mp.synchronize.Event"
+        str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool, List[str], "mp.managers.EventProxy"
     ]:
         """Take ownership of buffered data for async flush at checkpoint time.
 
@@ -821,7 +832,7 @@ class LogitsSaverHooks:
         meta_bytes: bytes,
         msc_enabled: bool = False,
         existing_tars: Optional[List[str]] = None,
-        failure_event: Optional["mp.synchronize.Event"] = None,
+        failure_event: Optional["mp.managers.EventProxy"] = None,
     ) -> None:
         """Write a tar archive containing multiple iterations.
 
