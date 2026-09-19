@@ -34,13 +34,16 @@ from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic
 
 if HAVE_TE:
-    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
+    from .quantized_dbuffer import QuantizedDBuffer
 else:
-    QuantizedDBuffer = None
 
-    def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
-        """Without TE, all parameters use their native storage dtype."""
-        return tensor.dtype
+    class QuantizedDBuffer:
+        """Fallback for parameter grouping when Transformer Engine is unavailable."""
+
+        @staticmethod
+        def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
+            """Without TE, all parameters use their native storage dtype."""
+            return tensor.dtype
 
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -176,13 +179,13 @@ class FsdpParameterGroup:
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
         first_parameter = next(iter(parameter_to_fqns))
-        dtype = effective_dtype(first_parameter)
+        dtype = QuantizedDBuffer.effective_dtype(first_parameter)
         requires_grad = first_parameter.requires_grad
         for parameter, fqns in parameter_to_fqns.items():
-            if effective_dtype(parameter) != dtype:
+            if QuantizedDBuffer.effective_dtype(parameter) != dtype:
                 raise ValueError(
                     f"Expected parameter {fqns!r} to have dtype {dtype}, "
-                    f"got {effective_dtype(parameter)}."
+                    f"got {QuantizedDBuffer.effective_dtype(parameter)}."
                 )
             if parameter.requires_grad != requires_grad:
                 raise ValueError(
@@ -223,15 +226,19 @@ class FsdpParameterGroup:
         for index, parameter in enumerate(parameters):
             # TE can preserve the values from before MXFP8 quantization. Use them
             # to initialize optimizer weights without quantization error, then
-            # release TE's extra copy. Otherwise initialize from the parameter.
+            # release TE's extra copy. MXFP8 parameters require these values.
             get_high_precision_init_val = getattr(parameter, "get_high_precision_init_val", None)
-            if get_high_precision_init_val:
-                initial_value = get_high_precision_init_val()
+            initial_value = get_high_precision_init_val() if get_high_precision_init_val else None
+            if initial_value is not None:
                 parameter.clear_high_precision_init_val()
+            elif self.dtype == torch.uint8:
+                raise ValueError(
+                    "MXFP8 parameters require preserved high-precision initialization values. "
+                    "Use quantized_model_init(preserve_high_precision_init_val=True)."
+                )
             else:
                 initial_value = parameter
-            # Convert MXFP8 tensors to ordinary tensors before copying their owned slice.
-            self.main_weight.copy_from(index, initial_value.to(dtype=main_weight_dtype))
+            self.main_weight.copy_from(index, initial_value)
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.

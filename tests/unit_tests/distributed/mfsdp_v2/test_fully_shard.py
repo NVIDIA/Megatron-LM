@@ -33,11 +33,8 @@ from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.parametrize("preserve_high_precision_init_val", [True, False])
 @pytest.mark.parametrize("parameter_placement", [Shard(0), Replicate()])
-def test_mxfp8_linear_training_step_uses_quantized_dbuffer(
-    distributed_setup, preserve_high_precision_init_val, parameter_placement
-):
+def test_mxfp8_linear_training_step_uses_quantized_dbuffer(distributed_setup, parameter_placement):
     """A bias-free TE MXFP8 Linear completes a ZeRO-1/3 training step on two ranks."""
     te = pytest.importorskip("transformer_engine")
     if distributed_setup.world_size != 2:
@@ -46,21 +43,16 @@ def test_mxfp8_linear_training_step_uses_quantized_dbuffer(
         pytest.skip("MXFP8 requires Blackwell-or-newer CUDA hardware.")
 
     recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=te.common.recipe.Format.HYBRID)
-    with te.pytorch.quantized_model_init(
-        recipe=recipe, preserve_high_precision_init_val=preserve_high_precision_init_val
-    ):
+    with te.pytorch.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
         linear = te.pytorch.Linear(
             64, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
         )
         reference = te.pytorch.Linear(
             64, 256, bias=False, params_dtype=torch.bfloat16, device=distributed_setup.device
         )
-    get_high_precision_init_val = getattr(linear.weight, "get_high_precision_init_val", None)
-    initial_value = get_high_precision_init_val() if get_high_precision_init_val else None
+    initial_value = linear.weight.get_high_precision_init_val()
     reference_main_weight = torch.nn.Parameter(
-        (initial_value if initial_value is not None else linear.weight).to(
-            device=distributed_setup.device, dtype=torch.float32
-        )
+        initial_value.to(device=distributed_setup.device, dtype=torch.float32)
     )
     with torch.no_grad():
         reference.weight.quantize_(reference_main_weight)

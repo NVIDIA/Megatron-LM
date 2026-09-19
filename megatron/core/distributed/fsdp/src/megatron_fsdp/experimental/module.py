@@ -30,7 +30,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import FsdpParameterGroup, QuantizedDBuffer, get_containing_parameter_group
 from .placement import BlockAtomic, Flat
 from .schedule import SchedulePolicy
 
@@ -214,7 +214,7 @@ class FsdpModule:
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             first_parameter = next(iter(group_parameters.values()))
-            group_dtype = effective_dtype(first_parameter)
+            group_dtype = QuantizedDBuffer.effective_dtype(first_parameter)
             parameter_groups.append(
                 FsdpParameterGroup(
                     owning_module=self,
@@ -620,7 +620,7 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
     grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (effective_dtype(parameter), parameter.requires_grad)
+        key = (QuantizedDBuffer.effective_dtype(parameter), parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 

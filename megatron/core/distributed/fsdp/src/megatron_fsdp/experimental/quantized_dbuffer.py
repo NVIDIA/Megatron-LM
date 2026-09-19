@@ -40,11 +40,6 @@ _MXFP8_QUANTIZER = MXFP8Quantizer(_MXFP8_DTYPE)
 _MXFP8_BLOCK_SIZE = 32
 
 
-def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
-    """Return MFSDP's storage dtype for a parameter."""
-    return torch.uint8 if isinstance(tensor, MXFP8Tensor) else tensor.dtype
-
-
 def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
@@ -119,6 +114,11 @@ class QuantizedDBuffer:
     columnwise_data: DBuffer
     rowwise_scale: DBuffer
     columnwise_scale: DBuffer
+
+    @staticmethod
+    def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
+        """Return MFSDP's storage dtype for a parameter."""
+        return torch.uint8 if isinstance(tensor, MXFP8Tensor) else tensor.dtype
 
     def __init__(
         self,
