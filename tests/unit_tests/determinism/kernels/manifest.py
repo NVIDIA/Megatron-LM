@@ -332,6 +332,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
     ),
+    # ---------------------------------------------------------------- Triton config selection
+    KernelEntry(
+        name="triton_autotune_policy",
+        sources=(
+            "megatron/core/tuning/interception.py",
+            "megatron/core/tuning/policy.py",
+            "megatron/core/tuning/selection.py",
+            "megatron/core/tuning/table.py",
+        ),
+        tests=(K + "test_autotune_kernels.py", K + "test_ssm_kernels.py"),
+        kind="dispatch",
+        notes="Bit-exact reduction replay through the Autotuner adapter using min-cost and "
+        "JSON-table choices; SSM replay covers decoration-time pinning with autotune caching on/off.",
+    ),
     # ---------------------------------------------------------------- SSM
     KernelEntry(
         name="ssm_causal_conv1d",
@@ -372,7 +386,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
-        notes="determinism.py is the autotune/workspace policy every SSM kernel test runs under.",
+        notes="determinism.py provides ordered workspaces and re-exports the shared tuning policy; "
+        "SSM replay verifies the relocated policy still pins configs when autotune caching is enabled.",
     ),
     KernelEntry(
         name="ssm_gdp_kernels",
