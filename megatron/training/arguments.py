@@ -87,6 +87,12 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
 
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
     args = parse_args(extra_args_provider, ignore_unknown_args)
+    mtp_decay = args.mtp_loss_scaling_factor_decay
+    mtp_start = args.mtp_loss_scaling_factor_decay_start
+    if (mtp_decay is None) != (mtp_start is None):
+        raise ValueError('MTP loss decay requires both a weight and a completed-update threshold')
+    if mtp_decay is not None and (mtp_decay < 0 or mtp_start < 0):
+        raise ValueError('MTP loss decay weight and threshold must be nonnegative')
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
         from megatron.training.checkpointing import load_args_from_checkpoint
@@ -396,6 +402,53 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
+def validate_engram_args(args):
+    """Validate Engram-specific training-stack combinations."""
+    if not getattr(args, 'engram_layer_ids', None):
+        return
+
+    if not getattr(args, 'hybrid_layer_pattern', None):
+        raise ValueError("Engram requires pretrain_hybrid.py with --hybrid-layer-pattern")
+
+    if args.init_model_with_meta_device:
+        raise ValueError(
+            "Engram does not support --init-model-with-meta-device because tokenizer "
+            "lookup and hash addressing state require materialized tensors"
+        )
+    if args.overlap_moe_expert_parallel_comm:
+        raise ValueError(
+            "Engram does not support --overlap-moe-expert-parallel-comm because the "
+            "fine-grained schedule does not carry Engram token context"
+        )
+    if args.use_megatron_fsdp or args.use_torch_fsdp2:
+        raise ValueError("Engram currently supports ordinary Megatron DDP only")
+    if getattr(args, 'enable_mhc_connections', False):
+        raise ValueError(
+            "Engram does not yet support --enable-mhc-connections. Keep a single residual "
+            "stream; combining Engram with Hybrid mHC wrappers requires separate validation"
+        )
+
+    if args.engram_table_backend == 'row_a2a':
+        if args.optimizer_cpu_offload:
+            raise ValueError("Engram row_a2a does not support optimizer CPU offload")
+        if args.cpu_offloading_num_layers != 0:
+            raise ValueError("Engram row_a2a does not support Transformer Engine CPU offload")
+        if args.fp16:
+            raise ValueError("Engram row_a2a supports FP32 or BF16, not FP16")
+        if args.loss_scale not in (None, 1.0):
+            raise ValueError(
+                "Engram row_a2a requires unity loss scaling because FP32 owner gradients "
+                "are not handled by Megatron loss scalers"
+            )
+        if args.ckpt_format != 'torch_dist':
+            raise ValueError("Engram row_a2a requires --ckpt-format torch_dist")
+        if args.optimizer == 'sgd':
+            raise ValueError(
+                "Engram row_a2a requires Adam or an emerging dense optimizer; "
+                "its table parameters use native Adam"
+            )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -697,7 +750,7 @@ def validate_args(args, defaults={}):
         for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
             args.per_split_data_args_path is not None
     if use_per_split_data_path:
-         # Exactly one of the two has to be None if we use it.
+        # Exactly one of the two has to be None if we use it.
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
@@ -1353,6 +1406,8 @@ def validate_args(args, defaults={}):
     for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
+    validate_engram_args(args)
+
     # Checks.
     if args.ffn_hidden_size is None:
         if args.swiglu:
@@ -1540,7 +1595,6 @@ def validate_args(args, defaults={}):
             args.high_priority_stream_groups.append('dp_cp')
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
-
 
     # Derive the internal gtp_weight_remat_size from the user-facing
     # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
@@ -3445,6 +3499,12 @@ def _add_tokenizer_args(parser):
 
     tokenizer_factory = ArgumentGroupFactory(TokenizerConfig)
     group = tokenizer_factory.build_group(parser, "tokenizer")
+    group.add_argument(
+        '--engram-pad-id',
+        type=int,
+        default=None,
+        help='Optional raw pad token ID override. Defaults to the main tokenizer pad or EOD ID.',
+    )
 
     return parser
 

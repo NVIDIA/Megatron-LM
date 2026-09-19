@@ -258,6 +258,9 @@ class _ParamAndGradBucketGroup:
         # responsible for, param_to_bucket maps params to the corresponding bucket.
         self.param_to_bucket = {}
         self.params = set()
+        self.optimizer_sharding_group = getattr(
+            buckets[0].params_list[0], 'optimizer_sharding_group', None
+        )
         for bucket in self.buckets:
             for param in bucket.params_list:
                 self.param_to_bucket[param] = bucket
@@ -652,6 +655,8 @@ class _ParamAndGradBucketGroup:
         communication call. When ddp_config.overlap_grad_reduce is set to False, makes
         synchronous call.
         """
+        if self.optimizer_sharding_group is not None and self.grad_reduce_finished:
+            return
         if self.is_first_batch and self.grad_reduce_handle is not None:
             # Make this start_grad_sync call a no-op if in first batch and collective has
             # already been dispatched.
@@ -829,6 +834,8 @@ class _ParamAndGradBucketGroup:
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
             self.grad_reduce_handle = None
+            if self.optimizer_sharding_group is not None:
+                self.grad_reduce_finished = True
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -967,14 +974,21 @@ def group_params_for_buffers(
         param_dtype = param.dtype
         if _param_uses_quantized_storage(param):
             param_dtype = torch.uint8
-        grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
+        sharding_group = getattr(param, 'optimizer_sharding_group', None)
+        grad_dtype = (
+            torch.float if grad_reduce_in_fp32 or sharding_group is not None else param.dtype
+        )
         is_expert_parallel = not getattr(param, 'allreduce', True)
         is_managed_by_layer_wise_optimizer = getattr(
             param, 'is_managed_by_layer_wise_optimizer', False
         )
 
         key = BufferKey(
-            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param_dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            sharding_group,
         )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
@@ -983,7 +997,11 @@ def group_params_for_buffers(
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
         offset_key = BufferKey(
-            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param.dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            sharding_group,
         )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
@@ -1749,6 +1767,20 @@ def partition_buckets(
 
     if len(buffers) == 0:
         return []
+
+    # Never merge buffers whose replicas or optimizer policies differ.
+    by_sharding_group = {}
+    for buffer in buffers:
+        group = getattr(buffer.params[0], 'optimizer_sharding_group', None)
+        by_sharding_group.setdefault(group, []).append(buffer)
+    if len(by_sharding_group) > 1:
+        return [
+            bucket_group
+            for group_buffers in by_sharding_group.values()
+            for bucket_group in partition_buckets(
+                group_buffers, force_single_bucket_group, reduce_scatter_with_fp32_accumulation
+            )
+        ]
 
     # LayerWiseDistributedOptimizer and DistributedOptimizer classify a whole bucket group from
     # its first bucket when synchronizing their subsets. Partition only when the policy below may

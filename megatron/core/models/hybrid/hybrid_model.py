@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from typing import Literal, Optional
+from typing import Literal, Optional, Protocol
 
 import torch
 from torch import Tensor
@@ -56,6 +57,33 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
     return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
 
 
+class TokenContextProvider(Protocol):
+    """Compose layer-owned modules with explicit per-call token context.
+
+    Providers own no parameters or mutable microbatch state. Their replacement
+    specs build ordinary registered children of the selected layers. Consumers
+    declare ``accepts_token_context = True`` and accept a ``token_context`` Tensor
+    keyword in both normal execution and activation recomputation.
+    """
+
+    def layer_spec_overrides(
+        self, submodules: object, layer_config_list: Sequence[TransformerConfig], layer_offset: int
+    ) -> Mapping[int, ModuleSpec]:
+        """Return replacements for this segment, indexed by global layer position."""
+        ...
+
+    def prepare(
+        self,
+        input_ids: Tensor | None,
+        *,
+        inference_context: BaseInferenceContext | None,
+        packed_seq_params: PackedSeqParams | None,
+        cp_batch: ContextParallelBatch | None,
+    ) -> Tensor:
+        """Return microbatch context without retaining mutable per-forward state."""
+        ...
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -104,6 +132,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
         vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
+        token_context_provider_spec (ModuleSpec, optional): Provider composing layers that consume
+            an explicit per-microbatch token context.
     """
 
     def __init__(
@@ -130,6 +160,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        token_context_provider_spec: ModuleSpec | None = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -292,6 +323,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
+        self._token_context_provider: TokenContextProvider | None = None
+        self.requires_token_context = False
+        decoder_extra_kwargs = {}
+        if token_context_provider_spec is not None:
+            self._token_context_provider = build_module(
+                token_context_provider_spec, config=self.config, pg_collection=self.pg_collection
+            )
+            decoder_extra_kwargs['layer_spec_overrides'] = (
+                self._token_context_provider.layer_spec_overrides(
+                    hybrid_stack_spec.submodules, layer_config_list, layer_offset
+                )
+            )
+            self.requires_token_context = bool(decoder_extra_kwargs['layer_spec_overrides'])
+
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -302,6 +347,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
             name="decoder",
+            **decoder_extra_kwargs,
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -477,6 +523,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        decoder_context_kwargs = {}
+        if self.requires_token_context:
+            token_context_provider = self._token_context_provider
+            assert token_context_provider is not None
+            decoder_context_kwargs['token_context'] = token_context_provider.prepare(
+                input_ids,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                cp_batch=cp_batch,
+            )
+
         in_inference_mode = InferenceMode.is_active()
 
         if in_inference_mode:
@@ -565,6 +622,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask=padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **decoder_context_kwargs,
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output

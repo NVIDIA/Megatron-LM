@@ -44,7 +44,9 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
 
     This DDP-buffer ownership rule must match Muon's parameter-group routing.
     """
-    if not getattr(param, 'use_muon', True):
+    if getattr(param, 'optimizer_sharding_group', None) is not None or not getattr(
+        param, 'use_muon', True
+    ):
         return False
     if not param.dim() == 2:
         return False
@@ -66,6 +68,8 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     if not bucket.params_list:
         return False
     param = bucket.params_list[0]
+    if getattr(param, 'optimizer_sharding_group', None) is not None:
+        return False
     if not hasattr(param, 'is_managed_by_layer_wise_optimizer'):
         return default_for_untagged
     return param.is_managed_by_layer_wise_optimizer
@@ -506,8 +510,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 )
             else:
                 compute_per_buffer_layout = DistributedOptimizer._compute_per_buffer_param_layout
+            buffer_config = buffer_key.get_ddp_config(ddp_config)
+            if buffer_key.optimizer_sharding_group is not None:
+                dp_world_size = buffer_key.optimizer_sharding_group.size()
             layouts[buffer_key] = compute_per_buffer_layout(
-                group_params, bucket_size, dp_world_size, ddp_config, param_indices
+                group_params,
+                None if buffer_key.optimizer_sharding_group is not None else bucket_size,
+                dp_world_size,
+                buffer_config,
+                param_indices,
             )
         return FullParamLayout(layouts=layouts)
 

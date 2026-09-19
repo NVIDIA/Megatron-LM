@@ -1,0 +1,112 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  HF_HUB_OFFLINE: 1
+  TRANSFORMERS_OFFLINE: 1
+BEFORE_SCRIPT: |
+  # Preserve the mounted corpus's GPT-2 token IDs without downloading Hub metadata.
+  uv run --no-sync python - <<'PY'
+  import json
+  import os
+  from pathlib import Path
+
+  from transformers import GPT2TokenizerFast
+
+  source = Path(os.environ["DATA_PATH"]) / "text/common_pile/v01_filtered_data/bpe"
+  target = Path(os.environ["OUTPUT_PATH"]) / "tokenizer"
+  tokenizer = GPT2TokenizerFast(
+      vocab_file=str(source / "vocab.json"), merges_file=str(source / "merges.txt")
+  )
+  assert tokenizer.get_vocab() == json.loads((source / "vocab.json").read_text())
+  tokenizer.save_pretrained(target)
+  PY
+MODEL_ARGS:
+  --hidden-size: 128
+  --ffn-hidden-size: 256
+  --num-attention-heads: 4
+  --kv-channels: 32
+  --group-query-attention: true
+  --num-query-groups: 2
+  --hybrid-layer-pattern: "*-*E*E*E/*E"
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --mtp-num-layers: 1
+  --mtp-loss-scaling-factor: 0.1
+  --num-experts: 4
+  --moe-router-topk: 2
+  --moe-ffn-hidden-size: 64
+  --moe-shared-expert-intermediate-size: 64
+  --moe-router-load-balancing-type: aux_loss
+  --moe-aux-loss-coeff: 0.01
+  --moe-token-dispatcher-type: alltoall
+  --engram-layer-ids: "[1]"
+  --engram-target-layer-indices: "[2]"
+  --engram-hash-table-min-sizes: "[101 103]"
+  --engram-max-ngram-size: 3
+  --engram-embedding-dim-per-ngram: 16
+  --engram-num-hash-heads-per-ngram: 2
+  --engram-kernel-size: 4
+  --engram-table-backend: row_a2a
+  --engram-seed: 0
+  --normalization: RMSNorm
+  --norm-epsilon: 1.0e-6
+  --swiglu: true
+  --disable-bias-linear: true
+  --position-embedding-type: rope
+  --rotary-base: 10000
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-model: ${OUTPUT_PATH}/tokenizer
+  --make-vocab-size-divisible-by: 128
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --split: 949,50,1
+  --seed: 1234
+  --seq-length: 128
+  --max-position-embeddings: 128
+  --micro-batch-size: 1
+  --global-batch-size: 16
+  --train-iters: 100
+  --exit-interval: 100
+  --optimizer: adam
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --lr: 0.00015
+  --min-lr: 1.0e-5
+  --lr-decay-style: cosine
+  --lr-decay-iters: 100
+  --lr-warmup-iters: 5
+  --weight-decay: 0.01
+  --clip-grad: 1.0
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 1
+  --expert-model-parallel-size: 1
+  --distributed-backend: nccl
+  --use-distributed-optimizer: true
+  --transformer-impl: transformer_engine
+  --attention-backend: unfused
+  --attention-softmax-in-fp32: true
+  --no-gradient-accumulation-fusion: true
+  --bf16: true
+  --use-mcore-models: true
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 50
+  --ckpt-format: torch_dist
+  --use-checkpoint-opt_param-scheduler: true
+  --eval-interval: 1000
+  --eval-iters: 2
+  --log-interval: 1
+  --log-num-zeros-in-grad: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --tensorboard-log-interval: 1
+  --timing-log-level: 0
+TEST_TYPE: ckpt-resume
+LAUNCHER: torchrun
+METRICS:
+  - lm loss
+  - mtp_1 loss
+  - num-zeros

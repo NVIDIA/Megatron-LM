@@ -8,6 +8,12 @@ from typing import List, Literal, Optional
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
+    mtp_loss_scaling_factor_decay: float | None = None
+    """Optional MTP loss weight used after mtp_loss_scaling_factor_decay_start completed updates."""
+
+    mtp_loss_scaling_factor_decay_start: int | None = None
+    """Completed update count at which the MTP loss weight switches; disabled by default."""
+
     micro_batch_size: int | None = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times
     data parallel size times number of micro batches."""
@@ -37,7 +43,6 @@ class TrainingConfig:
         step_batch_size_schedule = "0:768 250B:1536 500B:3072 750B:6144"
     Cannot be used together with decrease_batch_size_if_needed.
     """
-
 
     decrease_batch_size_if_needed: bool = False
     """If set, decrease batch size if microbatch_size * dp_size does not 

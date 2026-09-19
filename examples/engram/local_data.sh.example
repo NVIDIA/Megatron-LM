@@ -1,0 +1,14 @@
+# Copy to local_data.sh; keep machine paths outside the submitted PR.
+export PER_SPLIT_DATA_ARGS_PATH="/path/to/prepared-data/per_split.json"
+export DATA_CACHE_PATH="/path/to/shared-fineweb-index-cache"
+export TOKENIZER_MODEL="/path/to/downloaded-gpt2-tokenizer"
+export RUN_ROOT="${RUN_ROOT:-/path/to/runs/fineweb-comparison}"
+export WANDB_PROJECT="engram-fineweb"
+export WANDB_RUN_GROUP="engram-fineweb-0.73b-2026"
+# Use online with existing W&B credentials, or offline when the host cannot connect.
+# export WANDB_MODE=online
+# The 128-step acceptance run retains the full model/data/LR horizon:
+# export EXIT_INTERVAL=130
+# export SAVE_INTERVAL=128
+# export EVAL_INTERVAL=64
+# Choose another RUN_ROOT for acceptance tests and formal experiments.
