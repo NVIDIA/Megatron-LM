@@ -206,6 +206,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",
     ),
+    KernelEntry(
+        name="streamwise_residual_ops",
+        sources=("megatron/core/transformer/streamwise_residual_ops.py",),
+        tests=(K + "test_streamwise_residual_ops.py",),
+        kind="triton",
+        notes="Fused streamwise read/write with fixed-order controller-gradient reductions; "
+        "replay covers identity carry and learned retention.",
+    ),
     # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
         name="fused_layer_norm",

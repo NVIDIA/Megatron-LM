@@ -42,6 +42,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
 from megatron.core.typed_torch import copy_signature
 
 
@@ -155,6 +156,15 @@ def get_gpt_layer_with_inference_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use inference optimized linear layers."""
     return ModuleSpec(
         module=TransformerLayer, submodules=get_gpt_layer_with_inference_submodules(*args, **kwargs)
+    )
+
+
+@copy_signature(get_gpt_layer_with_inference_submodules)
+def get_gpt_wide_residual_layer_with_inference_spec(*args, **kwargs) -> ModuleSpec:
+    """Use inference-optimized linear layers with explicit wide-residual construction."""
+    return ModuleSpec(
+        module=WideResidualTransformerLayer,
+        submodules=get_gpt_layer_with_inference_submodules(*args, **kwargs),
     )
 
 
@@ -336,6 +346,15 @@ def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     )
 
 
+@copy_signature(get_gpt_layer_with_transformer_engine_submodules)
+def get_gpt_wide_residual_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
+    """Use Transformer Engine modules with explicit wide-residual construction."""
+    return ModuleSpec(
+        module=WideResidualTransformerLayer,
+        submodules=get_gpt_layer_with_transformer_engine_submodules(*args, **kwargs),
+    )
+
+
 def get_gpt_layer_local_submodules(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -445,6 +464,15 @@ def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core."""
     return ModuleSpec(
         module=TransformerLayer, submodules=get_gpt_layer_local_submodules(*args, **kwargs)
+    )
+
+
+@copy_signature(get_gpt_layer_local_submodules)
+def get_gpt_wide_residual_layer_local_spec(*args, **kwargs) -> ModuleSpec:
+    """Use Megatron-Core modules with explicit wide-residual construction."""
+    return ModuleSpec(
+        module=WideResidualTransformerLayer,
+        submodules=get_gpt_layer_local_submodules(*args, **kwargs),
     )
 
 
@@ -565,8 +593,17 @@ def get_gpt_decoder_layer_specs(
         f"but got {config.experimental_attention_variant=}."
     )
 
+    if config.wide_residual is not None:
+        te_layer_spec = get_gpt_wide_residual_layer_with_transformer_engine_spec
+        inference_layer_spec = get_gpt_wide_residual_layer_with_inference_spec
+        local_layer_spec = get_gpt_wide_residual_layer_local_spec
+    else:
+        te_layer_spec = get_gpt_layer_with_transformer_engine_spec
+        inference_layer_spec = get_gpt_layer_with_inference_spec
+        local_layer_spec = get_gpt_layer_local_spec
+
     if use_transformer_engine:
-        dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        dense_layer_spec = te_layer_spec(
             num_experts=None,
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
@@ -578,7 +615,7 @@ def get_gpt_decoder_layer_specs(
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
-        moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        moe_layer_spec = te_layer_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
@@ -591,12 +628,12 @@ def get_gpt_decoder_layer_specs(
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
     elif config.transformer_impl == "inference_optimized":
-        dense_layer_spec = get_gpt_layer_with_inference_spec(
+        dense_layer_spec = inference_layer_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             qk_l2_norm=qk_l2_norm,
         )
-        moe_layer_spec = get_gpt_layer_with_inference_spec(
+        moe_layer_spec = inference_layer_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             qk_l2_norm=qk_l2_norm,
@@ -605,7 +642,7 @@ def get_gpt_decoder_layer_specs(
             moe_use_legacy_grouped_gemm=getattr(config, "moe_use_legacy_grouped_gemm", False),
         )
     else:
-        dense_layer_spec = get_gpt_layer_local_spec(
+        dense_layer_spec = local_layer_spec(
             num_experts=None,
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
@@ -616,7 +653,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
         )
-        moe_layer_spec = get_gpt_layer_local_spec(
+        moe_layer_spec = local_layer_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
