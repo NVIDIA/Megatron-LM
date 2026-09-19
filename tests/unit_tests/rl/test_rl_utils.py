@@ -21,6 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -50,10 +51,12 @@ VOCAB = 754
 
 
 class MockModel(LanguageModule):
-    def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB):
+    def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB, requires_grad=False):
         self.batch = batch
         self.seq = seq
         self.vocab = vocab
+        self.requires_grad = requires_grad
+        self.last_hidden_states = None
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.config = TransformerConfig(
             num_attention_heads=8, num_layers=8, pipeline_dtype=torch.bfloat16
@@ -64,8 +67,36 @@ class MockModel(LanguageModule):
         del position_ids
         del attention_mask
         batch, seq = x.shape
-        mock_model_outputs = torch.ones((batch, seq, self.vocab), device=x.device)
-        return mock_model_outputs
+        mock_model_outputs = torch.ones(
+            (batch, seq, self.vocab),
+            device=x.device,
+            requires_grad=self.requires_grad,
+        )
+        self.last_hidden_states = mock_model_outputs
+
+        output_processor = kwargs.get("output_processor")
+        if output_processor is None or not is_pp_last_stage(self.pg_collection.pp):
+            return mock_model_outputs
+
+        tp_size = torch.distributed.get_world_size(self.pg_collection.tp)
+        tp_rank = torch.distributed.get_rank(self.pg_collection.tp)
+        assert self.vocab % tp_size == 0
+        vocab_per_rank = self.vocab // tp_size
+
+        class MockOutputLayer:
+            def __call__(self, hidden_states, weight=None, runtime_gather_output=None):
+                assert runtime_gather_output is False
+                start = tp_rank * vocab_per_rank
+                end = start + vocab_per_rank
+                return hidden_states[..., start:end], None
+
+        return output_processor(
+            hidden_states=mock_model_outputs.transpose(0, 1).contiguous(),
+            output_layer=MockOutputLayer(),
+            output_weight=None,
+            context=kwargs["output_processor_context"],
+            scale_logits=lambda logits: logits,
+        )
 
     def load_state_dict(self, params):
         del params
@@ -129,7 +160,7 @@ class DummyLogprobsModel(torch.nn.Module):
         super().__init__()
         self.config = config
         self.layer = DummyConfigModule(layer_config)
-        self.pg_collection = SimpleNamespace(pp=object(), cp=None)
+        self.pg_collection = SimpleNamespace(pp=object(), cp=None, tp=None)
         self.config_values_during_forward = None
 
     def forward(self, tokens, position_ids, attention_mask, **kwargs):
@@ -699,7 +730,7 @@ class TestRLUtils:
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
 
         model = MockModel()
-        tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
+        tokens = torch.ones((BATCH, SEQ), dtype=torch.long, device=torch.cuda.current_device())
         logprobs = rl_utils.get_logprobs(
             model, tokens, position_ids=None, sequence_packing=use_sequence_packing
         )
@@ -711,6 +742,81 @@ class TestRLUtils:
         else:
             assert logprobs.shape == (BATCH, SEQ, VOCAB)
 
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1, 2), id="cp2")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_get_logprobs_context_parallel_reassembly(
+        self, initialize_model_parallel
+    ):
+        """CP reassembly preserves selected logprobs and autograd with cached partition indices."""
+        self.create_test_args(rl_use_sequence_packing=False)
+
+        model = MockModel(requires_grad=True)
+        cp_group = model.pg_collection.cp
+        cp_rank = torch.distributed.get_rank(cp_group)
+
+        tokens = torch.tensor(
+            [[0, 1, 2, 3]],
+            dtype=torch.long,
+            device=torch.cuda.current_device(),
+        )
+        position_ids = torch.arange(SEQ, device=tokens.device).unsqueeze(0)
+
+        cu_seqlens = torch.tensor([0, SEQ], dtype=torch.int32, device=tokens.device)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=SEQ,
+            max_seqlen_kv=SEQ,
+            pad_between_seqs=False,
+        )
+
+        gather_perm = torch.tensor([0, 3, 1, 2], dtype=torch.long, device=tokens.device)
+        local_len = SEQ // 2
+        partition_index = gather_perm[
+            cp_rank * local_len : (cp_rank + 1) * local_len
+        ]
+
+        cp_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=SEQ,
+            max_seqlen_kv=SEQ,
+            pad_between_seqs=False,
+        )
+        cp_packed_seq_params.cp_scatter_cache = None
+        cp_packed_seq_params.cp_group = cp_group
+        cp_packed_seq_params.local_cp_size = 2
+
+        packed_seq_params.cp_scatter_cache = rl_utils._CPScatterCache(
+            seq_len=SEQ,
+            cp_group=cp_group,
+            cp_packed_seq_params=cp_packed_seq_params,
+            partition_index=partition_index,
+            inverse_gather_perm=torch.argsort(gather_perm),
+        )
+
+        logprobs = rl_utils.get_logprobs(
+            model,
+            tokens,
+            position_ids=position_ids,
+            no_grad=False,
+            sequence_packing=False,
+            packed_seq_params=packed_seq_params,
+        )
+
+        assert logprobs.shape == (1, SEQ - 1)
+        expected = torch.full_like(logprobs, -torch.log(torch.tensor(float(VOCAB))))
+        torch.testing.assert_close(logprobs, expected)
+
+        logprobs.sum().backward()
+        assert model.last_hidden_states.grad is not None
+        assert torch.isfinite(model.last_hidden_states.grad).all()
+        assert model.last_hidden_states.grad.abs().sum() > 0
     @pytest.mark.parametrize(
         "ratio, advantage, clamp_eps, kl_beta, entropy_weight, expected",
         [
