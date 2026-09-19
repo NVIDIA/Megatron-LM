@@ -20,10 +20,16 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.activations import squared_relu
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import moe_utils
-from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    SequentialMLP,
+    TEGroupedMLP,
+    _te_supports_scaled_tanh_srelu,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
@@ -295,6 +301,19 @@ def _moe_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
+class _InQuantizationContext(torch.nn.Module):
+    """Run the wrapped module inside MCore's FP8 autocast, as TransformerBlock does."""
+
+    def __init__(self, module, config):
+        super().__init__()
+        self.module = module
+        self.config = config
+
+    def forward(self, *args):
+        with get_fp8_context(self.config):
+            return self.module(*args)
+
+
 class TestMoEModules:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -399,6 +418,52 @@ class TestMoEModules:
 
         assert_replays_bit_exact(
             build_stacks, weights, backward=False, what="vLLM MXFP8 expert-weight stacking"
+        )
+
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])
+    def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser):
+        """Squared ReLU with the tanh soft clamp: the unfused weighted_squared_relu_impl path, and
+        the fused cuDNN srelu_tanh grouped GEMM (op fuser + MXFP8; SM100 and ScaledTanhSReLU)."""
+        if op_fuser:
+            if torch.cuda.get_device_capability()[0] < 10:
+                pytest.skip("fused grouped MLP under MXFP8 needs SM100+")
+            if not _te_supports_scaled_tanh_srelu():
+                pytest.skip("installed TE has no ScaledTanhSReLU")
+        self._init()
+        seeded()
+        config = _moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            bias_activation_fusion=False,
+            use_fused_weighted_squared_relu=True,
+            activation_func_tanh_clamp_scale=16.0,
+            use_transformer_engine_op_fuser=op_fuser,
+            **({"fp8": "e4m3", "fp8_recipe": "mxfp8"} if op_fuser else {}),
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+        with get_fp8_context(config, is_init=True):
+            experts = get_submodules(spec.submodules.mlp).experts(
+                num_local_experts=8,
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl is op_fuser
+        experts = experts.cuda()
+        tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(rows, device="cuda", requires_grad=True)
+        module = _InQuantizationContext(experts, config) if op_fuser else experts
+        assert_module_replays_bit_exact(
+            module,
+            (hidden, tokens_per_expert, probs),
+            replays=3,
+            contention=True,
+            what=f"TEGroupedMLP[tanh clamp, {'op fuser' if op_fuser else 'unfused'}]",
         )
 
     def test_sequential_mlp_replays_on_uneven_experts(self):
