@@ -829,20 +829,21 @@ class HyperConnectionModule(MegatronModule):
         self, h_res, original_residual, h_post, x, bias, dropout_prob, training
     ) -> Tensor:
         """Apply residual mixing and branch expansion once, preserving FP32 coefficients."""
-        streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
-        if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
-            return (
-                self._h_post_bda_op(
-                    h_res, streams, h_post, x.float(), None if bias is None else bias.float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
+            if self.config.use_fused_mhc and (not training or dropout_prob == 0.0):
+                return (
+                    self._h_post_bda_op(
+                        h_res, streams, h_post, x.float(), None if bias is None else bias.float()
+                    )
+                    .flatten(-2)
+                    .to(x.dtype)
                 )
-                .flatten(-2)
-                .to(x.dtype)
-            )
-        mixed = torch.einsum("sbij,sbic->sbjc", h_res.float(), streams)
-        branch = x.float() if bias is None else x.float() + bias.float()
-        expanded = h_post.float().unsqueeze(-1) * branch.unsqueeze(-2)
-        expanded = F.dropout(expanded, p=dropout_prob, training=training)
-        return (mixed + expanded).flatten(-2).to(x.dtype)
+            mixed = torch.einsum("sbij,sbic->sbjc", h_res.float(), streams)
+            branch = x.float() if bias is None else x.float() + bias.float()
+            expanded = h_post.float().unsqueeze(-1) * branch.unsqueeze(-2)
+            expanded = F.dropout(expanded, p=dropout_prob, training=training)
+            return (mixed + expanded).flatten(-2).to(x.dtype)
 
     def _fused_h_res_h_post_bda_native(
         self,
