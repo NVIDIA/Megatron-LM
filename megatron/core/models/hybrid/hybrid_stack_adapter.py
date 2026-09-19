@@ -3,7 +3,7 @@
 """Spec-injected forward extensions for the standard HybridStack layer loop."""
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from torch import Tensor
 
@@ -38,6 +38,8 @@ class HybridStackForwardAdapter(Protocol):
         """Initialize or validate the caller's per-forward state before the layer loop."""
         ...
 
-    def finalize_forward(self, output: Tensor, context: HybridStackForwardContext) -> Tensor:
+    def finalize_forward(
+        self, output: Tensor | tuple[Tensor, Tensor], context: HybridStackForwardContext
+    ) -> Any:
         """Return the stack output after final normalization and stream contraction."""
         ...
