@@ -1233,19 +1233,26 @@ def save_checkpoint(
             else:
                 logits_finalize_fns = []
             # Record run progress AFTER the logits tar is confirmed written, so a resumed job
-            # never skips or replays a window. Written by a single rank -- the last rank, which
-            # lives on the last pipeline stage where the logits saver is attached (get_logits_saver
-            # is None on earlier stages, including global rank 0 when PP > 1).
+            # never skips or replays a window. Written by the TP0/CP0/DP0 owner on the last
+            # pipeline stage -- deliberately *not* is_last_rank(), which has no guaranteed
+            # relationship to TP/CP ownership (tp_rank == tp_size - 1 there, by default, when
+            # tp_size > 1) and would attach this to a rank whose take_pending_data() is always
+            # empty, defeating the "AFTER the write" guarantee whenever tp_size > 1.
             if skip_weight_ckpt and (
-                not torch.distributed.is_initialized() or is_last_rank()
+                not torch.distributed.is_initialized()
+                or (
+                    logits_saver.tp_rank == 0
+                    and logits_saver.cp_rank == 0
+                    and logits_saver.dp_rank == 0
+                )
             ):
 
                 def progress_finalize_fn():
                     tracker_filename = get_checkpoint_tracker_filename(args.save)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
-                    print_rank_last(f"  recorded logits-dump progress: iteration "
-                                    f"{iteration} to {tracker_filename}")
+                    print(f"  recorded logits-dump progress: iteration "
+                          f"{iteration} to {tracker_filename}", flush=True)
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
