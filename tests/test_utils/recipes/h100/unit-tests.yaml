@@ -287,6 +287,29 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # Split the larger A2A files to fit the one-hour CI job limit. The bucket
+  # selector excludes these files from the remaining A2A bucket below.
+  - test_case: [tests/unit_tests/a2a_overlap/test_delay_wgrad_compute.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_fsdp_1f1b_overlap.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/a2a_overlap/**/*.py]
     products:
       - environment: [lts, dev]
