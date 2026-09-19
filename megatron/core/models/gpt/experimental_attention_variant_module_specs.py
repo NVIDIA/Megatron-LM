@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import warnings
 from typing import List, Optional
 
@@ -22,8 +23,20 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.experimental_attention_variant.qsa import (
+    QSACoreAttention,
+    QSAIndexer,
+    QSAIndexerSubmodules,
+    QwenSparseSelfAttention,
+    QwenSparseSelfAttentionSubmodules,
+)
+from megatron.core.transformer.hyper_connection import (
+    GatedResidualHyperConnection,
+    GatedResidualOutputMixer,
+    HyperConnectionModule,
+)
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.per_layer_embedding import PerLayerEmbedding
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
@@ -56,9 +69,16 @@ _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 
 
 def get_gated_delta_net_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig,
+    backend: BackendSpecProvider = None,
+    fuse_input_layernorm: bool = True,
 ) -> ModuleSpec:
-    """Build module spec for GatedDeltaNet attention."""
+    """Build module spec for GatedDeltaNet attention.
+
+    Args:
+        fuse_input_layernorm: Fuse the input layer norm into ``in_proj``. Set to ``False`` when
+            the layer input is already normalized (gated-residual hyper connections).
+    """
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
@@ -68,16 +88,67 @@ def get_gated_delta_net_module_spec(
     gdn_module = (
         GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
     )
+    in_proj = (
+        backend.column_parallel_layer_norm_linear()
+        if fuse_input_layernorm
+        else backend.column_parallel_linear()
+    )
     attention = ModuleSpec(
         module=gdn_module,
         submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
+            in_proj=in_proj,
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
-        metainfo={"fuse_input_layernorm": True},
+        metainfo={"fuse_input_layernorm": fuse_input_layernorm},
     )
     return attention
+
+
+def is_qsa_enabled(config: TransformerConfig) -> bool:
+    """Whether standard-attention layers of the hybrid pattern are Qwen Sparse Attention."""
+    return isinstance(getattr(config, "qsa_indexer_n_heads", None), int)
+
+
+def get_qsa_module_spec_for_backend(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Module spec for Qwen Sparse Attention (gated GQA attention + block-selecting indexer).
+
+    The input layer norm is never fused into ``linear_qkv``: the indexer consumes the same
+    (already normalized) layer input as the QKV projection.
+    """
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    rms_norm = config.normalization == "RMSNorm"
+    qk_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+    )
+    indexer = ModuleSpec(
+        module=QSAIndexer,
+        submodules=QSAIndexerSubmodules(
+            linear_qk=backend.linear(),
+            q_layernorm=backend.layer_norm(rms_norm=rms_norm, for_qk=True),
+            k_layernorm=backend.layer_norm(rms_norm=rms_norm, for_qk=True),
+        ),
+    )
+    core_attention = functools.partial(
+        QSACoreAttention, dense_core_attention=backend.core_attention()
+    )
+    return ModuleSpec(
+        module=QwenSparseSelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=QwenSparseSelfAttentionSubmodules(
+            linear_qkv=backend.column_parallel_linear(),
+            core_attention=core_attention,
+            linear_proj=backend.row_parallel_linear(),
+            q_layernorm=qk_norm,
+            k_layernorm=qk_norm,
+            indexer=indexer,
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
 
 
 def get_dsa_module_spec_for_backend(
@@ -194,6 +265,11 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
+    # Hyper connections: the gated-residual variant (Qwen4-Exp) normalizes the sub-layer input
+    # itself, so no (fused) input/pre-MLP layer norms are built.
+    use_hyper_connections = config.enable_mhc_connections
+    gated_residual = use_hyper_connections and config.mhc_variant == "gated_residual"
+
     # Get attention patterns and specs
     experimental_attention_pattern = [0] * config.num_layers
     if is_linear_attention_variant(config.experimental_attention_variant):
@@ -202,14 +278,31 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         experimental_attention_pattern = [1] * config.num_layers
 
     if 1 in experimental_attention_pattern:
-        experimental_attention_spec = get_experimental_attention_variant_module_spec(
-            config=config, backend=backend
-        )
+        if gated_residual and is_gated_delta_net_variant(config.experimental_attention_variant):
+            experimental_attention_spec = get_gated_delta_net_module_spec(
+                config=config, backend=backend, fuse_input_layernorm=False
+            )
+        else:
+            experimental_attention_spec = get_experimental_attention_variant_module_spec(
+                config=config, backend=backend
+            )
     else:
         experimental_attention_spec = None
 
     if 0 in experimental_attention_pattern:
-        standard_attention_spec = _get_self_attention_module_spec(config=config, backend=backend)
+        if is_qsa_enabled(config):
+            standard_attention_spec = get_qsa_module_spec_for_backend(
+                config=config, backend=backend
+            )
+        else:
+            standard_attention_spec = _get_self_attention_module_spec(
+                config=config, backend=backend
+            )
+            if gated_residual and standard_attention_spec.metainfo.get("fuse_input_layernorm"):
+                raise NotImplementedError(
+                    "Gated-residual hyper connections need a standard attention spec without a "
+                    "fused input layer norm; use QSA or a backend without layernorm-linear fusion."
+                )
     else:
         standard_attention_spec = None
 
@@ -235,9 +328,19 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
-    enable_mhc = config.enable_mhc_connections
-    hyper_connection = HyperConnectionModule if enable_mhc else IdentityOp
-    layer_module = HyperConnectionTransformerLayer if enable_mhc else TransformerLayer
+    if gated_residual and fuse_layernorm_pre_dense:
+        raise NotImplementedError(
+            "Gated-residual hyper connections need a dense MLP spec without a fused pre-MLP "
+            "layer norm."
+        )
+    if not use_hyper_connections:
+        hyper_connection = IdentityOp
+    elif gated_residual:
+        hyper_connection = GatedResidualHyperConnection
+    else:
+        hyper_connection = HyperConnectionModule
+    layer_module = HyperConnectionTransformerLayer if use_hyper_connections else TransformerLayer
+    ple_layer_ids = set(config.ple_layer_ids or []) if use_hyper_connections else set()
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -251,21 +354,33 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
             if moe_layer_pattern[layer_number] == 1
             else fuse_layernorm_pre_dense
         )
-        input_layernorm = (
-            IdentityOp
-            if attention.metainfo["fuse_input_layernorm"]
-            else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
-        )
-        pre_mlp_layernorm = (
-            IdentityOp
-            if fuse_pre_mlp_layernorm
-            else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+        if gated_residual:
+            # The hyper connection reads a normalized mix of the streams: no extra norms.
+            input_layernorm = IdentityOp
+            pre_mlp_layernorm = IdentityOp
+        else:
+            input_layernorm = (
+                IdentityOp
+                if attention.metainfo["fuse_input_layernorm"]
+                else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+            )
+            pre_mlp_layernorm = (
+                IdentityOp
+                if fuse_pre_mlp_layernorm
+                else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+            )
+
+        per_layer_embedding = (
+            ModuleSpec(module=PerLayerEmbedding)
+            if (layer_number + 1) in ple_layer_ids
+            else IdentityOp
         )
 
         layer_specs.append(
             ModuleSpec(
                 module=layer_module,
                 submodules=TransformerLayerSubmodules(
+                    per_layer_embedding=per_layer_embedding,
                     input_layernorm=input_layernorm,
                     self_attention=attention,
                     self_attn_bda=get_bias_dropout_add,
@@ -329,8 +444,13 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block spec
     rms_norm = config.normalization == "RMSNorm"
+    if config.enable_mhc_connections and config.mhc_variant == "gated_residual":
+        # Learned contraction of the residual streams replaces the final layer norm.
+        final_layer_norm = GatedResidualOutputMixer
+    else:
+        final_layer_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=False)
     gpt_decoder_block_spec = TransformerBlockSubmodules(
-        layer_specs=layer_specs, layer_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+        layer_specs=layer_specs, layer_norm=final_layer_norm
     )
 
     return gpt_decoder_block_spec
