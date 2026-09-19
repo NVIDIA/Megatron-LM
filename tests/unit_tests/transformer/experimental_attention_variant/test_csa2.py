@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -31,6 +32,7 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
 )
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_attention_spec,
+    get_csa2_module_spec_for_backend,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -42,11 +44,72 @@ from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import _make_config
 
 
+class _IEEEFP32Linear(nn.Module):
+    """TP=1 test backend separating attention math from TE's TF32 GEMM policy.
+
+    BF16 oracle and fused-attention cases still exercise the real TE projections.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        config,
+        init_method,
+        bias=False,
+        skip_bias_add=False,
+        **kwargs,
+    ):
+        super().__init__()
+        assert config.tensor_model_parallel_size == 1
+        self.weight = nn.Parameter(torch.empty(output_size, input_size, dtype=config.params_dtype))
+        self.bias = (
+            nn.Parameter(torch.zeros(output_size, dtype=config.params_dtype)) if bias else None
+        )
+        self.skip_bias_add = skip_bias_add
+        if config.perform_initialization:
+            init_method(self.weight)
+
+    def forward(self, hidden_states):
+        """Use IEEE PyTorch GEMM and the standard optional-bias return contract."""
+        bias = None if self.skip_bias_add else self.bias
+        return F.linear(hidden_states, self.weight, bias), self.bias if self.skip_bias_add else None
+
+
+class _IEEEFP32Backend(TESpecProvider):
+    """Keep real normalization/RoPE modules while making FP32 projections IEEE."""
+
+    def linear(self):
+        """Build an unpartitioned IEEE projection."""
+        return _IEEEFP32Linear
+
+    def column_parallel_linear(self):
+        """TP=1 column projection has the same IEEE contract."""
+        return _IEEEFP32Linear
+
+    def row_parallel_linear(self):
+        """TP=1 row projection has the same IEEE contract."""
+        return _IEEEFP32Linear
+
+
+def _attention_spec(dtype):
+    """Keep strict FP32 math tests independent of cached vendor GEMM precision."""
+    return (
+        get_csa2_module_spec_for_backend(_IEEEFP32Backend())
+        if dtype == torch.float32
+        else csa2_attention_spec
+    )
+
+
 @pytest.fixture(autouse=True)
-def ieee_fp32_oracle(monkeypatch):
-    # Tight FP32 oracle tolerances compare independent TE and torch GEMMs.
-    # Disable TF32 in both libraries, rather than weakening the math checks.
-    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+def ieee_fp32_oracle():
+    # CUDA libraries may cache NVIDIA_TF32_OVERRIDE before a per-test fixture runs.
+    # FP32 projection oracles therefore use the explicit IEEE backend above;
+    # BF16 continues to cover TE, including real fused forward/backward kernels.
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    yield
+    torch.backends.cuda.matmul.allow_tf32 = previous
 
 
 @pytest.mark.parametrize("ratio", [0, 1, 2])
@@ -82,7 +145,14 @@ def test_fused_attention_matches_native_for_multiple_batches(pg_collection, rati
     x = torch.randn(9, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     other = x.detach().clone().requires_grad_()
     expected = native(x, None)[0]
-    actual = fused(other, None)[0]
+    try:
+        actual = fused(other, None)[0]
+    except RuntimeError as error:
+        if torch.cuda.get_device_capability()[0] == 9 and "no kernel image is available" in str(
+            error
+        ):
+            pytest.skip("Installed FlashMLA was built without SM90 kernels")
+        raise
     # Match the existing CSA backend's BF16 kernel tolerance before projection.
     torch.testing.assert_close(core_outputs["fused"], core_outputs["native"], atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=3e-2)
@@ -126,7 +196,7 @@ def _layer(pg_collection, ratio, dtype=torch.float32, **overrides):
     config_values.update(overrides)
     config = _make_config(params_dtype=dtype, **config_values)
     layer = build_module(
-        csa2_attention_spec, config=config, layer_number=1, pg_collection=pg_collection
+        _attention_spec(dtype), config=config, layer_number=1, pg_collection=pg_collection
     ).cuda()
     # Nontrivial query magnitudes, gates, and sink expose normalization/softmax mistakes.
     with torch.no_grad():
@@ -406,7 +476,7 @@ def _layers(pg_collection, dtype=torch.float32, candidates=True):
         )
     )
     config = _make_config(params_dtype=dtype, dsa_indexer_topk=2, **overrides)
-    spec = csa2_attention_spec
+    spec = _attention_spec(dtype)
     layers = torch.nn.ModuleList(
         build_module(spec, config=config, layer_number=i + 1, pg_collection=pg_collection)
         for i in range(config.num_layers)

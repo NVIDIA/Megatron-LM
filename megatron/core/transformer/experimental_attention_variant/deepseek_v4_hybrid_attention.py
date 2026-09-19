@@ -22,7 +22,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -455,10 +455,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         )
 
         q_down_proj_kwargs = {}
-        if submodules.linear_q_down_proj in [TELinear]:
+        # The backend supplies a duplicated linear projection. Only TE requires
+        # an explicit parallel-mode selector; other builders own that contract.
+        q_down_proj_module = get_module(submodules.linear_q_down_proj)
+        if (
+            TELinear is not None
+            and isinstance(q_down_proj_module, type)
+            and issubclass(q_down_proj_module, TELinear)
+        ):
             q_down_proj_kwargs['parallel_mode'] = 'duplicated'
-        else:
-            raise ValueError(f"Unsupported linear_q_down_proj: {submodules.linear_q_down_proj}")
 
         self.linear_q_down_proj = build_module(
             submodules.linear_q_down_proj,
