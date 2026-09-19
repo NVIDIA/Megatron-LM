@@ -1884,11 +1884,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             if self.config.fp8 or self.config.fp4:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
+                tp_group = self.tp_group
+                if tp_group is None:
+                    # Compatibility fallback for layers constructed without explicit groups.
+                    tp_group = parallel_state.get_tensor_model_parallel_group()
                 return te_checkpoint(
                     custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    tp_group,
                     hidden_states,
                     decoder_input,
                     attention_mask,
