@@ -375,8 +375,9 @@ class FsdpParameterGroup:
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
         if isinstance(self.post_optimizer_model_weight, DBuffer):
-            assert isinstance(self.model_weight, DBuffer)
-            self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+            self.main_weight.cast(
+                self.post_optimizer_model_weight.dtype, out=self.post_optimizer_model_weight
+            )
         else:
             self.post_optimizer_model_weight.quantize_(self.main_weight)
         self._model_weight_is_stale = (
