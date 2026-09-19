@@ -21,7 +21,12 @@ _MAX_VIDEO_BYTES = 256 * 1024 * 1024  # 256 MiB
 _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.config import MultimodalPromptConfig
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.inference_request import (
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
+    prepare_multimodal_data,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -40,7 +45,12 @@ from ..openai_streaming import (
     json_safe_top_n_logprobs,
     openai_stream,
 )
-from .common import abort_requests
+from .common import (
+    abort_requests,
+    attach_stage_metadata,
+    collect_stage_metadata,
+    validate_offload_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -576,6 +586,34 @@ def _replace_prefix_tokens(
     return previous_turn_token_ids + current_turn_additional_token_ids
 
 
+def _has_previous_turn_tokens(last_assistant_message):
+    """True when the last assistant message carries the token ids of a previous
+    Megatron-Inference response, so the endpoint can replace the prefix with the exact prior turn here.
+    Dataset-provided conversation history won't have these fields."""
+    return last_assistant_message is not None and (
+        isinstance(last_assistant_message.get("prompt_token_ids"), list)
+        and isinstance(last_assistant_message.get("generation_token_ids"), list)
+    )
+
+
+def _last_assistant_message(template_messages):
+    """Return ``(index, message)`` of the last assistant turn, or ``(None, None)``."""
+    for i in reversed(range(len(template_messages))):
+        if template_messages[i]["role"] == "assistant":
+            return i, template_messages[i]
+    return None, None
+
+
+def _replace_prefix_tokens_metadata(eos_token_id, template_prefix_token_ids, offload_params):
+    """Ship the rendered prior-turn tokens so the engine's RequestPromptPreparer can replace the
+    prefix with the exact prior tokens itself (NeMo RL's ``replace_prefix_tokens``)."""
+    return {
+        **offload_params,
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: list(template_prefix_token_ids),
+        PREFIX_EOS_TOKEN_ID_FIELD: eos_token_id,
+    }
+
+
 def _apply_chat_template_sync(
     tokenizer, messages, tools, chat_template_kwargs, add_generation_prompt=True
 ):
@@ -761,6 +799,10 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        offload_params = req.get("offload_params")
+        offload_params_error = validate_offload_params(offload_params)
+        if offload_params_error is not None:
+            return Response(offload_params_error, status=400)
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
@@ -791,6 +833,26 @@ try:
             multi_modal_data = {"video": video_bytes_list}
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
+
+        # The exact tokens of the previous turn can come from one of two places, never both:
+        #  - the last assistant message, when the client echoed back the token ids of a
+        #    previous Megatron-Inference response (prefix replaced here), or
+        #  - a store the engine's RequestPromptPreparer can reach, when the client sent
+        #    offload_params (prefix replaced in the engine; we ship what the preparer needs).
+        last_assistant_message_idx, last_assistant_message = _last_assistant_message(
+            template_messages
+        )
+        has_previous_turn_tokens = _has_previous_turn_tokens(last_assistant_message)
+        if has_previous_turn_tokens and offload_params is not None:
+            return Response(
+                "prompt_token_ids/generation_token_ids on the last assistant message and "
+                "'offload_params' are mutually exclusive prefix sources",
+                status=400,
+            )
+        replace_prefix_tokens_here = prevent_retokenization and has_previous_turn_tokens
+        replace_prefix_tokens_in_engine = (
+            offload_params is not None and last_assistant_message is not None
+        )
 
         # Inject the server-configured chat template (e.g. pretraining.jinja for
         # VLM checkpoints). Loaded once at server startup from --chat-template
@@ -864,85 +926,72 @@ try:
                         ),
                     )
 
-                if prevent_retokenization:
-                    # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
+                if replace_prefix_tokens_here or replace_prefix_tokens_in_engine:
+                    # Replace the re-rendered prefix with the exact tokens of the previous turn.
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
-
-                    # Find the last assistant message
-                    last_assistant_message_idx = None
-                    for i in reversed(range(len(template_messages))):
-                        if template_messages[i]["role"] == "assistant":
-                            last_assistant_message_idx = i
-                            break
-
-                    last_assistant_message = (
-                        template_messages[last_assistant_message_idx]
-                        if last_assistant_message_idx is not None
-                        else None
-                    )
-
-                    # Only proceed if the last assistant message has the token IDs from a previous generation.
-                    # Dataset-provided conversation history won't have these fields.
-                    if (
-                        last_assistant_message is not None
-                        and isinstance(last_assistant_message.get("prompt_token_ids"), list)
-                        and isinstance(last_assistant_message.get("generation_token_ids"), list)
-                    ):
-                        messages_to_last_assistant_message = template_messages[
-                            : last_assistant_message_idx + 1
-                        ]
-                        previous_media_slots = [
-                            slot for slot in media_slots if slot[2] <= last_assistant_message_idx
-                        ]
+                    messages_to_last_assistant_message = template_messages[
+                        : last_assistant_message_idx + 1
+                    ]
+                    previous_media_slots = [
+                        slot for slot in media_slots if slot[2] <= last_assistant_message_idx
+                    ]
+                    if replace_prefix_tokens_here:
                         previous_prompt_token_ids = last_assistant_message.get(
                             "compact_prompt_token_ids"
                         )
                         if not isinstance(previous_prompt_token_ids, list):
-                            raise ValueError(
-                                "Prefix stitching requires compact_prompt_token_ids "
-                                "from the previous Megatron-Inference response."
-                            )
-                        eos_token_id = tokenizer.eos_id
-                        assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+                            if previous_media_slots:
+                                raise ValueError(
+                                    "Prefix stitching requires compact_prompt_token_ids "
+                                    "from the previous Megatron-Inference response."
+                                )
+                            previous_prompt_token_ids = last_assistant_message["prompt_token_ids"]
+                    eos_token_id = tokenizer.eos_id
+                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
-                        warnings.warn(
-                            "Avoiding prefix retokenization."
-                            " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
-                            " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                    warnings.warn(
+                        "Avoiding prefix retokenization."
+                        " This is a patch that ensures subsequent generations are not retokenized differently than the previous generation."
+                        " This may cause unexpected behavior if messages (including system messages) are altered between generations."
+                    )
+
+                    # Get the templated tokenization of just the previous generation.
+                    if previous_media_slots:
+                        retokenized_previous_turn_token_ids = (
+                            await asyncio.get_running_loop().run_in_executor(
+                                current_app.config.get('tokenize_executor'),
+                                partial(
+                                    _tokenize_with_media_slots_sync,
+                                    tokenize_chat_tok,
+                                    messages_to_last_assistant_message,
+                                    previous_media_slots,
+                                    prompt_config,
+                                    tools=template_tools,
+                                    chat_template_kwargs=chat_template_kwargs,
+                                    add_generation_prompt=False,
+                                ),
+                            )
+                        )
+                    else:
+                        retokenized_previous_turn_token_ids = (
+                            await asyncio.get_running_loop().run_in_executor(
+                                current_app.config.get('tokenize_executor'),
+                                partial(
+                                    _apply_chat_template_sync,
+                                    tokenize_chat_tok,
+                                    messages_to_last_assistant_message,
+                                    template_tools,
+                                    chat_template_kwargs,
+                                    add_generation_prompt=False,
+                                ),
+                            )
                         )
 
-                        # Get the templated tokenization of just the previous generation.
-                        if previous_media_slots:
-                            retokenized_previous_turn_token_ids = (
-                                await asyncio.get_running_loop().run_in_executor(
-                                    current_app.config.get('tokenize_executor'),
-                                    partial(
-                                        _tokenize_with_media_slots_sync,
-                                        tokenize_chat_tok,
-                                        messages_to_last_assistant_message,
-                                        previous_media_slots,
-                                        prompt_config,
-                                        tools=template_tools,
-                                        chat_template_kwargs=chat_template_kwargs,
-                                        add_generation_prompt=False,
-                                    ),
-                                )
-                            )
-                        else:
-                            retokenized_previous_turn_token_ids = (
-                                await asyncio.get_running_loop().run_in_executor(
-                                    current_app.config.get('tokenize_executor'),
-                                    partial(
-                                        _apply_chat_template_sync,
-                                        tokenize_chat_tok,
-                                        messages_to_last_assistant_message,
-                                        template_tools,
-                                        chat_template_kwargs,
-                                        add_generation_prompt=False,
-                                    ),
-                                )
-                            )
-
+                    if replace_prefix_tokens_in_engine:
+                        offload_params = _replace_prefix_tokens_metadata(
+                            eos_token_id, retokenized_previous_turn_token_ids, offload_params
+                        )
+                    else:
                         previous_turn_token_ids = (
                             previous_prompt_token_ids
                             + last_assistant_message["generation_token_ids"]
@@ -1067,15 +1116,11 @@ try:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
-        # TODO(perf): with n > 1, the same ``image_bytes_list`` is forwarded n
-        # times, and every admission independently re-preprocesses the bytes
-        # and runs the vision encoder. The engine has an
-        # ``ImageProcessingConfig`` that could preprocess once here if it were
-        # plumbed to the HTTP layer; embedding-level reuse across the n
-        # requests would need a wider change (compute embeddings once, ship
-        # them as a serialized tensor dict on the wire, skip the encoder for
-        # admissions 2..n). Kept as a known limitation for a follow-up so this
-        # PR stays scoped.
+        # Hash and serialize shared media once before fanning one prompt out to
+        # multiple independently sampled choices. Each request still carries
+        # its own media payload, while coordinator affinity keeps equivalent
+        # requests on the engine that owns the cached vision embedding.
+        prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -1089,7 +1134,10 @@ try:
 
             streams = [
                 client.add_request_streaming(
-                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=prepared_multimodal_data,
+                    offload_params=offload_params,
                 )
                 for _ in range(n)
             ]
@@ -1157,7 +1205,10 @@ try:
         try:
             for _ in range(n):
                 request_id, future = client.add_request_with_id(
-                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=prepared_multimodal_data,
+                    offload_params=offload_params,
                 )
                 request_ids.append(request_id)
                 tasks.append(future)
@@ -1235,10 +1286,12 @@ try:
         # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
         response_uid = None
+        response_metadata = {}
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
             if response_uid is None:
                 response_uid = result["uid"]
+            collect_stage_metadata(response_metadata, result)
 
             text_output = TextGenerationController.detokenize(
                 tokenizer,
@@ -1254,9 +1307,12 @@ try:
             prompt_tokens_counts.append(prompt_tokens_count)
             cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
+            # Under payload offload the engine dropped the per-token log probs from the reply
+            # so the OpenAI logprobs block is absent.
+            payload_offloaded = bool(result.get("payload_offloaded"))
             logprobs_content = None
-            if sampling_params.return_log_probs:
-                token_logprobs = json_safe_logprobs(result.get('log_probs') or [])
+            if sampling_params.return_log_probs and not payload_offloaded:
+                token_logprobs = json_safe_logprobs(result.get("generated_log_probs") or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))
@@ -1324,7 +1380,7 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            if return_tokenized_data:
+            if return_tokenized_data and not payload_offloaded:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
                 # (post vision/video expansion). Preserve the exact compact form
                 # separately for lossless multi-turn prefix stitching.
@@ -1333,11 +1389,12 @@ try:
                     result.get("compact_prompt_tokens") or result["prompt_tokens"]
                 )
                 message["generation_token_ids"] = result["generated_tokens"]
-            if return_raw_text:
+            if return_raw_text and not payload_offloaded:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            # Small RL/debug scalars (a few bytes each); harmless to keep for NeMo-RL compatibility.
-            message["generation_log_probs"] = result.get("generated_log_probs", [])
+            if not payload_offloaded:
+                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
+                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -1361,7 +1418,7 @@ try:
                 "index": request_idx,
                 "message": message,
                 # 'logprobs' in chat API is an object containing 'content'
-                "logprobs": {"content": logprobs_content} if return_log_probs else None,
+                "logprobs": {"content": logprobs_content} if logprobs_content is not None else None,
                 "finish_reason": finish_reason,
             }
             if current_app.config['verbose']:
@@ -1375,7 +1432,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if result.get("generated_log_probs") is None:
+            if not payload_offloaded and result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
@@ -1398,6 +1455,7 @@ try:
                 "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
+        attach_stage_metadata(response, response_metadata)
 
         if HAVE_ORJSON:
             # Use orjson for faster serialization

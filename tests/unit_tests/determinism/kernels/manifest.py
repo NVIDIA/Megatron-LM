@@ -167,10 +167,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
         ),
-        tests=(K + "test_fused_activations.py",),
+        tests=(
+            K + "test_fused_activations.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
+        ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
-        "the rest of the file is orchestration around registered TE / RoPE / CSA kernels.",
+        "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
+        "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
     ),
     # ---------------------------------------------------------------- Megatron Triton fusions
     KernelEntry(
@@ -424,6 +428,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
     ),
     KernelEntry(
+        name="tensor_metric_l2",
+        sources=("megatron/training/tensor_metrics/definitions.py",),
+        tests=(K + "test_optimizer_kernels.py",),
+        kind="dispatch",
+        notes="L2NormMetric dispatches TE multi_tensor_l2norm with per-tensor output enabled, "
+        "then squares each norm. Replayed for FP16, BF16 and FP32 batches under side-stream "
+        "contention, with the per-tensor fallback forbidden so the fused path is exercised.",
+    ),
+    KernelEntry(
         name="ddp_grad_buffer_reductions",
         sources=("megatron/core/distributed/param_and_grad_buffer.py",),
         tests=(C + "test_gpt_model.py",),
@@ -435,6 +448,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/nccl_allocator.py",),
         kind="cuda-ext",
         exempt_reason="Pluggable allocator (ncclMemAlloc); allocation only, no compute kernel.",
+    ),
+    KernelEntry(
+        name="vmm_symm_allocator",
+        sources=("megatron/core/allocator/vmm_symm_allocator.py",),
+        kind="cuda-ext",
+        exempt_reason="Pluggable allocator (CUDA VMM driver calls); allocation only, no "
+        "compute kernel.",
     ),
     # ---------------------------------------------------------------- inference (single GPU)
     KernelEntry(
@@ -454,6 +474,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/batch_invariant.py",
             "megatron/core/inference/moe/permute.py",
             "megatron/core/inference/moe/vllm_fused_moe.py",
+            "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
         tests=(K + "test_inference_kernels.py",),
@@ -467,6 +488,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/custom_layers/batch_invariant_kernels.py",),
         tests=(
             K + "test_inference_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
         ),
         kind="triton",
@@ -638,6 +660,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
+    ),
+    # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
+    KernelEntry(
+        name="csa_teacher_lse",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
+        ),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(

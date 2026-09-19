@@ -179,8 +179,8 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
     def _check_stop_words_for_request_post_append(self, request):
         for stop_word_ids in request.stop_word_ids or []:
             if request.generated_tokens[-len(stop_word_ids) :] == stop_word_ids:
-                return True, 0
-        return False, 0
+                return True, 0, 0
+        return False, 0, 0
 
 
 def _meta(request_id):
@@ -248,6 +248,7 @@ def test_prefilled_decode_admission_uses_exact_ssm_state_without_prompt_tokens()
         request_output_lengths=torch.zeros(2, dtype=torch.int32),
         request_in_prefill_status_tensor=torch.ones(2, dtype=torch.int32),
         request_kv_block_counts=torch.zeros(2, dtype=torch.int32),
+        mtp_metadata=SimpleNamespace(reset_request_rows=mock.Mock()),
         request_last_kv_block_id=torch.full((2,), -1, dtype=torch.int32),
         request_last_kv_block_offset=torch.zeros(2, dtype=torch.int32),
         token_to_input_ids=torch.zeros(8, dtype=torch.int64),
@@ -284,6 +285,7 @@ def test_prefilled_decode_admission_uses_exact_ssm_state_without_prompt_tokens()
     assert context.token_to_block_idx[:3].tolist() == [10, 11, 11]
     assert context.mamba_metadata.request_to_mamba_state_idx[0].item() == 10
     assert request.remaining_prompt_length == 0
+    context.mtp_metadata.reset_request_rows.assert_called_once_with(0)
 
 
 def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff_loop):
@@ -767,16 +769,23 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     engine.finished_request_count = 0
     engine.use_coordinator = False
     engine.is_mp_coordinator = False
-    engine.controller = SimpleNamespace(
-        tokenizer=object(), detokenize=mock.Mock(side_effect=["prompt", "answer"])
-    )
+    tokenizer = SimpleNamespace(eod=None, detokenize=mock.Mock(return_value="answer"))
+
+    def complete_request(request_entry):
+        finished_request = request_entry.record.merge()
+        request_entry.future.set_result(finished_request)
+        return finished_request
+
+    engine._complete_request = complete_request
 
     engine._complete_handoff_request_without_forward(7)
 
     assert request.status == Status.COMPLETED
     assert request.generated_length == 1
-    assert request.generated_text == "answer"
-    assert request_future.result() is record
+    finished_request = request_future.result()
+    assert isinstance(finished_request, DynamicInferenceRequest)
+    assert finished_request.generated_text is None
+    assert finished_request.finalize_text(tokenizer).generated_text == "answer"
     assert engine.finished_request_count == 1
     assert 7 not in engine.requests
 

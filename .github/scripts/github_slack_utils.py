@@ -53,7 +53,12 @@ def get_headers(token_env: str = "GH_TOKEN") -> dict[str, str]:
 
 
 def get_user_email(username: str) -> str:
-    """Resolve a GitHub username to an email, preferring @nvidia.com addresses."""
+    """Resolve an email from the profile or recent commits by the GitHub user.
+
+    Prefer NVIDIA author emails over sign-offs, which may belong to collaborators
+    on squashed PRs. Rank addresses by the number of commits containing them,
+    leaving ties unresolved.
+    """
 
     if username in _email_cache:
         return _email_cache[username]
@@ -64,6 +69,8 @@ def get_user_email(username: str) -> str:
 
     headers = get_headers()
     public_email = None
+    author_email_counts = {}
+    signoff_counts = {}
 
     try:
         response = requests.get(f"{GITHUB_API_URL}/users/{username}", headers=headers, timeout=30)
@@ -81,25 +88,46 @@ def get_user_email(username: str) -> str:
         response = requests.get(commits_url, headers=headers, timeout=30)
         if response.status_code == 200:
             for commit in response.json():
+                # Co-author attribution must not resolve to the primary author's email.
+                author_login = (commit.get("author") or {}).get("login") or ""
+                if author_login.casefold() != username.casefold():
+                    continue
+
                 commit_data = commit.get("commit", {})
                 author_data = commit_data.get("author", {})
                 email = author_data.get("email")
 
                 if email and not email.endswith("@users.noreply.github.com"):
                     if email.endswith("@nvidia.com"):
-                        _email_cache[username] = email
-                        print(f"Found @nvidia.com email for {username} from commits")
-                        return email
-                    if public_email is None:
+                        email = email.casefold()
+                        author_email_counts[email] = author_email_counts.get(email, 0) + 1
+                    elif public_email is None:
                         public_email = email
 
-                signoff_matches = re.findall(
-                    r"Signed-off-by:.*<([^>]+@nvidia\.com)>", commit_data.get("message", "")
-                )
-                if signoff_matches:
-                    _email_cache[username] = signoff_matches[0]
-                    print(f"Found @nvidia.com email for {username} from Signed-off-by")
-                    return signoff_matches[0]
+                signoff_emails = {
+                    email.casefold()
+                    for email in re.findall(
+                        r"^Signed-off-by:[ \t]*[^<>\r\n]*" r"<([^<>\s]+@nvidia\.com)>[ \t]*\r?$",
+                        commit_data.get("message", ""),
+                        flags=re.MULTILINE | re.IGNORECASE,
+                    )
+                }
+                # Repeated trailers in one squash commit count as only one observation.
+                for email in signoff_emails:
+                    signoff_counts[email] = signoff_counts.get(email, 0) + 1
+
+        # Check all recent author emails before falling back to sign-offs.
+        email_counts = author_email_counts or signoff_counts
+        source = "commit authors" if author_email_counts else "Signed-off-by"
+        if email_counts:
+            highest_count = max(email_counts.values())
+            candidates = [email for email, count in email_counts.items() if count == highest_count]
+            if len(candidates) == 1:
+                email = candidates[0]
+                _email_cache[username] = email
+                print(f"Found @nvidia.com email for {username} from {source}")
+                return email
+            print(f"Warning: Equally common NVIDIA emails for {username} from {source}")
 
         if public_email:
             _email_cache[username] = public_email

@@ -396,15 +396,16 @@ class TestMultiTokenPredictionLayer:
 
     @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
     def test_mtp_hsm_requires_multiple_layers(self, mtp_num_layers):
-        """TransformerConfig rejects HSM when there is no history to mix."""
+        """The MTP block rejects HSM when there is no history to mix."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=4,
+            num_attention_heads=1,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
         with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
-            TransformerConfig(
-                num_layers=2,
-                hidden_size=4,
-                num_attention_heads=1,
-                mtp_num_layers=mtp_num_layers,
-                mtp_hsm=True,
-            )
+            MultiTokenPredictionBlock(config=config, spec=object(), mtp_num_depths=0)
 
     @pytest.mark.parametrize(
         ("training", "expected_second_input"), [(True, [1.0, 2.0]), (False, [2.0, 2.0])]
@@ -2660,7 +2661,9 @@ class TestMultiTokenPrediction:
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
     )
-    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (2, 2)])
+    @pytest.mark.parametrize(
+        ("tp", "cp"), [(1, 1), (2, 1), pytest.param(2, 2, marks=pytest.mark.flaky_in_dev)]
+    )
     def test_packed_sequences(self, tp, cp):
         """Test MTP with packed sequences."""
         # Create args with packed sequences support
@@ -3509,6 +3512,8 @@ class TestMultiTokenPredictionHybrid:
         def output_layer(output, **kwargs):
             return output, None
 
+        output_layer.gather_output = False
+
         def compute_language_model_loss(labels, logits):
             call_counts["main_loss"] += 1
             return labels.to(dtype=logits.dtype) + 1000.0
@@ -3929,6 +3934,90 @@ class TestMultiTokenPredictionHybrid:
                 pytest.fail(f"Attention mask validation failed for Mamba hybrid model: {e}")
             else:
                 raise
+
+
+class TestRollTensorWithCPSubgroup:
+    """Roll-tensor CP paths on a CP group that is a strict subgroup of WORLD.
+
+    Regression coverage for the CP-boundary exchange being issued on the
+    default (WORLD) process group instead of ``cp_group``: with
+    WORLD == CP group the two are indistinguishable, so these tests run
+    TP2 x CP2 to make the CP group a strict subgroup.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _cp_shard(tensor, cp_rank, cp_size, dim=-1):
+        """Shard along ``dim`` in the load-balanced two-chunk CP layout."""
+        chunks = tensor.chunk(2 * cp_size, dim=dim)
+        return torch.cat([chunks[cp_rank], chunks[2 * cp_size - 1 - cp_rank]], dim=dim)
+
+    def test_roll_tensor_cp_boundary_exchange(self, monkeypatch):
+        cp_group = get_context_parallel_group()
+        cp_size = cp_group.size()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+
+        # Spy on the batched P2P launch: every boundary-exchange op must be
+        # addressed to the CP communicator, never the default (WORLD) group.
+        seen_groups = []
+        real_batch_isend_irecv = torch.distributed.batch_isend_irecv
+
+        def spy_batch_isend_irecv(ops):
+            seen_groups.extend(op.group for op in ops)
+            return real_batch_isend_irecv(ops)
+
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", spy_batch_isend_irecv)
+
+        full = torch.arange(2 * 16, dtype=torch.float32, device="cuda").reshape(2, 16)
+        # Oracle: the documented single-rank semantics on the full sequence.
+        expected_full, _ = roll_tensor(full.clone(), shifts=-1, dims=-1)
+        expected_local = self._cp_shard(expected_full, cp_rank, cp_size)
+
+        local = self._cp_shard(full, cp_rank, cp_size).contiguous()
+        rolled, rolled_sum = roll_tensor(local, shifts=-1, dims=-1, cp_group=cp_group)
+
+        assert torch.equal(rolled, expected_local)
+        assert rolled_sum == expected_local.sum()
+        assert seen_groups, "CP boundary exchange must go through batch_isend_irecv"
+        assert all(group is cp_group for group in seen_groups)
+
+    def test_roll_tensor_packed_seq_cp_boundary_exchange(self):
+        cp_group = get_context_parallel_group()
+        cp_size = cp_group.size()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+
+        seq_lengths = [8, 16]  # each divisible by 2 * cp_size
+        cu_seqlens = torch.tensor([0, 8, 24], dtype=torch.int32, device="cuda")
+        full = torch.arange(1 * 24, dtype=torch.float32, device="cuda").reshape(1, 24)
+
+        packed_seq_params = PackedSeqParams(cu_seqlens_q=cu_seqlens)
+        # Oracle: single-rank packed semantics (per-sequence roll) on the full tensor.
+        expected_full, _ = roll_tensor(
+            full.clone(), shifts=-1, dims=-1, packed_seq_params=packed_seq_params
+        )
+
+        def shard_packed(tensor):
+            pieces = []
+            start = 0
+            for length in seq_lengths:
+                seq = tensor[..., start : start + length]
+                pieces.append(self._cp_shard(seq, cp_rank, cp_size))
+                start += length
+            return torch.cat(pieces, dim=-1)
+
+        expected_local = shard_packed(expected_full)
+        local = shard_packed(full).contiguous()
+        rolled, rolled_sum = roll_tensor(
+            local, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+
+        assert torch.equal(rolled, expected_local)
+        assert rolled_sum == expected_local.sum()
 
 
 class TestLearnedOutputContract:

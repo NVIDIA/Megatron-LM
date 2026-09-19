@@ -7,6 +7,7 @@ import time
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import detokenize_tokens
 
 from .common import (
     generation_config_sampling_defaults,
@@ -15,7 +16,12 @@ from .common import (
 )
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
-from .common import abort_requests
+from .common import (
+    abort_requests,
+    attach_stage_metadata,
+    collect_stage_metadata,
+    validate_offload_params,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +41,13 @@ try:
         req = await request.get_json(force=True)
         if req is None:
             return "Invalid or missing JSON body", 400
+
+        # Opaque metadata forwarded to the engine's payload stager. Keys starting
+        # with '_' are engine-owned and rejected here so a client cannot forge them.
+        offload_params = req.get("offload_params")
+        offload_params_error = validate_offload_params(offload_params)
+        if offload_params_error is not None:
+            return offload_params_error, 400
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -222,11 +235,17 @@ try:
                     # keep the prompt tokens on the payload (default is now to drop them).
                     return_prompt_tokens=True,
                     streaming_interval=sampling_params.streaming_interval,
+                    # This frontend detokenizes its own output while formatting the response.
+                    # Keep that work off the coordinator so it can forward the reply body unchanged.
+                    detokenize_generations=False,
                 )
                 if stream_requested:
                     tasks.append(
                         client.add_request_streaming(
-                            prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                            prompt_tokens,
+                            per_req_params,
+                            multi_modal_data=multi_modal_data,
+                            offload_params=offload_params,
                         )
                     )
                 else:
@@ -234,7 +253,10 @@ try:
                     # writes nothing to the socket while generating, so a disconnect
                     # is never discovered as a broken pipe. Aborting needs the ids.
                     request_id, future = client.add_request_with_id(
-                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                        prompt_tokens,
+                        per_req_params,
+                        multi_modal_data=multi_modal_data,
+                        offload_params=offload_params,
                     )
                     request_ids.append(request_id)
                     tasks.append(future)
@@ -315,17 +337,24 @@ try:
 
         request_idx = 0
         response_uid = None
+        response_metadata = {}
         for completed_request in batch_results:
             result = unwrap_serialized_tensors(completed_request)
             if response_uid is None:
                 response_uid = result["uid"]
-            full_text = result["generated_text"] or ""
+            collect_stage_metadata(response_metadata, result)
+            generated_tokens = result.get("generated_tokens") or []
+            full_text = detokenize_tokens(
+                tokenizer, generated_tokens, remove_EOD=not sampling_params.detokenize_stop_sequence
+            )
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
-            generated_tokens = result.get("generated_tokens") or []
             prompt_tokens_list = result.get("prompt_tokens") or []
             total_completion_tokens += len(generated_tokens)
-            prompt_tokens_counts.append(len(prompt_tokens_list))
+            prompt_token_count = result.get("prompt_length")
+            if prompt_token_count is None:
+                prompt_token_count = len(prompt_tokens_list)
+            prompt_tokens_counts.append(prompt_token_count)
 
             finish_reason = "length"
             sampling_params_result = result.get("sampling_params") or {}
@@ -333,11 +362,15 @@ try:
             if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
                 finish_reason = "stop"
 
+            # Under payload offload the engine dropped the per-token log probs from the reply,
+            # so the OpenAI logprobs block is absent.
+            payload_offloaded = bool(result.get("payload_offloaded"))
+
             # Clamped: processed logprobs can be -inf, which JSON cannot carry.
             generated_log_probs = json_safe_logprobs(result.get('generated_log_probs') or [])
 
             logprobs_data = None
-            if sampling_params.return_log_probs:
+            if sampling_params.return_log_probs and not payload_offloaded:
                 prompt_tokens_list = result["prompt_tokens"] or []
 
                 prompt_log_probs = json_safe_logprobs(result.get('prompt_log_probs') or [])
@@ -408,8 +441,17 @@ try:
                 "finish_reason": finish_reason,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": generated_log_probs,
             }
+            if not payload_offloaded:
+                choice_data["generation_log_probs"] = generated_log_probs
+
+            # Speculative decoding (e.g. MTP): per-engine-step emitted token counts, summing to
+            # the generated token count. Empty/None when spec decoding is off. `ttft` is the real
+            # time-to-first-token in seconds; `tpot` is a SPARSE per-token step-time sample (only
+            # populated on logging steps), so a dense TPOT must come from ttft + total latency.
+            choice_data["acceptance_step_lengths"] = result.get("acceptance_step_lengths")
+            choice_data["ttft"] = result.get("ttft")
+            choice_data["tpot"] = result.get("tpot")
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -425,20 +467,23 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
-        return jsonify(
-            {
-                "id": response_uid,
-                "object": "text_completion",  # as per the openAI spec
-                "created": int(time.time()),
-                "model": "EMPTY",
-                "choices": choices,
-                "usage": {
-                    "prompt_tokens": prompt_token_count,
-                    "completion_tokens": total_completion_tokens,
-                    "total_tokens": prompt_token_count + total_completion_tokens,
-                },
-            }
-        )
+        response = {
+            "id": response_uid,
+            "object": "text_completion",  # as per the openAI spec
+            "created": int(time.time()),
+            "model": "EMPTY",
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": prompt_token_count,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": prompt_token_count + total_completion_tokens,
+            },
+        }
+        # Under payload offload the stager's response metadata (e.g. a store handle
+        # for the log probs dropped from the reply) rides at the top level, as it
+        # does on /v1/chat/completions.
+        attach_stage_metadata(response, response_metadata)
+        return jsonify(response)
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")

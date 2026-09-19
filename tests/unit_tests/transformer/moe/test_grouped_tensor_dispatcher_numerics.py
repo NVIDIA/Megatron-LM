@@ -48,6 +48,14 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _allow_nondeterministic_grouped_dbias():
+    """Allow TE's nondeterministic grouped-dbias kernel for tolerance-based comparisons."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
+        yield
+
+
 _ALIGN_SIZE = 256
 _HIDDEN_SIZE = 256
 _MOE_FFN_HIDDEN_SIZE = 256
