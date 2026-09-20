@@ -47,8 +47,7 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     Can't use pytest `tmp_path_factory` directly because directory must be shared between processes.
     """
 
-    tmp_dir = tmp_path_factory.mktemp('ignored', numbered=False)
-    tmp_dir = tmp_dir.parent.parent / 'tmp_dist_ckpt'
+    tmp_dir = tmp_path_factory.getbasetemp().parent / 'tmp_dist_ckpt'
 
     if Utils.rank == 0:
         with TempNamedDir(tmp_dir, sync=False):
