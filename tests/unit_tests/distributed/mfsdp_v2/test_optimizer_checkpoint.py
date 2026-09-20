@@ -362,6 +362,28 @@ class TestOptimizerCheckpoint:
         torch.distributed.all_gather_object(nonempty_flags, local_nonempty)
         assert any(nonempty_flags), "All ranks had empty local shards."
 
+    def test_sharded_state_dict_before_any_step_has_no_state(self) -> None:
+        """A save before the first optimizer step emits no per-parameter state at all.
+
+        Nothing has stepped, so no parameter has ``exp_avg``/``exp_avg_sq`` on any rank. The
+        entries must then be absent rather than present-and-empty: the ``fsdp_dtensor``
+        handlers in :mod:`megatron.core.transformer.fsdp_dtensor_checkpoint` check ``state``
+        for emptiness as a whole and then index ``exp_avg`` per entry, so a mapping of empty
+        mappings raises ``KeyError`` where an empty mapping is handled. ``--ckpt-convert-format``
+        saves exactly here, before training starts.
+        """
+        config = _transformer_config()
+        model, optimizer = _build_model_and_optimizer(config, self.pg_collection, zero_init=False)
+
+        state_dict = optimizer.sharded_state_dict({})
+
+        assert state_dict["state"] == {}, (
+            "An un-stepped optimizer must contribute no per-parameter state, got "
+            f"{ {fqn: sorted(entry) for fqn, entry in state_dict['state'].items()} }"
+        )
+        # The param groups are still described, which is what carries the hyperparameters.
+        assert state_dict["param_to_group_meta"], "param_to_group_meta should still be emitted"
+
     def test_tied_parameter_roundtrip(self, tmp_path_dist_ckpt: Path) -> None:
         """A tied weight is saved once, under one of its FQNs, and restored bit-exactly.
 
