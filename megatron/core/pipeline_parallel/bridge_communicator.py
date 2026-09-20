@@ -212,6 +212,15 @@ class BridgeCommunicator:
         self.build_comm_map(self.src_tp_leaders, self.dest_tp_leaders)
         dist.barrier()
 
+    def _validate_send_dtype(self, tensor: torch.Tensor, operation: str) -> None:
+        """Fail before entering NCCL when a sender disagrees with the receive dtype."""
+        if self.comm_dtype is not None and tensor.dtype != self.comm_dtype:
+            raise TypeError(
+                f"[Bridge Communicator] [{operation}] Rank {self.current_rank} is sending "
+                f"{tensor.dtype}, but the bridge receive dtype is {self.comm_dtype} "
+                f"({self.src_module_name} -> {self.dest_module_name})."
+            )
+
     @property
     def _batch_dim(self) -> int:
         """Get the tensor dimension used for fan-in/fan-out (cat/split).
@@ -407,6 +416,7 @@ class BridgeCommunicator:
             raise RuntimeError("cannot skip backward for a source tensor that requires gradients")
 
         if rank_info.role == CommRole.SENDER:
+            self._validate_send_dtype(tensor_to_send, "send_forward")
             # Send splits to destination ranks
             num_sends = len(rank_info.send_to_ranks)
             if num_sends > 0:
@@ -604,6 +614,7 @@ class BridgeCommunicator:
             assert (
                 self.current_rank == self.dest_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
+            self._validate_send_dtype(grad_tensor, "send_backward")
             # Send gradients back to source ranks
             num_receives = len(rank_info.recv_from_ranks)
             tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
@@ -771,6 +782,7 @@ class BridgeCommunicator:
             assert (
                 self.current_rank == self.src_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
+            self._validate_send_dtype(input_tensor, "send_forward_recv_backward")
 
             num_sends = len(rank_info.send_to_ranks)
             activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
@@ -911,6 +923,7 @@ class BridgeCommunicator:
             assert (
                 self.current_rank == self.dest_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
+            self._validate_send_dtype(grad_tensor, "send_backward_recv_forward")
 
             num_receives = len(rank_info.recv_from_ranks)
             gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)

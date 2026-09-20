@@ -3792,6 +3792,9 @@ try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
 
     _TE_SUPPORTS_CG_CAPTURABLE = is_te_min_version("2.7.0")
+    _TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT = (
+        "overwrite_input" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -3799,15 +3802,24 @@ try:
         labels: torch.Tensor,
         tp_group: torch.distributed.ProcessGroup,
         is_cg_capturable: bool = False,
+        overwrite_input: bool = True,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel"""
+        parallel_cross_entropy_kwargs = {
+            "label_smoothing": 0.0,
+            "reduce_loss": False,
+            "dist_process_group": tp_group,
+        }
+        if _TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT:
+            # TransformerEngine will reuse the input buffer for dgrad if overwrite_input=True.
+            # Supported after https://github.com/NVIDIA/TransformerEngine/pull/3273.
+            parallel_cross_entropy_kwargs["overwrite_input"] = overwrite_input
         if _TE_SUPPORTS_CG_CAPTURABLE:
+            # Use the CUDA graph-capturable version of the loss function.
+            parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
-            return parallel_cross_entropy(
-                logits, labels, 0.0, False, tp_group, -100, is_cg_capturable
-            )
-        else:
-            return parallel_cross_entropy(logits, labels, 0.0, False, tp_group)
+            parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
@@ -3819,12 +3831,15 @@ def te_cross_entropy(
     tp_group: torch.distributed.ProcessGroup | None = None,
     *,
     cuda_graph_capturable: bool = False,
+    overwrite_input: bool = True,
 ) -> torch.Tensor:
     """Adapt TE cross entropy to the backend target signature and required label stride."""
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-    return te_parallel_cross_entropy(logits, labels, tp_group, cuda_graph_capturable)
+    return te_parallel_cross_entropy(
+        logits, labels, tp_group, cuda_graph_capturable, overwrite_input=overwrite_input
+    )
 
 
 try:
