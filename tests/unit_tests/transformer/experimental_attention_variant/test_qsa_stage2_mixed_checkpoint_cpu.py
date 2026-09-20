@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.qsa import (
     QSACoreAttention,
@@ -115,3 +116,50 @@ def test_qsa_core_uses_bound_selection_even_after_module_field_is_overwritten():
         assert bound.compressed_key is detached_key
     with pytest.raises(RuntimeError, match="omitted differentiable indexer tensors"):
         core(query, key, key, None, qsa_selection=first)
+
+
+@pytest.mark.parametrize("loss_coeff", [0.0, 0.7])
+@pytest.mark.parametrize("raise_in_core", [False, True])
+def test_qsa_forward_clears_selection_on_success_and_exception(
+    monkeypatch, loss_coeff, raise_in_core
+):
+    attention = object.__new__(QwenSparseSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.config = SimpleNamespace(
+        qsa_indexer_loss_coeff=loss_coeff, attention_dropout=0.0, tensor_model_parallel_size=1
+    )
+    attention.pg_collection = SimpleNamespace(tp=None)
+    selection = _selection(8)
+    stored = []
+    core = SimpleNamespace(sparse_backend="id_sparse", _selection=None)
+
+    def set_selection(value):
+        core._selection = value
+        stored.append(value)
+
+    core.set_selection = set_selection
+    attention.core_attention = core
+    formats = []
+
+    def select(*args, output_format):
+        formats.append(output_format)
+        return selection
+
+    attention.indexer = select
+    output = torch.randn(8, 1, 4)
+
+    def fake_attention_forward(self, *args, **kwargs):
+        assert self.core_attention._selection is selection
+        if raise_in_core:
+            raise RuntimeError("synthetic core failure")
+        return output, None
+
+    monkeypatch.setattr(SelfAttention, "forward", fake_attention_forward)
+    if raise_in_core:
+        with pytest.raises(RuntimeError, match="synthetic core failure"):
+            attention(torch.zeros_like(output), attention_mask=None)
+    else:
+        assert attention(torch.zeros_like(output), attention_mask=None)[0] is output
+    assert formats == ["ids"]
+    assert stored == [selection, None]
+    assert attention.core_attention._selection is None

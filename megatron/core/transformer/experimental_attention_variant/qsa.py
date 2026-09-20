@@ -1354,19 +1354,25 @@ class QwenSparseSelfAttention(SelfAttention):
             hidden_states, rotary_pos_emb, packed_seq_params, output_format=output_format
         )
         self.core_attention.set_selection(selection)
-        return super().forward(
-            hidden_states,
-            attention_mask,
-            key_value_states=key_value_states,
-            inference_context=None,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
+        try:
+            return super().forward(
+                hidden_states,
+                attention_mask,
+                key_value_states=key_value_states,
+                inference_context=None,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+        finally:
+            # The autograd graph or selective-checkpoint invocation holds what backward
+            # needs. Retaining even detached selected IDs here costs 512 MiB per QSA
+            # layer at 256K tokens and K=512, including when Stage-2 is disabled.
+            self.core_attention.set_selection(None)
 
 
 __all__ = [

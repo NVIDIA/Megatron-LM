@@ -62,16 +62,27 @@ def _attention(recompute):
 def _run_two_microbatches(attention, cases, order):
     attention.zero_grad(set_to_none=True)
     inputs, outputs, selections = [], [], []
-    for hidden, freqs, _, packed in cases:
-        input_state = hidden.detach().clone().requires_grad_()
-        output, _ = attention(
-            input_state, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
-        )
-        inputs.append(input_state)
-        outputs.append(output)
-        selection = attention.core_attention._selection
+    original_forward = attention.indexer.forward
+
+    def capture_selection(*args, **kwargs):
+        selection = original_forward(*args, **kwargs)
         assert selection.index_query is not None and selection.compressed_key is not None
         selections.append(selection.selected_ids.detach().clone())
+        return selection
+
+    attention.indexer.forward = capture_selection
+    try:
+        for hidden, freqs, _, packed in cases:
+            input_state = hidden.detach().clone().requires_grad_()
+            output, _ = attention(
+                input_state, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
+            )
+            inputs.append(input_state)
+            outputs.append(output)
+            assert attention.core_attention._selection is None
+    finally:
+        attention.indexer.forward = original_forward
+    assert len(selections) == 2
     assert selections[0].shape[0] != selections[1].shape[0]
     for index in order:
         outputs[index].backward(cases[index][2])

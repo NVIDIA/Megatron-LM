@@ -4,6 +4,7 @@
 
 import os
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,30 @@ def _weight_sha(weight):
     return hashlib.sha256(
         weight.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
     ).hexdigest()
+
+
+@contextmanager
+def _capture_selection(attention):
+    """Observe route metadata without retaining its autograd graph after forward."""
+    observed = []
+    original_forward = attention.indexer.forward
+
+    def capture(*args, **kwargs):
+        selection = original_forward(*args, **kwargs)
+        observed.append(
+            (
+                selection.all_selected,
+                selection.selected_bits is None,
+                selection.selected_ids is not None,
+            )
+        )
+        return selection
+
+    attention.indexer.forward = capture
+    try:
+        yield observed
+    finally:
+        attention.indexer.forward = original_forward
 
 
 @pytest.mark.skipif(int(os.environ.get("WORLD_SIZE", "1")) != 2, reason="requires two ranks")
@@ -87,12 +112,16 @@ def test_qsa_id_cp2_matches_dense_masked_local_output_and_gradients(packed, mrop
         def run(backend):
             attention.core_attention.sparse_backend = backend
             hidden = local_hidden.detach().clone().requires_grad_()
-            output, _ = attention(
-                hidden,
-                attention_mask=None,
-                rotary_pos_emb=local_freqs,
-                packed_seq_params=packed_params,
-            )
+            with _capture_selection(attention) as observed:
+                output, _ = attention(
+                    hidden,
+                    attention_mask=None,
+                    rotary_pos_emb=local_freqs,
+                    packed_seq_params=packed_params,
+                )
+            assert attention.core_attention._selection is None
+            if backend == "id_sparse":
+                assert observed == [(False, True, True)]
             gradients = torch.autograd.grad(
                 output, (hidden, attention.linear_qkv.weight), grad_output
             )
@@ -103,13 +132,15 @@ def test_qsa_id_cp2_matches_dense_masked_local_output_and_gradients(packed, mrop
         torch.testing.assert_close(sparse[0].float(), dense[0].float(), atol=3e-2, rtol=3e-2)
         for actual, reference in zip(sparse[1], dense[1]):
             torch.testing.assert_close(actual.float(), reference.float(), atol=6e-2, rtol=6e-2)
-        assert attention.core_attention._selection.selected_bits is None
-        assert attention.core_attention._selection.selected_ids is not None
+        assert attention.core_attention._selection is None
     finally:
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.skipif(int(os.environ.get("WORLD_SIZE", "1")) != 1, reason="requires one rank")
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 1 or not torch.cuda.is_available(),
+    reason="requires one CUDA rank",
+)
 def test_qsa_id_cp1_real_vl_geometry_sparse_packed_mrope_gradient_baseline():
     """CP1 baseline for the same real geometry and rank-0-only loss as the CP2 gate."""
     Utils.initialize_model_parallel(1, 1)
@@ -166,13 +197,15 @@ def test_qsa_id_cp1_real_vl_geometry_sparse_packed_mrope_gradient_baseline():
         def run(backend):
             attention.core_attention.sparse_backend = backend
             hidden = hidden_base.detach().clone().requires_grad_()
-            output, _ = attention(
-                hidden,
-                attention_mask=None,
-                rotary_pos_emb=global_freqs,
-                packed_seq_params=packed_params,
-            )
-            assert attention.core_attention._selection.all_selected is False
+            with _capture_selection(attention) as observed:
+                output, _ = attention(
+                    hidden,
+                    attention_mask=None,
+                    rotary_pos_emb=global_freqs,
+                    packed_seq_params=packed_params,
+                )
+            assert attention.core_attention._selection is None
+            assert len(observed) == 1 and observed[0][0] is False
             gradients = torch.autograd.grad(
                 output, (hidden, attention.linear_qkv.weight), upstream_grad
             )
@@ -278,12 +311,14 @@ def test_qsa_id_cp2_real_vl_geometry_sparse_packed_mrope_gradients():
                 )
                 return output
 
-            output = (
-                checkpoint(attention_forward, hidden, use_reentrant=False)
-                if recompute
-                else attention_forward(hidden)
-            )
-            assert attention.core_attention._selection.all_selected is False
+            with _capture_selection(attention) as observed:
+                output = (
+                    checkpoint(attention_forward, hidden, use_reentrant=False)
+                    if recompute
+                    else attention_forward(hidden)
+                )
+            assert attention.core_attention._selection is None
+            assert len(observed) == 1 and observed[0][0] is False
             gradients = torch.autograd.grad(
                 output, (hidden, attention.linear_qkv.weight), upstream_grad
             )
@@ -410,8 +445,7 @@ def test_qsa_id_cp2_real_vl_geometry_sparse_packed_mrope_gradients():
             grouped_weight_grad = sparse[1][1].view(config.num_query_groups, -1, config.hidden_size)
             assert torch.count_nonzero(grouped_weight_grad[:, : 24 * 256]) == 0
             assert torch.count_nonzero(grouped_weight_grad[:, 24 * 256 :]) > 0
-        assert attention.core_attention._selection.selected_bits is None
-        assert attention.core_attention._selection.selected_ids is not None
+        assert attention.core_attention._selection is None
     finally:
         Utils.destroy_model_parallel()
 

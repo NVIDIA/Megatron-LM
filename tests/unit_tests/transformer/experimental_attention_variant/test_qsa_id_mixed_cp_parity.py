@@ -60,12 +60,23 @@ def test_qsa_mixed_padded_empty_documents_cp1_cp2_dense_id_parity():
         def run(backend):
             attention.core_attention.sparse_backend = backend
             hidden = hidden_base.detach().clone().requires_grad_()
-            output, _ = attention(
-                hidden, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
-            )
-            selection = attention.core_attention._selection
-            assert selection.all_selected is False
-            assert selection.doc_ids[0].unique().numel() == 2
+            observed = []
+            original_forward = attention.indexer.forward
+
+            def capture_selection(*args, **kwargs):
+                selection = original_forward(*args, **kwargs)
+                observed.append((selection.all_selected, selection.doc_ids[0].unique().numel()))
+                return selection
+
+            attention.indexer.forward = capture_selection
+            try:
+                output, _ = attention(
+                    hidden, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
+                )
+            finally:
+                attention.indexer.forward = original_forward
+            assert observed == [(False, 2)]
+            assert attention.core_attention._selection is None
             grads = torch.autograd.grad(
                 output, (hidden, attention.linear_qkv.weight), upstream_local
             )

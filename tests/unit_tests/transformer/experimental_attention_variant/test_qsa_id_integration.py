@@ -39,11 +39,25 @@ def qsa_attention(monkeypatch):
 def _run_attention(attention, hidden, freqs, packed, backend, grad_output):
     attention.core_attention.sparse_backend = backend
     input_states = hidden.detach().clone().requires_grad_()
-    output, _ = attention(
-        input_states, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
-    )
+    observed = []
+    original_forward = attention.indexer.forward
+
+    def capture_selection(*args, **kwargs):
+        selection = original_forward(*args, **kwargs)
+        observed.append((selection.selected_bits is None, selection.selected_ids is not None))
+        return selection
+
+    attention.indexer.forward = capture_selection
+    try:
+        output, _ = attention(
+            input_states, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=packed
+        )
+    finally:
+        attention.indexer.forward = original_forward
+    assert attention.core_attention._selection is None
+    assert len(observed) == 1
     grads = torch.autograd.grad(output, (input_states, attention.linear_qkv.weight), grad_output)
-    return output.detach(), tuple(grad.detach() for grad in grads)
+    return output.detach(), tuple(grad.detach() for grad in grads), observed[0]
 
 
 @pytest.mark.parametrize("packed_lengths", [None, [21, 30]])
@@ -71,5 +85,4 @@ def test_qsa_id_backend_matches_dense_masked_model_forward_backward(qsa_attentio
     torch.testing.assert_close(sparse[0].float(), dense[0].float(), atol=3e-2, rtol=3e-2)
     for actual, expected in zip(sparse[1], dense[1]):
         torch.testing.assert_close(actual.float(), expected.float(), atol=6e-2, rtol=6e-2)
-    assert attention.core_attention._selection.selected_bits is None
-    assert attention.core_attention._selection.selected_ids is not None
+    assert sparse[2] == (True, True)
