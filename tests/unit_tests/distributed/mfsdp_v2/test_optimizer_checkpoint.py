@@ -308,10 +308,10 @@ class TestOptimizerCheckpoint:
         assert {group["step"] for group in param_group_snapshot} == {source_steps}
 
         if world_size > 1:
-            # Confirm the placeholder path is not vacuous: at least one rank must have had an
-            # empty-local shard filtered out of its optimizer. Count empty local shards
-            # directly, which is the exact condition the filter tests, over the trainable
-            # parameters, which are the only ones the optimizer is given in the first place.
+            # Confirm the placeholder path is not vacuous: at least one rank must own an
+            # empty local shard, which is what the TE < 2.18 filter drops from its optimizer.
+            # Count empty local shards directly, which is that exact condition, over the
+            # trainable parameters, which are the only ones the optimizer is ever given.
             empty_local = sum(
                 1
                 for param in source_model.parameters()

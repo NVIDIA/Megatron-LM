@@ -138,10 +138,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
         """Yield the parameters the base optimizer owns before the empty-shard filter.
 
-        ``_get_param_groups`` keeps every ``requires_grad`` parameter, but MFSDP v2 then
-        drops the ones whose *local* shard is empty, working around a TE FusedAdam bug (see
-        :func:`get_megatron_optimizer`). That filter is applied per rank, so the surviving
-        set differs across ranks; this iterator reconstructs the rank-invariant superset.
+        ``_get_param_groups`` keeps every ``requires_grad`` parameter, and under TE < 2.18
+        MFSDP v2 then drops the ones whose *local* shard is empty, working around a TE
+        FusedAdam bug (see :func:`get_megatron_optimizer`). That filter is applied per rank,
+        so on an older TE the surviving set differs across ranks; this iterator reconstructs
+        the rank-invariant superset, which is the same thing on either TE.
         """
         for model_chunk in self.model_chunks:
             for param in model_chunk.parameters():
@@ -191,10 +192,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         The keys are read off live state (``exp_avg``/``exp_avg_sq`` for Adam) rather than
         hard-coded, so any base optimizer works. They are gathered because a parameter that
-        this rank's optimizer filtered out is only described by the rank that owns a
-        non-empty shard of it, which is what lets every rank synthesize a placeholder with
-        exactly the owning rank's keys. A parameter that has no state anywhere (nothing has
-        stepped yet) is simply absent.
+        the TE < 2.18 empty-shard filter dropped from this rank's optimizer is only described
+        by the rank that owns a non-empty shard of it, which is what lets every rank
+        synthesize a placeholder with exactly the owning rank's keys. A parameter that has no
+        state anywhere (nothing has stepped yet) is simply absent.
 
         Which key set a parameter has is a property of the base optimizer, not of the shard,
         so ranks that both describe an FQN describe it identically and the merge below can
@@ -251,8 +252,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                     "match this model."
                 )
             # Every parameter of a group carries that group's hyperparameters, so read them
-            # from the first one. A group left empty by the empty-shard filter has none to
-            # read and contributes no state either.
+            # from the first one. A group that the TE < 2.18 empty-shard filter left empty
+            # has none to read and contributes no state either.
             hyperparameters = param_to_group_meta[fqns[0]] if fqns else {}
             param_groups.append({"params": fqns, **hyperparameters})
         return param_groups
@@ -303,12 +304,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         whose names are the plain ``named_parameters`` ones rather than MCore's PP/EP-unique
         checkpoint names.
 
-        Rank consistency is the load-bearing invariant here. The empty-shard filter (see
-        :meth:`_trainable_parameters`) leaves each rank with a different set of parameters,
-        while ``preprocess_state_dict_for_uneven_dtensor`` runs one ``all_gather_object``
-        *per DTensor* in sorted key order, so a rank-dependent DTensor keyspace deadlocks.
-        Every trainable parameter is therefore emitted: the parameters this rank's optimizer
-        holds contribute their real state, and the rest contribute empty-local placeholders.
+        Rank consistency is the load-bearing invariant here. Under TE < 2.18 the empty-shard
+        filter (see :meth:`_trainable_parameters`) leaves each rank with a different set of
+        parameters, while ``preprocess_state_dict_for_uneven_dtensor`` runs one
+        ``all_gather_object`` *per DTensor* in sorted key order, so a rank-dependent DTensor
+        keyspace deadlocks. Every trainable parameter is therefore emitted: the parameters
+        this rank's optimizer holds contribute their real state, and the rest contribute
+        empty-local placeholders. On a newer TE no parameter is ever missing, so the loop
+        below takes the real-state branch throughout and the result is the same.
 
         Args:
             model_sharded_state_dict: Accepted for interface parity; the optimizer state is
