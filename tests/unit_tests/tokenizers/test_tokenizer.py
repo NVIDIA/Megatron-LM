@@ -1218,11 +1218,7 @@ def test_load_generation_config_resolves_hub_model_id(tmp_path, monkeypatch):
 def test_load_generation_config_missing_file_returns_none(monkeypatch):
     from megatron.core.tokenizers.text.libraries import huggingface_tokenizer as hf_mod
 
-    monkeypatch.setattr(
-        hf_mod,
-        "cached_file",
-        lambda path_or_repo_id, filename, **kwargs: None,
-    )
+    monkeypatch.setattr(hf_mod, "cached_file", lambda path_or_repo_id, filename, **kwargs: None)
 
     assert hf_mod._load_generation_config("org/some-hub-model-id-without-one") is None
 

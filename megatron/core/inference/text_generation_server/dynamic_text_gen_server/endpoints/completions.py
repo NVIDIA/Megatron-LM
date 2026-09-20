@@ -9,17 +9,15 @@ from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
-from .common import (
-    generation_config_sampling_defaults,
-    log_sampling_defaults_once,
-    resolve_sampling_default,
-)
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
 from .common import (
     abort_requests,
     attach_stage_metadata,
     collect_stage_metadata,
+    generation_config_sampling_defaults,
+    log_sampling_defaults_once,
+    resolve_sampling_default,
     validate_offload_params,
 )
 

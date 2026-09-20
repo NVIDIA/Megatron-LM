@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 from typing import List, Optional
 
 try:
@@ -18,7 +17,6 @@ from megatron.core.utils import log_single_rank
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
 logger = logging.getLogger(__name__)
-
 
 
 def _load_generation_config(tokenizer_path: str) -> Optional[dict]:

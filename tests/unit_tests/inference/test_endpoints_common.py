@@ -39,7 +39,9 @@ def test_resolve_sampling_default_falls_through_to_generation_config_when_unset(
     app_config = {}
     gen_defaults = {"temperature": 0.6}
     assert (
-        resolve_sampling_default(app_config, gen_defaults, "temperature", "default_temperature", 1.0)
+        resolve_sampling_default(
+            app_config, gen_defaults, "temperature", "default_temperature", 1.0
+        )
         == 0.6
     )
 
@@ -48,7 +50,9 @@ def test_resolve_sampling_default_prefers_explicit_server_config():
     app_config = {"default_temperature": 0.2}
     gen_defaults = {"temperature": 0.6}
     assert (
-        resolve_sampling_default(app_config, gen_defaults, "temperature", "default_temperature", 1.0)
+        resolve_sampling_default(
+            app_config, gen_defaults, "temperature", "default_temperature", 1.0
+        )
         == 0.2
     )
 

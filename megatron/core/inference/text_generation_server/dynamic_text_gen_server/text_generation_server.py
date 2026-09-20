@@ -20,11 +20,10 @@ except ImportError as e:
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
 from megatron.core.inference.config import MultimodalPromptConfig, PrefixCachingCoordinatorPolicy
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
-    apply_optional_sampling_default,
-)
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
+
+from .endpoints.common import apply_optional_sampling_default
 
 logger = logging.getLogger(__name__)
 

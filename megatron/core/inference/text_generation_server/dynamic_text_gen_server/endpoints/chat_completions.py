@@ -31,11 +31,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
-    generation_config_sampling_defaults,
-    log_sampling_defaults_once,
-    resolve_sampling_default,
-)
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
@@ -49,6 +44,9 @@ from .common import (
     abort_requests,
     attach_stage_metadata,
     collect_stage_metadata,
+    generation_config_sampling_defaults,
+    log_sampling_defaults_once,
+    resolve_sampling_default,
     validate_offload_params,
 )
 
