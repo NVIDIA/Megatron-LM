@@ -449,6 +449,9 @@ class TransformerConfig(ModelParallelConfig):
     qsa_indexer_compress_ratio: Optional[int] = None
     """Number of consecutive key tokens mean-pooled into one QSA index block."""
 
+    qsa_indexer_loss_coeff: float = 0.0
+    """Opt-in Stage-2 sparse KL coefficient for the selected-ID QSA backend."""
+
     qsa_force_sparse: bool = False
     """Always run the block-sparse (FlexAttention) kernel, even for sequences short enough
     that every block is selected and dense causal attention would be exact. Testing knob."""
@@ -2505,6 +2508,8 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.qsa_indexer_n_heads is not None:
+            if not math.isfinite(self.qsa_indexer_loss_coeff) or self.qsa_indexer_loss_coeff < 0:
+                raise ValueError("qsa_indexer_loss_coeff must be finite and non-negative.")
             for name in (
                 "qsa_indexer_head_dim",
                 "qsa_indexer_budget",

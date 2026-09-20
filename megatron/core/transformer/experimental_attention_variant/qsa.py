@@ -29,7 +29,8 @@ import functools
 import math
 import os
 import warnings
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple, Union
 
 import torch
@@ -46,6 +47,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
+from megatron.core.transformer.experimental_attention_variant.qsa_stage2_loss import (
+    qsa_stage2_sparse_kl,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -71,7 +76,8 @@ class QSASelection:
     Attributes:
         doc_ids: [b, s] int32 document id of every token (packed sequences) or the batch row.
         positions: [b, s] int32 position of every token inside its document.
-        selected_bits: Flat uint8 bitset ``[b * s * nbytes]`` over document-relative block ids:
+        selected_bits: Flat uint8 bitset ``[b * s * nbytes]`` over document-relative block ids,
+            or None for the opt-in selected-ID backend:
             for query ``(b, q)`` bit ``j`` of byte ``(b * s + q) * nbytes + i`` is set when block
             ``8 * i + j`` is selected. Flat so that the FlexAttention mask kernel indexes a 1-D
             buffer (its row stride is passed as a tensor scalar to avoid recompiling per shape).
@@ -80,15 +86,77 @@ class QSASelection:
         compress_ratio: Tokens per block.
         all_selected: True when every query selected all of its visible complete blocks, i.e.
             the attention pattern is plain causal attention.
+        selected_ids: Optional ``[b * s, K]`` int32 document-relative complete block IDs.
     """
 
     doc_ids: Tensor
     positions: Tensor
-    selected_bits: Tensor
+    selected_bits: Optional[Tensor]
     bits_per_row: int
     bits_per_row_t: Tensor
     compress_ratio: int
     all_selected: bool
+    selected_ids: Optional[Tensor] = None
+    index_query: Optional[Tensor] = None
+    compressed_key: Optional[Tensor] = None
+    compact_block_prefix: Optional[Tensor] = None
+    compact_block_starts: Optional[Tensor] = None
+
+
+def _stage2_packed_lengths(
+    packed_seq_params: PackedSeqParams, *, total_tokens: int, device: torch.device
+) -> Tuple[Tensor, Tensor]:
+    """Return physical starts and true lengths from producer-owned CPU metadata.
+
+    THD cu_seqlens can contain only physical padding boundaries in VL training.
+    Stage-2 must never infer real lengths from those boundaries or token values.
+    A zero valid length is allowed for a final, padding-only THD segment.
+    The immutable CPU layout is validated once per packed batch. It must be
+    built from the same source lengths as the attention's device cu_seqlens.
+    """
+    layout = getattr(packed_seq_params, "qsa_stage2_layout_cpu", None)
+    physical_cu = packed_seq_params.cu_seqlens_q_padded
+    if physical_cu is None:
+        physical_cu = packed_seq_params.cu_seqlens_q
+    if not isinstance(layout, tuple) or len(layout) != 2:
+        raise ValueError("THD QSA Stage-2 KL requires qsa_stage2_layout_cpu")
+    starts_cpu, lengths_cpu = layout
+    if not isinstance(starts_cpu, tuple) or not isinstance(lengths_cpu, tuple):
+        raise ValueError("qsa_stage2_layout_cpu must contain immutable tuples")
+    if not isinstance(physical_cu, Tensor) or physical_cu.ndim != 1 or physical_cu.numel() < 2:
+        raise ValueError("THD QSA Stage-2 KL requires physical query cu_seqlens")
+    if len(starts_cpu) != physical_cu.numel() or len(lengths_cpu) != len(starts_cpu) - 1:
+        raise ValueError("qsa_stage2_layout_cpu must cover every physical THD segment")
+    if physical_cu.dtype not in (torch.int32, torch.int64):
+        raise ValueError("THD QSA Stage-2 metadata must have integer dtype")
+    cached = getattr(packed_seq_params, "_qsa_stage2_layout_cache", None)
+    if cached is not None and cached[:3] == (layout, total_tokens, device):
+        if cached[3] is not physical_cu or cached[4] != physical_cu._version:
+            raise ValueError("THD QSA Stage-2 device cu_seqlens changed without a new CPU layout")
+        return cached[5], cached[6]
+    if any(type(value) is not int for value in starts_cpu + lengths_cpu):
+        raise ValueError("qsa_stage2_layout_cpu must contain Python integers")
+    if (
+        starts_cpu[0] != 0
+        or starts_cpu[-1] != total_tokens
+        or any(
+            end <= start or valid < 0 or valid > end - start
+            for start, end, valid in zip(starts_cpu[:-1], starts_cpu[1:], lengths_cpu)
+        )
+    ):
+        raise ValueError("qsa_stage2_layout_cpu exceeds physical THD boundaries")
+    starts = torch.tensor(starts_cpu, device=device, dtype=torch.long)
+    lengths = torch.tensor(lengths_cpu, device=device, dtype=torch.long)
+    packed_seq_params._qsa_stage2_layout_cache = (
+        layout,
+        total_tokens,
+        device,
+        physical_cu,
+        physical_cu._version,
+        starts,
+        lengths,
+    )
+    return starts, lengths
 
 
 @dataclass
@@ -108,7 +176,11 @@ class QwenSparseSelfAttentionSubmodules(SelfAttentionSubmodules):
 
 
 def _sequence_layout(
-    batch_size: int, seq_len: int, packed_seq_params: Optional[PackedSeqParams], device
+    batch_size: int,
+    seq_len: int,
+    packed_seq_params: Optional[PackedSeqParams],
+    device,
+    stage2_max_doc_len: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, int]:
     """Document ids and in-document positions for every token.
 
@@ -119,13 +191,20 @@ def _sequence_layout(
         cu = packed_seq_params.cu_seqlens_q
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu = packed_seq_params.cu_seqlens_q_padded
-        cu = cu.to(device=device, dtype=torch.long)
+        if stage2_max_doc_len is not None:
+            cu = packed_seq_params._qsa_stage2_layout_cache[5]
+        else:
+            cu = cu.to(device=device, dtype=torch.long)
         starts = cu[:-1]
         arange = torch.arange(seq_len, device=device, dtype=torch.long)
         doc = torch.searchsorted(starts, arange, right=True) - 1
         doc = doc.clamp_min(0)
         positions = arange - starts[doc]
-        max_doc_len = int((cu[1:] - cu[:-1]).max().item())
+        max_doc_len = (
+            int((cu[1:] - cu[:-1]).max().item())
+            if stage2_max_doc_len is None
+            else stage2_max_doc_len
+        )
         return doc.unsqueeze(0).to(torch.int32), positions.unsqueeze(0).to(torch.int32), max_doc_len
     arange = torch.arange(seq_len, device=device, dtype=torch.int32)
     positions = arange.unsqueeze(0).expand(batch_size, -1).contiguous()
@@ -274,6 +353,71 @@ class QSAIndexer(MegatronModule):
         )
         return pooled, block_positions, block_valid
 
+    def _select_mixed_packed_ids(
+        self,
+        q: Tensor,
+        raw_keys: Tensor,
+        doc_ids: Tensor,
+        positions: Tensor,
+        rotary_pos_emb: Tensor,
+        packed_seq_params: PackedSeqParams,
+        max_doc_len: int,
+        is_absolute_mrope: bool,
+        stage2_physical_cu: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, bool, Tensor, Tensor, Tensor]:
+        """Route mixed packed documents through a differentiable compact key pool.
+
+        Hard TopK remains detached; Stage-2 can differentiate selected scores
+        through the compact keys when its auxiliary coefficient is positive.
+        """
+        from megatron.core.transformer.experimental_attention_variant.qsa_id_mixed_router import (
+            pool_complete_blocks,
+            select_document_local_ids,
+        )
+
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        pooled, prefix, counts, block_doc, block_relative, block_valid = pool_complete_blocks(
+            raw_keys, doc_ids, positions, num_docs=cu.numel() - 1, ratio=self.compress_ratio
+        )
+        starts = (
+            stage2_physical_cu[:-1]
+            if stage2_physical_cu is not None
+            else cu[:-1].to(device=block_relative.device, dtype=torch.long)
+        )
+        block_starts = torch.where(
+            block_valid,
+            starts[block_doc] + block_relative.long() * self.compress_ratio,
+            torch.zeros_like(block_relative, dtype=torch.long),
+        )
+        if pooled.numel() > 0:
+            pooled = self.k_layernorm(pooled)
+            rope_positions = block_relative.long() * self.compress_ratio
+            if is_absolute_mrope and rotary_pos_emb.shape[0] == q.shape[0]:
+                rope_positions = rope_positions + starts[block_doc]
+            rope_positions = torch.where(
+                block_valid, rope_positions, torch.zeros_like(rope_positions)
+            ).clamp_max(rotary_pos_emb.shape[0] - 1)
+            pooled = self._rope_at_positions(pooled, rotary_pos_emb, rope_positions)
+        selected_ids = select_document_local_ids(
+            q.detach(),
+            pooled.detach(),
+            doc_ids,
+            positions,
+            prefix,
+            counts,
+            ratio=self.compress_ratio,
+            topk=self.block_topk,
+        )
+        return (
+            selected_ids,
+            max_doc_len // self.compress_ratio <= self.block_topk,
+            pooled,
+            prefix,
+            block_starts,
+        )
+
     @torch.no_grad()
     def _select_blocks(
         self,
@@ -283,6 +427,7 @@ class QSAIndexer(MegatronModule):
         doc_ids: Tensor,
         positions: Tensor,
         uniform_doc_len: Optional[int] = None,
+        output_format: str = "bits",
     ) -> Tuple[Tensor, bool]:
         """Top-k complete blocks per query.
 
@@ -292,39 +437,54 @@ class QSAIndexer(MegatronModule):
             block_valid: [n_docs, n_blocks_max].
             doc_ids / positions: [T] int32.
             uniform_doc_len: Length of each document in the non-THD batch layout.
+            output_format: ``bits`` retains the existing Flex mask contract;
+                ``ids`` retains ``top.indices`` without building a bitset.
 
         Returns:
-            ``(selected_bits [T, nbytes] uint8, all_selected)``.
+            ``(selection, all_selected)``; selection is either
+            ``selected_bits [T, nbytes] uint8`` or ``selected_ids [T, K] int32``.
         """
         T, H, D = q.shape
         R = self.compress_ratio
         n_blocks_max = pooled_keys.shape[1]
+        if output_format not in ("bits", "ids"):
+            raise ValueError(f"unsupported QSA selection format: {output_format}")
         # One extra (always clear) bit for the incomplete tail block: the mask kernels look up
         # ``position // R`` for every key, including keys of the block that is still open.
         nbytes = (n_blocks_max + 1 + 7) // 8
-        # The mask consumes bytes. Keep only the final byte tensor for the whole sequence;
-        # scatter accumulation in int32 is bounded to one tile below.
-        selected_bits = torch.empty(T, nbytes, dtype=torch.uint8, device=q.device)
+        # Retain compact TopK IDs directly for the selected-ID kernel. This
+        # avoids the O(T * n_blocks_max) bitset, including at long lengths.
+        if output_format == "ids":
+            selected = torch.full((T, self.block_topk), -1, dtype=torch.int32, device=q.device)
+        else:
+            selected = torch.empty(T, nbytes, dtype=torch.uint8, device=q.device)
         visible = ((positions.long() + 1) // R).clamp_max(n_blocks_max)  # complete blocks per query
         all_selected = bool((visible <= self.block_topk).all().item())
         block_ids = torch.arange(n_blocks_max, device=q.device)
         # Bound scores, converted queries and the temporary scatter buffer together. The
-        # output byte tensor remains O(T * n_blocks_max / 8), rather than four times larger.
-        bytes_per_query = 4 * (n_blocks_max * H + H * D + nbytes)
+        # selected-ID output remains O(T * block_topk) when requested.
+        output_bytes = 4 * self.block_topk if output_format == "ids" else nbytes
+        bytes_per_query = 4 * (n_blocks_max * H + H * D + output_bytes)
         tile = max(1, min(T, _QSA_SELECT_TILE_BYTES // max(1, bytes_per_query)))
         if all_selected or n_blocks_max == 0:
             # Every visible block is selected: the pattern is plain causal attention. Still
-            # materialize the bitset so the sparse kernels (qsa_force_sparse) see it.
+            # materialize the requested output so forced sparse runs see the selection.
             for start in range(0, T, tile):
                 end = min(T, start + tile)
+                if output_format == "ids":
+                    ids = torch.arange(self.block_topk, device=q.device, dtype=torch.int32)
+                    selected[start:end] = torch.where(
+                        ids[None, :] < visible[start:end, None], ids[None, :], -1
+                    )
+                    continue
                 bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
                 if n_blocks_max > 0:
                     vis = (block_ids.unsqueeze(0) < visible[start:end].unsqueeze(1)).to(torch.int32)
                     weights = (1 << (block_ids & 7)).to(torch.int32).unsqueeze(0)
                     byte_idx = (block_ids >> 3).unsqueeze(0).expand(end - start, -1)
                     bits.scatter_add_(1, byte_idx, vis * weights)
-                selected_bits[start:end] = bits.to(torch.uint8)
-            return selected_bits, True
+                selected[start:end] = bits.to(torch.uint8)
+            return selected, True
 
         n_docs = pooled_keys.shape[0]
         k = min(self.block_topk, n_blocks_max)
@@ -338,7 +498,7 @@ class QSAIndexer(MegatronModule):
             n_blocks_max * D * (pooled_keys.element_size() + 4)
             + n_blocks_max * (H * 4 + 8)
             + H * D * 4
-            + nbytes * 4
+            + output_bytes * 4
             + k * 32
         )
         gathered_tile = max(1, min(T, _QSA_SELECT_TILE_BYTES // gathered_bytes_per_query))
@@ -353,12 +513,15 @@ class QSAIndexer(MegatronModule):
                 scores.masked_fill_(~vis, float("-inf"))
                 top = torch.topk(scores, k=k, dim=-1)
                 valid = torch.isfinite(top.values)
+                if output_format == "ids":
+                    selected[start:end, :k] = top.indices.masked_fill(~valid, -1).to(torch.int32)
+                    continue
                 blocks = top.indices.masked_fill(~valid, 0)
                 bit_val = ((1 << (blocks & 7)) * valid.to(blocks.dtype)).to(torch.int32)
                 bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
                 bits.scatter_add_(1, blocks >> 3, bit_val)
-                selected_bits[start:end] = bits.to(torch.uint8)
-            return selected_bits, False
+                selected[start:end] = bits.to(torch.uint8)
+            return selected, False
 
         # A single document or a non-THD batch has offsets known from tensor shapes.
         # For packed long documents, doc_ids are monotone after CP reconstruction;
@@ -386,14 +549,17 @@ class QSAIndexer(MegatronModule):
                 scores.masked_fill_(~vis, float("-inf"))
                 top = torch.topk(scores, k=k, dim=-1)
                 valid = torch.isfinite(top.values)
+                if output_format == "ids":
+                    selected[start:end, :k] = top.indices.masked_fill(~valid, -1).to(torch.int32)
+                    continue
                 blocks = top.indices.masked_fill(~valid, 0)  # compact [t, k] block IDs
                 byte_idx = blocks >> 3
                 # Top-k blocks are distinct; summing their bit values is equivalent to OR.
                 bit_val = ((1 << (blocks & 7)) * valid.to(blocks.dtype)).to(torch.int32)
                 bits = torch.zeros(end - start, nbytes, dtype=torch.int32, device=q.device)
                 bits.scatter_add_(1, byte_idx, bit_val)
-                selected_bits[start:end] = bits.to(torch.uint8)
-        return selected_bits, False
+                selected[start:end] = bits.to(torch.uint8)
+        return selected, False
 
     # ------------------------------------------------------------------ forward
     def forward(
@@ -401,6 +567,7 @@ class QSAIndexer(MegatronModule):
         hidden_states: Tensor,
         rotary_pos_emb: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams] = None,
+        output_format: str = "bits",
     ) -> QSASelection:
         """Compute the block selection.
 
@@ -408,6 +575,7 @@ class QSAIndexer(MegatronModule):
             hidden_states: [s, b, H] layer input (sequence-parallel-sharded when SP is on).
             rotary_pos_emb: [max_s, 1, 1, rot_dim] rotary frequencies of the attention layer.
             packed_seq_params: THD packing parameters.
+            output_format: ``bits`` for Flex/dense or ``ids`` for the opt-in Triton backend.
 
         Returns:
             :class:`QSASelection` over the full (gathered) sequence.
@@ -422,6 +590,26 @@ class QSAIndexer(MegatronModule):
             )
         local_seq_len = hidden_states.shape[0]
         cp_size = get_pg_size(self.pg_collection.cp)
+        use_loss = (
+            output_format == "ids"
+            and self.training
+            and torch.is_grad_enabled()
+            and self.config.qsa_indexer_loss_coeff > 0
+        )
+        if use_loss and local_seq_len * cp_size * hidden_states.shape[1] > 4096:
+            raise NotImplementedError(
+                "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
+            )
+        stage2_max_doc_len = None
+        stage2_physical_cu = None
+        if use_loss and packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            stage2_physical_cu, _ = _stage2_packed_lengths(
+                packed_seq_params, total_tokens=local_seq_len * cp_size, device=hidden_states.device
+            )
+            starts_cpu = packed_seq_params.qsa_stage2_layout_cpu[0]
+            stage2_max_doc_len = max(
+                end - start for start, end in zip(starts_cpu[:-1], starts_cpu[1:])
+            )
         if cp_size > 1:
             # Rebuild the full sequence (true causal order) so the block selection sees every
             # key of the sequence, exactly as in the CP=1 case. The owning
@@ -442,11 +630,17 @@ class QSAIndexer(MegatronModule):
         # full-sequence queries as if they were still rank-local.
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         s, b, _ = hidden_states.shape
+        if use_loss and s * b > 4096:
+            raise NotImplementedError(
+                "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
+            )
         with torch.no_grad():
             doc_ids, positions, max_doc_len = _sequence_layout(
-                b, s, packed_seq_params, hidden_states.device
+                b, s, packed_seq_params, hidden_states.device, stage2_max_doc_len
             )
-        qk, _ = self.index_qk_proj(hidden_states)  # [s, b, (H+1)*D]
+        # The auxiliary KL must update the indexer without adding a second
+        # gradient path into the backbone's layer input.
+        qk, _ = self.index_qk_proj(hidden_states.detach() if use_loss else hidden_states)
         q, raw_keys = torch.split(
             qk, [self.n_heads * self.head_dim, self.kv_heads * self.head_dim], dim=-1
         )
@@ -477,44 +671,77 @@ class QSAIndexer(MegatronModule):
         doc_flat = doc_ids.reshape(-1)
         pos_flat = positions.reshape(-1)
 
-        with torch.no_grad():
-            pooled, block_positions, block_valid = self._pool_keys(
-                keys_flat.detach(), doc_flat, pos_flat, max_doc_len
-            )
-            n_docs, n_blocks_max, D = pooled.shape
-            if n_blocks_max > 0:
-                pooled = self.k_layernorm(pooled.reshape(-1, D))
-                rope_block_positions = block_positions
-                if is_absolute_mrope and is_thd and rotary_pos_emb.shape[0] == s:
-                    cu = packed_seq_params.cu_seqlens_q_padded
-                    if cu is None:
-                        cu = packed_seq_params.cu_seqlens_q
-                    starts = cu[:-1].to(device=block_positions.device, dtype=torch.long)
-                    ends = cu[1:].to(device=block_positions.device, dtype=torch.long)
-                    rope_block_positions = (block_positions + starts[:, None]).clamp_max(
-                        ends[:, None] - 1
+        compact_block_prefix = None
+        compact_block_starts = None
+        with nullcontext() if use_loss else torch.no_grad():
+            if is_thd and output_format == "ids" and packed_seq_params.cu_seqlens_q.numel() > 2:
+                selection, all_selected, pooled, compact_block_prefix, compact_block_starts = (
+                    self._select_mixed_packed_ids(
+                        q_flat,
+                        keys_flat if use_loss else keys_flat.detach(),
+                        doc_flat,
+                        pos_flat,
+                        rotary_pos_emb,
+                        packed_seq_params,
+                        max_doc_len,
+                        is_absolute_mrope,
+                        stage2_physical_cu,
                     )
-                batch_indices = None
-                if is_absolute_mrope and not is_thd and b > 1:
-                    batch_indices = torch.arange(n_docs, device=pooled.device).repeat_interleave(
-                        n_blocks_max
-                    )
-                pooled = self._rope_at_positions(
-                    pooled, rotary_pos_emb, rope_block_positions.reshape(-1), batch_indices
                 )
-                pooled = pooled.view(n_docs, n_blocks_max, D)
-            selected_bits, all_selected = self._select_blocks(
-                q_flat.detach(), pooled, block_valid, doc_flat, pos_flat, None if is_thd else s
-            )
-        nbytes = selected_bits.shape[1]
+                D = pooled.shape[-1]
+            else:
+                pooled, block_positions, block_valid = self._pool_keys(
+                    keys_flat if use_loss else keys_flat.detach(), doc_flat, pos_flat, max_doc_len
+                )
+                n_docs, n_blocks_max, D = pooled.shape
+                if n_blocks_max > 0:
+                    pooled = self.k_layernorm(pooled.reshape(-1, D))
+                    rope_block_positions = block_positions
+                    if is_absolute_mrope and is_thd and rotary_pos_emb.shape[0] == s:
+                        cu = packed_seq_params.cu_seqlens_q_padded
+                        if cu is None:
+                            cu = packed_seq_params.cu_seqlens_q
+                        starts = cu[:-1].to(device=block_positions.device, dtype=torch.long)
+                        ends = cu[1:].to(device=block_positions.device, dtype=torch.long)
+                        rope_block_positions = (block_positions + starts[:, None]).clamp_max(
+                            ends[:, None] - 1
+                        )
+                    batch_indices = None
+                    if is_absolute_mrope and not is_thd and b > 1:
+                        batch_indices = torch.arange(
+                            n_docs, device=pooled.device
+                        ).repeat_interleave(n_blocks_max)
+                    pooled = self._rope_at_positions(
+                        pooled, rotary_pos_emb, rope_block_positions.reshape(-1), batch_indices
+                    )
+                    pooled = pooled.view(n_docs, n_blocks_max, D)
+                selection, all_selected = self._select_blocks(
+                    q_flat.detach(),
+                    pooled,
+                    block_valid,
+                    doc_flat,
+                    pos_flat,
+                    None if is_thd else s,
+                    output_format=output_format,
+                )
+        selected_ids = selection if output_format == "ids" else None
+        selected_bits = selection if output_format == "bits" else None
+        nbytes = selected_bits.shape[1] if selected_bits is not None else 0
         return QSASelection(
             doc_ids=doc_ids,
             positions=positions,
-            selected_bits=selected_bits.reshape(-1).contiguous(),
+            selected_bits=(
+                selected_bits.reshape(-1).contiguous() if selected_bits is not None else None
+            ),
             bits_per_row=nbytes,
-            bits_per_row_t=torch.tensor(nbytes, device=selected_bits.device, dtype=torch.int64),
+            bits_per_row_t=torch.tensor(nbytes, device=selection.device, dtype=torch.int64),
             compress_ratio=self.compress_ratio,
             all_selected=all_selected,
+            selected_ids=selected_ids.contiguous() if selected_ids is not None else None,
+            index_query=q_flat if use_loss else None,
+            compressed_key=pooled.reshape(-1, D) if use_loss else None,
+            compact_block_prefix=compact_block_prefix if use_loss else None,
+            compact_block_starts=compact_block_starts if use_loss else None,
         )
 
 
@@ -599,6 +826,151 @@ class QSACoreAttention(torch.nn.Module):
     def set_selection(self, selection: Optional[QSASelection]) -> None:
         """Register the block selection consumed by the next forward call."""
         self._selection = selection
+
+    def _attach_indexer_loss(
+        self,
+        output: Tensor,
+        query: Tensor,
+        key: Tensor,
+        selection: QSASelection,
+        packed_seq_params: Optional[PackedSeqParams],
+        cp_size: int,
+    ) -> Tensor:
+        """Use only this CP rank's query rows against the global selected routes."""
+        if (
+            selection.index_query is None
+            or selection.compressed_key is None
+            or selection.selected_ids is None
+        ):
+            raise RuntimeError("QSA Stage-2 KL requires differentiable indexer projections")
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        if is_thd:
+            s, hq, d = query.shape
+            b = 1
+        else:
+            s, b, hq, d = query.shape
+        if s * b > 4096:
+            raise NotImplementedError(
+                "QSA Stage-2 KL is gated above 4096 tokens pending memory validation"
+            )
+        if self.config.attention_dropout != 0:
+            raise NotImplementedError("QSA Stage-2 KL requires attention_dropout=0")
+        if self.config.tensor_model_parallel_size > 1 and self.pg_collection.tp is None:
+            raise RuntimeError("QSA Stage-2 KL requires an explicit TP process group")
+        if cp_size > 1:
+            from megatron.core.ssm.mamba_context_parallel import split_tensor_cp
+
+            local_positions = split_tensor_cp(
+                torch.arange(s, device=query.device, dtype=torch.long), packed_seq_params, dim=0
+            )
+        else:
+            local_positions = torch.arange(s, device=query.device, dtype=torch.long)
+        rows = (
+            torch.arange(b, device=query.device, dtype=torch.long)[:, None] * s
+            + local_positions[None, :]
+        ).reshape(-1)
+        ids = selection.selected_ids.index_select(0, rows).long()
+        if is_thd:
+            physical_cu, valid_lengths = _stage2_packed_lengths(
+                packed_seq_params, total_tokens=s, device=query.device
+            )
+            doc_ids = selection.doc_ids.reshape(-1).index_select(0, rows).long()
+            positions = selection.positions.reshape(-1).index_select(0, rows).long()
+            query_valid_rows = positions < valid_lengths[doc_ids]
+            ids = ids.masked_fill(~query_valid_rows[:, None], -1)
+            document_starts = physical_cu[:-1].index_select(0, doc_ids)
+            if selection.compact_block_prefix is not None:
+                if selection.compact_block_starts is None:
+                    raise RuntimeError("compact QSA Stage-2 routes require block starts")
+                block_starts = selection.compact_block_starts
+                block_ids = torch.where(
+                    ids >= 0, ids + selection.compact_block_prefix[doc_ids][:, None].long(), -1
+                )
+            else:
+                n_docs = valid_lengths.numel()
+                blocks_per_doc = selection.compressed_key.shape[0] // n_docs
+                # Unused slots in the rectangular pooled table are harmless but must
+                # have an in-bounds dummy start for the helper's metadata validation.
+                block_offsets = (
+                    torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)
+                    * selection.compress_ratio
+                )
+                block_starts = (
+                    (physical_cu[:-1, None] + block_offsets[None, :])
+                    .reshape(-1)
+                    .clamp_max(s - selection.compress_ratio)
+                )
+                block_ids = torch.where(ids >= 0, ids + doc_ids[:, None] * blocks_per_doc, -1)
+        else:
+            blocks_per_doc = selection.compressed_key.shape[0] // b
+            doc_base = torch.arange(b, device=query.device, dtype=torch.long)[:, None]
+            doc_base = doc_base.expand(-1, local_positions.numel()).reshape(-1)
+            document_starts = doc_base * s
+            query_valid_rows = None
+            block_starts = (
+                torch.arange(b, device=query.device, dtype=torch.long)[:, None] * s
+                + torch.arange(blocks_per_doc, device=query.device, dtype=torch.long)[None, :]
+                * selection.compress_ratio
+            ).reshape(-1)
+            positions = selection.positions.index_select(1, local_positions).reshape(-1).long()
+            block_ids = torch.where(ids >= 0, ids + doc_base[:, None] * blocks_per_doc, -1)
+        if selection.compressed_key.shape[0] == 0:
+            return output
+        local_query = query.index_select(0, local_positions)
+        index_query = selection.index_query.index_select(0, rows)
+        teacher_query = local_query if is_thd else local_query.transpose(0, 1).reshape(-1, hq, d)
+        teacher_key = key if is_thd else key.transpose(0, 1).reshape(-1, key.shape[-2], d)
+        loss = qsa_stage2_sparse_kl(
+            index_query,
+            selection.compressed_key,
+            block_ids,
+            block_starts,
+            teacher_query,
+            teacher_key,
+            document_starts,
+            positions,
+            compress_ratio=selection.compress_ratio,
+            loss_coeff=self.config.qsa_indexer_loss_coeff,
+            softmax_scale=self.softmax_scale,
+            calculate_per_token_loss=self.config.calculate_per_token_loss,
+            query_valid_rows=query_valid_rows,
+            query_chunk_size=8,
+            tp_group=self.pg_collection.tp,
+        )
+        return DSAIndexerLossAutoScaler.apply(output, loss)
+
+    def _id_sparse_forward(
+        self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
+    ) -> Tensor:
+        """Run the experimental selected-ID kernel on the current full-sequence order."""
+        from megatron.core.transformer.experimental_attention_variant.qsa_id_sparse import (
+            qsa_sparse_attention_id,
+        )
+
+        if selection.selected_ids is None:
+            raise RuntimeError("QSA selected-ID backend requires compact block IDs")
+        if is_thd:
+            q = query.unsqueeze(0).transpose(1, 2)
+            k = key.unsqueeze(0).transpose(1, 2)
+            v = value.unsqueeze(0).transpose(1, 2)
+        else:
+            q = query.permute(1, 2, 0, 3)
+            k = key.permute(1, 2, 0, 3)
+            v = value.permute(1, 2, 0, 3)
+        b, hq, s, d = q.shape
+        ids = selection.selected_ids.view(b, s, -1)
+        out = qsa_sparse_attention_id(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            ids.contiguous(),
+            selection.positions.contiguous(),
+            ratio=selection.compress_ratio,
+            scale=self.softmax_scale,
+        )
+        if is_thd:
+            return out.transpose(1, 2).squeeze(0).reshape(s, hq * d)
+        return out.permute(2, 0, 1, 3).reshape(s, b, hq * d)
 
     def _flex_forward(
         self, query: Tensor, key: Tensor, value: Tensor, selection: QSASelection, is_thd: bool
@@ -732,24 +1104,46 @@ class QSACoreAttention(torch.nn.Module):
         attn_mask_type: Optional[AttnMaskType] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        qsa_selection: Optional[QSASelection] = None,
+        qsa_index_query: Optional[Tensor] = None,
+        qsa_compressed_key: Optional[Tensor] = None,
     ) -> Tensor:
         """Attention over the selected tokens.
 
         ``query``/``key``/``value`` are ``[s, b, h, d]`` (sbhd) or ``[t, h, d]`` (thd); the output
         is ``[s, b, h*d]`` / ``[t, h*d]`` like the backend core attention.
         """
-        # Keep the selection registered: selective `core_attn` recompute re-runs this forward
-        # in the backward pass with the same tensors, and the next attention forward always
-        # registers a fresh selection before reaching here.
-        selection = self._selection
+        # Selective core-attention checkpointing may recompute an older microbatch after a
+        # newer forward has replaced the module field. Its invocation carries the original
+        # selection and differentiable indexer tensors explicitly through checkpoint inputs.
+        selection = qsa_selection if qsa_selection is not None else self._selection
         if selection is None:
             raise RuntimeError(
                 "QSACoreAttention.forward called without a block selection; "
                 "QwenSparseSelfAttention must run the indexer first."
             )
+        if qsa_selection is not None:
+            if (qsa_index_query is None) != (qsa_compressed_key is None) or (
+                self.training
+                and torch.is_grad_enabled()
+                and self.config.qsa_indexer_loss_coeff > 0
+                and qsa_index_query is None
+            ):
+                raise RuntimeError(
+                    "selective QSA checkpoint omitted differentiable indexer tensors"
+                )
+            selection = replace(
+                selection, index_query=qsa_index_query, compressed_key=qsa_compressed_key
+            )
+        elif qsa_index_query is not None or qsa_compressed_key is not None:
+            raise RuntimeError("selective QSA checkpoint tensors require a bound selection")
         cp_size = get_pg_size(self.pg_collection.cp)
+        use_loss = (
+            self.training and torch.is_grad_enabled() and self.config.qsa_indexer_loss_coeff > 0
+        )
         if selection.all_selected and not self.config.qsa_force_sparse and cp_size == 1:
-            return self.dense_core_attention(
+            out = self.dense_core_attention(
                 query,
                 key,
                 value,
@@ -758,6 +1152,11 @@ class QSACoreAttention(torch.nn.Module):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
+            if use_loss:
+                out = self._attach_indexer_loss(
+                    out, query, key, selection, packed_seq_params, cp_size
+                )
+            return out
         assert attention_bias is None, "QSA does not support attention bias"
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         # The sparse (FlexAttention) and dense-masked (SDPA) paths run their kernel directly on
@@ -767,8 +1166,9 @@ class QSACoreAttention(torch.nn.Module):
         # sequence -- the per-token RoPE the owning attention applied already uses each token's
         # correct global position, so it stays aligned after the gather -- run the sparse kernel
         # over the full sequence with the full-seq selection, then split the output back to the
-        # local slice. Numerically exact vs CP=1; the sparse kernel is O(global_s^2) here, so the
-        # block-sparse triton kernel remains the long-seq production follow-up. For CP>1,
+        # local slice. Numerically exact vs CP=1; Flex's coarse block-mask construction can
+        # allocate O(global_s^2), while the opt-in ID backend stores O(global_s * K) routes.
+        # Both still reconstruct full-sequence activations on every CP rank. For CP>1,
         # the all-selected dense TE kernel returns NaN gradients with packed padding-causal
         # attention, so short sequences use the explicit gather + masked SDPA path too.
         if cp_size > 1:
@@ -789,10 +1189,14 @@ class QSACoreAttention(torch.nn.Module):
             out = self._all_selected_cp_forward(query, key, value, packed_seq_params)
         elif self.sparse_backend == "dense_masked":
             out = self._dense_masked_forward(query, key, value, selection, is_thd)
+        elif self.sparse_backend == "id_sparse":
+            out = self._id_sparse_forward(query, key, value, selection, is_thd)
         else:
             out = self._flex_forward(query, key, value, selection, is_thd)
         if cp_size > 1:
             out = split_tensor_cp(out, packed_seq_params, dim=0)
+        if use_loss:
+            out = self._attach_indexer_loss(out, query, key, selection, packed_seq_params, cp_size)
         return out
 
 
@@ -851,6 +1255,66 @@ class QwenSparseSelfAttention(SelfAttention):
             pg_collection=self.pg_collection,
         )
 
+    def _checkpointed_attention_forward(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        rotary_pos_emb=None,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        core_attention_extra_kwargs=None,
+    ):
+        """Bind this microbatch's selection without capturing indexer graphs in the closure."""
+        from megatron.core import tensor_parallel
+
+        if core_attention_extra_kwargs:
+            raise NotImplementedError("QSA selective checkpoint does not accept extra core kwargs")
+        selection = self.core_attention._selection
+        if selection is None:
+            raise RuntimeError("selective QSA checkpoint requires a registered selection")
+        metadata = replace(selection, index_query=None, compressed_key=None)
+        mask_type = attn_mask_type if attn_mask_type is not None else self.attn_mask_type
+        mask_type_tensor = torch.tensor([mask_type.value], dtype=torch.int)
+
+        def custom_forward(
+            query,
+            key,
+            value,
+            attention_mask,
+            _rotary_pos_emb,
+            mask_type_arg,
+            index_query,
+            compressed_key,
+        ):
+            return self._run_core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=AttnMaskType(mask_type_arg.item()),
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                qsa_selection=metadata,
+                qsa_index_query=index_query,
+                qsa_compressed_key=compressed_key,
+            )
+
+        return tensor_parallel.checkpoint(
+            custom_forward,
+            False,
+            query,
+            key,
+            value,
+            attention_mask,
+            rotary_pos_emb,
+            mask_type_tensor,
+            selection.index_query,
+            selection.compressed_key,
+        )
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -872,21 +1336,43 @@ class QwenSparseSelfAttention(SelfAttention):
             raise NotImplementedError(
                 "QwenSparseSelfAttention does not support inference contexts yet."
             )
-        selection = self.indexer(hidden_states, rotary_pos_emb, packed_seq_params)
-        self.core_attention.set_selection(selection)
-        return super().forward(
-            hidden_states,
-            attention_mask,
-            key_value_states=key_value_states,
-            inference_context=None,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
+        use_loss = (
+            self.training and torch.is_grad_enabled() and self.config.qsa_indexer_loss_coeff > 0
         )
+        if use_loss and self.core_attention.sparse_backend != "id_sparse":
+            raise NotImplementedError("QSA Stage-2 KL requires MCORE_QSA_SPARSE_BACKEND=id_sparse")
+        if use_loss and self.config.attention_dropout != 0:
+            raise NotImplementedError("QSA Stage-2 KL requires attention_dropout=0")
+        if (
+            use_loss
+            and self.config.tensor_model_parallel_size > 1
+            and self.pg_collection.tp is None
+        ):
+            raise RuntimeError("QSA Stage-2 KL requires an explicit TP process group")
+        output_format = "ids" if self.core_attention.sparse_backend == "id_sparse" else "bits"
+        selection = self.indexer(
+            hidden_states, rotary_pos_emb, packed_seq_params, output_format=output_format
+        )
+        self.core_attention.set_selection(selection)
+        try:
+            return super().forward(
+                hidden_states,
+                attention_mask,
+                key_value_states=key_value_states,
+                inference_context=None,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+        finally:
+            # The autograd graph or selective-checkpoint invocation holds what backward
+            # needs. Retaining even detached selected IDs here costs 512 MiB per QSA
+            # layer at 256K tokens and K=512, including when Stage-2 is disabled.
+            self.core_attention.set_selection(None)
 
 
 __all__ = [
