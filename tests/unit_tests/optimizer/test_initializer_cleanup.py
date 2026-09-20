@@ -9,8 +9,6 @@ import pytest
 import torch
 
 import megatron.core.optimizer as optimizer_module
-from megatron.core.models.mimo import optimizer as mimo_optimizer_module
-from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
@@ -47,9 +45,9 @@ def _model():
     return model
 
 
-@pytest.mark.parametrize('path', ['muon', 'mimo', 'adam', 'sgd', 'fsdp', 'fsdp_overlap'])
+@pytest.mark.parametrize('path', ['muon', 'adam', 'sgd', 'fsdp', 'fsdp_overlap'])
 def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path):
-    """Every successful return releases non-owned storage without clearing it too early."""
+    """Optimizer builders finish before releasing saved initializers."""
     chunks = [_model(), _model()]
     config = OptimizerConfig(
         optimizer=path if path in ('muon', 'adam', 'sgd') else 'adam',
@@ -72,49 +70,37 @@ def test_factory_clears_initializers_after_all_master_weights(monkeypatch, path)
         built.append(optimizer)
         return optimizer
 
-    if path == 'mimo':
-        model = MimoModel.__new__(MimoModel)
-        torch.nn.Module.__init__(model)
-        model.chunks = torch.nn.ModuleList(chunks)
-        monkeypatch.setattr(
-            mimo_optimizer_module, 'get_mimo_optimizer', lambda model, config: build(model.chunks)
-        )
-        factory_chunks = [model]
-    else:
-        factory_chunks = chunks
-        monkeypatch.setattr(optimizer_module, '_get_megatron_emerging_optimizer', build)
-        monkeypatch.setattr(
-            optimizer_module, '_get_megatron_optimizer_based_on_param_groups', build
-        )
-        monkeypatch.setattr(optimizer_module, 'ChainedOptimizer', tuple)
-        monkeypatch.setattr(optimizer_module, 'get_pg_rank', lambda group: 0)
-        monkeypatch.setattr(optimizer_module, 'get_pg_size', lambda group: 1)
-        monkeypatch.setattr(
-            ProcessGroupCollection,
-            'setup_process_groups_for_optimizer',
-            lambda *args, **kwargs: dict.fromkeys(
-                (
-                    'dp_cp_group',
-                    'intra_dp_cp_group',
-                    'intra_expt_dp_group',
-                    'mp_group',
-                    'expt_tp_pp_group',
-                    'expt_tp_pp_with_egtp_remat_group',
-                    'intra_dp_cp_group_gloo',
-                    'intra_expt_dp_group_gloo',
-                    'intra_dist_opt_group',
-                )
-            ),
-        )
-        monkeypatch.setattr(
-            optimizer_module, '_get_param_groups_and_buffers', lambda *args, **kwargs: ([], {})
-        )
-        for chunk in chunks:
-            chunk.ddp_config.use_megatron_fsdp = path.startswith('fsdp')
+    monkeypatch.setattr(optimizer_module, '_get_megatron_emerging_optimizer', build)
+    monkeypatch.setattr(optimizer_module, '_get_megatron_optimizer_based_on_param_groups', build)
+    monkeypatch.setattr(optimizer_module, 'ChainedOptimizer', tuple)
+    monkeypatch.setattr(optimizer_module, 'get_pg_rank', lambda group: 0)
+    monkeypatch.setattr(optimizer_module, 'get_pg_size', lambda group: 1)
+    monkeypatch.setattr(
+        ProcessGroupCollection,
+        'setup_process_groups_for_optimizer',
+        lambda *args, **kwargs: dict.fromkeys(
+            (
+                'dp_cp_group',
+                'intra_dp_cp_group',
+                'intra_expt_dp_group',
+                'mp_group',
+                'expt_tp_pp_group',
+                'expt_tp_pp_with_egtp_remat_group',
+                'intra_dp_cp_group_gloo',
+                'intra_expt_dp_group_gloo',
+                'intra_dist_opt_group',
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        optimizer_module, '_get_param_groups_and_buffers', lambda *args, **kwargs: ([], {})
+    )
+    for chunk in chunks:
+        chunk.ddp_config.use_megatron_fsdp = path.startswith('fsdp')
 
-    result = get_megatron_optimizer(config, factory_chunks, config_overrides={})
+    result = get_megatron_optimizer(config, chunks, config_overrides={})
 
-    if path in ('muon', 'mimo', 'fsdp'):
+    if path in ('muon', 'fsdp'):
         assert result is built[0]
     else:
         assert result == tuple(built)
