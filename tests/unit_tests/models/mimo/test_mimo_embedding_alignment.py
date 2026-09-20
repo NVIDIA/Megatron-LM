@@ -140,6 +140,40 @@ class TestEmbeddingAlignment:
         for s, b in text_positions:
             assert torch.all(combined[s, b] == 0.01)
 
+    @pytest.mark.parametrize("use_precomputed_indices", [False, True])
+    def test_mixed_precision_modalities_follow_text_embedding_dtype(self, use_precomputed_indices):
+        """BF16 modality embeddings should merge into an FP32 language residual stream."""
+        input_ids = torch.tensor([[100, 50, 101]], dtype=torch.long, device=self.device)
+        text_embeddings = torch.full(
+            (2, self.hidden_dim), 0.25, dtype=torch.float32, device=self.device, requires_grad=True
+        )
+        vision_embeddings = torch.full(
+            (1, self.hidden_dim), 2.0, dtype=torch.bfloat16, device=self.device, requires_grad=True
+        )
+        modality_token_indices = None
+        if use_precomputed_indices:
+            modality_token_indices = {
+                "text": torch.tensor([0, 2], dtype=torch.long, device=self.device),
+                "vision": torch.tensor([1], dtype=torch.long, device=self.device),
+            }
+
+        combined = self.model.align_embeddings_by_token_positions(
+            modality_embeddings={"text": text_embeddings, "vision": vision_embeddings},
+            input_ids=input_ids,
+            special_token_ids={"vision": 50},
+            modality_token_indices=modality_token_indices,
+        )
+
+        assert combined.dtype is torch.float32
+        torch.testing.assert_close(combined[0, 0], text_embeddings[0])
+        torch.testing.assert_close(combined[1, 0], vision_embeddings[0].float())
+        torch.testing.assert_close(combined[2, 0], text_embeddings[1])
+
+        combined.sum().backward()
+        assert text_embeddings.grad is not None
+        assert vision_embeddings.grad is not None
+        assert vision_embeddings.grad.dtype is torch.bfloat16
+
     def test_multiple_modalities(self):
         """Test alignment with multiple modalities with special tokens at different positions."""
         batch_size = 2

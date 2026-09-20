@@ -145,13 +145,21 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
 
     def _forward(self, inference_input: Dict[str, Any]) -> torch.Tensor:
         """Dispatch text-only/decode and image-prefill forwards."""
-        if "image_token_mask" in inference_input:
+        # Dynamic-engine prefill supplies precomputed image embeddings, and
+        # decode supplies no raw images. Both use the LM-only path.
+        if "image_token_mask" in inference_input or "images" not in inference_input:
             return self._forward_dynamic(inference_input)
 
+        # Legacy/manual path: let NemotronOmniModel encode raw images and merge
+        # them with the compact placeholder tokens.
         output = self.model(
+            images=inference_input["images"],
             input_ids=inference_input["tokens"],
             position_ids=inference_input["position_ids"],
             attention_mask=inference_input["attention_mask"],
+            imgs_sizes=inference_input.get("imgs_sizes"),
+            vision_packed_seq_params=inference_input.get("vision_packed_seq_params"),
+            num_frames=inference_input.get("num_frames"),
             inference_context=self.inference_context,
             runtime_gather_output=True,
         )
@@ -162,20 +170,22 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
-        image_token_mask = inference_input["image_token_mask"]
+        image_token_mask = inference_input.get("image_token_mask")
         image_embeddings = inference_input.get("image_embeddings")
         model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
 
         # The mask covers compact-path padding and pre-expanded model sentinels.
-        input_ids_text = tokens.masked_fill(image_token_mask >= 0, 0)
+        input_ids_text = (
+            tokens if image_token_mask is None else tokens.masked_fill(image_token_mask >= 0, 0)
+        )
         decoder_input = model.language_model.embedding(
             input_ids=input_ids_text, position_ids=position_ids
         )
         combined_embeddings = decoder_input.transpose(0, 1).contiguous()
 
         # Inject vision embeddings into the decoder input.
-        image_positions = image_token_mask >= 0
-        if image_positions.any():
+        image_positions = image_token_mask >= 0 if image_token_mask is not None else None
+        if image_positions is not None and image_positions.any():
             if image_embeddings is None:
                 raise ValueError("Image positions were provided without image embeddings.")
             flat_image_embeddings = image_embeddings.reshape(-1, image_embeddings.shape[-1]).to(

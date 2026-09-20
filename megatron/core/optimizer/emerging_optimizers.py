@@ -284,6 +284,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_group: torch.distributed.ProcessGroup,
             partition_dim: int | None = None,
             tp_mode_this_group: str = tp_mode,
+            scale_shape: tuple[int, int] | None = None,
         ) -> torch.Tensor:
             log_single_rank(
                 logger,
@@ -292,9 +293,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'{coefficient_type} coefficient, '
                 f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
             )
-            size = [grad.size(-2), grad.size(-1)]
-            if partition_dim is not None:
-                size[partition_dim] *= get_pg_size(tp_group)
+            if scale_shape is None:
+                size = [grad.size(-2), grad.size(-1)]
+                if partition_dim is not None:
+                    size[partition_dim] *= get_pg_size(tp_group)
+            else:
+                # This overrides only the final Muon scalar; NS still uses grad's physical
+                # shape and partition metadata for its collectives.
+                size = scale_shape
             # Only forward the kwarg when enabled; older emerging_optimizers do not
             # accept it at all, and __init__ has already rejected use_syrk on those.
             ns_kwargs = {"use_syrk": True} if use_syrk else {}
@@ -400,8 +406,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
         duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
         after, since every rank holds a uniform, fully-reconstructed tensor by then.
-        distributed does not: it stays row-sharded through its own collective, where
-        stripping isn't safe (known limitation).
+        distributed keeps the padding needed by its collective, but applies Muon's scale
+        factor using the unpadded logical matrix shape.
 
         ``qkv_split_shapes`` (when set) runs Newton-Schulz on q, k and v separately. The
         split needs the whole matrix, so under GTP it is available on the duplicated path
@@ -529,13 +535,26 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return result[gtp_rank * reshard_size : (gtp_rank + 1) * reshard_size].contiguous()
 
         # distributed: NS via the small-Gram all-reduce (no redundant full-matrix NS).
+        # QKV splitting has already fallen back to this unsplit fused layout above, so
+        # pad_length describes grad's full dim-0 layout here. Keep the physical rows for
+        # the collective, but exclude them from Muon's shape-based scale.
+        scale_shape = None
+        if pad_length:
+            if grad.shape != p.shape:
+                raise RuntimeError(
+                    "Distributed GTP Muon padding requires the momentum and parameter "
+                    f"layouts to match, got grad={tuple(grad.shape)} and p={tuple(p.shape)}"
+                )
+            size = [grad.size(-2) * gtp_remat_size - pad_length, grad.size(-1)]
+            if partition_dim is not None:
+                size[partition_dim] *= get_pg_size(tp_group)
+            scale_shape = (size[0], size[1])
+
         # A momentum with both TP and GTP as sharding axes takes two communication steps: an
         # all-gather that eliminates one axis, then the Gram all-reduce that distributes NS over
         # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
         # communication needed. partition_dim is what says whether TP is a sharding axis here,
         # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
-        #
-        # GTP_remat's alignment padding is not corrected for here -- see the class docstring.
         needs_two_step_communication = (
             partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
         )
@@ -543,7 +562,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if not needs_two_step_communication:
             # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
             return self.scaled_orthogonalize_fn(
-                grad, gtp_remat_group, partition_dim=0, tp_mode_this_group=mode
+                grad,
+                gtp_remat_group,
+                partition_dim=0,
+                tp_mode_this_group=mode,
+                scale_shape=scale_shape,
             )
 
         # GTP + TP: distributed NS can only operate over one (group, dim) at a
@@ -560,7 +583,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         gathered_grad = self._all_gather_tensor(grad, smaller_group, smaller_dim)
         orthogonalized_grad = self.scaled_orthogonalize_fn(
-            gathered_grad, larger_group, larger_dim, tp_mode_this_group=mode
+            gathered_grad,
+            larger_group,
+            larger_dim,
+            tp_mode_this_group=mode,
+            scale_shape=scale_shape,
         )
         shard_size = orthogonalized_grad.size(smaller_dim) // get_pg_size(smaller_group)
         reshard_rank = get_pg_rank(smaller_group)
