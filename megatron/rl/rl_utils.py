@@ -182,7 +182,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     with UVM or torch_memory_saver when enabled.
     """
     args = get_args()
-    if not args.rl_offload_inference_model_weights_when_idle:
+    if not args.rl_offload_inference_model_weights:
         return
 
     # Check for torch_memory_saver path (when offloading is enabled but UVM is not)
