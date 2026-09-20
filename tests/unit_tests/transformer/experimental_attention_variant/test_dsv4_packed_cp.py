@@ -19,6 +19,8 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybri
     _make_config,
 )
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 class _CP1:
     @staticmethod
@@ -65,10 +67,10 @@ def test_packed_cp_matches_full_attention_and_gradients(
     if backend == "cudnn":
         pytest.importorskip("flash_mla")
         pytest.importorskip("cudnn.deepseek_sparse_attention")
-        if torch.cuda.get_device_capability()[0] < 9:
-            pytest.skip("FlashMLA CSA requires SM90+")
-        if torch.cuda.get_device_capability()[0] == 9 and not sparse and coeff > 0:
-            pytest.skip("The existing SM90 dense-loss restriction is retained")
+        # CI builds FlashMLA with FLASH_MLA_DISABLE_SM90=1. Keep native CP
+        # coverage on Hopper and run the real fused kernels on Blackwell.
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("Fused CSA CP tests require the SM100 kernels included in the CI image")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
     )

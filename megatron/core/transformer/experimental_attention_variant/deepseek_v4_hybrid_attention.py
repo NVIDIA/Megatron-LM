@@ -489,10 +489,10 @@ class DSv4HybridAttention(Attention):
 
         # Grouped output
         core_attn_out = core_attn_out.view(
-            core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
+            core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
         wo_a_weight = self.linear_o_group_proj.view(
-            self.o_local_groups, self.config.o_lora_rank, -1
+            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
