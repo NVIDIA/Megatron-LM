@@ -46,6 +46,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
 from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
@@ -2687,6 +2688,13 @@ def load_checkpoint(
         sharded_sd_metadata['dp_cp_group'] = dp_cp_group
         # Optimizer load templates use the content version to select checkpoint-era FQNs.
         sharded_sd_metadata['checkpoint_version'] = state_dict.get('checkpoint_version', 0)
+        if gen_sd_optim is not None and (sharded_sd_metadata['checkpoint_version'] or 0) < 3.1:
+            # Pre-3.1 distributed-optimizer FQNs spell the (param dtype, grad dtype) tuple of the
+            # run that saved the checkpoint. Recover those grad dtypes from the checkpoint's keys
+            # so that a run with a different main-grad dtype still addresses the same tensors.
+            sharded_sd_metadata['legacy_grad_dtypes'] = get_legacy_grad_dtypes(
+                dist_checkpointing.load_tensors_metadata(checkpoint_name).keys()
+            )
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
@@ -2792,6 +2800,11 @@ def load_checkpoint(
         optim_sd_kwargs = dict(
             metadata=_build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group),
             is_loading=True,
+        )
+        # Same as the torch_dist branch: optimizer load templates select checkpoint-era keys by
+        # version. fsdp_dtensor state has no dtype-keyed FQNs today; keep both paths identical.
+        optim_sd_kwargs['metadata']['checkpoint_version'] = (
+            state_dict.get('checkpoint_version') or 0
         )
 
         # Megatron-FSDP materializes optimizer slots with a dummy zero-gradient
