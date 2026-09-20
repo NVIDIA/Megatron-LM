@@ -1382,6 +1382,42 @@ class TestChunkStaticInputs:
         static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
         assert static_inputs["labels"].shape == (1, 128)
         assert static_inputs["hidden_states"].shape == (128, 1, 256)
+        # Without MTP the post-process consumes neither the tokens nor the padding mask, and a
+        # last stage without MTP does not even receive tokens / position ids (a captured keyword
+        # that is None at replay would make the graphed callable raise).
+        assert "input_ids" not in static_inputs
+        assert "position_ids" not in static_inputs
+        assert "padding_mask" not in static_inputs
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_postprocess_static_inputs_follow_mtp_and_sequence_parallel(self):
+        """With MTP on the stage the token inputs are captured. Under sequence parallelism the
+        decoder output is scattered but the padding mask keeps its full length: the model hands the
+        post-process the caller's mask (the MTP rolls it alongside input_ids), not the scattered
+        copy the decoder gets."""
+        model = _build_chunk_model(256, 4, 4, 1024, 128, 8)
+        block = model.postprocess_block
+        config = model.config
+        saved = (config.mtp_num_layers, config.sequence_parallel, config.tensor_model_parallel_size)
+        saved_mtp_process = model.mtp_process
+        try:
+            model.mtp_process = True
+            config.mtp_num_layers = 1
+            config.sequence_parallel = True
+            config.tensor_model_parallel_size = 2  # sizing only; no real TP group is needed
+            static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+            assert static_inputs["input_ids"].shape == (1, 128)
+            assert static_inputs["position_ids"].shape == (1, 128)
+            assert static_inputs["labels"].shape == (1, 128)
+            assert static_inputs["hidden_states"].shape == (64, 1, 256)
+            assert static_inputs["padding_mask"].shape == (1, 128)
+            assert not static_inputs["padding_mask"].any()
+        finally:
+            model.mtp_process = saved_mtp_process
+            config.mtp_num_layers, config.sequence_parallel, config.tensor_model_parallel_size = (
+                saved
+            )
 
 
 class TestStaticInputs:

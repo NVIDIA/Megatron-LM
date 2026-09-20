@@ -636,13 +636,17 @@ class GPTModel(LanguageModule):
             padding_mask=padding_mask,
         )
 
+        # Under sequence parallelism the pre-process scatters the padding mask along the sequence
+        # for the decoder (whose hidden states are scattered). The post-process keeps the caller's
+        # full-length mask: the MTP rolls it alongside input_ids / position_ids, and its MoE
+        # layers re-align it to their hidden states themselves.
         (
             decoder_input,
             rotary_pos_emb,
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
-            padding_mask,
+            decoder_padding_mask,
         ) = preproc_output[:6]
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
@@ -663,7 +667,7 @@ class GPTModel(LanguageModule):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
+            padding_mask=decoder_padding_mask,
             **decoder_extra_block_kwargs,
         )
         # When mHC + MTP, the decoder returns (contracted, multi-stream).

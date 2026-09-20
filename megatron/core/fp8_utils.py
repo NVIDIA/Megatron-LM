@@ -1014,3 +1014,35 @@ else:
             "prepare_model_for_fp8_inference requires Transformer Engine to be installed. "
             "Please install transformer-engine to use FP8 inference."
         )
+
+
+def get_layer_fp8_context(config: TransformerConfig, layer_no: int, is_mtp_layer: bool = False):
+    """FP8 context for one layer of a block whose enclosing FP8 state cannot be inherited.
+
+    Chunk-granularity CUDA graphs capture a whole block under one ``fp8_autocast`` (the outer
+    context enables the quantization bookkeeping for every layer of the block). While it warms
+    up and captures, TE wraps the ``__call__`` of the *class* of every graphed module in that
+    autocast, so an instance of the same class that is not itself one of the graphed callables
+    (the MTP's inner stack, captured as a sub-module of the post-process block's graph) runs
+    with FP8 disabled during the capture, and its graph is recorded in that state. The
+    ``nullcontext`` that ``get_fp8_context`` returns for a layer that needs no context of its own
+    would inherit whichever of the two happens to be active, so under chunk graphs both kinds of
+    layer state their precision explicitly:
+
+    * a BF16 boundary layer (``first_last_layers_bf16``, ``0 <= layer_no < num_layers``) opts
+      out of the block-wide FP8 context;
+    * an MTP layer (``is_mtp_layer``) runs in FP8. Its inner stack numbers layers from 1, so by
+      arithmetic ``is_first_last_bf16_layer`` would take it for a BF16 boundary layer, but its
+      parameters are built under ``fp8_model_init`` (MTP only uses the global FP8 context);
+      running it with FP8 disabled makes TE dequantize the weights and lose the
+      wgrad-accumulation ``main_grad`` binding.
+
+    Outside chunk graphs this is exactly ``get_fp8_context``.
+    """
+    if not config.fp8 or getattr(config, "cuda_graph_granularity", "layer") != "chunk":
+        return get_fp8_context(config, layer_no)
+    if is_mtp_layer:
+        return get_fp8_context(config)
+    if 0 <= layer_no < config.num_layers and is_first_last_bf16_layer(config, layer_no):
+        return get_fp8_disabled_context(config)
+    return get_fp8_context(config, layer_no)

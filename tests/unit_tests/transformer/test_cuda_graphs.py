@@ -2463,13 +2463,13 @@ class TestChunkGranularity:
     def test_chunk_disables_fp8_for_bf16_boundary_layers(self, monkeypatch):
         disabled_context = object()
         fp8_context = object()
+        # The block delegates to fp8_utils.get_layer_fp8_context, which resolves these two
+        # names in fp8_utils at call time.
         monkeypatch.setattr(
-            'megatron.core.transformer.transformer_block.get_fp8_disabled_context',
-            lambda config: disabled_context,
+            'megatron.core.fp8_utils.get_fp8_disabled_context', lambda config: disabled_context
         )
         monkeypatch.setattr(
-            'megatron.core.transformer.transformer_block.get_fp8_context',
-            lambda config, layer_idx: fp8_context,
+            'megatron.core.fp8_utils.get_fp8_context', lambda config, layer_idx: fp8_context
         )
         block = object.__new__(TransformerBlock)
         object.__setattr__(

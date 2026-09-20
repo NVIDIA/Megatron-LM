@@ -20,6 +20,7 @@ from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import use_te_checkpoint
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -2416,7 +2417,8 @@ class MultiTokenPredictionLayer(MegatronModule):
           ``te_checkpoint`` because its reentrant implementation only
           tracks positional tensor inputs as checkpoint inputs (kwarg
           tensors are not represented in the recompute backward path).
-        * Quantized recipes (fp8, fp4) route through ``te_checkpoint``;
+        * Quantized recipes (fp8, fp4) and chunk CUDA graph captures route
+          through ``te_checkpoint`` (``recompute.use_te_checkpoint``);
           everything else uses ``tensor_parallel.checkpoint``.
         * Only ``fp8 + delayed scaling`` needs an outer quantization
           context entered before ``te_checkpoint``; see the
@@ -2476,11 +2478,12 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            # fp4 quantization is internally implemented via TE's
-            # ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``), so
-            # quantized recompute on either fp8 or fp4 must go through
-            # ``te_checkpoint``. Matches ``transformer_block``'s policy.
-            if self.config.fp8 or self.config.fp4:
+            # Quantized recompute (fp4 is implemented via TE's ``fp8_autocast``, see
+            # ``fp4_utils.get_fp4_context``) and recompute inside a chunk CUDA graph
+            # capture (``tensor_parallel.checkpoint`` skips the checkpoint node while a
+            # graph is captured) go through ``te_checkpoint``; same policy as
+            # ``transformer_block``.
+            if use_te_checkpoint(self.config):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(

@@ -750,7 +750,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
-        # Decoder embedding.
+        # Decoder embedding. Under sequence parallelism the decoder gets the padding mask scattered
+        # along the sequence like its hidden states; the post-process keeps the caller's full-length
+        # mask (the MTP rolls it alongside input_ids / position_ids, and MoE layers re-align it to
+        # their hidden states themselves).
+        decoder_padding_mask = padding_mask
         if decoder_input is not None:
             pass
         elif self.pre_process:
@@ -778,7 +782,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     decoder_input, group=self.pg_collection.tp
                 )
             if padding_mask is not None and self.config.sequence_parallel:
-                padding_mask = (
+                decoder_padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
                         padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
                     )
@@ -865,7 +869,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
+            padding_mask=decoder_padding_mask,
             **decoder_extra_block_kwargs,
         )
         # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple

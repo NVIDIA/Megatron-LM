@@ -370,11 +370,8 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
                 device=device,
             )
         }
-        if (
-            config.enable_hyper_connections
-            and (config.mtp_num_layers or 0) > 0
-            and self._owner.mtp_process
-        ):
+        mtp_on_this_stage = (config.mtp_num_layers or 0) > 0 and self._owner.mtp_process
+        if config.enable_hyper_connections and mtp_on_this_stage:
             # The decoder hands MTP the pre-contraction residual streams.
             inputs["mhc_multistream"] = torch.ones(
                 (hidden_tokens, 1, config.hidden_size * config.num_residual_streams),
@@ -382,8 +379,16 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
                 requires_grad=True,
                 device=device,
             )
-        inputs["input_ids"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
-        inputs["position_ids"] = torch.arange(tokens, dtype=torch.long, device=device).unsqueeze(0)
+        if mtp_on_this_stage:
+            # Only the MTP block reads these (and the padding mask below) in post-process. A last
+            # stage without MTP receives no tokens / position ids in its packed batch
+            # (data_schedule.py), the replay drops None keywords, and a keyword that was captured
+            # but never arrives at replay makes the graphed callable raise, so they are captured
+            # only where the stage actually consumes them.
+            inputs["input_ids"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
+            inputs["position_ids"] = torch.arange(
+                tokens, dtype=torch.long, device=device
+            ).unsqueeze(0)
         inputs["labels"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
         inputs["loss_mask"] = torch.ones((1, tokens), dtype=torch.float32, device=device)
         max_num_seqs = config.thd_max_packed_sequences
@@ -400,7 +405,10 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
             cu_seqlens_kv_padded=cu_seqlens.clone(),
         )
         self._add_graph_dynamic_dsa_route_static_inputs(inputs, cu_seqlens, max_tokens)
-        inputs["padding_mask"] = torch.zeros(1, tokens, dtype=torch.bool, device=device)
+        if mtp_on_this_stage:
+            # Full length on every stage: the model hands the post-process the caller's padding
+            # mask (the MTP rolls it alongside input_ids); only the decoder gets the SP-scattered copy.
+            inputs["padding_mask"] = torch.zeros(1, tokens, dtype=torch.bool, device=device)
         return inputs
 
 
