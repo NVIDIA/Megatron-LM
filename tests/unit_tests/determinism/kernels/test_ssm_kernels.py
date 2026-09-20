@@ -10,15 +10,18 @@ the kernels Megatron ships itself: the Mamba2 varlen chunked scan (``ssd_*`` ker
 (``gdp/*`` kernels) and its decode kernels, and the torch gated-delta-rule path that
 ``--deterministic-mode`` selects instead of FLA.
 
-Autotuning is the mechanism that can break replay here: ``ops/common/determinism.py`` pins a
-single config and a zero-initialised, ordered-sum workspace when ``MAMBA_DETERMINISTIC`` (or
-``torch.use_deterministic_algorithms``) is on. Each kernel is replayed in that mode.
+Autotuning is the mechanism that can break replay here: ``megatron.core.tuning`` pins a
+single config, while ``ops/common/determinism.py`` selects a zero-initialised, ordered-sum
+workspace when ``MAMBA_DETERMINISTIC`` (or ``torch.use_deterministic_algorithms``) is on.
+Each kernel is replayed in that mode, including with Triton's autotune cache enabled.
 """
 
 import pytest
 import torch
 
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
+from megatron.core.tuning import autotune_configs
+from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 try:
@@ -34,11 +37,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def ssm_deterministic():
+def ssm_deterministic(monkeypatch):
     """Pin the SSM autotuner / workspace path like ``--deterministic-mode`` does."""
-    ssm_determinism.set_deterministic_mode(True)
-    yield
-    ssm_determinism.set_deterministic_mode(None)
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
 
 
 # --- Mamba2 --------------------------------------------------------------------------------
@@ -152,8 +153,31 @@ def test_causal_conv1d_update_replays():
     )
 
 
-def test_causal_conv1d_varlen_replays():
-    from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+@pytest.mark.parametrize("cache_autotuning", ["0", "1"])
+def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
+    from megatron.core.ssm.ops.common import causal_conv1d_varlen
+
+    monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", cache_autotuning)
+    assert ssm_determinism.autotune_configs is autotune_configs
+    assert ssm_determinism.use_deterministic_mode()
+    configs = autotune_configs(
+        [
+            triton.Config({"BLOCK_T": 8, "BLOCK_C": 256}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_T": 128, "BLOCK_C": 128}, num_warps=4),
+        ]
+    )
+    # Recreate the decorator under each cache setting: a previously imported singleton
+    # would hide a regression that restores timed autotuning when caching is enabled.
+    assert len(configs) == 1
+    kernel = triton.autotune(configs=configs, key=["conv_dim"])(
+        causal_conv1d_varlen._causal_conv1d_varlen_kernel.fn
+    )
+
+    def forbid_benchmark(*args, **kwargs):
+        pytest.fail("deterministic SSM execution benchmarked a config")
+
+    monkeypatch.setattr(kernel, "_bench", forbid_benchmark)
+    monkeypatch.setattr(causal_conv1d_varlen, "_causal_conv1d_varlen_kernel", kernel)
 
     seeded()
     dim, width = 2048, 4
@@ -166,7 +190,7 @@ def test_causal_conv1d_varlen_replays():
         len(bounds) - 1, dim, width - 1, device="cuda", dtype=torch.bfloat16
     )
     assert_replays_bit_exact(
-        lambda x, w, b, s: causal_conv1d_varlen_fn(x, w, b, cu_seqlens, s),
+        lambda x, w, b, s: causal_conv1d_varlen.causal_conv1d_varlen_fn(x, w, b, cu_seqlens, s),
         (x, weight, bias, initial_states),
         replays=4,
         backward=False,
