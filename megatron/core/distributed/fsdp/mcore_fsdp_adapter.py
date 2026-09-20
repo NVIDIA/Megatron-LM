@@ -38,6 +38,26 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+    FSDPDistributedIndex,
+    MegatronFSDP,
+    MixedPrecisionPolicy,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    SchedulePolicy,
+    fully_shard,
+    fully_shard_context,
+    microbatch,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
+    copy_parameter_attributes,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+    all_sharding_strategies_in,
+    any_sharding_strategy_in,
+    get_sharding_strategy,
+)
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -45,33 +65,6 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
-
-try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import (
-        FSDPDistributedIndex,
-        MegatronFSDP,
-        MixedPrecisionPolicy,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-        Placements,
-        SchedulePolicy,
-        fully_shard,
-        fully_shard_context,
-        microbatch,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
-        copy_parameter_attributes,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
-        all_sharding_strategies_in,
-        any_sharding_strategy_in,
-        get_sharding_strategy,
-    )
-
-    HAVE_MEGATRON_FSDP = True
-except ImportError as import_megatron_fsdp_error:
-    IMPORT_MEGATRON_FSDP_ERROR = import_megatron_fsdp_error
-    HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +175,6 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        if not HAVE_MEGATRON_FSDP:
-            raise IMPORT_MEGATRON_FSDP_ERROR
-
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -576,12 +566,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 data-parallel mesh.
 
         Raises:
-            ImportError: If the Megatron FSDP implementation is unavailable.
             ValueError: If required process groups are missing or the configuration
                 requests a feature unsupported by MFSDP v2.
         """
-        if not HAVE_MEGATRON_FSDP:
-            raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
         FullyShardedDataParallelV2._validate_config(

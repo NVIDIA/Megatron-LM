@@ -42,6 +42,9 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    preprocess_state_dict_for_uneven_dtensor,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
@@ -51,6 +54,15 @@ from megatron.core.post_training.modelopt.checkpointing import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+    handle_experts_in_state_dict,
+    handle_fp8_extra_state_case,
+    handle_mla_down_proj_in_state_dict,
+    handle_mtp_in_state_dict,
+    handle_swiglu_in_state_dict,
+    print_diff_in_state_dicts,
+    validate_fsdp_dtensor_model_load,
+)
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -68,25 +80,6 @@ from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, 
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
-
-try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        preprocess_state_dict_for_uneven_dtensor,
-    )
-    from megatron.core.transformer.fsdp_dtensor_checkpoint import (
-        handle_experts_in_state_dict,
-        handle_fp8_extra_state_case,
-        handle_mla_down_proj_in_state_dict,
-        handle_mtp_in_state_dict,
-        handle_swiglu_in_state_dict,
-        print_diff_in_state_dicts,
-        validate_fsdp_dtensor_model_load,
-    )
-
-    HAVE_MEGATRON_FSDP = True
-except ImportError:
-    HAVE_MEGATRON_FSDP = False
-
 
 # [ModelOpt]: Import
 try:
@@ -2217,7 +2210,6 @@ def _load_base_checkpoint(
                 state_dict=state_dict, storage_reader=fs_storage_reader
             )
     elif ckpt_format == 'fsdp_dtensor':
-        assert HAVE_MEGATRON_FSDP, 'Should not be called if Megatron-FSDP is not available.'
         if rank0:
             state_dict = {'args': None, 'iteration': None, 'checkpoint_version': None}
             torch.distributed.checkpoint.load(state_dict=state_dict, checkpoint_id=checkpoint_name)
