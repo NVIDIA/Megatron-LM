@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import squared_relu
+from megatron.core.activations import situlu, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -413,13 +413,14 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
+        # Check activation: SwiGLU, SiTU-GLU, quick GEGLU, or weighted squared ReLU.
         # Clamped SwiGLU (e.g. DSv4) routes through ScaledClampedQGeGLU with
         # alpha=1.0, since the cuDNN geglu kernel is a superset of swiglu.
         # Use config.activation_func instead of self.activation_func because when
         # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
         use_glu_fusion = self.config.gated_linear_unit and self.config.activation_func in (
             F.silu,
+            situlu,
             quick_gelu,
         )
         use_srelu_fusion = (
@@ -433,7 +434,14 @@ class TEGroupedMLP(MegatronModule):
                 f"(gated_linear_unit={self.config.gated_linear_unit}, "
                 f"use_fused_weighted_squared_relu={self.config.use_fused_weighted_squared_relu})"
             )
-        if self.config.activation_func == F.silu:
+        if use_glu_fusion and self.activation_recompute:
+            return _unsupported(
+                "Transformer Engine scaled GLU ops do not support activation recompute"
+            )
+        if self.config.activation_func == situlu:
+            if not hasattr(te_ops, "ScaledSiTUGLU"):
+                return _unsupported("SiTU-GLU needs ScaledSiTUGLU")
+        elif self.config.activation_func == F.silu:
             if self.config.activation_func_clamp_value is not None:
                 if not is_te_min_version("2.17.0.dev0"):
                     return _unsupported("clamped SwiGLU needs TE >= 2.17.0.dev0")
@@ -536,14 +544,20 @@ class TEGroupedMLP(MegatronModule):
         )
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU, clamped GeGLU, or SReLU).
+        # Activation and post-multiply probs (SwiGLU, SiTU-GLU, clamped GeGLU, or SReLU).
         # TE's ScaledClampedQGeGLU computes sigmoid(alpha * x) * x, so
         # alpha=1.702 gives quick_gelu and alpha=1.0 gives silu/swiglu.
         # With cuDNN FE >= 1.24.0 the alpha, limit and offset are
         # forwarded as runtime params to the cuDNN kernel.
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
-        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
+        if self.config.activation_func is situlu and self.config.gated_linear_unit:
+            op = te.pytorch.ops.ScaledSiTUGLU(
+                glu_interleave_size=glu_interleave,
+                beta1=self.config.situ_glu_beta1,
+                beta2=self.config.situ_glu_beta2,
+            )
+        elif self.config.activation_func == F.silu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
                 qgeglu_kwargs = {
@@ -611,7 +625,8 @@ class TEGroupedMLP(MegatronModule):
                 op = te.pytorch.ops.ScaledSReLU()
         else:
             raise RuntimeError(
-                "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
+                "_make_fused_ops expected SwiGLU, SiTU-GLU, quick_gelu, or weighted "
+                "squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
         ops.append(op)
@@ -914,7 +929,14 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = self._remove_glu_interleaving(
                         intermediate_parallel, self.config.moe_mlp_glu_interleave_size
                     )
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if self.activation_func is situlu:
+                    intermediate_parallel = situlu(
+                        intermediate_parallel,
+                        self.config.situ_glu_beta1,
+                        self.config.situ_glu_beta2,
+                    )
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
                     intermediate_parallel = intermediate_parallel * permuted_probs
@@ -959,6 +981,8 @@ class TEGroupedMLP(MegatronModule):
                             x = self._remove_glu_interleaving(
                                 x, self.config.moe_mlp_glu_interleave_size
                             )
+                        if self.config.activation_func is situlu:
+                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
                         x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)

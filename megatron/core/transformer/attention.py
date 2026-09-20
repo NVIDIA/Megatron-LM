@@ -89,10 +89,22 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
+# not `flash_attn.__version__` (which reports the 2.x version) or
+# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
+# `is_fa_min_version` here.
+_MIN_FA4_VERSION = "4.0.0b20"
 try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _get_dist_version
 
-    HAVE_FA4 = True
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from packaging.version import Version as _Version
+
+    try:
+        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    except PackageNotFoundError:
+        HAVE_FA4 = False
 except ImportError:
     HAVE_FA4 = False
 
@@ -287,6 +299,14 @@ class Attention(MegatronModule, ABC):
     This layer only contains common modules required for the "self attn" and
     "cross attn" specializations.
     """
+
+    uses_attention_mask: bool = True
+    """Whether this module consumes the ``attention_mask`` argument and exposes
+    ``attn_mask_type``. Softmax attention does; linear-attention variants that occupy the
+    same ``self_attention`` slot (e.g. ``GatedDeltaNet``) do not, and set this to ``False``
+    so callers can skip building an attention mask they would only discard. Callers should
+    read it with ``getattr(module, "uses_attention_mask", True)`` so third-party attention
+    modules keep the softmax-attention behaviour by default."""
 
     def __init__(
         self,
@@ -1142,7 +1162,7 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=1,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                 )
             elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -1264,7 +1284,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=1,
+                        num_splits=0 if not self.batch_invariant_mode else 1,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)

@@ -32,6 +32,7 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
@@ -44,7 +45,6 @@ from dataclasses import dataclass
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
-    get_gpt_decoder_layer_specs,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -122,6 +122,7 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             use_te_activation_func=config.transformer.use_te_activation_func,
             use_kitchen_attention=config.transformer.use_kitchen_attention,
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
+            enable_hyper_connection=config.transformer.enable_hyper_connections,
             mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
             use_grouped_gemm_for_dense_mlp=config.transformer.use_grouped_gemm_for_dense_mlp,
             **kwargs,
@@ -137,6 +138,7 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             use_kitchen=transformer_cfg.use_kitchen,
             use_kitchen_attention=transformer_cfg.use_kitchen_attention,
             kitchen_attention_backend=transformer_cfg.kitchen_attention_backend,
+            enable_hyper_connection=transformer_cfg.enable_hyper_connections,
         )
 
 
@@ -421,12 +423,16 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
 
 
 def mtp_block_spec(
-    config: "GPTModelConfig", transformer_layer_spec: ModuleSpec, vp_stage: int | None = None
+    config: "GPTModelConfig",
+    transformer_layer_spec: ModuleSpec | TransformerBlockSubmodules,
+    vp_stage: int | None = None,
 ) -> ModuleSpec | None:
     """Create MTP block spec if model has MTP layers.
 
     Args:
-        config: full model config
+        config: Full model configuration.
+        transformer_layer_spec: Resolved decoder layer or block specification.
+        vp_stage: Optional virtual-pipeline stage.
 
     Returns:
         ModuleSpec: The MTP module specification
@@ -437,22 +443,14 @@ def mtp_block_spec(
     if config.transformer.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
-        if (
-            hasattr(transformer_layer_spec, "layer_specs")
-            and len(transformer_layer_spec.layer_specs) == 0
-        ):
-            # Get the decoder layer spec explicitly if no decoder layer in the last stage,
-            # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-            spec = _te_or_local_layer_spec(config, vp_stage)
+        if isinstance(transformer_layer_spec, TransformerBlockSubmodules):
+            if transformer_layer_spec.layer_specs:
+                spec = transformer_layer_spec.layer_specs[-1]
+            else:
+                # A pipeline stage with no decoder layers still needs a decoder spec for MTP.
+                spec = _te_or_local_layer_spec(config, vp_stage)
         else:
-            decoder_specs = get_gpt_decoder_layer_specs(
-                transformer_cfg,
-                use_transformer_engine=use_te,
-                normalization=transformer_cfg.normalization,
-                qk_l2_norm=transformer_cfg.qk_l2_norm,
-                vp_stage=vp_stage,
-            )
-            spec = decoder_specs[-1]
+            spec = transformer_layer_spec
 
         return get_gpt_mtp_block_spec(
             transformer_cfg, spec, use_transformer_engine=use_te, vp_stage=vp_stage

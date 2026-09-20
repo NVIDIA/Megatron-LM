@@ -500,6 +500,53 @@ FP8 training provides benefits across all three performance walls:
 
 > **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
 
+### MoE Megakernel Backends
+
+#### MOK
+
+A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.
+Select MOK with the following YAML configuration:
+
+```yaml
+bf16: true
+moe_grouped_gemm: true
+moe_ffn_hidden_size: 3072
+gradient_accumulation_fusion: true
+moe_shared_expert_intermediate_size: 3072
+moe_megakernel_backend: mok
+moe_megakernel_backend_config:
+  fwd_num_comm_sms: 40
+  bwd_num_comm_sms: 28
+```
+
+The equivalent backend-specific CLI value is a JSON object:
+
+```bash
+--moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
+```
+
+This integration targets the
+[MCore integration branch of Mixture-of-Kittens](https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration),
+which is an optional dependency and is imported only when the backend is selected.
+
+| Area | Current MOK support |
+|------|---------------------|
+| GPU architecture | NVIDIA Blackwell; validated on GB300 |
+| Routed precision | BF16, or MXFP8 with FP8 parameter gather (Transformer Engine 2.10 or later) |
+| Shared experts | Required; BF16; same intermediate size as routed experts |
+| Activation | SwiGLU |
+| Routed weight layout | Single-grouped and per-expert non-single weights |
+| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64} |
+| Recomputation | Whole-MoE activation recompute |
+| CUDA Graph | Full-iteration capture |
+| Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
+
+The current backend requires grouped experts and fused gradient accumulation. It does not support
+MCore EP 1F1B overlap or delayed wgrad, native shared-expert overlap/gating, shared-expert-only
+recompute, latent MoE, overload-factor logging, partial MoE CUDA Graph replay, MCore expert-input
+capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
+layouts.
+
 
 ### CUDA Graph
 CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:

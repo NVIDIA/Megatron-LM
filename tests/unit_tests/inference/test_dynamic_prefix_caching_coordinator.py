@@ -351,23 +351,24 @@ class TestCoordinatorPrefixRouting:
         selected = coordinator.get_best_data_parallel_rank(hashes)
         assert selected == rank_0
 
-    def test_empty_hashes_uses_round_robin(self):
-        """Empty hash list falls back to round-robin."""
+    def test_empty_hashes_uses_load_balanced(self):
+        """Empty hash list falls back to the least-loaded rank."""
         coordinator = make_coordinator_direct()
-        for identity in coordinator.identities_of_data_parallel_ranks:
-            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 1
-        rank1 = coordinator.get_best_data_parallel_rank([])
-        rank2 = coordinator.get_best_data_parallel_rank([])
-        assert rank1 != rank2
+        identities = list(coordinator.identities_of_data_parallel_ranks)
+        for identity in identities:
+            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 2
+        # Make the second rank the least loaded.
+        coordinator._pending_counts[coordinator.identity_to_rank_index[identities[1]]] = 0
+        assert coordinator.get_best_data_parallel_rank([]) == identities[1]
 
-    def test_disabled_prefix_caching_uses_round_robin(self):
-        """With prefix caching disabled, always uses round-robin."""
+    def test_disabled_prefix_caching_uses_load_balanced(self):
+        """With prefix caching disabled, always routes to the least-loaded rank."""
         coordinator = make_coordinator_direct(enable_prefix_caching=False)
-        for identity in coordinator.identities_of_data_parallel_ranks:
-            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 1
-        rank1 = coordinator.get_best_data_parallel_rank([1, 2, 3])
-        rank2 = coordinator.get_best_data_parallel_rank([1, 2, 3])
-        assert rank1 != rank2
+        identities = list(coordinator.identities_of_data_parallel_ranks)
+        for identity in identities:
+            coordinator._pending_counts[coordinator.identity_to_rank_index[identity]] = 2
+        coordinator._pending_counts[coordinator.identity_to_rank_index[identities[1]]] = 0
+        assert coordinator.get_best_data_parallel_rank([1, 2, 3]) == identities[1]
 
 
 class TestCoordinatorShadowState:
@@ -438,7 +439,7 @@ class TestCoordinatorShadowState:
         tokens = [1, 2, 3, 4, 5, 6, 7, 8]
         hashes = coordinator.compute_request_hashes(tokens)
 
-        # First request: no matches, round-robin.
+        # First request: no matches, routed by load (least-loaded rank).
         rank = coordinator.get_best_data_parallel_rank(hashes)
         coordinator._update_rank_hashes(rank, hashes)
 

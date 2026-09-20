@@ -130,6 +130,68 @@ def test_load_args_restores_latent_rmsnorm_from_checkpoint():
     assert restored_args.moe_latent_up_projection_rmsnorm is True
 
 
+@pytest.mark.parametrize(
+    "checkpoint_args",
+    [
+        SimpleNamespace(swiglu=True, situ_glu=False, situ_glu_beta1=4.0, situ_glu_beta2=25.0),
+        SimpleNamespace(swiglu=False, situ_glu=True, situ_glu_beta1=3.0, situ_glu_beta2=20.0),
+    ],
+)
+def test_load_args_restores_glu_activation_from_checkpoint(checkpoint_args):
+    """Checkpoint arguments select the saved gated activation and SiTU scaling."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        swiglu=not checkpoint_args.swiglu,
+        situ_glu=not checkpoint_args.situ_glu,
+        situ_glu_beta1=1.0,
+        situ_glu_beta2=1.0,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.swiglu is checkpoint_args.swiglu
+    assert restored_args.situ_glu is checkpoint_args.situ_glu
+    assert restored_args.situ_glu_beta1 == checkpoint_args.situ_glu_beta1
+    assert restored_args.situ_glu_beta2 == checkpoint_args.situ_glu_beta2
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "checkpoint_args", "expected_mode"),
+    [
+        ("indices", SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "indices"),
+        (None, SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "bool"),
+        (None, SimpleNamespace(), None),
+    ],
+)
+def test_load_args_preserves_runtime_hybridep_routing_map_mode(
+    runtime_mode, checkpoint_args, expected_mode
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_hybridep_routing_map_mode=runtime_mode,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_hybridep_routing_map_mode == expected_mode
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123

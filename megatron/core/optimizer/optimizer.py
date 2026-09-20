@@ -46,6 +46,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
+from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -95,7 +96,17 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+def _param_group_override_keys() -> tuple[str, ...]:
+    """Return every field declared on ``ParamGroupOverride``."""
+    return tuple(sorted(_ParamGroupOverride.__annotations__.keys()))
+
+
+param_group_identifier_keys = (
+    *_param_group_override_keys(),
+    'lr_mult',
+    'is_expert_parallel',
+    'is_decoupled_lr',
+)
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -677,24 +688,21 @@ class MegatronOptimizer(ABC):
         Raises:
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
-        # Define groups order that is needed in the current optimizer (coming from runtime)
-        needed_groups = [
-            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
-            for g in current_groups
-        ]
 
-        # Keep state_dict param group order since groups are LocalNonpersistentObject
-        # and their order is determined at runtime, not from the checkpoint.
-        params_in_state_dict_order = [g['params'] for g in state_dict_groups]
-        loaded_groups_map = {
-            tuple(
-                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-                group[key] if key in group else group[f"pre_{key}"]
-                for key in param_group_identifier_keys
-            ): group
-            for group in state_dict_groups
-        }
+        def _identifier_for(group: dict) -> tuple:
+            identifier = []
+            for key in param_group_identifier_keys:
+                if key in group:
+                    identifier.append(group[key])
+                elif f"pre_{key}" in group:
+                    identifier.append(group[f"pre_{key}"])
+                else:
+                    identifier.append(None)
+            return tuple(identifier)
+
+        needed_groups = [_identifier_for(group) for group in current_groups]
+        params_in_state_dict_order = [group['params'] for group in state_dict_groups]
+        loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):

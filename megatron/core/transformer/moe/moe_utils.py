@@ -26,6 +26,7 @@ from megatron.core.transformer.moe.moe_logging import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
+from megatron.core.utils import maybe_move_tensor_to_cpu as _maybe_move_tensor_to_cpu
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -38,6 +39,7 @@ if HAVE_TE:
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
         fused_topk_with_score_function_supports_qb,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -55,6 +57,7 @@ else:
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
     fused_topk_with_score_function_supports_qb = False
+    fused_topk_with_score_function_supports_topk_indices = False
 
 
 def switch_load_balancing_loss_func(
@@ -709,6 +712,7 @@ def topk_routing_with_score_function(
     dense_output: bool = False,
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -737,6 +741,8 @@ def topk_routing_with_score_function(
                                                with shape [num_experts, num_bins].
         qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
                                                 K3 Quantile Balancing histogram bounds.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -746,7 +752,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -812,6 +819,8 @@ def topk_routing_with_score_function(
                 qb_bin_bounds=qb_bin_bounds,
                 qb_histogram_mode="fused_atomic",
             )
+        if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
+            kwargs["topk_indices"] = topk_indices
         return fused_topk_with_score_function(**kwargs)
 
     def _compute_topk(
@@ -1333,26 +1342,8 @@ def get_updated_expert_bias_with_quantile(
 def maybe_move_tensor_to_cpu(
     tensor: torch.Tensor, as_numpy: bool = False, record_stream: bool = False
 ) -> torch.Tensor:
-    """Move a tensor to CPU if it is on GPU.
-    Args:
-        tensor (torch.Tensor): The tensor to move to CPU.
-        as_numpy (bool, optional): Whether to convert the tensor to a numpy array.
-                                   Defaults to False.
-        record_stream (bool, optional): Whether to record the stream of the tensor, to prevent
-                                        memory leak when the DtoH data transfer is on a side
-                                        stream. Defaults to False.
-
-    Returns:
-        torch.Tensor: The tensor moved to CPU.
-    """
-    if torch.is_tensor(tensor) and tensor.is_cuda:
-        cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
-        if as_numpy:
-            cpu_tensor = cpu_tensor.numpy()
-        if record_stream:
-            tensor.record_stream(torch.cuda.current_stream())
-        tensor = cpu_tensor
-    return tensor
+    """Compatibility wrapper for :func:`megatron.core.utils.maybe_move_tensor_to_cpu`."""
+    return _maybe_move_tensor_to_cpu(tensor, as_numpy=as_numpy, record_stream=record_stream)
 
 
 @internal_api

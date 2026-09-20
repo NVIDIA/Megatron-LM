@@ -26,6 +26,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
     TransformerLayer,
+    TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
 from megatron.core.utils import is_te_min_version
@@ -108,6 +109,112 @@ class TestParallelTransformerLayer:
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
+
+    @pytest.mark.parametrize("cp_comm_type", ["all_gather", ["p2p", "all_gather"]])
+    def test_dynamic_cp_passes_cp_comm_type_at_configured_cp1(self, cp_comm_type):
+        seen = {}
+
+        class RecordingAttention(torch.nn.Module):
+            def __init__(self, *, cp_comm_type=None, **_kwargs):
+                super().__init__()
+                seen["cp_comm_type"] = cp_comm_type
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            context_parallel_size=1,
+            dynamic_context_parallel=True,
+            cp_comm_type=cp_comm_type,
+        )
+
+        for layer_number in (1, 2):
+            TransformerLayer(
+                config,
+                TransformerLayerSubmodules(self_attention=RecordingAttention),
+                layer_number=layer_number,
+            )
+
+            expected = (
+                cp_comm_type[layer_number - 1] if isinstance(cp_comm_type, list) else cp_comm_type
+            )
+            assert seen["cp_comm_type"] == expected
+
+    def test_offload_scope_in_cuda_graph_preserves_gpt_rules(self):
+        """The shared helper keeps the existing GPT attention/dense-MLP scope rules."""
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.offload_qkv_linear = False
+        layer.offload_core_attn = True
+        layer.offload_attn_proj = False
+        layer.offload_mlp_norm = False
+        layer.is_moe_layer = False
+
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+        assert layer.offload_scope_in_cuda_graph()
+
+        layer.offload_core_attn = False
+        assert not layer.offload_scope_in_cuda_graph()
+
+        layer.config.cuda_graph_modules = [CudaGraphModule.mlp]
+        layer.offload_mlp_norm = True
+        assert layer.offload_scope_in_cuda_graph()
+
+        layer.is_moe_layer = True
+        assert not layer.offload_scope_in_cuda_graph()
+
+    def test_offload_scope_in_cuda_graph_can_require_concrete_branches(self):
+        """Hybrid split layers ignore configured scopes backed only by IdentityOp."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.mlp]
+        layer.offload_qkv_linear = False
+        layer.offload_core_attn = True
+        layer.offload_attn_proj = False
+        layer.offload_mlp_norm = True
+        layer.is_moe_layer = False
+        layer.self_attention = IdentityOp()
+        layer.cross_attention = IdentityOp()
+        layer.mlp = IdentityOp()
+
+        # The default intentionally preserves GPT's config-based rule.
+        assert layer.offload_scope_in_cuda_graph()
+        assert not layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+        layer.self_attention = torch.nn.Linear(2, 2)
+        assert layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+        layer.offload_core_attn = False
+        layer.mlp = torch.nn.Linear(2, 2)
+        assert layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+    def test_set_offload_modules_requires_concrete_attention_branch(self, monkeypatch):
+        """The stored capture flag must not survive on an attention-free split layer."""
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.config.offload_modules = ['core_attn']
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+        layer.config.cuda_graph_warmup_steps = 1
+        layer.is_moe_layer = False
+        monkeypatch.setattr(transformer_layer_module, 'is_torch_min_version', lambda _version: True)
+        monkeypatch.setattr(transformer_layer_module, 'is_te_min_version', lambda _version: True)
+
+        # A normal GPT attention layer owns the configured core-attention boundary.
+        assert not isinstance(layer.self_attention, IdentityOp)
+        layer._set_offload_modules()
+        assert layer.offload_module_in_cuda_graph
+
+        # A split Hybrid MoE tail shares the config but has no attention body.
+        layer.self_attention = IdentityOp()
+        layer.cross_attention = IdentityOp()
+        layer._set_offload_modules()
+        assert not layer.offload_module_in_cuda_graph
 
     def test_split_branch_norms_join_mhc_recompute_manager(self, monkeypatch):
         """Explicit norms in split hybrid branches use the unified mHC manager."""
@@ -900,30 +1007,31 @@ class TestMHCWithCudaGraph:
         assert layer.self_attention in graph_submodules
         assert layer.self_attention_hyper_connection not in graph_submodules
 
-    def test_mhc_split_config_rejects_packed_sequence(self):
-        """The split validator rejects packed (THD) sequences at config time.
-
-        The split replay's kwargs assembly does not forward the THD captured
-        kwargs (cu_seqlens_*, padding_mask) to the graphed callable, and
-        Transformer Engine raises TypeError for a kwarg present at capture but
-        missing at replay -- so without this gate a THD split run is accepted
-        and then dies on the first replay. The gate keys on
-        sequence_packing_scheduler, the same signal _is_thd_cuda_graph() uses
-        to shape the THD static inputs.
-        """
-        with pytest.raises(ValueError, match="does not support packed"):
-            self._create_mhc_layer(
-                bf16=True,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn],
-                recompute_granularity="selective",
-                recompute_modules=["mhc"],
-                mhc_recompute_attn_cuda_graph_split=True,
-                sequence_packing_scheduler="dp_balanced",
-                max_seqlen_per_dp_cp_rank=32,
-                thd_max_packed_sequences=2,
-                pad_packed_seq_alignment="max",
-            )
+    @pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="THD packing requires TE >= 2.9")
+    def test_mhc_split_static_inputs_preserve_packed_sequence_metadata(self):
+        """Packed split capture keeps THD metadata beside the one-stream aggregate."""
+        layer, config = self._create_mhc_layer(
+            bf16=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_attn_cuda_graph_split=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=32,
+            thd_max_packed_sequences=2,
+            pad_packed_seq_alignment="max",
+        )
+        inputs = layer.get_layer_static_inputs(32, 1)
+        assert inputs["hidden_states"].shape == (32, 1, config.hidden_size)
+        assert inputs["padding_mask"].shape == (1, 32)
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+        ):
+            assert inputs[name].shape == (3,)
 
     @pytest.mark.parametrize(
         "offload_modules",
