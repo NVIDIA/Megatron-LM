@@ -205,6 +205,9 @@ def offload_optimizer(optimizer) -> None:
         if _opt.optimizer is not None:
             hdo = _opt.optimizer
             state_offloader = getattr(_opt, "_optimizer_state_offloader", None)
+            if state_offloader is not None:
+                # Chunked step evicts moments, but retains masters until this boundary.
+                state_offloader.offload_for_forward()
             if all(
                 hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
             ):
