@@ -5886,7 +5886,14 @@ def train(
                 # cost span (it stalls the critical path), unlike passive monitors.
                 with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
                     params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
-            if grad_norm is not None and iteration % args.tensorboard_log_interval == 0:
+            # Only DSA runs have an indexer to split off. Without this gate a non-DSA run
+            # scans every gradient and launches two extra reductions on every step, since
+            # default clipping always produces grad_norm and tensorboard_log_interval is 1.
+            # training_log skips these metrics when they stay None.
+            dsa_split_stats = getattr(args, 'experimental_attention_variant', None) == 'dsa'
+            if dsa_split_stats and grad_norm is not None and (
+                iteration % args.tensorboard_log_interval == 0
+            ):
                 # The optimizer already computed these while clipping; reuse them rather
                 # than walking every parameter a second time.
                 split_grad_norms = (
@@ -5904,7 +5911,9 @@ def train(
                 non_indexer_grad_norm = reduce_max_stat_across_model_parallel_group(
                     non_indexer_grad_norm
                 )
-            if num_zeros_in_grad is not None and iteration % args.tensorboard_log_interval == 0:
+            if dsa_split_stats and num_zeros_in_grad is not None and (
+                iteration % args.tensorboard_log_interval == 0
+            ):
                 indexer_num_zeros_in_grad, non_indexer_num_zeros_in_grad = (
                     calc_dsa_split_grad_num_zeros(model, optimizer)
                 )
