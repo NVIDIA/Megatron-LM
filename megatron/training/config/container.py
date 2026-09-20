@@ -244,6 +244,8 @@ class PretrainConfigContainer(ConfigContainerBase):
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     model: HybridModelConfig | GPTModelConfig
+    peft: object | None = None
+    """Optional PEFT callable; YAML export requires a dataclass or config serializer."""
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
@@ -257,6 +259,17 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the config without silently dropping PEFT constructor state."""
+        peft = self.peft
+        if peft is not None and not (
+            isinstance(peft, Serializable)
+            or callable(getattr(peft, "to_cfg_dict", None))
+            or (is_dataclass(peft) and not isinstance(peft, type))
+        ):
+            raise TypeError("peft must be serializable as a dataclass or via to_cfg_dict/as_dict")
+        return super().to_dict()
 
 
 @dataclass(kw_only=True)

@@ -167,6 +167,8 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
+from megatron.training.models.base import ModelConfig
+from megatron.training.peft import register_peft_pre_wrap_hook
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -2479,14 +2481,17 @@ def _freeze_base_model_for_mtp(model_list):
 
 
 def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
-    """Install the requested freeze hook before a config-built model is wrapped."""
+    """Keep the requested freeze hook after parameter-adding pre-wrap hooks."""
     freeze_hook = None
     if freeze_all_layers:
         freeze_hook = _freeze_all_model_chunks
     elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
 
-    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
+    if freeze_hook is not None:
+        model_config.pre_wrap_hooks[:] = [
+            hook for hook in model_config.pre_wrap_hooks if hook is not freeze_hook
+        ]
         model_config.pre_wrap_hooks.append(freeze_hook)
 
 
@@ -2865,6 +2870,8 @@ def setup_model_and_optimizer(
 
             cfg = cfg_container
             model_config = cfg.model
+            if isinstance(model_config, ModelConfig):
+                register_peft_pre_wrap_hook(model_config, getattr(cfg, "peft", None))
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
 
