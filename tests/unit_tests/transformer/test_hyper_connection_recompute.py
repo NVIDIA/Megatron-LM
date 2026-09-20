@@ -1733,14 +1733,7 @@ class TestSinglePassMHC:
         "overrides, message",
         [
             ({"enable_hyper_connections": False}, "requires enable_hyper_connections=True"),
-            (
-                {
-                    "recompute_granularity": "full",
-                    "recompute_method": "uniform",
-                    "recompute_num_layers": 1,
-                },
-                "activation recomputation",
-            ),
+            ({"tensor_model_parallel_size": 2}, "requires tensor_model_parallel_size=1"),
         ],
     )
     def test_single_pass_validates_its_own_prerequisites(self, overrides, message):

@@ -16,10 +16,12 @@ import torch.distributed as dist
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelineDataIterator,
+    PipelineGradientMessage,
     PipelinePayload,
     PipelinePayloadPlan,
     PipelinePayloadSpec,
     PipelineTensorSpec,
+    backward_pipeline_payload,
 )
 from megatron.core.pipeline_parallel.schedules import (
     backward_step,
@@ -29,11 +31,14 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.pipeline_parallel.typed_p2p_communication import (
     TypedP2PCommunicator,
+    _decode_header,
+    _MessageRecord,
     _pack_header,
     _unpack_header,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -75,7 +80,7 @@ def test_joint_backward_sums_local_and_relay_contributions(release):
     )
     torch.testing.assert_close(gradients[0], torch.tensor([14.0, 16.0]))
     torch.testing.assert_close(gradients[1], torch.tensor([51.0, 74.0]))
-    torch.testing.assert_close(gradients[2], torch.zeros(2))
+    assert gradients[2] is None
     assert gradients[3] is None
     torch.testing.assert_close(weight.grad, torch.tensor(23.0))
 
@@ -105,7 +110,7 @@ def test_payload_release_preserves_saved_views_hooks_and_empty_gradients():
     payload.release_output()
     payload.release_output()  # The schedule may retire the same output more than once.
     gc.collect()
-    assert hidden_ref() is None
+    assert hidden_ref() is not None  # Original roots remain alive until backward completes.
     assert not payload.tensors
     backward_step(
         None,
@@ -116,7 +121,8 @@ def test_payload_release_preserves_saved_views_hooks_and_empty_gradients():
     torch.testing.assert_close(x.grad, 2 + saved_value * (1 - saved_value))
     assert len(hooks) == 1
     torch.testing.assert_close(hooks[0], torch.ones(4))
-    assert payload._backward_state.edges == ()
+    assert payload._backward_state.outputs == ()
+    assert hidden_ref() is None
 
 
 def test_terminal_payload_backward_scales_loss_once():
@@ -154,16 +160,260 @@ def test_header_preserves_mixed_dtypes_empty_shapes_and_host_metadata():
         _unpack_header(values, 7, chunk_id=1)
 
 
+def test_generic_schema_has_no_csa2_field_dimension_or_metadata_limit():
+    specs = tuple(
+        PipelineTensorSpec(
+            f"feature/value:L{i}",
+            (2, 1, 3, 1),
+            torch.float32,
+            i % 3 == 0,
+            layout="bshd",
+            present=i % 2 == 0,
+        )
+        for i in range(12)
+    )
+    descriptor = PipelinePayloadSpec(specs, (0, 1, 2, 3, 4, 5), "decoder/cut:20")
+    values = _pack_header(specs, descriptor.metadata, 7, 2, boundary_id=descriptor.boundary_id)
+    assert _decode_header(values, 7, 2) == descriptor
+    assert descriptor.schema.present_spec_indices == (0, 2, 4, 6, 8, 10)
+    assert descriptor.schema.grad_tensor_indices == (0, 3)
+    message = PipelineGradientMessage(
+        (torch.zeros(1), None, torch.ones(1)),
+        torch.tensor([7, 2, descriptor.fingerprint, 1, 0]),
+        (7, 2, descriptor.fingerprint),
+        (0, 2),
+    )
+    grads = message.resolve()
+    assert grads[0] is not None and grads[1:] == (None, None)
+    message.control[0] += 1
+    with pytest.raises(ValueError, match="microbatch"):
+        message.resolve()
+
+
+@pytest.mark.parametrize("activity", ["kv", "zero_hidden", "inactive"])
+def test_pipeline_roots_preserve_dsa_aux_activity(monkeypatch, activity):
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+    x = torch.ones(3, requires_grad=True)
+    weight = torch.nn.Parameter(torch.tensor(2.0))
+    auxiliary = torch.nn.Parameter(torch.tensor(3.0))
+    hidden = DSAIndexerLossAutoScaler.apply(x.square(), auxiliary.square())
+    kv = x * weight
+    payload = _Payload((hidden, kv))
+    payload.release_output()
+    grads = (
+        torch.zeros_like(hidden) if activity == "zero_hidden" else None,
+        torch.ones_like(kv) if activity != "inactive" else None,
+    )
+    backward_pipeline_payload(None, payload, grads)
+    assert (auxiliary.grad is not None) == (activity == "zero_hidden")
+    assert (weight.grad is not None) == (activity != "inactive")
+    if auxiliary.grad is not None:
+        assert auxiliary.grad == 6
+    assert payload._backward_state.outputs == ()
+
+
+def test_duplicate_output_roots_accumulate_exactly_once():
+    x = torch.ones(3, requires_grad=True)
+    shared = x.square()
+    backward_pipeline_payload(
+        None, _Payload((shared, shared)), (torch.ones(3), torch.full((3,), 2.0))
+    )
+    torch.testing.assert_close(x.grad, torch.full((3,), 6.0))
+
+
+def test_inactive_boundary_backward_with_mcore_ddp(monkeypatch):
+    """Exercise real DDP buffers/reduction with changing activity on two DP ranks.
+
+    CPU runs replace only CUDA allocation/stream access; autograd, MCore hooks,
+    buffer lifecycle and Gloo collectives execute normally. Overlapping DDP's
+    fixed parameter-readiness counts are outside this dynamic-activity contract.
+    """
+    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+        pytest.skip("Requires two distributed ranks")
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+
+    if not dist.is_initialized():
+        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
+    rank = dist.get_rank()
+    singletons = [dist.new_group([i]) for i in range(2)]
+    groups = ProcessGroupCollection()
+    groups.dp = groups.dp_cp = groups.expt_dp = dist.group.WORLD
+    groups.tp = groups.pp = groups.ep = singletons[rank]
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        device = torch.device("cpu")
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: device)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+
+    class Stage(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0, device=device))
+            self.auxiliary = torch.nn.Parameter(torch.tensor(3.0, device=device))
+
+        def forward(self, x):
+            return _Payload(
+                (
+                    DSAIndexerLossAutoScaler.apply(x.square(), self.auxiliary.square()),
+                    x * self.weight,
+                )
+            )
+
+    config = TransformerConfig(num_layers=1, hidden_size=4, num_attention_heads=1)
+    module = Stage()
+    ddp = DistributedDataParallel(
+        config,
+        DistributedDataParallelConfig(
+            overlap_grad_reduce=False, use_distributed_optimizer=False, check_for_nan_in_grad=False
+        ),
+        module,
+        pg_collection=groups,
+    )
+    try:
+        for activity in ("kv", "inactive", "zero_hidden", "different_ranks", "inactive"):
+            ddp.zero_grad_buffer()
+            x = torch.full((3,), rank + 1.0, device=device, requires_grad=True)
+            output = ddp(x)
+            active = activity != "inactive" and (activity != "different_ranks" or rank == 0)
+            backward_pipeline_payload(
+                None,
+                output,
+                (
+                    torch.zeros_like(x) if activity == "zero_hidden" else None,
+                    torch.ones_like(x) if active else None,
+                ),
+            )
+            ddp.finish_grad_sync()
+            expected_weight = 1.5 if activity == "different_ranks" else (4.5 if active else 0.0)
+            torch.testing.assert_close(
+                module.weight.main_grad, torch.tensor(expected_weight, device=device)
+            )
+            torch.testing.assert_close(
+                module.auxiliary.main_grad,
+                torch.tensor(6.0 if activity == "zero_hidden" else 0.0, device=device),
+            )
+            assert (x.grad is not None) == active
+    finally:
+        dist.destroy_process_group(singletons[rank])
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_generic_packed_fields_actual_transport(monkeypatch, prepared):
+    """Absence, 4-D fields and all-inactive backward use the real two-rank protocol."""
+    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+        pytest.skip("Requires two distributed ranks")
+    if not dist.is_initialized():
+        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
+    rank = dist.get_rank()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+    descriptor = PipelinePayloadSpec(
+        tuple(
+            PipelineTensorSpec(
+                f"example/value:L{i}",
+                (2, 1, 3, 1),
+                torch.float32 if i % 3 == 0 else torch.int64,
+                i % 3 == 0,
+                present=i % 2 == 0,
+                layout="bshd",
+            )
+            for i in range(12)
+        ),
+        (0, 1, 2, 3, 4, 5),
+        "example/pp:4",
+    )
+
+    class Payload(PipelinePayload):
+        tensor_specs = descriptor.tensor_specs
+        metadata = descriptor.metadata
+        boundary_id = descriptor.boundary_id
+
+        def __init__(self, tensors, metadata):
+            assert metadata == self.metadata
+            self.tensors = tensors
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=4,
+        num_attention_heads=1,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+        batch_p2p_comm=False,
+        deallocate_pipeline_outputs=True,
+    )
+    plans = (
+        [
+            PipelinePayloadPlan(
+                (descriptor if rank else None,) * 3, (None if rank else descriptor,) * 3
+            )
+        ]
+        if prepared
+        else None
+    )
+    transport = TypedP2PCommunicator(
+        dist.group.WORLD, config, Payload, device=device, payload_plans=plans
+    )
+    for activity in ("kv", "zero_hidden", "inactive"):
+        if rank == 0:
+            x = torch.ones(2, 1, 3, 1, device=device, requires_grad=True)
+            auxiliary = torch.tensor(3.0, device=device, requires_grad=True)
+            hidden = DSAIndexerLossAutoScaler.apply(x.square(), auxiliary.square())
+            kv = x * 2
+            tensors = tuple(
+                (
+                    hidden
+                    if i == 0
+                    else (
+                        kv
+                        if i == 6
+                        else torch.zeros(
+                            descriptor.tensor_specs[i].shape,
+                            dtype=descriptor.tensor_specs[i].dtype,
+                            device=device,
+                        )
+                    )
+                )
+                for i in descriptor.schema.present_spec_indices
+            )
+            outgoing = Payload(tensors, descriptor.metadata)
+            gradients = transport.send_forward_recv_backward(outgoing, None, False)
+            backward_pipeline_payload(None, outgoing, gradients)
+            assert (x.grad is not None) == (activity != "inactive")
+            assert (auxiliary.grad is not None) == (activity == "zero_hidden")
+            if x.grad is not None:
+                torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
+        else:
+            incoming = transport.recv_forward(None, False)
+            loss = (
+                incoming.tensors[3].sum()
+                if activity != "inactive"
+                else torch.zeros((), device=device)
+            )
+            if activity == "zero_hidden":
+                loss = loss + incoming.tensors[0].sum() * 0
+            gradients = backward_pipeline_payload(incoming, loss, None)
+            transport.send_backward(gradients, False)
+    transport.finish()
+
+
 @pytest.mark.parametrize(
     "spec",
     [
         PipelineTensorSpec("bad", (-1, 3), torch.float32, True),
-        PipelineTensorSpec("bad", (1,) * 4, torch.float32, True),
         PipelineTensorSpec("bad", (1,), torch.int32, True),
     ],
 )
 def test_invalid_wire_descriptors(spec):
-    with pytest.raises(ValueError, match="[Ii]nvalid"):
+    with pytest.raises(ValueError):
         _pack_header((spec,), (0, 0), 0)
 
 
@@ -264,33 +514,39 @@ def test_overlap_constructs_payload_after_header_and_waits_before_data_use(
         result = post(**kwargs)
         for name, request in result.items():
             if name == "recv_prev":
-                request.received_value = wire_header if len(requests) == 1 else 7
+                request.received_value = (
+                    wire_header.numel()
+                    if request.buffer().shape == (1,) and request.buffer().dtype == torch.int64
+                    else wire_header if request.buffer().dtype == torch.int64 else 7
+                )
         return result
 
     def factory(tensors, metadata):
-        assert requests[0].wait_count == 1  # Header is parsed synchronously.
-        assert all(request.wait_count == 0 for request in requests[1:])
+        assert all(request.wait_count == 1 for request in requests[:2])
+        assert len(requests) == 2  # Length and descriptor precede allocation/data receive.
         return _make_payload(tensors, metadata)
 
     monkeypatch.setattr(
         "megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post_receive
     )
     communicator.make_payloads[1] = factory
-    payload, handles = communicator.send_forward_recv_forward(
+    received, handles = communicator.send_forward_recv_forward(
         None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
     )
-    assert payload.metadata == (3, 0)
-    assert len(requests) == 2 and requests[1].wait_count == 0
+    assert len(requests) == 1 and requests[0].wait_count == 0
     handles["recv_prev"].wait()
+    payload = communicator.resolve_forward(received)
+    assert payload.metadata == (3, 0)
     torch.testing.assert_close(payload.tensors[0], torch.full((3,), 7.0))
     assert payload.tensors[1].numel() == 0
 
-    # Gradients use the same chunk's FIFO; missing contributions become zeros.
+    # Fixed buffers carry zeros, but the bitmap preserves inactive contributions.
     _, handles = communicator.send_backward_recv_backward(
         (None, None), False, None, overlap_p2p_comm=True, send_chunk_id=1
     )
     assert requests[-1].wait_count == 0
     torch.testing.assert_close(requests[-1].buffer(), torch.zeros(3))
+    assert requests[-2].buffer()[-1].item() == 0
     communicator.finish()
     assert all(request.wait_count == 1 for request in requests)
     assert not communicator._pending
@@ -326,15 +582,24 @@ def test_warmup_prefetch_defers_header_and_preserves_peer_order(
         for i, source in enumerate(sources)
     )
     posted, factories = [], []
+    current_header = None
 
     def post_receive(**kwargs):
+        nonlocal current_header
         result = post(**kwargs)
         for name, request in result.items():
             tensor = request.buffer()
             is_header = name == "recv_prev" and tensor.dtype == torch.int64
-            posted.append((name, "header" if is_header else tuple(tensor.shape)))
+            is_length = is_header and tensor.numel() == 1
+            posted.append(
+                (name, "length" if is_length else "header" if is_header else tuple(tensor.shape))
+            )
             if name.startswith("recv_"):
-                request.received_value = next(headers) if is_header else 7
+                if is_length:
+                    current_header = next(headers)
+                    request.received_value = current_header.numel()
+                else:
+                    request.received_value = current_header if is_header else 7
         return result
 
     def factory(tensors, metadata):
@@ -348,13 +613,13 @@ def test_warmup_prefetch_defers_header_and_preserves_peer_order(
     first, first_handles = communicator.send_forward_recv_forward(
         None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
     )
-    assert posted == [("recv_prev", "header")]
+    assert posted == [("recv_prev", "length")]
     assert requests[0].wait_count == 0 and not factories
     assert not isinstance(first, PipelinePayload)
 
     if next_is_backward:
         # A gradient receive sharing PP=2's peer must not consume forward data.
-        communicator._sent[0].append(sources[0].tensor_specs)
+        communicator._sent[0].append(_MessageRecord(sources[0].descriptor, 0, 0))
         _, next_handles = communicator.send_backward_recv_backward(
             None, True, None, overlap_p2p_comm=True, recv_chunk_id=0
         )
@@ -363,15 +628,17 @@ def test_warmup_prefetch_defers_header_and_preserves_peer_order(
         second, next_handles = communicator.send_forward_recv_forward(
             None, True, None, overlap_p2p_comm=True, recv_chunk_id=1
         )
-        next_direction, next_shape = "recv_prev", "header"
+        next_direction, next_shape = "recv_prev", "length"
     assert posted == [
+        ("recv_prev", "length"),
         ("recv_prev", "header"),
         ("recv_prev", (3,)),
         ("recv_prev", (2,)),
+        *([(next_direction, (4,))] if next_is_backward else []),
         (next_direction, next_shape),
     ]
-    assert requests[0].wait_count == 1
-    assert all(request.wait_count == 0 for request in requests[1:])
+    assert all(request.wait_count == 1 for request in requests[:2])
+    assert all(request.wait_count == 0 for request in requests[2:])
     assert factories == [(3, 0)]
 
     first_handles["recv_prev"].wait()
@@ -407,7 +674,7 @@ def test_warmup_send_retains_header_and_all_fields_until_wait(delayed_transport,
     )
     _, handles = communicator.send_forward_recv_forward(source, False, None, overlap_p2p_comm=True)
     assert bool(source.tensors) is not release
-    assert len(requests) == 3 and all(request.wait_count == 0 for request in requests)
+    assert len(requests) == 4 and all(request.wait_count == 0 for request in requests)
     assert requests[0].buffer().dtype == torch.int64
     assert all(request.buffer().is_contiguous() for request in requests)
     del source
@@ -427,7 +694,11 @@ def test_retiring_send_advances_prefetched_data_before_wait(delayed_transport, m
         result = post(**kwargs)
         for name, request in result.items():
             if name == "recv_prev":
-                request.received_value = wire_header if request.buffer().dtype == torch.int64 else 9
+                request.received_value = (
+                    wire_header.numel()
+                    if request.buffer().shape == (1,) and request.buffer().dtype == torch.int64
+                    else wire_header if request.buffer().dtype == torch.int64 else 9
+                )
         return result
 
     monkeypatch.setattr(
@@ -440,11 +711,11 @@ def test_retiring_send_advances_prefetched_data_before_wait(delayed_transport, m
     empty["send_prev"].wait()
     assert len(requests) == 1 and requests[0].wait_count == 0
     _, handles = communicator.send_forward_recv_forward(source, False, None, overlap_p2p_comm=True)
-    assert len(requests) == 3 and all(request.wait_count == 0 for request in requests)
+    assert len(requests) == 4 and all(request.wait_count == 0 for request in requests)
     handles["send_next"].wait()
     # Retiring a send must first post the prefetched payload's data. Otherwise
     # neighbors can both block retiring sends that have no posted data receives.
-    assert len(requests) == 4 and requests[0].wait_count == 1
+    assert len(requests) == 6 and requests[0].wait_count == 1
     assert requests[-1].name == "recv_prev" and requests[-1].wait_count == 0
     payload = communicator.resolve_forward(received)
     torch.testing.assert_close(payload.tensors[0], torch.full((3,), 9.0))
@@ -475,7 +746,11 @@ def test_prepared_receive_posts_all_fields_without_waiting_for_a_header(
         result = post(**kwargs)
         for name, request in result.items():
             if name == "recv_prev":
-                request.received_value = 7
+                request.received_value = (
+                    torch.tensor((0, 1, descriptor.fingerprint))
+                    if request.buffer().shape == (3,) and request.buffer().dtype == torch.int64
+                    else 7
+                )
         return result
 
     monkeypatch.setattr(
@@ -492,7 +767,7 @@ def test_prepared_receive_posts_all_fields_without_waiting_for_a_header(
     )
     assert bool(source.tensors) is not release
     assert isinstance(received, PipelinePayload)
-    assert len(requests) == 4  # Two nonempty fields in each direction; no header.
+    assert len(requests) == 6  # Identity + two fields each way; no dynamic descriptor.
     assert all(request.wait_count == 0 for request in requests)
     assert communicator._forward_header is None
     handles["recv_prev"].wait()

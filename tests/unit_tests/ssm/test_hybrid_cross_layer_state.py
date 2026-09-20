@@ -6,6 +6,7 @@ CPU modules use the production Hybrid/Transformer layers and checkpoint engine.
 These tests cover autograd and replay contracts, not distributed or CUDA kernels.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import pytest
@@ -13,11 +14,18 @@ import torch
 from torch import nn
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.hybrid import hybrid_stack_adapter as boundary_runtime
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
+from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStateAdapter
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import random as checkpoint_runtime
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.state_boundary import (
+    BoundarySchema,
+    StateRegion,
+    TensorField,
+    TensorSchema,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
@@ -33,39 +41,60 @@ class _MemoryState:
     def recompute_boundary_tensors(self):
         return () if self.memory is None else (self.memory,)
 
-    def save_for_recompute(self):
-        # Capture only immutable metadata, never this mutable state instance.
-        last_layer = self.last_layer
 
-        def restore(tensors):
-            return _MemoryState(tensors[0], last_layer)
+class _MemoryDeclaration:
+    """Native memory fields and codec using the same contract as CSA2 and mHC."""
 
-        return (self.memory,), restore
+    context_attribute = "cross_layer_state"
 
+    def __init__(self, config, *, layer_type_list, pp_layer_offset, **kwargs):
+        self.config = config
+        self.pattern, self.offset = layer_type_list, pp_layer_offset
 
-class _MemoryAdapter:
-    consumes_input_tensor = False
+    def initial_state(self, hidden, packed_seq_params):
+        return _MemoryState()
 
-    def __init__(self, config, **kwargs):
-        pass
+    @staticmethod
+    def _key(last_layer):
+        source = 4 if last_layer >= 4 else int(last_layer > 0)
+        return f"memory/shared:L{source}"
 
-    def configure_cuda_graphs(self, layers):
-        pass
+    def _field(self, hidden, last_layer):
+        return TensorField(
+            self._key(last_layer),
+            (*hidden.shape[:2], self.config.hidden_size),
+            self.config.params_dtype,
+            "sbhd",
+            True,
+            present=last_layer > 0,
+        )
 
-    def configure_distributed_pipeline(self, pattern, pp_group, vp_stage=None):
-        assert pp_group.size() == 1
+    def checkpoint_region(self, start, end, hidden, state):
+        readers = [self.offset + i + 1 for i in range(start, end) if self.pattern[i] != "-"]
+        last_layer = readers[-1] if readers else state.last_layer
+        return StateRegion(
+            BoundarySchema(
+                f"memory/checkpoint:{start}:{end}",
+                (self._field(hidden, state.last_layer),),
+                (self._field(hidden, last_layer),),
+            ),
+            self,
+            (state.last_layer,),
+            (last_layer,),
+        )
 
-    def pipeline_payload_spec(self, *args, **kwargs):
-        return None, None
+    def export(self, state, fields):
+        assert len(fields) == 1 and fields[0].key == self._key(state.last_layer)
+        assert fields[0].present == (state.memory is not None)
+        tensors = (state.memory,) if fields[0].present else ()
+        TensorSchema(fields).validate(tensors)
+        return tensors
 
-    def validate_input(self, input_tensor):
-        pass
-
-    def prepare_forward(self, hidden_states, packed_seq_params, inference_context):
-        return hidden_states, packed_seq_params, HybridStackForwardContext(_MemoryState())
-
-    def finalize_forward(self, output, packed_seq_params, context):
-        return output, context.cross_layer_state.memory
+    def restore(self, fields, tensors, metadata):
+        TensorSchema(fields).validate(tensors)
+        state = _MemoryState(tensors[0] if tensors else None, metadata[0])
+        self.export(state, fields)
+        return state
 
 
 class _Norm(nn.LayerNorm):
@@ -129,6 +158,7 @@ def _config(kind):
         attention_dropout=0.0,
         params_dtype=torch.float32,
         enable_hyper_connections=kind.startswith("mhc_"),
+        mhc_single_pass=kind.startswith("mhc_single_"),
         num_residual_streams=2,
         use_fused_mhc=False,
         bias_dropout_fusion=False,
@@ -139,7 +169,7 @@ def _stack(config, kind):
     groups = ProcessGroupCollection()
     groups.tp = groups.pp = groups.cp = torch.distributed.ProcessGroup(0, 1)
     submodules = HybridStackSubmodules(
-        forward_adapter=_MemoryAdapter,
+        forward_adapter=_MemoryDeclaration,
         mamba_layer=_MemoryLayer,
         mlp_layer=_PlainLayer,
         attention_layer=ModuleSpec(
@@ -152,13 +182,26 @@ def _stack(config, kind):
         ),
     )
     # A layer that does not consume memory separates its producer and consumers.
-    return HybridStack(
+    stack = HybridStack(
         config,
         submodules,
-        layer_type_list=list("*-***" if kind.endswith("attention") else "M-MMM"),
+        layer_type_list=list(
+            "*****"
+            if kind.startswith("mhc_single_")
+            else "*-***" if kind.endswith("attention") else "M-MMM"
+        ),
         post_layer_norm=False,
         pg_collection=groups,
     )
+    finalize = stack.forward_adapter.finalize_forward
+
+    def observe_memory(output, packed_seq_params, context):
+        # Expose a native side output only to test independent backward roots.
+        # Model state initialization and checkpoint replay use the shared executor.
+        return finalize(output, packed_seq_params, context), context.cross_layer_state.memory
+
+    stack.forward_adapter.finalize_forward = observe_memory
+    return stack
 
 
 @pytest.fixture(autouse=True)
@@ -177,7 +220,86 @@ def _assert_grad(actual, expected):
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
 
 
-@pytest.mark.parametrize("kind", ["attention", "custom", "mhc_custom"])
+@pytest.mark.parametrize("backend", ["mcore", "te"])
+@pytest.mark.parametrize("objective", ["memory", "both"])
+def test_checkpoint_codec_with_arbitrary_context_attribute(monkeypatch, backend, objective):
+    """Both checkpoint backends carry state with no built-in context name or snapshot API."""
+    torch.manual_seed(852)
+    config = replace(
+        _config("attention"),
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=2,
+    )
+    declaration = _MemoryDeclaration(config, layer_type_list=["*"] * 5, pp_layer_offset=0)
+    declaration.context_attribute = "memory_owner"
+    groups = ProcessGroupCollection()
+    groups.tp = groups.cp = torch.distributed.ProcessGroup(0, 1)
+    adapter = HybridStateAdapter(
+        config,
+        components=(declaration,),
+        hidden_size=config.hidden_size,
+        hidden_dtype=config.params_dtype,
+        layer_type_list=["*"] * 5,
+        pp_layer_offset=0,
+        pre_process=True,
+        post_process=True,
+        is_mtp_layer=False,
+        pg_collection=groups,
+    )
+    actual = nn.ModuleList(_MemoryAttention(config, i + 1) for i in range(5))
+    reference = nn.ModuleList(_MemoryAttention(config, i + 1) for i in range(5))
+    reference.load_state_dict(actual.state_dict())
+    calls = []
+
+    def te_checkpoint(function, distribute, rng_tracker, tp_group, *inputs):
+        assert tp_group is groups.tp
+        calls.append(len(inputs))
+        return checkpoint_runtime.checkpoint(function, distribute, *inputs)
+
+    if backend == "te":
+        # Exercise TE dispatch with the real MCore checkpoint engine on CPU.
+        config.quant_recipe = object()
+        monkeypatch.setattr(boundary_runtime, "te_checkpoint", te_checkpoint)
+
+    def forward(layer, hidden, working):
+        return layer(hidden, memory_state=working.memory_owner)[0]
+
+    forwards = []
+    for length in (3, 5):
+        x = torch.randn(length, 2, config.hidden_size, requires_grad=True)
+        ref_x = x.detach().clone().requires_grad_()
+        _, _, context = adapter.prepare_forward(x, None, None)
+        _, _, ref_context = adapter.prepare_forward(ref_x, None, None)
+        assert set(vars(context)) == {"memory_owner"}
+        hidden = boundary_runtime.checkpointed_hybrid_forward(
+            config,
+            actual,
+            x,
+            context,
+            tp_group=groups.tp,
+            quantization_context=lambda *_: nullcontext(),
+            layer_forward=forward,
+            boundary_factory=adapter.checkpoint_region,
+        )
+        ref_hidden = ref_x
+        for layer in reference:
+            ref_hidden = forward(layer, ref_hidden, ref_context)
+        output = (hidden, context.memory_owner.memory)
+        expected = (ref_hidden, ref_context.memory_owner.memory)
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        forwards.append((x, ref_x, output, expected))
+    for x, ref_x, output, expected in reversed(forwards):
+        for values in (output, expected):
+            selected = values if objective == "both" else values[1:]
+            sum(t.square().sum() for t in selected).backward()
+        _assert_grad(x.grad, ref_x.grad)
+    for parameter, ref_parameter in zip(actual.parameters(), reference.parameters()):
+        _assert_grad(parameter.grad, ref_parameter.grad)
+    assert len(calls) == (6 if backend == "te" else 0)
+
+
+@pytest.mark.parametrize("kind", ["attention", "custom", "mhc_custom", "mhc_single_attention"])
 @pytest.mark.parametrize("method,count", [("uniform", 1), ("uniform", 2), ("block", 2)])
 @pytest.mark.parametrize("objective", ["hidden", "memory", "both"])
 def test_memory_full_recompute_and_outstanding_microbatches(kind, method, count, objective):

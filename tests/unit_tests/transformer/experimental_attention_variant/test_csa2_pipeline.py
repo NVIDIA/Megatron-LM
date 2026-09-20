@@ -17,6 +17,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStateAdapter, HybridStatePayload
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.pipeline_payload import backward_pipeline_payload
 from megatron.core.transformer.enums import AttnMaskType
@@ -35,7 +36,6 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hyb
     CSA2HybridAdapter,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pipeline import (
-    CSA2PipelinePayload,
     build_csa2_pipeline_plan,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -106,7 +106,7 @@ def test_reference_layout_live_fields(block, fields, owners):
     chunks = build_csa2_pipeline_plan(config, _pattern((block * 2,), "DE" * 40), pp_size=2)
     boundary = chunks[0].outgoing
     assert boundary is chunks[1].incoming
-    assert boundary.field_names == ("hidden_states", "pre_mix", *fields)
+    assert boundary.field_names == fields
     assert (
         boundary.kv_source_layer,
         boundary.index_source_layer,
@@ -126,22 +126,18 @@ def test_vpp_placement_and_ffn_relay():
     assert (
         chunks[2].incoming.field_names
         == chunks[2].outgoing.field_names
-        == (
-            "hidden_states",
-            "pre_mix",
-            "global_kv",
-            "indexer_k",
-            "candidate_indices",
-            "candidate_lengths",
-        )
+        == ("global_kv", "indexer_k", "candidate_indices", "candidate_lengths")
     )
     assert chunks[2].incoming.last_attention_layer == chunks[2].outgoing.last_attention_layer == 6
 
 
 @pytest.mark.parametrize("use_fused_mhc", [False, True])
 @pytest.mark.parametrize("max_seqlen", [0, 1, 7])
-def test_prepared_specs_need_no_device_values(use_fused_mhc, max_seqlen):
-    config = replace(_config(torch.bfloat16), use_fused_mhc=use_fused_mhc)
+@pytest.mark.parametrize("single_pass", [False, True])
+def test_prepared_specs_need_no_device_values(use_fused_mhc, max_seqlen, single_pass):
+    config = replace(
+        _config(torch.bfloat16), use_fused_mhc=use_fused_mhc, mhc_single_pass=single_pass
+    )
     plan = build_csa2_pipeline_plan(config, _pattern((3, 4, 6, 7, 8, 10)), qkv_format="thd")
     # Meta tensors deliberately have no readable contents. Any item/tolist/cpu
     # in shape planning would fail here, even on hosts without a GPU.
@@ -154,27 +150,35 @@ def test_prepared_specs_need_no_device_values(use_fused_mhc, max_seqlen):
         max_seqlen_kv=max_seqlen,
     )
     for chunk in plan[:-1]:
-        descriptor = chunk.outgoing.payload_spec(config, 16, 1, params)
+        descriptor = _stack(config, chunk).forward_adapter.pipeline_payload_spec(16, 1, params)[1]
         specs = {spec.name: spec for spec in descriptor.tensor_specs}
         assert specs["cu_seqlens"].shape == specs["cu_seqlens_padded"].shape == (4,)
         assert specs["cu_seqlens"].dtype == specs["cu_seqlens_padded"].dtype == torch.int64
-        assert specs["pre_mix"].dtype == (torch.bfloat16 if use_fused_mhc else torch.float32)
+        assert specs["hidden_states"].shape == (
+            16,
+            1,
+            config.hidden_size * config.num_residual_streams,
+        )
+        assert ("pre_mix" in specs) == single_pass
+        if single_pass:
+            assert specs["pre_mix"].dtype == (torch.bfloat16 if use_fused_mhc else torch.float32)
         assert descriptor.metadata == (chunk.outgoing.layer_offset, max_seqlen)
         if chunk.outgoing.compress_ratio == 2 and max_seqlen < 2:
             assert specs["global_kv"].shape[0] == 0
     params.max_seqlen_q = torch.empty((), device="meta")
     with pytest.raises(ValueError, match="host integer"):
-        plan[0].outgoing.payload_spec(config, 16, 1, params)
+        plan[0].outgoing.tensor_fields(config, 16, 1, params)
 
 
 @pytest.mark.parametrize(
     "pattern, kwargs, message",
     [
-        ("DE|", {}, "nonempty"),
-        ("DEDEDEDEDEDE/DE", {}, "without MTP"),
-        ("DE|DE", {}, "exactly num_layers"),
-        ("DEDEDE|DEDEDE", {"pp_size": 3}, "divisible"),
-        ("DEDEDE|DEDEDE", {"qkv_format": "bshd"}, "qkv_format"),
+        ("DE|", {}, "Invalid Hybrid state pipeline placement"),
+        ("DEDEDEDEDEDE/DE", {}, "Invalid Hybrid state pipeline placement"),
+        ("DE|DE", {}, "Invalid Hybrid state pipeline placement"),
+        ("DEDEDE|DEDEDE", {"pp_size": 3}, "Invalid Hybrid state pipeline placement"),
+        ("DEDEDE|DEDEDE", {"qkv_format": "bshd"}, "Invalid Hybrid state pipeline placement"),
+        ("MEMEMEMEMEME", {}, "D/W/E/- sublayers"),
         ("DEEEDE|DEDEDE", {}, "D Hybrid symbol"),
     ],
 )
@@ -298,7 +302,7 @@ def _run_chunks(stacks, plan, x, params=None):
         )
         assert stack.input_tensor is None
         if chunk.outgoing is not None:
-            assert isinstance(output, CSA2PipelinePayload)
+            assert isinstance(output, HybridStatePayload)
             outputs.append(output)
             payload = output
     return output, outputs
@@ -332,8 +336,8 @@ def test_split_hybrid_forward_backward(
         reference_x = x.detach().clone().requires_grad_()
         expected = full(reference_x, None, packed_seq_params=params)
         actual, payloads = _run_chunks(stacks, plan, x, params)
-        for payload in payloads:
-            descriptor = payload.boundary.payload_spec(config, *shape, params)
+        for stack, payload in zip(stacks, payloads):
+            descriptor = stack.forward_adapter.pipeline_payload_spec(*shape, params)[1]
             assert descriptor.tensor_specs == payload.tensor_specs
             assert descriptor.metadata == payload.metadata
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -389,8 +393,12 @@ def test_payload_replay_snapshot_and_thd_caches(monkeypatch, cache_device):
     x = torch.randn(valid.numel(), 1, config.hidden_size, requires_grad=True)
     _, payloads = _run_chunks(stacks, plan, x, params)
     payload = payloads[0]
-    hidden, state, mhc, restored_params = payload.restore(use_fused_kernels=True)
-    _, other, other_mhc, _ = payload.restore(use_fused_kernels=True)
+    hidden, context, restored_params = payload.restore()
+    state, mhc = context.cross_layer_state, context.mhc_state
+    state.prepare_fused_kv()
+    _, other_context, _ = payload.restore()
+    other, other_mhc = other_context.cross_layer_state, other_context.mhc_state
+    other.prepare_fused_kv()
     assert state is not other and mhc is not other_mhc
     assert state.global_kv is other.global_kv and mhc.pre_mix is other_mhc.pre_mix
     assert (
@@ -408,12 +416,14 @@ def test_payload_replay_snapshot_and_thd_caches(monkeypatch, cache_device):
     mhc.pre_mix = None
     params.cu_seqlens_q.zero_()
     params.cu_seqlens_q_padded.zero_()
-    again = payload.restore()[1]
+    again = payload.restore()[1].cross_layer_state
     assert again.last_layer == 6 and again.global_kv is other.global_kv
     torch.testing.assert_close(again.thd_layout.valid_tokens, valid)
     # Reuse needs only KV/top-k. Its fused addresses are derived at the receiver.
     received = replace(payloads[1], tensors=tuple(t.to(cache_device) for t in payloads[1].tensors))
-    _, reuse, _, _ = received.restore(use_fused_kernels=True)
+    _, context, _ = received.restore()
+    reuse = context.cross_layer_state
+    reuse.prepare_fused_kv()
     assert reuse.indexer_k is None and reuse.candidates is None
     assert reuse.global_indices is not None and reuse.global_kv_flat is not None
     core = stacks[-1].layers[1].inner_layer.self_attention.core
@@ -459,16 +469,17 @@ def test_payload_rejects_missing_fields_wrong_sources_and_metadata(monkeypatch):
     x = torch.randn(5, 2, config.hidden_size, requires_grad=True)
     _, payloads = _run_chunks(stacks, plan, x)
     payload = payloads[0]
-    with pytest.raises(ValueError, match="required tensor fields"):
+    with pytest.raises(ValueError, match="tensor count"):
         replace(payload, tensors=payload.tensors[:-1]).restore()
     with pytest.raises(ValueError, match="pre_mix"):
         replace(
             payload, tensors=(payload.tensors[0], payload.tensors[1][..., :1], *payload.tensors[2:])
         ).restore()
-    hidden, state, mhc, _ = payload.restore()
+    hidden, context, _ = payload.restore()
+    state, mhc = context.cross_layer_state, context.mhc_state
     state.kv_source_layer = 2
-    with pytest.raises(ValueError, match="kv_source_layer=6"):
-        payload.boundary.export_payload(hidden, state, mhc)
+    with pytest.raises(ValueError, match="source version"):
+        stacks[0].forward_adapter.finalize_forward(hidden, None, context)
     with pytest.raises(ValueError, match="incoming boundary"):
         stacks[-1].set_input_tensor(payload)
     with pytest.raises(ValueError, match="adapter.configure_pipeline"):
@@ -480,7 +491,7 @@ def test_chunk_configuration_and_input_contract(monkeypatch):
     config = _config()
     plan = build_csa2_pipeline_plan(config, _pattern((7,)))
     full = _stack(config)
-    with pytest.raises(ValueError, match="does not match this HybridStack segment"):
+    with pytest.raises(ValueError, match="does not match this"):
         full.forward_adapter.configure_pipeline(plan[0])
     first, receiver = _split_stacks(full, plan)
     thd_plan = build_csa2_pipeline_plan(config, _pattern((7,)), qkv_format="thd")
@@ -488,9 +499,9 @@ def test_chunk_configuration_and_input_contract(monkeypatch):
         receiver.forward_adapter.configure_pipeline(thd_plan[1])
     x = torch.randn(5, 2, config.hidden_size, requires_grad=True)
     payload = first(x, None)
-    with pytest.raises(ValueError, match="first CSA2 pipeline chunk"):
+    with pytest.raises(ValueError, match="first Hybrid pipeline chunk"):
         first.set_input_tensor(payload)
-    with pytest.raises(ValueError, match="receive a payload"):
+    with pytest.raises(ValueError, match="typed pipeline payload"):
         receiver.set_input_tensor(x)
     with pytest.raises(ValueError, match="requires a payload from set_input_tensor"):
         receiver(None, None)
@@ -533,7 +544,7 @@ def test_failed_forward_consumes_payload_and_allows_new_microbatch(monkeypatch):
     x = torch.randn(valid.numel(), 1, config.hidden_size, requires_grad=True)
     payload = first(x, None, packed_seq_params=params)
     receiver.set_input_tensor(payload)
-    with pytest.raises(ValueError, match="different THD layout"):
+    with pytest.raises(ValueError, match="prefixes do not match"):
         receiver(None, None, packed_seq_params=different)
     assert receiver.input_tensor is None
     receiver.set_input_tensor(payload)
@@ -590,7 +601,11 @@ def test_generic_stack_without_adapter_preserves_tensor_input_and_gradients(
         post_layer_norm=False,
         pg_collection=groups,
     )
-    assert stack.forward_adapter is None
+    assert (
+        isinstance(stack.forward_adapter, HybridStateAdapter)
+        if enable_hyper_connections
+        else stack.forward_adapter is None
+    )
     assert hybrid_stack_spec.submodules.forward_adapter is None
     width = config.hidden_size * (config.num_residual_streams if enable_hyper_connections else 1)
     x = torch.randn(5, 2, width, requires_grad=True)
@@ -613,8 +628,25 @@ def test_payload_preserves_residual_and_mixing_dtypes(monkeypatch, mix_dtype):
     x = torch.randn(5, 2, config.hidden_size, dtype=torch.bfloat16, requires_grad=True)
     _, (payload,) = _run_chunks(stacks, plan, x)
     hidden, mix, *shared = payload.tensors
-    payload = replace(payload, tensors=(hidden.float(), mix.to(mix_dtype), *shared))
-    restored_hidden, state, mhc, _ = payload.restore()
+    specs = tuple(
+        (
+            replace(s, dtype=(torch.float32 if s.name == "hidden_states" else mix_dtype))
+            if s.name in ("hidden_states", "pre_mix")
+            else s
+        )
+        for s in payload.tensor_specs
+    )
+    fields = tuple(s.field for s in specs)
+    payload = replace(
+        payload,
+        tensors=(hidden.float(), mix.to(mix_dtype), *shared),
+        spec=replace(payload.spec, tensor_specs=specs),
+        region=replace(
+            payload.region, schema=replace(payload.region.schema, inputs=fields, outputs=fields)
+        ),
+    )
+    restored_hidden, context, _ = payload.restore()
+    state, mhc = context.cross_layer_state, context.mhc_state
     specs = {spec.name: spec for spec in payload.tensor_specs}
     assert restored_hidden.dtype == specs["hidden_states"].dtype == torch.float32
     assert mhc.pre_mix.dtype == specs["pre_mix"].dtype == mix_dtype
@@ -685,20 +717,28 @@ def test_distributed_adapter_binds_both_layouts_and_rejects_other_boundaries():
 
     config = _config()
     pattern = _pattern((7, 8, 10))
-    adapter = CSA2HybridAdapter(
-        config,
+    kwargs = dict(
         layer_type_list=["E"],
         pp_layer_offset=7,
         pre_process=False,
         post_process=False,
         is_mtp_layer=False,
+        pg_collection=_groups(),
+    )
+    declaration = CSA2HybridAdapter(config, **kwargs)
+    adapter = HybridStateAdapter(
+        config,
+        components=(declaration,),
+        hidden_size=config.hidden_size * config.num_residual_streams,
+        hidden_dtype=config.params_dtype,
+        **kwargs,
     )
     factory = adapter.configure_distributed_pipeline(
         pattern, SimpleNamespace(size=lambda: 4, rank=lambda: 1)
     )
     assert set(adapter._pipeline_chunks) == {"sbhd", "thd"}
     assert factory is not None
-    with pytest.raises(ValueError, match="incoming pipeline boundary"):
+    with pytest.raises(ValueError, match="incoming boundary"):
         factory((), (-1, -1))
 
 
@@ -741,21 +781,35 @@ def test_distributed_adapter_binds_each_virtual_chunk(layout):
     pattern = _pattern((7, 8, 10))
     plan = build_csa2_pipeline_plan(config, pattern, pp_size=2, qkv_format=layout)
     for chunk in plan:
-        adapter = CSA2HybridAdapter(
-            config,
+        kwargs = dict(
             layer_type_list=list(chunk.layer_pattern),
             pp_layer_offset=chunk.layer_offset,
             pre_process=chunk.incoming is None,
             post_process=chunk.outgoing is None,
             is_mtp_layer=False,
+            pg_collection=_groups(),
+        )
+        declaration = CSA2HybridAdapter(config, **kwargs)
+        adapter = HybridStateAdapter(
+            config,
+            components=(declaration,),
+            hidden_size=config.hidden_size * config.num_residual_streams,
+            hidden_dtype=config.params_dtype,
+            **kwargs,
         )
         group = SimpleNamespace(size=lambda: 2, rank=lambda: chunk.pp_rank)
-        with pytest.raises(ValueError, match="vp_stage"):
+        with pytest.raises(ValueError, match="virtual stage"):
             adapter.configure_distributed_pipeline(pattern, group)
         with pytest.raises(ValueError, match="segment count"):
             adapter.configure_distributed_pipeline(_pattern((6,)), group, chunk.vp_stage)
         adapter.configure_distributed_pipeline(pattern, group, chunk.vp_stage)
-        assert adapter._pipeline_chunks[layout] == chunk
+        actual = adapter._pipeline_chunks[layout]
+        assert (actual.layer_offset, actual.layer_pattern, actual.pp_rank, actual.vp_stage) == (
+            chunk.layer_offset,
+            chunk.layer_pattern,
+            chunk.pp_rank,
+            chunk.vp_stage,
+        )
 
 
 @pytest.mark.parametrize("version,pp_size", [("v4.1", 2), ("v4.1", 4), ("v4", 2)])
@@ -808,3 +862,66 @@ def test_vpp_cli_derives_chunks_and_preserves_legacy_pp2_guard(
         assert args.overlap_p2p_comm == overlap
         assert args.overlap_p2p_comm_warmup_flush == warmup_flush
         assert args.num_layers == pp_size * 4
+
+
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+def test_third_state_uses_same_pipeline_boundary_as_csa2_and_mhc(monkeypatch, layout, present):
+    from megatron.core.transformer.state_boundary import (
+        BoundarySchema,
+        StateRegion,
+        TensorField,
+        TensorMappingCodec,
+    )
+
+    class LookupState:
+        context_attribute = "lookup_state"
+
+        def pipeline_region(self, boundary, hidden, params, *, requires_grad=True):
+            field = TensorField(
+                "lookup/hidden_states:L0",
+                (*hidden.shape[:2], 1),
+                torch.float32,
+                layout,
+                requires_grad,
+                present=present,
+            )
+            return StateRegion(BoundarySchema("lookup", (field,), (field,)), TensorMappingCodec())
+
+    _record_losses(monkeypatch)
+    config = _config()
+    plan = build_csa2_pipeline_plan(config, _pattern((7,)), qkv_format=layout)
+    first, second = _split_stacks(_stack(config), plan)
+    params = None if layout == "sbhd" else _packed([3, 0, 4], [5, 0, 6], tail=2)[0]
+    x = torch.randn(5 if params is None else 13, 1, config.hidden_size, requires_grad=True)
+    original = first(x, None, packed_seq_params=params)
+    hidden, context, params = original.restore()
+    table = torch.nn.Parameter(torch.full((*x.shape[:2], 1), 0.5))
+    context.lookup_state = {"lookup/hidden_states:L0": table.square() if present else None}
+    for stack in (first, second):
+        stack.forward_adapter.components += (LookupState(),)
+    outgoing = first.forward_adapter.finalize_forward(hidden, params, context)
+    received = second.forward_adapter.make_pipeline_payload(outgoing.tensors, outgoing.metadata)
+    restored_hidden, restored, _ = received.restore()
+    assert restored.lookup_state is not context.lookup_state
+    assert (
+        restored.lookup_state["lookup/hidden_states:L0"]
+        is context.lookup_state["lookup/hidden_states:L0"]
+    )
+    assert restored.cross_layer_state is not context.cross_layer_state
+    assert restored.mhc_state is not context.mhc_state
+    if layout == "thd":
+        assert sum(s.name == "cu_seqlens" for s in outgoing.tensor_specs) == 1
+        assert sum(s.name == "cu_seqlens_padded" for s in outgoing.tensor_specs) == 1
+    loss = (
+        restored_hidden.sum()
+        + restored.cross_layer_state.global_kv.sum()
+        + restored.mhc_state.pre_mix.sum()
+        + (restored.lookup_state["lookup/hidden_states:L0"].sum() if present else 0)
+    )
+    loss.backward()
+    if present:
+        torch.testing.assert_close(table.grad, 2 * table.detach())
+    else:
+        assert table.grad is None
+    assert x.grad is not None and torch.isfinite(x.grad).all()

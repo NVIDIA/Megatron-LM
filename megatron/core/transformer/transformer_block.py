@@ -292,13 +292,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     ):
         super().__init__(config=config)
 
-        if (
-            config.mhc_single_pass
-            and config.recompute_granularity == "selective"
-            and "mhc" in config.recompute_modules
+        if config.mhc_single_pass and (
+            config.recompute_granularity is not None
+            or config.cuda_graph_impl != "none"
+            or config.pipeline_model_parallel_size > 1
+            or config.context_parallel_size > 1
+            or config.virtual_pipeline_model_parallel_size is not None
         ):
             raise ValueError(
-                "Single-pass mHC recomputation requires HybridModel and its state adapter"
+                "Single-pass mHC support for pipeline, recompute and CUDA Graphs requires "
+                "HybridModel and its state adapter"
             )
 
         if (

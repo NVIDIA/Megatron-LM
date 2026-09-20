@@ -1045,10 +1045,17 @@ def validate_args(args, defaults={}):
                 ), 'Number of layers should be divisible by the pipeline-model-parallel size'
 
     if args.virtual_pipeline_model_parallel_size is not None:
-        # V4.1 Hybrid uses typed P2P, which orders multiple fields sharing the
+        # Hybrid state adapters use typed P2P, which orders multiple fields sharing the
         # same peer under PP=2. Keep the older restriction for tensor transport.
         if args.overlap_p2p_comm or (
-            args.hybrid_layer_pattern is not None and args.dsv4_version == 'v4.1'
+            args.hybrid_layer_pattern is not None
+            and (
+                args.mhc_single_pass
+                or (
+                    args.experimental_attention_variant == 'dsv4_hybrid'
+                    and args.dsv4_version == 'v4.1'
+                )
+            )
         ):
             assert args.pipeline_model_parallel_size > 1, (
                 'When interleaved schedule is used, pipeline-model-parallel size '
@@ -1205,9 +1212,7 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
-    if args.moe_megakernel_backend == "mok" and (
-        args.use_megatron_fsdp or args.use_torch_fsdp2
-    ):
+    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
     if args.use_megatron_fsdp:

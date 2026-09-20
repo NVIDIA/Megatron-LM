@@ -12,12 +12,13 @@ no activation state or inference caches.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Callable
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
-from torch import nn
+from torch import Tensor, nn
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -76,6 +77,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_util
     CSA2THDCompressionLayout,
     CSA2THDLayout,
     build_csa2_thd_layout,
+    get_thd_compressed_capacity,
     get_thd_token_metadata,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -88,11 +90,15 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.state_boundary import (
+    StateDependency,
+    StatePlacement,
+    TensorField,
+    TensorSchema,
+    validate_metadata,
+)
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import get_pg_size
-
-if TYPE_CHECKING:
-    from megatron.core.transformer.transformer_layer import RecomputeTensors
 
 
 @dataclass
@@ -153,34 +159,6 @@ class CSA2State:
         """Guard shared-K consumers even if the local attention output is unused."""
         return tuple(tensor for tensor in (self.global_kv, self.indexer_k) if tensor is not None)
 
-    def save_for_recompute(
-        self,
-    ) -> tuple[RecomputeTensors, Callable[[RecomputeTensors], "CSA2State"]]:
-        """Checkpoint canonical floats and rebuild derived K views during replay."""
-        tensors = (self.global_kv, self.indexer_k, self.indexer_loss)
-        metadata = replace(
-            self,
-            global_kv=None,
-            indexer_k=None,
-            indexer_loss=None,
-            global_kv_flat=None,
-            indexer_k_flat=None,
-        )
-        # Preserve whether this boundary uses packed views without retaining the
-        # original views (which may have been built under checkpoint's no-grad).
-        packed_kv = self.global_kv_flat is not None or self.indexer_k_flat is not None
-
-        def restore(values: RecomputeTensors) -> "CSA2State":
-            global_kv, indexer_k, indexer_loss = values
-            state = replace(
-                metadata, global_kv=global_kv, indexer_k=indexer_k, indexer_loss=indexer_loss
-            )
-            if packed_kv:
-                state.prepare_fused_kv()
-            return state
-
-        return tensors, restore
-
     def prepare_fused_kv(self) -> None:
         """Pack canonical shared K once per owner or pipeline receiver, retaining its graph."""
         if self.global_kv is not None and self.global_kv_flat is None:
@@ -229,6 +207,306 @@ class CSA2State:
             raise ValueError("CSA2State cannot mix packed and unpacked layouts in one forward.")
         elif thd_layout is not None and self.thd_layout is not thd_layout:
             self.thd_layout.validate_layout(thd_layout)
+
+
+def csa2_source_layers(config: "MLATransformerConfig", layer: int) -> tuple[int | None, int | None]:
+    """Resolve the original Full/Reindex source rule once for math and adapters."""
+    if not config.csa_compress_ratios[layer]:
+        return None, None
+    return tuple(
+        max(source for source in sources if source <= layer)
+        for sources in (config.csa2_kv_source_layers, config.csa2_index_source_layers)
+    )
+
+
+def csa2_dependency_edges(config: "MLATransformerConfig") -> dict[str, tuple[tuple[int, int], ...]]:
+    """Describe native single-slot sources/readers, independently of any boundary backend."""
+    edges = {name: [] for name in ("global_kv", "indexer_k", "global_indices", "candidates")}
+    for layer, ratio in enumerate(config.csa_compress_ratios):
+        if not ratio:
+            continue
+        owner, index = csa2_source_layers(config, layer)
+        if layer != owner:
+            edges["global_kv"].append((owner, layer))
+        if layer in config.csa2_index_source_layers:
+            if layer != owner:
+                edges["indexer_k"].append((owner, layer))
+            candidate = config.csa2_candidate_source_layer
+            if candidate is not None and layer > candidate:
+                edges["candidates"].append((candidate, layer))
+        else:
+            edges["global_indices"].append((index, layer))
+    # The native payload has one slot per kind. Never silently replace an old
+    # version that still has a reader after another producer overwrites the slot.
+    for name, dependencies in edges.items():
+        versions = sorted({source for source, _ in dependencies})
+        for old, new in zip(versions, versions[1:]):
+            if any(source == old and reader >= new for source, reader in dependencies):
+                raise ValueError(f"CSA2 single-slot {name} has overlapping source versions")
+    return {name: tuple(values) for name, values in edges.items()}
+
+
+def csa2_state_key(name: str, source: int | None, namespace: str = "csa2.decoder") -> str:
+    """Give canonical fields stable identities; batch identity belongs to the schedule."""
+    if name in ("cu_seqlens", "cu_seqlens_padded"):
+        namespace = "host"
+    version = "batch" if source is None else f"L{source}"
+    return f"{namespace}/{name}:{version}"
+
+
+def csa2_state_dependencies(
+    config: "MLATransformerConfig",
+    field_factory: Callable[[str, int], TensorField],
+    placement: tuple[StatePlacement, ...],
+) -> tuple[StateDependency, ...]:
+    """Bind CSA2's source facts to a concrete batch profile and existing placement."""
+    dependencies = []
+    for name, edges in csa2_dependency_edges(config).items():
+        readers = defaultdict(list)
+        for source, consumer in edges:
+            readers[source].append(2 * consumer + 1)
+        for source, consumers in readers.items():
+            position = 2 * source + 1
+            owner = next((p for p in placement if p.start <= position < p.end), None)
+            if owner is None:
+                raise ValueError("CSA2 source is outside the existing placement")
+            names = ("candidate_indices", "candidate_lengths") if name == "candidates" else (name,)
+            dependencies.extend(
+                StateDependency(
+                    field_factory(field, source),
+                    "activation",
+                    position,
+                    owner.pp_rank,
+                    tuple(consumers),
+                    "pipeline",
+                )
+                for field in names
+            )
+    return tuple(dependencies)
+
+
+def csa2_field_factory(
+    config: "MLATransformerConfig",
+    sequence_length: int,
+    batch_size: int,
+    *,
+    qkv_format: str = "sbhd",
+    max_seqlen: int | None = None,
+    num_sequences: int | None = None,
+    cp_size: int = 1,
+    namespace: str = "csa2.decoder",
+) -> Callable[[str, int], TensorField]:
+    """Describe canonical activations from host batch dimensions, never device values."""
+    if qkv_format not in ("sbhd", "thd"):
+        raise ValueError("CSA2 state layout must be sbhd or thd")
+
+    def field(name: str, source: int) -> TensorField:
+        ratio = config.csa_compress_ratios[source]
+        capacity = (
+            get_thd_compressed_capacity(sequence_length * cp_size, max_seqlen, num_sequences, ratio)
+            if qkv_format == "thd"
+            else sequence_length // ratio
+        )
+        leading = (sequence_length,) if qkv_format == "thd" else (batch_size, sequence_length)
+        dtype, differentiable = config.params_dtype, True
+        if name in ("global_kv", "indexer_k"):
+            dim = config.v_head_dim if name == "global_kv" else config.dsa_indexer_head_dim
+            shape = (capacity, batch_size, dim)
+            differentiable = name == "global_kv" or (config.dsa_indexer_loss_coeff or 0) > 0
+        else:
+            dtype, differentiable = torch.int32, False
+            if name == "global_indices":
+                shape = (*leading, min(config.dsa_indexer_topk, capacity))
+            else:
+                keys = max_seqlen // ratio if qkv_format == "thd" else capacity
+                width = min(
+                    config.csa2_candidate_topk_blocks,
+                    (keys + max(1, config.csa2_candidate_block_size) - 1)
+                    // max(1, config.csa2_candidate_block_size),
+                )
+                shape = leading if name == "candidate_lengths" else (*leading, width)
+        return TensorField(
+            csa2_state_key(name, source, namespace), shape, dtype, qkv_format, differentiable
+        )
+
+    return field
+
+
+class CSA2StateCodec:
+    """Restore fresh CSA2State objects from canonical tensors and immutable scalars.
+
+    Derived flat K, sparse addresses and THD caches are rebuilt locally. No
+    original state, candidate tensor or layout tensor is retained in metadata.
+    """
+
+    def __init__(
+        self, namespace: str = "csa2.decoder", *, indexer_k_differentiable: bool | None = None
+    ) -> None:
+        self.namespace = namespace
+        self.indexer_k_differentiable = indexer_k_differentiable
+
+    @staticmethod
+    def _values(state: "CSA2State") -> dict[str, Tensor]:
+        values = {
+            name: getattr(state, name)
+            for name in ("global_kv", "indexer_k", "global_indices", "indexer_loss")
+            if getattr(state, name) is not None
+        }
+        if state.candidates is not None:
+            values.update(
+                candidate_indices=state.candidates.indices,
+                candidate_lengths=state.candidates.lengths,
+            )
+        if state.thd_layout is not None:
+            values.update(
+                cu_seqlens=state.thd_layout.cu_seqlens,
+                cu_seqlens_padded=state.thd_layout.cu_seqlens_padded,
+            )
+        return values
+
+    @staticmethod
+    def _source(name: str, metadata: dict) -> int | None:
+        if name in ("global_kv", "indexer_k"):
+            return metadata["kv_source_layer"]
+        if name == "global_indices":
+            return metadata["index_source_layer"]
+        if name.startswith("candidate_"):
+            return metadata["candidate_source_layer"]
+        if name == "indexer_loss":
+            return metadata["last_layer"]
+        if name in ("cu_seqlens", "cu_seqlens_padded"):
+            return None
+        raise ValueError(f"Unknown CSA2 state field: {name}")
+
+    def metadata(self, state: "CSA2State") -> tuple:
+        """Snapshot scalar source/layout information without holding any activations."""
+        layout = state.thd_layout
+        metadata = tuple(
+            {
+                "namespace": self.namespace,
+                "sequence_length": state.sequence_length,
+                "batch_size": state.batch_size,
+                "device": None if state.device is None else str(state.device),
+                "dtype": None if state.dtype is None else str(state.dtype).removeprefix("torch."),
+                "last_layer": state.last_layer,
+                "kv_source_layer": state.kv_source_layer,
+                "index_source_layer": state.index_source_layer,
+                "candidate_source_layer": state.candidate_source_layer,
+                "candidate_block_size": (
+                    None if state.candidates is None else state.candidates.block_size
+                ),
+                "layout": (
+                    None
+                    if layout is None
+                    else (layout.total_tokens, layout.max_seqlen, layout.cp_rank, layout.cp_size)
+                ),
+                "compress_ratio": (
+                    None if state.compressed_layout is None else state.compressed_layout.ratio
+                ),
+                "packed_kv": state.global_kv_flat is not None or state.indexer_k_flat is not None,
+                "defer_indexer_loss": state.defer_indexer_loss,
+            }.items()
+        )
+        validate_metadata(metadata)
+        return metadata
+
+    def fields(self, state: "CSA2State") -> tuple[TensorField, ...]:
+        """Describe the canonical values currently present in a native snapshot."""
+        metadata = dict(self.metadata(state))
+        layout = "thd" if state.thd_layout is not None else "sbhd"
+        result = []
+        for name, tensor in self._values(state).items():
+            grad = name in ("global_kv", "indexer_loss")
+            if name == "indexer_k":
+                grad = (
+                    tensor.requires_grad
+                    if self.indexer_k_differentiable is None
+                    else self.indexer_k_differentiable
+                )
+            result.append(
+                TensorField(
+                    csa2_state_key(name, self._source(name, metadata), self.namespace),
+                    tuple(tensor.shape),
+                    tensor.dtype,
+                    layout,
+                    grad,
+                )
+            )
+        return tuple(result)
+
+    def _validate_fields(self, fields: tuple[TensorField, ...], metadata: dict) -> tuple[str, ...]:
+        if metadata["namespace"] != self.namespace:
+            raise ValueError("CSA2 state belongs to a different namespace")
+        names = []
+        for field in fields:
+            name = field.key.split("/", 1)[1].split(":", 1)[0]
+            if field.key != csa2_state_key(name, self._source(name, metadata), self.namespace):
+                raise ValueError(f"CSA2 field has the wrong source version: {field.key}")
+            if field.layout != ("thd" if metadata["layout"] is not None else "sbhd"):
+                raise ValueError(f"CSA2 field has the wrong logical layout: {field.key}")
+            names.append(name)
+        return tuple(names)
+
+    def export(self, state: "CSA2State", fields: tuple[TensorField, ...]) -> tuple[Tensor, ...]:
+        """Export selected canonical tensors, checking source identity before packing."""
+        schema = TensorSchema(fields)
+        names = self._validate_fields(schema.packed_fields, dict(self.metadata(state)))
+        values = self._values(state)
+        tensors = tuple(values.get(name) for name in names)
+        schema.validate(tensors)
+        return tensors
+
+    def restore(
+        self, fields: tuple[TensorField, ...], tensors: tuple[Tensor, ...], metadata: tuple
+    ) -> "CSA2State":
+        """Rebuild native state and caches using only the explicit tensor arguments."""
+        validate_metadata(metadata)
+        schema = TensorSchema(fields)
+        schema.validate(tensors)
+        meta = dict(metadata)
+        names = self._validate_fields(schema.packed_fields, meta)
+        values = dict(zip(names, tensors))
+        state = CSA2State(
+            **{
+                name: meta[name]
+                for name in (
+                    "sequence_length",
+                    "batch_size",
+                    "last_layer",
+                    "kv_source_layer",
+                    "index_source_layer",
+                    "candidate_source_layer",
+                    "defer_indexer_loss",
+                )
+            }
+        )
+        state.device = None if meta["device"] is None else torch.device(meta["device"])
+        state.dtype = None if meta["dtype"] is None else getattr(torch, meta["dtype"])
+        for name in ("global_kv", "indexer_k", "global_indices", "indexer_loss"):
+            setattr(state, name, values.get(name))
+        if "candidate_indices" in values or "candidate_lengths" in values:
+            if not {"candidate_indices", "candidate_lengths"} <= values.keys():
+                raise ValueError("CSA2 candidates require both indices and lengths")
+            state.candidates = CSA2CandidateBlocks(
+                values["candidate_indices"],
+                values["candidate_lengths"],
+                meta["candidate_block_size"],
+            )
+        if meta["layout"] is not None:
+            total, maximum, rank, size = meta["layout"]
+            if not {"cu_seqlens", "cu_seqlens_padded"} <= values.keys():
+                raise ValueError("CSA2 packed state requires explicit prefix tensors")
+            cu, padded = values["cu_seqlens"], values["cu_seqlens_padded"]
+            rows = torch.arange(total, dtype=torch.int64, device=cu.device) + rank * total
+            seq, pos, valid = get_thd_token_metadata(cu, padded, rows)
+            state.thd_layout = CSA2THDLayout(
+                total, maximum, cu, padded, seq, pos, valid, rank, size
+            )
+            if meta["compress_ratio"] is not None:
+                state.compressed_layout = state.thd_layout.for_compression(meta["compress_ratio"])
+        if meta["packed_kv"]:
+            state.prepare_fused_kv()
+        return state
 
 
 def apply_csa2_thd_rope(
@@ -1282,16 +1560,7 @@ class CompressedSparseAttention2(MegatronModule):
         self.layer_idx = layer_idx
         self.is_kv_source = layer_idx in config.csa2_kv_source_layers
         self.is_index_source = layer_idx in config.csa2_index_source_layers
-        self.kv_source_layer = (
-            max(source for source in config.csa2_kv_source_layers if source <= layer_idx)
-            if ratio
-            else None
-        )
-        self.index_source_layer = (
-            max(source for source in config.csa2_index_source_layers if source <= layer_idx)
-            if ratio
-            else None
-        )
+        self.kv_source_layer, self.index_source_layer = csa2_source_layers(config, layer_idx)
         self.is_candidate_source = layer_idx == config.csa2_candidate_source_layer
         self.uses_candidates = (
             config.csa2_candidate_source_layer is not None
@@ -1966,12 +2235,13 @@ class CompressedSparseAttention2(MegatronModule):
             if self.config.calculate_per_token_loss:
                 token_count = thd_layout.cu_seqlens[-1].clamp_min(1) if is_thd else seq_len * batch
                 logged_loss = logged_loss / token_count
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=logged_loss,
-                layer_number=self.layer_idx + 1,
-                num_layers=self.config.num_layers,
-                reduce_group=cp_group if cp_size > 1 else None,
-            )
+            if not csa2_state.defer_indexer_loss:
+                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                    loss=logged_loss,
+                    layer_number=self.layer_idx + 1,
+                    num_layers=self.config.num_layers,
+                    reduce_group=cp_group if cp_size > 1 else None,
+                )
             if csa2_state.defer_indexer_loss:
                 csa2_state.indexer_loss = indexer_loss
             else:

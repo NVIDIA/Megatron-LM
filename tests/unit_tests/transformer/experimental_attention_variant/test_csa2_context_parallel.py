@@ -54,7 +54,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_con
     build_csa2_cp_compression_layout,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_cuda_graph import (
-    CSA2CudaGraphAdapter,
+    CSA2GraphState,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
     CSA2HybridAdapter,
@@ -63,7 +63,6 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_ind
     prepare_csa2_indexer_inputs,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pipeline import (
-    CSA2PipelinePayload,
     build_csa2_pipeline_plan,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
@@ -73,7 +72,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
-from megatron.core.transformer.hyper_connection import SinglePassMHCState
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from tests.unit_tests.pipeline_parallel.test_typed_pipeline import _Timers
@@ -1152,8 +1150,16 @@ def test_cp_sharing_recomputes_local_projections(
 @pytest.mark.parametrize("cp_size", [2, 4])
 @pytest.mark.parametrize("cp_rank", [0, 1])
 def test_cp_pipeline_roundtrip_keeps_local_queries_and_global_keys(cp_size, cp_rank):
+    from megatron.core.models.hybrid.hybrid_stack_adapter import (
+        HybridStackForwardContext,
+        HybridStateAdapter,
+        HybridStatePayload,
+    )
+
     config = replace(
         _pipeline_config(),
+        enable_hyper_connections=False,
+        mhc_single_pass=False,
         context_parallel_size=cp_size,
         cp_partition_mode="contiguous",
         sequence_packing_scheduler="dp_balanced",
@@ -1170,7 +1176,23 @@ def test_cp_pipeline_roundtrip_keeps_local_queries_and_global_keys(cp_size, cp_r
     )
     for chunk in plan[:-1]:
         boundary = chunk.outgoing
-        descriptor = boundary.payload_spec(config, rows, 1, params, cp_group=group)
+        kwargs = dict(
+            layer_type_list=list(chunk.layer_pattern),
+            pp_layer_offset=chunk.layer_offset,
+            pre_process=chunk.incoming is None,
+            post_process=False,
+            is_mtp_layer=False,
+            pg_collection=SimpleNamespace(cp=group),
+        )
+        adapter = HybridStateAdapter(
+            config,
+            components=(CSA2HybridAdapter(config, **kwargs),),
+            hidden_size=config.hidden_size,
+            hidden_dtype=config.params_dtype,
+            **kwargs,
+        )
+        adapter.configure_pipeline(chunk)
+        descriptor = adapter.pipeline_payload_spec(rows, 1, params)[1]
         assert descriptor.metadata == (boundary.layer_offset, params.max_seqlen_q, cp_size, cp_rank)
         values = {
             spec.name: torch.zeros(spec.shape, dtype=spec.dtype, requires_grad=spec.requires_grad)
@@ -1192,14 +1214,10 @@ def test_cp_pipeline_roundtrip_keeps_local_queries_and_global_keys(cp_size, cp_r
                 values["candidate_lengths"],
                 config.csa2_candidate_block_size,
             )
-        payload = boundary.export_payload(
-            values["hidden_states"],
-            state,
-            SinglePassMHCState(values["pre_mix"]),
-            packed_seq_params=params,
-            cp_group=group,
+        payload = adapter.finalize_forward(
+            values["hidden_states"], params, HybridStackForwardContext(cross_layer_state=state)
         )
-        assert isinstance(payload, CSA2PipelinePayload)
+        assert isinstance(payload, HybridStatePayload)
         assert payload.tensor_specs == descriptor.tensor_specs
         if state.global_kv is not None:
             assert (
@@ -1211,8 +1229,9 @@ def test_cp_pipeline_roundtrip_keeps_local_queries_and_global_keys(cp_size, cp_r
         )
         assert metadata == payload.metadata
         assert [spec.shape for spec in specs] == [spec.shape for spec in payload.tensor_specs]
-        hidden, restored, mhc, received_params = payload.restore(cp_group=group)
-        assert hidden is values["hidden_states"] and mhc.pre_mix is values["pre_mix"]
+        hidden, context, received_params = payload.restore(cp_group=group)
+        restored = context.cross_layer_state
+        assert hidden is values["hidden_states"]
         assert (
             received_params.cp_group is group and received_params.cp_partition_mode == "contiguous"
         )
@@ -1223,12 +1242,15 @@ def test_cp_pipeline_roundtrip_keeps_local_queries_and_global_keys(cp_size, cp_r
                 restored.compressed_layout, global_layout.for_compression(boundary.compress_ratio)
             )
             assert restored.global_kv is state.global_kv
-        with pytest.raises(ValueError, match="CP shard"):
+        with pytest.raises(ValueError, match="CP coordinates"):
             payload.restore(cp_group=_LayoutGroup(cp_size, 1 - cp_rank))
-        with pytest.raises(ValueError, match="CP shard"):
+        with pytest.raises(ValueError, match="CP coordinates"):
             payload.restore()
-        with pytest.raises(ValueError, match="invalid CP metadata"):
-            replace(payload, cp_rank=cp_size).validate()
+        with pytest.raises(ValueError, match="invalid CP coordinates"):
+            replace(
+                payload,
+                spec=replace(payload.spec, metadata=(*payload.metadata[:2], cp_size, cp_size)),
+            ).validate()
         # Planning works with content-free prefixes and needs no device scalar reads.
         meta_params = replace(
             params,
@@ -1237,11 +1259,13 @@ def test_cp_pipeline_roundtrip_keeps_local_queries_and_global_keys(cp_size, cp_r
             total_tokens=None,
             seq_idx=None,
         )
-        assert boundary.payload_spec(config, rows, 1, meta_params, cp_group=group) == descriptor
+        assert adapter.pipeline_payload_spec(rows, 1, meta_params)[1] == descriptor
         with pytest.raises(ValueError, match="explicit CP group"):
-            boundary.payload_spec(config, rows, 1, params)
+            boundary.tensor_fields(config, rows, 1, params)
         explicit_params = replace(params, cp_group=group)
-        assert boundary.payload_spec(config, rows, 1, explicit_params) == descriptor
+        assert boundary.tensor_fields(config, rows, 1, explicit_params) == tuple(
+            spec.field for spec in descriptor.tensor_specs[1:]
+        )
 
 
 @contextmanager
@@ -1739,14 +1763,27 @@ def test_cp_pipeline_entry_plans_local_capacity_without_device_reads(
         pipeline_dtype=torch.float32,
     )
     pattern = _pipeline_pattern((7, 8, 10))
-    adapter = CSA2HybridAdapter(
-        config,
+    from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStateAdapter
+    from megatron.core.transformer.hyper_connection import SinglePassMHCBoundary
+
+    kwargs = dict(
         layer_type_list=list(pattern.split("|")[stage]),
         pp_layer_offset=(0, 7, 8, 10)[stage],
         pre_process=stage == 0,
         post_process=stage == 3,
         is_mtp_layer=False,
         pg_collection=SimpleNamespace(cp=group),
+    )
+    components = (
+        SinglePassMHCBoundary(config, kwargs["pp_layer_offset"]),
+        CSA2HybridAdapter(config, **kwargs),
+    )
+    adapter = HybridStateAdapter(
+        config,
+        components=components,
+        hidden_size=config.hidden_size * config.num_residual_streams,
+        hidden_dtype=config.params_dtype,
+        **kwargs,
     )
     adapter.configure_distributed_pipeline(pattern, _LayoutGroup(2, stage % 2), vp_stage=stage // 2)
     model = SimpleNamespace(
@@ -1873,18 +1910,21 @@ def _install_cp_graph_callables(stacks, monkeypatch, *, joint_backward=False, nu
 
 @pytest.mark.parametrize("cp_size,cp_rank", [(2, 0), (2, 1), (4, 0), (4, 3)])
 def test_cp_cuda_graph_static_shapes_and_group_validation(cp_size, cp_rank):
+    from megatron.core.transformer.state_boundary import StateGraphAdapter
+
     config = _cp_graph_config(cp_size)
     group = _LayoutGroup(cp_size, cp_rank)
     with pytest.raises(ValueError, match="explicit CP group"):
-        CSA2CudaGraphAdapter(config, layer_number=1, is_attention=True)
+        CSA2GraphState(config, layer_number=1, is_attention=True)
     with pytest.raises(ValueError, match="group size"):
-        CSA2CudaGraphAdapter(
+        CSA2GraphState(
             config, layer_number=1, is_attention=True, cp_group=_LayoutGroup(cp_size * 2, cp_rank)
         )
     for index in (0, 2, 4, 6, 8, 10):
-        adapter = CSA2CudaGraphAdapter(
+        component = CSA2GraphState(
             config, layer_number=index + 1, is_attention=True, cp_group=group
         )
+        adapter = StateGraphAdapter((component,))
         static = {"hidden_states": torch.empty(32 // cp_size, 1, 128, device="meta")}
         static.update(
             {
@@ -1893,12 +1933,12 @@ def test_cp_cuda_graph_static_shapes_and_group_validation(cp_size, cp_rank):
             }
         )
         values = adapter.get_static_inputs(static)
-        params = adapter._packed_params(static)
+        params = component._packed_params(static)
         assert params.max_seqlen_q == params.max_seqlen_kv == 32
         assert params.cp_group is group and params.local_cp_size == cp_size
         for name, tensor in values.items():
             if name in ("csa2_graph_global_kv", "csa2_graph_indexer_k"):
-                assert tensor.shape[0] == 32 // adapter.ratio
+                assert tensor.shape[0] == 32 // component.ratio
             elif name in (
                 "csa2_graph_global_indices",
                 "csa2_graph_candidate_indices",

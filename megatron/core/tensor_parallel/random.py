@@ -22,6 +22,7 @@ from megatron.core.parallel_state import (
     get_expert_tensor_parallel_rank,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.transformer.state_boundary import CheckpointBoundaryPolicy
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
 
 # ---------------------------------------------------------------------------
@@ -742,12 +743,95 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
+class BoundaryCheckpointFunction(torch.autograd.Function):
+    """Full-region checkpoint which preserves absent versus explicitly zero gradients."""
+
+    @staticmethod
+    def forward(ctx, function, policy, *args):
+        """Save explicit inputs and expose only the declared present output slots."""
+        previous = is_checkpointing()
+        _set_checkpointing()
+        try:
+            ctx.run_function, ctx.policy = function, policy
+            ctx.rng_states = _get_all_rng_states()
+            ctx.set_materialize_grads(False)
+            with torch.no_grad():
+                outputs = function(*args)
+            ctx.single_output = isinstance(outputs, torch.Tensor)
+            outputs = (outputs,) if ctx.single_output else tuple(outputs)
+            policy.outputs.validate(outputs)
+            inactive = tuple(
+                output
+                for output, field in zip(outputs, policy.outputs.packed_fields)
+                if not field.differentiable
+            )
+            if inactive:
+                ctx.mark_non_differentiable(*inactive)
+            ctx.save_for_backward(*args)
+            return outputs[0] if ctx.single_output else outputs
+        finally:
+            if not previous:
+                _unset_checkpointing()
+
+    @staticmethod
+    def backward(ctx, *output_grads):
+        """Replay with fresh input leaves, then backpropagate active output roots only."""
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError("Boundary checkpoint requires backward(), not autograd.grad()")
+        previous = is_checkpointing()
+        _set_checkpointing()
+        try:
+            inputs = detach_variable(ctx.saved_tensors)
+            # Restore RNG around replay only. Backward may itself invoke another
+            # checkpoint, whose RNG lifecycle must remain independent of this fork.
+            with _fork_rng():
+                _set_all_rng_states(*ctx.rng_states)
+                with torch.enable_grad():
+                    outputs = ctx.run_function(*inputs)
+            outputs = (outputs,) if ctx.single_output else tuple(outputs)
+            ctx.policy.outputs.validate(outputs)
+            roots, seeds = [], []
+            for index in ctx.policy.outputs.grad_tensor_indices:
+                grad, output = output_grads[index], outputs[index]
+                if grad is not None and output.requires_grad:
+                    roots.append(output)
+                    seeds.append(grad)
+            if roots:
+                torch.autograd.backward(roots, seeds)
+            return (None, None) + tuple(tensor.grad for tensor in inputs)
+        finally:
+            if not previous:
+                _unset_checkpointing()
+
+
 def checkpoint(
-    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+    function: Callable[[Unpack[_Ts]], _R],
+    distribute_saved_activations: bool,
+    *args: Unpack[_Ts],
+    boundary_policy: CheckpointBoundaryPolicy | None = None,
 ) -> _R:
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+    if boundary_policy is not None:
+        if distribute_saved_activations:
+            raise ValueError("Boundary checkpoint does not support distributed saved activations")
+        if is_graph_warmup() or is_graph_capturing():
+            raise ValueError("Boundary checkpoint has no CUDA Graph/full-recompute bridge")
+        if not all(isinstance(tensor, torch.Tensor) for tensor in args):
+            raise TypeError("Boundary checkpoint inputs must be an explicit packed Tensor tuple")
+        if not torch.is_grad_enabled() or not any(tensor.requires_grad for tensor in args):
+            if torch.is_grad_enabled() and boundary_policy.strict:
+                raise ValueError(
+                    "Boundary checkpoint needs a differentiable input; use eager execution"
+                )
+            outputs = function(*args)
+            boundary_policy.outputs.validate(
+                (outputs,) if isinstance(outputs, torch.Tensor) else outputs
+            )
+            return outputs
+        return BoundaryCheckpointFunction.apply(function, boundary_policy, *args)
 
     # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
     # CheckpointWithoutOutput. The graph captures all ops directly; recomputation cannot

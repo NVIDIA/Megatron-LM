@@ -17,7 +17,6 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import hybrid_block as hybrid_runtime
 from megatron.core.models.hybrid import hybrid_stack_adapter as recompute_runtime
-from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
 from megatron.core.tensor_parallel import random as checkpoint_runtime
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
@@ -180,7 +179,7 @@ def test_recompute_when_only_shared_output_receives_gradient(
     ref_x = x.detach().clone().requires_grad_()
     actual = stacks[0](x, None)
     expected = ref_stacks[0](ref_x, None)
-    index = actual.boundary.field_names.index(field)
+    index = tuple(s.name for s in actual.tensor_specs).index(field)
     actual.tensors[index].square().sum().backward()
     expected.tensors[index].square().sum().backward()
     assert all(manager._recomputed for manager in checkpoints)
@@ -562,10 +561,10 @@ def test_full_recompute_shared_state_and_outstanding_microbatches(
         actual_records.extend(records)
         records.clear()
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        for payload in payloads:
+        for stack, payload in zip(stacks, payloads):
             assert (
                 payload.tensor_specs
-                == payload.boundary.payload_spec(config, *shape, params).tensor_specs
+                == stack.forward_adapter.pipeline_payload_spec(*shape, params)[1].tensor_specs
             )
         pairs.append((actual, expected, x, reference_x))
     assert len(calls) == 2 * config.num_layers
@@ -603,7 +602,7 @@ def test_full_recompute_side_output_only_backward(monkeypatch, field, method, co
     reference_x = x.detach().clone().requires_grad_()
     actual = stacks[0](x, None)
     expected = reference_stacks[0](reference_x, None)
-    index = actual.boundary.field_names.index(field)
+    index = tuple(s.name for s in actual.tensor_specs).index(field)
     actual.tensors[index].square().sum().backward()
     expected.tensors[index].square().sum().backward()
     _assert_gradient(x.grad, reference_x.grad)
@@ -625,7 +624,7 @@ def test_full_recompute_indexer_k_boundary_gradient(monkeypatch, method, count):
     reference_x = x.detach().clone().requires_grad_()
     actual = stacks[0](x, None)
     expected = reference_stacks[0](reference_x, None)
-    index = actual.boundary.field_names.index("indexer_k")
+    index = tuple(s.name for s in actual.tensor_specs).index("indexer_k")
     # The zero hidden objective invokes the same auxiliary autoscaler in both
     # paths: reentrant checkpoint backward also materializes unused-output zeros.
     (actual.tensors[index].square().sum() + actual.tensors[0].sum() * 0).backward()
@@ -744,13 +743,14 @@ def test_full_recompute_frozen_hidden_input_preserves_parameter_gradients(monkey
 
 @pytest.mark.usefixtures("cpu_checkpoint_rng")
 @pytest.mark.parametrize("quantization", ["fp8", "fp4", "quant_recipe"])
-def test_full_recompute_quantization_dispatch_and_layer_context(monkeypatch, quantization):
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+def test_full_recompute_quantization_dispatch_and_layer_context(monkeypatch, quantization, layout):
     """Validate TE checkpoint dispatch and global layer contexts without quantized kernels."""
     torch.manual_seed(437)
     _record_losses(monkeypatch)
     reference = _stack(_config())
     config = _full_config(reference.config, "uniform", 3)
-    stacks, plan = _stacks(reference, config, (5,), "sbhd")
+    stacks, plan = _stacks(reference, config, (5,), layout)
     # These adapters contain ordinary CPU linears. Enabling only dispatch after
     # construction isolates checkpoint/context wiring from TE recipe dependencies.
     if quantization == "fp8":
@@ -776,10 +776,11 @@ def test_full_recompute_quantization_dispatch_and_layer_context(monkeypatch, qua
     monkeypatch.setattr(recompute_runtime, "te_checkpoint", te_checkpoint)
     monkeypatch.setattr(hybrid_runtime, "get_fp8_context", quantization_context)
     monkeypatch.setattr(hybrid_runtime, "get_fp4_context", quantization_context)
-    x = torch.randn(9, 2, reference.config.hidden_size, requires_grad=True)
+    params = None if layout == "sbhd" else _packed([3, 0, 4], [4, 0, 5])[0]
+    x = torch.randn(9, 2 if params is None else 1, reference.config.hidden_size, requires_grad=True)
     reference_x = x.detach().clone().requires_grad_()
-    actual, _ = _run_chunks(stacks, plan, x)
-    expected = reference(reference_x, None)
+    actual, _ = _run_chunks(stacks, plan, x, params)
+    expected = reference(reference_x, None, packed_seq_params=params)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     actual.square().sum().backward()
     expected.square().sum().backward()
@@ -857,24 +858,85 @@ def test_recompute_restore_rebuilds_differentiable_fused_k_views(monkeypatch):
     config = _config()
     stacks, _ = _stacks(_stack(config), config, (7,), "sbhd")
     payload = stacks[0](torch.randn(9, 2, config.hidden_size, requires_grad=True), None)
-    _, state, mhc_state, _ = payload.restore()
+    hidden, context, _ = payload.restore()
+    state = context.cross_layer_state
     state.global_kv_flat = state.indexer_k_flat = None
     with torch.no_grad():
         state.prepare_fused_kv()
     assert not state.global_kv_flat.requires_grad and not state.indexer_k_flat.requires_grad
-    context = HybridStackForwardContext(cross_layer_state=state, mhc_state=mhc_state)
-    tensors, restore = context.save_for_recompute()
+    # Only declare fused views here; the CPU forward above used native attention.
+    config.dsa_kernel_backend = "cudnn"
+    region = stacks[1].forward_adapter.checkpoint_region(0, 2, hidden, context)
+    tensors = region.codec.export(context, region.schema.inputs)
     positional = tuple(
-        tensor.detach().requires_grad_() if tensor is not None else None for tensor in tensors
+        tensor.detach().requires_grad_(tensor.requires_grad) if tensor is not None else None
+        for tensor in tensors
     )
-    replay = restore(positional)
+    replay = region.codec.restore(region.schema.inputs, positional, region.input_metadata)
     replay_state = replay.cross_layer_state
     objective = (
         replay.mhc_state.pre_mix.square().sum()
         + replay_state.global_kv_flat.square().sum()
         + replay_state.indexer_k_flat.square().sum()
     )
-    differentiable = tuple(tensor for tensor in positional if tensor is not None)
+    differentiable = tuple(
+        tensor for tensor in positional if tensor is not None and tensor.requires_grad
+    )
     gradients = torch.autograd.grad(objective, differentiable)
     for tensor, gradient in zip(differentiable, gradients):
         torch.testing.assert_close(gradient, 2 * tensor)
+
+
+def test_canonical_codec_restores_fresh_packed_state_for_outstanding_microbatches():
+    """Changing integer prefixes/selection values cannot leak through a saved payload."""
+    import weakref
+
+    from megatron.core.transformer.experimental_attention_variant.csa2 import (
+        CSA2State,
+        CSA2StateCodec,
+    )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+        build_csa2_thd_layout,
+    )
+    from megatron.core.transformer.state_boundary import validate_metadata
+
+    snapshots = []
+    for lengths in ([1, 3], [2, 2]):
+        params, _, valid = _packed(lengths, [2, 4])
+        state = CSA2State(
+            global_kv=torch.randn(3, 1, 4, requires_grad=True),
+            global_indices=torch.full((valid.numel(), 1), lengths[0], dtype=torch.int32),
+            kv_source_layer=2,
+            index_source_layer=4,
+            last_layer=4,
+            sequence_length=valid.numel(),
+            batch_size=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            thd_layout=build_csa2_thd_layout(params, valid.numel()),
+        )
+        state.compressed_layout = state.thd_layout.for_compression(2)
+        codec = CSA2StateCodec()
+        fields, metadata = codec.fields(state), codec.metadata(state)
+        validate_metadata(metadata)
+        tensors = codec.export(state, fields)
+        reference = weakref.ref(state)
+        del state
+        assert reference() is None
+        snapshots.append((tensors, codec, fields, metadata))
+    for tensors, codec, fields, metadata in reversed(snapshots):
+        replay = codec.restore(fields, tensors, metadata)
+        second = codec.restore(fields, tensors, metadata)
+        assert replay is not second and replay.thd_layout is not second.thd_layout
+        assert replay.compressed_layout is not second.compressed_layout
+        assert torch.equal(
+            replay.global_indices[:, 0],
+            replay.thd_layout.cu_seqlens[1].expand(replay.sequence_length),
+        )
+        replay.global_kv.sum().backward()
+        torch.testing.assert_close(tensors[0].grad, torch.ones_like(tensors[0]))
+        with pytest.raises(ValueError, match="namespace"):
+            CSA2StateCodec(namespace="csa2.mtp").restore(fields, tensors, metadata)
+        wrong = (replace(fields[0], key="csa2.decoder/global_kv:L0"), *fields[1:])
+        with pytest.raises(ValueError, match="source version"):
+            codec.restore(wrong, tensors, metadata)

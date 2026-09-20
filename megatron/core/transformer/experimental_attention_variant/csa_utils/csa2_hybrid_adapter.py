@@ -1,43 +1,47 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""DSv4.1 state lifecycle and logical pipeline boundaries for HybridStack."""
+"""CSA2 state declarations for the common Hybrid execution boundaries."""
 
 from typing import Any
 
 from torch import Tensor
-from torch.distributed import ProcessGroup
-from torch.nn import ModuleList
+from torch.nn import Module
 
-from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.pipeline_payload import (
-    PipelinePayloadFactory,
-    PipelinePayloadSpec,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2State
+from megatron.core.transformer.experimental_attention_variant.csa2 import (
+    CSA2State,
+    CSA2StateCodec,
+    csa2_field_factory,
+    csa2_state_dependencies,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_cuda_graph import (
-    CSA2CudaGraphAdapter,
+    CSA2GraphState,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pipeline import (
-    CSA2PipelineChunk,
-    CSA2PipelinePayload,
-    build_csa2_pipeline_plan,
+    CSA2PipelineBoundary,
+    csa2_pipeline_boundary,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+    build_csa2_thd_layout,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     use_fused_dsa_kernels,
+)
+from megatron.core.transformer.state_boundary import (
+    BoundarySchema,
+    StateBoundary,
+    StatePlacement,
+    StateRegion,
+    prepare_boundaries,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 
 class CSA2HybridAdapter:
-    """Own CSA2 semantics while leaving Hybrid's layer loop and mHC execution generic.
+    """Declare native fields, sources and cache semantics without owning a backend."""
 
-    The adapter stores only construction metadata and an optional static PP-1
-    plan. Each forward creates or restores its own CSA2/mHC state; received THD
-    metadata and derived attention caches belong to that forward's context.
-    """
+    context_attribute = "cross_layer_state"
 
     def __init__(
         self,
@@ -45,10 +49,9 @@ class CSA2HybridAdapter:
         *,
         layer_type_list: list[str],
         pp_layer_offset: int,
-        pre_process: bool,
-        post_process: bool,
         is_mtp_layer: bool,
         pg_collection: ProcessGroupCollection | None = None,
+        **kwargs,
     ) -> None:
         if (
             config.experimental_attention_variant != "dsv4_hybrid"
@@ -57,189 +60,167 @@ class CSA2HybridAdapter:
         ):
             raise ValueError("CSA2 Hybrid adapters require a V4.1 backbone stack")
         self.config = config
-        self.layer_pattern = "".join(layer_type_list)
-        self.layer_offset = pp_layer_offset
-        self.pre_process = pre_process
-        self.post_process = post_process
+        self.layer_pattern, self.layer_offset = "".join(layer_type_list), pp_layer_offset
         self.cp_group = None if pg_collection is None else pg_collection.cp
-        self._pipeline_chunk: CSA2PipelineChunk | None = None
-        self._pipeline_chunks: dict[str, CSA2PipelineChunk] = {}
+        self.codec = CSA2StateCodec(
+            indexer_k_differentiable=(config.dsa_indexer_loss_coeff or 0) > 0
+        )
+        self.pattern, self.placement = None, ()
 
-    def configure_cuda_graphs(self, layers: ModuleList) -> None:
-        """Attach graph schemas without changing module registration or checkpoint keys."""
-        if self.config.cuda_graph_impl != "transformer_engine":
-            return
-        for layer, symbol in zip(layers, self.layer_pattern):
-            layer._te_cuda_graph_adapter = CSA2CudaGraphAdapter(
-                self.config,
-                layer_number=layer.layer_number,
-                is_attention=symbol in ("D", "W"),
-                cp_group=self.cp_group,
+    def bind_placement(self, pattern: str, placement: tuple[StatePlacement, ...]) -> None:
+        """Use the host's existing order to identify the last attention at a cut."""
+        self.pattern, self.placement = pattern, placement
+
+    def graph_state(self, layer: Module, symbol: str) -> CSA2GraphState:
+        """Supply native graph fields and auxiliary-loss/cache publication."""
+        return CSA2GraphState(
+            self.config,
+            layer_number=layer.layer_number,
+            is_attention=symbol in ("D", "W"),
+            cp_group=self.cp_group,
+        )
+
+    def initial_state(self, hidden: Tensor, packed_seq_params: PackedSeqParams | None) -> CSA2State:
+        """Build forward-local native state and, when packed, its layout snapshot."""
+        state = CSA2State()
+        if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
+            state.thd_layout = build_csa2_thd_layout(
+                packed_seq_params, hidden.shape[0], cp_group=self.cp_group
             )
+        return state
 
-    def configure_pipeline(self, chunk: CSA2PipelineChunk) -> None:
-        """Bind a static logical chunk for local split execution."""
-        if (
-            chunk.layer_offset != self.layer_offset
-            or chunk.layer_pattern != self.layer_pattern
-            or self.pre_process != (chunk.incoming is None)
-            or self.post_process != (chunk.outgoing is None)
-        ):
-            raise ValueError("CSA2 pipeline chunk does not match this HybridStack segment")
-        if self._pipeline_chunk is not None and self._pipeline_chunk != chunk:
-            raise ValueError("CSA2 pipeline chunk is already configured with a different plan")
-        self._pipeline_chunk = chunk
-        boundary = chunk.outgoing if chunk.outgoing is not None else chunk.incoming
-        if boundary is not None:
-            self._pipeline_chunks[boundary.qkv_format] = chunk
-
-    def configure_distributed_pipeline(
-        self, pattern: str, pp_group: ProcessGroup, vp_stage: int | None = None
-    ) -> PipelinePayloadFactory | None:
-        """Bind this physical/virtual chunk's packed and unpacked boundaries."""
-        if pp_group.size() == 1:
-            return
-        vp_size = self.config.virtual_pipeline_model_parallel_size or 1
-        if (vp_size > 1 and vp_stage is None) or not 0 <= (vp_stage or 0) < vp_size:
-            raise ValueError("CSA2 pipeline requires a valid vp_stage for each virtual chunk")
-        if len(pattern.split("|")) != pp_group.size() * vp_size:
-            raise ValueError("CSA2 pipeline segment count must equal PP size times VPP size")
-        chunk_index = (vp_stage or 0) * pp_group.size() + pp_group.rank()
-        chunks = tuple(
-            build_csa2_pipeline_plan(
-                self.config, pattern, pp_size=pp_group.size(), qkv_format=layout
-            )[chunk_index]
-            for layout in ("sbhd", "thd")
-        )
-        self.configure_pipeline(chunks[0])
-        self._pipeline_chunks = dict(zip(("sbhd", "thd"), chunks))
-        return self.make_pipeline_payload
-
-    def make_pipeline_payload(
-        self, tensors: tuple[Tensor, ...], metadata: tuple[int, ...]
-    ) -> CSA2PipelinePayload:
-        """Reconstruct a received input using this adapter's existing boundary plan."""
-        if len(metadata) not in (2, 4):
-            raise ValueError("CSA2 message has invalid pipeline metadata")
-        offset, max_seqlen = metadata[:2]
-        cp_size, cp_rank = metadata[2:] if len(metadata) == 4 else (1, 0)
-        chunk = self._pipeline_chunks.get("sbhd" if max_seqlen == -1 else "thd")
-        if chunk is None or chunk.incoming is None or chunk.incoming.layer_offset != offset:
-            raise ValueError("CSA2 message does not match the incoming pipeline boundary")
-        payload = CSA2PipelinePayload(
-            chunk.incoming, tensors, None if max_seqlen == -1 else max_seqlen, cp_size, cp_rank
-        )
-        payload.validate()
-        payload.validate_cp_group(self.cp_group)
-        return payload
-
-    def pipeline_payload_spec(
+    def pipeline_region(
         self,
-        seq_length: int,
-        micro_batch_size: int,
-        packed_seq_params: PackedSeqParams | None = None,
+        boundary: Any,
+        hidden: Tensor,
+        packed_seq_params: PackedSeqParams | None,
         *,
         requires_grad: bool = True,
-    ) -> tuple[PipelinePayloadSpec | None, PipelinePayloadSpec | None]:
-        """Describe both boundaries for one prepared batch without reading device values."""
-        layout = (
-            "thd"
-            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
-            else "sbhd"
-        )
-        chunk = self._pipeline_chunks[layout]
-        return tuple(
-            (
-                boundary.payload_spec(
-                    self.config,
-                    seq_length,
-                    micro_batch_size,
-                    packed_seq_params,
-                    requires_grad=requires_grad,
-                    cp_group=self.cp_group,
-                )
-                if boundary is not None
-                else None
+    ) -> StateRegion:
+        """Describe canonical native tensors and immutable metadata at a host cut."""
+        if not isinstance(boundary, CSA2PipelineBoundary):
+            boundary = csa2_pipeline_boundary(
+                self.config,
+                self.pattern,
+                boundary.layer_offset,
+                boundary.qkv_format,
+                self.placement,
             )
-            for boundary in (chunk.incoming, chunk.outgoing)
-        )
-
-    @property
-    def consumes_input_tensor(self) -> bool:
-        """A receiving chunk consumes exactly one submitted payload per forward."""
-        return self._pipeline_chunk is not None and self._pipeline_chunk.incoming is not None
-
-    def validate_input(self, input_tensor: Tensor | CSA2PipelinePayload | None) -> None:
-        """Check a payload against this chunk without retaining any activation state."""
-        chunk = self._pipeline_chunk
-        if isinstance(input_tensor, CSA2PipelinePayload):
-            if chunk is None:
-                raise ValueError(
-                    "CSA2 pipeline payload requires adapter.configure_pipeline() first"
-                )
-            if chunk.incoming is None:
-                raise ValueError("The first CSA2 pipeline chunk cannot receive a payload")
-            chunk = self._pipeline_chunks.get(input_tensor.boundary.qkv_format)
-            if chunk is None or input_tensor.boundary != chunk.incoming:
-                raise ValueError("CSA2 pipeline payload does not match the incoming boundary")
-        elif chunk is not None and input_tensor is not None:
-            raise ValueError("Configured CSA2 chunks receive a payload through set_input_tensor()")
-
-    def prepare_forward(
-        self,
-        hidden_states: Any,
-        packed_seq_params: PackedSeqParams | None,
-        inference_context: BaseInferenceContext | None,
-    ) -> tuple[Any, PackedSeqParams | None, HybridStackForwardContext]:
-        """Create fresh state or restore the incoming snapshot, including THD caches."""
-        chunk = self._pipeline_chunk
-        if chunk is not None and inference_context is not None:
-            raise ValueError("CSA2 pipeline chunks require a backbone training forward")
-        mhc_state = None
-        if self.consumes_input_tensor:
-            if hidden_states is None:
-                raise ValueError("CSA2 receiving chunk requires a payload from set_input_tensor()")
-            self.validate_input(hidden_states)
-            hidden_states, csa2_state, mhc_state, restored_params = hidden_states.restore(
-                use_fused_kernels=use_fused_dsa_kernels(self.config), cp_group=self.cp_group
-            )
-            if packed_seq_params is not None:
-                if csa2_state.thd_layout is not None:
-                    csa2_state.thd_layout.validate_compatible(
-                        packed_seq_params, hidden_states.shape[0], self.cp_group
-                    )
-                elif packed_seq_params.qkv_format == "thd":
-                    raise ValueError("CSA2 pipeline payload expects SBHD, not THD")
-            packed_seq_params = restored_params
-        else:
-            csa2_state = CSA2State()
-        return (
-            hidden_states,
+        fields = boundary.tensor_fields(
+            self.config,
+            *hidden.shape[:2],
             packed_seq_params,
-            HybridStackForwardContext(cross_layer_state=csa2_state, mhc_state=mhc_state),
+            requires_grad=requires_grad,
+            cp_group=self.cp_group,
+        )
+        cp_size, cp_rank = (
+            (1, 0) if self.cp_group is None else (self.cp_group.size(), self.cp_group.rank())
+        )
+        template = CSA2State(
+            kv_source_layer=boundary.kv_source_layer,
+            index_source_layer=boundary.index_source_layer,
+            candidate_source_layer=boundary.candidate_source_layer,
+            sequence_length=hidden.shape[0],
+            batch_size=hidden.shape[1],
+            device=hidden.device,
+            dtype=self.config.params_dtype,
+            last_layer=boundary.last_attention_layer,
+        )
+        metadata = dict(self.codec.metadata(template))
+        metadata.update(
+            candidate_block_size=boundary.candidate_block_size,
+            layout=(
+                None
+                if boundary.qkv_format == "sbhd"
+                else (hidden.shape[0], packed_seq_params.max_seqlen_q, cp_rank, cp_size)
+            ),
+            compress_ratio=boundary.compress_ratio if boundary.qkv_format == "thd" else None,
+            packed_kv=use_fused_dsa_kernels(self.config),
+        )
+        metadata = tuple(metadata.items())
+        return StateRegion(
+            BoundarySchema(f"csa2.decoder/pp:{boundary.layer_offset}", fields, fields),
+            self.codec,
+            metadata,
+            metadata,
         )
 
-    def finalize_forward(
-        self,
-        output: Tensor | tuple[Tensor, Tensor],
-        packed_seq_params: PackedSeqParams | None,
-        context: HybridStackForwardContext,
-    ) -> Tensor | tuple[Tensor, Tensor] | CSA2PipelinePayload:
-        """Snapshot only live outgoing dependencies while preserving their autograd edges."""
-        layout = (
-            "thd"
-            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
-            else "sbhd"
+    def checkpoint_region(
+        self, start: int, end: int, hidden: Tensor, state: CSA2State
+    ) -> StateRegion:
+        """Describe a host-selected full-recompute group without changing its layer order."""
+        start, end = start + self.layer_offset, end + self.layer_offset
+        config, layout = self.config, state.thd_layout
+        # Placement here describes a local compute region, not a new PP route.
+        # Preserve the actual chunk boundary so a caller cannot checkpoint across it.
+        positions = (
+            0,
+            self.layer_offset,
+            self.layer_offset + len(self.layer_pattern),
+            config.num_layers,
         )
-        chunk = self._pipeline_chunks.get(layout, self._pipeline_chunk)
-        if chunk is not None and chunk.outgoing is not None:
-            if not isinstance(output, Tensor):
-                raise TypeError("CSA2 pipeline chunks require a tensor before payload export")
-            return chunk.outgoing.export_payload(
-                output,
-                context.cross_layer_state,
-                context.mhc_state,
-                packed_seq_params=packed_seq_params,
-                cp_group=self.cp_group,
+        positions = tuple(sorted(set(positions)))
+        placement = tuple(
+            StatePlacement(2 * a, 2 * b, 0, i)
+            for i, (a, b) in enumerate(zip(positions, positions[1:]))
+        )
+        factory = csa2_field_factory(
+            config,
+            hidden.shape[0],
+            hidden.shape[1],
+            qkv_format="thd" if layout is not None else "sbhd",
+            max_seqlen=None if layout is None else layout.max_seqlen,
+            num_sequences=None if layout is None else layout.cu_seqlens.numel() - 1,
+            cp_size=1 if layout is None else layout.cp_size,
+        )
+        dependencies = csa2_state_dependencies(config, factory, placement)
+        boundary = StateBoundary(
+            f"csa2.decoder/checkpoint:{start}:{end}", "checkpoint", 2 * start, 2 * end
+        )
+        (schema,) = prepare_boundaries(dependencies, (boundary,), placement)
+        codec = CSA2StateCodec(indexer_k_differentiable=(config.dsa_indexer_loss_coeff or 0) > 0)
+        metadata = dict(codec.metadata(state))
+        metadata.update(
+            sequence_length=hidden.shape[0],
+            batch_size=hidden.shape[1],
+            device=str(hidden.device),
+            dtype=str(config.params_dtype).removeprefix("torch."),
+            packed_kv=use_fused_dsa_kernels(config),
+        )
+        # Prefix tensors are ordinary explicit layout inputs. The codec rebuilds
+        # physical indices instead of closing over cached tensors from another call.
+        prefixes = tuple(f for f in codec.fields(state) if "/cu_seqlens" in f.key)
+        inputs = (*schema.inputs, *prefixes)
+        retained = (
+            tuple(
+                dep.field
+                for dep in dependencies
+                if dep.available_at < 2 * start
+                and any(reader >= 2 * end for reader in dep.consumed_at)
             )
-        return output
+            + prefixes
+        )
+        input_metadata = tuple(metadata.items())
+        for layer in range(start, end):
+            symbol = self.layer_pattern[layer - self.layer_offset]
+            if symbol in ("D", "W"):
+                metadata["last_layer"] = layer
+            if layer in config.csa2_kv_source_layers:
+                metadata["kv_source_layer"] = layer
+                metadata["candidate_source_layer"] = None
+                metadata["candidate_block_size"] = None
+                metadata["compress_ratio"] = (
+                    config.csa_compress_ratios[layer] if layout is not None else None
+                )
+            if layer in config.csa2_index_source_layers:
+                metadata["index_source_layer"] = layer
+            if layer == config.csa2_candidate_source_layer:
+                metadata["candidate_source_layer"] = layer
+                metadata["candidate_block_size"] = config.csa2_candidate_block_size
+        return StateRegion(
+            BoundarySchema(schema.boundary_id, inputs, schema.outputs),
+            codec,
+            input_metadata,
+            tuple(metadata.items()),
+            retained,
+        )

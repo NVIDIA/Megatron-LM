@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -221,9 +221,6 @@ def get_transformer_layer_offset(
     return offset
 
 
-RecomputeTensors = tuple[Tensor | None, ...]
-
-
 class CrossLayerState(Protocol):
     """Model-owned working state, passed explicitly rather than retained on modules.
 
@@ -233,8 +230,9 @@ class CrossLayerState(Protocol):
     non-Transformer layers opt in with ``supports_cross_layer_state = True``
     and accept the ``cross_layer_state`` keyword.
 
-    Pipeline serialization and CUDA Graph schemas remain model-specific: they
-    may carry a different subset of tensors than a local recompute boundary.
+    Pipeline, full-recompute and CUDA Graph state use the module's boundary
+    declarations and codec. This protocol only covers the layer's native access
+    and selective-recompute consumers.
     """
 
     def attention_kwargs(self) -> dict[str, Any]:
@@ -250,19 +248,6 @@ class CrossLayerState(Protocol):
 
         Return tensor references now, not a callback that reads mutable state
         during backward. Do not detach them: every consumer must reach its producer.
-        """
-        ...
-
-    def save_for_recompute(
-        self,
-    ) -> tuple[RecomputeTensors, Callable[[RecomputeTensors], CrossLayerState]]:
-        """Separate checkpoint tensors from a callable restoring fresh working state.
-
-        All differentiable state must be explicit tensor inputs/outputs. The
-        callable may capture immutable metadata, but must not retain the live
-        state or its floating activations. Rebuild derived views from the supplied
-        tensors so replay retains their new autograd edges. Each call must return
-        independent working state, including when several microbatches are live.
         """
         ...
 

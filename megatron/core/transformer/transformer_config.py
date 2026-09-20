@@ -4667,48 +4667,16 @@ class TransformerConfig(ModelParallelConfig):
         """Validate the forward-local single-pass implementation independently of model version."""
         if not self.enable_hyper_connections:
             raise ValueError("mhc_single_pass requires enable_hyper_connections=True")
-        if self.recompute_granularity is not None:
-            if not (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and self.dsv4_version == "v4.1"
-                and (
-                    self.recompute_granularity == "full"
-                    or (
-                        self.recompute_granularity == "selective"
-                        and set(self.recompute_modules)
-                        <= {"mhc", "layernorm", "mla_up_proj", "moe_act", "moe", "shared_experts"}
-                    )
-                )
-            ):
-                raise ValueError(
-                    "mhc_single_pass activation recomputation requires V4.1 Hybrid with "
-                    "recompute_granularity='full' or 'selective'; supported selective modules "
-                    "are 'mhc', 'layernorm', 'mla_up_proj', 'moe_act', 'moe', and 'shared_experts'"
-                )
-        if self.cuda_graph_impl != "none" and not (
-            self.experimental_attention_variant == "dsv4_hybrid"
-            and self.dsv4_version == "v4.1"
-            and self.cuda_graph_impl == "transformer_engine"
-        ):
-            raise ValueError("mhc_single_pass CUDA Graphs require the V4.1 Hybrid TE state adapter")
+        # Attention-specific recompute restrictions belong to that attention's
+        # validation. Ordinary attention/MLP retain the common module checks above.
+        if self.cuda_graph_impl not in ("none", "transformer_engine"):
+            raise ValueError("mhc_single_pass CUDA Graphs require the Hybrid TE state adapter")
+        if self.cuda_graph_impl != "none" and self.recompute_granularity == "full":
+            raise ValueError("Single-pass mHC CUDA Graphs do not yet support full recompute")
         if self.mtp_num_layers:
             raise ValueError("mhc_single_pass does not yet support MTP")
-        if self.pipeline_model_parallel_size != 1 and not (
-            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
-        ):
-            raise ValueError(
-                "mhc_single_pass requires pipeline_model_parallel_size=1 outside V4.1 Hybrid"
-            )
         if self.tensor_model_parallel_size != 1:
             raise ValueError("mhc_single_pass requires tensor_model_parallel_size=1")
-        if self.context_parallel_size != 1 and not (
-            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
-        ):
-            raise ValueError("mhc_single_pass requires context_parallel_size=1 outside V4.1 Hybrid")
-        if self.virtual_pipeline_model_parallel_size is not None and not (
-            self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1"
-        ):
-            raise ValueError("mhc_single_pass supports VPP only with V4.1 Hybrid")
         if self.sequence_parallel:
             raise ValueError("mhc_single_pass does not yet support sequence parallelism")
         if self.dynamic_context_parallel:

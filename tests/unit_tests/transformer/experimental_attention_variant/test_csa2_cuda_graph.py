@@ -133,7 +133,7 @@ def _install_eager_graph_callables(stacks, *, joint_backward=False, num_microbat
                         slot = layer.get_te_cuda_graph_static_hidden_input(microbatch)
                         assert args[0].data_ptr() == slot.data_ptr(), "aggregate must direct-write"
                         assert args[0].shape[-1] == layer.config.hidden_size
-                        assert "csa2_graph_pre_mix" not in kwargs
+                        assert "mhc_graph_pre_mix" not in kwargs
                     if joint_backward:
                         names = tuple(name for name, value in kwargs.items() if value is not None)
                         flat_inputs = (*args, *(kwargs[name] for name in names))
@@ -174,7 +174,9 @@ def _static_inputs(layer):
             seq, batch, width, dtype=config.params_dtype, device=device, requires_grad=True
         )
     }
-    if packed and layer._te_cuda_graph_adapter.is_attention:
+    adapter = layer._te_cuda_graph_adapter
+    feature = next((c for c in adapter.components if hasattr(c, "is_attention")), None)
+    if packed and feature is not None and feature.is_attention:
         prefix = torch.tensor([0, seq, seq, seq, seq], dtype=torch.int32, device=device)
         for suffix in ("q", "kv", "q_padded", "kv_padded"):
             static["cu_seqlens_" + suffix] = prefix.clone()
@@ -365,7 +367,7 @@ def test_graph_boundary_side_state_only_loss_reaches_its_producer(
     ref_x = x.detach().clone().requires_grad_()
     actual = stacks[0](x, None, packed_seq_params=params)
     expected = expected_stacks[0](ref_x, None, packed_seq_params=params)
-    index = actual.boundary.field_names.index(field)
+    index = tuple(spec.name for spec in actual.tensor_specs).index(field)
     torch.testing.assert_close(actual.tensors[index], expected.tensors[index])
     actual.tensors[index].square().sum().backward()
     expected.tensors[index].square().sum().backward()
@@ -399,6 +401,9 @@ def test_joint_graph_backward_does_not_inject_auxiliary_loss_for_unused_hidden(
     torch.manual_seed(219)
     _record_losses(monkeypatch)
     config = _config(coefficient=0.3, enable_hyper_connections=mhc)
+    # The boundary exports values with a declared external reader. Make L4 a
+    # Reindex consumer so L2's indexer K is a live side output for this objective.
+    config.csa2_index_source_layers = [2, 4, 6, 8]
     reference = _stack(config)
     actual = _stack(_graph_config(config, layout))
     actual.load_state_dict(reference.state_dict())
@@ -600,14 +605,14 @@ def test_mhc_recompute_graph_side_output_only_backward(
     ref_hidden = hidden.detach().clone().requires_grad_()
     actual = stacks[0](hidden, None, packed_seq_params=params)
     expected = expected_stacks[0](ref_hidden, None, packed_seq_params=params)
-    index = actual.boundary.field_names.index(field)
+    index = tuple(spec.name for spec in actual.tensor_specs).index(field)
     target, ref_target = actual.tensors[index], expected.tensors[index]
     torch.testing.assert_close(target, ref_target, atol=0, rtol=0)
     loss, ref_loss = target.square().sum(), ref_target.square().sum()
     if explicit_zero_hidden:
         # An actual zero hidden gradient must still activate the ordinary aux
         # scaler. Only an absent hidden objective can suppress its graph edge.
-        hidden_index = actual.boundary.field_names.index("hidden_states")
+        hidden_index = tuple(spec.name for spec in actual.tensor_specs).index("hidden_states")
         loss = loss + actual.tensors[hidden_index].sum() * 0
         ref_loss = ref_loss + expected.tensors[hidden_index].sum() * 0
     loss.backward()

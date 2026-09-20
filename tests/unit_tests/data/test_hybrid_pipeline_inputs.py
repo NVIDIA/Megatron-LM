@@ -10,11 +10,13 @@ import pytest
 import torch
 
 import pretrain_hybrid as entry
+from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStateAdapter
 from megatron.core.pipeline_parallel.pipeline_payload import PipelineDataIterator
 from megatron.core.rerun_state_machine import RerunDataIterator, RerunMode
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
     CSA2HybridAdapter,
 )
+from megatron.core.transformer.hyper_connection import SinglePassMHCBoundary
 from megatron.training.datasets import hybrid_pipeline
 from tests.unit_tests.pipeline_parallel.test_typed_pipeline import _Timers
 from tests.unit_tests.transformer.experimental_attention_variant.test_csa2 import _packed
@@ -22,6 +24,20 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_csa2_pipel
     _config,
     _pattern,
 )
+
+
+def _adapter(config, **kwargs):
+    return HybridStateAdapter(
+        config,
+        components=(
+            SinglePassMHCBoundary(config, kwargs["pp_layer_offset"]),
+            CSA2HybridAdapter(config, **kwargs),
+        ),
+        hidden_size=config.hidden_size * config.num_residual_streams,
+        hidden_dtype=config.params_dtype,
+        pg_collection=SimpleNamespace(cp=None),
+        **kwargs,
+    )
 
 
 @pytest.mark.parametrize("stage", [0, 1, 2, 3])
@@ -58,7 +74,7 @@ def test_training_prepares_each_batch_once_and_rebuilds_plans_on_rerun(
     )
     pattern = _pattern((7, 8, 10))
     offsets = (0, 7, 8, 10)
-    adapter = CSA2HybridAdapter(
+    adapter = _adapter(
         config,
         layer_type_list=list(pattern.split("|")[stage]),
         pp_layer_offset=offsets[stage],
@@ -166,7 +182,7 @@ def test_static_middle_stage_keeps_none_data_iterator(monkeypatch):
     monkeypatch.setattr(entry.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(entry, "mtp_on_this_rank_func", lambda **kwargs: False)
     monkeypatch.setattr(entry, "is_first_or_last_pipeline_stage", lambda vp: False)
-    adapter = CSA2HybridAdapter(
+    adapter = _adapter(
         config,
         layer_type_list=["E"],
         pp_layer_offset=7,

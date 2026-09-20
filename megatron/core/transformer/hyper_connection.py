@@ -2,14 +2,22 @@
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.state_boundary import (
+    BoundarySchema,
+    StateRegion,
+    TensorField,
+    TensorSchema,
+    validate_metadata,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
@@ -72,6 +80,171 @@ class SinglePassMHCState:
         return (
             (streams.float() * self.pre_mix.float().unsqueeze(-1)).sum(-2).to(hidden_states.dtype)
         )
+
+
+class SinglePassMHCStateCodec:
+    """Describe and restore the aggregation edge without depending on attention state."""
+
+    @staticmethod
+    def field(
+        config: TransformerConfig,
+        source: int,
+        shape: tuple[int, int],
+        *,
+        dtype: torch.dtype | None = None,
+        present: bool = True,
+        differentiable: bool = True,
+    ) -> TensorField:
+        """Describe the previous sublayer's mix; an absent entry selects stream zero."""
+        return TensorField(
+            f"mhc.decoder/pre_mix:L{source}",
+            (*shape, config.num_residual_streams),
+            dtype or (config.params_dtype if config.use_fused_mhc else torch.float32),
+            "sbn",
+            differentiable,
+            present,
+        )
+
+    def export(
+        self, state: SinglePassMHCState, fields: tuple[TensorField, ...]
+    ) -> tuple[Tensor, ...]:
+        """Export the original differentiable edge, preserving an absent initial mix."""
+        if len(fields) != 1 or not fields[0].key.startswith("mhc.decoder/pre_mix:"):
+            raise ValueError("Single-pass mHC requires exactly one pre_mix field")
+        if fields[0].present != (state.pre_mix is not None):
+            raise ValueError("Single-pass mHC pre_mix presence disagrees with its boundary")
+        tensors = (state.pre_mix,) if fields[0].present else ()
+        TensorSchema(fields).validate(tensors)
+        return tensors
+
+    def restore(
+        self, fields: tuple[TensorField, ...], tensors: tuple[Tensor, ...], metadata=()
+    ) -> SinglePassMHCState:
+        """Create independent working state while retaining each supplied tensor's graph."""
+        validate_metadata(metadata)
+        TensorSchema(fields).validate(tensors)
+        state = SinglePassMHCState(tensors[0] if tensors else None)
+        self.export(state, fields)
+        return state
+
+
+class SinglePassMHCBoundary:
+    """Declare mHC state at host-selected cuts without owning an execution backend."""
+
+    context_attribute = "mhc_state"
+
+    def __init__(self, config: TransformerConfig, layer_offset: int) -> None:
+        self.config, self.layer_offset = config, layer_offset
+        self.codec = SinglePassMHCStateCodec()
+        self.graph_mhc = not (
+            config.recompute_granularity == "selective"
+            and "mhc" in (config.recompute_modules or [])
+        )
+
+    def initial_state(
+        self, hidden: Tensor, packed_seq_params: PackedSeqParams | None
+    ) -> SinglePassMHCState:
+        """Create a fresh empty mixing state for one model forward."""
+        return SinglePassMHCState()
+
+    def pipeline_region(
+        self,
+        boundary: Any,
+        hidden: Tensor,
+        packed_seq_params: PackedSeqParams | None,
+        *,
+        requires_grad: bool = True,
+    ) -> StateRegion:
+        """Declare the live mixing edge at a pipeline cut."""
+        field = self.codec.field(
+            self.config, boundary.layer_offset - 1, hidden.shape[:2], differentiable=requires_grad
+        )
+        return StateRegion(BoundarySchema("mhc/pipeline", (field,), (field,)), self.codec)
+
+    def checkpoint_region(
+        self, start: int, end: int, hidden: Tensor, state: SinglePassMHCState
+    ) -> StateRegion:
+        """Declare the incoming and produced mix for a host-selected layer group."""
+        incoming = self.codec.field(
+            self.config,
+            self.layer_offset + start - 1,
+            hidden.shape[:2],
+            present=state.pre_mix is not None,
+        )
+        outgoing = self.codec.field(self.config, self.layer_offset + end - 1, hidden.shape[:2])
+        return StateRegion(BoundarySchema("mhc/checkpoint", (incoming,), (outgoing,)), self.codec)
+
+    def graph_state(self, layer: nn.Module, symbol: str) -> "SinglePassMHCBoundary":
+        """Describe native mHC state for the common graph boundary."""
+        return SinglePassMHCBoundary(self.config, layer.layer_number - 1)
+
+    def get_static_inputs(self, inputs: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Declare an input mix only when mHC is inside the captured region."""
+        if self.graph_mhc and self.layer_offset:
+            hidden = inputs["hidden_states"]
+            field = self.codec.field(self.config, self.layer_offset - 1, hidden.shape[:2])
+            inputs["mhc_graph_pre_mix"] = torch.full(
+                field.shape,
+                1 / self.config.num_residual_streams,
+                dtype=field.dtype,
+                device=hidden.device,
+                requires_grad=True,
+            )
+        return inputs
+
+    def restore_inputs(
+        self, hidden: Tensor, kwargs: dict
+    ) -> tuple[SinglePassMHCState, TensorField] | None:
+        """Restore the explicit graph input into fresh mixing state."""
+        if not self.graph_mhc:
+            return None
+        field = self.codec.field(
+            self.config, self.layer_offset - 1, hidden.shape[:2], present=self.layer_offset > 0
+        )
+        tensors = (kwargs.pop("mhc_graph_pre_mix"),) if field.present else ()
+        state = self.codec.restore((field,), tensors)
+        kwargs["mhc_state"] = state
+        return state, self.codec.field(self.config, self.layer_offset, hidden.shape[:2])
+
+    def export_outputs(
+        self, snapshot: tuple[SinglePassMHCState, TensorField] | None
+    ) -> tuple[Tensor, ...]:
+        """Export the mix produced inside this capture region."""
+        if snapshot is None:
+            return ()
+        state, field = snapshot
+        return self.codec.export(state, (field,))
+
+    def prepare_replay(self, hidden: Tensor, kwargs: dict) -> tuple[int, Callable]:
+        """Declare replay inputs and a native state publication callback."""
+        params = kwargs.get("packed_seq_params")
+        if params is not None:
+            maximum = self.config.max_seqlen_per_dp_cp_rank
+            if (
+                params.qkv_format != "thd"
+                or maximum is None
+                or params.max_seqlen_q != maximum * self.config.context_parallel_size
+                or params.max_seqlen_kv != params.max_seqlen_q
+            ):
+                raise ValueError("mHC CUDA Graph THD requires the configured static max_seqlen")
+        if not self.graph_mhc:
+            return 0, lambda result, side: result
+        state = kwargs.pop("mhc_state", None)
+        if not isinstance(state, SinglePassMHCState):
+            raise ValueError("Single-pass mHC graph replay requires forward-local state")
+        field = self.codec.field(
+            self.config, self.layer_offset - 1, hidden.shape[:2], present=self.layer_offset > 0
+        )
+        tensors = self.codec.export(state, (field,))
+        if field.present:
+            kwargs["mhc_graph_pre_mix"] = tensors[0]
+
+        def publish(result, side):
+            output = self.codec.field(self.config, self.layer_offset, hidden.shape[:2])
+            state.pre_mix = self.codec.restore((output,), side).pre_mix
+            return result
+
+        return 1, publish
 
 
 class SinkhornKnopp(torch.autograd.Function):
