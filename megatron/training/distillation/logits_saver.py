@@ -263,6 +263,26 @@ class LogitsSaverHooks:
             self.metadata_dict, sort_keys=False, separators=(',', ':'),
         ).encode("utf-8")
 
+        # Packed (--sft) documents are padded to a multiple of
+        # 2 * context_parallel_size of *this* run (SFTDataset
+        # ._calculate_padding_divisor), baked permanently into this cache.
+        # Surface the resulting load-time CP constraint up front rather than
+        # only when a student's TeacherTarDataset construction later raises
+        # or warns about it (see the cp_size_save checks there).
+        is_packed = getattr(args, 'sft', False) or getattr(
+            args, 'dataloader_inter_document_masking', False
+        )
+        if is_packed and self.cp_size > 1:
+            print_rank_last(
+                f"Cached-logits saver: writing packed (--sft) sequences with "
+                f"context-parallel size {self.cp_size}. Document padding is "
+                f"baked in for this CP size -- students must load with a CP "
+                f"size that evenly divides {self.cp_size} (a larger load CP "
+                "will fail with a clear error; a smaller load CP works "
+                "mechanically but may see trailing content this run "
+                "truncated that its own data pipeline would have kept)."
+            )
+
         # Hook states – store already-processed top-K results (not full logits)
         self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor]] = []
         # Parallel to _accumulated_results (same append-guard, same length):

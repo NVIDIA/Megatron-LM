@@ -268,6 +268,55 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
         )
 
+        # Packed (--sft) documents are padded per-document to a multiple of
+        # 2 * context_parallel_size of whichever run built the SFTDataset
+        # (see SFTDataset._calculate_padding_divisor) -- that padding is
+        # baked in permanently. Resharding to a different CP size at load
+        # time only stays *mechanically* safe (every document's saved
+        # padding divisor evenly covers the new one) when cp_size_save is an
+        # exact multiple of cp_size_load; otherwise some document's real
+        # length will be divisible by 2*cp_size_save but not by
+        # 2*cp_size_load, surfacing later as an opaque per-document
+        # ValueError deep in slice_tensor_for_cp_rank. Check it once, up
+        # front, with an explanation instead.
+        if self._requires_cu_seqlens:
+            cp_size_save = meta.get("saver", {}).get("cp_size_save")
+            if cp_size_save is not None and cp_size_save % self.cp_size != 0:
+                raise ValueError(
+                    f"Cached-logits CP resharding from saved context-parallel "
+                    f"size {cp_size_save} to current context-parallel size "
+                    f"{self.cp_size} is not supported for packed (--sft) "
+                    "sequences. SFTDataset pads each document to a multiple "
+                    f"of 2*context_parallel_size of the run that built it, so "
+                    f"documents saved at CP={cp_size_save} are only "
+                    "guaranteed compatible with load CP sizes that evenly "
+                    f"divide {cp_size_save} (this load's CP={self.cp_size} "
+                    f"does not: {cp_size_save} % {self.cp_size} != 0). "
+                    "Regenerate the teacher cache at a CP size that is a "
+                    f"multiple of {self.cp_size}, or load at a CP size that "
+                    f"evenly divides {cp_size_save}."
+                )
+            if (
+                cp_size_save is not None
+                and cp_size_save > self.cp_size
+                and safe_get_rank() == 0
+            ):
+                warnings.warn(
+                    "Cached-logits CP resharding from a larger saved "
+                    f"context-parallel size ({cp_size_save}) down to this "
+                    f"run's context-parallel size ({self.cp_size}) for "
+                    "packed (--sft) sequences: this is mechanically safe "
+                    "(no reshard error), but SFTDataset's per-document "
+                    "truncation point also depends on context_parallel_size "
+                    "-- the higher-CP teacher run may have truncated more "
+                    "content per document than this run's own data pipeline "
+                    "would, leaving some of this run's trailing tokens "
+                    "without corresponding teacher logits. This mismatch is "
+                    "not detected or corrected here; match CP sizes between "
+                    "save and load if exact content alignment matters.",
+                    UserWarning,
+                )
+
         if decode_lookahead is None:
             # When each load step consumes >1 saved iters, scale the lookahead
             # so the decode pipeline stays full.  Inverse direction (load step

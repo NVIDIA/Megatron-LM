@@ -36,7 +36,13 @@ def _torch_save_bytes(payload) -> bytes:
 
 
 def _write_v2_shard(
-    root: Path, *, dp_rank: int = 0, num_samples: int, seq_len: int, cu_seqlens_padded
+    root: Path,
+    *,
+    dp_rank: int = 0,
+    num_samples: int,
+    seq_len: int,
+    cu_seqlens_padded,
+    cp_size_save=None,
 ) -> None:
     """Write a single v2 tar shard: one saved iteration of num_samples
     samples, each with a real (seq_len,) sequence whose values encode
@@ -62,6 +68,8 @@ def _write_v2_shard(
     metadata = {
         "saver": {"format_version": 2, "mbs_save": 1, "dp_size_save": 1, "gbs_save": num_samples}
     }
+    if cp_size_save is not None:
+        metadata["saver"]["cp_size_save"] = cp_size_save
     compressor = zstandard.ZstdCompressor(level=1)
     tar_path = root / f"dp{dp_rank}__0-{num_samples}.tar"
     with tarfile.open(tar_path, "w") as tar:
@@ -189,3 +197,103 @@ def test_missing_cu_seqlens_is_harmless_when_load_run_not_packed(tmp_path, monke
     )
     loaded = list(dataset)  # should not raise -- CP=2 but no packing intent
     assert len(loaded) == 1
+
+
+# ---------------------------------------------------------------------------
+# CP-size compatibility: saved CP vs. load CP for packed (--sft) sequences
+# ---------------------------------------------------------------------------
+
+
+def test_load_cp_larger_and_not_dividing_save_cp_raises_early(tmp_path, monkeypatch):
+    """Saved at CP=4 (documents padded to multiples of 8), loading at CP=16
+    (needs multiples of 32) is not guaranteed safe -- must raise at dataset
+    construction time, before any per-document ValueError surfaces."""
+    seq_len = 16
+    cu_seqlens_padded = torch.tensor([[0, seq_len]])
+    _write_v2_shard(
+        tmp_path,
+        num_samples=1,
+        seq_len=seq_len,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size_save=4,
+    )
+    _load_args(monkeypatch, sft=True, num_samples=1)
+
+    with pytest.raises(ValueError, match="context-parallel"):
+        make_teacher_tar_dataset(
+            str(tmp_path), cp_rank=0, cp_size=16, dp_rank=0, dp_size=1, ignore_hash=True
+        )
+
+
+def test_load_cp_dividing_save_cp_does_not_raise(tmp_path, monkeypatch):
+    """Saved at CP=16, loading at CP=4 (a divisor of 16): mechanically safe,
+    no error expected from the early check."""
+    seq_len = 16
+    cu_seqlens_padded = torch.tensor([[0, seq_len]])
+    _write_v2_shard(
+        tmp_path,
+        num_samples=1,
+        seq_len=seq_len,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size_save=16,
+    )
+    _load_args(monkeypatch, sft=True, num_samples=1)
+
+    make_teacher_tar_dataset(
+        str(tmp_path), cp_rank=0, cp_size=4, dp_rank=0, dp_size=1, ignore_hash=True
+    )  # should not raise
+
+
+def test_load_cp_smaller_than_save_cp_warns_about_truncation(tmp_path, monkeypatch):
+    seq_len = 16
+    cu_seqlens_padded = torch.tensor([[0, seq_len]])
+    _write_v2_shard(
+        tmp_path,
+        num_samples=1,
+        seq_len=seq_len,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size_save=16,
+    )
+    _load_args(monkeypatch, sft=True, num_samples=1)
+
+    with pytest.warns(UserWarning, match="truncat"):
+        make_teacher_tar_dataset(
+            str(tmp_path), cp_rank=0, cp_size=4, dp_rank=0, dp_size=1, ignore_hash=True
+        )
+
+
+def test_load_cp_equal_to_save_cp_does_not_warn_or_raise(tmp_path, monkeypatch, recwarn):
+    seq_len = 16
+    cu_seqlens_padded = torch.tensor([[0, seq_len]])
+    _write_v2_shard(
+        tmp_path,
+        num_samples=1,
+        seq_len=seq_len,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size_save=4,
+    )
+    _load_args(monkeypatch, sft=True, num_samples=1)
+
+    make_teacher_tar_dataset(
+        str(tmp_path), cp_rank=0, cp_size=4, dp_rank=0, dp_size=1, ignore_hash=True
+    )
+    assert len(recwarn) == 0
+
+
+def test_missing_cp_size_save_skips_the_early_check(tmp_path, monkeypatch):
+    """Old-format metadata (no cp_size_save) can't be compared -- falls
+    through to the missing-cu_seqlens_padded guard instead, not this one."""
+    seq_len = 16
+    cu_seqlens_padded = torch.tensor([[0, seq_len]])
+    _write_v2_shard(
+        tmp_path,
+        num_samples=1,
+        seq_len=seq_len,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size_save=None,
+    )
+    _load_args(monkeypatch, sft=True, num_samples=1)
+
+    make_teacher_tar_dataset(
+        str(tmp_path), cp_rank=0, cp_size=16, dp_rank=0, dp_size=1, ignore_hash=True
+    )  # should not raise from the cp_size_save check (metadata doesn't have it)

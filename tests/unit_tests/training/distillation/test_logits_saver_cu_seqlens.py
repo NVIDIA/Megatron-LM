@@ -11,6 +11,7 @@ reassemble_cp_sequence, which _gather_full_cp_microbatch simply delegates to.
 
 import io
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -157,3 +158,66 @@ def test_buffered_payload_rejects_mixed_none_and_present_cu_seqlens(monkeypatch)
 
     with pytest.raises(RuntimeError, match="[Ss]ome but not all"):
         saver._save_accumulated_log_probs()
+
+
+# ---------------------------------------------------------------------------
+# __init__: dump-time CP-compatibility note for packed (--sft) sequences
+# ---------------------------------------------------------------------------
+
+
+def _patch_init_deps(monkeypatch, *, cp_size, sft):
+    fake_ps = SimpleNamespace(
+        get_tensor_model_parallel_rank=lambda: 0,
+        get_tensor_model_parallel_world_size=lambda: 1,
+        get_tensor_model_parallel_group=lambda: None,
+        get_context_parallel_rank=lambda: 0,
+        get_context_parallel_world_size=lambda: cp_size,
+        get_context_parallel_group=lambda: None,
+        get_data_parallel_rank=lambda: 0,
+        get_data_parallel_world_size=lambda: 1,
+        get_tensor_model_parallel_src_rank=lambda: 0,
+    )
+    monkeypatch.setattr(logits_saver, "parallel_state", fake_ps)
+    monkeypatch.setattr(logits_saver.dist, "get_global_rank", lambda group, rank: 0)
+
+    args = SimpleNamespace(
+        mtp_num_layers=0,
+        micro_batch_size=1,
+        global_batch_size=4,
+        sft=sft,
+        dataloader_inter_document_masking=False,
+        freeze_all_layers=False,
+    )
+    monkeypatch.setattr(logits_saver, "get_args", lambda: args)
+    monkeypatch.setattr(logits_saver, "compute_dataset_hash", lambda: ("hash", {}))
+    monkeypatch.setattr(logits_saver, "storage_makedirs", lambda *a, **k: None)
+
+
+def test_init_prints_cp_compatibility_note_for_packed_cp_gt_1(tmp_path, monkeypatch):
+    _patch_init_deps(monkeypatch, cp_size=4, sft=True)
+    messages = []
+    monkeypatch.setattr(logits_saver, "print_rank_last", messages.append)
+
+    LogitsSaverHooks(save_dir=str(tmp_path), k=4)
+
+    assert any("context-parallel size 4" in m for m in messages)
+
+
+def test_init_no_note_when_cp_size_one(tmp_path, monkeypatch):
+    _patch_init_deps(monkeypatch, cp_size=1, sft=True)
+    messages = []
+    monkeypatch.setattr(logits_saver, "print_rank_last", messages.append)
+
+    LogitsSaverHooks(save_dir=str(tmp_path), k=4)
+
+    assert not any("context-parallel" in m for m in messages)
+
+
+def test_init_no_note_when_not_packed(tmp_path, monkeypatch):
+    _patch_init_deps(monkeypatch, cp_size=4, sft=False)
+    messages = []
+    monkeypatch.setattr(logits_saver, "print_rank_last", messages.append)
+
+    LogitsSaverHooks(save_dir=str(tmp_path), k=4)
+
+    assert not any("context-parallel" in m for m in messages)
