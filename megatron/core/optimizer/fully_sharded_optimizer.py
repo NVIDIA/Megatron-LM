@@ -180,12 +180,16 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         if not sharded_parameters:
             return []
 
+        # Union over every parameter rather than reading the first one's layout: a mesh
+        # dimension that one parameter replicates and another sharded still has to be gathered
+        # over, or the rank that solely describes an FQN never reaches the ranks that need it.
         mesh = sharded_parameters[0].device_mesh
-        return [
-            mesh.get_group(mesh_dim)
-            for mesh_dim, placement in enumerate(sharded_parameters[0].placements)
-            if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1
-        ]
+        sharded_dims = set()
+        for param in sharded_parameters:
+            for mesh_dim, placement in enumerate(param.placements):
+                if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1:
+                    sharded_dims.add(mesh_dim)
+        return [mesh.get_group(mesh_dim) for mesh_dim in sorted(sharded_dims)]
 
     def _gather_state_keys_by_fqn(self) -> dict[str, list[str]]:
         """Map every parameter's FQN to the keys of its ``DTensor`` optimizer state entries.
@@ -255,6 +259,18 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             # from the first one. A group that the TE < 2.18 empty-shard filter left empty
             # has none to read and contributes no state either.
             hyperparameters = param_to_group_meta[fqns[0]] if fqns else {}
+            # The rest of the group must agree. They will not if the checkpoint grouped the
+            # parameters differently -- say a weight-decay or decoupled-lr rule changed and a
+            # parameter moved between groups -- in which case applying the first parameter's
+            # hyperparameters to the whole group would silently restore the wrong lr, weight
+            # decay and step. :class:`DistributedOptimizer` raises on the same mismatch.
+            disagreeing = [fqn for fqn in fqns if param_to_group_meta[fqn] != hyperparameters]
+            if disagreeing:
+                raise ValueError(
+                    f"Parameters {disagreeing} carry different param-group hyperparameters "
+                    f"than {fqns[0]} does, but are in one group in this optimizer; the "
+                    "checkpoint's optimizer param groups do not match this model."
+                )
             param_groups.append({"params": fqns, **hyperparameters})
         return param_groups
 
@@ -338,7 +354,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             fqn = self._param_to_fqn[param]
             if fqn in state_by_fqn:
                 packed_state[fqn] = state_by_fqn[fqn]
-            else:
+            elif fqn in state_keys_by_fqn:
                 # Filtered out of this rank's optimizer because its local shard is empty. The
                 # rank owning a non-empty shard saves the real state; this placeholder has the
                 # same global shape and dtype but no local rows, so it contributes no data and
@@ -353,9 +369,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # ever synthesized and this branch is dead -- it is left unconditional
                 # rather than version-gated so there is one keyspace to reason about
                 # instead of two.
-                packed_state[fqn] = {
-                    key: torch.zeros_like(param) for key in state_keys_by_fqn.get(fqn, ())
-                }
+                packed_state[fqn] = {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}
+            # A parameter absent from the gathered keyspace has no state on any rank, because
+            # nothing has stepped yet. Emitting it as an empty mapping would be rank-consistent
+            # but wrong in a subtler way: the fsdp_dtensor handlers in fsdp_dtensor_checkpoint
+            # test ``state`` for emptiness as a whole and then index ``exp_avg`` per entry, so
+            # a dict of empty dicts raises where an empty dict is handled. v1 emits nothing
+            # here for the same reason, so nothing is emitted here either.
 
         return {"state": packed_state, "param_to_group_meta": self._param_to_group_meta()}
 
