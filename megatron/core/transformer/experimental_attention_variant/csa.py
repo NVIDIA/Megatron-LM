@@ -2009,6 +2009,49 @@ class CompressedSparseAttentionSubmodules:
     indexer: Union[ModuleSpec, type] = None
 
 
+class _CompactIndexerWorkspaceStore:
+    """Warmed-up compact-indexer workspaces (BSHD, THD, balanced THD per slot) and the active one
+    of each kind (the immediately preceding warm-up, which capture reuses).
+
+    One store per CSA module reproduces the historical per-layer ownership. With
+    ``TransformerConfig.dsa_compact_indexer_workspace_sharing`` all CSA modules built from the same
+    config on the same device share one store: layers execute serially on one stream and nothing in
+    a workspace outlives the indexer dispatch that fills it (the quantized q/k, packed scales and
+    candidate offsets are consumed by the compact top-k kernel, whose outputs are copied into
+    per-dispatch buffers; the attention and indexer-loss backward read bf16 saved tensors, never
+    the workspace), so a later layer overwriting the buffers is the same reuse eager gets from
+    its transient allocations.
+    """
+
+    def __init__(self) -> None:
+        self.bshd: list[BSHDCompactIndexerWorkspace] = []
+        self.bshd_active: BSHDCompactIndexerWorkspace | None = None
+        self.thd: list[THDCompactIndexerWorkspace] = []
+        self.thd_active: THDCompactIndexerWorkspace | None = None
+        self.balanced_thd: dict[str, list[THDCompactIndexerWorkspace]] = {}
+        self.balanced_thd_active: dict[str, THDCompactIndexerWorkspace] = {}
+
+    def __deepcopy__(self, memo):
+        # Runtime GPU state shared by graphs; a copied config must not duplicate it.
+        return self
+
+
+def _shared_compact_indexer_workspace_store(config, device: torch.device):
+    """Return the store shared by all CSA layers built from ``config`` on ``device``."""
+    stores = getattr(config, "_compact_indexer_workspace_stores", None)
+    if stores is None:
+        stores = {}
+        # Plain attribute on the (non-frozen) dataclass: not a field, so it is invisible to
+        # ``dataclasses.asdict``/``replace``; ``__deepcopy__`` above keeps copies from cloning it.
+        setattr(config, "_compact_indexer_workspace_stores", stores)
+    key = (device.type, device.index)
+    store = stores.get(key)
+    if store is None:
+        store = _CompactIndexerWorkspaceStore()
+        stores[key] = store
+    return store
+
+
 class CompressedSparseAttention(MegatronModule):
     """Sparse core attention for CompressedSparseAttention.
 
@@ -2120,22 +2163,15 @@ class CompressedSparseAttention(MegatronModule):
             )
 
         # Compact CUDA graphs reference caller-owned THD offsets and MXFP8
-        # buffers by address. Retain every warmed-up static geometry for the
-        # lifetime of this module so later graph captures cannot invalidate an
-        # earlier graph's storage. Candidate scratch and compact outputs are
-        # allocated inside the forward, so the CUDA-graph pool can reuse them
-        # after each serialized graph.
-        # ``_active_*`` identifies the immediately preceding warmup.
-        self._bshd_compact_indexer_workspaces: list[BSHDCompactIndexerWorkspace] = []
-        self._active_bshd_compact_indexer_workspace: BSHDCompactIndexerWorkspace | None = None
-        self._thd_compact_indexer_workspaces: list[THDCompactIndexerWorkspace] = []
-        self._active_thd_compact_indexer_workspace: THDCompactIndexerWorkspace | None = None
-        self._balanced_thd_compact_indexer_workspaces: dict[
-            str, list[THDCompactIndexerWorkspace]
-        ] = {}
-        self._active_balanced_thd_compact_indexer_workspaces: dict[
-            str, THDCompactIndexerWorkspace
-        ] = {}
+        # buffers by address. Every warmed-up static geometry is retained in a
+        # ``_CompactIndexerWorkspaceStore`` for the lifetime of the graphs so
+        # later captures cannot invalidate an earlier graph's storage. Candidate
+        # scratch and compact outputs are allocated inside the forward, so the
+        # CUDA-graph pool can reuse them after each serialized graph. The store
+        # is bound lazily (the device is only known at the first dispatch) and,
+        # with ``config.dsa_compact_indexer_workspace_sharing``, is shared by all
+        # CSA layers built from this config on that device.
+        self._compact_indexer_store: _CompactIndexerWorkspaceStore | None = None
 
     def backward_dw(self):
         """Compute the deferred weight gradients of the optional compressor/indexer submodules.
@@ -2151,6 +2187,64 @@ class CompressedSparseAttention(MegatronModule):
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
+
+    def _compact_indexer_workspace_store(
+        self, device: torch.device | None = None
+    ) -> _CompactIndexerWorkspaceStore:
+        """Bind (once) and return this layer's compact-indexer workspace store."""
+        store = self._compact_indexer_store
+        if store is None:
+            if device is None:
+                param = next(self.parameters(), None)
+                device = (
+                    param.device
+                    if param is not None
+                    else torch.device("cuda", torch.cuda.current_device())
+                )
+            if getattr(self.config, "dsa_compact_indexer_workspace_sharing", True):
+                store = _shared_compact_indexer_workspace_store(self.config, device)
+            else:
+                store = _CompactIndexerWorkspaceStore()
+            self._compact_indexer_store = store
+        return store
+
+    # The historical per-module attribute names stay valid (tests and probes read them); they now
+    # resolve into the bound store, shared or private.
+    @property
+    def _bshd_compact_indexer_workspaces(self) -> list[BSHDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().bshd
+
+    @property
+    def _active_bshd_compact_indexer_workspace(self) -> BSHDCompactIndexerWorkspace | None:
+        return self._compact_indexer_workspace_store().bshd_active
+
+    @_active_bshd_compact_indexer_workspace.setter
+    def _active_bshd_compact_indexer_workspace(self, value) -> None:
+        self._compact_indexer_workspace_store().bshd_active = value
+
+    @property
+    def _thd_compact_indexer_workspaces(self) -> list[THDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().thd
+
+    @property
+    def _active_thd_compact_indexer_workspace(self) -> THDCompactIndexerWorkspace | None:
+        return self._compact_indexer_workspace_store().thd_active
+
+    @_active_thd_compact_indexer_workspace.setter
+    def _active_thd_compact_indexer_workspace(self, value) -> None:
+        self._compact_indexer_workspace_store().thd_active = value
+
+    @property
+    def _balanced_thd_compact_indexer_workspaces(
+        self,
+    ) -> dict[str, list[THDCompactIndexerWorkspace]]:
+        return self._compact_indexer_workspace_store().balanced_thd
+
+    @property
+    def _active_balanced_thd_compact_indexer_workspaces(
+        self,
+    ) -> dict[str, THDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().balanced_thd_active
 
     def _get_bshd_compact_indexer_workspace(
         self,
@@ -2168,6 +2262,7 @@ class CompressedSparseAttention(MegatronModule):
         wrapper, avoiding an extra permutation during graph capture.
         """
         precision = self.config.dsa_indexer_precision
+        self._compact_indexer_workspace_store(q.device)
         if self.config.cuda_graph_impl == "none" or not bshd_compact_indexer_available(
             q, k, precision
         ):
@@ -2239,6 +2334,7 @@ class CompressedSparseAttention(MegatronModule):
         clearly. Unsupported devices/frontends retain the non-compact path.
         """
         precision = self.config.dsa_indexer_precision
+        self._compact_indexer_workspace_store(q.device)
         if self.config.cuda_graph_impl == "none" or not thd_compact_indexer_available(
             q, k, precision
         ):

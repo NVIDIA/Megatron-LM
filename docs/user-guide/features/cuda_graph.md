@@ -183,6 +183,15 @@ so the captured graphs do not depend on the recorded pipeline order; it needs TE
 backward graph, where the RNG state cannot be rewound (forced-load-balancing router logits are
 replayed from their recorded seed and are therefore allowed).
 
+**DSA compact-indexer workspace.** With CUDA graphs the fused compact DSA indexer (`--dsa-kernel-backend cudnn`,
+`--dsa-indexer-precision mxfp8`) keeps a persistent workspace per static geometry: the MXFP8 q/k quantization
+destinations, packed scales and candidate offsets have to be prepared in eager warm-up because their sizing
+synchronises with the host. By default all CSA layers built from one model config share one workspace per geometry
+and balanced-indexer slot (`dsa_compact_indexer_workspace_sharing`); the layers of a graph run serially and nothing in
+the workspace outlives the indexer dispatch that fills it, so sharing removes only duplicates (one workspace per layer
+costs ~7 GiB per rank on DSv4 at 16K tokens per rank). `--no-dsa-compact-indexer-workspace-sharing` restores
+per-layer workspaces.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
