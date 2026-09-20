@@ -304,7 +304,15 @@ class HybridStack(MegatronModule):
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
                     )
 
-            if self.config.enable_mhc_connections:
+            # An MTP TransformerLayer can already own the attention and MLP hyper
+            # connections. Wrapping it again changes both the forward and checkpoint
+            # names (adding inner_layer.* and hyper_connection.*).
+            owns_mhc = (
+                is_mtp_layer
+                and isinstance(layer, TransformerLayer)
+                and layer.supports_mhc_connections
+            )
+            if self.config.enable_mhc_connections and not owns_mhc:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
 

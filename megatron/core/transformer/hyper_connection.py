@@ -882,6 +882,33 @@ def gated_residual_group_rmsnorm(x: Tensor, weight: Tensor, n: int, eps: float) 
     return normed.to(orig_dtype)
 
 
+class GatedResidualMTPHiddenNorm(MegatronModule):
+    """Normalize MTP's n-stream hidden state with a separate gain for every stream."""
+
+    def __init__(self, config: TransformerConfig, hidden_size: int, eps: float):
+        super().__init__(config)
+        assert hidden_size == config.hidden_size
+        self.num_streams = config.mhc_num_residual_streams
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = nn.Parameter(
+            torch.zeros(self.num_streams * hidden_size, dtype=config.params_dtype)
+        )
+        if config.sequence_parallel:
+            setattr(self.weight, "sequence_parallel", True)
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        shape = hidden_states.shape
+        assert shape[-2:] == (self.num_streams, self.hidden_size)
+        result = gated_residual_group_rmsnorm(
+            hidden_states.reshape(*shape[:-2], self.num_streams * self.hidden_size),
+            self.weight,
+            self.num_streams,
+            self.eps,
+        )
+        return result.reshape(shape)
+
+
 class GatedResidualHyperConnection(MegatronModule):
     """Gated Residual hyper-connection of Qwen4-Exp (Qwen3.8-Flash-Next).
 

@@ -3,7 +3,7 @@
 import logging
 from collections import OrderedDict
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, Optional
 
 import torch
 from torch import Tensor
@@ -49,6 +49,9 @@ from megatron.core.utils import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
+
 
 class GPTModel(LanguageModule, GraphableMegatronModule):
     """GPT Transformer language model.
@@ -93,6 +96,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
+        mtp_layer_pattern (str, optional): HybridStack pattern for the MTP inner layer.
+        mtp_hybrid_submodules (HybridStackSubmodules, optional): Inner-layer specs for
+            hybrid MTP. Both arguments are passed to MultiTokenPredictionBlock.
         pg_collection (ProcessGroupCollection): Model communication process groups
     """
 
@@ -120,6 +126,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        mtp_layer_pattern: Optional[str] = None,
+        mtp_hybrid_submodules: Optional['HybridStackSubmodules'] = None,
     ) -> None:
         log_single_rank(
             logger,
@@ -251,6 +259,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 spec=self.mtp_block_spec,
                 vp_stage=vp_stage,
                 pg_collection=self.pg_collection,
+                mtp_layer_pattern=mtp_layer_pattern,
+                hybrid_submodules=mtp_hybrid_submodules,
             )
 
             self._setup_mtp_cuda_graphs()
@@ -739,6 +749,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         inference_context=None,
         output_processor=None,
         output_processor_context=None,
+        mhc_multistream=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -778,6 +789,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 padding_mask=padding_mask,
                 embedding=self.embedding,
                 mtp_input_mask=mtp_input_mask,
+                mhc_multistream=mhc_multistream,
                 **(extra_block_kwargs or {}),
             )
 

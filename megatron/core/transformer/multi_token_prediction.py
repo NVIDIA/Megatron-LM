@@ -1443,7 +1443,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-        if self.mhc_enabled:
+        if self.mhc_enabled and not getattr(self.final_layernorm, 'contracts_mhc_streams', False):
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -1702,7 +1702,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         Postprocesses the output of the transformer layers.
         """
 
-        if self.mhc_enabled:
+        if self.mhc_enabled and not getattr(self.final_layernorm, 'contracts_mhc_streams', False):
             hidden_states = learned_output_contract(
                 hidden_states,
                 self.hc_head_fn,

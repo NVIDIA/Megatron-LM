@@ -10,11 +10,22 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import (
     GatedResidualHyperConnection,
+    GatedResidualMTPHiddenNorm,
     GatedResidualOutputMixer,
     gated_residual_group_rmsnorm,
+)
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -112,6 +123,92 @@ class TestGatedResidualHyperConnection:
         assert ref_inject is None
         assert out.shape == (4, 3, config.hidden_size)
         torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+    def test_mtp_output_mixer_contracts_once_and_backpropagates(self):
+        config = _make_config()
+        mtp = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+        torch.nn.Module.__init__(mtp)
+        mtp.config = config
+        mtp.mhc_enabled = True
+        mtp.final_layernorm = GatedResidualOutputMixer(config).cuda()
+        x = torch.randn(4, 2, config.mhc_num_residual_streams * config.hidden_size, device="cuda", requires_grad=True)
+
+        out = mtp._postprocess(x)
+        expected, _ = _reference_gated_residual(mtp.final_layernorm, x)
+        assert out.shape == (4, 2, config.hidden_size)
+        torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+        out.square().sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in mtp.parameters())
+
+    def test_mtp_hidden_norm_uses_per_stream_gains(self):
+        config = _make_config(hidden_size=32, n=4)
+        norm = GatedResidualMTPHiddenNorm(config, hidden_size=32, eps=1e-6).cuda()
+        assert norm.weight.shape == (128,)
+        with torch.no_grad():
+            norm.weight.uniform_(-0.2, 0.2)
+        x = torch.randn(5, 2, 4, 32, device="cuda", requires_grad=True)
+
+        out = norm(x)
+        expected = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        expected = expected * (1 + norm.weight.view(4, 32))
+        assert out.shape == x.shape
+        torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+        out.square().sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert norm.weight.grad is not None and torch.isfinite(norm.weight.grad).all()
+
+    def test_mtp_hybrid_stack_keeps_embedded_hyper_connections(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_query_groups=2,
+            kv_channels=16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            layernorm_zero_centered_gamma=True,
+            qk_layernorm=True,
+            attention_output_gate=True,
+            add_bias_linear=False,
+            enable_mhc_connections=True,
+            mhc_variant="gated_residual",
+            mhc_num_residual_streams=4,
+            mhc_gated_residual_rank=8,
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=0.2,
+            qsa_indexer_n_heads=2,
+            qsa_indexer_kv_heads=1,
+            qsa_indexer_head_dim=16,
+            qsa_indexer_budget=8,
+            qsa_indexer_compress_ratio=4,
+            num_moe_experts=2,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=32,
+            ffn_hidden_size=128,
+        )
+        decoder_spec = get_transformer_block_with_experimental_attention_variant_spec(config)
+        mtp_spec = get_gpt_mtp_block_spec(config, decoder_spec, use_transformer_engine=True)
+        mtp_layer_spec = mtp_spec.layer_specs[0].submodules
+        mtp_layer_spec.hnorm = GatedResidualMTPHiddenNorm
+        mtp_layer_spec.e_proj = TEColumnParallelLinear
+        mtp_layer_spec.h_proj = TEColumnParallelLinear
+        mtp_layer_spec.layer_norm = GatedResidualOutputMixer
+        block = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_spec,
+            mtp_layer_pattern="*",
+            hybrid_submodules=HybridStackSubmodules(attention_layer=decoder_spec.layer_specs[-1]),
+        )
+
+        names = [name for name, _ in block.named_parameters()]
+        assert any("mtp_model_layer.layers.0.self_attention_hyper_connection." in name for name in names)
+        assert any("mtp_model_layer.layers.0.mlp_hyper_connection." in name for name in names)
+        assert not any(".inner_layer." in name or ".hyper_connection." in name for name in names)
+        assert block.layers[0].hnorm.weight.shape == (256,)
+        assert not any("hc_head_" in name for name in names)
 
     def test_group_rmsnorm_matches_reference(self):
         x = torch.randn(6, 2, 8 * 4, device="cuda", dtype=torch.bfloat16)
