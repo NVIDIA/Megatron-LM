@@ -432,9 +432,9 @@ class TestTransformerConfigRecomputeMhc:
         assert "mhc" in config.recompute_modules
         assert config.enable_mhc_connections is True
 
-    def test_config_rejects_pipeline_parallel(self):
-        """mHC expands to n-stream inside the block, so PP p2p shapes disagree."""
-        with pytest.raises(NotImplementedError, match="pipeline_model_parallel_size"):
+    def test_config_pipeline_parallel_requires_variable_shapes(self):
+        """Fixed-shape PP buffers cannot receive the n-stream activation."""
+        with pytest.raises(NotImplementedError, match="variable_seq_lengths"):
             TransformerConfig(
                 num_layers=2,
                 hidden_size=64,
@@ -444,6 +444,45 @@ class TestTransformerConfigRecomputeMhc:
                 # ModelParallelConfig.__post_init__ runs first and requires this
                 # whenever pipeline_model_parallel_size > 1.
                 pipeline_dtype=torch.bfloat16,
+            )
+
+    def test_config_allows_non_interleaved_variable_shape_pipeline_parallel(self):
+        """Dynamic PP exchanges the actual n-stream activation shape."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+            variable_seq_lengths=True,
+        )
+        assert config.pipeline_model_parallel_size == 2
+
+    def test_config_rejects_interleaved_pipeline_parallel(self):
+        with pytest.raises(NotImplementedError, match="virtual_pipeline_model_parallel_size"):
+            TransformerConfig(
+                num_layers=4,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_mhc_connections=True,
+                pipeline_model_parallel_size=2,
+                virtual_pipeline_model_parallel_size=2,
+                pipeline_dtype=torch.bfloat16,
+                variable_seq_lengths=True,
+            )
+
+    def test_config_rejects_layout_inferred_interleaved_pipeline_parallel(self):
+        with pytest.raises(NotImplementedError, match="virtual_pipeline_model_parallel_size"):
+            TransformerConfig(
+                num_layers=4,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_mhc_connections=True,
+                pipeline_model_parallel_size=2,
+                pipeline_model_parallel_layout="t|t|t|t",
+                pipeline_dtype=torch.bfloat16,
+                variable_seq_lengths=True,
             )
 
     def test_config_rejects_fp32_residual_connection(self):

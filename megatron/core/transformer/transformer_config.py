@@ -2575,14 +2575,22 @@ class TransformerConfig(ModelParallelConfig):
         if self.enable_mhc_connections:
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
             # the stage holding the final layernorm, so every intermediate pipeline stage
-            # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.
-            # Pipeline support must resize the p2p buffers before this guard can be lifted.
-            if self.pipeline_model_parallel_size > 1:
+            # exchanges [s, b, n*C]. Non-interleaved variable-length PP exchanges the
+            # actual tensor shape before allocating each receive buffer. Fixed-shape PP
+            # still sizes those buffers from hidden_size.
+            if self.pipeline_model_parallel_size > 1 and not self.variable_seq_lengths:
                 raise NotImplementedError(
-                    "enable_mhc_connections does not support pipeline_model_parallel_size > 1 "
-                    "yet. Inter-stage activations are n-stream ([s, b, n*C]) while pipeline "
-                    "p2p buffers are sized from hidden_size, so the shapes disagree. Use "
-                    "pipeline_model_parallel_size=1 until mHC pipeline support lands."
+                    "enable_mhc_connections with pipeline_model_parallel_size > 1 requires "
+                    "variable_seq_lengths. Inter-stage activations are n-stream ([s, b, n*C]) "
+                    "and fixed-shape pipeline p2p buffers are sized from hidden_size."
+                )
+            if (
+                self.pipeline_model_parallel_size > 1
+                and self.virtual_pipeline_model_parallel_size is not None
+            ):
+                raise NotImplementedError(
+                    "enable_mhc_connections with pipeline_model_parallel_size > 1 does not "
+                    "support virtual_pipeline_model_parallel_size."
                 )
 
             # The residual carried across an mHC layer is the n-stream tensor consumed by
@@ -2774,6 +2782,16 @@ class TransformerConfig(ModelParallelConfig):
                 )
             elif detected_vpp_size > 1:
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
+
+            if (
+                self.enable_mhc_connections
+                and self.pipeline_model_parallel_size > 1
+                and self.virtual_pipeline_model_parallel_size is not None
+            ):
+                raise NotImplementedError(
+                    "enable_mhc_connections with pipeline_model_parallel_size > 1 does not "
+                    "support virtual_pipeline_model_parallel_size."
+                )
 
             # Check whether the layout is valid.
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
