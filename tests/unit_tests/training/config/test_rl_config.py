@@ -4,6 +4,7 @@
 import argparse
 import dataclasses
 import importlib.util
+import os
 import sys
 import types
 import typing
@@ -179,14 +180,16 @@ def _instantiate(as_dict):
 
 
 def test_validate_args_mirrors_derived_values_onto_args():
+    dp = int(os.environ.get("WORLD_SIZE", "1"))
+    samples = 12 * dp
     argv = (
         "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
-        "--micro-batch-size 1 --global-batch-size 12 --seq-length 32 --max-position-embeddings 32 "
-        "--perform-rl-step --grpo-prompts-per-step 4 --grpo-group-size 3 "
-        "--rl-partial-rollouts --rl-max-inflight-requests 24"
+        f"--micro-batch-size 1 --global-batch-size {samples} --seq-length 32 "
+        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {4 * dp} "
+        f"--grpo-group-size 3 --rl-partial-rollouts --rl-max-inflight-requests {2 * samples}"
     ).split()
     with patch("sys.argv", argv):
         args = validate_args(parse_args())
     cfg = _default_config_from_args(RLConfig, args)
-    assert (args.grpo_samples_per_iteration, args.rl_generation_lag) == (12, 1.0)
-    assert (cfg.grpo_samples_per_iteration, cfg.rl_generation_lag) == (12, 1.0)
+    assert (args.grpo_samples_per_iteration, args.rl_generation_lag) == (samples, 1.0)
+    assert (cfg.grpo_samples_per_iteration, cfg.rl_generation_lag) == (samples, 1.0)
