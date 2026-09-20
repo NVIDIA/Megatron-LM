@@ -358,7 +358,13 @@ def _document_zigzag_index(
         if doc_len % num_chunks != 0:
             raise ValueError(
                 f"Document length ({doc_len}) in range [{start}, {end}) must be "
-                f"divisible by 2 * CP size ({num_chunks}) for per-document CP zigzag."
+                f"divisible by 2 * CP size ({num_chunks}) for per-document CP zigzag. "
+                "This usually means the saved cu_seqlens_padded was computed for a "
+                "smaller context-parallel size than this one (SFTDataset pads each "
+                "document to a multiple of 2*context_parallel_size of the run that "
+                "built it) -- TeacherTarDataset checks this up front from saved "
+                "metadata when available, so seeing it here means that check was "
+                "skipped or the metadata predates it."
             )
         chunk_size = doc_len // num_chunks
         chunks = torch.arange(start, end, device=device).view(num_chunks, chunk_size)
