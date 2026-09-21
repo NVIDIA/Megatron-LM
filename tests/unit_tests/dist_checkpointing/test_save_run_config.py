@@ -64,7 +64,7 @@ def test_save_checkpoint_writes_run_config(init_model_parallel, create_args, tmp
         set_args(args)
 
         with mock.patch(
-            "megatron.training.checkpointing.get_full_config",
+            "megatron.training.checkpointing.get_run_config",
             return_value=MockFullConfig(run_config_data),
         ):
             save_checkpoint(

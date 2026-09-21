@@ -61,7 +61,7 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
-from megatron.training.global_vars import get_full_config, get_tokenizer
+from megatron.training.global_vars import get_run_config, get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -1120,7 +1120,7 @@ def save_checkpoint(
                     from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
-                    run_config = get_full_config()
+                    run_config = get_run_config()
                     if run_config is not None:
                         run_config.to_yaml(run_config_filename)
 

@@ -40,10 +40,11 @@ def get_args():
     return _GLOBAL_ARGS
 
 
-def get_full_config():
+def get_run_config():
     """Return the full pretrain config container. It can be None so no need
     to check if it is initialized."""
-    return _GLOBAL_FULL_CONFIG
+    _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
+    return _GLOBAL_RUN_CONFIG
 
 
 def get_train_state():
@@ -243,9 +244,10 @@ def set_args(args):
     _GLOBAL_ARGS = args
 
 
-def set_full_config(cfg_container):
-    global _GLOBAL_FULL_CONFIG
-    _GLOBAL_FULL_CONFIG = cfg_container
+def set_run_config(cfg_container):
+    global _GLOBAL_RUN_CONFIG
+    _ensure_var_is_not_initialized(_GLOBAL_RUN_CONFIG, 'run config')
+    _GLOBAL_RUN_CONFIG = cfg_container
 
 
 def _set_train_state():
