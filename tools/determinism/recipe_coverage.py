@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 DETERMINISTIC = "verified_deterministic"
@@ -298,13 +299,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Fail on known N; exit 2 for unknown/incomplete coverage",
     )
     args = parser.parse_args(argv)
-    inventories = [
-        json.loads(path.read_text()) for path in sorted(args.inventory.glob("rank-*.json"))
-    ]
-    report = build_report(inventories, [json.loads(path.read_text()) for path in args.evidence])
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-    args.output.with_suffix(".md").write_text(markdown_report(report))
+    try:
+        inventories = [
+            json.loads(path.read_text()) for path in sorted(args.inventory.glob("rank-*.json"))
+        ]
+        report = build_report(inventories, [json.loads(path.read_text()) for path in args.evidence])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as error:
+        print(f"Invalid recipe evidence: {error}", file=sys.stderr)
+        return 3
+    try:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        args.output.with_suffix(".md").write_text(markdown_report(report))
+    except (OSError, ValueError, TypeError) as error:
+        print(f"Could not write recipe coverage: {error}", file=sys.stderr)
+        return 3
     print(markdown_report(report))
     if args.strict:
         if report["counts"][NONDETERMINISTIC]:
