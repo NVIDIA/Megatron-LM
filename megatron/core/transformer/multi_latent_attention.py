@@ -28,6 +28,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
+from megatron.core.packed_seq_params import resolve_tp_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -387,7 +388,9 @@ class MultiLatentAttention(Attention):
             packed_seq_params=packed_seq_params,
             cp_group=self.pg_collection.cp,
             tp_group=self.pg_collection.tp,
-            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            tp_cp_group=resolve_tp_cp_group(
+                getattr(self.pg_collection, "tp_cp", None), packed_seq_params
+            ),
             target_partition_mode="zigzag",
             sequence_parallel=self.config.sequence_parallel,
             config=self.config,

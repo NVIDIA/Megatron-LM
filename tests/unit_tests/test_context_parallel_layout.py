@@ -24,7 +24,7 @@ from megatron.core.context_parallel_layout.routes import (
     get_thd_cp_partition_route,
     get_thd_tp_cp_partition_route,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_tp_cp_group
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -982,8 +982,12 @@ def test_tp_cp_group_rank_mapping_follows_cartesian_product():
     # A TP x CP group built in a different order still maps every coordinate to its rank.
     assert build_tp_cp_group_rank_by_logical_rank((0, 2), (0, 1), (0, 2, 1, 3), 0) == (0, 2, 1, 3)
     with pytest.raises(RuntimeError, match="Cartesian product"):
-        # A dynamic CP sub-group spanning another data-parallel replica.
+        # A dynamic CP sub-group spanning another data-parallel replica does not fit the
+        # static TP x CP group ...
         build_tp_cp_group_rank_by_logical_rank((0, 4), (0, 1), (0, 1, 2, 3), 0)
+    # ... but it does fit its own TP x sub-group group (here TP2, CP1, DP4: the sub-group
+    # (4, 6) of TP rank 0 with the TP groups (4, 5) and (6, 7), seen from rank 6).
+    assert build_tp_cp_group_rank_by_logical_rank((4, 6), (6, 7), (4, 5, 6, 7), 6) == (0, 1, 2, 3)
     with pytest.raises(RuntimeError, match="Cartesian product"):
         # Groups whose coordinate sums collide cannot be a product inside the group.
         build_tp_cp_group_rank_by_logical_rank((0, 1), (0, 1), (0, 1, 2, 3), 0)
@@ -1470,7 +1474,10 @@ def test_finalize_packed_seq_params_prebuilds_fused_route_only_for_sequence_para
     assert packed_seq_params.cp_group is cp_group
     assert isinstance(packed_seq_params.cp_partition_route, ThdCpRoute)
     assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
+    # Static CP never stores a TP x CP group on the metadata; modules keep their own.
+    assert packed_seq_params.tp_cp_group is None
     if sequence_parallel:
+        # ... but the prebuild itself uses the static TP x CP group.
         assert resolved == [(cp_group, tp_group, tp_cp_group)]
         assert isinstance(packed_seq_params.tp_cp_partition_route, ThdCpRoute)
         _assert_thd_routes_equal(
@@ -1505,6 +1512,198 @@ def test_finalize_packed_seq_params_default_matches_no_sequence_parallel(monkeyp
 
     assert packed_seq_params.cp_partition_route is not None
     assert packed_seq_params.tp_cp_partition_route is None
+
+
+def test_finalize_packed_seq_params_resolves_dynamic_tp_cp_group(monkeypatch):
+    static_cp_group = _FakeGroup(size=4, rank=1)
+    tp_group = _FakeGroup(size=2, rank=0)
+    static_tp_cp_group = _FakeGroup(size=8, rank=2)
+    dynamic_cp_group = _FakeGroup(size=2, rank=1)
+    dynamic_tp_cp_group = _FakeGroup(size=4, rank=2)
+    _patch_static_parallel_state_groups(
+        monkeypatch, cp_group=static_cp_group, tp_group=tp_group, tp_cp_group=static_tp_cp_group
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_dynamic_tensor_and_data_context_parallel_groups",
+        lambda check_initialized=True, group_size=None: (
+            dynamic_tp_cp_group if group_size == 2 else None
+        ),
+    )
+    monkeypatch.setattr(
+        context_parallel_layout_routes,
+        "resolve_tp_cp_group_rank_by_logical_rank",
+        lambda cp, tp, tp_cp: (
+            (0, 1, 2, 3) if cp is dynamic_cp_group and tp_cp is dynamic_tp_cp_group else None
+        ),
+    )
+    cu_seqlens = torch.tensor([0, 16, 40], dtype=torch.int32)
+
+    dynamic_packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        local_cp_size=2,
+        cp_group=dynamic_cp_group,
+    )
+    finalize_packed_seq_params(dynamic_packed_seq_params, sequence_parallel=True)
+    assert dynamic_packed_seq_params.cp_group is dynamic_cp_group
+    assert dynamic_packed_seq_params.tp_cp_group is dynamic_tp_cp_group
+    assert resolve_tp_cp_group(static_tp_cp_group, dynamic_packed_seq_params) is dynamic_tp_cp_group
+    assert resolve_tp_cp_group(static_tp_cp_group, None) is static_tp_cp_group
+    route = dynamic_packed_seq_params.tp_cp_partition_route
+    assert isinstance(route, ThdCpRoute)
+    # Built for this rank's coordinate in the TP x sub-group: cp_rank 1 of 2, tp_rank 0 of 2.
+    _assert_thd_routes_equal(
+        route, build_thd_tp_cp_partition_route(cu_seqlens, 2, 1, 2, 0, (0, 1, 2, 3))
+    )
+
+    static_packed_seq_params = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens
+    )
+    finalize_packed_seq_params(static_packed_seq_params)
+    assert static_packed_seq_params.cp_group is static_cp_group
+    # Static CP leaves the field unset so modules fall back to their own TP x CP group.
+    assert static_packed_seq_params.tp_cp_group is None
+    assert resolve_tp_cp_group(static_tp_cp_group, static_packed_seq_params) is static_tp_cp_group
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+def test_sequence_parallel_thd_conversion_fuses_dynamic_cp_sub_groups(source_layout, target_layout):
+    """Dynamic CP sub-groups take the fused route over their TP x sub-group process group."""
+    if not torch.cuda.is_available() or Utils.world_size != 8:
+        pytest.skip("Dynamic CP sequence-parallel THD conversion needs exactly 8 CUDA ranks.")
+
+    tp_size, sub_group_size = 2, 2
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size, context_parallel_size=1, dynamic_context_parallel=True
+    )
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        static_tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=sub_group_size
+        )
+        tp_cp_group = parallel_state.get_dynamic_tensor_and_data_context_parallel_groups(
+            group_size=sub_group_size
+        )
+        rank = torch.distributed.get_rank()
+        tp_ranks = torch.distributed.get_process_group_ranks(tp_group)
+        cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
+        assert sorted(torch.distributed.get_process_group_ranks(tp_cp_group)) == sorted(
+            {member + tp_rank - rank for member in cp_ranks for tp_rank in tp_ranks}
+        )
+        # The static TP x CP group (CP size 1 here) cannot carry the sub-group exchange,
+        # the TP x sub-group group can.
+        assert (
+            context_parallel_layout_routes.resolve_tp_cp_group_rank_by_logical_rank(
+                cp_group, tp_group, static_tp_cp_group
+            )
+            is None
+        )
+        assert (
+            context_parallel_layout_routes.resolve_tp_cp_group_rank_by_logical_rank(
+                cp_group, tp_group, tp_cp_group
+            )
+            is not None
+        )
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        cu_seqlens = torch.tensor([0, 16, 48, 64, 128], device=device, dtype=torch.int32)
+        full_tensor = _make_sequence_tensor(total_seq_len=128, seq_dim=0, device=device)
+        full_upstream_grad = full_tensor.mul(0.125).add(1.0)
+        source_indices = _get_test_thd_sp_shard_token_indices(
+            cu_seqlens.cpu(),
+            sub_group_size,
+            cp_group.rank(),
+            tp_size,
+            tp_group.rank(),
+            source_layout,
+        ).to(device)
+        target_indices = _get_test_thd_sp_shard_token_indices(
+            cu_seqlens.cpu(),
+            sub_group_size,
+            cp_group.rank(),
+            tp_size,
+            tp_group.rank(),
+            target_layout,
+        ).to(device)
+        expected_target = full_tensor.index_select(0, target_indices)
+        target_upstream_grad = full_upstream_grad.index_select(0, target_indices)
+        expected_source_grad = full_upstream_grad.index_select(0, source_indices)
+
+        fused_input = full_tensor.index_select(0, source_indices).requires_grad_(True)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fused_output = context_parallel_layout_conversion.convert_cp_partition_mode(
+                x=fused_input,
+                source_partition_mode=source_layout,
+                target_partition_mode=target_layout,
+                seq_dim=0,
+                cu_seqlens=cu_seqlens,
+                sequence_parallel=True,
+                cp_group=cp_group,
+                tp_group=tp_group,
+                tp_cp_group=tp_cp_group,
+            )
+        assert not [
+            w
+            for w in caught
+            if issubclass(w.category, RuntimeWarning) and "naive" in str(w.message)
+        ], "dynamic CP sub-groups must use the fused route over TP x sub-group"
+        fused_output.mul(target_upstream_grad).sum().backward()
+
+        reference_input = full_tensor.index_select(0, source_indices).requires_grad_(True)
+        reference_output = _convert_thd_sp_shard_via_tp_gather(
+            reference_input,
+            source_layout=source_layout,
+            target_layout=target_layout,
+            cu_seqlens=cu_seqlens,
+            cp_group=cp_group,
+            tp_group=tp_group,
+        )
+        reference_output.mul(target_upstream_grad).sum().backward()
+
+        torch.testing.assert_close(fused_output, expected_target, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(reference_output, expected_target, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(fused_input.grad, expected_source_grad, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(reference_input.grad, expected_source_grad, atol=0.0, rtol=0.0)
+
+        # Batch metadata path: finalize resolves the TP x sub-group and prebuilds its route,
+        # and modules pick it up through resolve_tp_cp_group.
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cp_partition_mode=source_layout,
+            local_cp_size=sub_group_size,
+            cp_group=cp_group,
+        )
+        finalize_packed_seq_params(packed_seq_params, sequence_parallel=True)
+        assert packed_seq_params.cp_group is cp_group
+        assert packed_seq_params.tp_cp_group is tp_cp_group
+        assert resolve_tp_cp_group(static_tp_cp_group, packed_seq_params) is tp_cp_group
+        assert isinstance(packed_seq_params.tp_cp_partition_route, ThdCpRoute)
+        converter = CpPartitionModeConverter(
+            packed_seq_params=packed_seq_params,
+            source_partition_mode=source_layout,
+            target_partition_mode=target_layout,
+            config=SimpleNamespace(cuda_graph_impl=None),
+            cp_group=cp_group,
+            tp_group=tp_group,
+            tp_cp_group=resolve_tp_cp_group(static_tp_cp_group, packed_seq_params),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            converter_output = converter.convert(
+                full_tensor.index_select(0, source_indices), seq_dim=0, sequence_parallel=True
+            )
+        torch.testing.assert_close(converter_output, expected_target, atol=0.0, rtol=0.0)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 # -----------------------------------------------------------------------------

@@ -49,21 +49,35 @@ def finalize_packed_seq_params(
     from megatron.core.packed_seq_params import resolve_cp_group
     from megatron.core.parallel_state import (
         get_context_parallel_group,
+        get_dynamic_tensor_and_data_context_parallel_groups,
         get_tensor_and_context_parallel_group,
         get_tensor_model_parallel_group,
     )
 
     cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
     packed_seq_params.cp_group = cp_group
-    # Sequence-parallel THD layout conversion exchanges shards directly over the TP x CP
-    # group. Prebuild that route from the same host copy of cu_seqlens while the CUDA
-    # queue is still shallow; it is skipped when TP is inactive or the CP group is a
-    # dynamic sub-group of the TP x CP group.
-    tp_group = tp_cp_group = None
-    if sequence_parallel:
-        tp_group = get_tensor_model_parallel_group(check_initialized=False)
+    # The TP x CP group that pairs with this microbatch's CP group. Under dynamic CP the
+    # CP group is a sub-group, whose TP x sub-group counterpart exists next to it; store
+    # it on the metadata so modules pick it up through resolve_tp_cp_group when converting
+    # sequence-parallel shards. Static CP leaves the field unset, and modules keep using
+    # their own process-group collection.
+    if getattr(packed_seq_params, "local_cp_size", None) is not None:
+        tp_cp_group = get_dynamic_tensor_and_data_context_parallel_groups(
+            check_initialized=False, group_size=packed_seq_params.local_cp_size
+        )
+        packed_seq_params.tp_cp_group = tp_cp_group
+    else:
         tp_cp_group = get_tensor_and_context_parallel_group(check_initialized=False)
+    # Sequence-parallel THD layout conversion exchanges shards directly over that TP x CP
+    # group. Prebuild the route from the same host copy of cu_seqlens while the CUDA queue
+    # is still shallow; only sequence-parallel shards ever need it.
+    tp_group = (
+        get_tensor_model_parallel_group(check_initialized=False) if sequence_parallel else None
+    )
     prebuild_thd_cp_partition_routes(
-        packed_seq_params, cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
+        packed_seq_params,
+        cp_group,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group if sequence_parallel else None,
     )
     return packed_seq_params

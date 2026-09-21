@@ -34,7 +34,7 @@ import torch.nn as nn
 import megatron.core.context_parallel_layout.conversion as cp_layout_conversion
 import megatron.core.context_parallel_layout.routes as cp_layout_routes
 from megatron.core import parallel_state
-from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1238,15 +1238,10 @@ def _prepare_mixed_model_batch(seq_indices, cp_group, config, vocab_size):
         cp_partition_mode=config.cp_partition_mode,
         pad_between_seqs=True,
     )
-    # Mirror batch construction: with TP the sequence-parallel layout conversion
-    # inside attention exchanges shards over the TP x CP group, so prebuild that
-    # route too (it is skipped automatically for dynamic CP sub-groups).
-    prebuild_thd_cp_partition_routes(
-        packed_seq_params,
-        cp_group,
-        tp_group=parallel_state.get_tensor_model_parallel_group(),
-        tp_cp_group=parallel_state.get_tensor_and_context_parallel_group(),
-    )
+    # Mirror batch construction: resolve the CP and TP x CP groups of this microbatch
+    # (the TP x sub-group under dynamic CP) and prebuild the layout routes, including
+    # the fused TP x CP route under sequence parallelism.
+    finalize_packed_seq_params(packed_seq_params, sequence_parallel=config.sequence_parallel)
     return batch, packed_seq_params
 
 
@@ -1309,8 +1304,8 @@ def test_mixed_gdn_gqa_model_cp_correctness(
     uses a no-CP reference with the same TP layout that processes one complete
     packed sequence per DPxCP rank. The candidate runs the contiguous CP layout, so
     its attention layers convert to zigzag internally: with TP2+SP that is the
-    fused TP x CP all-to-all for static CP and the composed TP gather -> CP
-    all-to-all -> TP scatter fallback for dynamic CP sub-groups.
+    fused TP x CP all-to-all, over the static TP x CP group or, under dynamic CP,
+    over the TP x sub-group process group.
     """
     if not torch.cuda.is_available() or Utils.world_size != 8:
         pytest.skip("Mixed GDN/GQA model CP correctness requires exactly 8 CUDA ranks.")
@@ -1406,9 +1401,10 @@ def test_mixed_gdn_gqa_model_cp_correctness(
             issubclass(w.category, RuntimeWarning) and "naive TP gather" in str(w.message)
             for w in caught
         )
-        # Static TP x CP groups take the fused route; dynamic CP sub-groups cannot be
-        # fused with the static TP x CP group and keep the composed fallback.
-        assert used_composed_fallback == (sequence_parallel and dynamic_context_parallel)
+        # Static and dynamic CP both take the fused route (dynamic CP through the
+        # TP x sub-group process groups); the composed fallback is only for groups that
+        # cannot be fused.
+        assert not used_composed_fallback
 
         reference_loss, reference_mtp_loss, reference_grad_names, reference_grads = reference_stats
         candidate_loss, candidate_mtp_loss, candidate_grad_names, candidate_grads = candidate_stats
@@ -1420,7 +1416,7 @@ def test_mixed_gdn_gqa_model_cp_correctness(
             torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
         assert_close("aggregated parameter gradients", candidate_grads, reference_grads, False)
 
-        if sequence_parallel and not dynamic_context_parallel:
+        if sequence_parallel:
             # Model-level check that the fused TP x CP all-to-all and the composed
             # TP gather -> CP all-to-all -> TP scatter path agree: force the fallback
             # and rerun the same model on the same batch.

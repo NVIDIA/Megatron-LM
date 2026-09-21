@@ -14,7 +14,7 @@ from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
@@ -236,7 +236,9 @@ class KimiDeltaAttention(_GDNBase):
                 packed_seq_params=packed_seq_params,
                 cp_group=cp_group_chunkwise,
                 tp_group=self.tp_group,
-                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
+                tp_cp_group=resolve_tp_cp_group(
+                    getattr(active_pg_collection, "tp_cp", None), packed_seq_params
+                ),
                 target_partition_mode="contiguous",
                 sequence_parallel=self.config.sequence_parallel,
                 config=self.config,

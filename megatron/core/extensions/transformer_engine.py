@@ -1972,6 +1972,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         self.cp_comm_type,
                     )
             self.kept_packed_seq_params.discard("cp_group")
+            self.kept_packed_seq_params.discard("tp_cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
         # Default to constructor-provided num_splits unless explicitly overridden

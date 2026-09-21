@@ -20,6 +20,8 @@ class PackedSeqParams:
     ``cp_partition_route`` is a per-microbatch THD CP layout conversion route over the
     CP group. ``tp_cp_partition_route`` is the same kind of plan for the fused TP x CP
     conversion of sequence-parallel shards, with split sizes in TP x CP group order.
+    ``tp_cp_group`` is set under dynamic CP only: the TP x sub-group that pairs with
+    ``cp_group``; static CP leaves it None and modules use their own TP x CP group.
     Metadata annotation helpers update the current partition mode in-place while
     preserving the route identities.
     '''
@@ -33,6 +35,7 @@ class PackedSeqParams:
     max_seqlen_kv: int = None
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
+    tp_cp_group: dist.ProcessGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
@@ -94,6 +97,25 @@ def resolve_cp_group(
     if packed_seq_params is not None and packed_seq_params.cp_group is not None:
         return packed_seq_params.cp_group
     return static_cp_group
+
+
+def resolve_tp_cp_group(
+    static_tp_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+) -> Optional[dist.ProcessGroup]:
+    """Return the dynamic TP x CP group from packed_seq_params when set, else the static one.
+
+    Under dynamic CP the microbatch's CP group is a sub-group of the static one, so the
+    TP x CP group used to exchange sequence-parallel shards during layout conversion
+    must be the matching TP x sub-group. ``finalize_packed_seq_params`` stores it on the
+    metadata under dynamic CP only (see
+    ``get_dynamic_tensor_and_data_context_parallel_groups``); for static CP the field
+    stays None and the module's own TP x CP group is returned, mirroring
+    ``resolve_cp_group``.
+    """
+    dynamic_tp_cp_group = getattr(packed_seq_params, "tp_cp_group", None)
+    if dynamic_tp_cp_group is not None:
+        return dynamic_tp_cp_group
+    return static_tp_cp_group
 
 
 def _pad_seq_tensor(t: Optional[Tensor], target_len: int) -> Optional[Tensor]:
