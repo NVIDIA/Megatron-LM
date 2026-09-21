@@ -403,7 +403,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "MTP pattern specified but mtp_block_spec is None in hybrid_stack_spec.submodules. "
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
-            mtp_stack_submodules = decoder_submodules.mtp_stack_submodules or decoder_submodules
+            if decoder_submodules.mtp_stack_submodules is not None:
+                # Wide decoder specs provide separate ordinary-width layer recipes for MTP.
+                mtp_stack_submodules = decoder_submodules.mtp_stack_submodules
+            else:
+                # Ordinary decoder specs can reuse their own layer recipes for MTP.
+                mtp_stack_submodules = decoder_submodules
 
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
