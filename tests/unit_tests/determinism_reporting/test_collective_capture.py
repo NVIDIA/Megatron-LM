@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -569,6 +570,10 @@ def test_replay_preflight_rejects_incomplete_or_changed_contracts(
         load_captures(tmp_path, max_bytes=4096)
 
 
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[3] / "megatron/determinism/__init__.py").is_file(),
+    reason="integration requires MCore #7419",
+)
 @pytest.mark.parametrize("max_bytes,expected_events", [(4096, 2), (1, 0)])
 def test_cli_writes_rank_capture_and_propagates_capture_gaps(tmp_path, max_bytes, expected_events):
     module = tmp_path / "collective_probe.py"

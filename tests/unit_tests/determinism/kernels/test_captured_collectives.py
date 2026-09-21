@@ -9,10 +9,19 @@ and performance. It never claims that unbound/native collectives were captured.
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
 import torch
+
+CAPTURE_PATH = os.environ.get("MCORE_DETERMINISM_COLLECTIVE_CAPTURE")
+if not CAPTURE_PATH:
+    pytest.skip("requires an explicit collective recipe capture", allow_module_level=True)
+
+pytest.importorskip(
+    "tools.determinism.pytest_plugin", reason="requires MCore #7317 coverage producer"
+)
 
 from tests.unit_tests.determinism.comparison import bytes_equal
 from tests.unit_tests.determinism.kernels.harness import (
@@ -32,9 +41,6 @@ from tools.determinism.collective_reference import collective_reference, collect
 from tools.determinism.recipe_coverage import signature_key
 from tools.determinism.reference import assert_reference_close, assert_replay_sensitivity
 
-CAPTURE_PATH = os.environ.get("MCORE_DETERMINISM_COLLECTIVE_CAPTURE")
-if not CAPTURE_PATH:
-    pytest.skip("requires an explicit collective recipe capture", allow_module_level=True)
 CAPTURE_ROOT = Path(os.environ["MCORE_DETERMINISM_COLLECTIVE_CAPTURE"])
 MAX_BYTES = int(os.environ.get("MCORE_DETERMINISM_COLLECTIVE_MAX_BYTES", 256 * 1024 * 1024))
 CAPTURES = load_captures(CAPTURE_ROOT, max_bytes=MAX_BYTES)
@@ -56,11 +62,15 @@ def replay_groups():
     initialized = torch.distributed.is_initialized()
     Utils.initialize_distributed()
     rank = torch.distributed.get_rank()
-    error = (
-        None
-        if source_context(torch) == CAPTURES[rank]["context"]
-        else "Capture source/environment differs"
-    )
+    assert torch.distributed.get_world_size() == len(CAPTURES), "Capture/replay world sizes differ"
+    try:
+        error = (
+            None
+            if source_context(torch) == CAPTURES[rank]["context"]
+            else "Capture source/environment differs"
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as caught:
+        error = f"Capture provenance unavailable: {caught}"
     errors = [None] * len(CAPTURES)
     torch.distributed.all_gather_object(errors, error)
     assert not any(errors), errors

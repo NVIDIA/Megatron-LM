@@ -493,6 +493,7 @@ def test_empty_inventory_has_no_percentage():
 
 
 class Tensor:
+    is_leaf = False
     shape = (2, 4)
     dtype = "torch.bfloat16"
     requires_grad = True
@@ -563,6 +564,10 @@ def test_cli_strict_unknown_and_matching_failure(tmp_path):
     assert output.with_suffix(".md").is_file()
 
 
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[3] / "megatron/determinism/__init__.py").is_file(),
+    reason="integration requires MCore #7419",
+)
 @pytest.mark.parametrize("exit_code,complete", [(0, True), (1, False)])
 def test_capture_entrypoint_preserves_exit_and_incomplete_evidence(tmp_path, exit_code, complete):
     bindings = tmp_path / "bindings.json"
@@ -602,6 +607,10 @@ def test_capture_entrypoint_preserves_exit_and_incomplete_evidence(tmp_path, exi
     assert json.loads((output / "rank-0.json").read_text())["complete"] == complete
 
 
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[3] / "megatron/determinism/__init__.py").is_file(),
+    reason="integration requires MCore #7419",
+)
 @pytest.mark.parametrize("mode", ["cli", "yaml", "yaml-overrides-cli"])
 def test_capture_bootstraps_effective_policy_before_binding_import(tmp_path, mode):
     enabled = mode != "yaml-overrides-cli"
@@ -691,6 +700,10 @@ def test_capture_bootstraps_effective_policy_before_binding_import(tmp_path, mod
     )
 
 
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[3] / "megatron/determinism/__init__.py").is_file(),
+    reason="integration requires MCore #7419",
+)
 @pytest.mark.parametrize("change", ["revision", "dirty", "environment"])
 def test_capture_rejects_context_drift_after_successful_training(tmp_path, monkeypatch, change):
     before = inventory()["context"] | {"environment": {"NCCL_ALGO": "Ring"}}
@@ -699,7 +712,7 @@ def test_capture_rejects_context_drift_after_successful_training(tmp_path, monke
         change
     ]
     contexts = iter((before, after))
-    monkeypatch.setattr(capture_recipe, "source_context", lambda torch: next(contexts))
+    monkeypatch.setattr(capture_recipe, "source_context", lambda torch, **kwargs: next(contexts))
     monkeypatch.setenv("RANK", "0")
     bindings = tmp_path / "bindings.json"
     bindings.write_text("[]")
@@ -806,3 +819,71 @@ def test_capture_rejects_bound_callables_with_unrecorded_state(monkeypatch, kind
         with install_bindings(Inventory(torch, 10), [binding]):
             pass
     assert module.activation is original
+
+
+def test_bound_call_styles_share_one_signature_with_defaults():
+    observed = Inventory(torch, 10)
+
+    def activation(value, scale=2):
+        return value * scale
+
+    wrapped = observed.wrap(
+        activation, {"target": "test:activation", "op_id": "test", "implementation": "torch:mul"}
+    )
+    value = torch.ones(2)
+    wrapped(value)
+    wrapped(value=value, scale=2)
+    wrapped(value, 2)
+    assert len(observed.operations) == 1
+    assert next(iter(observed.operations.values()))["calls"] == 3
+
+
+def test_opaque_input_is_an_issue_without_interrupting_training():
+    observed = Inventory(torch, 10)
+    wrapped = observed.wrap(
+        lambda value: torch.ones(2),
+        {"target": "test:opaque", "op_id": "test", "implementation": "test"},
+    )
+    assert torch.equal(wrapped(object()), torch.ones(2))
+    assert not observed.operations
+    assert any("Opaque argument" in issue for issue in observed.issues)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_scalar_signature_is_json_safe(value):
+    encoded = capture_recipe.input_signature(value, torch.Tensor)
+    assert json.dumps(encoded, allow_nan=False)
+    assert encoded == {"float": repr(value)}
+
+
+@pytest.mark.parametrize(
+    "problem", ["invalid_json", "empty", "null", "missing_fields", "write_error"]
+)
+def test_invalid_input_and_output_errors_have_distinct_exit(tmp_path, problem, capsys):
+    root = tmp_path / "inventory"
+    root.mkdir()
+    value = None if problem == "null" else {} if problem == "missing_fields" else inventory()
+    if problem != "empty":
+        (root / "rank-0.json").write_text("{" if problem == "invalid_json" else json.dumps(value))
+    output = tmp_path / "result.json"
+    if problem == "write_error":
+        output.mkdir()
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps(evidence()))
+    assert (
+        main([str(root), "--evidence", str(evidence_path), "--output", str(output), "--strict"])
+        == 3
+    )
+    assert capsys.readouterr().err
+
+
+def test_leaf_outputs_do_not_accumulate_backward_hooks():
+    observed = Inventory(torch, 10)
+    parameter = torch.nn.Parameter(torch.ones(2))
+    wrapped = observed.wrap(
+        lambda: parameter, {"target": "test:leaf", "op_id": "leaf", "implementation": "identity"}
+    )
+    for _ in range(4):
+        assert wrapped() is parameter
+    assert not parameter._backward_hooks
+    assert any("persistent leaf" in issue for issue in observed.issues)

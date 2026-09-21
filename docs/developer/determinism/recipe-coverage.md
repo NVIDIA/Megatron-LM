@@ -231,3 +231,28 @@ CPU contract tests:
 PYTHONPATH=. python -m pytest --confcutdir=tests/unit_tests/determinism_reporting \
   tests/unit_tests/determinism_reporting/test_recipe_coverage.py
 ```
+
+### Capture and launcher failure contracts
+
+Generic Python bindings canonicalize arguments with `inspect.signature().bind()`
+and include defaults before encoding positional and keyword-only inputs. Evidence
+producers must use that same complete argument form. Opaque objects are capture
+issues, never type-only signatures. Non-finite scalar arguments use tagged strings.
+Returned leaf tensors do not receive persistent backward hooks; their missing
+backward observation is reported as a capture issue.
+
+Strict coverage returns 1 for a matching N, 2 for incomplete or unknown coverage,
+and 3 for invalid input or report-write failures. The replay launcher returns 2
+if no cases pass, including a CUDA skip. Startup/replay require #7419 and #7317;
+standalone branch tests skip only those integration cases until they are present.
+
+Replay `--max-bytes` must equal capture `--max-collective-bytes`. Replay names any
+NCCL environment keys that differ. Programmatic allocator setup (for example
+NCCL user buffers) needs a dedicated replay adapter; copying environment variables
+alone does not recreate that allocator. Preserve exact storage offsets within the
+byte limit. Large parent-buffer views remain explicitly unsupported.
+
+Capture excludes its declared inventory, collective and checkpoint output roots
+from untracked-file checks, while tracked modifications remain visible. Use output
+paths outside the checkout for evidence that will be joined to other producers;
+those producers independently audit the checkout and may flag untracked outputs.

@@ -415,10 +415,18 @@ def prepare_replay(
             group, torch.device("cuda", torch.cuda.current_device())
         ),
     }
-    if actual["backend"] != "nccl" or any(
-        value != collective[key] for key, value in actual.items()
-    ):
-        raise ValueError("Replay group or NCCL policy differs from the capture")
+    different = [key for key, value in actual.items() if value != collective[key]]
+    if actual["backend"] != "nccl" or different:
+        env_keys = sorted(
+            key
+            for key in actual["nccl_environment"].keys() | collective["nccl_environment"].keys()
+            if actual["nccl_environment"].get(key) != collective["nccl_environment"].get(key)
+        )
+        raise ValueError(
+            "Replay group or NCCL policy differs from the capture: "
+            + ", ".join(different)
+            + ("; environment keys: " + ", ".join(env_keys) if env_keys else "")
+        )
     local = load_tensor(root, collective["input"], max_bytes=max_bytes, device="cuda")
     gradient = (
         load_tensor(root, collective["gradient"], max_bytes=max_bytes, device="cuda")
@@ -511,7 +519,11 @@ def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> 
     if store is None:
         raise ValueError("Collective bindings require --collective-capture")
     mappings = importlib.import_module("megatron.core.tensor_parallel.mappings")
-    cases = [case for case, name in MAPPINGS.items() if function is getattr(mappings, name)]
+    cases = [
+        case
+        for case, name in MAPPINGS.items()
+        if inspect.unwrap(function) is inspect.unwrap(getattr(mappings, name))
+    ]
     if len(cases) != 1:
         raise ValueError("Collective bindings must select a supported MCore mapping or its alias")
     case = cases[0]
@@ -584,7 +596,7 @@ def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> 
                 "runtime": runtime_signature(torch),
                 "configuration": {"collective": collective},
             }
-        except ValueError as error:
+        except (ValueError, OSError, RuntimeError) as error:
             store.issues.add(str(error))
             return fallback(*args, **kwargs)
         result = function(*args, **kwargs)
@@ -625,7 +637,7 @@ def wrap_collective(inventory: Inventory, function: Callable, binding: dict) -> 
                 store.events.append(
                     {"call_id": call_id, "signature": backward_signature, "site": binding["target"]}
                 )
-            except ValueError as error:
+            except (ValueError, OSError, RuntimeError) as error:
                 store.issues.add(str(error))
             return gradient
 

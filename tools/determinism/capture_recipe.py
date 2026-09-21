@@ -17,6 +17,7 @@ import importlib
 import importlib.metadata
 import inspect
 import json
+import math
 import os
 import platform
 import runpy
@@ -71,15 +72,19 @@ def input_signature(value, tensor_type) -> object:
             "requires_grad": value.requires_grad,
         }
     if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("Signature mappings require string keys")
         return {str(key): input_signature(item, tensor_type) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [input_signature(item, tensor_type) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"float": repr(value)}
     if value is None or isinstance(value, (str, bool, int, float)):
         return value
-    return {"type": type(value).__qualname__}
+    raise ValueError(f"Opaque argument cannot establish a signature: {type(value).__qualname__}")
 
 
-def source_context(torch) -> dict:
+def source_context(torch, *, output_roots=()) -> dict:
     """Use the replay producer's versioned provenance fields."""
     versions: dict[str, str | None] = {}
     for name in (
@@ -107,11 +112,29 @@ def source_context(torch) -> dict:
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         driver = None
+    root = Path(__file__).resolve().parents[2]
+    outputs = [Path(path).resolve() for path in output_roots if path is not None]
+    # Always inspect tracked edits. Only generated, untracked output paths are
+    # excluded; cwd changes in a recipe cannot redirect the provenance query.
+    tracked = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=root
+    )
+    untracked = (
+        subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=root
+        )
+        .decode()
+        .split("\0")
+    )
+    dirty = bool(tracked) or any(
+        name and not any((root / name).resolve().is_relative_to(path) for path in outputs)
+        for name in untracked
+    )
     return {
-        "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "dirty": bool(
-            subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"])
-        ),
+        "revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "dirty": dirty,
         "world_size": int(os.environ.get("WORLD_SIZE", "1")),
         "python": platform.python_version(),
         "versions": versions,
@@ -137,6 +160,7 @@ class Inventory:
         self.operations: dict[str, dict] = {}
         self.truncated = False
         self.collectives = collectives
+        self.issues: set[str] = set()
 
     def wrap(self, function, binding):
         """Wrap a declared callable while preserving its result and exceptions."""
@@ -147,12 +171,21 @@ class Inventory:
 
         @functools.wraps(function)
         def wrapped(*args, **kwargs):
-            inputs = {"args": args, "kwargs": kwargs} if args and kwargs else kwargs or args
+            try:
+                bound = inspect.signature(function).bind(*args, **kwargs)
+                bound.apply_defaults()
+                inputs = (
+                    {"args": bound.args, "kwargs": bound.kwargs} if bound.kwargs else bound.args
+                )
+                encoded = input_signature(inputs, self.torch.Tensor)
+            except (ValueError, TypeError) as error:
+                self.issues.add(f"{binding['target']}: {error}")
+                return function(*args, **kwargs)
             signature = {
                 "op_id": binding["op_id"],
                 "implementation": binding["implementation"],
                 "phase": "forward",
-                "inputs": input_signature(inputs, self.torch.Tensor),
+                "inputs": encoded,
                 "deterministic_algorithms": self.torch.are_deterministic_algorithms_enabled(),
                 "runtime": runtime_signature(self.torch),
             }
@@ -179,6 +212,11 @@ class Inventory:
 
             def register(value):
                 if isinstance(value, self.torch.Tensor) and value.requires_grad:
+                    if value.is_leaf:
+                        self.issues.add(
+                            f"{binding['target']}: backward observation of a persistent leaf is unsupported"
+                        )
+                        return
                     value.register_hook(backward)
                 elif isinstance(value, dict):
                     for item in value.values():
@@ -273,7 +311,12 @@ def main(argv: list[str] | None = None) -> int:
     # Honor the effective CLI/YAML policy before bound modules can import Core,
     # initialize CUDA or cache backend settings. Training still validates all
     # model options through its normal parser.
-    from megatron.determinism import bootstrap_training_determinism
+    try:
+        from megatron.determinism import bootstrap_training_determinism
+    except ModuleNotFoundError as error:
+        if error.name != "megatron.determinism":
+            raise
+        parser.exit(2, "Recipe capture requires the shared startup API from MCore #7419.\n")
 
     bootstrap_training_determinism(command[1:])
     import torch
@@ -294,12 +337,19 @@ def main(argv: list[str] | None = None) -> int:
             max_events=args.max_signatures,
         )
     inventory = Inventory(torch, args.max_signatures, collectives=collectives)
+    output_roots = [args.output, args.collective_capture]
+    # Megatron's checkpoint output is generated during the instrumented recipe.
+    for index, argument in enumerate(command):
+        if argument == "--save" and index + 1 < len(command):
+            output_roots.append(Path(command[index + 1]))
+        elif argument.startswith("--save="):
+            output_roots.append(Path(argument.split("=", 1)[1]))
     report = {
         "schema_version": 1,
         "kind": "determinism_inventory",
         "recipe_id": args.recipe_id,
         "rank": int(os.environ.get("RANK", "0")),
-        "context": source_context(torch),
+        "context": source_context(torch, output_roots=output_roots),
         "complete": False,
         "truncated": False,
         "operations": [],
@@ -307,8 +357,10 @@ def main(argv: list[str] | None = None) -> int:
 
     def write():
         report.update(truncated=inventory.truncated, operations=list(inventory.operations.values()))
+        report["capture_issues"] = sorted(
+            inventory.issues | (collectives.issues if collectives is not None else set())
+        )
         if collectives is not None:
-            report["capture_issues"] = sorted(collectives.issues)
             collectives.write(report)
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
@@ -326,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
             except SystemExit as error:
                 if error.code not in (None, 0):
                     raise
-            report["context_after"] = source_context(torch)
+            report["context_after"] = source_context(torch, output_roots=output_roots)
             if report["context_after"] != report["context"]:
                 raise RuntimeError("Source or environment context changed during recipe capture")
             report["complete"] = True
