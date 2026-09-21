@@ -330,3 +330,31 @@ def test_byte_identical_retry_is_deduplicated_with_both_receipts(ci, tmp_path):
     (duplicate,) = report["ignored_inputs"]
     assert duplicate["duplicate_of"] == original.name
     assert duplicate["reason"] == "Byte-identical retry upload"
+
+
+def test_successful_attempt_pointer_excludes_preserved_failed_attempt(ci, tmp_path):
+    root = inputs(ci, tmp_path)
+    timed = metadata(root, "performance").parent
+    successful = timed / "logs" / "kernel-leaderboard.success"
+    successful.mkdir(parents=True)
+    for path in list(timed.iterdir()):
+        if path.name not in (ci.METADATA, "logs"):
+            shutil.move(path, successful / path.name)
+    failed = timed / "logs" / "kernel-leaderboard.failed"
+    failed.mkdir()
+    write_json(failed / "leaderboard.json", [])
+    (timed / "determinism-successful-attempt.txt").write_text("logs/kernel-leaderboard.success\n")
+    record = ci.stamp(
+        timed,
+        REPOSITORY,
+        REVISION,
+        RUN,
+        ATTEMPT,
+        "dgx_h100",
+        "determinism_kernel_perf",
+        "success",
+        0,
+    )
+    timed.rename(root / record["artifact_name"])
+    report = consume(ci, root, tmp_path / "result")
+    assert report["status"] == "complete"

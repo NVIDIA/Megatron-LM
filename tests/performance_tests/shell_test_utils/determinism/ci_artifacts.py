@@ -75,6 +75,17 @@ def stamp(
         "producer_exit_code": exit_code,
         "artifact_name": name,
     }
+    marker = directory / "determinism-successful-attempt.txt"
+    if CASES[test_case] == "performance" and marker.is_file():
+        relative = Path(marker.read_text().strip())
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:1] != ("logs",)
+            or not (directory / relative).is_dir()
+        ):
+            raise ValueError("Invalid successful performance attempt pointer")
+        record["result_root"] = relative.as_posix()
     _write(directory / METADATA, record)
     return record
 
@@ -121,6 +132,7 @@ def _tree_hash(directory: Path) -> str:
         digest.update(relative)
         digest.update(b"d" if path.is_dir() else b"f")
         if path.is_file():
+            digest.update(path.stat().st_size.to_bytes(8, "big"))
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
@@ -267,7 +279,15 @@ def collect(
                         "Expected one successful replay artifact and one timing artifact; missing or ambiguous uploads"
                     )
                 covered, timed = (paths[0] for paths in candidates)
-                leaderboard = _one(timed, "leaderboard.json")
+                timing_record = next(
+                    source["provenance"]
+                    for source in report["inputs"]
+                    if source["artifact"] == timed.name
+                )
+                result_root = Path(timing_record.get("result_root", "."))
+                if result_root.is_absolute() or ".." in result_root.parts:
+                    raise ValueError("Invalid performance result root")
+                leaderboard = _one(timed / result_root, "leaderboard.json")
                 _platform(leaderboard, platform)
                 result = baseline.publish(
                     _one(covered, "determinism-coverage.json"),

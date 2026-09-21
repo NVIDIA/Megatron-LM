@@ -35,6 +35,8 @@ spec:
     ATTEMPT=$(mktemp -d "{assets_dir}/logs/kernel-leaderboard.XXXXXX")
     uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/kernel_leaderboard.py \
       --output "$ATTEMPT"
+    # Bind the successful attempt explicitly; preserve failed attempts for diagnosis.
+    printf 'logs/%s\n' "$(basename "$ATTEMPT")" > "{assets_dir}/determinism-successful-attempt.txt"
 
 products:
   # Report-only pilot; calibration is required before imposing per-kernel budgets.
