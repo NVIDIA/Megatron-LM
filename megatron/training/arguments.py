@@ -1895,9 +1895,6 @@ def validate_args(args, defaults={}):
             )
             args.async_save = False
 
-    if not args.async_save:
-        args.async_strategy = "mcore"
-
     if args.logits_save_dir is not None:
         assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
         assert args.async_save, (
@@ -2991,7 +2988,9 @@ def _add_rl_args(parser):
                         help='Directory to write RL profiling data. Defaults to {save}/profiles.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
-                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
+                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool). '
+                            'qwen3-coder-tool-combined additionally treats <tool_call> as the end of '
+                            'an unterminated reasoning block, like vLLM\'s combined qwen3 parser.')
     return parser
 
 def _add_training_args(parser):
