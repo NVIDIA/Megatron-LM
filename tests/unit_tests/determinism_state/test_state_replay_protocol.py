@@ -364,3 +364,43 @@ def test_control_without_downstream_effect_cannot_pass(tmp_path, monkeypatch, co
     )
     assert result["status"] == "failed"
     assert not result["expected_observations"]
+
+
+@pytest.mark.parametrize("interruption", ["timeout", "keyboard", "termination"])
+def test_worker_interruption_terminates_the_entire_group(tmp_path, monkeypatch, interruption):
+    import signal
+    import subprocess
+
+    error = {
+        "timeout": subprocess.TimeoutExpired("worker", 3),
+        "keyboard": KeyboardInterrupt(),
+        "termination": SystemExit(128 + signal.SIGTERM),
+    }[interruption]
+    signals = []
+    waits = []
+
+    class Child:
+        pid = 4242
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise error
+            return 0
+
+    monkeypatch.setattr(replay.subprocess, "Popen", lambda *args, **kwargs: Child())
+    monkeypatch.setattr(replay.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    with (tmp_path / "worker.log").open("w") as log:
+        with pytest.raises(type(error)):
+            replay._run_worker(["worker"], {}, log, timeout=3)
+    assert signals == [(4242, signal.SIGTERM)]
+    assert waits == [3, 30]
