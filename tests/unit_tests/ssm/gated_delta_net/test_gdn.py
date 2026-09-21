@@ -3,6 +3,7 @@
 import copy
 import inspect
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -16,6 +17,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ssm.gated_delta_net.common import _GDNBase
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -843,37 +845,52 @@ class TestGDNCuSeqlensResolve:
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
 
 
-def test_deterministic_mode_covers_the_qk_l2_norm():
-    """deterministic_mode must not leave a Triton kernel in the GDN forward path.
-
-    Regression guard. deterministic_mode swaps the gated delta rule for its torch
-    implementation but historically left the q/k L2 norm as fla's Triton kernel.
-    torch.use_deterministic_algorithms cannot see inside Triton, so every determinism
-    check in the training script passed while training was not reproducible run to run:
-    on one node, one session, the unfixed path deviated in 7 of 7 repeats and the fixed
-    one in 0 of 14 (~1e-4, growing to 1.6e-02 over 20 iterations).
-
-    This asserts the source text rather than running the layer, because building a GDN
-    module needs a process group and the point is only that no ``l2norm(`` call survives
-    outside a deterministic_mode branch -- a cheap check that fails loudly if someone
-    reintroduces one.
-    """
-    from megatron.core.ssm.gated_delta_net.common import _GDNBase
-
-    src = inspect.getsource(_GDNBase._prepare_input_for_gated_delta_rule)
-    assert "l2norm(" in src, "test is stale: the q/k L2 norm call moved or was renamed"
-
-    # Strip comments before asserting: a bare `"deterministic_mode" in src` is satisfied by the
-    # explanatory comment above the branch, so deleting the branch itself would still pass.
-    code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
-    assert "deterministic_mode" in code, (
-        "the q/k L2 norm no longer consults deterministic_mode: fla's Triton l2norm is back on "
-        "the deterministic path, which makes training irreproducible while every "
-        "validate_deterministic() check still passes"
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("deterministic_mode", [False, True])
+@pytest.mark.parametrize("use_qk_l2norm", [False, True])
+def test_qk_l2_norm(dtype, deterministic_mode, use_qk_l2norm):
+    """Check normalization dispatch, additive epsilon, and gradients on CPU."""
+    gdn = SimpleNamespace(
+        config=SimpleNamespace(deterministic_mode=deterministic_mode),
+        use_qk_l2norm=use_qk_l2norm,
+        qk_dim_local_tp=2,
+        v_dim_local_tp=2,
+        key_head_dim=2,
+        value_head_dim=2,
+        num_key_heads=1,
+        num_value_heads=1,
+        _compute_gates=mock.Mock(return_value=(torch.empty(0), {})),
     )
-    # And pin WHICH side calls fla: every l2norm( call must sit after the deterministic_mode
-    # branch opens, i.e. on the else. A call before it would run unconditionally again.
-    assert code.index("deterministic_mode") < code.index("l2norm("), (
-        "an l2norm( call now precedes the deterministic_mode check, so the Triton kernel runs "
-        "unconditionally"
-    )
+    # Normal, small-norm, and zero rows distinguish additive epsilon from clamping.
+    qkv = torch.tensor([3.0, 4.0, -4.0, 3.0, 5.0, 6.0]).repeat(1, 3, 1)
+    qkv = (qkv * torch.tensor([1.0, 1e-4, 0.0]).view(1, 3, 1)).to(dtype)
+    qkv.requires_grad_(True)
+
+    # Exercise the eager method without constructing a model or process groups.
+    prepare = inspect.unwrap(_GDNBase._prepare_input_for_gated_delta_rule)
+    # Use a distinct mock output to verify FLA dispatch and consumption of its result.
+    with mock.patch(
+        "megatron.core.ssm.gated_delta_net.common.l2norm", side_effect=lambda x: x * 2
+    ) as fla_norm:
+        out = prepare(gdn, qkv, torch.empty(0), torch.empty(0), torch.empty(0), 1, 3)
+        if use_qk_l2norm and not deterministic_mode:
+            fla_norm.assert_called_once()
+        else:
+            fla_norm.assert_not_called()
+
+    # Check values and gradients against a higher-precision reference.
+    reference = qkv.detach().double().requires_grad_(True)
+    expected = reference[..., :4].reshape(1, 3, 2, 2)
+    if use_qk_l2norm:
+        if deterministic_mode:
+            expected = expected / torch.sqrt(expected.square().sum(-1, keepdim=True) + 1e-6)
+        else:
+            expected = expected * 2
+    expected = expected.to(dtype)
+    actual = torch.cat((out["q"], out["k"]), dim=2)
+    rtol = 1e-5 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=1e-6)
+
+    actual.float().sum().backward()
+    expected.float().sum().backward()
+    torch.testing.assert_close(qkv.grad, reference.grad.to(dtype), rtol=rtol, atol=1e-6)
