@@ -10,6 +10,12 @@ import argparse
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers

@@ -166,7 +166,9 @@ class ArgumentGroupFactory:
         argparse_kwargs = {}
         argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
         argparse_kwargs["dest"] = attribute.name
-        argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
+        # Config docstrings are literal text, not argparse %-format templates.
+        # Explicit argparse_meta help below retains its placeholder semantics.
+        argparse_kwargs["help"] = self.field_docstrings.get(attribute.name, "").replace("%", "%%")
 
         # dataclasses specifies that both should not be set
         if isinstance(attribute.default, type(dataclasses.MISSING)):

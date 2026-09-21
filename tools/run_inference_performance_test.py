@@ -6,6 +6,12 @@ import random
 import sys
 import time
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
