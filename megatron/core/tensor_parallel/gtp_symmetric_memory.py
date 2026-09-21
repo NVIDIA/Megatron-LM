@@ -11,11 +11,15 @@ ProcessGroupNCCL hook window-registers every allocation made inside
 ``gtp_symm_pool_ctx(group)``, which lets NCCL run its symmetric / NVLS kernels on
 those buffers.
 
-Two parts:
+Three parts:
   - Pool lifecycle: create, register, query, and tear down the per-group pools,
     plus the allocation context ``gtp_symm_pool_ctx``.
   - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
     send buffers for the wgrad reduce-scatter.
+  - DDP buffer registration: ``register_ddp_buffers_on_gtp_groups`` and its undo put
+    the DDP param buffer (the all-gather input under the distributed optimizer) in
+    the symmetric window; the pool itself is created by core DDP
+    (see param_and_grad_buffer.py).
 """
 
 from __future__ import annotations
@@ -45,6 +49,13 @@ _pools: typing.Dict[str, torch.cuda.MemPool] = {}
 # Groups whose pool registration is live. Maps name -> group (not a set) because
 # teardown needs the group object to deregister.
 _registered: typing.Dict[str, typing.Any] = {}
+
+# Which sides of the GTP communication each registered group covers: any subset of
+# {"ag", "rs"}. Window registration itself is mode-independent; the modes only gate
+# which callers route their buffers into the pool.
+_registered_modes: typing.Dict[str, frozenset] = {}
+
+_VALID_MODES = frozenset({"ag", "rs"})
 
 # ---------------------------------------------------------------------------
 # Pool lifecycle: create -> warm -> register -> allocate-into -> query -> deregister
@@ -76,13 +87,29 @@ def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     return pool
 
 
-def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPool | None:
+def _warmup_group_comm(group: dist.ProcessGroup) -> None:
+    """Run one tiny all-reduce: NCCL creates communicators lazily on the first collective,
+    and window registration needs an initialized communicator."""
+    warmup = torch.zeros(1, device=torch.cuda.current_device())
+    dist.all_reduce(warmup, group=group)
+
+
+def register_gtp_symm_pool(
+    group: dist.ProcessGroup | None, modes: typing.Iterable[str] = ("ag", "rs")
+) -> torch.cuda.MemPool | None:
     """Create (if needed) and register the group's pool. Safe to call more than once;
     does nothing for ``None`` or single-rank groups.
+
+    ``modes`` says which sides route buffers into the pool: any non-empty subset of
+    ``{"ag", "rs"}``. Re-registering unions the modes (the window registration itself
+    is mode-independent, so widening is collective-free).
 
     Issues a collective, so call it during model construction — before the first
     forward or any CUDA-graph capture. New segments register automatically afterwards.
     """
+    modes = frozenset(modes)
+    if not modes or not modes <= _VALID_MODES:
+        raise ValueError(f"[GTP] modes must be a non-empty subset of {{'ag', 'rs'}}, got {modes}")
     if group is None or group.size() <= 1:
         return None
     if not is_torch_min_version("2.9.0a0"):
@@ -94,13 +121,12 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
         )
     pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
+        _registered_modes[group.group_name] |= modes
         return pool
-    # NCCL creates communicators lazily on the first collective; run one tiny all-reduce
-    # so the registration below sees an initialized communicator.
-    warmup = torch.zeros(1, device=torch.cuda.current_device())
-    dist.all_reduce(warmup, group=group)
+    _warmup_group_comm(group)
     vmm_symm_allocator.register_mem_pool(pool, group)
     _registered[group.group_name] = group
+    _registered_modes[group.group_name] = modes
     log_single_rank(
         logger,
         logging.INFO,
@@ -116,10 +142,17 @@ def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
     return torch.cuda.use_mem_pool(_get_gtp_symm_pool(group))
 
 
-def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None) -> bool:
+def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None, mode: str | None = None) -> bool:
     """True once ``register_gtp_symm_pool`` has registered this group's pool; also False for
-    ``None`` and single-rank groups, which are never registered."""
-    return group is not None and group.size() > 1 and group.group_name in _registered
+    ``None`` and single-rank groups, which are never registered.
+
+    ``mode``: ``None`` asks "registered at all" (lifecycle/teardown); ``"ag"`` or ``"rs"``
+    asks whether that side of the communication routes buffers into the pool."""
+    if group is None or group.size() <= 1 or group.group_name not in _registered:
+        return False
+    if mode is None:
+        return True
+    return mode in _registered_modes[group.group_name]
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +224,7 @@ class RegisteredLIFOPool:
                     f"(group={group.group_name}, numel={numel}, dtype={dtype}): {hint}."
                 )
             # Allocate from the group's registered pool when it has one; else plain memory.
-            if is_gtp_symm_pool_registered(group):
+            if is_gtp_symm_pool_registered(group, mode="rs"):
                 with gtp_symm_pool_ctx(group):
                     flat = torch.empty(numel, dtype=dtype, device=device)
             else:
@@ -243,4 +276,74 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # is safe to release.
     symmetric_wgrad_pool.clear()
     _registered.clear()
+    _registered_modes.clear()
     _pools.clear()
+
+
+# ---------------------------------------------------------------------------
+# DDP param-buffer registration: put the GTP all-gather INPUT in the window
+# (the pool itself is created by core DDP; see param_and_grad_buffer.py)
+# ---------------------------------------------------------------------------
+
+
+def _ddp_buffers(ddp_module: torch.nn.Module) -> list:
+    """All param/grad buffers of a DDP-wrapped module (dense + expert-parallel)."""
+    return list(getattr(ddp_module, "buffers", [])) + list(
+        getattr(ddp_module, "expert_parallel_buffers", [])
+    )
+
+
+def _buffer_symm_groups(buf) -> list[dist.ProcessGroup]:
+    """Return the GTP groups this buffer's pool must be (de)registered on: the buffer has
+    a pool and a param_data section, and a param opted in via ``needs_nccl_mem``. Sorted
+    by name so all ranks walk groups in the same order (mismatched order can deadlock).
+    """
+    if getattr(buf, "nccl_mem_pool", None) is None or getattr(buf, "param_data", None) is None:
+        return []
+    groups = {}
+    for param in buf.params:
+        if not getattr(param, "needs_nccl_mem", False):
+            continue
+        group = getattr(param, "group", None)
+        if group is not None and group.size() > 1:
+            groups.setdefault(group.group_name, group)
+    return [group for _, group in sorted(groups.items())]
+
+
+def register_ddp_buffers_on_gtp_groups(ddp_module: torch.nn.Module) -> None:
+    """Register each DDP buffer's pool on its params' GTP groups. This puts the DDP param
+    buffer — the GTP all-gather input under the distributed optimizer — in the symmetric
+    window.
+
+    Always symmetric: --disable-symmetric-registration scopes to the DP-group
+    registration, not the GTP groups, which are opted into by
+    --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub.
+    """
+    for buf in _ddp_buffers(ddp_module):
+        for group in _buffer_symm_groups(buf):
+            # buf.nccl_mem_pool is non-None here (checked in _buffer_symm_groups).
+            _warmup_group_comm(group)
+            nccl_allocator.register_mem_pool(buf.nccl_mem_pool, group, symmetric=True)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][GTP] Registered DDP param/grad pool on GTP group "
+                f"{group.group_name} (size={group.size()})",
+            )
+
+
+def deregister_ddp_buffers_from_gtp_groups(ddp_module: torch.nn.Module) -> None:
+    """Undo ``register_ddp_buffers_on_gtp_groups`` at shutdown, before the process groups
+    are destroyed. (The DP-group registration from --use-nccl-ub is deregistered
+    separately by the training loop.)
+    """
+    for buf in _ddp_buffers(ddp_module):
+        for group in _buffer_symm_groups(buf):
+            # buf.nccl_mem_pool is non-None here (checked in _buffer_symm_groups).
+            nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, group)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][GTP] Deregistered DDP param/grad pool from GTP group "
+                f"{group.group_name} (size={group.size()})",
+            )
