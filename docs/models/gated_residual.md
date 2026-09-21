@@ -1,6 +1,6 @@
 # Gated Residual (Qwen4-Exp hyper-connection variant)
 
-`hyper_connection_variant="gated_residual"` selects the 4-stream residual
+`mhc_connection_variant="gated_residual"` selects the 4-stream residual
 mechanism of Qwen4-Exp (HF `model_type: qwen4_exp`) as an alternative to the
 default mHC (Manifold-Constrained Hyper-Connections) mathematics, reusing the
 entire mHC engineering pipeline: per-sublayer hook points, block-level
@@ -9,7 +9,7 @@ expand/contract, MTP interop, selective recompute, and SP gradient marking.
 ## Mathematics
 
 Each sublayer (attention and MLP each) owns one `GatedResidualModule` with
-`n = num_residual_streams`, `C = hidden_size`, `r = hc_lowrank`:
+`n = mhc_num_residual_streams`, `C = hidden_size`, `r = hc_lowrank`:
 
 ```
 x̃      = GroupedRMSNorm(x, group_size=C)          # per-stream RMSNorm, zero-centered gamma
@@ -38,14 +38,14 @@ unfused QKV/`in_proj`/`linear_fc1` projections.
 
 | Knob | Meaning |
 |---|---|
-| `--enable-hyper-connections` | master switch (shared with mHC) |
-| `--hyper-connection-variant gated_residual` | select this variant (default `mhc`) |
-| `--num-residual-streams 4` | n |
+| `--enable-mhc-connections` | master switch (shared with mHC) |
+| `--mhc-connection-variant gated_residual` | select this variant (default `mhc`) |
+| `--mhc-num-residual-streams 4` | n |
 | `--hc-lowrank 320` | read-gate bottleneck r |
 | `--recompute-granularity selective --recompute-modules mhc` | GR recompute (shared knob with mHC) |
 
-The layer-spec builders take `hyper_connection_variant` as an argument; it must
-match `config.hyper_connection_variant` (TransformerBlock verifies this at
+The layer-spec builders take `mhc_connection_variant` as an argument; it must
+match `config.mhc_connection_variant` (TransformerBlock verifies this at
 build time). On the hybrid path, an explicitly provided `--spec` overrides the
 auto-selected norm-free spec — the builder warns, since a spec that keeps the
 fused input layernorms would normalize the streams twice.
