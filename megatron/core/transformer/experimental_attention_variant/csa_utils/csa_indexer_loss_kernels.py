@@ -33,19 +33,7 @@ def _sparse_kl_loss_impl(
     return loss
 
 
-@torch.compile(fullgraph=True)
-def _compiled_sparse_kl_loss(
-    target: Tensor,
-    predict: Tensor,
-    topk_indices: Tensor,
-    loss_coeff: float,
-    calculate_per_token_loss: bool,
-    loss_divisor: int | float | Tensor | None,
-) -> Tensor:
-    """Compile the sparse KL reductions into CUDA pointwise/reduction kernels."""
-    return _sparse_kl_loss_impl(
-        target, predict, topk_indices, loss_coeff, calculate_per_token_loss, loss_divisor
-    )
+_compiled_sparse_kl_loss = torch.compile(_sparse_kl_loss_impl, fullgraph=True)
 
 
 def sparse_kl_loss(

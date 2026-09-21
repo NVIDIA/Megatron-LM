@@ -25,9 +25,9 @@ from .fused_sparse_attention import (
     _csa_sparse_attention_backward,
 )
 from .fused_sparse_attention import _get_topk_alignment as get_flash_mla_topk_alignment
+from .fused_sparse_attention import _kl_loss_from_dense_scores
 
 _DSA: Any = None
-_CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 
 
 def _ensure_dsa_namespace():
@@ -74,71 +74,6 @@ def defer_reduce_scatter_wait(
     """Return a gradient edge whose backward waits for an attached collective."""
     state = _DeferredReduceScatterState(wait_range)
     return _WaitForDeferredReduceScatter.apply(input_, state), state
-
-
-def batch_of_row(cu_seqlens_q: Tensor, total_q: Optional[int] = None) -> Tensor:
-    """For a THD-packed query of length ``total_q``, return a ``(total_q,)``
-    int64 tensor where entry ``i`` is the index of the segment that owns
-    query row ``i`` (i.e. the unique ``b`` with
-    ``cu_seqlens_q[b] <= i < cu_seqlens_q[b+1]``).
-
-    When ``total_q`` exceeds ``cu_seqlens_q[-1]`` (e.g. after
-    ``pad_thd_for_cuda_graph`` pads token tensors to a static capacity),
-    orphan rows are clamped to the last segment so the returned indices
-    are always in ``[0, B-1]`` and never cause OOB on per-segment arrays.
-
-    Used by every helper that needs to translate between per-row indices
-    and per-segment cumulative tensors.
-
-    Args:
-        cu_seqlens_q: ``(B+1,)`` int — cumulative Q lengths.
-        total_q: optional row count override; defaults to
-            ``int(cu_seqlens_q[-1].item())`` (forces a GPU→CPU sync).
-
-    Returns:
-        ``(total_q,)`` int64.
-    """
-    if total_q is None:
-        total_q = int(cu_seqlens_q[-1].item())
-    num_sequences = cu_seqlens_q.shape[0] - 1
-    row_idx = torch.arange(total_q, device=cu_seqlens_q.device, dtype=torch.int64)
-    return torch.bucketize(row_idx, cu_seqlens_q[1:], right=True).clamp(
-        max=max(num_sequences - 1, 0)
-    )
-
-
-@torch.no_grad()
-def _compute_full_csa_teacher_lse(
-    query: Tensor,
-    query_flat: Tensor,
-    full_kv_flat: Tensor,
-    compressed_kv: Tensor,
-    attn_sink: Tensor,
-    window_indices: Tensor,
-    softmax_scale: float,
-    ratio: int,
-    *,
-    cu_seqlens_q: Optional[Tensor] = None,
-    cu_seqlens_kv: Optional[Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_kv: Optional[int] = None,
-    q_causal_offsets: Optional[Tensor] = None,
-) -> Tensor:
-    """Stream the full packed teacher denominator through the requested Triton backend."""
-    return fused_csa_teacher_lse(
-        query_flat,
-        full_kv_flat,
-        compressed_kv,
-        attn_sink,
-        window_indices,
-        softmax_scale,
-        ratio,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_kv,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_kv,
-        q_causal_offsets=q_causal_offsets,
-    )
 
 
 def _validate_kv_reconstruction_parts(
@@ -261,12 +196,11 @@ def csa_sparse_attn(
     topk_idxs,
     softmax_scale,
     topk_length=None,
-    is_thd=True,
     kv_reconstruction_parts=None,
     q_padding_mask=None,
 ):
     """Run fused attention for flat packed Q/KV and physical indices."""
-    if not is_thd or query.ndim != 3 or kv.ndim != 2:
+    if query.ndim != 3 or kv.ndim != 2:
         raise ValueError("Packed CSA requires query [tokens, heads, dim] and KV [tokens, dim].")
     if topk_length is not None:
         # Short windows can leave holes before valid compressed keys. The backend
@@ -298,65 +232,19 @@ def _compute_attn_target(
     topk_indices: Tensor,
     softmax_scale: float,
     qhead_per_kv_head: int,
-    *,
-    topk_indices_global: bool = False,
 ) -> Tensor:
-    """Compute ``target`` distribution (L1-normalised head-sum softmax).
-
-    Wraps :attr:`cudnn.DSA.sparse_attn_score_recompute_wrapper`. Same
-    layout convention as :func:`_compute_indexer_predict`: 4-D q is
-    BSHD; 3-D q is THD and gets fake-BSHD'd with ``B=1`` before the
-    wrapper call (so the 4-D-Q shape check passes).
-    """
+    """Compute packed teacher targets using global compressed-key indices."""
     _ensure_dsa_namespace()
-    is_thd = q_attn.ndim == 3
-    if is_thd:
-        if not topk_indices_global:
-            raise ValueError(
-                "THD ``_compute_attn_target`` requires "
-                "``topk_indices_global=True`` so the kernel addresses K "
-                "by flat ids over the packed ``(total_k, D)`` buffer."
-            )
-        q_bshd, k_bsd, lse_bsh, topk_bst = _thd_to_fake_bshd(q_attn, k_attn, lse, topk_indices)
-    else:
-        q_bshd, k_bsd, lse_bsh, topk_bst = q_attn, k_attn, lse, topk_indices
-
-    result = _DSA.sparse_attn_score_recompute_wrapper(
+    q_bshd, k_bsd, lse_bsh, topk_bst = _thd_to_fake_bshd(q_attn, k_attn, lse, topk_indices)
+    return _DSA.sparse_attn_score_recompute_wrapper(
         q_bshd,
         k_bsd,
         lse_bsh,
         topk_bst,
         softmax_scale,
         qhead_per_kv_head=qhead_per_kv_head,
-        topk_indices_global=topk_indices_global,
-    )
-    target = result["target"]
-    if is_thd:
-        target = target.squeeze(0)
-    return target
-
-
-def _kl_loss_from_target_predict(
-    target: Tensor,
-    predict: Tensor,
-    topk_indices: Tensor,
-    loss_coeff: float,
-    calculate_per_token_loss: bool = False,
-    loss_divisor: int | float | Tensor | None = None,
-) -> Tensor:
-    """KL(target || predict) reduced over ``(B, S_q)`` and scaled by loss_coeff.
-
-    Rows with no valid top-K positions (early query rows with ratio causal
-    masking) contribute 0 to the loss — the sparse score kernels produce
-    garbage for those rows, mirroring ``compute_dsa_indexer_loss``'s
-    ``row_valid`` handling. The default mean is taken over all ``(B, S_q)``
-    positions. Per-token-loss mode returns a raw local sum unless
-    ``loss_divisor`` is supplied, in which case the global normalization is
-    folded into the same compiled reduction.
-    """
-    return csa_indexer_loss_kernels.sparse_kl_loss(
-        target, predict, topk_indices, loss_coeff, calculate_per_token_loss, loss_divisor
-    )
+        topk_indices_global=True,
+    )["target"].squeeze(0)
 
 
 def _scale_indexer_grads(grad_loss: Tensor, *grads: Tensor) -> Tuple[Tensor, ...]:
@@ -376,151 +264,6 @@ def _scale_indexer_grads(grad_loss: Tensor, *grads: Tensor) -> Tuple[Tensor, ...
         for (index, _), scaled_grad in zip(indexed_grads, scaled_group):
             scaled_by_index[index] = scaled_grad
     return tuple(scaled_by_index[index] for index in range(len(grads)))
-
-
-def _compute_dense_indexer_score(
-    q_indexer: Tensor,
-    k_indexer: Tensor,
-    weights: Tensor,
-    qhead_per_kv_head: int,
-    indexer_softmax_scale: float,
-    ratio: int,
-    *,
-    cu_seqlens_q: Optional[Tensor] = None,
-    cu_seqlens_kv: Optional[Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_kv: Optional[int] = None,
-    q_causal_offsets: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]:
-    """Dense indexer score forward over the full ``S_k`` axis (BSHD or THD).
-
-    Wraps :attr:`cudnn.DSA.dense_indexer_score_recompute_wrapper`.
-    Layout is selected by ``cu_seqlens_*`` kwargs:
-
-    * **BSHD** (``cu_seqlens_*=None``): inputs are 4-D q ``(B, S_q, H, D)``,
-      4-D k ``(B, S_k, H_kv, D)``, 3-D w ``(B, S_q, H)``. Outputs are
-      ``out (B, S_q, S_k)`` + ``denom (B, S_q)``.
-    * **THD** (``cu_seqlens_*`` supplied): inputs are 3-D q
-      ``(total_q, H, D)``, 3-D k ``(total_k, H_kv, D)``, 2-D w
-      ``(total_q, H)``. Outputs are ``out (total_q, max_seqlen_kv)`` +
-      ``denom (total_q,)``.
-
-    The ratio-causal limit is
-    ``min(S_k, (q_causal_offset + q + 1) // ratio)``; omitted offsets are zero.
-    """
-    _ensure_dsa_namespace()
-    kwargs = dict(
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_kv,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_kv,
-    )
-    if q_causal_offsets is not None:
-        kwargs["q_causal_offsets"] = q_causal_offsets
-    result = _DSA.dense_indexer_score_recompute_wrapper(
-        q_indexer,
-        k_indexer,
-        weights,
-        qhead_per_kv_head=qhead_per_kv_head,
-        sm_scale=indexer_softmax_scale,
-        ratio=ratio,
-        **kwargs,
-    )
-    return result["out"], result["denom"]
-
-
-def _compute_dense_attn_score(
-    q_attn: Tensor,
-    k_attn: Tensor,
-    lse: Tensor,
-    qhead_per_kv_head: int,
-    softmax_scale: float,
-    ratio: int,
-    *,
-    cu_seqlens_q: Optional[Tensor] = None,
-    cu_seqlens_kv: Optional[Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_kv: Optional[int] = None,
-    q_causal_offsets: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]:
-    """Dense attention score forward over the full ``S_k`` axis (BSHD or THD).
-
-    Wraps :attr:`cudnn.DSA.dense_attn_score_recompute_wrapper`. Same
-    BSHD/THD layout convention as :func:`_compute_dense_indexer_score`.
-    """
-    _ensure_dsa_namespace()
-    kwargs = dict(
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_kv,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_kv,
-    )
-    if q_causal_offsets is not None:
-        kwargs["q_causal_offsets"] = q_causal_offsets
-    result = _DSA.dense_attn_score_recompute_wrapper(
-        q_attn,
-        k_attn,
-        lse,
-        softmax_scale,
-        qhead_per_kv_head=qhead_per_kv_head,
-        ratio=ratio,
-        **kwargs,
-    )
-    return result["out"], result["denom"]
-
-
-def _kl_loss_from_dense_scores(
-    attn_score: Tensor,
-    attn_l1norm: Tensor,
-    index_score: Tensor,
-    index_lse: Tensor,
-    loss_coeff: float,
-    calculate_per_token_loss: bool = False,
-) -> Tensor:
-    """KL(target || predict) over the **full** KV axis, averaged over rows.
-
-    Derives ``target = attn_score / attn_l1norm`` (L1-normalised, matches
-    ``compute_dsa_indexer_loss``'s ``attention_scores / sum`` step) and
-    ``log_predict = index_score - index_lse`` (LSE-normalised log-softmax),
-    then computes ``KL = sum_k target * (log target - log predict)`` and
-    scales by ``loss_coeff``.
-
-    Layout-agnostic: works for both BSHD inputs (shapes
-    ``attn_score (B, S_q, S_k)``, ``attn_l1norm (B, S_q)``, …) and THD
-    inputs (shapes ``attn_score (total_q, max_seqlen_kv)``,
-    ``attn_l1norm (total_q,)``, …). The final ``.mean()`` averages over
-    all rows in either case.
-
-    Rows where the kernel's ``ratio`` causal mask leaves no valid KV
-    position have ``attn_l1norm <= 0`` (L1) or ``index_lse == -inf``
-    (LSE); those rows contribute 0 to the loss — the same ``row_valid``
-    semantics as the reference ``compute_dsa_indexer_loss``.
-    """
-    eps = _CLIP_PROB_MIN
-    # row_valid: rows with at least one un-masked KV position.
-    row_valid = (attn_l1norm > eps) & torch.isfinite(index_lse)
-
-    # Safe denoms: replace invalid rows with a finite value so target /
-    # log-predict don't produce NaN; the row mask zeroes their KL below.
-    safe_l1 = attn_l1norm.clamp(min=eps)
-    safe_lse = torch.where(row_valid, index_lse, torch.zeros_like(index_lse))
-
-    target = attn_score / safe_l1.unsqueeze(-1)
-    target_clamped = target.clamp(min=eps)
-    # Per-position validity: the indexer-score kernel emits -inf at
-    # ratio-masked positions; those contribute 0 to KL by the
-    # ``0 · log(0/p) = 0`` convention. Without this gate, the eps-clamp
-    # on target makes the term ``eps · (log eps - (-inf)) = +inf``.
-    position_valid = torch.isfinite(index_score)
-    safe_index_score = torch.where(position_valid, index_score, torch.zeros_like(index_score))
-    log_predict = safe_index_score - safe_lse.unsqueeze(-1)
-
-    kl_terms = target_clamped * (torch.log(target_clamped) - log_predict)
-    kl_terms = torch.where(position_valid, kl_terms, torch.zeros_like(kl_terms))
-    kl_per_row = kl_terms.sum(dim=-1)  # (B, S_q)
-    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
-    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
-    return loss_coeff * loss
 
 
 class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
@@ -550,18 +293,20 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ratio: int,
         max_seqlen_q: int,
         indexer_layout: Tuple[Tensor, Tensor, Tensor],
-        q_padding_mask: Optional[Tensor] = None,
-        local_k_indexer: Optional[Tensor] = None,
-        local_compressed_kv: Optional[Tensor] = None,
-        cp_group=None,
-        compressed_kv_start: int = 0,
-        indexer_rank_map: Optional[Tensor] = None,
-        indexer_k_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
-        compressed_kv_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
-        logical_window_width: int | None = None,
-        kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+        q_padding_mask: Tensor | None,
+        local_k_indexer: Tensor,
+        local_compressed_kv: Tensor,
+        cp_group: torch.distributed.ProcessGroup,
+        compressed_kv_start: int,
+        indexer_rank_map: Tensor | None,
+        indexer_k_reduce_scatter_state: _DeferredReduceScatterState,
+        compressed_kv_reduce_scatter_state: _DeferredReduceScatterState,
+        logical_window_width: int,
+        kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None,
     ) -> Tuple[Tensor, Tensor]:
-        """Run fused sparse attention using caller-supplied top-k indices."""
+        """Run packed attention with positive indexer loss and deferred CP reductions."""
+        if loss_coeff <= 0:
+            raise ValueError("Use csa_sparse_attn when indexer loss is disabled.")
         _ensure_dsa_namespace()
 
         total_q, np_ = query.shape[:2]
@@ -571,8 +316,6 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         # Preserve the fixed window suffix for the dense teacher before
         # compacting the complete attention index set.
-        if logical_window_width is None:
-            logical_window_width = topk_idxs.shape[-1] - indexer_topk
         window_topk_idxs = topk_idxs[:, indexer_topk : indexer_topk + int(logical_window_width)]
         topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
 
@@ -595,7 +338,6 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         # cuDNN accepts a host scalar coefficient; normalize by real packed
         # rows on device after the kernel, without synchronizing padded lengths.
-        bwd_loss_coeff = loss_coeff
         real_row_scale = (
             total_q / loss_divisor.clamp_min(1)
             if torch.is_tensor(loss_divisor)
@@ -603,171 +345,153 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         )
         unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
 
-        indexer_loss = query.new_zeros((), dtype=torch.float32)
-        if loss_coeff > 0:
-            if sparse_loss:
-                indexer_topk_idxs_for_loss = indexer_topk_idxs
-                if q_padding_mask is not None:
-                    indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
-                        q_padding_mask.unsqueeze(-1), -1
-                    )
-                weights_scaled = weights
-                if indexer_softmax_scale != 1.0:
-                    weights_scaled = (weights.float() * indexer_softmax_scale).to(weights.dtype)
-                q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
-                    q_indexer, k_indexer, weights_scaled, indexer_topk_idxs_for_loss
-                )
-                predict = _DSA.sparse_indexer_score_recompute_wrapper(
-                    q_bshd,
-                    k_bsd,
-                    w_bsh,
-                    topk_bst,
-                    qhead_per_kv_head=idx_nh,
-                    topk_indices_global=True,
-                )["predict"].squeeze(0)
-                target = _compute_attn_target(
-                    query.detach(),
-                    compressed_kv.detach(),
-                    torch.logaddexp(lse.detach().float(), attn_sink.detach().float().view(1, np_)),
-                    indexer_topk_idxs_for_loss,
-                    softmax_scale,
-                    qhead_per_kv_head=np_,
-                    topk_indices_global=True,
-                )
-                indexer_loss = _kl_loss_from_target_predict(
-                    target,
-                    predict,
-                    indexer_topk_idxs_for_loss,
-                    loss_coeff,
-                    calculate_per_token_loss=True,
-                    loss_divisor=loss_divisor,
-                )
-                if loss_coeff > 0:
-                    ig = _DSA.indexer_backward_wrapper(
-                        q_indexer.view(1, total_q, idx_nh, idx_hd),
-                        weights.view(1, total_q, idx_nh),
-                        k_indexer.view(1, total_comp, idx_hd),
-                        target.view(1, total_q, indexer_topk),
-                        predict.view(1, total_q, indexer_topk),
-                        indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk),
-                        sm_scale=indexer_softmax_scale,
-                        loss_coeff=bwd_loss_coeff,
-                        grad_loss=unit_grad_loss,
-                        block_I=128,
-                    )
-            else:
-                cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
-                max_seqlen_k = max_seqlen_q // ratio
-                torch._assert_async(
-                    (
-                        ((cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 0)
-                        | ((cu_seqlens_k[1:] - cu_seqlens_k[:-1]) > 0)
-                    ).all(),
-                    "cuDNN dense packed indexer loss requires a compressed key in each "
-                    "nonempty Q segment; use sparse loss or dsa_kernel_backend='none' "
-                    "for shorter documents.",
-                )
-                index_score, index_lse = _compute_dense_indexer_score(
-                    q_indexer,
-                    k_indexer.unsqueeze(1),
-                    weights,
-                    qhead_per_kv_head=idx_nh,
-                    indexer_softmax_scale=indexer_softmax_scale,
-                    ratio=ratio,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_k,
-                    q_causal_offsets=q_causal_offsets,
-                )
-                if q_padding_mask is not None:
-                    index_score = index_score.masked_fill(
-                        q_padding_mask.unsqueeze(-1), float("-inf")
-                    )
-                    index_lse = index_lse.masked_fill(q_padding_mask, float("-inf"))
-                dense_teacher_lse = _compute_full_csa_teacher_lse(
-                    query.detach(),
-                    query,
-                    kv_full,
-                    compressed_kv.detach(),
-                    attn_sink,
-                    window_topk_idxs,
-                    softmax_scale,
-                    ratio,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_k,
-                    q_causal_offsets=q_causal_offsets,
-                )
-                attn_score, attn_l1norm = _compute_dense_attn_score(
-                    query.detach(),
-                    compressed_kv.detach().unsqueeze(1),
-                    dense_teacher_lse,
-                    qhead_per_kv_head=np_,
-                    softmax_scale=softmax_scale,
-                    ratio=ratio,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_k,
-                    q_causal_offsets=q_causal_offsets,
-                )
-                if q_padding_mask is not None:
-                    attn_score = attn_score.masked_fill(q_padding_mask.unsqueeze(-1), 0)
-                    attn_l1norm = attn_l1norm.masked_fill(q_padding_mask, 0)
-                raw_local_loss = _kl_loss_from_dense_scores(
-                    attn_score,
-                    attn_l1norm,
-                    index_score,
-                    index_lse,
-                    loss_coeff,
-                    calculate_per_token_loss=True,
-                )
-                indexer_loss = raw_local_loss / loss_divisor
-
-                if loss_coeff > 0:
-                    index_score_for_bwd = index_score.clone()
-                    index_lse_for_bwd = index_lse
-                    if q_padding_mask is not None:
-                        index_score_for_bwd[q_padding_mask] = 0
-                        index_lse_for_bwd = index_lse.masked_fill(q_padding_mask, 0)
-                    ig = _DSA.dense_indexer_backward_wrapper(
-                        q_indexer,
-                        weights,
-                        k_indexer,
-                        attn_score,
-                        attn_l1norm,
-                        index_score_for_bwd,
-                        index_lse_for_bwd,
-                        sm_scale=indexer_softmax_scale,
-                        loss_coeff=bwd_loss_coeff,
-                        grad_loss=unit_grad_loss,
-                        block_I=128,
-                        ratio=ratio,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        max_seqlen_q=max_seqlen_q,
-                        max_seqlen_k=max_seqlen_k,
-                        q_causal_offsets=q_causal_offsets,
-                    )
-        if loss_coeff > 0:
-            saved_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd) * real_row_scale
-            saved_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd) * real_row_scale
-            saved_grad_weights = ig["d_weights"].view(total_q, idx_nh) * real_row_scale
+        if sparse_loss:
+            indexer_topk_idxs_for_loss = indexer_topk_idxs
             if q_padding_mask is not None:
-                saved_grad_q_indexer[q_padding_mask] = 0
-                saved_grad_weights[q_padding_mask] = 0
+                indexer_topk_idxs_for_loss = indexer_topk_idxs.masked_fill(
+                    q_padding_mask.unsqueeze(-1), -1
+                )
+            weights_scaled = weights
+            if indexer_softmax_scale != 1.0:
+                weights_scaled = (weights.float() * indexer_softmax_scale).to(weights.dtype)
+            q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
+                q_indexer, k_indexer, weights_scaled, indexer_topk_idxs_for_loss
+            )
+            predict = _DSA.sparse_indexer_score_recompute_wrapper(
+                q_bshd, k_bsd, w_bsh, topk_bst, qhead_per_kv_head=idx_nh, topk_indices_global=True
+            )["predict"].squeeze(0)
+            target = _compute_attn_target(
+                query.detach(),
+                compressed_kv.detach(),
+                torch.logaddexp(lse.detach().float(), attn_sink.detach().float().view(1, np_)),
+                indexer_topk_idxs_for_loss,
+                softmax_scale,
+                qhead_per_kv_head=np_,
+            )
+            indexer_loss = csa_indexer_loss_kernels.sparse_kl_loss(
+                target,
+                predict,
+                indexer_topk_idxs_for_loss,
+                loss_coeff,
+                calculate_per_token_loss=True,
+                loss_divisor=loss_divisor,
+            )
+            ig = _DSA.indexer_backward_wrapper(
+                q_indexer.view(1, total_q, idx_nh, idx_hd),
+                weights.view(1, total_q, idx_nh),
+                k_indexer.view(1, total_comp, idx_hd),
+                target.view(1, total_q, indexer_topk),
+                predict.view(1, total_q, indexer_topk),
+                indexer_topk_idxs_for_loss.view(1, total_q, indexer_topk),
+                sm_scale=indexer_softmax_scale,
+                loss_coeff=loss_coeff,
+                grad_loss=unit_grad_loss,
+                block_I=128,
+            )
         else:
-            saved_grad_q_indexer = torch.zeros_like(q_indexer)
-            saved_grad_k_indexer = torch.zeros_like(k_indexer)
-            saved_grad_weights = torch.zeros_like(weights)
+            cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
+            max_seqlen_k = max_seqlen_q // ratio
+            torch._assert_async(
+                (
+                    ((cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 0)
+                    | ((cu_seqlens_k[1:] - cu_seqlens_k[:-1]) > 0)
+                ).all(),
+                "cuDNN dense packed indexer loss requires a compressed key in each "
+                "nonempty Q segment; use sparse loss for shorter documents.",
+            )
+            index_result = _DSA.dense_indexer_score_recompute_wrapper(
+                q_indexer,
+                k_indexer.unsqueeze(1),
+                weights,
+                qhead_per_kv_head=idx_nh,
+                sm_scale=indexer_softmax_scale,
+                ratio=ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+            )
+            index_score, index_lse = index_result["out"], index_result["denom"]
+            del index_result
+            if q_padding_mask is not None:
+                index_score = index_score.masked_fill(q_padding_mask.unsqueeze(-1), float("-inf"))
+                index_lse = index_lse.masked_fill(q_padding_mask, float("-inf"))
+            dense_teacher_lse = fused_csa_teacher_lse(
+                query,
+                kv_full,
+                compressed_kv.detach(),
+                attn_sink,
+                window_topk_idxs,
+                softmax_scale,
+                ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+            )
+            attn_result = _DSA.dense_attn_score_recompute_wrapper(
+                query.detach(),
+                compressed_kv.detach().unsqueeze(1),
+                dense_teacher_lse,
+                softmax_scale,
+                qhead_per_kv_head=np_,
+                ratio=ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+            )
+            attn_score, attn_l1norm = attn_result["out"], attn_result["denom"]
+            del attn_result
+            if q_padding_mask is not None:
+                attn_score = attn_score.masked_fill(q_padding_mask.unsqueeze(-1), 0)
+                attn_l1norm = attn_l1norm.masked_fill(q_padding_mask, 0)
+            raw_local_loss = _kl_loss_from_dense_scores(
+                attn_score,
+                attn_l1norm,
+                index_score,
+                index_lse,
+                loss_coeff,
+                calculate_per_token_loss=True,
+            )
+            indexer_loss = raw_local_loss / loss_divisor
 
-        if cp_group is not None:
-            if local_k_indexer is None or local_compressed_kv is None:
-                raise RuntimeError("CP backward overlap requires both local compressed tensors.")
-            ctx.local_k_indexer_rows = local_k_indexer.shape[0]
-            ctx.local_compressed_kv_rows = local_compressed_kv.shape[0]
+            index_score_for_bwd = index_score.clone()
+            index_lse_for_bwd = index_lse
+            if q_padding_mask is not None:
+                index_score_for_bwd[q_padding_mask] = 0
+                index_lse_for_bwd = index_lse.masked_fill(q_padding_mask, 0)
+            ig = _DSA.dense_indexer_backward_wrapper(
+                q_indexer,
+                weights,
+                k_indexer,
+                attn_score,
+                attn_l1norm,
+                index_score_for_bwd,
+                index_lse_for_bwd,
+                sm_scale=indexer_softmax_scale,
+                loss_coeff=loss_coeff,
+                grad_loss=unit_grad_loss,
+                block_I=128,
+                ratio=ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+            )
+        saved_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd) * real_row_scale
+        saved_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd) * real_row_scale
+        saved_grad_weights = ig["d_weights"].view(total_q, idx_nh) * real_row_scale
+        if q_padding_mask is not None:
+            saved_grad_q_indexer[q_padding_mask] = 0
+            saved_grad_weights[q_padding_mask] = 0
+
+        ctx.local_k_indexer_rows = local_k_indexer.shape[0]
+        ctx.local_compressed_kv_rows = local_compressed_kv.shape[0]
         if indexer_rank_map is None:
             indexer_rank_map = torch.empty(0, dtype=torch.int32, device=query.device)
 
@@ -775,8 +499,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ctx.compressed_kv_start = int(compressed_kv_start)
         ctx.indexer_k_reduce_scatter_state = indexer_k_reduce_scatter_state
         ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
-        ctx.indexer_grad_is_sequence_major = cp_group is not None and not sparse_loss
-        ctx.num_forward_inputs = len(ctx.needs_input_grad)
+        ctx.indexer_grad_is_sequence_major = not sparse_loss
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
         if ctx.reconstruct_kv_for_backward:
             assert kv_reconstruction_parts is not None
@@ -817,7 +540,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
     def backward(ctx, grad_output, grad_loss):
         """Run sparse-attention and indexer-loss backward kernels."""
         _ensure_dsa_namespace()
-        if getattr(ctx, "reconstruct_kv_for_backward", False):
+        if ctx.reconstruct_kv_for_backward:
             (
                 query,
                 boundary_kv,
@@ -851,21 +574,19 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         cp_group = ctx.cp_group
         grad_k_indexer = saved_grad_k_indexer * grad_loss
-        grad_k_indexer_rank_major = None
-        if cp_group is not None:
-            if ctx.indexer_grad_is_sequence_major:
-                global_rows = ctx.local_k_indexer_rows * cp_group.size()
-                grad_k_indexer_rank_major = grad_k_indexer.new_zeros(
-                    (global_rows, *grad_k_indexer.shape[1:])
-                )
-                valid_rows = indexer_rank_map >= 0
-                rank_rows = indexer_rank_map.clamp_min(0).long()
-                mask_shape = (valid_rows.shape[0],) + (1,) * (grad_k_indexer.ndim - 1)
-                grad_k_indexer_rank_major.index_add_(
-                    0, rank_rows, grad_k_indexer * valid_rows.view(mask_shape)
-                )
-            else:
-                grad_k_indexer_rank_major = grad_k_indexer
+        if ctx.indexer_grad_is_sequence_major:
+            global_rows = ctx.local_k_indexer_rows * cp_group.size()
+            grad_k_indexer_rank_major = grad_k_indexer.new_zeros(
+                (global_rows, *grad_k_indexer.shape[1:])
+            )
+            valid_rows = indexer_rank_map >= 0
+            rank_rows = indexer_rank_map.clamp_min(0).long()
+            mask_shape = (valid_rows.shape[0],) + (1,) * (grad_k_indexer.ndim - 1)
+            grad_k_indexer_rank_major.index_add_(
+                0, rank_rows, grad_k_indexer * valid_rows.view(mask_shape)
+            )
+        else:
+            grad_k_indexer_rank_major = grad_k_indexer
 
         dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
         if ctx.q_padding_mask is not None:
@@ -886,45 +607,40 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         attn_bwd = {"dq": dq, "dkv": dkv, "d_sink": d_sink}
         nvtx_range_pop("dsv4_cp_sparse_attention_backward")
 
-        grad_local_k_indexer = None
-        grad_local_compressed_kv = None
-        if cp_group is not None:
-            expected_indexer_rows = ctx.local_k_indexer_rows * cp_group.size()
-            if grad_k_indexer_rank_major.shape[0] != expected_indexer_rows:
-                raise RuntimeError(
-                    "Indexer-K gradient has an unexpected CP-global shape: "
-                    f"got {grad_k_indexer_rank_major.shape[0]} rows, "
-                    f"expected {expected_indexer_rows}."
-                )
-            grad_compressed_kv = attn_bwd["dkv"][ctx.compressed_kv_start :]
-            expected_rows = ctx.local_compressed_kv_rows * cp_group.size()
-            if grad_compressed_kv.shape[0] != expected_rows:
-                raise RuntimeError(
-                    "Compressed-KV gradient has an unexpected CP-global shape: "
-                    f"got {grad_compressed_kv.shape[0]} rows, expected {expected_rows}."
-                )
-            nvtx_range_push("dsv4_cp_attention_kv_reduce_scatter_launch")
-            compressed_kv_reduce_scatter = async_reduce_scatter_along_first_dim(
-                grad_compressed_kv, group=cp_group
+        expected_indexer_rows = ctx.local_k_indexer_rows * cp_group.size()
+        if grad_k_indexer_rank_major.shape[0] != expected_indexer_rows:
+            raise RuntimeError(
+                "Indexer-K gradient has an unexpected CP-global shape: "
+                f"got {grad_k_indexer_rank_major.shape[0]} rows, "
+                f"expected {expected_indexer_rows}."
             )
-            nvtx_range_pop("dsv4_cp_attention_kv_reduce_scatter_launch")
-
-            # Both reductions launch after the main sparse-attention backward,
-            # avoiding its SM/L2 contention. Compressed-KV goes first because
-            # its consumer branch is newer in autograd and runs first; Indexer-K
-            # can then remain in flight during the attention compressor backward.
-            nvtx_range_push("dsv4_cp_indexer_k_reduce_scatter_launch")
-            indexer_reduce_scatter = async_reduce_scatter_along_first_dim(
-                grad_k_indexer_rank_major, group=cp_group
+        grad_compressed_kv = attn_bwd["dkv"][ctx.compressed_kv_start :]
+        expected_rows = ctx.local_compressed_kv_rows * cp_group.size()
+        if grad_compressed_kv.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Compressed-KV gradient has an unexpected CP-global shape: "
+                f"got {grad_compressed_kv.shape[0]} rows, expected {expected_rows}."
             )
-            nvtx_range_pop("dsv4_cp_indexer_k_reduce_scatter_launch")
+        nvtx_range_push("dsv4_cp_attention_kv_reduce_scatter_launch")
+        compressed_kv_reduce_scatter = async_reduce_scatter_along_first_dim(
+            grad_compressed_kv, group=cp_group
+        )
+        nvtx_range_pop("dsv4_cp_attention_kv_reduce_scatter_launch")
 
-            if ctx.indexer_k_reduce_scatter_state is not None:
-                ctx.indexer_k_reduce_scatter_state.handle = indexer_reduce_scatter
-                grad_local_k_indexer = indexer_reduce_scatter.tensor
-            if ctx.compressed_kv_reduce_scatter_state is not None:
-                ctx.compressed_kv_reduce_scatter_state.handle = compressed_kv_reduce_scatter
-                grad_local_compressed_kv = compressed_kv_reduce_scatter.tensor
+        # Both reductions launch after the main sparse-attention backward,
+        # avoiding its SM/L2 contention. Compressed-KV goes first because
+        # its consumer branch is newer in autograd and runs first; Indexer-K
+        # can then remain in flight during the attention compressor backward.
+        nvtx_range_push("dsv4_cp_indexer_k_reduce_scatter_launch")
+        indexer_reduce_scatter = async_reduce_scatter_along_first_dim(
+            grad_k_indexer_rank_major, group=cp_group
+        )
+        nvtx_range_pop("dsv4_cp_indexer_k_reduce_scatter_launch")
+
+        ctx.indexer_k_reduce_scatter_state.handle = indexer_reduce_scatter
+        grad_local_k_indexer = indexer_reduce_scatter.tensor
+        ctx.compressed_kv_reduce_scatter_state.handle = compressed_kv_reduce_scatter
+        grad_local_compressed_kv = compressed_kv_reduce_scatter.tensor
 
         # These local branches do not consume either reduce-scatter result.
         # Queue them before either branch-local consumer wait. K stays in the
@@ -935,20 +651,13 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         )
         nvtx_range_pop("dsv4_cp_local_indexer_grads")
 
-        if cp_group is not None:
-            if ctx.indexer_k_reduce_scatter_state is None:
-                grad_local_k_indexer = indexer_reduce_scatter.wait()
-            if ctx.compressed_kv_reduce_scatter_state is None:
-                grad_local_compressed_kv = compressed_kv_reduce_scatter.wait()
-            grad_k_indexer = None
-
-        gradients = (
+        return (
             attn_bwd["dq"],
             attn_bwd["dkv"],
             attn_bwd["d_sink"],
             None,
             grad_q_indexer,
-            grad_k_indexer,
+            None,  # Global indexer-K gradients return through the local deferred edge.
             grad_weights,
             None,
             None,
@@ -971,9 +680,6 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             None,
         )
-        # Older call sites omit the optional CP-overlap inputs. PyTorch expects
-        # exactly one backward result for every argument passed to ``apply``.
-        return gradients[: ctx.num_forward_inputs]
 
 
 def indexer_topk(

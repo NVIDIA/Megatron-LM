@@ -268,7 +268,6 @@ def compute_cp_indexer_topk(
     topk_width: int,
     indexer_softmax_scale: float,
     max_seqlen_q: int,
-    use_fused: bool,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
@@ -294,56 +293,6 @@ def compute_cp_indexer_topk(
         )
         return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
 
-    if not use_fused:
-        global_rows = torch.arange(
-            global_start,
-            global_start + l_local,
-            dtype=cu_seqlens_q.dtype,
-            device=cu_seqlens_q.device,
-        )
-        sequence_ids = torch.bucketize(
-            global_rows, cu_seqlens_q[1:], out_int32=True, right=True
-        ).clamp_max(cu_seqlens_q.shape[0] - 2)
-        positions = global_rows - cu_seqlens_q[sequence_ids]
-        visible_k = torch.minimum(
-            torch.div(positions + 1, int(ratio), rounding_mode="floor"),
-            cu_seqlens_compressed[sequence_ids + 1] - cu_seqlens_compressed[sequence_ids],
-        ).clamp_min(0)
-        valid_q = (global_rows >= cu_seqlens_q[sequence_ids]) & (
-            global_rows < cu_seqlens_q[sequence_ids + 1]
-        )
-
-        k_rows = torch.arange(
-            k_indexer_seq_major.shape[0],
-            dtype=cu_seqlens_compressed.dtype,
-            device=cu_seqlens_compressed.device,
-        )
-        k_sequence_ids = torch.bucketize(
-            k_rows, cu_seqlens_compressed[1:], out_int32=True, right=True
-        ).clamp_max(cu_seqlens_compressed.shape[0] - 2)
-        k_positions = k_rows - cu_seqlens_compressed[k_sequence_ids]
-        output = torch.full(
-            (l_local, topk_width), -1, dtype=torch.int32, device=q_indexer_local.device
-        )
-        selected_width = min(topk_width, k_indexer_seq_major.shape[0])
-        for start in range(0, l_local, 128):
-            end = min(start + 128, l_local)
-            scores = torch.einsum(
-                "rhd,kd->rhk", q_indexer_local[start:end].float(), k_indexer_seq_major.float()
-            )
-            scores = torch.relu(scores) * weights_indexer_local[start:end].float().unsqueeze(-1)
-            scores = scores.sum(dim=1) * float(indexer_softmax_scale)
-            valid_k = (
-                (k_sequence_ids.unsqueeze(0) == sequence_ids[start:end].unsqueeze(1))
-                & (k_positions.unsqueeze(0) < visible_k[start:end].unsqueeze(1))
-                & valid_q[start:end].unsqueeze(1)
-            )
-            scores = scores.masked_fill(~valid_k, float("-inf"))
-            values, rows = torch.topk(scores, selected_width, dim=-1)
-            local_rows = k_positions[rows].to(torch.int32)
-            output[start:end, :selected_width] = torch.where(torch.isfinite(values), local_rows, -1)
-        return output, (cu_q_topk, cu_k_topk, q_causal_offsets)
-
     topk, _ = indexer_topk(
         q_indexer_local,
         k_indexer_seq_major,
@@ -367,6 +316,8 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
     transitions are a separate integration; reject them instead of accidentally
     using a stale build-time group during forward or recompute.
     """
+    if config.dsa_kernel_backend != "cudnn":
+        raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
     if packed_seq_params.qkv_format != "thd":
         raise ValueError("DSv4 packed attention requires qkv_format='thd'.")
     if cp_group is None:

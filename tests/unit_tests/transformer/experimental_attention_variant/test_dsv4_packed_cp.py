@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Real-kernel packed DSv4 CP parity; run with torch.distributed.run (at least 4 GPUs)."""
+"""Packed DSv4 CP parity against per-document SBHD; run on at least 4 GPUs."""
 
 from copy import copy
 from dataclasses import replace
@@ -43,34 +43,43 @@ def _assert_match(actual, expected):
     torch.testing.assert_close(actual, expected, atol=0.06, rtol=0.06)
 
 
+def _reference_per_document(model, hidden, physical, real):
+    """Use the existing native SBHD backend without packed layout or CP helpers."""
+    outputs = []
+    for i, (start, end) in enumerate(zip(physical, physical[1:])):
+        length = real[i + 1] - real[i]
+        if length:
+            output, _ = model(hidden[start : start + length], attention_mask=None)
+            outputs.append(output)
+        if start + length < end:
+            # Keep padding gradients explicitly zero in the reference input.
+            outputs.append(hidden[start + length : end] * 0)
+    return torch.cat(outputs, dim=0)
+
+
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TE and HAVE_HADAMARD),
     reason="needs CUDA, TE and the real Hadamard kernel",
 )
 @pytest.mark.parametrize("cp_size", [2, 4])
 @pytest.mark.parametrize(
-    "ratio,backend,sparse,coeff,recompute",
+    "ratio,sparse,coeff,recompute",
     [
-        (0, "cudnn", True, 0.0, False),
-        (4, "none", True, 0.2, False),
-        (4, "cudnn", True, 0.2, True),
-        (4, "cudnn", False, 0.0, False),
-        (4, "cudnn", False, 0.2, False),
-        (128, "cudnn", True, 0.0, True),
+        (0, True, 0.0, False),
+        (4, True, 0.2, True),
+        (4, False, 0.0, False),
+        (4, False, 0.2, False),
+        (128, True, 0.0, True),
     ],
 )
-def test_packed_cp_matches_full_attention_and_gradients(
-    cp_size, ratio, backend, sparse, coeff, recompute
-):
+def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, coeff, recompute):
     if Utils.world_size < cp_size:
         pytest.skip(f"requires {cp_size} ranks")
-    if backend == "cudnn":
-        pytest.importorskip("flash_mla")
-        pytest.importorskip("cudnn.deepseek_sparse_attention")
-        # CI builds FlashMLA with FLASH_MLA_DISABLE_SM90=1. Keep native CP
-        # coverage on Hopper and run the real fused kernels on Blackwell.
-        if torch.cuda.get_device_capability()[0] < 10:
-            pytest.skip("Fused CSA CP tests require the SM100 kernels included in the CI image")
+    pytest.importorskip("flash_mla")
+    pytest.importorskip("cudnn.deepseek_sparse_attention")
+    # CI builds FlashMLA with FLASH_MLA_DISABLE_SM90=1.
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Fused CSA CP tests require the SM100 kernels included in the CI image")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
     )
@@ -80,6 +89,10 @@ def test_packed_cp_matches_full_attention_and_gradients(
         ref_pg.cp = _CP1()
         torch.manual_seed(198)
         model_parallel_cuda_manual_seed(198)
+        # A rank boundary cuts a document and a ratio-4 group. Real lengths
+        # exclude internal padding; a repeated prefix exercises empty documents.
+        physical_cu = [0, 133, 133, 1157, 2048]
+        real_cu = [0, 129, 129, 1141, 2016]
         cfg = _make_config(
             num_layers=1,
             hidden_size=256,
@@ -94,26 +107,29 @@ def test_packed_cp_matches_full_attention_and_gradients(
             dsa_indexer_topk=512,
             dsa_indexer_loss_coeff=coeff,
             dsa_indexer_use_sparse_loss=sparse,
-            dsa_kernel_backend=backend,
+            dsa_kernel_backend="cudnn",
             context_parallel_size=cp_size,
             attention_cp_layout="contiguous",
             linear_cp_layout="contiguous",
             qk_layernorm=True,
-            apply_rope_fusion=backend == "cudnn",
+            apply_rope_fusion=True,
             recompute_granularity="selective" if recompute else None,
             recompute_modules=["mla_up_proj"] if recompute else [],
         )
-        # Compare CP against native full attention with the same RoPE arithmetic.
-        # Switching fused/unfused RoPE also changes BF16 intermediate rounding,
-        # which can accumulate in weight gradients independently of CP.
-        ref_cfg = replace(cfg, context_parallel_size=1, dsa_kernel_backend="none")
+        # Keep RoPE arithmetic identical. Sum each document's auxiliary loss
+        # with one global divisor, matching the packed mean over real tokens.
+        ref_cfg = replace(
+            cfg,
+            context_parallel_size=1,
+            dsa_kernel_backend="none",
+            calculate_per_token_loss=True,
+            dsa_indexer_loss_coeff=coeff / real_cu[-1],
+        )
         model = _build_attention(cfg, 1, pg).cuda()
         reference = _build_attention(ref_cfg, 1, ref_pg).cuda()
         reference.load_state_dict(model.state_dict())
-        # A rank boundary cuts a document and a ratio-4 group. Real lengths
-        # exclude internal padding; a repeated prefix exercises empty documents.
-        physical = torch.tensor([0, 133, 133, 1157, 2048], dtype=torch.int32, device="cuda")
-        real = torch.tensor([0, 129, 129, 1141, 2016], dtype=torch.int32, device="cuda")
+        physical = torch.tensor(physical_cu, dtype=torch.int32, device="cuda")
+        real = torch.tensor(real_cu, dtype=torch.int32, device="cuda")
         packed = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=real,
@@ -129,7 +145,7 @@ def test_packed_cp_matches_full_attention_and_gradients(
         local = whole[rows].clone().requires_grad_()
         whole = whole.requires_grad_()
         output, _ = model(local, attention_mask=None, packed_seq_params=packed)
-        expected, _ = reference(whole, attention_mask=None, packed_seq_params=packed)
+        expected = _reference_per_document(reference, whole, physical_cu, real_cu)
         _assert_match(output, expected[rows])
         grad = torch.randn_like(expected)
         output.backward(grad[rows])

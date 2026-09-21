@@ -8,7 +8,6 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
     csa_indexer_loss_kernels,
     packed_layout,
-    packed_sparse_attention,
 )
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
@@ -66,13 +65,6 @@ def test_packed_indexer_metadata_and_loss_replay():
         return csa_indexer_loss_kernels.sparse_kl_loss(t, p, ids, 0.2, True, 256)
 
     assert_replays_bit_exact(loss, (target, predict, indices), backward=False, contention=True)
-    # The packed adapter routes KL through the same registered compiled reduction.
-    torch.testing.assert_close(
-        packed_sparse_attention._kl_loss_from_target_predict(
-            target, predict, indices, 0.2, True, 256
-        ),
-        loss(target, predict, indices),
-    )
 
 
 def test_async_context_parallel_collectives_replay():
