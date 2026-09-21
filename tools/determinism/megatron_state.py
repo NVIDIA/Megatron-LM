@@ -76,7 +76,19 @@ def capture_adam_state(wrapper) -> tuple[dict, dict]:
     The parameter order matches the IDs in the inner optimizer's state dict.
     """
     inner = wrapper.optimizer
-    state = inner.state_dict()
+    if any(
+        getattr(inner, name)
+        for name in (
+            "_optimizer_state_dict_pre_hooks",
+            "_optimizer_state_dict_post_hooks",
+            "_optimizer_step_pre_hooks",
+            "_optimizer_step_post_hooks",
+            "_optimizer_load_state_dict_pre_hooks",
+            "_optimizer_load_state_dict_post_hooks",
+        )
+    ):
+        raise UnverifiedState("Optimizer hooks require a separate adapter")
+    state = torch.optim.Optimizer.state_dict(inner)
     masters = []
     for group in inner.param_groups:
         masters.append(

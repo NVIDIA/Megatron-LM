@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -41,15 +42,16 @@ def _validate_pipeline_size(
         raise ValueError("VPP=2 requires the Megatron training adapter with PP=2")
 
 
-def _run_worker(command: list[str], env: dict, log) -> int:
+def _run_worker(command: list[str], env: dict, log, *, timeout: float = 600) -> int:
     """Give torchrun time to terminate its workers if a phase times out."""
     with subprocess.Popen(
         command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
     ) as child:
         try:
-            return child.wait(timeout=600)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGTERM)
+            return child.wait(timeout=timeout)
+        except BaseException:
+            if child.poll() is None:
+                os.killpg(child.pid, signal.SIGTERM)
             try:
                 child.wait(timeout=30)
             except subprocess.TimeoutExpired:
@@ -157,6 +159,7 @@ def run_protocol(
     pipeline_size: int = 1,
     virtual_pipeline_size: int = 1,
     optimizer_mode: str = "standard",
+    phase_timeout: float = 600,
 ) -> dict:
     """Run two independent trainings, a resume, and a deliberately broken resume.
 
@@ -164,6 +167,8 @@ def run_protocol(
     worker logs remain available when a comparison or child process fails.
     """
     capture = capture_configuration(steps, checkpoint_step, stop_step)
+    if not math.isfinite(phase_timeout) or phase_timeout <= 0:
+        raise ValueError("Phase timeout must be finite and positive")
     if backend not in ("cpu", "mcore_gpt", "megatron_gpt") or world_size not in (1, 2, 4, 8):
         raise ValueError("Unsupported backend or world size")
     if backend == "cpu" and world_size != 1:
@@ -193,6 +198,7 @@ def run_protocol(
         "checkpoint_step": checkpoint_step,
         "control_injection": f"omit_restore_{control}",
         "capture": capture,
+        "phase_timeout_seconds": phase_timeout,
     }
     worker_env = dict(os.environ)
     for key in list(worker_env):
@@ -209,6 +215,10 @@ def run_protocol(
         ) or key.startswith("TORCHELASTIC_"):
             worker_env.pop(key)
     try:
+        if backend != "cpu" and not (ROOT / "megatron/determinism/__init__.py").is_file():
+            raise UnverifiedState(
+                "GPU state replay requires the shared startup API from MCore #7419"
+            )
         for name in ("reference", "repeat", "resume", "control"):
             command = [sys.executable]
             if backend != "cpu":
@@ -250,7 +260,7 @@ def run_protocol(
                 command += ["--omit-restore", control]
             (output / f"{name}-command.json").write_text(json.dumps(command, indent=2) + "\n")
             with (output / f"{name}.log").open("w") as log:
-                exit_code = _run_worker(command, worker_env, log)
+                exit_code = _run_worker(command, worker_env, log, timeout=phase_timeout)
             if exit_code:
                 result.update(reason=f"{name} worker failed", exit_code=exit_code)
                 return result
@@ -281,13 +291,31 @@ def run_protocol(
                 world_size=world_size,
                 comparison="resume",
             )
+        # Omitted state must affect downstream training state. An RNG-only
+        # difference does not establish sensitivity of model/gradient capture.
+        result["control_effect"] = compare_runs(
+            output / "reference",
+            output / "control",
+            steps=(
+                [stop_step]
+                if stop_step is not None
+                else list(range(checkpoint_step + 1, steps + 1))
+            ),
+            world_size=world_size,
+            comparison="resume",
+            components=sorted({"model", "gradients", "optimizer"} - {control}),
+        )
         observed = (
             result["fresh"].get("comparison_status") == "equal"
             and result["resume"].get("comparison_status") == "equal"
             and result["control"].get("comparison_status") == "different"
+            and result["control_effect"].get("comparison_status") == "different"
         )
         result["expected_observations"] = observed
-        if any(result[name]["status"] == "not_verified" for name in ("fresh", "resume", "control")):
+        if any(
+            result[name]["status"] == "not_verified"
+            for name in ("fresh", "resume", "control", "control_effect")
+        ):
             result["reason"] = "At least one comparison has incomplete or ineligible evidence"
         elif observed:
             result["status"] = "passed"
@@ -313,8 +341,11 @@ def run_stop_points(
     pipeline_size: int = 1,
     virtual_pipeline_size: int = 1,
     optimizer_mode: str = "standard",
+    phase_timeout: float = 600,
 ) -> dict:
     """Run a separate four-launch protocol for every selected target step."""
+    if not math.isfinite(phase_timeout) or phase_timeout <= 0:
+        raise ValueError("Phase timeout must be finite and positive")
     _validate_pipeline_size(backend, pipeline_size, virtual_pipeline_size)
     _validate_optimizer_mode(backend, pipeline_size, virtual_pipeline_size, optimizer_mode)
     if not stop_steps or len(set(stop_steps)) != len(stop_steps):
@@ -336,6 +367,7 @@ def run_stop_points(
         "stop_steps": sorted(stop_steps),
         "control_injection": f"omit_restore_{control}",
         "targets": [],
+        "phase_timeout_seconds": phase_timeout,
     }
     try:
         for step in sorted(stop_steps):
@@ -350,6 +382,7 @@ def run_stop_points(
                 pipeline_size=pipeline_size,
                 virtual_pipeline_size=virtual_pipeline_size,
                 optimizer_mode=optimizer_mode,
+                phase_timeout=phase_timeout,
             )
             result["targets"].append(target)
         statuses = {target["status"] for target in result["targets"]}
@@ -366,6 +399,12 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--backend", choices=("cpu", "mcore_gpt", "megatron_gpt"), required=True)
     parser.add_argument("--world-size", type=int, default=1)
+    parser.add_argument(
+        "--phase-timeout",
+        type=float,
+        default=600,
+        help="Seconds allowed for each fresh worker phase",
+    )
     parser.add_argument("--pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument("--virtual-pipeline-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
@@ -383,20 +422,31 @@ def main() -> int:
     )
     args = parser.parse_args()
     run = run_protocol if args.stop_steps is None else run_stop_points
-    result = run(
-        args.output,
-        backend=args.backend,
-        world_size=args.world_size,
-        pipeline_size=args.pipeline_size,
-        virtual_pipeline_size=args.virtual_pipeline_size,
-        optimizer_mode=args.optimizer_mode,
-        steps=args.steps,
-        checkpoint_step=args.checkpoint_step,
-        control=args.control,
-        **({} if args.stop_steps is None else {"stop_steps": args.stop_steps}),
-    )
+    try:
+        result = run(
+            args.output,
+            backend=args.backend,
+            world_size=args.world_size,
+            pipeline_size=args.pipeline_size,
+            virtual_pipeline_size=args.virtual_pipeline_size,
+            optimizer_mode=args.optimizer_mode,
+            phase_timeout=args.phase_timeout,
+            steps=args.steps,
+            checkpoint_step=args.checkpoint_step,
+            control=args.control,
+            **({} if args.stop_steps is None else {"stop_steps": args.stop_steps}),
+        )
+    except (ValueError, OSError) as error:
+        print(f"State replay not verified: {error}", file=sys.stderr)
+        return 2
     return {"passed": 0, "failed": 1, "not_verified": 2}[result["status"]]
 
 
 if __name__ == "__main__":
+
+    def terminate(signum, _frame):
+        """Let worker cleanup run when the scheduler cancels this controller."""
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
     raise SystemExit(main())

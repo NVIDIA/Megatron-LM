@@ -229,7 +229,7 @@ def _provenance(backend: str, world_size: int, device: torch.device, *, capture:
             "DP": 1,
             "precision": "fp32",
             "optimizer": "torch.optim.AdamW(foreach=False,fused=False)",
-            "scheduler": "StepLR(step_size=2,gamma=0.9)",
+            "scheduler": "StepLR(step_size=3,gamma=0.9)",
             "loss": "MSE" if backend == "cpu" else "mean_squared_local_logits",
         },
     }
@@ -267,7 +267,7 @@ def run_worker(args: argparse.Namespace) -> None:
         raise ValueError("The tiny GPT pilot supports TP=1,2,4,8 and no DP/PP/FSDP")
     model, device = _initialize(args.backend, world_size)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.002, foreach=False, fused=False)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.9)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.9)
     data = PilotData(args.backend, device)
     provenance = _provenance(args.backend, world_size, device, capture=capture)
     captured_steps = []

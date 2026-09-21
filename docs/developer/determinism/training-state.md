@@ -60,7 +60,7 @@ The H100 and GB200 `determinism-state.yaml` recipes each select two per-step job
 `mcore_gpt` pilot and the `megatron_gpt` training adapter, with eight and four
 ranks respectively. They use the existing integration-test
 selection path; actual scheduling still depends on the CI scope and protected
-runner approval. Each also adds seven stop-point jobs to nightly cadence (or an
+runner approval. Each also adds six stop-point jobs to nightly cadence (or an
 explicit cadence bypass): both original GPU adapters plus TP=2/PP=2 training
 with one or two virtual chunks, the precision-aware optimizer recipe below,
 and the hybrid CPU/GPU Adam recipe below,
@@ -348,3 +348,10 @@ uninstrumented recipe for performance measurements. Per-step capture can also
 change scheduling between steps. The stop-point mode removes earlier diagnostic
 snapshots, but final production validation still needs the original recipe's
 execution and contention conditions and complete adapters for its state.
+
+The broken-resume control must change model, gradient, or optimizer state beyond
+the omitted component. An RNG-only or scheduler-counter-only difference does not
+pass the sensitivity gate. Each worker phase has a configurable `--phase-timeout`
+(default 600 seconds); interruption terminates the worker process group. GPU
+workers require the shared startup API from #7419; hybrid capture also requires
+the optimizer state fixes from #7449. These are landing prerequisites.

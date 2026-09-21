@@ -341,15 +341,27 @@ def _read_completion(directory: Path, rank: int, world_size: int, steps: list[in
     return record
 
 
-def _first_difference(left: Path, right: Path, a: dict, b: dict) -> dict | None:
+def _first_difference(left: Path, right: Path, a: dict, b: dict, components=None) -> dict | None:
+    def selected(record):
+        return [
+            item for item in record["index"] if components is None or item["path"][0] in components
+        ]
+
+    def descriptor(item):
+        return {key: value for key, value in item.items() if key != "offset"} if item else item
+
     with left.with_suffix(".bin").open("rb") as x, right.with_suffix(".bin").open("rb") as y:
-        for item, other in zip_longest(a["index"], b["index"]):
-            if item != other:
+        for item, other in zip_longest(selected(a), selected(b)):
+            # Omitted components can change offsets without changing selected state.
+            if descriptor(item) != descriptor(other):
                 return {
                     "path": (item or other)["path"],
                     "reason": "structure_dtype_shape_or_scalar",
                 }
             remaining = item.get("nbytes", 0)
+            if remaining:
+                x.seek(item["offset"])
+                y.seek(other["offset"])
             offset = 0
             while remaining:
                 size = min(remaining, 1024 * 1024)
@@ -447,7 +459,13 @@ def read_checkpoint_record(directory: Path, *, step: int, rank: int) -> dict:
 
 
 def compare_runs(
-    reference: Path, candidate: Path, *, steps: list[int], world_size: int, comparison: str
+    reference: Path,
+    candidate: Path,
+    *,
+    steps: list[int],
+    world_size: int,
+    comparison: str,
+    components: list[str] | None = None,
 ) -> dict:
     """Compare every declared rank/step and report the first observed divergence.
 
@@ -458,6 +476,14 @@ def compare_runs(
     provenance are evidence supplied by the capture protocol, not attestation.
     """
     result: dict = {"kind": FORMAT, "status": "not_verified", "comparison": comparison}
+    if components is not None:
+        if (
+            not components
+            or len(set(components)) != len(components)
+            or set(components) - set(COMPONENTS)
+        ):
+            return result | {"reason": "Invalid component comparison scope"}
+        result["components"] = components
     if not steps or any(type(step) is not int or step < 1 for step in steps):
         return result | {"reason": "A nonempty list of positive steps is required"}
     if (
@@ -564,7 +590,7 @@ def compare_runs(
         compared = 0
         difference = None
         for step, rank, paths, records in pairs:
-            difference = _first_difference(paths[0], paths[1], records[0], records[1])
+            difference = _first_difference(paths[0], paths[1], records[0], records[1], components)
             compared += 1
             if difference:
                 difference.update(step=step, rank=rank)

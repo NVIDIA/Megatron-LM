@@ -48,7 +48,7 @@ def test_unsupported_optimizer_modes_fail_before_output(
     assert not output.exists()
 
 
-@pytest.mark.parametrize("control,first_component", [("rng", "model"), ("scheduler", "scheduler")])
+@pytest.mark.parametrize("control,first_component", [("rng", "model"), ("scheduler", "optimizer")])
 def test_cpu_training_replay_resume_and_omitted_state_control(tmp_path, control, first_component):
     output = tmp_path / "protocol"
     result = run_protocol(
@@ -60,6 +60,12 @@ def test_cpu_training_replay_resume_and_omitted_state_control(tmp_path, control,
     assert result["resume"]["comparison_status"] == "equal"
     assert result["resume"]["compared_snapshots"] == 2
     assert result["control"]["comparison_status"] == "different"
+    assert result["control_effect"]["comparison_status"] == "different"
+    assert result["control_effect"]["first_difference"]["path"][0] in (
+        "model",
+        "gradients",
+        "optimizer",
+    )
     assert result["control"]["first_difference"]["step"] == 3
     assert result["control"]["first_difference"]["rank"] == 0
     assert result["control"]["first_difference"]["path"][0] == first_component
@@ -315,3 +321,46 @@ def test_virtual_pipeline_requires_real_training_with_two_physical_stages(tmp_pa
             stop_steps=[3, 5],
         )
     assert not (tmp_path / "invalid").exists()
+
+
+@pytest.mark.parametrize("run", [run_protocol, run_stop_points])
+@pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
+def test_invalid_phase_timeout_precedes_launch(tmp_path, run, timeout):
+    output = tmp_path / "invalid-timeout"
+    with pytest.raises(ValueError, match="timeout"):
+        run(
+            output,
+            backend="cpu",
+            world_size=1,
+            steps=4,
+            checkpoint_step=2,
+            control="rng",
+            phase_timeout=timeout,
+            **({"stop_steps": [3]} if run is run_stop_points else {}),
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("component", ["rng", "scheduler"])
+def test_control_without_downstream_effect_cannot_pass(tmp_path, monkeypatch, component):
+    monkeypatch.setattr(replay, "_run_worker", lambda *args, **kwargs: 0)
+
+    def compare(reference, candidate, **kwargs):
+        different = candidate.name == "control" and "components" not in kwargs
+        return {
+            "status": "different" if different else "equal",
+            "comparison_status": "different" if different else "equal",
+            "first_difference": {"path": [component]} if different else None,
+        }
+
+    monkeypatch.setattr(replay, "compare_runs", compare)
+    result = run_protocol(
+        tmp_path / "protocol",
+        backend="cpu",
+        world_size=1,
+        steps=4,
+        checkpoint_step=2,
+        control=component,
+    )
+    assert result["status"] == "failed"
+    assert not result["expected_observations"]

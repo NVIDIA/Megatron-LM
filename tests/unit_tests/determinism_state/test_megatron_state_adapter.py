@@ -701,3 +701,22 @@ def test_hybrid_pending_transfer_is_rejected_before_capture_barrier(monkeypatch,
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: pytest.fail("Barrier masked transfer"))
     with pytest.raises(UnverifiedState, match="pending transfer"):
         capture.capture([], optimizer, None, 3)
+
+
+def test_adam_capture_rejects_serialization_hooks_before_they_hide_state():
+    _, wrapper = trained_adam()
+    hook = wrapper.optimizer.register_state_dict_post_hook(lambda *_: {})
+    try:
+        with pytest.raises(UnverifiedState, match="hooks require a separate adapter"):
+            capture_adam_state(wrapper)
+    finally:
+        hook.remove()
+
+
+def test_adam_capture_reads_live_slots_without_custom_serializer(monkeypatch):
+    _, wrapper = trained_adam()
+    monkeypatch.setattr(
+        wrapper.optimizer, "state_dict", lambda: pytest.fail("Custom serializer invoked")
+    )
+    state, _ = capture_adam_state(wrapper)
+    assert state["state"]["state"]

@@ -333,3 +333,18 @@ def test_resume_cannot_mix_two_valid_checkpoint_identities(tmp_path, pair):
     result = compare(roots, steps=(3, 4), comparison="resume")
     assert result["status"] == "not_verified"
     assert "Checkpoint step differs" in result["reason"]
+
+
+def test_component_comparison_seeks_past_changed_unselected_state(pair, state):
+    changed = copy.deepcopy(state)
+    changed["rng"]["extra"] = b"a new and larger field changes later byte offsets"
+    roots = pair(right=changed)
+    assert compare(roots)["comparison_status"] == "different"
+    selected = states.compare_runs(
+        *roots,
+        steps=[1],
+        world_size=1,
+        comparison="fresh",
+        components=["model", "gradients", "optimizer", "scheduler"],
+    )
+    assert selected["comparison_status"] == "equal"
