@@ -52,6 +52,11 @@ _VALUE_DTYPE_BF16 = 2
 _HADAMARD_CACHE = {}
 _MIN_MEMORY_TRITON_ENABLED = True
 
+# Key width the Triton router streams internally, in ``triton_topk_index_block``. It bounds what a
+# routing call actually holds, whatever key chunk the caller streams on the outside, so the
+# execution planner budgets against it rather than against the caller's key chunk.
+ROUTER_KEY_SUB_BLOCK = 256
+
 
 def set_min_memory_triton_enabled(enabled: bool) -> bool:
     """Enable or disable optional Triton dispatch for the active min-memory backend call."""
@@ -2695,7 +2700,7 @@ def triton_topk_index_block(
     block_topk = min(topk, key_len)
     # Keep the Tensor Core tiled kernel in a compile-friendly key width and merge sub-block top-k
     # results exactly the same way the outer streamed router merges key chunks.
-    sub_block_n = 256
+    sub_block_n = ROUTER_KEY_SUB_BLOCK
     if key_len <= sub_block_n:
         tiled = _triton_topk_index_block_tiled_once(
             q_index, weights, k_index, topk, q_start, k_start, apply_relu, score_scale
