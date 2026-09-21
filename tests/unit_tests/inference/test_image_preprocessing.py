@@ -209,7 +209,7 @@ def test_torch_bicubic_antialias_resize_mode_uses_tensor_resize(monkeypatch):
     assert imgs_sizes.tolist() == [[4, 4]]
 
 
-def test_image_list_applies_model_length_budget_per_request(monkeypatch):
+def test_image_list_applies_model_length_budget_per_request(monkeypatch, caplog):
     observed_budgets = []
 
     def fake_preprocess(_payload, config, target_hw=None, device=None):
@@ -221,6 +221,7 @@ def test_image_list_applies_model_length_budget_per_request(monkeypatch):
         image_preprocessing,
     )
 
+    image_preprocessing._warn_multi_image_patch_budget.cache_clear()
     monkeypatch.setattr(image_preprocessing, "preprocess_image_bytes", fake_preprocess)
     config = ImageProcessingConfig(
         patch_dim=2,
@@ -232,9 +233,13 @@ def test_image_list_applies_model_length_budget_per_request(monkeypatch):
         dynamic_resolution_model_length=5,
     )
 
-    preprocess_image_bytes_list([b"first", b"second", b"third"], config)
+    with caplog.at_level("WARNING"):
+        preprocess_image_bytes_list([b"first", b"second", b"third"], config)
+        preprocess_image_bytes_list([b"first", b"second", b"third"], config)
 
-    assert observed_budgets == [6, 6, 6]
+    assert observed_budgets == [6, 6, 6, 6, 6, 6]
+    assert caplog.text.count("may use more patches per image when given more images") == 1
+    image_preprocessing._warn_multi_image_patch_budget.cache_clear()
 
 
 def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):

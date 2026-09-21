@@ -9,8 +9,10 @@ can import it without circular dependencies.
 
 import io
 import json
+import logging
 import math
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +21,18 @@ import torch
 
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
+
+logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _warn_multi_image_patch_budget() -> None:
+    """Warn once per process about Nemotron's counter-intuitive image budget."""
+    logger.warning(
+        "Nemotron VL 3.5 may use more patches per image when given more images. "
+        "This is counter-intuitive and likely a processor bug, but users can set "
+        "dynamic_resolution_max_patches to cap the patches used per image."
+    )
 
 
 def _resolve_pixel_stats(vision_model_type: str):
@@ -329,6 +343,12 @@ def preprocess_image_bytes_list(
             raise ValueError("dynamic_resolution_model_length must be greater than 4.")
         merge_size = max(int(config.spatial_merge_size), 1)
         model_patch_budget = (model_length - 4) * (merge_size * merge_size)
+        # NOTE(@cspades): Oddly, Nemotron VL 3.5 uses more patches per image when given more images.
+        # This is counter-intuitive and likely a bug:
+        # https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16/blob/main/image_processing.py#L98
+        # Until fixed, manually control patches per image using dynamic_resolution_max_patches.
+        if len(image_bytes_list) > 1:
+            _warn_multi_image_patch_budget()
         request_patch_budget = max(
             model_patch_budget, int(config.dynamic_resolution_min_patches) * len(image_bytes_list)
         )
