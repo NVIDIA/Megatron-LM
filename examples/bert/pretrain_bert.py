@@ -7,27 +7,32 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.core import tensor_parallel
-from megatron.core.enums import ModelType
-from megatron.core.models.bert.bert_model import BertModel
-from megatron.training import pretrain
-from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec, bert_layer_local_spec
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
-from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
+from megatron.core.datasets.bert_dataset import (
+    BERTMaskedWordPieceDataset,
+    BERTMaskedWordPieceDatasetConfig,
+)
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.utils import get_blend_from_list
+from megatron.core.enums import ModelType
+from megatron.core.models.bert.bert_layer_specs import (
+    bert_layer_local_spec,
+    bert_layer_with_transformer_engine_spec,
+)
+from megatron.core.models.bert.bert_model import BertModel
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.utils import average_losses_across_data_parallel_group
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
     """Build the model."""
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     print_rank_0('building BERT model ...')
 
@@ -55,7 +60,9 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
         parallel_output=True,
         pre_process=pre_process,
         post_process=post_process,
-        vp_stage=vp_stage)
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
+    )
 
     return model
 

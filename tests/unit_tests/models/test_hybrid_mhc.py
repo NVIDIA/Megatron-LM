@@ -292,6 +292,7 @@ class TestHybridStackMHC:
             max_sequence_length=8,
             hybrid_layer_pattern="M*-",
             parallel_output=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         input_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
         position_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
@@ -316,6 +317,7 @@ class TestHybridStackMHC:
             max_sequence_length=8,
             hybrid_layer_pattern="-/-",
             parallel_output=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         input_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
         position_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))

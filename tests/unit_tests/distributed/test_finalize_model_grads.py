@@ -240,6 +240,7 @@ class TestAllReduceLNGrads:
             vocab_size=100,
             max_sequence_length=4,
             share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def setup_method(self, method):

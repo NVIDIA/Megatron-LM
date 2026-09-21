@@ -1330,6 +1330,7 @@ class TestRLUtils:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
             max_sequence_length=32,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
 
         ddp_config = DistributedDataParallelConfig(
@@ -1389,6 +1390,7 @@ class TestRLUtils:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
             max_sequence_length=32,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
 
         ddp_config = DistributedDataParallelConfig(
@@ -1518,6 +1520,7 @@ class TestRLUtils:
             max_sequence_length=4192,
             pre_process=is_pp_first_stage(pp_group),
             post_process=is_pp_last_stage(pp_group),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         sequence_length = gpt_model.max_sequence_length
 
@@ -1594,6 +1597,7 @@ class TestRLUtils:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
             max_sequence_length=32,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
 
         # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs

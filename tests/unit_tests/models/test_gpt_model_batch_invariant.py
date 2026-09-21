@@ -17,6 +17,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
@@ -120,6 +121,7 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
         vocab_size=vocab_size,
         max_sequence_length=seq_len,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     return model.cuda().eval()
 

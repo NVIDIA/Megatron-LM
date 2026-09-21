@@ -123,6 +123,7 @@ def get_language_model_spec(hidden_size, vocab_size, seq_len):
             "max_sequence_length": seq_len,
             "pre_process": True,
             "post_process": True,
+            "pg_collection": ProcessGroupCollection.use_mpu_process_groups(),
         },
     )
 
@@ -455,6 +456,7 @@ class TestMimoModel:
                 "max_sequence_length": self.seq_len,
                 "pre_process": True,
                 "post_process": True,
+                "pg_collection": ProcessGroupCollection.use_mpu_process_groups(),
             },
         )
         mimo_config = MimoModelConfig(
