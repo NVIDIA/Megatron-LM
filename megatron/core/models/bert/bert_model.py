@@ -126,6 +126,7 @@ class BertModel(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.cp_group,
             )
 
         # Transformer.

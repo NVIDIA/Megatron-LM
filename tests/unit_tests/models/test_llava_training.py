@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import _rank_utils
+from megatron.core import _rank_utils, parallel_state
 from megatron.core.models.multimodal import context_parallel, llava_model
 from megatron.core.models.multimodal.llava_model import (
     IGNORE_INDEX,
@@ -50,7 +50,7 @@ class _PatchIdentityEncoder(torch.nn.Module):
         return images[..., :2].contiguous() + 1000
 
 
-def _make_model(cp_size=1):
+def _make_model(cp_size=1, cp_group=None):
     """Build only the state needed by the real forward and preprocessing methods."""
     model = object.__new__(LLaVAModel)
     torch.nn.Module.__init__(model)
@@ -72,7 +72,7 @@ def _make_model(cp_size=1):
     model.dynamic_resolution = True
     model.context_parallel_lm = cp_size
     model.sequence_parallel_lm = False
-    model.pg_collection = SimpleNamespace(tp=None)
+    model.pg_collection = SimpleNamespace(tp=None, cp=cp_group)
     model.use_loss_scaling = False
     model._drop_vision_class_token = True
     model._pixel_shuffle = False
@@ -226,10 +226,22 @@ def test_forward_cp_loss_scaling_rejects_all_ignored_labels(device):
 
 
 @pytest.fixture
-def vision_cp_group():
+def vision_cp_group(monkeypatch):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+    group = parallel_state.get_context_parallel_group()
+
+    def forbid_global_cp():
+        raise AssertionError("Vision CP must use the model's supplied group")
+
     try:
-        yield
+        with monkeypatch.context() as patch:
+            for name in (
+                "get_context_parallel_group",
+                "get_context_parallel_rank",
+                "get_context_parallel_world_size",
+            ):
+                patch.setattr(parallel_state, name, forbid_global_cp)
+            yield group
     finally:
         Utils.destroy_model_parallel()
 
@@ -238,8 +250,12 @@ def vision_cp_group():
 @pytest.mark.parametrize("balance_by_tokens", [False, True])
 @pytest.mark.parametrize("dummy_rank", [False, True])
 def test_dynamic_vision_cp_matches_unsharded_preprocessing(
-    device, vision_cp_group, balance_by_tokens, dummy_rank
+    device, vision_cp_group, monkeypatch, balance_by_tokens, dummy_rank
 ):
+    splitter = mock.Mock(wraps=llava_model.split_to_context_parallel_ranks_dynamic_res)
+    gatherer = mock.Mock(wraps=llava_model.gather_from_context_parallel_ranks_dynamic_res)
+    monkeypatch.setattr(llava_model, "split_to_context_parallel_ranks_dynamic_res", splitter)
+    monkeypatch.setattr(llava_model, "gather_from_context_parallel_ranks_dynamic_res", gatherer)
     sizes = [[4, 8]] if dummy_rank else [[4, 4], [4, 4], [4, 8]]
     frames = [1] if dummy_rank else [2, 1]
     expected_counts = [8] if dummy_rank else [8, 8]
@@ -264,7 +280,7 @@ def test_dynamic_vision_cp_matches_unsharded_preprocessing(
     outputs = []
     masks = []
     for cp_size in (1, 2):
-        model = _make_model(cp_size)
+        model = _make_model(cp_size, cp_group=vision_cp_group if cp_size > 1 else None)
         model.add_encoder = True
         model.vision_model = _PatchIdentityEncoder()
         model._balance_vision_context_parallel_by_tokens = balance_by_tokens
@@ -290,8 +306,121 @@ def test_dynamic_vision_cp_matches_unsharded_preprocessing(
         )
     models[0]._process_embedding_token_parallel.assert_not_called()
     models[1]._process_embedding_token_parallel.assert_called_once()
-    if dummy_rank and context_parallel.get_context_parallel_rank() == 1:
+    splitter.assert_called_once()
+    gatherer.assert_called_once()
+    assert splitter.call_args.kwargs["cp_group"] is vision_cp_group
+    assert gatherer.call_args.kwargs["cp_group"] is vision_cp_group
+    assert gatherer.call_args.kwargs["num_padded_imgs"] == int(dummy_rank)
+    if dummy_rank and vision_cp_group.rank() == 1:
         assert models[1].vision_model.imgs_sizes.tolist() == [[2, 2]]
+
+
+@pytest.mark.internal
+def test_static_vision_cp_matches_unsharded_preprocessing(device, vision_cp_group, monkeypatch):
+    """Static vision splitting uses the supplied CP group and removes rank padding."""
+    splitter = mock.Mock(wraps=llava_model.split_to_context_parallel_ranks)
+    gatherer = mock.Mock(wraps=llava_model.gather_from_context_parallel_ranks)
+    monkeypatch.setattr(llava_model, "split_to_context_parallel_ranks", splitter)
+    monkeypatch.setattr(llava_model, "gather_from_context_parallel_ranks", gatherer)
+
+    class StaticIdentityEncoder(torch.nn.Module):
+        class_token_len = 0
+
+        def forward(self, images):
+            return images + 1000
+
+    images = torch.arange(6, dtype=torch.float32, device=device).reshape(3, 1, 2)
+    input_ids = torch.tensor([[11, -200, 12, -200, 13, -200, 14]], device=device)
+    outputs = []
+    masks = []
+    for cp_size in (1, 2):
+        model = _make_model(cp_size, cp_group=vision_cp_group if cp_size > 1 else None)
+        model.add_encoder = True
+        model.dynamic_resolution = False
+        model.vision_model = StaticIdentityEncoder()
+        model._preprocess_data = mock.Mock(wraps=model._preprocess_data)
+        output, loss_mask = model(
+            images=images,
+            input_ids=input_ids,
+            position_ids=None,
+            attention_mask=None,
+            labels=input_ids.roll(-1, dims=1),
+            loss_mask=torch.ones_like(input_ids, dtype=torch.float32),
+        )
+        outputs.append(output if cp_size == 1 else output.transpose(0, 1))
+        masks.append(loss_mask)
+        torch.testing.assert_close(
+            model._preprocess_data.call_args.args[0],
+            (images + 1000).transpose(0, 1),
+            rtol=0,
+            atol=0,
+        )
+
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+    torch.testing.assert_close(masks[1], masks[0], rtol=0, atol=0)
+    splitter.assert_called_once()
+    gatherer.assert_called_once()
+    assert splitter.call_args.kwargs["cp_group"] is vision_cp_group
+    assert gatherer.call_args.kwargs["cp_group"] is vision_cp_group
+    assert gatherer.call_args.args[1] == 1
+
+
+@pytest.mark.internal
+def test_temporal_vision_cp_matches_unsharded_preprocessing(device, vision_cp_group, monkeypatch):
+    """Temporal metadata and embeddings gather on the same supplied CP group."""
+
+    class TemporalIdentityEncoder(torch.nn.Module):
+        dynamic_resolution = True
+        patch_dim = 2
+        class_token_len = 0
+
+        def forward(self, images, *, imgs_sizes, packed_seq_params, num_frames):
+            # Every frame is one patch; compress each pair into one tubelet token.
+            assert all(count % 2 == 0 for count in num_frames)
+            embeddings = images.reshape(1, -1, 2, 12).mean(dim=2)[..., :2] + 1000
+            sizes = imgs_sizes[::2].contiguous()
+            return embeddings, sizes, None
+
+    monkeypatch.setattr(llava_model, "RADIOViTModel", TemporalIdentityEncoder)
+    gatherer = mock.Mock(wraps=llava_model.gather_from_context_parallel_ranks_dynamic_res)
+    monkeypatch.setattr(llava_model, "gather_from_context_parallel_ranks_dynamic_res", gatherer)
+    images = torch.arange(72, dtype=torch.float32, device=device).reshape(1, 6, 12)
+    input_ids = torch.tensor([[11, -200, 12, -200, 13]], device=device)
+    outputs = []
+    masks = []
+    for cp_size in (1, 2):
+        model = _make_model(cp_size, cp_group=vision_cp_group if cp_size > 1 else None)
+        model.add_encoder = True
+        model.temporal_patch_dim = 2
+        model.vision_model = TemporalIdentityEncoder()
+        model._preprocess_data = mock.Mock(wraps=model._preprocess_data)
+        output, loss_mask = model(
+            images=images,
+            input_ids=input_ids,
+            position_ids=None,
+            attention_mask=None,
+            labels=input_ids.roll(-1, dims=1),
+            loss_mask=torch.ones_like(input_ids, dtype=torch.float32),
+            imgs_sizes=torch.tensor([[2, 2]] * 6, dtype=torch.int32, device=device),
+            num_frames=[4, 2],
+        )
+        outputs.append(output if cp_size == 1 else output.transpose(0, 1))
+        masks.append(loss_mask)
+        preprocess = model._preprocess_data.call_args
+        assert preprocess.kwargs["media_token_counts"].tolist() == [2, 1]
+        torch.testing.assert_close(
+            preprocess.args[0],
+            (images.reshape(3, 2, 12).mean(dim=1)[:, :2] + 1000).unsqueeze(1),
+            rtol=0,
+            atol=0,
+        )
+
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+    torch.testing.assert_close(masks[1], masks[0], rtol=0, atol=0)
+    assert gatherer.call_count == 3
+    for call in gatherer.call_args_list:
+        assert call.kwargs["cp_group"] is vision_cp_group
+        assert call.kwargs["num_padded_imgs"] == 0
 
 
 @pytest.mark.parametrize("profile_enabled", [False, True])
@@ -302,6 +431,7 @@ def test_vision_profiling_gate_uses_model_tp_group(device, monkeypatch, profile_
     model.vision_model = _PatchIdentityEncoder()
     model._profile_vision_context_parallel_partition = profile_enabled
     model.pg_collection.tp = object()
+    model.pg_collection.cp = object()
     rank_lookup = mock.Mock(return_value=tp_rank)
     monkeypatch.setattr(llava_model, "get_pg_rank", rank_lookup)
     splitter = mock.Mock(side_effect=RuntimeError("splitter reached"))
@@ -315,6 +445,7 @@ def test_vision_profiling_gate_uses_model_tp_group(device, monkeypatch, profile_
             attention_mask=None,
             imgs_sizes=torch.tensor([[4, 4]], device=device),
         )
+    assert splitter.call_args.kwargs["cp_group"] is model.pg_collection.cp
     assert splitter.call_args.kwargs["profile_partition"] == (profile_enabled and tp_rank == 0)
     if profile_enabled:
         rank_lookup.assert_called_once_with(model.pg_collection.tp)
@@ -327,8 +458,9 @@ def test_vision_profiling_gate_uses_model_tp_group(device, monkeypatch, profile_
 def test_partition_profile_logging_preserves_nonzero_global_rank(
     device, monkeypatch, caplog, cp_rank, profile_enabled
 ):
-    monkeypatch.setattr(context_parallel, "get_context_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(context_parallel, "get_context_parallel_rank", lambda: cp_rank)
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank)
+    monkeypatch.setattr(context_parallel, "get_pg_size", lambda group: group.size())
+    monkeypatch.setattr(context_parallel, "get_pg_rank", lambda group: group.rank())
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 6)
     monkeypatch.setattr(_rank_utils, "safe_get_rank", lambda: 6)
     caplog.set_level(logging.INFO, logger=context_parallel.__name__)
@@ -338,6 +470,7 @@ def test_partition_profile_logging_preserves_nonzero_global_rank(
         torch.ones(1, 8, 12, device=device),
         torch.tensor([[4, 4], [4, 4]], dtype=torch.int32, device=device),
         PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu),
+        cp_group=cp_group,
         patch_dim=2,
         profile_partition=profile_enabled,
     )

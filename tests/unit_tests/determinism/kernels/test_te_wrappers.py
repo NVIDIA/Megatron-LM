@@ -19,6 +19,7 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -151,6 +152,7 @@ class TestTEWrappers:
                     bias=False,
                     skip_bias_add=False,
                     is_expert=True,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .train()
@@ -288,6 +290,7 @@ class TestTEWrappers:
             bias=False,
             skip_bias_add=False,
             is_expert=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         m_splits = [4096, 13, 0, 2048, 1, 8191, 33, 1999]
         x = torch.randn(
@@ -394,6 +397,7 @@ class TestTEWrappers:
                     skip_bias_add=False,
                     is_expert=True,
                     name=name,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
 
         edge = build(0)

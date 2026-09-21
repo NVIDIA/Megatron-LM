@@ -2227,8 +2227,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 pg_collection, "cp"
             ), "TEDotProductAttention pg_collection must have cp pg"
             if cp_comm_type == "a2a+p2p":
-                assert hasattr(
-                    pg_collection, "hcp"
+                assert "hcp" in vars(
+                    pg_collection
                 ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
         self._tp_group = pg_collection.tp
 
@@ -2261,9 +2261,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
-                        check_initialized=False
-                    )
+                    # Both the explicit collection and the compatibility fallback carry hcp.
+                    extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
@@ -2587,8 +2586,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
-            if pg_collection is None:
-                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            assert pg_collection is not None, (
+                "TEGroupedLinear requires an explicit pg_collection; "
+                "see docs/developer/parallel-state-deprecation.md"
+            )
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"
             tp_group = pg_collection.expt_tp
