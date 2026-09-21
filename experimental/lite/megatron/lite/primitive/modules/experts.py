@@ -11,6 +11,7 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
+from megatron.core.fusions.fused_bias_geglu import weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.lora import (
@@ -37,6 +38,9 @@ def _expert_nvtx_range(name: str):
         torch.cuda.nvtx.range_pop()
 
 
+_QUICK_GELU_ALPHA = 1.702  # sigmoid slope of Core's quick_gelu
+
+
 def swiglu_with_probs(
     y: torch.Tensor,
     probs: torch.Tensor | None,
@@ -44,28 +48,26 @@ def swiglu_with_probs(
     swiglu_alpha: float = 1.0,
     swiglu_up_offset: float = 0.0,
 ) -> torch.Tensor:
-    """SwiGLU with optional expert probability scaling.
-
-    ``alpha=1, up_offset=0`` (the default) uses the fused ``bias_swiglu_impl`` kernel with its
-    built-in clamp. MiniMax-M3 (``swigluoai``) needs ``alpha=1.702, up_offset=1.0``, which the fused
-    kernel doesn't support, so that case falls back to an explicit fp32 computation:
-    ``(clamp(up) + up_offset) * clamp(gate) * sigmoid(alpha * gate)``.
-    """
-    if swiglu_alpha != 1.0 or swiglu_up_offset != 0.0:
-        gate, up = y.chunk(2, dim=-1)
-        if swiglu_limit > 0:
-            up = torch.clamp(up.float(), min=-swiglu_limit, max=swiglu_limit)
-            gate = torch.clamp(gate.float(), max=swiglu_limit)
-        else:
-            up, gate = up.float(), gate.float()
-        out = gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_up_offset)
-        if probs is not None:
-            out = out * probs
-        return out.to(dtype=y.dtype)
+    """``act(clamp(gate)) * (clamp(up) + offset) * probs`` via Core's fused swiglu / quick_geglu kernels."""
     clamp_value = swiglu_limit if swiglu_limit > 0 else None
+    if swiglu_alpha == 1.0 and swiglu_up_offset == 0.0:
+        if probs is not None:
+            return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
+        return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
+    if swiglu_alpha == _QUICK_GELU_ALPHA:
+        if probs is None:
+            probs = torch.ones(*y.shape[:-1], 1, dtype=y.dtype, device=y.device)
+        return weighted_bias_quick_geglu_impl(
+            y, None, probs, linear_offset=swiglu_up_offset, clamp_value=clamp_value
+        )
+    gate, up = y.chunk(2, dim=-1)
+    if clamp_value is not None:
+        gate = gate.clamp(max=clamp_value)
+        up = up.clamp(min=-clamp_value, max=clamp_value)
+    out = gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_up_offset)
     if probs is not None:
-        return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
-    return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
+        out = out * probs
+    return out.to(dtype=y.dtype)
 
 
 class _AllReduceETP(torch.autograd.Function):
