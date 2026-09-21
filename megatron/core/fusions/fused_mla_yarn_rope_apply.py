@@ -696,16 +696,20 @@ def _mla_rope_bwd_kv_split_kernel(
             dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
             x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
             mask = (i * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+            # ``other=0`` is required, not cosmetic: a masked-out lane is undefined without it,
+            # and these values are added unconditionally into the accumulators below and then
+            # reduced with ``tl.sum``. Every other masked load in this file feeds a masked store,
+            # which discards the invalid lanes; a reduction cannot.
             if REMOVE_INTERLEAVING:
                 x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
                 x_2_off = x_1_off + 1
-                x_left = tl.load(dK_ptr + x_1_off, mask=mask)
-                x_right = tl.load(dK_ptr + x_2_off, mask=mask)
+                x_left = tl.load(dK_ptr + x_1_off, mask=mask, other=0.0)
+                x_right = tl.load(dK_ptr + x_2_off, mask=mask, other=0.0)
             else:
                 x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
                 x_right_off = x_left_off + emb_dim // 2
-                x_left = tl.load(dK_ptr + x_left_off, mask=mask)
-                x_right = tl.load(dK_ptr + x_right_off, mask=mask)
+                x_left = tl.load(dK_ptr + x_left_off, mask=mask, other=0.0)
+                x_right = tl.load(dK_ptr + x_right_off, mask=mask, other=0.0)
             x_left_accum += x_left
             x_right_accum += x_right
         x_left_accum = tl.sum(x_left_accum, axis=0)
