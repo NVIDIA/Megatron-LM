@@ -845,9 +845,7 @@ try:
             multi_modal_data = {"image": image_bytes_list}
         elif video_bytes_list:
             multi_modal_data = {"video": video_bytes_list}
-        template_messages = _sanitize_messages_for_template(
-            messages, media_slots, prompt_config
-        )
+        template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
         template_tools = _sanitize_tools_for_template(tools)
 
         # The exact tokens of the previous turn can come from one of two places, never both:

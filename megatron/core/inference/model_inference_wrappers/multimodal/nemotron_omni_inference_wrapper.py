@@ -30,10 +30,7 @@ from megatron.core.utils import get_attr_wrapped_model
 
 
 def _render_nemotron_vl_video_prompt(
-    prompt_spec: MediaPromptSpec,
-    frame_indices: list[int],
-    fps: float,
-    temporal_patch_size: int,
+    prompt_spec: MediaPromptSpec, frame_indices: list[int], fps: float, temporal_patch_size: int
 ) -> str:
     """Render the canonical Nemotron-VL text and compact media slot per tubelet."""
     if any(type(index) is not int or index < 0 for index in frame_indices):
@@ -57,8 +54,7 @@ def _render_nemotron_vl_video_prompt(
             frame_label = "Frame" if offset == 0 else "frame"
             timestamp = frame_indices[frame_position] * frame_duration_ms / 1000.0
             descriptions.append(
-                f"{frame_label} {frame_position + 1} sampled at "
-                f"{timestamp:.2f} seconds"
+                f"{frame_label} {frame_position + 1} sampled at " f"{timestamp:.2f} seconds"
             )
         media_text = prompt_spec.prefix + prompt_spec.model_token + prompt_spec.suffix
         if prompt_spec.include_frame_timestamps_for_nemotron_vl:
@@ -95,12 +91,11 @@ def _replace_compact_video_slots(
             suffix_start = token_position + 1
             configured_suffix_end = suffix_start + len(compact_suffix_tokens)
             suffix_matches = (
-                sample_tokens[suffix_start:configured_suffix_end]
-                == compact_suffix_tokens
+                sample_tokens[suffix_start:configured_suffix_end] == compact_suffix_tokens
             )
-            has_wrapper = (
-                bool(compact_prefix_tokens) and prefix_matches
-            ) or (bool(compact_suffix_tokens) and suffix_matches)
+            has_wrapper = (bool(compact_prefix_tokens) and prefix_matches) or (
+                bool(compact_suffix_tokens) and suffix_matches
+            )
             if has_wrapper and not (prefix_matches and suffix_matches):
                 raise ValueError(
                     "Compact video marker must use either both configured "
@@ -132,14 +127,8 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
     supports_audio = False
 
     multimodal_prompt_config = MultimodalPromptConfig(
-        image_spec=MediaPromptSpec(
-            model_token="<image>", prefix="<img>", suffix="</img>"
-        ),
-        video_spec=MediaPromptSpec(
-            model_token="<image>",
-            prefix="<img>",
-            suffix="</img>",
-        ),
+        image_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
+        video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>"),
     )
 
     def get_preexpanded_media_token_id(self, modality: str) -> int:
@@ -235,9 +224,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
                     "Temporal video prompt expansion requires frame indices and FPS "
                     "for every compact video placeholder."
                 )
-            temporal_patch_size = int(
-                getattr(model.vision_model, "temporal_patch_dim", 1)
-            )
+            temporal_patch_size = int(getattr(model.vision_model, "temporal_patch_dim", 1))
             compact_prefix_tokens = tokenizer.tokenize(prompt_spec.prefix)
             compact_suffix_tokens = tokenizer.tokenize(prompt_spec.suffix)
 
@@ -260,9 +247,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
                     prompt_spec, indices, fps, temporal_patch_size
                 )
                 video_tokens = tokenizer.tokenize(rendered_video)
-                if sum(token == image_token_index for token in video_tokens) != len(
-                    video_counts
-                ):
+                if sum(token == image_token_index for token in video_tokens) != len(video_counts):
                     raise ValueError(
                         "Tokenizer did not preserve exactly one media token per "
                         "temporal video prompt group."
@@ -279,9 +264,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
                 per_video_tokens=per_video_tokens,
             )
             expanded_placeholder_count = sum(
-                token == image_token_index
-                for sample_tokens in tokens
-                for token in sample_tokens
+                token == image_token_index for sample_tokens in tokens for token in sample_tokens
             )
             if expanded_placeholder_count != len(replacement_counts):
                 raise ValueError(

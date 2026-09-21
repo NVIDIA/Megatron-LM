@@ -12,8 +12,8 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
@@ -154,10 +154,7 @@ def test_dynamic_video_embedding_counts_group_one_placeholder_per_video():
         frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2
     ) == [504]
     assert dynamic_media_replacement_counts(
-        frame_counts,
-        num_frames=torch.tensor(4),
-        temporal_patch_size=2,
-        aggregate_videos=False,
+        frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2, aggregate_videos=False
     ) == [252, 252]
 
 
@@ -210,9 +207,7 @@ def test_nemotron_video_expansion_adds_timestamped_tubelet_wrappers():
         "<img><image></img>"
     )
     assert expanded == [[11, 7, 77, -1, 78, 7, 77, -1, 78, 12]]
-    assert masks == [
-        [None, None, None, 0, None, None, None, 1, None, None]
-    ]
+    assert masks == [[None, None, None, 0, None, None, None, 1, None, None]]
 
 
 @pytest.mark.internal
@@ -226,10 +221,7 @@ def test_dynamic_video_embedding_counts_reject_misaligned_frames():
 @pytest.mark.internal
 def test_super_video_geometry_has_32_tubelets_and_8192_embeddings():
     counts = dynamic_media_replacement_counts(
-        [256] * 64,
-        num_frames=torch.tensor([64]),
-        temporal_patch_size=2,
-        aggregate_videos=False,
+        [256] * 64, num_frames=torch.tensor([64]), temporal_patch_size=2, aggregate_videos=False
     )
 
     assert len(counts) == 32

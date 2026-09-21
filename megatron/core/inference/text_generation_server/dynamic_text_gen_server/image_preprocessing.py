@@ -152,8 +152,7 @@ def dynamic_res_preprocess(
             closest_patch_width = round(orig_width / res_step + 0.5)
         else:
             raise ValueError(
-                "rounding_mode must be 'ceil' or 'round_plus_half', got "
-                f"{rounding_mode!r}."
+                "rounding_mode must be 'ceil' or 'round_plus_half', got " f"{rounding_mode!r}."
             )
         patches = closest_patch_height * closest_patch_width
 
@@ -161,13 +160,8 @@ def dynamic_res_preprocess(
         target_patch_height = math.floor(factor * closest_patch_height)
         target_patch_width = math.floor(factor * closest_patch_width)
 
-        should_enforce_minimum = (
-            rounding_mode != "round_plus_half" or max_patches > min_patches
-        )
-        if (
-            should_enforce_minimum
-            and target_patch_height * target_patch_width < min_patches
-        ):
+        should_enforce_minimum = rounding_mode != "round_plus_half" or max_patches > min_patches
+        if should_enforce_minimum and target_patch_height * target_patch_width < min_patches:
             up_factor = math.sqrt(min_patches / max(target_patch_height * target_patch_width, 1))
             target_patch_height = math.ceil(up_factor * target_patch_height)
             target_patch_width = math.ceil(up_factor * target_patch_width)
@@ -234,9 +228,7 @@ def preprocess_image(
         pixel_mean, pixel_std = _resolve_pixel_stats(vision_type)
 
     if config.dynamic_resolution_resize_mode == "pil":
-        transform = T.Compose(
-            [T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)]
-        )
+        transform = T.Compose([T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)])
         img_tensor = transform(img)  # [C, H, W]
     elif config.dynamic_resolution_resize_mode == "torch_bicubic_antialias":
         import torch.nn.functional as F
@@ -244,18 +236,11 @@ def preprocess_image(
         target_hw = (img.height, img.width)
         source_array = np.asarray(source_img, dtype=np.uint8)
         img_tensor = (
-            torch.from_numpy(source_array)
-            .permute(2, 0, 1)
-            .unsqueeze(0)
-            .to(dtype=torch.float32)
+            torch.from_numpy(source_array).permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32)
         )
         if img_tensor.shape[-2:] != target_hw:
             img_tensor = F.interpolate(
-                img_tensor,
-                size=target_hw,
-                mode="bicubic",
-                align_corners=False,
-                antialias=True,
+                img_tensor, size=target_hw, mode="bicubic", align_corners=False, antialias=True
             )
         mean = torch.tensor(pixel_mean, dtype=img_tensor.dtype).view(1, -1, 1, 1)
         std = torch.tensor(pixel_std, dtype=img_tensor.dtype).view(1, -1, 1, 1)
@@ -345,8 +330,7 @@ def preprocess_image_bytes_list(
         merge_size = max(int(config.spatial_merge_size), 1)
         model_patch_budget = (model_length - 4) * (merge_size * merge_size)
         request_patch_budget = max(
-            model_patch_budget,
-            int(config.dynamic_resolution_min_patches) * len(image_bytes_list),
+            model_patch_budget, int(config.dynamic_resolution_min_patches) * len(image_bytes_list)
         )
         configured_max = int(config.dynamic_resolution_max_patches)
         if configured_max > 0:
@@ -354,8 +338,7 @@ def preprocess_image_bytes_list(
         config = replace(
             config,
             dynamic_resolution_max_patches=max(
-                int(config.dynamic_resolution_min_patches),
-                request_patch_budget,
+                int(config.dynamic_resolution_min_patches), request_patch_budget
             ),
         )
 
@@ -463,9 +446,7 @@ def preprocess_video_bytes_list(
         )
 
     def decode_frames(encoded_video):
-        manifest_result = _load_frame_sequence_manifest(
-            encoded_video, config.frame_manifest_magic
-        )
+        manifest_result = _load_frame_sequence_manifest(encoded_video, config.frame_manifest_magic)
         if manifest_result is not None:
             frames, frame_indices, fps = manifest_result
             return frames, frame_indices, fps, True
@@ -482,9 +463,7 @@ def preprocess_video_bytes_list(
     for encoded_video in video_bytes_list:
         if not isinstance(encoded_video, (bytes, bytearray)):
             raise TypeError("video payloads must contain only bytes.")
-        frames, frame_indices, fps, is_frame_sequence = decode_frames(
-            bytes(encoded_video)
-        )
+        frames, frame_indices, fps, is_frame_sequence = decode_frames(bytes(encoded_video))
         if not frames:
             raise ValueError("Decoded video contains no frames.")
 

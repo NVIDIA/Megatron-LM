@@ -102,12 +102,12 @@ def test_frame_sequence_manifest_loads_rgb_copies(tmp_path):
         frame_paths.append(str(frame_path))
 
     magic = b"frames:"
-    payload = magic + json.dumps(
-        {
-            "frame_paths": frame_paths,
-            "metadata": {"frames_indices": [3, 7], "fps": 29.97},
-        }
-    ).encode()
+    payload = (
+        magic
+        + json.dumps(
+            {"frame_paths": frame_paths, "metadata": {"frames_indices": [3, 7], "fps": 29.97}}
+        ).encode()
+    )
     frames, frame_indices, fps = _load_frame_sequence_manifest(payload, magic)
 
     assert [frame.mode for frame in frames] == ["RGB", "RGB"]
@@ -260,11 +260,7 @@ def test_video_manifest_rejects_wrong_frame_count(monkeypatch):
     monkeypatch.setattr(
         image_preprocessing,
         "_load_frame_sequence_manifest",
-        lambda _payload, _magic: (
-            [image_module.new("RGB", (2, 2))],
-            [0],
-            1.0,
-        ),
+        lambda _payload, _magic: ([image_module.new("RGB", (2, 2))], [0], 1.0),
     )
     config = VideoProcessingConfig(
         image_config=ImageProcessingConfig(patch_dim=2, dynamic_resolution=True),

@@ -295,10 +295,7 @@ class ImageProcessingConfig:
                 "ImageProcessingConfig.dynamic_resolution_rounding_mode must be "
                 "'ceil' or 'round_plus_half'."
             )
-        if self.dynamic_resolution_resize_mode not in (
-            "pil",
-            "torch_bicubic_antialias",
-        ):
+        if self.dynamic_resolution_resize_mode not in ("pil", "torch_bicubic_antialias"):
             raise ValueError(
                 "ImageProcessingConfig.dynamic_resolution_resize_mode must be "
                 "'pil' or 'torch_bicubic_antialias'."
@@ -308,8 +305,7 @@ class ImageProcessingConfig:
             and self.dynamic_resolution_model_length <= 4
         ):
             raise ValueError(
-                "ImageProcessingConfig.dynamic_resolution_model_length must be "
-                "greater than 4."
+                "ImageProcessingConfig.dynamic_resolution_model_length must be " "greater than 4."
             )
 
 
@@ -375,12 +371,8 @@ class MultimodalPromptConfig:
             return defaults or cls()
         defaults = defaults or cls()
         return cls(
-            image_spec=replace(
-                defaults.image_spec, **dict(value.get("image_spec", {}))
-            ),
-            video_spec=replace(
-                defaults.video_spec, **dict(value.get("video_spec", {}))
-            ),
+            image_spec=replace(defaults.image_spec, **dict(value.get("image_spec", {}))),
+            video_spec=replace(defaults.video_spec, **dict(value.get("video_spec", {}))),
         )
 
 

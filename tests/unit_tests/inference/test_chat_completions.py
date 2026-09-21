@@ -144,9 +144,7 @@ def test_temporal_video_slot_uses_the_configured_compact_wrapper():
 
 
 def test_media_content_uses_the_configured_part_separator():
-    prompt_config = MultimodalPromptConfig(
-        video_spec=MediaPromptSpec(content_part_separator="\n")
-    )
+    prompt_config = MultimodalPromptConfig(video_spec=MediaPromptSpec(content_part_separator="\n"))
     messages = [
         {
             "role": "user",
@@ -158,9 +156,7 @@ def test_media_content_uses_the_configured_part_separator():
     ]
 
     sanitized = _sanitize_messages_for_template(
-        messages,
-        media_slots=[("__VIDEO__", "video", 0)],
-        prompt_config=prompt_config,
+        messages, media_slots=[("__VIDEO__", "video", 0)], prompt_config=prompt_config
     )
 
     assert sanitized[0]["content"] == "question\n__VIDEO__"
