@@ -162,7 +162,7 @@ class StreamingChatParser:
     def parse(self, text, *, finished=False):
         """Parse accumulated text and return zero or more structured deltas."""
         try:
-            content, metadata = self._parse(text)
+            content, metadata = self._parse(text, finished=finished)
         except Exception:
             logger.exception("Failed to parse a streaming chat delta.")
             return []

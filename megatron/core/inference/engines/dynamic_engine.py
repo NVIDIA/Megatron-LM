@@ -32,6 +32,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
+    PromptPreparationError,
     TokenOverflowError,
 )
 from megatron.core.inference.data_parallel_inference_coordinator import (
@@ -46,6 +47,9 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    OffloadedRequestPayload,
+    RequestPayloadStager,
+    RequestPromptPreparer,
     Status,
     compute_media_cache_key,
     merge_multimodal_data,
@@ -77,6 +81,24 @@ from megatron.core.utils import (
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
+
+# Engine-owned control field written into ``offload_params`` on MP rank 0 when the
+# RequestPromptPreparer fails, and read back by ``_apply_prompt_preparation_error``
+# on every rank. The HTTP endpoints reject client-supplied ``offload_params`` keys
+# that start with ``_`` (see ``endpoints.common.validate_offload_params``), so
+# this namespace cannot be forged from a request body.
+_PROMPT_PREPARATION_ERROR_FIELD = "_request_prompt_preparation_error"
+
+# Wire encoding of a None offload frame: msgpack nil is the single byte 0xc0,
+# i.e. ``msgpack.packb(None, use_bin_type=True)``. Spelled as a literal because
+# msgpack is an optional import below. Compared against the frame bytes so a
+# request without offload params is recognised without decoding anything.
+_PACKED_NONE = b"\xc0"
+
+# Frames the coordinator forwards for a SUBMIT_REQUEST: metadata, prompt,
+# media, offload params. The block-hash frame the client sent is consumed there.
+_SUBMIT_REQUEST_FRAMES = 4
+_SUBMIT_REQUEST_METADATA_FIELDS = 4
 
 try:
     from tqdm import tqdm
@@ -343,6 +365,10 @@ class DynamicInferenceEngine(AbstractEngine):
     # the += in resume() still rebinds onto the instance.
     _weight_epoch: int = 0
 
+    # Defaults for instances created without __init__ (tests build the engine via __new__).
+    payload_stager: Optional[RequestPayloadStager] = None
+    prompt_preparer: Optional[RequestPromptPreparer] = None
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -407,6 +433,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self._initialize_disaggregation_state()
         # Initialize engine.
         self.reset()
+
+        # Payload offload: with a stager attached, each completed request's per-token payload
+        # (log probs, MoE routing indices, token ids) is handed to stage() and dropped from the
+        # reply instead of riding the RESTful API. Consumer-owned, so it survives reset().
+        self.payload_stager: Optional[RequestPayloadStager] = None
+        self.prompt_preparer: Optional[RequestPromptPreparer] = None
 
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
@@ -1500,20 +1532,45 @@ class DynamicInferenceEngine(AbstractEngine):
     def _send_requests_to_coordinator(self, requests: List[DynamicInferenceRequest]) -> None:
         """Send completed or failed flat requests from model-parallel rank 0."""
 
-        if self.local_metadata_ledger_enabled:
-            # Failed requests are sent immediately but remain in the engine until the
-            # next bookkeeping pass. Index only completed requests as they are dropped.
-            for request in requests:
-                if request.status == Status.FAILED:
-                    continue
+        # Failed requests are sent immediately but remain in the engine until the next
+        # bookkeeping pass; only completed requests are indexed and staged.
+        # A reply is stripped only when its payload was staged.
+        serialized = []
+        for request in requests:
+            if request.status == Status.FAILED:
+                serialized.append(request.serialize())
+                continue
+            # One metadata record per completed request serves both the ledger and the stager.
+            finished_metadata = None
+            if self.local_metadata_ledger_enabled or self.payload_stager is not None:
+                finished_metadata = FinishedRequestRecord.from_request(request)
+            if self.local_metadata_ledger_enabled:
                 assert (
                     request.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {request.uid!r}"
-                self.local_metadata_ledger[request.uid] = FinishedRequestRecord.from_request(
-                    request
-                )
-        self.socket_for_receiving_requests.send_multipart(
-            _engine_reply_frames([request.serialize() for request in requests])
+                self.local_metadata_ledger[request.uid] = finished_metadata
+            serialized.append(self._serialize_finished_request(request, finished_metadata))
+        self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
+
+    def _serialize_finished_request(
+        self, request: DynamicInferenceRequest, finished_metadata: Optional[FinishedRequestRecord]
+    ) -> Dict:
+        """Stage a non-streaming accepted payload before constructing its coordinator reply."""
+        stage_result = None
+        if self.payload_stager is not None and not getattr(
+            request.sampling_params, "streaming", False
+        ):
+            stage_result = self.payload_stager.stage(
+                request.uid,
+                OffloadedRequestPayload.from_request(request),
+                finished_metadata=finished_metadata,
+                offload_params=request.offload_params,
+            )
+        return request.serialize(
+            payload_offloaded=stage_result is not None,
+            payload_stage_metadata=(
+                stage_result.response_metadata if stage_result is not None else None
+            ),
         )
 
     def _handle_failed_request(self, request_id: int):
@@ -1548,6 +1605,9 @@ class DynamicInferenceEngine(AbstractEngine):
         request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
+        # Media registered by _build_vlm_request is never consumed for a request
+        # that fails before admission, so drop it here (a no-op for text-only).
+        self.context.remove_vlm_request_data(request_id)
         finished_request = self._complete_request(request_entry)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
@@ -1779,6 +1839,7 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
+        offload_params: Optional[Dict] = None,
         media_cache_key: Optional[str] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
@@ -1812,6 +1873,7 @@ class DynamicInferenceEngine(AbstractEngine):
             num_frames (Optional[Tensor]): Number of frames per image/video item.
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
+            offload_params (Optional[Dict]): Opaque metadata forwarded to the payload stager.
             media_cache_key (Optional[str]): Media identity computed by the submitting
                 inference client. Direct callers may omit it and let the engine derive
                 an identity from the resolved media tensors.
@@ -1887,10 +1949,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     precomputed_block_hashes=precomputed_block_hashes,
                     num_frames=num_frames,
                     media_tokens_preexpanded=media_tokens_preexpanded,
+                    offload_params=offload_params,
                     media_cache_key=media_cache_key,
                 )
             finally:
                 nvtx_range_pop(nvtx_range)
+            self._apply_prompt_preparation_error(request, offload_params)
             # _build_vlm_request has already registered the image embeddings
             # and token mask into the context (add_vlm_request_data). If
             # _add_request now rejects the request (oversized prompt, cache
@@ -1907,6 +1971,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 prompt=prompt_str,
                 prompt_tokens=tokens,
                 sampling_params=sampling_params,
+                offload_params=offload_params,
                 block_size_tokens=self.context.block_size_tokens,
                 enable_prefix_caching=self.context.enable_prefix_caching,
                 precomputed_block_hashes=precomputed_block_hashes or [],
@@ -1917,8 +1982,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 # generation its sender hashed under.
                 block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
+            self._apply_prompt_preparation_error(request, offload_params)
 
         return self._add_request(request)
+
+    def _apply_prompt_preparation_error(self, request, offload_params) -> None:
+        """Fail a request whose prompt preparer reported an error on MP rank zero."""
+        error = (
+            offload_params.get(_PROMPT_PREPARATION_ERROR_FIELD)
+            if isinstance(offload_params, dict)
+            else None
+        )
+        if error is not None:
+            request.status = Status.FAILED
+            request.add_event_error_nontransient(
+                PromptPreparationError(request.request_id, str(error))
+            )
 
     def _build_vlm_request(
         self,
@@ -1934,6 +2013,7 @@ class DynamicInferenceEngine(AbstractEngine):
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
         media_tokens_preexpanded: bool = False,
+        offload_params: Optional[Dict] = None,
         media_cache_key: Optional[str] = None,
     ) -> DynamicVLMInferenceRequest:
         """Prepare media tokens, run the vision encoder, register per-request
@@ -2125,6 +2205,7 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt_tokens=tokens,
             compact_prompt_tokens=compact_prompt_tokens,
             sampling_params=sampling_params,
+            offload_params=offload_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
             # Recompute the block hashes for multimodal embeddings,
@@ -3828,9 +3909,8 @@ class DynamicInferenceEngine(AbstractEngine):
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    all_messages.append(
-                        self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
-                    )
+                    message = self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
+                    all_messages.append(self._prepare_submit_request_message(message))
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
@@ -3851,10 +3931,29 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
+                # Drop rather than raise: this loop runs on every MP rank over
+                # the same broadcast list, so a raise here takes the whole
+                # engine down for one version-skewed client, while `continue`
+                # stays collective because every rank skips the same message.
+                if (
+                    len(data) != _SUBMIT_REQUEST_METADATA_FIELDS
+                    or len(message) != _SUBMIT_REQUEST_FRAMES
+                ):
+                    logger.warning(
+                        "dropping malformed SUBMIT_REQUEST: %d metadata fields, %d frames "
+                        "(expected %d and %d)",
+                        len(data),
+                        len(message),
+                        _SUBMIT_REQUEST_METADATA_FIELDS,
+                        _SUBMIT_REQUEST_FRAMES,
+                    )
+                    continue
                 request_id, sampling_params, media_meta = data[1:]
-                # The prompt and the media each ride in their own frame. The
-                # coordinator forwarded both untouched, while the bounded media
-                # descriptor lets a cache hit avoid decoding the payload frame.
+                # The prompt, the media, and the offload params each ride in
+                # their own frame; the engine is their first consumer, so this
+                # is where they finally get decoded. The coordinator forwarded
+                # all three untouched, while the bounded media descriptor in
+                # the metadata lets a cache hit avoid decoding the media frame.
                 nvtx_range = "megatron.inference.multimodal.message_unpack"
                 nvtx_range_push(nvtx_range)
                 try:
@@ -3873,6 +3972,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         multi_modal_data = merge_multimodal_data(media_meta, media_payload)
                     else:
                         multi_modal_data = None
+                    offload_params = msgpack.unpackb(message[3], raw=False)
                     sampling_params = SamplingParams.deserialize(sampling_params)
                 finally:
                     nvtx_range_pop(nvtx_range)
@@ -3916,9 +4016,17 @@ class DynamicInferenceEngine(AbstractEngine):
                         finally:
                             nvtx_range_pop(nvtx_range)
                     if vlm_kwargs:
-                        self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
+                        self.add_request(
+                            request_id,
+                            prompt,
+                            sampling_params,
+                            offload_params=offload_params,
+                            **vlm_kwargs,
+                        )
                     else:
-                        self.add_request(request_id, prompt, sampling_params)
+                        self.add_request(
+                            request_id, prompt, sampling_params, offload_params=offload_params
+                        )
                 except Exception as error:  # pylint: disable=broad-except
                     self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request")
@@ -4044,6 +4152,50 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self._collect_failed_requests()
         return len(all_messages)
+
+    def _prepare_submit_request_message(self, message: List[bytes]) -> List[bytes]:
+        """Resolve a prompt once on MP rank zero before broadcasting the request.
+
+        The preparer only has work when the client sent offload params, so a
+        request whose offload frame is None passes through untouched without
+        any frame being decoded. When it runs, only the prompt frame and the
+        offload frame are rewritten; the metadata frame is never repacked.
+        """
+        if (
+            self.prompt_preparer is None
+            or len(message) < _SUBMIT_REQUEST_FRAMES
+            or message[3] == _PACKED_NONE
+        ):
+            return message
+        data = msgpack.unpackb(message[0], raw=False)
+        if data[0] != Headers.SUBMIT_REQUEST.value or len(data) != _SUBMIT_REQUEST_METADATA_FIELDS:
+            return message
+        request_id = data[1]
+        prompt = msgpack.unpackb(message[1], raw=False)
+        offload_params = msgpack.unpackb(message[3], raw=False)
+
+        def _pack(prompt, offload_params):
+            if isinstance(prompt, torch.Tensor):
+                prompt = prompt.tolist()
+            return [
+                message[0],
+                msgpack.packb(prompt, use_bin_type=True),
+                message[2],
+                msgpack.packb(offload_params, use_bin_type=True),
+                *message[4:],
+            ]
+
+        try:
+            # Packing stays inside the try: an unserializable preparer result must
+            # fail this request, not exit rank 0 and hang the other MP ranks.
+            result = self.prompt_preparer.prepare_prompt(prompt, offload_params=offload_params)
+            return _pack(result.prompt, result.offload_params)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.exception("prompt preparation failed for request %s", request_id)
+            # The original prompt and params came off the wire, so they pack safely.
+            failed_params = dict(offload_params) if isinstance(offload_params, dict) else {}
+            failed_params[_PROMPT_PREPARATION_ERROR_FIELD] = f"{type(error).__name__}: {error}"
+            return _pack(prompt, failed_params)
 
     async def shutdown(self):
         """Shut down the engine and clean up ZMQ resources.
