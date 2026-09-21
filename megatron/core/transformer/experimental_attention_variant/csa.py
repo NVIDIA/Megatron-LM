@@ -1237,8 +1237,11 @@ class CompressedSparseAttention(MegatronModule):
             if boundary_hidden is None:
                 if self.pg_collection.cp.size() > 1:
                     raise ValueError("Packed CP requires the projected left boundary.")
-                boundary_hidden = x[:0]
-                boundary_kv = key[:0]
+                # Empty CP1 boundaries must not alias the full inputs: Dynamo's
+                # dynamic-shape guards otherwise track an unused view base when
+                # the compiled compactor switches between CP and CP1 layouts.
+                boundary_hidden = x.new_empty((0, *x.shape[1:]))
+                boundary_kv = key.new_empty((0, *key.shape[1:]))
             return self._forward_packed(
                 query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
             )

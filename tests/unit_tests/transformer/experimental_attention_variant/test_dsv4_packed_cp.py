@@ -103,9 +103,10 @@ def test_packed_cp_matches_full_attention_and_gradients(
             recompute_granularity="selective" if recompute else None,
             recompute_modules=["mla_up_proj"] if recompute else [],
         )
-        ref_cfg = replace(
-            cfg, context_parallel_size=1, dsa_kernel_backend="none", apply_rope_fusion=False
-        )
+        # Compare CP against native full attention with the same RoPE arithmetic.
+        # Switching fused/unfused RoPE also changes BF16 intermediate rounding,
+        # which can accumulate in weight gradients independently of CP.
+        ref_cfg = replace(cfg, context_parallel_size=1, dsa_kernel_backend="none")
         model = _build_attention(cfg, 1, pg).cuda()
         reference = _build_attention(ref_cfg, 1, ref_pg).cuda()
         reference.load_state_dict(model.state_dict())
@@ -137,9 +138,13 @@ def test_packed_cp_matches_full_attention_and_gradients(
         ref_params = dict(reference.named_parameters())
         for name, param in model.named_parameters():
             assert param.grad is not None, name
-            total_grad = param.grad.detach().clone()
+            # Avoid extra BF16 rounding when summing CP rank contributions.
+            total_grad = param.grad.detach().to(dtype=torch.float32, copy=True)
             dist.all_reduce(total_grad, group=pg.cp)
-            _assert_match(total_grad, ref_params[name].grad)
+            try:
+                _assert_match(total_grad, ref_params[name].grad.float())
+            except AssertionError as error:
+                raise AssertionError(f"Parameter gradient mismatch: {name}\n{error}") from error
             if ratio == 4 and coeff == 0 and ".indexer." in name:
                 assert torch.count_nonzero(total_grad) == 0
     finally:
