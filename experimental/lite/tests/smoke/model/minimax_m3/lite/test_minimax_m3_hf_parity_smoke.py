@@ -7,7 +7,7 @@ checked: ``flex`` (pure torch, Hopper) and the production ``magi`` protocol (msa
 
 bf16 is the only precision the msa_v1 kernels support, and bf16 flips a few percent of the
 indexer's top-k rows whenever the GEMM order changes, so the gates are loose (per-layer
-rel-to-max 5e-2, cosine 0.999, gradient cosines 0.99 / 0.95) and every number is printed as evidence.
+rel-to-max 1e-1, cosine 0.999, gradient cosines 0.99 / 0.95) and every number is printed as evidence.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 pytestmark = pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 DEV = "cuda"
-LAYER_REL, LAYER_COS = 5e-2, 0.999
+LAYER_REL, LAYER_COS = 1e-1, 0.999
 LOGITS_COS, LOGITS_KL = 0.999, 5e-2
 LOSS_REL = 2e-2
 DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95

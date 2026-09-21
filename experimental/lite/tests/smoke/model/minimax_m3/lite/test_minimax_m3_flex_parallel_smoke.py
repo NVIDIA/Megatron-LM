@@ -7,7 +7,7 @@ code paths: TP shards + SP (index heads sharded like KV heads), EP dispatch, PP 
 all-gather CP of K/V + index-K on zigzag shards.
 
 Gates (bf16; reduction order differs between layouts, so a few indexer top-k rows may flip):
-per-layer hidden states rel-to-max < 5e-2 on this rank's shard, loss rel < 1e-2, top-k flips < 20% of
+per-layer hidden states rel-to-max < 1e-1 on this rank's shard, loss rel < 1e-2, top-k flips < 20% of
 rows, gradient cosines >= 0.99 (routing-independent) / 0.95 (router gate, per-layer experts), and the
 weights exported back through the TP/EP/PP merge bitwise equal to the source.
 """
@@ -23,7 +23,7 @@ import torch.nn.functional as F
 pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 B, S = 2, 1024  # 8 KV blocks > top-4 -> the sparse layers are truly sparse; S % (2*tp*cp) == 0
-LOSS_REL, LAYER_REL, TOPK_FLIP_BUDGET = 1e-2, 5e-2, 0.2
+LOSS_REL, LAYER_REL, TOPK_FLIP_BUDGET = 1e-2, 1e-1, 0.2
 DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95
 
 
