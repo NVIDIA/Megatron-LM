@@ -62,8 +62,28 @@ def cp_config(request):
         ),
         pytest.param(
             dict(cp_partition_mode="contiguous", multi_latent_attention=True),
-            "not supported with multi_latent_attention",
+            "requires experimental_attention_variant",
             id="mla-contiguous",
+        ),
+        pytest.param(
+            dict(
+                cp_partition_mode="contiguous",
+                multi_latent_attention=True,
+                experimental_attention_variant="kda",
+            ),
+            None,
+            id="mla-kda-contiguous",
+        ),
+        pytest.param(
+            dict(
+                cp_partition_mode="contiguous",
+                experimental_attention_variant="gdn",
+                mtp_num_layers=1,
+                tensor_model_parallel_size=2,
+                sequence_parallel=True,
+            ),
+            None,
+            id="mtp-tp-sp-contiguous",
         ),
         pytest.param(
             dict(

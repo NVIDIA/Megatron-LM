@@ -533,6 +533,50 @@ def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize(
+    "world_size, tp_size, cp_size, dp_size",
+    [(8, 2, 2, 2), (8, 1, 2, 4)],  # 8 GPUs, 2 TP, 2 CP, 2 DP  # 8 GPUs, 1 TP, 2 CP, 4 DP
+)
+def test_dynamic_tp_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
+    """
+    Test that the TP x (dynamic DP x CP sub-group) groups span exactly the TP groups of
+    the sub-group members, and that the full size maps to the tp-dp-cp group.
+    """
+    Utils.destroy_model_parallel()
+
+    # Gate on the launched world size: the ranks may span several nodes.
+    if Utils.world_size != world_size:
+        pytest.skip(f"Test requires world_size={world_size}, but got {Utils.world_size}")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        dynamic_context_parallel=True,
+    )
+
+    rank = torch.distributed.get_rank()
+    tp_ranks = torch.distributed.get_process_group_ranks(ps.get_tensor_model_parallel_group())
+    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True)
+    group_sizes = [2**i for i in range(int(log2(dp_cp_size)))]
+    for group_size in group_sizes:
+        dp_cp_group = ps.get_dynamic_data_context_parallel_groups(group_size=group_size)
+        dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+        group = ps.get_dynamic_tensor_and_data_context_parallel_groups(group_size=group_size)
+        # Members of this rank's sub-group share its TP coordinate, so the TP group of a
+        # member is this rank's TP group shifted by the member's offset.
+        expected_ranks = sorted(
+            {member + tp_rank - rank for member in dp_cp_ranks for tp_rank in tp_ranks}
+        )
+        assert sorted(torch.distributed.get_process_group_ranks(group)) == expected_ranks
+        assert group.size() == tp_size * group_size
+        if tp_size == 1:
+            assert group is dp_cp_group
+
+    full_group = ps.get_dynamic_tensor_and_data_context_parallel_groups(group_size=dp_cp_size)
+    assert full_group is ps.get_tensor_and_data_parallel_group(with_context_parallel=True)
+
+    Utils.destroy_model_parallel()
+
+
 def test_separate_all_gather_group():
     """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
     Utils.initialize_model_parallel(context_parallel_size=world_size)

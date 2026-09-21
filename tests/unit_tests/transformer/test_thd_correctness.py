@@ -22,6 +22,7 @@ Check Levels
 
 import gc
 import os
+import warnings
 from dataclasses import dataclass
 from typing import List
 
@@ -30,8 +31,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+import megatron.core.context_parallel_layout.conversion as cp_layout_conversion
+import megatron.core.context_parallel_layout.routes as cp_layout_routes
 from megatron.core import parallel_state
-from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1098,6 +1101,9 @@ def _make_mixed_model_config(
     cp_partition_mode: str,
     dynamic_context_parallel: bool,
     context_parallel_size: int,
+    tensor_model_parallel_size: int = 1,
+    sequence_parallel: bool = False,
+    mtp_num_layers: int = 1,
 ) -> TransformerConfig:
     layer_pattern = [1, 1, 0, 1, 0]
     return TransformerConfig(
@@ -1117,6 +1123,8 @@ def _make_mixed_model_config(
         cp_partition_mode=cp_partition_mode,
         context_parallel_size=context_parallel_size,
         dynamic_context_parallel=dynamic_context_parallel,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        sequence_parallel=sequence_parallel,
         cp_comm_type="p2p",
         sequence_packing_scheduler=(
             "default_dynamic_cp" if dynamic_context_parallel else "dp_balanced"
@@ -1128,7 +1136,7 @@ def _make_mixed_model_config(
         calculate_per_token_loss=True,
         bf16=True,
         params_dtype=torch.bfloat16,
-        mtp_num_layers=1,
+        mtp_num_layers=mtp_num_layers,
     )
 
 
@@ -1155,8 +1163,11 @@ def _build_mixed_model(model_type: str, config: TransformerConfig):
         from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
         from megatron.core.models.hybrid.hybrid_model import HybridModel
 
+        hybrid_layer_pattern = "GG*G*/*" if config.mtp_num_layers else "GG*G*"
         model = HybridModel(
-            hybrid_stack_spec=hybrid_stack_spec, hybrid_layer_pattern="GG*G*/*", **model_kwargs
+            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_layer_pattern=hybrid_layer_pattern,
+            **model_kwargs,
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
@@ -1227,13 +1238,17 @@ def _prepare_mixed_model_batch(seq_indices, cp_group, config, vocab_size):
         cp_partition_mode=config.cp_partition_mode,
         pad_between_seqs=True,
     )
-    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    # Mirror batch construction: resolve the CP and TP x CP groups of this microbatch
+    # (the TP x sub-group under dynamic CP) and prebuild the layout routes, including
+    # the fused TP x CP route under sequence parallelism.
+    finalize_packed_seq_params(packed_seq_params, sequence_parallel=config.sequence_parallel)
     return batch, packed_seq_params
 
 
 def _run_mixed_model(model, batch, packed_seq_params, dp_cp_group):
     MTPLossLoggingHelper.tracker = {}
     MTPLossLoggingHelper.configure_acceptance_collection(enabled=False)
+    has_mtp = bool(getattr(model.config, "mtp_num_layers", 0))
 
     loss = model(
         input_ids=batch["tokens"],
@@ -1253,16 +1268,24 @@ def _run_mixed_model(model, batch, packed_seq_params, dp_cp_group):
     MTPLossAutoScaler.set_loss_scale(global_denominator.reciprocal())
     (local_numerator / global_denominator).backward()
 
-    MTPLossLoggingHelper.reduce_loss_in_tracker()
-    assert "values" in MTPLossLoggingHelper.tracker
-    mtp_loss = MTPLossLoggingHelper.tracker["values"].detach().float().clone()
+    mtp_loss = None
+    if has_mtp:
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        assert "values" in MTPLossLoggingHelper.tracker
+        mtp_loss = MTPLossLoggingHelper.tracker["values"].detach().float().clone()
 
-    grads = [
-        (name, param.grad) for name, param in model.named_parameters() if param.grad is not None
-    ]
+    grads = [(name, param) for name, param in model.named_parameters() if param.grad is not None]
     assert grads, "Mixed GDN/GQA model did not produce parameter gradients."
-    grad_names, grad_tensors = zip(*grads)
-    grad_vector = torch.cat([grad.detach().float().reshape(-1) for grad in grad_tensors])
+    grad_names, params = zip(*grads)
+    grad_tensors = [param.grad.detach().float().reshape(-1) for param in params]
+    # Sequence-parallel parameters (norms) only see their TP rank's shard of tokens;
+    # reduce them over TP so runs with different CP layouts are comparable per rank.
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    if tp_group.size() > 1:
+        for param, grad in zip(params, grad_tensors):
+            if getattr(param, "sequence_parallel", False):
+                dist.all_reduce(grad, group=tp_group)
+    grad_vector = torch.cat(grad_tensors)
     dist.all_reduce(grad_vector, group=dp_cp_group)
     return global_stats[0] / global_denominator, mtp_loss, grad_names, grad_vector
 
@@ -1271,23 +1294,37 @@ def _run_mixed_model(model, batch, packed_seq_params, dp_cp_group):
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("model_type", ("gpt", "hybrid"))
 @pytest.mark.parametrize("dynamic_context_parallel", (False, True), ids=("thd_cp", "dcp"))
-def test_mixed_gdn_gqa_model_cp_correctness(model_type, dynamic_context_parallel):
+@pytest.mark.parametrize("tp_size", (1, 2), ids=("tp1", "tp2_sp"))
+def test_mixed_gdn_gqa_model_cp_correctness(
+    monkeypatch, model_type, dynamic_context_parallel, tp_size
+):
     """Compare mixed GDN/GQA/MTP models against a THD CP=1 baseline.
 
-    Each of the {fixed THD CP, DCP} x {GPTModel, HybridModel} cases uses a no-CP
-    reference that processes one complete packed sequence per rank.
+    Each of the {fixed THD CP, DCP} x {GPTModel, HybridModel} x {TP1, TP2+SP} cases
+    uses a no-CP reference with the same TP layout that processes one complete
+    packed sequence per DPxCP rank. The candidate runs the contiguous CP layout, so
+    its attention layers convert to zigzag internally: with TP2+SP that is the
+    fused TP x CP all-to-all, over the static TP x CP group or, under dynamic CP,
+    over the TP x sub-group process group.
     """
     if not torch.cuda.is_available() or Utils.world_size != 8:
         pytest.skip("Mixed GDN/GQA model CP correctness requires exactly 8 CUDA ranks.")
 
     seed = 1234
+    sequence_parallel = tp_size > 1
+    # MTP runs in every case, including TP2+SP with the contiguous layout: MTP rolls the
+    # padding mask in the CP-local layout of its other token-side fields.
+    mtp_num_layers = 1
     reference_config = _make_mixed_model_config(
         linear_cp_mode="chunkwise",
         cp_partition_mode="zigzag",
         dynamic_context_parallel=False,
         context_parallel_size=1,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=sequence_parallel,
+        mtp_num_layers=mtp_num_layers,
     )
-    Utils.initialize_model_parallel(context_parallel_size=1)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size, context_parallel_size=1)
     try:
         reference_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         reference_cp_group = parallel_state.get_context_parallel_group()
@@ -1321,9 +1358,14 @@ def test_mixed_gdn_gqa_model_cp_correctness(model_type, dynamic_context_parallel
         cp_partition_mode="contiguous",
         dynamic_context_parallel=dynamic_context_parallel,
         context_parallel_size=2,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=sequence_parallel,
+        mtp_num_layers=mtp_num_layers,
     )
     Utils.initialize_model_parallel(
-        context_parallel_size=2, dynamic_context_parallel=dynamic_context_parallel
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=2,
+        dynamic_context_parallel=dynamic_context_parallel,
     )
     try:
         candidate_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
@@ -1350,17 +1392,80 @@ def test_mixed_gdn_gqa_model_cp_correctness(model_type, dynamic_context_parallel
         candidate_batch, candidate_packed_seq_params = _prepare_mixed_model_batch(
             candidate_seq_indices, candidate_cp_group, candidate_config, candidate_model.vocab_size
         )
-        candidate_stats = _run_mixed_model(
-            candidate_model, candidate_batch, candidate_packed_seq_params, candidate_dp_cp_group
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            candidate_stats = _run_mixed_model(
+                candidate_model, candidate_batch, candidate_packed_seq_params, candidate_dp_cp_group
+            )
+        used_composed_fallback = any(
+            issubclass(w.category, RuntimeWarning) and "naive TP gather" in str(w.message)
+            for w in caught
         )
+        # Static and dynamic CP both take the fused route (dynamic CP through the
+        # TP x sub-group process groups); the composed fallback is only for groups that
+        # cannot be fused.
+        assert not used_composed_fallback
+
         reference_loss, reference_mtp_loss, reference_grad_names, reference_grads = reference_stats
         candidate_loss, candidate_mtp_loss, candidate_grad_names, candidate_grads = candidate_stats
 
         assert reference_grad_names == candidate_grad_names
         assert candidate_packed_seq_params.cp_partition_mode == "contiguous"
+        # A microbatch carries exactly one route kind: the fused TP x CP route for
+        # sequence-parallel shards, the CP-only route otherwise. Ranks that process their
+        # sequences alone under dynamic CP (a CP group of size 1) convert nothing and
+        # carry no route at all.
+        if candidate_packed_seq_params.cp_group.size() == 1:
+            assert candidate_packed_seq_params.tp_cp_partition_route is None
+            assert candidate_packed_seq_params.cp_partition_route is None
+        else:
+            assert (
+                candidate_packed_seq_params.tp_cp_partition_route is not None
+            ) == sequence_parallel
+            assert (candidate_packed_seq_params.cp_partition_route is None) == sequence_parallel
         torch.testing.assert_close(candidate_loss, reference_loss, atol=5e-3, rtol=0.0)
         torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
         assert_close("aggregated parameter gradients", candidate_grads, reference_grads, False)
+
+        if sequence_parallel:
+            # Model-level check that the fused TP x CP all-to-all and the composed
+            # TP gather -> CP all-to-all -> TP scatter path agree: force the fallback
+            # and rerun the same model on the same batch. The metadata is prepared
+            # afresh under the patch: a microbatch carries exactly one route kind, and
+            # the composed fallback needs the CP-only route.
+            candidate_model.zero_grad(set_to_none=True)
+            for module in (cp_layout_conversion, cp_layout_routes):
+                monkeypatch.setattr(
+                    module,
+                    "resolve_tp_cp_group_rank_by_logical_rank",
+                    lambda cp_group, tp_group, tp_cp_group: None,
+                )
+            fallback_batch, fallback_packed_seq_params = _prepare_mixed_model_batch(
+                candidate_seq_indices,
+                candidate_cp_group,
+                candidate_config,
+                candidate_model.vocab_size,
+            )
+            assert fallback_packed_seq_params.tp_cp_partition_route is None
+            assert (fallback_packed_seq_params.cp_partition_route is not None) == (
+                fallback_packed_seq_params.cp_group.size() > 1
+            )
+            with pytest.warns(RuntimeWarning, match="naive TP gather"):
+                fallback_stats = _run_mixed_model(
+                    candidate_model,
+                    fallback_batch,
+                    fallback_packed_seq_params,
+                    candidate_dp_cp_group,
+                )
+            fallback_loss, _, fallback_grad_names, fallback_grads = fallback_stats
+            assert fallback_grad_names == candidate_grad_names
+            torch.testing.assert_close(fallback_loss, candidate_loss, atol=1e-3, rtol=0.0)
+            assert_close(
+                "fused vs composed TP x CP conversion gradients",
+                fallback_grads,
+                candidate_grads,
+                False,
+            )
     finally:
         MTPLossLoggingHelper.tracker = {}
         Utils.destroy_model_parallel()

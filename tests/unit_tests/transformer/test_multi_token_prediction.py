@@ -921,6 +921,89 @@ class TestMultiTokenPrediction:
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
 
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    def test_packed_sequences_roll_cp_local_padding_mask_under_sequence_parallel(self, monkeypatch):
+        """MTP receives and rolls the caller's CP-local padding mask under SP.
+
+        The decoder consumes the sequence-parallel shard of the padding mask, but MTP
+        rolls the mask together with input_ids, position_ids, labels and loss_mask in
+        the CP-local layout; a shard-length mask cannot be rolled with them (packed CP1
+        and contiguous CP raise, zigzag CP rolls it wrongly). The MTP layer's MoE aligns
+        the full-length rolled mask to its sequence-parallel hidden states itself.
+        """
+        if Utils.world_size < 2 or Utils.world_size % 2 != 0:
+            pytest.skip("Sequence-parallel MTP needs a multiple of 2 CUDA ranks.")
+        tp, cp = 2, 1
+        seq_lengths = [16, 24, 12]
+        total_seq_length = sum(seq_lengths)
+
+        args = self.create_test_args(tp, cp, total_seq_length, micro_batch_size=1)
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+
+        batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+        tokens = batch['tokens']
+        packed_seq_params = batch['packed_seq_params']
+        # Router convention: True marks padding. Mark the last two tokens of every
+        # packed sequence so the mask differs from the all-valid default.
+        padding_mask = torch.zeros_like(tokens, dtype=torch.bool)
+        sequence_end = 0
+        for seq_len in seq_lengths:
+            sequence_end += seq_len
+            padding_mask[:, sequence_end - 2 : sequence_end] = True
+
+        seen_padding_masks = []
+        original_get_embeddings = MultiTokenPredictionLayer._get_embeddings
+
+        def recording_get_embeddings(layer, *get_embeddings_args, **get_embeddings_kwargs):
+            seen_padding_masks.append(get_embeddings_kwargs["padding_mask"])
+            return original_get_embeddings(layer, *get_embeddings_args, **get_embeddings_kwargs)
+
+        monkeypatch.setattr(MultiTokenPredictionLayer, "_get_embeddings", recording_get_embeddings)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
+        )
+
+        output = gpt_model[0].forward(
+            input_ids=tokens,
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        # Every MTP depth sees the CP-local layout, not the sequence-parallel shard:
+        # depth 0 the caller's mask, depth 1 the mask rolled once by depth 0.
+        assert len(seen_padding_masks) == args.mtp_num_layers
+        for seen_padding_mask in seen_padding_masks:
+            assert seen_padding_mask.shape == tokens.shape
+        assert torch.equal(seen_padding_masks[0], padding_mask)
+        expected_rolled_padding_mask = roll_tensor(
+            [padding_mask],
+            shifts=-1,
+            dims=-1,
+            packed_seq_params=packed_seq_params,
+            fill_values=[True],
+        )[0]
+        assert torch.equal(seen_padding_masks[1], expected_rolled_padding_mask)
+
+        assert output.shape[1] == total_seq_length
+        output.mean().backward()
+
     @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),

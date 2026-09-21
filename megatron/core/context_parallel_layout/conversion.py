@@ -11,7 +11,11 @@ import torch
 
 from megatron.core.context_parallel_layout.routes import (
     build_thd_cp_partition_route,
+    build_thd_tp_cp_partition_route,
     get_thd_cp_partition_route,
+    get_thd_tp_cp_partition_route,
+    get_tp_cp_group_rank_by_logical_rank,
+    resolve_tp_cp_group_rank_by_logical_rank,
 )
 from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
 from megatron.core.context_parallel_layout.utils import (
@@ -107,6 +111,23 @@ class CpPartitionModeConverter:
             return value
 
         resolved_seq_dim = seq_dim(value) if callable(seq_dim) else seq_dim
+        # Sequence-parallel THD shards travel over the fused TP x CP route when the
+        # process groups allow it; only the composed fallback needs the CP-only route.
+        thd_tp_cp_partition_route = None
+        if sequence_parallel and self.tp_group is not None and self.tp_group.size() > 1:
+            thd_tp_cp_partition_route = get_thd_tp_cp_partition_route(
+                self.packed_seq_params,
+                self.source_partition_mode,
+                self.target_partition_mode,
+                cp_group=self.cp_group,
+                tp_group=self.tp_group,
+                tp_cp_group=self.tp_cp_group,
+            )
+        thd_cp_partition_route = None
+        if thd_tp_cp_partition_route is None:
+            thd_cp_partition_route = get_thd_cp_partition_route(
+                self.packed_seq_params, self.source_partition_mode, self.target_partition_mode
+            )
         converted = convert_cp_partition_mode(
             x=value,
             source_partition_mode=self.source_partition_mode,
@@ -117,9 +138,8 @@ class CpPartitionModeConverter:
             cp_group=self.cp_group,
             tp_group=self.tp_group,
             tp_cp_group=self.tp_cp_group,
-            thd_cp_partition_route=get_thd_cp_partition_route(
-                self.packed_seq_params, self.source_partition_mode, self.target_partition_mode
-            ),
+            thd_cp_partition_route=thd_cp_partition_route,
+            thd_tp_cp_partition_route=thd_tp_cp_partition_route,
         )
         if self.packed_seq_params is not None:
             self.packed_seq_params.cp_partition_mode = self.target_partition_mode
@@ -217,13 +237,17 @@ def convert_cp_partition_mode(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     thd_cp_partition_route: Optional[ThdCpRoute] = None,
+    thd_tp_cp_partition_route: Optional[ThdCpRoute] = None,
 ) -> torch.Tensor:
     """Convert a sequence tensor between CP zigzag and contiguous layouts.
 
     SBHD tensors use one unified all-to-all-v redistribution path over CP or
-    TPxCP. THD tensors use their packed-token CP route and, when sequence
-    parallelism shards the packed sequence, retain the naive TP gather/scatter
-    fallback.
+    TPxCP. THD tensors use their packed-token CP route; when sequence
+    parallelism shards the packed sequence, the shards are exchanged directly
+    over the TPxCP group with one all-to-all-v. The composed TP gather -> CP
+    all-to-all -> TP scatter path only remains for process groups that cannot
+    be fused (no ``tp_cp_group``, or a CP group that is not the one the TPxCP
+    group was built from, as with dynamic context parallelism).
     """
 
     if source_partition_mode == target_partition_mode:
@@ -261,37 +285,32 @@ def convert_cp_partition_mode(
         return converted.movedim(0, seq_dim).contiguous() if seq_dim != 0 else converted
 
     if sequence_parallel and tp_group is not None and tp_group.size() > 1:
-        from megatron.core.tensor_parallel.mappings import (
-            gather_from_sequence_parallel_region,
-            scatter_to_sequence_parallel_region,
+        group_rank_by_logical_rank = resolve_tp_cp_group_rank_by_logical_rank(
+            cp_group, tp_group, tp_cp_group
         )
-
-        # TODO(yuzhongw): replace the naive THD TP gather -> CP all-to-all -> TP scatter
-        # fallback with a direct packed THD TPxCP redistribution path.
-        warnings.warn(
-            "THD CP layout conversion with sequence parallelism uses the naive "
-            "TP gather -> CP all-to-all -> TP scatter fallback.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
-        # This gather is only used to run a duplicated CP layout permutation before
-        # scattering back to SP shards. Its backward must split, not reduce-scatter;
-        # otherwise every TP rank contributes the same full-sequence gradient.
-        gathered = gather_from_sequence_parallel_region(
-            input_=moved, tensor_parallel_output_grad=False, group=tp_group
-        )
-        converted = _redistribute_thd_layout(
-            x=gathered,
+        if group_rank_by_logical_rank is not None:
+            return _redistribute_thd_tp_cp_layout(
+                x=x,
+                cp_group=cp_group,
+                tp_group=tp_group,
+                tp_cp_group=tp_cp_group,
+                group_rank_by_logical_rank=group_rank_by_logical_rank,
+                seq_dim=seq_dim,
+                cu_seqlens=cu_seqlens,
+                source_partition_mode=source_layout,
+                target_partition_mode=target_layout,
+                thd_tp_cp_partition_route=thd_tp_cp_partition_route,
+            )
+        return _redistribute_thd_layout_via_tp_gather(
+            x=x,
             cp_group=cp_group,
-            seq_dim=0,
+            tp_group=tp_group,
+            seq_dim=seq_dim,
             cu_seqlens=cu_seqlens,
             source_partition_mode=source_layout,
             target_partition_mode=target_layout,
             thd_cp_partition_route=thd_cp_partition_route,
         )
-        scattered = scatter_to_sequence_parallel_region(input_=converted, group=tp_group)
-        return scattered.movedim(0, seq_dim).contiguous() if seq_dim != 0 else scattered
 
     return _redistribute_thd_layout(
         x=x,
@@ -302,6 +321,55 @@ def convert_cp_partition_mode(
         target_partition_mode=target_layout,
         thd_cp_partition_route=thd_cp_partition_route,
     )
+
+
+def _redistribute_thd_layout_via_tp_gather(
+    x: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
+    seq_dim: int,
+    cu_seqlens: torch.Tensor,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+    thd_cp_partition_route: Optional[ThdCpRoute],
+) -> torch.Tensor:
+    """Composed TP gather -> CP all-to-all -> TP scatter conversion of an SP THD shard.
+
+    Only used when the TP and CP groups cannot be fused into one TP x CP
+    all-to-all (see :func:`convert_cp_partition_mode`).
+    """
+    from megatron.core.tensor_parallel.mappings import (
+        gather_from_sequence_parallel_region,
+        scatter_to_sequence_parallel_region,
+    )
+
+    warnings.warn(
+        "THD CP layout conversion with sequence parallelism uses the naive "
+        "TP gather -> CP all-to-all -> TP scatter fallback because the TP and CP "
+        "process groups cannot be fused into one TP x CP all-to-all (no tp_cp_group, or "
+        "a CP group that is not part of the TP x CP group, e.g. dynamic context "
+        "parallelism).",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
+    # This gather is only used to run a duplicated CP layout permutation before
+    # scattering back to SP shards. Its backward must split, not reduce-scatter;
+    # otherwise every TP rank contributes the same full-sequence gradient.
+    gathered = gather_from_sequence_parallel_region(
+        input_=moved, tensor_parallel_output_grad=False, group=tp_group
+    )
+    converted = _redistribute_thd_layout(
+        x=gathered,
+        cp_group=cp_group,
+        seq_dim=0,
+        cu_seqlens=cu_seqlens,
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        thd_cp_partition_route=thd_cp_partition_route,
+    )
+    scattered = scatter_to_sequence_parallel_region(input_=converted, group=tp_group)
+    return scattered.movedim(0, seq_dim).contiguous() if seq_dim != 0 else scattered
 
 
 def _pack_thd_cp_route_send_buffer(
@@ -321,6 +389,98 @@ def _scatter_thd_cp_route_recv_buffer(
     if recv_index.numel() > 0:
         out.index_copy_(0, recv_index, recv_buf)
     return out
+
+
+def _select_thd_route_direction(
+    route: ThdCpRoute, source_partition_mode: str, target_partition_mode: str
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], list, list]:
+    """Return (send_index, recv_index, input_split_sizes, output_split_sizes)."""
+    if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
+        return (
+            route.zigzag_index,
+            route.contiguous_index,
+            route.zigzag_split_sizes,
+            route.contiguous_split_sizes,
+        )
+    if source_partition_mode == "contiguous" and target_partition_mode == "zigzag":
+        return (
+            route.contiguous_index,
+            route.zigzag_index,
+            route.contiguous_split_sizes,
+            route.zigzag_split_sizes,
+        )
+    raise ValueError(
+        f"Unsupported CP partition mode conversion "
+        f"{source_partition_mode!r} -> {target_partition_mode!r} for THD route."
+    )
+
+
+def _exchange_thd_layout_with_route(
+    x: torch.Tensor,
+    route: ThdCpRoute,
+    communication_group: torch.distributed.ProcessGroup,
+    seq_dim: int,
+    source_partition_mode: str,
+    target_partition_mode: str,
+    *,
+    nvtx_scope: str,
+    rank_description: str,
+) -> torch.Tensor:
+    """Differentiable pack -> all-to-all-v -> scatter of a packed THD tensor.
+
+    ``route`` describes the exchange from this rank's point of view over
+    ``communication_group``. Every op is differentiable, so the backward is the
+    inverse exchange: the gradient is packed by the receive index, sent back with
+    the swapped split sizes and scattered by the send index.
+    """
+    conversion_name = f"{source_partition_mode}_to_{target_partition_mode}"
+    with nvtx_range(f"cp_layout/thd/{nvtx_scope}/{conversion_name}"):
+        if seq_dim != 0:
+            x = x.movedim(seq_dim, 0)
+        x = x.contiguous()
+
+        send_index, recv_index, input_split_sizes, output_split_sizes = _select_thd_route_direction(
+            route, source_partition_mode, target_partition_mode
+        )
+        local_source_length = sum(input_split_sizes)
+        local_target_length = sum(output_split_sizes)
+
+        if x.size(0) != local_source_length:
+            raise ValueError(
+                f"Local THD tensor length ({x.size(0)}) does not match {source_partition_mode} "
+                f"{rank_description} partition length ({local_source_length})."
+            )
+        if local_target_length != x.size(0):
+            raise ValueError(
+                "THD CP layout conversion must preserve the local token count, "
+                f"got source={local_source_length}, target={local_target_length}, "
+                f"{rank_description}, "
+                f"source_layout={source_partition_mode!r}, "
+                f"target_layout={target_partition_mode!r}."
+            )
+
+        with nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
+            send_buf = _pack_thd_cp_route_send_buffer(x=x, send_index=send_index)
+            if not send_buf.is_contiguous():
+                send_buf = send_buf.contiguous()
+
+        with nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
+            recv_buf = all_to_all(
+                group=communication_group,
+                input_=send_buf,
+                output_split_sizes_=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+            )
+
+        with nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
+            out_shape = (local_target_length,) + tuple(x.shape[1:])
+            out = _scatter_thd_cp_route_recv_buffer(
+                recv_buf=recv_buf, recv_index=recv_index, out_shape=out_shape
+            )
+
+        if seq_dim != 0:
+            out = out.movedim(0, seq_dim)
+        return out.contiguous()
 
 
 def _redistribute_thd_layout(
@@ -343,73 +503,69 @@ def _redistribute_thd_layout(
         return x
     assert cp_group is not None
     cp_rank = cp_group.rank()
-    conversion_name = f"{source_partition_mode}_to_{target_partition_mode}"
-    with nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
-        if seq_dim != 0:
-            x = x.movedim(seq_dim, 0)
-        x = x.contiguous()
 
-        route = thd_cp_partition_route
-        if route is None:
-            route = build_thd_cp_partition_route(
-                cu_seqlens=cu_seqlens, cp_size=cp_size, cp_rank=cp_rank, device=x.device
-            )
+    route = thd_cp_partition_route
+    if route is None:
+        route = build_thd_cp_partition_route(
+            cu_seqlens=cu_seqlens, cp_size=cp_size, cp_rank=cp_rank, device=x.device
+        )
+    return _exchange_thd_layout_with_route(
+        x=x,
+        route=route,
+        communication_group=cp_group,
+        seq_dim=seq_dim,
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        nvtx_scope="swap",
+        rank_description=f"cp_size={cp_size}, cp_rank={cp_rank}",
+    )
 
-        if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
-            send_index = route.zigzag_index
-            recv_index = route.contiguous_index
-            input_split_sizes = route.zigzag_split_sizes
-            output_split_sizes = route.contiguous_split_sizes
-        elif source_partition_mode == "contiguous" and target_partition_mode == "zigzag":
-            send_index = route.contiguous_index
-            recv_index = route.zigzag_index
-            input_split_sizes = route.contiguous_split_sizes
-            output_split_sizes = route.zigzag_split_sizes
-        else:
-            raise ValueError(
-                f"Unsupported CP partition mode conversion "
-                f"{source_partition_mode!r} -> {target_partition_mode!r} for THD route."
-            )
 
-        local_source_length = sum(input_split_sizes)
-        local_target_length = sum(output_split_sizes)
+def _redistribute_thd_tp_cp_layout(
+    x: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
+    tp_cp_group: torch.distributed.ProcessGroup,
+    group_rank_by_logical_rank: Tuple[int, ...],
+    seq_dim: int,
+    cu_seqlens: torch.Tensor,
+    source_partition_mode: str,
+    target_partition_mode: str,
+    thd_tp_cp_partition_route: Optional[ThdCpRoute] = None,
+) -> torch.Tensor:
+    """Fused TP x CP permutation of one sequence-parallel THD shard.
 
-        if x.size(0) != local_source_length:
-            raise ValueError(
-                f"Local THD tensor length ({x.size(0)}) does not match {source_partition_mode} "
-                f"rank-{cp_rank} partition length ({local_source_length})."
-            )
-        if local_target_length != x.size(0):
-            raise ValueError(
-                "THD CP layout conversion must preserve the local token count, "
-                f"got source={local_source_length}, target={local_target_length}, "
-                f"cp_size={cp_size}, cp_rank={cp_rank}, "
-                f"source_layout={source_partition_mode!r}, "
-                f"target_layout={target_partition_mode!r}."
-            )
+    The shard moves directly from its ``(tp_rank, cp_rank)`` owner to the target
+    layout's owners with a single all-to-all-v over ``tp_cp_group``, replacing
+    the TP gather -> CP all-to-all -> TP scatter composition. Both compositions
+    apply the same token permutation, so the results are identical.
+    """
+    cp_size, cp_rank = cp_group.size(), cp_group.rank()
+    tp_size, tp_rank = tp_group.size(), tp_group.rank()
 
-        with nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
-            send_buf = _pack_thd_cp_route_send_buffer(x=x, send_index=send_index)
-            if not send_buf.is_contiguous():
-                send_buf = send_buf.contiguous()
-
-        with nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
-            recv_buf = all_to_all(
-                group=cp_group,
-                input_=send_buf,
-                output_split_sizes_=output_split_sizes,
-                input_split_sizes=input_split_sizes,
-            )
-
-        with nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
-            out_shape = (local_target_length,) + tuple(x.shape[1:])
-            out = _scatter_thd_cp_route_recv_buffer(
-                recv_buf=recv_buf, recv_index=recv_index, out_shape=out_shape
-            )
-
-        if seq_dim != 0:
-            out = out.movedim(0, seq_dim)
-        return out.contiguous()
+    route = thd_tp_cp_partition_route
+    if route is None:
+        route = build_thd_tp_cp_partition_route(
+            cu_seqlens=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            group_rank_by_logical_rank=group_rank_by_logical_rank,
+            device=x.device,
+        )
+    return _exchange_thd_layout_with_route(
+        x=x,
+        route=route,
+        communication_group=tp_cp_group,
+        seq_dim=seq_dim,
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        nvtx_scope="tp_cp_swap",
+        rank_description=(
+            f"cp_size={cp_size}, cp_rank={cp_rank}, tp_size={tp_size}, tp_rank={tp_rank}"
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -467,42 +623,6 @@ def _sbhd_segment_owner(
     raise ValueError(
         f"SBHD segment {segment_id} is not present in the {layout} layout for "
         f"{cp_size=} and {tp_size=}"
-    )
-
-
-@lru_cache(maxsize=None)
-def _build_sbhd_group_rank_by_logical_rank(
-    cp_global_ranks: tuple[int, ...],
-    tp_global_ranks: tuple[int, ...],
-    tp_cp_global_ranks: tuple[int, ...],
-    current_global_rank: int,
-) -> tuple[int, ...]:
-    """Map logical ``cp_rank * tp_size + tp_rank`` coordinates to group ranks for SBHD."""
-    group_rank_by_global_rank = {
-        global_rank: group_rank for group_rank, global_rank in enumerate(tp_cp_global_ranks)
-    }
-    group_rank_by_logical_rank = []
-    for cp_global_rank in cp_global_ranks:
-        for tp_global_rank in tp_global_ranks:
-            target_global_rank = cp_global_rank + tp_global_rank - current_global_rank
-            if target_global_rank not in group_rank_by_global_rank:
-                raise RuntimeError(
-                    "TP and CP process groups do not form the expected Cartesian product"
-                )
-            group_rank_by_logical_rank.append(group_rank_by_global_rank[target_global_rank])
-    return tuple(group_rank_by_logical_rank)
-
-
-def _get_sbhd_group_rank_by_logical_rank(
-    cp_group: torch.distributed.ProcessGroup,
-    tp_group: torch.distributed.ProcessGroup,
-    tp_cp_group: torch.distributed.ProcessGroup,
-) -> tuple[int, ...]:
-    return _build_sbhd_group_rank_by_logical_rank(
-        cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(cp_group)),
-        tp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_group)),
-        tp_cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_cp_group)),
-        current_global_rank=torch.distributed.get_rank(),
     )
 
 
@@ -621,7 +741,7 @@ def _redistribute_sbhd_layout(
             )
         tp_size, tp_rank = tp_group.size(), tp_group.rank()
         communication_group = tp_cp_group
-        group_rank_by_logical_rank = _get_sbhd_group_rank_by_logical_rank(
+        group_rank_by_logical_rank = get_tp_cp_group_rank_by_logical_rank(
             cp_group=cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
         )
 
