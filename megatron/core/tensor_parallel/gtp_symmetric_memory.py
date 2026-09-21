@@ -142,9 +142,7 @@ def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
     return torch.cuda.use_mem_pool(_get_gtp_symm_pool(group))
 
 
-def is_gtp_symm_pool_registered(
-    group: dist.ProcessGroup | None, mode: str | None = None
-) -> bool:
+def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None, mode: str | None = None) -> bool:
     """True once ``register_gtp_symm_pool`` has registered this group's pool; also False for
     ``None`` and single-rank groups, which are never registered.
 

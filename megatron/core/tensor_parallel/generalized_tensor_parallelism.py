@@ -603,9 +603,10 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     # Without the distributed optimizer the shard itself is the all-gather input, so clone
     # it inside the group's registered pool. With it, the optimizer re-homes the param into
     # the DDP buffer (registered as a whole) and this clone is freed.
-    if is_gtp_symm_pool_registered(
-        gtp_remat_group, mode="ag"
-    ) and not GTP_CONFIG.param_storage_in_ddp_buffer:
+    if (
+        is_gtp_symm_pool_registered(gtp_remat_group, mode="ag")
+        and not GTP_CONFIG.param_storage_in_ddp_buffer
+    ):
         with gtp_symm_pool_ctx(gtp_remat_group):
             gtp_shard = GTPShardedParam(shard.clone())
     else:
