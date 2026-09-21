@@ -21,18 +21,18 @@ import torch.nn.functional as F
 
 pytestmark = [pytest.mark.gpus(2, min_architecture="blackwell"), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
+CHUNK = 512
+SINGLE = [4096]  # 32 KV blocks > top-16
+PACKED = [1536, 2560, 3840]  # 7936 tokens: not a multiple of 512*2 -> pad doc under CP2
+BACKEND_LOSS_REL, LAYOUT_LOSS_REL, LAYER_COS = 1e-2, 5e-3, 0.999
+DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95
+
 
 def _train_config(ps):
     return SimpleNamespace(
         tp=ps.tp_size, ep=ps.ep_size, etp=ps.etp_size, pp=ps.pp_size, cp=ps.cp_size, vpp=None,
         use_deepep=False, fp8=False, recompute_modules=[], deterministic=True,
     )
-
-CHUNK = 512
-SINGLE = [4096]  # 32 KV blocks > top-16
-PACKED = [1536, 2560, 3840]  # 7936 tokens: not a multiple of 512*2 -> pad doc under CP2
-BACKEND_LOSS_REL, LAYOUT_LOSS_REL, LAYER_COS = 1e-2, 5e-3, 0.999
-DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95
 
 
 def _magi_deps():
