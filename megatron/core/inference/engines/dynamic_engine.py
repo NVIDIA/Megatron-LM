@@ -2208,7 +2208,6 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt=prompt_str,
             prompt_tokens=tokens,
             compact_prompt_tokens=compact_prompt_tokens,
-            # The payload stager takes custody of exactly what the encoder consumed.
             media_tensors={
                 name: tensor
                 for name, tensor in (

@@ -833,8 +833,6 @@ def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
 
     assert merged.uid == "chatcmpl-fixed"
     assert merged.offload_params == {"ng_capture": admission}
-    # Like offload_params, the media tensors are stager material: kept through the
-    # merge, dropped from the wire.
     assert merged.media_tensors is media_tensors
 
     serialized = merged.serialize(
@@ -865,7 +863,6 @@ def test_offloaded_request_payload_and_serialize():
             prompt_tokens=torch.tensor([1, 2, 3]),
             sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
             generated_tokens=[10, 11],
-            # A VLM request also keeps its compact prompt and the encoder's inputs.
             compact_prompt_tokens=torch.tensor([1, 2]) if multimodal else None,
             media_tensors={"imgs": imgs} if multimodal else None,
         )

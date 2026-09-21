@@ -766,11 +766,7 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     compact_prompt_tokens: Optional[torch.Tensor] = None
-    # The media tensors the vision encoder consumed (``imgs`` as packed patches or
-    # padded pixels, ``imgs_sizes``, ``num_frames``, ``num_tiles``; absent keys omitted).
-    # References to the VLM request's own tensors, so a payload stager can take custody
-    # of the exact pixels the request ran on. Preserved across checkpoint/merge (the
-    # merged finished request is a plain DynamicInferenceRequest); never on the wire.
+    # Media tensors the vision encoder consumed; kept for the payload stager, never on the wire.
     media_tensors: Optional[Dict[str, torch.Tensor]] = None
     # Opaque JSON/msgpack-compatible metadata owned by an external payload stager.
     offload_params: Optional[Dict[str, Any]] = None
@@ -964,8 +960,6 @@ class DynamicInferenceRequest(InferenceRequest):
         # Request metadata is input-only. Only the stager's response metadata
         # crosses back to the REST endpoint.
         obj.pop("offload_params", None)
-        # Media tensors are engine-local custody material for the payload stager
-        # (OffloadedRequestPayload.media_tensors); the REST reply never needs them.
         obj.pop("media_tensors", None)
         obj["prompt_length"] = prompt_len
         obj["payload_offloaded"] = payload_offloaded

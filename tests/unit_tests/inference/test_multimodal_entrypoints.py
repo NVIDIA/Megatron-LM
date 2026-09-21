@@ -313,7 +313,6 @@ async def test_generate_multimodal_entrypoint_with_toy_model(
     assert service.wrapper._forward_vision_encoder.call_count == 1
     assert int((result.image_token_mask >= 0).sum()) == result.image_embeddings.shape[0]
 
-    # The payload stager gets the compact prompt and the exact media the encoder consumed.
     payload = OffloadedRequestPayload.from_request(result)
     toy = _toy_preprocessed_media(modality)
     assert payload.compact_prompt_token_ids == _PROMPT_TOKENS
