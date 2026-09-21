@@ -27,6 +27,10 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.gdn_fusion import enabled as gdn_fusion_enabled
+from megatron.core.ssm.gdn_fusion import fused_prepare
+from megatron.core.ssm.gdn_gated_norm import enabled as gdn_output_fusion_enabled
+from megatron.core.ssm.gdn_gated_norm import fused_gated_norm
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
@@ -130,7 +134,6 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
-            # Resolve cu_seqlens with alignment padding handling.
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
@@ -180,6 +183,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
         # (beta, alpha for GDN; f, b, w for GDN2)
         qkv, gate, beta, alpha = self._split_projection(qkvzba, batch, seq_len)
+        use_fusion = gdn_fusion_enabled(self, qkvzba)
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
@@ -218,7 +222,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        else:
+        elif not use_fusion:
             assert self.activation in ["silu", "swish"]
             qkv, _ = causal_conv1d(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
@@ -238,9 +242,20 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
-        )
+        if use_fusion:
+            query, key, value, gate, g, beta = fused_prepare(
+                qkvzba,
+                conv1d_weight.squeeze(1),
+                conv1d_bias,
+                A_log_local_cp,
+                dt_bias_local_cp,
+                cu_seqlens_q,
+            )
+            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta, "gate": gate}
+        else:
+            kernel_inputs = self._prepare_input_for_gated_delta_rule(
+                qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
+            )
         gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
@@ -323,6 +338,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             sequence_len_offset=sequence_len_offset,
             **kwargs,
         )
+
+    def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Use fused output gating for supported RMSNorm layouts."""
+        if gdn_output_fusion_enabled(self, x, gate):
+            return fused_gated_norm(
+                x, gate, self.out_norm.weight, self.out_norm.eps, self.out_norm.zero_centered_gamma
+            ).reshape(-1, self.value_head_dim)
+        return super()._apply_gated_norm(x, gate)
 
     def _split_projection(
         self, projected: torch.Tensor, batch: int, seq_len: int
