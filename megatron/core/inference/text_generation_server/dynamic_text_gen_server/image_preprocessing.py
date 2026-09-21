@@ -112,7 +112,7 @@ def dynamic_res_preprocess(
     pixel_shuffle=False,
     spatial_merge_size=1,
     video_maintain_aspect_ratio=None,
-    rounding_mode="ceil",
+    rounding_mode: Literal["ceil", "round_plus_half"] = "ceil",
 ):
     """Resize image to fit within [min_patches, max_patches] preserving aspect ratio.
 
