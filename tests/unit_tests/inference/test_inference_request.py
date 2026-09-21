@@ -151,6 +151,24 @@ def test_preexpanded_multimodal_request_round_trip():
     assert torch.equal(resolved["imgs_sizes"], media["image"]["imgs_sizes"])
 
 
+def test_preprocessed_video_timing_metadata_round_trip():
+    media = {
+        "video": {
+            "imgs": torch.ones(1, 2, 4),
+            "imgs_sizes": torch.tensor([[2, 2], [2, 2]]),
+            "num_frames": torch.tensor([2]),
+            "video_frame_indices": [[3, 7]],
+            "video_fps": [29.97],
+        }
+    }
+
+    wire = serialize_multimodal_data(media)
+    resolved = resolve_multimodal_data_for_engine(wire)
+
+    assert resolved["video_frame_indices"] == [[3, 7]]
+    assert resolved["video_fps"] == [29.97]
+
+
 def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
     wire = serialize_multimodal_data(
         {"image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}}

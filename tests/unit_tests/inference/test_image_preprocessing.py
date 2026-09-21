@@ -14,6 +14,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.imag
     _load_frame_sequence_manifest,
     _video_sample_indices,
     dynamic_res_preprocess,
+    preprocess_image,
     preprocess_image_bytes_list,
     preprocess_video_bytes_list,
 )
@@ -176,6 +177,36 @@ def test_round_plus_half_matches_observed_hf_grid_contract():
 
     assert old_megatron.size == (384, 704)
     assert hf_compatible.size == (416, 704)
+
+
+def test_torch_bicubic_antialias_resize_mode_uses_tensor_resize(monkeypatch):
+    image_module = pytest.importorskip("PIL.Image")
+    pytest.importorskip("torchvision")
+    import torch.nn.functional as functional
+
+    interpolate = functional.interpolate
+    calls = []
+
+    def record_interpolate(input_tensor, **kwargs):
+        calls.append(kwargs)
+        return interpolate(input_tensor, **kwargs)
+
+    monkeypatch.setattr(functional, "interpolate", record_interpolate)
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        dynamic_resolution_min_patches=4,
+        dynamic_resolution_max_patches=4,
+        dynamic_resolution_resize_mode="torch_bicubic_antialias",
+        pixel_mean=[0.0, 0.0, 0.0],
+        pixel_std=[1.0, 1.0, 1.0],
+    )
+
+    images, imgs_sizes = preprocess_image(image_module.new("RGB", (2, 2)), config)
+
+    assert calls == [{"size": (4, 4), "mode": "bicubic", "align_corners": False, "antialias": True}]
+    assert images.shape == (1, 4, 12)
+    assert imgs_sizes.tolist() == [[4, 4]]
 
 
 def test_image_list_applies_model_length_budget_per_request(monkeypatch):

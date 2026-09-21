@@ -322,6 +322,9 @@ async def test_generate_multimodal_entrypoint_with_toy_model(
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1
     assert int((result.image_token_mask >= 0).sum()) == result.image_embeddings.shape[0]
+    if modality == "video":
+        assert result.video_frame_indices == [[0, 1]]
+        assert result.video_fps == [1.0]
 
 
 @pytest.mark.internal

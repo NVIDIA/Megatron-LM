@@ -187,6 +187,20 @@ class TestInferenceConfig:
         with pytest.raises(ValueError, match="requires"):
             MediaPromptSpec(include_frame_timestamps_for_nemotron_vl=True)
 
+    @pytest.mark.parametrize(
+        ("kwargs", "error"),
+        [
+            ({"dynamic_resolution_rounding_mode": "floor"}, "rounding_mode"),
+            ({"dynamic_resolution_resize_mode": "nearest"}, "resize_mode"),
+            ({"dynamic_resolution_model_length": 4}, "greater than 4"),
+        ],
+    )
+    def test_image_processing_config_rejects_invalid_dynamic_resolution_options(
+        self, kwargs, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            ImageProcessingConfig(patch_dim=14, **kwargs)
+
     def test_video_processing_config_preserves_image_contract_and_defaults(self):
         image_config = ImageProcessingConfig(
             patch_dim=14, dynamic_resolution=True, pixel_shuffle=True

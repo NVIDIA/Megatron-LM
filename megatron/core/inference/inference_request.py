@@ -176,7 +176,8 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     Video:
         ``"video"`` accepts raw video bytes, a list of raw video bytes, or a
         preprocessed tensor dictionary containing ``imgs``, ``imgs_sizes``,
-        and ``num_frames``.
+        and ``num_frames``. Preprocessed video dictionaries may also include
+        ``video_frame_indices`` and ``video_fps`` timing metadata.
     Audio:
         Audio does not yet have any supported data preprocessing or modeling
         formats.
@@ -236,6 +237,10 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             wire[key] = serialize_tensor(value)
         if "num_img_embeddings_per_tile" in modality_data:
             wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
+        if modality == "video":
+            for key in ("video_frame_indices", "video_fps"):
+                if key in modality_data:
+                    wire[key] = copy.deepcopy(modality_data[key])
         return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
     else:
         raise TypeError(
@@ -403,6 +408,10 @@ def resolve_multimodal_data_for_engine(
             kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
     if "num_img_embeddings_per_tile" in modality_data:
         kwargs["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
+    if modality == "video":
+        for key in ("video_frame_indices", "video_fps"):
+            if key in modality_data:
+                kwargs[key] = copy.deepcopy(modality_data[key])
 
     if modality == "image":
         # Reject incomplete static-tiling payloads. Static tiling (imgs +

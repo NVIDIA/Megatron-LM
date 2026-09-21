@@ -17,6 +17,7 @@ from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
+    _render_nemotron_vl_video_prompt,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
     dynamic_media_embedding_counts,
@@ -208,6 +209,42 @@ def test_nemotron_video_expansion_adds_timestamped_tubelet_wrappers():
     )
     assert expanded == [[11, 7, 77, -1, 78, 7, 77, -1, 78, 12]]
     assert masks == [[None, None, None, 0, None, None, None, 1, None, None]]
+
+
+@pytest.mark.internal
+def test_nemotron_video_prompt_supports_partial_final_tubelet():
+    prompt = _render_nemotron_vl_video_prompt(
+        MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        ),
+        frame_indices=[0, 30, 60],
+        fps=30.0,
+        temporal_patch_size=2,
+    )
+
+    assert prompt == (
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
+        "<img><image></img>\n"
+        "Frame 3 sampled at 1.98 seconds: <img><image></img>"
+    )
+
+
+@pytest.mark.internal
+def test_nemotron_temporal_prompt_can_omit_timestamps():
+    prompt = _render_nemotron_vl_video_prompt(
+        MediaPromptSpec(
+            model_token="<image>", prefix="<img>", suffix="</img>", expansion_mode="temporal_patch"
+        ),
+        frame_indices=[0, 30, 60, 90],
+        fps=30.0,
+        temporal_patch_size=2,
+    )
+
+    assert prompt == "<img><image></img>\n<img><image></img>"
 
 
 @pytest.mark.internal

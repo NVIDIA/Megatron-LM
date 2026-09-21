@@ -11,6 +11,10 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
 )
 
 
+def test_frontend_processes_use_spawn_context():
+    assert text_generation_server._SERVER_PROCESS_CONTEXT.get_start_method() == "spawn"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provide_config", [False, True])
 async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_config):

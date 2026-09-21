@@ -1600,6 +1600,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 "num_tiles",
                 "imgs_sizes",
                 "num_frames",
+                "video_frame_indices",
+                "video_fps",
                 "image_embeddings",
                 "image_token_mask",
             ):
