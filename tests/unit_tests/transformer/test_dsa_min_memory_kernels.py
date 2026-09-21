@@ -8,6 +8,7 @@ attention layer: the kernels take plain tensors, so testing them at this level k
 numerical failure attributable to one kernel rather than to the layer that called it.
 """
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -15,11 +16,14 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+    _MAX_QUERY_CHUNK,
     _accumulate_simplified_learned_k_wgrad,
     _plan_execution,
     _sparse_attention_backward_torch_fp32,
     _sparse_attention_tile,
+    dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
+    dsa_min_memory_gqa_forward_only,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
     HAVE_TRITON,
@@ -256,15 +260,18 @@ def test_simplified_train_main_only_zero_loss_produces_no_indexer_update(freeze_
             torch.testing.assert_close(grad, torch.zeros_like(grad))
 
 
-def test_torch_min_memory_forces_full_key_routing_chunk():
-    """Routing under torch reads every key, so its top-k stays tie-equivalent to the reference."""
-    torch_plan = _plan_execution(1, 8192, 8192, use_triton=False)
-    assert torch_plan.routing_key_chunk == 8192
+def test_min_memory_routes_over_the_full_key_length():
+    """Both backends route over every key, for different reasons."""
+    # Torch: a streamed top-k is not tie-equivalent to a single full top-k, so reading every key
+    # is what keeps min-memory-torch faithful to reference routing.
+    assert _plan_execution(1, 8192, 8192, use_triton=False).routing_key_chunk == 8192
     # ...even when a caller asks for a smaller key chunk.
     assert _plan_execution(1, 8192, 8192, False, key_chunk_override=1024).routing_key_chunk == 8192
 
-    triton_plan = _plan_execution(1, 8192, 8192, use_triton=True)
-    assert triton_plan.routing_key_chunk == 1024
+    # Triton: its router streams the key dimension internally, so an outer key chunk saves no
+    # memory and only repeats the merge.
+    assert _plan_execution(1, 8192, 8192, use_triton=True).routing_key_chunk == 8192
+    # An explicit override still forces the outer multi-chunk merge, which the tests below need.
     assert _plan_execution(1, 8192, 8192, True, key_chunk_override=2048).routing_key_chunk == 2048
 
 
@@ -279,6 +286,40 @@ def test_execution_plan_bounds_the_score_tile():
     assert long_plan.query_chunk == 256
     # Batch enters the same product, so a larger batch shrinks the chunk proportionally.
     assert _plan_execution(4, 262144, 262144, use_triton=False).query_chunk == 64
+
+
+def test_tile_sizes_are_optional_on_every_public_entrypoint():
+    """Production callers let _plan_execution choose, so no entrypoint may require a tile size.
+
+    Regression test: dsa_min_memory_gqa was given None defaults when the tile sizes stopped being
+    configurable, but dsa_min_memory_gqa_forward_only and dsa_dense_indexer_loss kept theirs
+    required. The layer passes neither, so the eval and dense-warmup paths raised TypeError at
+    runtime -- in a forward that megatron.core.utils catches and logs, so it never surfaced as a
+    hard failure.
+    """
+    for fn in (dsa_min_memory_gqa, dsa_min_memory_gqa_forward_only, dsa_dense_indexer_loss):
+        parameters = inspect.signature(fn).parameters
+        for name in ("query_chunk_size", "key_chunk_size"):
+            assert name in parameters, f"{fn.__name__} lost {name}"
+            assert (
+                parameters[name].default is None
+            ), f"{fn.__name__} requires {name}; production callers do not pass it"
+
+
+def test_triton_query_chunk_is_not_shrunk_by_long_key_length():
+    """Triton budgets against its internal router sub-block, not the full routing width.
+
+    The Triton router never materialises a [batch, query_chunk, key_chunk] score tile, so charging
+    the query chunk for one costs occupancy to pay for memory that is never allocated. Regression
+    test: at sequence 131072 this previously produced a 1024-wide outer key chunk and 128 routing
+    launches per query tile, which measured 3.1x slower end to end than routing the full length.
+    """
+    plan = _plan_execution(1, 131072, 131072, use_triton=True)
+    assert plan.routing_key_chunk == 131072
+    assert plan.query_chunk == _MAX_QUERY_CHUNK
+
+    # The budget still binds on the backend that does materialise the tile.
+    assert _plan_execution(1, 131072, 131072, use_triton=False).query_chunk < _MAX_QUERY_CHUNK
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")

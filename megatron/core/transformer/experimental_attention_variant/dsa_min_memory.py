@@ -27,6 +27,7 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
+    ROUTER_KEY_SUB_BLOCK,
     set_min_memory_triton_enabled,
     triton_indexer_loss_grad,
     triton_linear_wgrad,
@@ -83,6 +84,9 @@ _SCORE_TILE_BUDGET_BYTES = 256 << 20
 # Upper bound on the query chunk. Past this the tile stops being the thing that limits occupancy,
 # and larger chunks mostly cost temporaries.
 _MAX_QUERY_CHUNK = 8192
+# Upper bound on the key chunk for the paths that stream keys on the outside -- the dense indexer
+# loss. Routing does not use it: both backends route over the whole key length, for the reasons in
+# _plan_execution.
 _MAX_KEY_CHUNK = 1024
 
 
@@ -124,11 +128,25 @@ def _plan_execution(
     # after ReLU, and simplified routing can also contain equal scores. Routing therefore reads
     # the whole key length under torch, so min-memory-torch reproduces reference routing. This
     # is a correctness rule, not a tuning choice.
-    routing_key_chunk = key_length if not use_triton else key_chunk
+    #
+    # Triton also routes over the whole key length, for a different reason. Its router does not
+    # materialise a [batch, query_chunk, key_chunk] tile at all: triton_topk_index_block streams
+    # the key dimension itself in ROUTER_KEY_SUB_BLOCK-wide sub-blocks and merges the per-sub-block
+    # top-k with the same merge the outer loop uses. An outer key chunk therefore buys no memory --
+    # it only repeats that merge and relaunches the kernel, 128 times over at sequence 131072.
+    routing_key_chunk = key_length
+    if use_triton and key_chunk_override is not None and key_chunk_override > 0:
+        # Honour an explicit override so tests can still force the outer multi-chunk merge.
+        routing_key_chunk = key_chunk
 
-    # Size the query chunk so the largest score tile stays inside the budget. The routing tile is
-    # the widest, so it sets the bound.
-    tile_row_bytes = max(1, batch_size * routing_key_chunk * 4)
+    # Size the query chunk so the largest score tile stays inside the budget. Under torch the
+    # routing tile is the widest and sets the bound. Under Triton the widest thing resident is the
+    # router's internal sub-block, so budgeting the full routing width would shrink the query chunk
+    # to pay for a tile that is never allocated.
+    budget_key_width = (
+        min(routing_key_chunk, ROUTER_KEY_SUB_BLOCK) if use_triton else routing_key_chunk
+    )
+    tile_row_bytes = max(1, batch_size * budget_key_width * 4)
     affordable = max(1, _SCORE_TILE_BUDGET_BYTES // tile_row_bytes)
     query_chunk = min(query_length, _MAX_QUERY_CHUNK, affordable)
     if query_chunk_override is not None and query_chunk_override > 0:
@@ -1858,8 +1876,10 @@ def dsa_min_memory_gqa_forward_only(
     indexer,
     softmax_scale: float,
     use_indexer_rope: bool,
-    query_chunk_size: Optional[int],
-    key_chunk_size: Optional[int],
+    # Default to None to match dsa_min_memory_gqa: the tile sizes are no longer configurable, so
+    # production callers let _plan_execution choose. Tests still pass explicit sizes.
+    query_chunk_size: Optional[int] = None,
+    key_chunk_size: Optional[int] = None,
     cache_indexer_k: bool = False,
     use_triton: bool = True,
     simplified_input_norm=None,
@@ -2006,8 +2026,10 @@ def dsa_dense_indexer_loss(
     softmax_scale: float,
     loss_coeff: float,
     use_indexer_rope: bool,
-    query_chunk_size: Optional[int],
-    key_chunk_size: Optional[int],
+    # Default to None to match dsa_min_memory_gqa: the tile sizes are no longer configurable, so
+    # production callers let _plan_execution choose. Tests still pass explicit sizes.
+    query_chunk_size: Optional[int] = None,
+    key_chunk_size: Optional[int] = None,
     use_triton: bool = True,
     simplified_input_norm=None,
 ) -> torch.Tensor:
@@ -2052,8 +2074,10 @@ def dsa_min_memory_gqa(
     softmax_scale: float,
     loss_coeff: float,
     use_indexer_rope: bool,
-    query_chunk_size: Optional[int],
-    key_chunk_size: Optional[int],
+    # Default to None: the tile sizes are not a model option, so production callers let
+    # _plan_execution choose. Tests still pass explicit sizes to exercise tiling.
+    query_chunk_size: Optional[int] = None,
+    key_chunk_size: Optional[int] = None,
     cache_routing: bool = False,
     cache_indexer_k: bool = False,
     cache_selected_scores: bool = False,
