@@ -19,7 +19,8 @@ import json
 import os
 import re
 import sys
-from types import SimpleNamespace
+from dataclasses import fields
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +30,76 @@ sys.path.insert(0, os.path.join(_LITE, "ref", "minimax_m3"))
 sys.path.insert(0, os.path.join(_LITE, "tools", "minimax_m3"))
 
 DEV = "cuda"
+
+
+def test_protocol_build_is_magi_only(monkeypatch):
+    from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
+    from megatron.lite.model.minimax_m3.lite import protocol as P
+
+    assert "msa_backend" not in {f.name for f in fields(P.ImplConfig)}
+    seen = {}
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self, _cfg, _train_cfg, _ps, *, msa_backend, **_kwargs):
+            super().__init__()
+            seen["msa_backend"] = msa_backend
+            self.layers = torch.nn.ModuleList()
+
+        def to(self, *_args, **_kwargs):
+            return self
+
+        def cuda(self, *_args, **_kwargs):
+            return self
+
+    ps = SimpleNamespace(tp_size=1, ep_size=1, etp_size=1, pp_size=1, cp_size=1)
+    fake_model_module = ModuleType("megatron.lite.model.minimax_m3.lite.model")
+    fake_model_module.MiniMaxM3Model = FakeModel
+    monkeypatch.setitem(sys.modules, fake_model_module.__name__, fake_model_module)
+    monkeypatch.setattr(P, "init_parallel", lambda _cfg: ps)
+    monkeypatch.setattr(P.magi_msa, "validate_device", lambda: None)
+    monkeypatch.setattr(P.magi_msa, "validate_kernel_shapes", lambda **_kwargs: None)
+    monkeypatch.setattr(P.magi_msa, "build_msa_config", lambda *_args, **_kwargs: object())
+
+    bundle = P.build_model(MiniMaxM3Config(), impl_cfg=P.ImplConfig(optimizer=None))
+    assert seen["msa_backend"] == "magi"
+    assert bundle.forward_step is P._forward_step
+    assert bundle.extras["magi_settings"] is not None
+    assert bundle.extras["magi_settings"].deterministic is False
+
+
+def test_magi_forward_step_preserves_packed_document_contract(monkeypatch):
+    from megatron.lite.model.minimax_m3.lite import protocol as P
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    ctx = SimpleNamespace(pad=3, cu_seqlens_host=(0, 2, 5, 8))
+    monkeypatch.setattr(P, "_magi_plan", lambda _model, _batch: ctx)
+    monkeypatch.setattr(P.magi_msa, "dispatch_tokens", lambda x, _ctx: x)
+    monkeypatch.setattr(P.magi_msa, "undispatch_tokens", lambda x, _ctx: x)
+
+    class Recorder(torch.nn.Module):
+        cross_entropy_fusion = False
+
+        def forward(self, **kwargs):
+            self.kwargs = kwargs
+            return kwargs["input_ids"].unsqueeze(-1)
+
+    model = Recorder()
+    batch = PackedBatch(
+        input_ids=torch.tensor([10, 11, 20, 21, 22]),
+        labels=torch.tensor([11, 12, 21, 22, 23]),
+        loss_mask=torch.tensor([1, 1, 1, 0, 1], dtype=torch.float32),
+        seq_lens=torch.tensor([2, 3]),
+    )
+    output = P._forward_step(model, batch)
+    assert output.shape == (1, 8, 1)
+    assert model.kwargs["input_ids"].tolist() == [[10, 11, 20, 21, 22, 0, 0, 0]]
+    assert model.kwargs["labels"].tolist() == [[11, 12, 21, 22, 23, 0, 0, 0]]
+    assert model.kwargs["loss_mask"].tolist() == [[1, 1, 1, 0, 1, 0, 0, 0]]
+    assert model.kwargs["magi_ctx"] is ctx
+
+    unpacked = P.unpack_forward_output(model, batch, output)
+    docs = list(unpacked.unbind())
+    assert [d.squeeze(-1).tolist() for d in docs] == [[10, 11], [20, 21, 22]]
 
 
 def test_magi_forward_step_rejects_invalid_packed_boundaries():
@@ -42,14 +113,6 @@ def test_magi_forward_step_rejects_invalid_packed_boundaries():
     )
     with pytest.raises(ValueError, match="seq_lens sums to 4"):
         P._validate_packed_batch(bad_length)
-
-    valid_positions = PackedBatch(
-        input_ids=torch.tensor([10, 11, 20, 21]),
-        labels=torch.tensor([11, 12, 21, 22]),
-        seq_lens=torch.tensor([2, 2]),
-        position_ids=torch.tensor([0, 1, 0, 1]),
-    )
-    P._validate_packed_batch(valid_positions)
 
     cross_document_positions = PackedBatch(
         input_ids=torch.tensor([10, 11, 20, 21]),

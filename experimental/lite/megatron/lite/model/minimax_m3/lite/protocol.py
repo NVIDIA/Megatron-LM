@@ -156,7 +156,9 @@ def _validate_packed_batch(batch: PackedBatch) -> None:
         expected = torch.cat(
             [torch.arange(length, device=batch.position_ids.device) for length in seq_lens]
         )
-        if not torch.equal(batch.position_ids.reshape(-1), expected):
+        if batch.position_ids.numel() != total or not torch.equal(
+            batch.position_ids.reshape(-1), expected
+        ):
             raise ValueError(
                 "MiniMax-M3 Magi derives document-local position_ids from seq_lens; explicit "
                 "position_ids must match those document boundaries"

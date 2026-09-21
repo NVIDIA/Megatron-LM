@@ -47,6 +47,68 @@ def _build_fp32_flex_oracle(cfg):
 
 
 @pytest.mark.skipif(not CKPT, reason="set MINIMAX_M3_TRUNCATED_DIR")
+def test_truncated_m3_magi_packed_logits_match_individual_documents():
+    """Real-weight bf16 smoke for the production Magi protocol and packed-document boundaries."""
+    from megatron.lite.model.minimax_m3.lite import protocol as P
+    from megatron.lite.primitive.kernels import magi_msa
+    from megatron.lite.runtime.contracts import ParallelConfig
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    torch.cuda.set_device(0)
+    magi_msa.ensure_single_process_group()
+    cfg = P.build_model_config(CKPT)
+    dense_backend = os.environ.get("MINIMAX_M3_MAGI_DENSE_BACKEND", "fa4")
+    bundle = P.build_model(
+        cfg,
+        impl_cfg=P.ImplConfig(
+            parallel=ParallelConfig(),
+            optimizer=None,
+            magi_chunk_size=512,
+            magi_dense_kernel_backend=dense_backend,
+        ),
+    )
+    model = bundle.chunks[0]
+    P.load_hf_weights(model, CKPT, cfg, bundle.parallel_state)
+    model.eval()
+    assert model.msa_backend == "magi"
+
+    generator = torch.Generator(device=DEV).manual_seed(20260918)
+    lengths = (
+        int(os.environ.get("MINIMAX_M3_MAGI_DOC1_LEN", "384")),
+        int(os.environ.get("MINIMAX_M3_MAGI_DOC2_LEN", "320")),
+    )
+    documents = [
+        torch.randint(0, cfg.vocab_size, (length,), device=DEV, generator=generator)
+        for length in lengths
+    ]
+
+    def forward_docs(docs):
+        ids = torch.cat(docs)
+        batch = PackedBatch(
+            input_ids=ids,
+            labels=None,
+            seq_lens=torch.tensor([doc.numel() for doc in docs], device=DEV),
+        )
+        with torch.no_grad():
+            output = bundle.forward_step(model, batch)
+            unpacked = P.unpack_forward_output(model, batch, output["logits"])
+        return [piece.detach().cpu() for piece in unpacked.unbind()]
+
+    individual = [forward_docs([doc])[0] for doc in documents]
+    packed = forward_docs(documents)
+    metrics = []
+    for got, want in zip(packed, individual, strict=True):
+        got_f, want_f = got.float(), want.float()
+        cosine = torch.nn.functional.cosine_similarity(got_f, want_f, dim=-1).mean().item()
+        mean_abs = (got_f - want_f).abs().mean().item()
+        metrics.append((cosine, mean_abs))
+        assert torch.isfinite(got_f).all()
+        assert cosine >= 0.9999, metrics
+        assert mean_abs < 2e-2, metrics
+    print(f"\nTruncated-M3 Magi ({dense_backend}) individual vs packed logits: {metrics}")
+
+
+@pytest.mark.skipif(not CKPT, reason="set MINIMAX_M3_TRUNCATED_DIR")
 @pytest.mark.parametrize("S", [int(os.environ.get("MINIMAX_M3_TRUNCATED_SEQ", "2048"))])
 def test_truncated_m3_matches_hf_fp32(S):
     from align_harness import LayerDumper, logits_metrics
