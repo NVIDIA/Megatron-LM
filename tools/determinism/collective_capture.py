@@ -501,7 +501,7 @@ class CollectiveCapture:
         report.update(
             kind="collective_recipe_capture",
             events=self.events,
-            capture_issues=sorted(self.issues),
+            capture_issues=sorted(self.issues | set(inventory_report.get("capture_issues", []))),
             bytes_written=self.bytes_written,
         )
         if "context_after" in inventory_report:
