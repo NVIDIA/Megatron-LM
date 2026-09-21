@@ -264,9 +264,10 @@ def plan_magi_batch(
     group = msa_cp_group(ps)
     dcfg = dispatch_config(settings)
     key = m.msa.make_magi_msa_key(list(cu_seqlens), group, config=msa_config, dispatch_config=dcfg)
+    position_ids = m.msa.get_position_ids(key).to(torch.int64)
     dense_key = None
     if need_dense_key:
-        cu_t = torch.tensor(cu_seqlens, dtype=torch.int32)
+        cu_t = torch.tensor(cu_seqlens, dtype=torch.int32, device=position_ids.device)
         dense_key = m.magi_attn_varlen_key(
             cu_t,
             cu_t,
@@ -278,7 +279,6 @@ def plan_magi_batch(
             causal=True,
             dist_attn_config=m.DistAttnConfig(dispatch_config=dcfg),
         )
-    position_ids = m.msa.get_position_ids(key).to(torch.int64)
     if position_ids.numel() % max(ps.tp_size, 1) != 0:
         raise ValueError(
             f"local token count {position_ids.numel()} is not divisible by tp={ps.tp_size}; "

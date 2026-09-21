@@ -191,7 +191,7 @@ def _build_reference(cfg, tmp_path_factory, tag):
     assert_fp32_env()
     ps0 = ParallelState()
     torch.manual_seed(20260910)
-    ref = MiniMaxM3Model(cfg, _train_cfg(ps0), ps0).float().cuda()
+    ref = MiniMaxM3Model(cfg, _train_cfg(ps0), ps0, msa_backend="flex").float().cuda()
     with torch.no_grad():  # non-trivial Gemma-norm weights and router bias
         for n, p in ref.named_parameters():
             if n.endswith("norm.weight") or n.endswith("layer_norm_weight"):
@@ -240,7 +240,7 @@ def _check_case(reference, *, tp=1, ep=1, pp=1, cp=1, etp=None):
     cfg = reference.cfg
     ps = init_parallel(ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp))
     torch.manual_seed(7)
-    model = MiniMaxM3Model(cfg, _train_cfg(ps), ps).float().cuda()
+    model = MiniMaxM3Model(cfg, _train_cfg(ps), ps, msa_backend="flex").float().cuda()
     load_hf_weights(model, reference.src, cfg, ps)
 
     def local(t, seq_dim):  # this rank's zigzag shard of a full-sequence reference tensor
@@ -371,10 +371,10 @@ def test_cp2_full_proxy_bf16_recorded(reference):
     dist = _init_dist_or_skip()
     cfg = reference.cfg
     ps0 = ParallelState()
-    ref = MiniMaxM3Model(cfg, _train_cfg(ps0), ps0).to(torch.bfloat16).cuda()
+    ref = MiniMaxM3Model(cfg, _train_cfg(ps0), ps0, msa_backend="flex").to(torch.bfloat16).cuda()
     load_hf_weights(ref, reference.src, cfg, ps0)
     ps = init_parallel(ParallelConfig(tp=1, ep=1, etp=None, pp=1, cp=2))
-    model = MiniMaxM3Model(cfg, _train_cfg(ps), ps).to(torch.bfloat16).cuda()
+    model = MiniMaxM3Model(cfg, _train_cfg(ps), ps, msa_backend="flex").to(torch.bfloat16).cuda()
     load_hf_weights(model, reference.src, cfg, ps)
     ids = zigzag_slice_for_cp(reference.ids, ps.cp_rank, 2, seq_dim=1).contiguous()
     labels = zigzag_slice_for_cp(reference.labels, ps.cp_rank, 2, seq_dim=1).contiguous()

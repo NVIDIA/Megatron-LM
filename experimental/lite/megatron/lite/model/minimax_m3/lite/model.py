@@ -158,9 +158,9 @@ class MiniMaxM3Layer(nn.Module):
         ps: ParallelState,
         layer_idx: int,
         *,
+        msa_backend: str,
         use_deepep: bool = False,
         moe_act_recompute: bool = False,
-        msa_backend: str = "flex",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -255,8 +255,8 @@ class MiniMaxM3Model(nn.Module):
         train_config,
         ps: ParallelState,
         *,
+        msa_backend: str,
         vpp_chunk_id: int | None = None,
-        msa_backend: str = "flex",
     ):
         super().__init__()
         self.config = config

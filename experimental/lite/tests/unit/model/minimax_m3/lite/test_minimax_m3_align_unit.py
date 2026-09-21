@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,6 +29,36 @@ sys.path.insert(0, os.path.join(_LITE, "ref", "minimax_m3"))
 sys.path.insert(0, os.path.join(_LITE, "tools", "minimax_m3"))
 
 DEV = "cuda"
+
+
+def test_magi_forward_step_rejects_invalid_packed_boundaries():
+    from megatron.lite.model.minimax_m3.lite import protocol as P
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    bad_length = PackedBatch(
+        input_ids=torch.tensor([10, 11, 20]),
+        labels=torch.tensor([11, 12, 21]),
+        seq_lens=torch.tensor([2, 2]),
+    )
+    with pytest.raises(ValueError, match="seq_lens sums to 4"):
+        P._validate_packed_batch(bad_length)
+
+    valid_positions = PackedBatch(
+        input_ids=torch.tensor([10, 11, 20, 21]),
+        labels=torch.tensor([11, 12, 21, 22]),
+        seq_lens=torch.tensor([2, 2]),
+        position_ids=torch.tensor([0, 1, 0, 1]),
+    )
+    P._validate_packed_batch(valid_positions)
+
+    cross_document_positions = PackedBatch(
+        input_ids=torch.tensor([10, 11, 20, 21]),
+        labels=torch.tensor([11, 12, 21, 22]),
+        seq_lens=torch.tensor([2, 2]),
+        position_ids=torch.tensor([0, 1, 2, 3]),
+    )
+    with pytest.raises(ValueError, match="document-local position_ids"):
+        P._validate_packed_batch(cross_document_positions)
 
 
 def _hf_available():
@@ -96,7 +127,8 @@ def _build_pair(tmp_path, seed=0):
     from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import MiniMaxM3VLForCausalLM
 
     from megatron.lite.model.minimax_m3.lite import protocol as P
-    from megatron.lite.runtime.contracts import ParallelConfig
+    from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
+    from megatron.lite.primitive.parallel import ParallelState
 
     assert_fp32_env()
     _dist()
@@ -115,11 +147,17 @@ def _build_pair(tmp_path, seed=0):
     hf.save_pretrained(src, safe_serialization=True)
 
     cfg = P.build_model_config(hf_cfg.to_dict())
-    bundle = P.build_model(cfg, impl_cfg=P.ImplConfig(parallel=ParallelConfig(), optimizer=None, deterministic=True))
-    lite = bundle.chunks[0].float()  # fp32 gate: cast BEFORE loading so weights are copied losslessly
-    P.load_hf_weights(lite, src, cfg, bundle.parallel_state)
+    ps = ParallelState()
+    train_cfg = SimpleNamespace(
+        tp=1, ep=1, etp=1, pp=1, cp=1, vpp=None, use_deepep=False,
+        fp8=False, recompute_modules=[], deterministic=True,
+    )
+    # The production protocol is Magi-only. The fp32 HF gate intentionally uses the explicit
+    # flex oracle because msa_v1 is bf16-only and fixed to the public M3 kernel shapes.
+    lite = MiniMaxM3Model(cfg, train_cfg, ps, msa_backend="flex").float().cuda()
+    P.load_hf_weights(lite, src, cfg, ps)
     lite.eval()
-    return hf, hf_cfg, lite, cfg, bundle.parallel_state, src
+    return hf, hf_cfg, lite, cfg, ps, src
 
 
 @pytest.mark.gpus(1)

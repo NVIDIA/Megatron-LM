@@ -22,7 +22,6 @@ from megatron.lite.model.minimax_m3.lite.checkpoint import save_hf_weights as _s
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     nested_from_packed,
-    unpack_thd_forward_output,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.kernels import magi_msa
@@ -59,13 +58,12 @@ class ImplConfig:
     cross_entropy_fusion: bool = False
     hf_path: str = ""
     router_aux_loss_coef: float | None = None
-    deterministic: bool = True
+    # The production MSA v1 dependency used for MiniMax-M3 rejects deterministic mode.
+    deterministic: bool = False
     optimizer_config: OptimizerConfig | None = None
-    msa_backend: str = "flex"  # "flex" (default, exact, trainable) | "dense" (reference, O(S^2)) | "magi" (Magi-MSA kernels)
-    # msa_backend="magi" only: CP dispatch chunk (tokens; batch padded to chunk*cp), FP32 dK group-reduce,
-    # kernel backend of the dense layers' native calc_attn (MAGI_ATTENTION_KERNEL_BACKEND): "fa4" (flash_attn_cute
-    # from the Magi flash-attention fork, production) or "sdpa_ol" (pure torch, tests only: its backward
-    # materialises [H, S, S] logits and OOMs beyond ~8K tokens).
+    # Magi CP dispatch chunk (tokens; batch padded to chunk*cp), FP32 dK group-reduce, and the kernel
+    # backend of the dense layers' native calc_attn. ``fa4`` is the production path; ``sdpa_ol`` is
+    # retained for tests only and materialises [H, S, S] logits in backward.
     magi_chunk_size: int = 2048
     magi_high_precision_reduce: bool = False
     magi_dense_kernel_backend: str = "fa4"
@@ -115,16 +113,6 @@ def build_model_config(source: str | Path | dict, **overrides) -> MiniMaxM3Confi
     return cfg
 
 
-def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
-    """Dense [b=1, s] forward for a single packed sequence (MSA has no THD path)."""
-    input_ids = batch.input_ids.reshape(1, -1)
-    labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    loss_mask = batch.loss_mask.reshape(1, -1) if batch.loss_mask is not None else None
-    kwargs: dict[str, Any] = {"input_ids": input_ids, "labels": labels, "loss_mask": loss_mask, "packed_seq_params": None}
-    add_cross_entropy_fusion(kwargs, model)
-    return model(**kwargs)
-
-
 def _unwrap(model: nn.Module) -> nn.Module:
     """Peel DDP / FSDP-style wrappers until the ``MiniMaxM3Model`` chunk (has ``layers``) is reached."""
     current = model
@@ -148,13 +136,41 @@ def _magi_plan(model: nn.Module, batch: PackedBatch) -> magi_msa.MagiMsaContext:
     )
 
 
-def _forward_step_magi(model: nn.Module, batch: PackedBatch) -> dict:
-    """``msa_backend="magi"``: pad to ``chunk*cp`` (extra trailing doc), dispatch tokens onto Magi's CP layout.
+def _validate_packed_batch(batch: PackedBatch) -> None:
+    """Validate the global packed-batch contract consumed by MiniMax-M3 Magi."""
+    seq_lens = [int(length) for length in batch.seq_lens.tolist()]
+    if not seq_lens or min(seq_lens) <= 0:
+        raise ValueError("MiniMax-M3 requires at least one non-empty packed document")
+    total = sum(seq_lens)
+    token_tensors = {
+        "input_ids": batch.input_ids,
+        "labels": batch.labels,
+        "loss_mask": batch.loss_mask,
+    }
+    for name, tensor in token_tensors.items():
+        if tensor is not None and tensor.numel() != total:
+            raise ValueError(
+                f"MiniMax-M3 packed {name} has {tensor.numel()} tokens, but seq_lens sums to {total}"
+            )
+    if batch.position_ids is not None:
+        expected = torch.cat(
+            [torch.arange(length, device=batch.position_ids.device) for length in seq_lens]
+        )
+        if not torch.equal(batch.position_ids.reshape(-1), expected):
+            raise ValueError(
+                "MiniMax-M3 Magi derives document-local position_ids from seq_lens; explicit "
+                "position_ids must match those document boundaries"
+            )
+
+
+def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
+    """Pad to ``chunk*cp`` (extra trailing doc), then dispatch tokens onto Magi's CP layout.
 
     The forward step runs on every PP stage (the runtime key is cached), so ``magi_ctx`` needs no PP plumbing.
     ``labels``/``loss_mask`` are dispatched with the same permutation as ``input_ids``; pad tokens get
     ``loss_mask=0`` so ``_reduce_loss`` (CP-global token count) stays correct.
     """
+    _validate_packed_batch(batch)
     ctx = _magi_plan(model, batch)
     input_ids = batch.input_ids.reshape(-1)
     labels = batch.labels.reshape(-1) if batch.labels is not None else None
@@ -177,10 +193,7 @@ def _forward_step_magi(model: nn.Module, batch: PackedBatch) -> dict:
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
-    chunk = _unwrap(model)
-    if getattr(chunk, "magi_settings", None) is None:
-        return unpack_thd_forward_output(model, batch, output)
-    # magi: outputs are in dispatched order -> undispatch to global packed order, drop the pad doc, split per doc
+    """Restore Magi output to global packed order, drop padding, and split it by document."""
     ctx = _magi_plan(model, batch)
     flat = output[0] if output.dim() >= 2 and output.shape[0] == 1 else output
     full = magi_msa.undispatch_tokens(flat.contiguous(), ctx)[: ctx.cu_seqlens_host[-1] - ctx.pad]
@@ -223,41 +236,41 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
     if impl_cfg.use_thd:
         raise NotImplementedError(
             "MiniMax-M3 lite: use_thd is not supported; packed multi-document batches are handled natively by "
-            "msa_backend='magi' (cu_seqlens from PackedBatch.seq_lens)"
+            "Magi (cu_seqlens from PackedBatch.seq_lens)"
         )
-    use_magi = impl_cfg.msa_backend == "magi"
-    magi_settings = None
-    magi_msa_config = None
-    if use_magi:
-        if p.tp > 1:
-            raise NotImplementedError(
-                "msa_backend='magi' requires tp=1 in this drop (msa_v1 kernels are fixed to 64/4/4 heads); use CP/EP/PP"
-            )
-        magi_msa.validate_kernel_shapes(
-            num_attention_heads=model_cfg.num_attention_heads,
-            num_key_value_heads=model_cfg.num_key_value_heads,
-            head_dim=model_cfg.head_dim,
-            index_n_heads=model_cfg.index_n_heads,
-            index_head_dim=model_cfg.index_head_dim,
-            block_size=model_cfg.index_block_size,
-            topk_blocks=model_cfg.index_topk_blocks,
-            local_blocks=model_cfg.index_local_blocks,
+    if p.tp > 1:
+        raise NotImplementedError(
+            "MiniMax-M3 Magi requires tp=1 in this drop (msa_v1 kernels are fixed to 64/4/4 heads); use CP/EP/PP"
         )
-        magi_msa.validate_device()
-        magi_settings = magi_msa.MagiMsaSettings(
-            chunk_size=impl_cfg.magi_chunk_size,
-            high_precision_reduce=impl_cfg.magi_high_precision_reduce,
-            dense_kernel_backend=impl_cfg.magi_dense_kernel_backend,
-            deterministic=impl_cfg.deterministic,
-        )
-        magi_msa_config = magi_msa.build_msa_config(magi_settings, head_dim=model_cfg.head_dim, index_head_dim=model_cfg.index_head_dim)
-        import os
+    magi_msa.validate_kernel_shapes(
+        num_attention_heads=model_cfg.num_attention_heads,
+        num_key_value_heads=model_cfg.num_key_value_heads,
+        head_dim=model_cfg.head_dim,
+        index_n_heads=model_cfg.index_n_heads,
+        index_head_dim=model_cfg.index_head_dim,
+        block_size=model_cfg.index_block_size,
+        topk_blocks=model_cfg.index_topk_blocks,
+        local_blocks=model_cfg.index_local_blocks,
+    )
+    magi_msa.validate_device()
+    magi_settings = magi_msa.MagiMsaSettings(
+        chunk_size=impl_cfg.magi_chunk_size,
+        high_precision_reduce=impl_cfg.magi_high_precision_reduce,
+        dense_kernel_backend=impl_cfg.magi_dense_kernel_backend,
+        deterministic=impl_cfg.deterministic,
+    )
+    magi_msa_config = magi_msa.build_msa_config(
+        magi_settings,
+        head_dim=model_cfg.head_dim,
+        index_head_dim=model_cfg.index_head_dim,
+    )
+    import os
 
-        os.environ.setdefault("MAGI_ATTENTION_KERNEL_BACKEND", magi_settings.dense_kernel_backend)
-        if magi_settings.dense_kernel_backend == "fa4":
-            # FA4 rejects a non-zero SM margin (Magi defaults to 4 when CUDA_DEVICE_MAX_CONNECTIONS > 1)
-            os.environ.setdefault("MAGI_ATTENTION_FFA_FORWARD_SM_MARGIN", "0")
-            os.environ.setdefault("MAGI_ATTENTION_FFA_BACKWARD_SM_MARGIN", "0")
+    os.environ.setdefault("MAGI_ATTENTION_KERNEL_BACKEND", magi_settings.dense_kernel_backend)
+    if magi_settings.dense_kernel_backend == "fa4":
+        # FA4 rejects a non-zero SM margin (Magi defaults to 4 when CUDA_DEVICE_MAX_CONNECTIONS > 1)
+        os.environ.setdefault("MAGI_ATTENTION_FFA_FORWARD_SM_MARGIN", "0")
+        os.environ.setdefault("MAGI_ATTENTION_FFA_BACKWARD_SM_MARGIN", "0")
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
     if impl_cfg.router_aux_loss_coef is not None:
@@ -278,7 +291,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,
     )
-    kwargs = dict(msa_backend=impl_cfg.msa_backend)
+    kwargs = dict(msa_backend="magi")
     if vpp is None:
         chunks = [MiniMaxM3Model(model_cfg, train_cfg, ps, **kwargs).to(torch.bfloat16).cuda()]
     else:
@@ -340,7 +353,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         parallel_state=ps,
         optimizer=optimizer,
         finalize_grads=finalize_grads,
-        forward_step=_forward_step_magi if use_magi else _forward_step_bshd,
+        forward_step=_forward_step,
         extras={
             "model_cfg": model_cfg,
             "magi_settings": magi_settings,

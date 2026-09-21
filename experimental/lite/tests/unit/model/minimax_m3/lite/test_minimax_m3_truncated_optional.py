@@ -15,6 +15,7 @@ from __future__ import annotations
 import gc
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +34,18 @@ def _rel(a, b):
     return ((a.float() - b.float()).abs().max() / b.float().abs().max().clamp_min(1e-30)).item()
 
 
+def _build_fp32_flex_oracle(cfg):
+    from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
+    from megatron.lite.primitive.parallel import ParallelState
+
+    ps = ParallelState()
+    train_cfg = SimpleNamespace(
+        tp=1, ep=1, etp=1, pp=1, cp=1, vpp=None, use_deepep=False,
+        fp8=False, recompute_modules=[], deterministic=True,
+    )
+    return MiniMaxM3Model(cfg, train_cfg, ps, msa_backend="flex").float().cuda(), ps
+
+
 @pytest.mark.skipif(not CKPT, reason="set MINIMAX_M3_TRUNCATED_DIR")
 @pytest.mark.parametrize("S", [int(os.environ.get("MINIMAX_M3_TRUNCATED_SEQ", "2048"))])
 def test_truncated_m3_matches_hf_fp32(S):
@@ -41,7 +54,6 @@ def test_truncated_m3_matches_hf_fp32(S):
     from thresholds import FP32, assert_fp32_env
 
     from megatron.lite.model.minimax_m3.lite import protocol as P
-    from megatron.lite.runtime.contracts import ParallelConfig
 
     assert_fp32_env()
     import torch.distributed as dist
@@ -68,9 +80,8 @@ def test_truncated_m3_matches_hf_fp32(S):
 
     # ---------------- lite fp32
     cfg = P.build_model_config(CKPT)
-    bundle = P.build_model(cfg, impl_cfg=P.ImplConfig(parallel=ParallelConfig(), optimizer=None, deterministic=True))
-    lite = bundle.chunks[0].float()
-    P.load_hf_weights(lite, CKPT, cfg, bundle.parallel_state)
+    lite, ps = _build_fp32_flex_oracle(cfg)
+    P.load_hf_weights(lite, CKPT, cfg, ps)
     lite.eval()
     d = LayerDumper(lite, patterns=(r"layers\.\d+",))
     with torch.no_grad():
@@ -127,7 +138,6 @@ def test_truncated_m3_grads_match_hf_fp32():
         MiniMaxM3WeightSpec,
         disk_to_module_name,
     )
-    from megatron.lite.runtime.contracts import ParallelConfig
 
     assert_fp32_env()
     import torch.distributed as dist
@@ -154,9 +164,8 @@ def test_truncated_m3_grads_match_hf_fp32():
     torch.cuda.empty_cache()
 
     cfg = P.build_model_config(CKPT_GRAD)
-    bundle = P.build_model(cfg, impl_cfg=P.ImplConfig(parallel=ParallelConfig(), optimizer=None, deterministic=True))
-    lite = bundle.chunks[0].float()
-    P.load_hf_weights(lite, CKPT_GRAD, cfg, bundle.parallel_state)
+    lite, ps = _build_fp32_flex_oracle(cfg)
+    P.load_hf_weights(lite, CKPT_GRAD, cfg, ps)
     lite.train()
     out = lite(input_ids=ids, labels=labels)
     out["loss"].backward()

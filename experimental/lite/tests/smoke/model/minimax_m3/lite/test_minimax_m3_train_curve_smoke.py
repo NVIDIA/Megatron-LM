@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""P3: 100-step training curves of Proxy-M3 under TP/EP/PP/CP (dist_opt, bf16) vs a pure-DP baseline.
+"""P3: 100-step Magi training curves of Proxy-M3 under EP/PP/CP (dist_opt, bf16) vs DP.
 
 Every rank sees the same token stream, so the dp=8 run equals a single-GPU run; each parallel
 configuration starts from the same HF-format weights and must track the baseline loss curve
@@ -22,7 +22,7 @@ _LITE = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 5))
 sys.path.insert(0, os.path.join(_LITE, "ref", "minimax_m3"))
 
 pytestmark = [
-    pytest.mark.gpus(8),
+    pytest.mark.gpus(8, min_architecture="blackwell"),
     pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
     pytest.mark.timeout(seconds=1800),
 ]
@@ -36,6 +36,7 @@ def _init_dist_or_skip():
     if not torch.cuda.is_available() or "RANK" not in os.environ:
         pytest.skip("run with torchrun on GPUs")
     pytest.importorskip("megatron.core", reason="dist_opt needs megatron-core")
+    pytest.importorskip("magi_attn_extensions.MSA")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     if not dist.is_initialized():
         dist.init_process_group("nccl")
@@ -49,7 +50,7 @@ def _proxy_config():
 
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
 
-    hf = dict(hf_proxy_text_config_kwargs())
+    hf = dict(hf_proxy_text_config_kwargs(magi=True))
     hf["model_type"] = "minimax_m3_vl_text"
     return MiniMaxM3Config._from_hf_dict(hf)
 
@@ -66,7 +67,7 @@ def source_weights(tmp_path_factory):
     ps0 = ParallelState()
     tc = SimpleNamespace(tp=1, ep=1, etp=1, pp=1, cp=1, vpp=None, use_deepep=False, fp8=False, recompute_modules=[], deterministic=True)
     torch.manual_seed(20260911)
-    ref = MiniMaxM3Model(cfg, tc, ps0).to(torch.bfloat16).cuda()
+    ref = MiniMaxM3Model(cfg, tc, ps0, msa_backend="flex").to(torch.bfloat16).cuda()
     with torch.no_grad():
         for n, p in ref.named_parameters():
             if n.endswith("norm.weight") or n.endswith("layer_norm_weight"):
@@ -92,7 +93,7 @@ def _build_handle(cfg, src, parallel):
         parallel=parallel,
         optimizer="dist_opt",
         optimizer_config=OptimizerConfig(optimizer="adam", lr=LR, weight_decay=0.0, clip_grad=1.0),
-        deterministic=True,
+        deterministic=False,
     )
     torch.manual_seed(1)
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
@@ -119,14 +120,14 @@ def _build_handle(cfg, src, parallel):
 
 
 def _batch(cfg, step, ps):
-    from megatron.lite.primitive.parallel import zigzag_slice_for_cp
     from megatron.lite.runtime.contracts.data import PackedBatch
 
     g = torch.Generator(device="cuda").manual_seed(100_000 + step)  # identical stream on every rank
     ids = torch.randint(0, cfg.vocab_size, (1, S), device="cuda", generator=g)
     labels = torch.randint(0, cfg.vocab_size, (1, S), device="cuda", generator=g)
-    ids = zigzag_slice_for_cp(ids, ps.cp_rank, ps.cp_size, seq_dim=1).reshape(-1).contiguous()
-    labels = zigzag_slice_for_cp(labels, ps.cp_rank, ps.cp_size, seq_dim=1).reshape(-1).contiguous()
+    # Magi plans and dispatches the identical global packed batch on every CP rank.
+    ids = ids.reshape(-1).contiguous()
+    labels = labels.reshape(-1).contiguous()
     return PackedBatch(input_ids=ids, labels=labels, seq_lens=torch.tensor([ids.numel()], dtype=torch.int64, device="cuda"))
 
 
@@ -187,12 +188,10 @@ def _curve_delta(losses, base) -> tuple[float, float]:
 
 
 _CASES = [
-    ("tp2_ep2", dict(tp=2, ep=2, etp=1, pp=1, cp=1)),
     ("pp2", dict(tp=1, ep=1, etp=1, pp=2, cp=1)),
-    ("tp2_pp2", dict(tp=2, ep=1, etp=1, pp=2, cp=1)),
-    ("tp2_ep2_pp2", dict(tp=2, ep=2, etp=1, pp=2, cp=1)),
+    ("ep2", dict(tp=1, ep=2, etp=1, pp=1, cp=1)),
     ("cp2", dict(tp=1, ep=1, etp=1, pp=1, cp=2)),
-    ("tp2_cp2", dict(tp=2, ep=1, etp=1, pp=1, cp=2)),
+    ("ep2_cp2", dict(tp=1, ep=2, etp=1, pp=1, cp=2)),
 ]
 
 

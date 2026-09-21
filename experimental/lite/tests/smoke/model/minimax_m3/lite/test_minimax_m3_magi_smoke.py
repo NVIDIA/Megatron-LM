@@ -243,7 +243,7 @@ def _save_source(cfg, tmp_path_factory, dist, tag):
 
     ps0 = ParallelState()
     torch.manual_seed(20260914)
-    ref = MiniMaxM3Model(cfg, _train_cfg(ps0), ps0).to(torch.bfloat16).cuda()
+    ref = MiniMaxM3Model(cfg, _train_cfg(ps0), ps0, msa_backend="flex").to(torch.bfloat16).cuda()
     with torch.no_grad():
         for n, p in ref.named_parameters():
             if n.endswith("norm.weight") or n.endswith("layer_norm_weight"):

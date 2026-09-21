@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""100-step training curves of the magi Proxy-M3 (msa_backend="magi", dist_opt, bf16) vs the flex baseline, 8 GPUs.
+"""100-step training curves of the Magi-only Proxy-M3 runtime under CP/EP, bf16, 8 GPUs.
 
-Every rank sees the same 4096-token stream. Baseline: flex dp8. Cases: magi cp1 (dp8) and magi cp2 through the
-real runtime (``MegatronLiteRuntime.forward_backward`` -> ``_forward_step_magi`` dispatch). Acceptance: mean
+Every rank sees the same 4096-token stream. Baseline: Magi CP1. Cases: CP1 and CP2 through the
+real runtime (``MegatronLiteRuntime.forward_backward`` -> Magi dispatch). Acceptance: mean
 relative |delta| over 100 steps < 1% (plan curve criterion), and the indexer weights are bitwise unchanged after
 training on every configuration (frozen selector; ``kl_loss_coeff=0`` alone would not guarantee this).
 
@@ -72,7 +72,7 @@ def source_weights(tmp_path_factory):
     ps0 = ParallelState()
     tc = SimpleNamespace(tp=1, ep=1, etp=1, pp=1, cp=1, vpp=None, use_deepep=False, fp8=False, recompute_modules=[], deterministic=True)
     torch.manual_seed(20260914)
-    ref = MiniMaxM3Model(cfg, tc, ps0).to(torch.bfloat16).cuda()
+    ref = MiniMaxM3Model(cfg, tc, ps0, msa_backend="flex").to(torch.bfloat16).cuda()
     with torch.no_grad():
         for n, p in ref.named_parameters():
             if n.endswith("norm.weight") or n.endswith("layer_norm_weight"):
@@ -88,7 +88,7 @@ def source_weights(tmp_path_factory):
     return SimpleNamespace(cfg=cfg, src=src[0])
 
 
-def _build_handle(cfg, src, parallel, backend, *, load=True):
+def _build_handle(cfg, src, parallel, *, load=True):
     from megatron.lite.model.minimax_m3.lite import protocol
     from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
     from megatron.lite.runtime.contracts.config import OptimizerConfig
@@ -98,8 +98,7 @@ def _build_handle(cfg, src, parallel, backend, *, load=True):
         parallel=parallel,
         optimizer="dist_opt",
         optimizer_config=OptimizerConfig(optimizer="adam", lr=LR, weight_decay=0.1, clip_grad=1.0),
-        deterministic=True,
-        msa_backend=backend,
+        deterministic=False,
         magi_chunk_size=CHUNK,
     )
     torch.manual_seed(1)
@@ -122,16 +121,12 @@ def _build_handle(cfg, src, parallel, backend, *, load=True):
     )
 
 
-def _batch(cfg, step, ps, backend, seq_len=S):
-    from megatron.lite.primitive.parallel import zigzag_slice_for_cp
+def _batch(cfg, step, ps, seq_len=S):
     from megatron.lite.runtime.contracts.data import PackedBatch
 
     g = torch.Generator(device="cuda").manual_seed(100_000 + step)  # identical stream on every rank
     ids = torch.randint(0, cfg.vocab_size, (1, seq_len), device="cuda", generator=g)
     labels = torch.randint(0, cfg.vocab_size, (1, seq_len), device="cuda", generator=g)
-    if backend != "magi":  # flex: the caller hands each CP rank its zigzag shard
-        ids = zigzag_slice_for_cp(ids, ps.cp_rank, ps.cp_size, seq_dim=1)
-        labels = zigzag_slice_for_cp(labels, ps.cp_rank, ps.cp_size, seq_dim=1)
     ids, labels = ids.reshape(-1).contiguous(), labels.reshape(-1).contiguous()
     return PackedBatch(input_ids=ids, labels=labels, seq_lens=torch.tensor([ids.numel()], dtype=torch.int64, device="cuda"))
 
@@ -143,13 +138,13 @@ def _indexer_weights(handle):
     return {n: p.detach().clone() for c in chunks for n, p in unwrap_model(c).named_parameters() if ".indexer." in n}
 
 
-def _train(cfg, src, parallel, backend, *, steps=STEPS, seq_len=S, bench=False, load=True):
+def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, bench=False, load=True):
     from test_minimax_m3_train_curve_smoke import _reset_parallel_state
 
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    handle = _build_handle(cfg, src, parallel, backend, load=load)
+    handle = _build_handle(cfg, src, parallel, load=load)
     ps = handle._parallel_state
     w0 = _indexer_weights(handle)
     losses, norms, step_times = [], [], []
@@ -158,7 +153,7 @@ def _train(cfg, src, parallel, backend, *, steps=STEPS, seq_len=S, bench=False, 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         runtime.zero_grad(handle)
-        res = runtime.forward_backward(handle, iter([_batch(cfg, step, ps, backend, seq_len)]), None, num_microbatches=1)
+        res = runtime.forward_backward(handle, iter([_batch(cfg, step, ps, seq_len)]), None, num_microbatches=1)
         ok, gnorm, _ = runtime.optimizer_step(handle)
         torch.cuda.synchronize()
         step_times.append(time.perf_counter() - t0)
@@ -168,7 +163,7 @@ def _train(cfg, src, parallel, backend, *, steps=STEPS, seq_len=S, bench=False, 
         norms.append(gnorm)
     peak_gib = torch.cuda.max_memory_allocated() / 2**30
     for n, w in _indexer_weights(handle).items():  # frozen selector: bitwise unchanged after training
-        assert torch.equal(w, w0[n]), f"indexer weight {n} changed during training ({backend})"
+        assert torch.equal(w, w0[n]), f"indexer weight {n} changed during Magi training"
     runtime.zero_grad(handle)
     del handle, runtime
     _reset_parallel_state(ps)
@@ -192,9 +187,9 @@ def baseline(source_weights):
 
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
-    losses, norms, st = _train(source_weights.cfg, source_weights.src, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1), "flex")
+    losses, norms, st = _train(source_weights.cfg, source_weights.src, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1))
     if dist.get_rank() == 0:
-        print(f"\nmagi curve baseline flex dp8: loss[0]={losses[0]:.4f} loss[49]={losses[49]:.4f} loss[99]={losses[99]:.4f} "
+        print(f"\nmagi curve baseline cp1: loss[0]={losses[0]:.4f} loss[49]={losses[49]:.4f} loss[99]={losses[99]:.4f} "
               f"gnorm[0]={norms[0]:.3f} gnorm[99]={norms[99]:.3f} | {st.step_ms:.0f} ms/step, peak {st.peak_gib:.2f} GiB", flush=True)
     assert all(torch.isfinite(torch.tensor(losses)))
     return losses
@@ -205,12 +200,12 @@ _CASES = [("magi_cp1", dict(tp=1, ep=1, etp=1, pp=1, cp=1)), ("magi_cp2", dict(t
 
 
 @pytest.mark.parametrize("name,parallel", _CASES, ids=[c[0] for c in _CASES])
-def test_magi_train_curve_tracks_flex_baseline(source_weights, baseline, name, parallel):
+def test_magi_train_curve_tracks_cp1_baseline(source_weights, baseline, name, parallel):
     import torch.distributed as dist
 
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
-    losses, norms, st = _train(source_weights.cfg, source_weights.src, ParallelConfig(**parallel), "magi")
+    losses, norms, st = _train(source_weights.cfg, source_weights.src, ParallelConfig(**parallel))
     mean_rel, tail_rel = _curve_delta(losses, baseline)
     if dist.get_rank() == 0:
         print(f"magi curve {name}: loss[0]={losses[0]:.4f} loss[49]={losses[49]:.4f} loss[99]={losses[99]:.4f} | "
@@ -226,18 +221,21 @@ def test_magi_train_curve_tracks_flex_baseline(source_weights, baseline, name, p
 @pytest.mark.parametrize("seq_len", [16384, 32768])
 @pytest.mark.parametrize("cp", [1, 2])
 def test_magi_bench_step_time_and_memory(source_weights, seq_len, cp, layers):
-    """Step time / peak memory, flex vs magi. ``all_msa`` attributes the cost to the MSA path alone (the dense
+    """Magi step time / peak memory. ``all_msa`` attributes the cost to the MSA path alone (the dense
     layers' native calc_attn runs on the pure-torch sdpa_ol backend and dominates at small S)."""
     import torch.distributed as dist
 
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
     cfg = source_weights.cfg if layers == "full" else _proxy_config(all_msa=True)
-    rows = []
-    for backend in ("flex", "magi"):
-        _, _, st = _train(cfg, source_weights.src, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), backend,
-                          steps=6, seq_len=seq_len, bench=True, load=layers == "full")
-        rows.append((backend, st.step_ms, st.peak_gib))
+    _, _, st = _train(
+        cfg,
+        source_weights.src,
+        ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp),
+        steps=6,
+        seq_len=seq_len,
+        bench=True,
+        load=layers == "full",
+    )
     if dist.get_rank() == 0:
-        for backend, ms, gib in rows:
-            print(f"BENCH {layers} S={seq_len} cp{cp} {backend}: {ms:.0f} ms/step, peak {gib:.2f} GiB", flush=True)
+        print(f"BENCH {layers} S={seq_len} cp{cp} magi: {st.step_ms:.0f} ms/step, peak {st.peak_gib:.2f} GiB", flush=True)
