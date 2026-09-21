@@ -91,6 +91,27 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
+def resolve_output_gate_activation(config, act_fn):
+    """Activation of the GDN output gate.
+
+    The output gate may use a different activation than the causal conv and the MLP
+    (Qwen3.8-Flash-Next uses sigmoid there while everything else stays on silu).
+    ``config.gdn_output_gate_activation`` selects it: ``None`` keeps the historical behaviour
+    of reusing the model-wide ``act_fn``, ``"silu"`` is the same as the default for a silu
+    model, ``"sigmoid"`` switches the gate alone.
+    """
+    choice = getattr(config, "gdn_output_gate_activation", None)
+    if choice is None:
+        return act_fn
+    if choice == "sigmoid":
+        return torch.sigmoid
+    if choice == "silu":
+        return torch.nn.functional.silu
+    raise ValueError(
+        f"Unsupported gdn_output_gate_activation={choice!r}; expected None, 'silu' or 'sigmoid'."
+    )
+
+
 class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     """Common base class for the Gated Delta Net (GDN) family of layers.
 
@@ -177,6 +198,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
+        self.output_gate_act_fn = resolve_output_gate_activation(config, self.act_fn)
         self.conv_kernel_dim = config.linear_conv_kernel_dim
         self.key_head_dim = config.linear_key_head_dim
         self.value_head_dim = config.linear_value_head_dim
@@ -404,7 +426,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         y = self.out_norm(x)
         # Output gate
         gate = gate.reshape(-1, gate.shape[-1])
-        y = y * self.act_fn(gate.float())
+        y = y * self.output_gate_act_fn(gate.float())
         y = y.to(x_dtype)
         return y
 

@@ -454,6 +454,12 @@ class TransformerConfig(ModelParallelConfig):
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
+    gdn_output_gate_activation: Optional[Literal['silu', 'sigmoid']] = None
+    """Activation of the GDN output gate. ``None`` keeps the historical behaviour of reusing
+    the model-wide ``activation_func`` (silu for Qwen3-Next). Qwen3.8-Flash-Next specifies
+    ``sigmoid`` for the output gate only; this knob must not change the causal-conv
+    activation or the MLP activation."""
+
     linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
 
