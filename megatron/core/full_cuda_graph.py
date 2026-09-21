@@ -198,7 +198,11 @@ class FullCudaGraphWrapper:
         except Exception:
             end_mxfp8_vmm_workspace_iteration(validate=False)
             raise
-        end_mxfp8_vmm_workspace_iteration()
+        # Validation is forward-only, so no backward callback will release
+        # leases retained by modules that still report training=True. All GPU
+        # consumers are ordered before this iteration boundary; return any
+        # remaining leases to the validation pool for the next warmup/capture.
+        end_mxfp8_vmm_workspace_iteration(validate=training_str != 'validation')
         return result
 
     def __call__(self, *args, **kwargs):
