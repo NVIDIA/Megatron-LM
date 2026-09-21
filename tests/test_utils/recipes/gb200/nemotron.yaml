@@ -73,3 +73,8 @@ products:
         scope: [L2]
         cadence: [nightly]
         platforms: [dgx_gb200]
+      - environment: [dev]
+        scope: [gb300-comparison]
+        cadence: [nightly]
+        platforms: [dgx_gb200]
+        time_limit_override: [10800]

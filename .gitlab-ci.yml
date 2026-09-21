@@ -212,6 +212,7 @@ variables:
       - "weekly"
       - "pre-release"
       - "release"
+      - "gb300-comparison"
     description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
   FUNCTIONAL_TEST_REPEAT:
     value: "5"
@@ -248,6 +249,12 @@ variables:
     options:
       - "dgxgb200_oci-hsg"
     description: "Cluster for H100 workloads"
+  CLUSTER_GB300:
+    value: ""
+    options:
+      - ""
+      - "dgxgb300_oci-jhb"
+    description: "Opt-in GB300 cluster for the five-test gb300-comparison scope"
   PUBLISH:
     value: "no"
     options:

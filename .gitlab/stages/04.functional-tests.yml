@@ -174,6 +174,17 @@ functional:configure:
         --cluster $GB200_CLUSTER \
         --output-path "functional-test-job-lts-GB200.yaml" \
         ${RELEASE_ARGS[@]}
+    - |
+      # Keep the GB200 recipe topology and goldens for this hardware comparison.
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "gb300-comparison" && -n "$CLUSTER_GB300" ]]; then
+        export PYTHONPATH=$(pwd)
+        python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+          ${ARGS[@]} \
+          --environment dev \
+          --platform dgx_gb200 \
+          --cluster "$CLUSTER_GB300" \
+          --output-path "functional-test-job-dev-GB300.yaml"
+      fi
   artifacts:
     paths:
       - functional-smoke-h100-job.yaml
@@ -184,6 +195,7 @@ functional:configure:
       - functional-test-job-dev-H100.yaml
       - functional-test-job-lts-GB200.yaml
       - functional-test-job-dev-GB200.yaml
+      - functional-test-job-dev-GB300.yaml
       - tests/test_utils/local_recipes
 
 .functional_run:
@@ -411,6 +423,20 @@ functional:run_dev_dgx_gb200:
     ENVIRONMENT: dev
     CLUSTER: GB200
 
+# Only the five comparison recipes are selected; normal suites retain their
+# current cluster placement and do not submit additional GB300 workloads.
+functional:run_dev_dgx_gb300:
+  extends: [.functional_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: GB300
+  rules:
+    - if: $BUILD == "no"
+      when: never
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE == "gb300-comparison" && $CLUSTER_GB300 != ""
+      when: on_success
+    - when: never
+
 functional:run_nemo:
   extends: [.functional_tests_rules]
   trigger:
@@ -443,6 +469,8 @@ functional:x_notify:
     - functional:run_dev_dgx_h100
     - functional:run_lts_dgx_gb200
     - functional:run_dev_dgx_gb200
+    - job: functional:run_dev_dgx_gb300
+      optional: true
   tags:
     - arch/amd64
     - env/prod

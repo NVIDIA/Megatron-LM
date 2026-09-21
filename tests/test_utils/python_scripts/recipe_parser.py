@@ -97,6 +97,8 @@ def resolve_cluster_config(cluster: str) -> str:
         return "eos"
     if cluster == "dgxgb200_oci-hsg":
         return "oci-hsg"
+    if cluster == "dgxgb300_oci-jhb":
+        return "oci-jhb"
     if cluster == "dgxa100_dracooci":
         return "draco-oci-iad"
     if cluster == "dgxa100_dracooci-ord":
