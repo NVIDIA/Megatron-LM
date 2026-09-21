@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import List, Optional
@@ -10,6 +10,7 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
 )
+from megatron.core.transformer.experimental_attention_variant import qsa_module_specs as qsa_specs
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -148,6 +149,8 @@ def get_experimental_attention_variant_module_spec(
         return dsv4_hybrid_specs.get_dsv4_hybrid_module_spec_for_backend(
             config=config, backend=backend
         )
+    elif config.experimental_attention_variant == "qsa":
+        return qsa_specs.get_qsa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"

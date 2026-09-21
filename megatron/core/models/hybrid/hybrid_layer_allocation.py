@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from dataclasses import dataclass
@@ -151,10 +151,12 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'W': 0}
+        {'*': 2, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'Q': 0,
+         'W': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'W': 0}
+        {'*': 1, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'Q': 0,
+         'W': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}

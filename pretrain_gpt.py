@@ -8,6 +8,7 @@ import time
 _PROGRAM_START_TIME = time.time()
 
 import json
+import logging
 
 from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
@@ -63,7 +64,11 @@ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_blend_and_blend_per_split,
+    get_pipeline_prefetched_tokens,
+    is_first_or_last_pipeline_stage,
+)
 from model_provider import model_provider
 
 try:
@@ -77,6 +82,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+logger = logging.getLogger(__name__)
 
 # Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
 # to match the historical ``sorted(batch.keys())`` order that callers unpack into.
@@ -131,7 +137,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        return [None for _ in BATCH_KEYS]
+        if not args.engram_enabled:
+            return [None for _ in BATCH_KEYS]
+        # Engram layers on middle stages consume the pipeline-prefetched tokens. No other
+        # field of the batch reaches this stage, and none is needed to hash n-grams.
+        middle_batch = {key: None for key in BATCH_KEYS}
+        middle_batch['tokens'] = get_pipeline_prefetched_tokens(data_iterator)
+        return [middle_batch[key] for key in BATCH_KEYS]
 
     batch = {}
     if tp_rank == 0:
@@ -162,6 +174,33 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     batch = flatten_batch_for_packed_sequences(batch)
 
+    if args.engram_enabled:
+        prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
+        if args.engram_verify_training and batch.get('tokens') is not None:
+            # The last pipeline stage consumes its own iterator for labels; its tokens must
+            # match the batch broadcast from the first stage or the sampler states diverged.
+            # Packed rows are compared on the common prefix: the local row is still unpadded
+            # here while the prefetched row is already zero-padded to the sequence capacity.
+            local_tokens = batch['tokens'].to(
+                device=prefetched_tokens.device, dtype=prefetched_tokens.dtype
+            )
+            common_length = min(local_tokens.shape[-1], prefetched_tokens.shape[-1])
+            assert torch.equal(
+                local_tokens[..., :common_length], prefetched_tokens[..., :common_length]
+            ), (
+                "Engram pipeline-prefetched tokens do not match this rank's own data iterator; "
+                "the data sampler state has diverged across pipeline stages."
+            )
+        if batch.get('tokens') is not None:
+            # Keep the batch's own unpadded length: pad_sequence_for_thd derives the local
+            # valid length from the token shape. Substituting the padded row here would
+            # silently mark the dummy tail as valid for MoE routing statistics.
+            batch['tokens'] = prefetched_tokens[..., : batch['tokens'].shape[-1]]
+        else:
+            # Packed middle stages never run pad_sequence_for_thd; use the full padded row
+            # so hash and hidden lengths match the fixed pipeline activation shape.
+            batch['tokens'] = prefetched_tokens
+
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
         return (
@@ -174,7 +213,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             None,
             batch['max_seqlen'],
             None,
-            None,
+            # Engram layers on middle stages consume the pipeline-prefetched tokens.
+            batch.get('tokens') if args.engram_enabled else None,
         )
 
     batch = get_batch_on_this_cp_rank(
@@ -364,6 +404,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 )
 
     timers('batch-generator').stop()
+
+    if args.engram_verify_training:
+        flat_tokens = tokens.reshape(-1).to(torch.int64)
+        positions = torch.arange(
+            1, flat_tokens.numel() + 1, dtype=torch.int64, device=flat_tokens.device
+        )
+        logger.info(
+            "[Engram batch] "
+            f"rank={torch.distributed.get_rank()} iteration={args.curr_iteration + 1} "
+            f"token_sum={flat_tokens.sum().item()} "
+            f"token_ordered_checksum={(flat_tokens * positions).sum().item()}"
+        )
 
     with stimer:
         if return_schedule_plan:

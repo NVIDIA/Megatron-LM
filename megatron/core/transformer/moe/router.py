@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
@@ -560,6 +560,21 @@ class TopKRouter(Router):
         )
         return probs
 
+    def _get_metric_layer_number(self) -> int:
+        """Return the 1-based metric slot this layer records into.
+
+        The tracker allocates ``num_layers + mtp_num_layers`` slots, i.e. one per MTP *depth*.
+        A hybrid MTP section can hold several inner sublayers per depth (for example ``/QE``),
+        so an MTP layer's own layer number can run past ``mtp_num_layers`` and index out of the
+        tensor. Clamp it: metrics are allocated per depth, not per inner sublayer.
+        """
+        if not self.is_mtp_layer:
+            return self.layer_number
+        mtp_layer_number = self.layer_number
+        if self.config.mtp_num_layers is not None:
+            mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
+        return self.config.num_layers + mtp_layer_number
+
     def attach_and_log_load_balancing_loss(
         self,
         activation: torch.Tensor,
@@ -601,10 +616,7 @@ class TopKRouter(Router):
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
 
-        if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
-        else:
-            layer_number = self.layer_number
+        layer_number = self._get_metric_layer_number()
 
         get_moe_metrics_tracker().record(
             aux_loss_name,
@@ -704,10 +716,7 @@ class TopKRouter(Router):
             if self.config.mtp_num_layers is not None:
                 num_layers += self.config.mtp_num_layers
 
-            if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
-            else:
-                layer_number = self.layer_number
+            layer_number = self._get_metric_layer_number()
 
             get_moe_metrics_tracker().record(
                 "z_loss",

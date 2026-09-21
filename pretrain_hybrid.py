@@ -60,10 +60,14 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_blend_and_blend_per_split,
+    get_pipeline_prefetched_tokens,
+    is_first_or_last_pipeline_stage,
+)
 from model_provider import model_provider
 
 try:
@@ -92,6 +96,36 @@ BATCH_KEYS = [
     "position_ids",
     "tokens",
 ]
+
+
+def _engram_tokens(data_iterator, tokens):
+    """Return this microbatch's n-gram memory tokens, distributed before the schedule.
+
+    Every pipeline stage needs the token IDs, including middle stages that own no batch, so
+    the tokens come from the pre-schedule broadcast rather than this rank's data iterator.
+    """
+    args = get_args()
+    prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
+    if args.engram_verify_training and tokens is not None:
+        # This rank consumed its own iterator for labels; its tokens must match the batch
+        # broadcast from the first stage or the sampler states diverged. Packed rows are
+        # compared on the common prefix, since the local row is still unpadded here.
+        local_tokens = tokens.to(device=prefetched_tokens.device, dtype=prefetched_tokens.dtype)
+        common_length = min(local_tokens.shape[-1], prefetched_tokens.shape[-1])
+        assert torch.equal(
+            local_tokens[..., :common_length], prefetched_tokens[..., :common_length]
+        ), (
+            "Engram pipeline-prefetched tokens do not match this rank's own data iterator; "
+            "the data sampler state has diverged across pipeline stages."
+        )
+    if tokens is None:
+        # Middle stages never run pad_sequence_for_thd; use the full padded row so hash and
+        # hidden lengths match the fixed pipeline activation shape.
+        return prefetched_tokens
+    # Keep the batch's own unpadded length: pad_sequence_for_thd derives the local valid
+    # length from the token shape, so substituting the padded row would mark the dummy tail
+    # as valid for MoE routing statistics.
+    return prefetched_tokens[..., : tokens.shape[-1]]
 
 
 def get_batch(data_iterator, vp_stage=None):
@@ -151,6 +185,14 @@ def get_batch(data_iterator, vp_stage=None):
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
+        if args.engram_enabled:
+            engram_batch = dict.fromkeys(BATCH_KEYS)
+            engram_batch["tokens"] = _engram_tokens(data_iterator, None)
+            return ContextParallelBatch(
+                boundary_layout=config.linear_cp_layout,
+                batches_by_layout={config.linear_cp_layout: engram_batch},
+                packed_seq_params_by_layout={config.linear_cp_layout: None},
+            )
         return ContextParallelBatch(
             boundary_layout=config.linear_cp_layout,
             batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
@@ -184,6 +226,12 @@ def get_batch(data_iterator, vp_stage=None):
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
 
+    if args.engram_enabled:
+        # Before flattening: flatten_batch_for_packed_sequences reshapes tokens together with
+        # labels and merges cu_seqlens, so substituting afterwards would restore the unflattened
+        # shape and silently misalign tokens against labels.
+        batch['tokens'] = _engram_tokens(data_iterator, batch.get('tokens'))
+
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
@@ -193,6 +241,8 @@ def get_batch(data_iterator, vp_stage=None):
             'cu_seqlens': batch['cu_seqlens'],
             'cu_seqlens_padded': batch['cu_seqlens_padded'],
             'max_seqlen': batch['max_seqlen'],
+            # Engram layers on middle stages consume the pipeline-prefetched tokens.
+            'tokens': batch['tokens'] if args.engram_enabled else None,
         }
 
     additional_layouts = set()
@@ -415,6 +465,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
         hybrid_context_parallel=args.hybrid_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
+        sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
         varlen_sbhd_validation=args.varlen_sbhd_validation,
     )
@@ -431,7 +482,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     is_packed_sequence = False
     if args.sft:
-        dataset_type = SFTDataset
+        # Mirror pretrain_gpt.py: --mock-data must select the mock packer, otherwise the
+        # packed path goes looking for a real SFT corpus on disk.
+        dataset_type = MockSFTDataset if args.mock_data else SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
     elif args.use_varlen_dataset:
         # Variable-length packed (THD) dataset, independent of --sft.

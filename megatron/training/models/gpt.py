@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
 
+from megatron.core.models.engram import EngramConfig, apply_engram_to_layer_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_decoder_layer_specs,
@@ -154,6 +155,8 @@ class GPTModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.gpt.GPTModelBuilder"
     transformer: TransformerConfig
     transformer_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
+    engram_config: EngramConfig | None = None
+    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers."""
 
     ### vocab padding related ###
     vocab_size: int | None = None
@@ -296,6 +299,15 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            # The padded vocabulary is only known here; MTP layers ignore the submodule
+            # because TransformerLayer skips Engram construction for them.
+            engram_config.validate_vocabulary(padded_vocab_size)
+            transformer_layer_spec = apply_engram_to_layer_spec(
+                transformer_layer_spec, engram_config
+            )
+
         mtp_spec = mtp_block_spec(
             self._model_config,
             transformer_layer_spec,
@@ -429,7 +441,20 @@ def mtp_block_spec(
         if hasattr(transformer_layer_spec, "layer_specs") and len(transformer_layer_spec.layer_specs) == 0:
             # Get the decoder layer spec explicitly if no decoder layer in the last stage,
             # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-            spec = _te_or_local_layer_spec(config, vp_stage)
+            if transformer_cfg.experimental_attention_variant is not None:
+                # `_te_or_local_layer_spec` builds a plain (non-experimental) attention layer,
+                # so such a stage would silently get a vanilla-attention MTP layer. Take the
+                # experimental spec entry point instead. This deliberately applies to EVERY
+                # experimental variant (dsa/gdn/gdn2/dsv4_hybrid/qsa), not just qsa.
+                from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+                    get_transformer_layer_with_experimental_attention_variant_spec,
+                )
+
+                spec = get_transformer_layer_with_experimental_attention_variant_spec(
+                    config=transformer_cfg
+                )[-1]
+            else:
+                spec = _te_or_local_layer_spec(config, vp_stage)
         else:
             decoder_specs = get_gpt_decoder_layer_specs(transformer_cfg, use_transformer_engine=use_te, normalization=transformer_cfg.normalization, qk_l2_norm=transformer_cfg.qk_l2_norm, vp_stage=vp_stage)
             spec = decoder_specs[-1]

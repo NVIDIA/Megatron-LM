@@ -1,4 +1,5 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import copy
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -53,6 +54,12 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa import (
+    QSAIndexer,
+    QSAIndexerSubmodules,
+    QSASelfAttention,
+    QSASelfAttentionSubmodules,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -94,6 +101,42 @@ _csa_indexer = partial(
     ),
 )
 _csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+
+# QSA (Qwen Sparse Attention). The indexer consumes the same post-input-layernorm hidden
+# states as the main q/k/v projections (HF semantics), so the input layernorm stays
+# unfused (``fuse_input_layernorm=False`` + a separate ``input_layernorm=TENorm``) and
+# ``linear_qkv`` is a plain column-parallel linear rather than the fused-LN form.
+_qsa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+_qsa_indexer = ModuleSpec(
+    module=QSAIndexer,
+    submodules=QSAIndexerSubmodules(
+        index_qk_proj=TELinear, q_layernorm=_qsa_qk_norm, k_layernorm=_qsa_qk_norm
+    ),
+)
+
+
+def _qsa_layer_spec(qk_layernorm: bool) -> ModuleSpec:
+    qk_norm = _qsa_qk_norm if qk_layernorm else IdentityOp
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm,
+            self_attention=ModuleSpec(
+                module=QSASelfAttention,
+                params={"attn_mask_type": AttnMaskType.arbitrary},
+                submodules=QSASelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=qk_norm,
+                    k_layernorm=qk_norm,
+                    indexer=_qsa_indexer,
+                ),
+                metainfo={"fuse_input_layernorm": False},
+            ),
+            self_attn_bda=get_bias_dropout_add,
+        ),
+    )
 
 
 # MTP block spec - provides norms and projection only.
@@ -333,6 +376,8 @@ hybrid_stack_spec = ModuleSpec(
         # Started with spec from gpt_layer_specs.py
         # Using the TE spec because we had problems getting the non-TE spec
         # working
+        qsa_layer=_qsa_layer_spec(qk_layernorm=False),
+        qsa_qk_layernorm_layer=_qsa_layer_spec(qk_layernorm=True),
         mlp_layer=ModuleSpec(
             module=MLPLayer,
             submodules=TransformerLayerSubmodules(
@@ -591,3 +636,55 @@ gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 # Preserve the existing --spec import path; C/H/W use the standard static stack spec.
 hybrid_dsv4_stack_spec = hybrid_stack_spec
+
+
+def _strip_input_norms(spec: ModuleSpec) -> ModuleSpec:
+    """Return a copy of ``spec`` with every pre-sublayer normalization removed.
+
+    Gated-residual layers carry no pre-sublayer norms (the gated-residual group norm owns
+    that role), so fused-LN projections (GDN ``in_proj``, attention ``linear_qkv``, dense-MLP
+    ``linear_fc1``) become plain column-parallel linears and explicit ``input_layernorm`` /
+    ``pre_mlp_layernorm`` entries become ``IdentityOp``.
+
+    This runs once at import time, not per model construction: the result below is a single
+    concrete ModuleSpec with one precise behavior, as `hybrid/CLAUDE.md` requires.
+    """
+    spec = copy.deepcopy(spec)
+    sub = spec.submodules
+
+    for name in ("gdn_layer", "gdn2_layer"):
+        layer = getattr(sub, name, None)
+        if layer is not None and hasattr(layer, "submodules"):
+            layer.submodules.self_attention.submodules.in_proj = TEColumnParallelLinear
+    for name in ("attention_layer", "qsa_layer", "qsa_qk_layernorm_layer"):
+        layer = getattr(sub, name, None)
+        if layer is not None and layer is not IdentityOp and hasattr(layer, "submodules"):
+            layer.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+            layer.submodules.input_layernorm = IdentityOp
+    for name in ("mla_layer", "dsa_layer", "csa_layer", "csa_qk_layernorm_layer"):
+        layer = getattr(sub, name, None)
+        if layer is not None and layer is not IdentityOp and hasattr(layer, "submodules"):
+            layer.submodules.input_layernorm = IdentityOp
+    sub.moe_layer.submodules.pre_mlp_layernorm = IdentityOp
+    sub.mlp_layer.submodules.mlp = partial(
+        MLP.as_mlp_submodule,
+        submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+    )
+    # Lets a builder that was handed this spec explicitly (via --spec) tell it apart from an
+    # arbitrary user spec, which must still be warned about as possibly double-normalizing.
+    spec.metainfo = {**(spec.metainfo or {}), "gated_residual_norm_free": True}
+    return spec
+
+
+# Norm-free stack for ``mhc_connection_variant='gated_residual'``.
+gated_residual_hybrid_stack_spec = _strip_input_norms(hybrid_stack_spec)
+
+
+def is_gated_residual_norm_free(spec) -> bool:
+    """True for stack specs built by :func:`_strip_input_norms`.
+
+    The hybrid builder warns about explicitly provided specs under the gated-residual
+    variant (fused input layernorms would normalize the residual streams twice); specs that
+    carry the ``gated_residual_norm_free`` metainfo are exempt.
+    """
+    return bool((getattr(spec, "metainfo", None) or {}).get("gated_residual_norm_free", False))

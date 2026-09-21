@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -283,7 +283,7 @@ def _get_experimental_attention_variant_loss_scale_func(config):
     if loss_scale_func is not None:
         return loss_scale_func
 
-    if getattr(config, 'experimental_attention_variant', None) in ('dsa', 'dsv4_hybrid'):
+    if getattr(config, 'experimental_attention_variant', None) in ('dsa', 'dsv4_hybrid', 'qsa'):
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             DSAIndexerLossAutoScaler,
         )
@@ -1182,7 +1182,14 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    # Interleaved PP sends and receives with the same buffer, and with more than one chunk
+    # per rank every boundary in the schedule is an intermediate one, so under mHC all of
+    # them carry the n-stream tensor.
+    hidden_dim = config.hidden_size
+    if getattr(config, 'enable_mhc_connections', False) and pipeline_parallel_size > 1:
+        hidden_dim *= getattr(config, 'mhc_num_residual_streams', 1)
+
+    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2113,6 +2120,27 @@ def forward_backward_pipelining_with_interleaving(
     return forward_data_store
 
 
+def _mhc_p2p_hidden_size(config, *, pp_group=None, is_recv=True) -> int:
+    """Hidden dimension a pipeline stage boundary carries.
+
+    ``config.hidden_size`` for an ordinary model; ``hidden_size * mhc_num_residual_streams``
+    for the mHC stage boundaries that carry the un-contracted n-stream tensor. Returns the
+    plain hidden size when the pipeline group is unknown, which is also the single-stage case.
+    """
+    hidden_size = config.hidden_size
+    if not getattr(config, 'enable_mhc_connections', False) or pp_group is None:
+        return hidden_size
+
+    pp_rank = pp_group.rank()
+    pp_size = pp_group.size()
+    # recv: every stage after the first receives n-stream from its predecessor.
+    # send: every stage before the last sends n-stream to its successor.
+    widen = (is_recv and pp_rank > 0) or (not is_recv and pp_rank < pp_size - 1)
+    if widen:
+        hidden_size *= getattr(config, 'mhc_num_residual_streams', 1)
+    return hidden_size
+
+
 def get_tensor_shapes(
     *,
     seq_length: int,
@@ -2121,8 +2149,20 @@ def get_tensor_shapes(
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    is_recv: bool = True,
 ):
     """Determine tensor shapes for pipeline communication.
+
+    With multi-stream hyper connections (mHC) the block expands to n streams at
+    ``pre_process`` and contracts back at the stage holding the final layernorm, so every
+    *intermediate* stage boundary carries ``[s, b, n * hidden_size]``.
+
+    Args:
+        is_recv: If True, compute the shape this rank receives; if False, the shape it sends.
+                 The two differ under mHC: the first stage receives nothing n-stream and the
+                 last stage sends nothing, so only ``pp_rank > 0`` (recv) and
+                 ``pp_rank < pp_size - 1`` (send) are widened.
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
@@ -2141,7 +2181,9 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    hidden_size = _mhc_p2p_hidden_size(config, pp_group=pp_group, is_recv=is_recv)
+
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
 
 
@@ -2321,6 +2363,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=getattr(p2p_communicator, "pp_group", None),
+        is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2329,6 +2373,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=getattr(p2p_communicator, "pp_group", None),
+        is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
