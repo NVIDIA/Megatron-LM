@@ -286,7 +286,8 @@ class TestLLaVAModel:
         assert torch.allclose(loss_mask[4], expected_loss_mask)
 
     @pytest.mark.internal
-    def test_preprocess_data_with_media_token_counts(self):
+    @pytest.mark.parametrize("media_token_counts_dtype", [torch.int32, torch.int64])
+    def test_preprocess_data_with_media_token_counts(self, media_token_counts_dtype):
         self.model.cuda()
 
         hidden_size = 8
@@ -301,7 +302,7 @@ class TestLLaVAModel:
             [[image_token_index, 1, 2], [3, image_token_index, 4]], dtype=torch.long, device="cuda"
         )
         num_image_tiles = torch.ones(2, dtype=torch.int, device="cuda")
-        media_token_counts = torch.tensor([2, 3], dtype=torch.int, device="cuda")
+        media_token_counts = torch.tensor([2, 3], dtype=media_token_counts_dtype, device="cuda")
 
         embeddings, _, _, _, _ = self.model._preprocess_data(
             image_embeddings,

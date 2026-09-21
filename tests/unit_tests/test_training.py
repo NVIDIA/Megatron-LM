@@ -4,13 +4,17 @@ from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
+from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
+    _get_optimizer_param_scheduler_increment,
+    _pop_samples_seen,
     _should_compute_params_norm,
     build_train_valid_test_data_iterators,
 )
@@ -94,6 +98,27 @@ def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
 
     args.csa_dense_mode = True
     assert _get_indexer_logging_layer_counts(args) == (5, 0)
+
+
+def test_indexer_logging_uses_normalized_hybrid_layer_positions():
+    """C layers in the main and repeated MTP patterns keep their positional denominator."""
+    args = SimpleNamespace(
+        experimental_attention_variant="dsv4_hybrid",
+        num_layers=3,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern="W-C/H-C/H-C",
+        csa_compress_ratios=None,
+        csa_dense_mode=False,
+    )
+    config_kwargs = {}
+
+    normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, args.hybrid_layer_pattern)
+
+    expected_ratios = [0, 0, 4, 128, 0, 4, 128, 0, 4]
+    assert args.csa_compress_ratios == expected_ratios
+    assert config_kwargs["csa_compress_ratios"] == expected_ratios
+    assert _get_indexer_logging_layer_counts(args) == (6, 3)
 
 
 class TestTraining:
@@ -219,6 +244,39 @@ class TestGetModelBucketSizingPgCollection:
         assert bucket_size == 40000000
         # pp rank is driven by pg_collection.pp, not the mpu global.
         assert pp_rank == 3
+
+
+class TestPackedSampleAccounting:
+    def test_pop_samples_seen_sums_and_removes_metadata(self):
+        losses = [
+            {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},
+            {"lm loss": torch.tensor(2.0), "_samples_seen": torch.tensor(5.0)},
+        ]
+
+        assert _pop_samples_seen(losses).item() == 8
+        assert all("_samples_seen" not in loss for loss in losses)
+
+    def test_pop_samples_seen_requires_every_microbatch(self):
+        losses = [
+            {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},
+            {"lm loss": torch.tensor(2.0)},
+        ]
+
+        with pytest.raises(ValueError, match="every microbatch"):
+            _pop_samples_seen(losses)
+
+    def test_iteration_schedule_uses_running_batch_size(self, monkeypatch):
+        args = SimpleNamespace(train_iters=100, train_samples=None)
+        monkeypatch.setattr(
+            "megatron.training.training.get_current_running_global_batch_size", lambda: 256
+        )
+
+        assert _get_optimizer_param_scheduler_increment(args, 3342) == 256
+
+    def test_sample_schedule_uses_samples_seen(self):
+        args = SimpleNamespace(train_iters=39, train_samples=10_000)
+
+        assert _get_optimizer_param_scheduler_increment(args, 3342) == 3342
 
 
 class TestSaveGrads:
