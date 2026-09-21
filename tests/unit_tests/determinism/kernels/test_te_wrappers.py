@@ -15,6 +15,7 @@ import os
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
@@ -46,6 +47,7 @@ if HAVE_TE:
         TELayerNormColumnParallelLinear,
         TENorm,
         TERowParallelLinear,
+        te_cross_entropy,
     )
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
@@ -411,6 +413,21 @@ class TestTEWrappers:
             module.load_state_dict(checkpoint)
             assert module.weight0 is parameter
             assert torch.equal(module.weight0, expected)
+
+    def test_te_fused_cross_entropy_replays(self):
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(
+            tokens, 1, 32768, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        assert_replays_bit_exact(
+            lambda l, t: te_cross_entropy(l, t, tp_group),
+            (logits, target),
+            replays=4,
+            what="te_fused_cross_entropy",
+        )
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):
