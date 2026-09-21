@@ -844,13 +844,13 @@ class TestMultiTokenPredictionLayer:
         assert torch.equal(seen["padding_mask"], expected_padding_mask)
         assert torch.equal(returned_padding_mask, expected_padding_mask)
 
-    def test_get_embeddings_detaches_decoder_input(self):
-        """With mtp_detach_heads=True, _get_embeddings detaches decoder_input (severing
-        gradient flow to the shared embedding) while still returning a hidden_states
-        tensor that requires grad so MTP layer params and activation checkpointing work."""
+    @pytest.mark.parametrize("detach_embedding", [False, True])
+    def test_get_embeddings_respects_detach_embedding(self, detach_embedding):
+        """The embedding detach path is independent from the other MTP inputs."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        config.mtp_detach_heads = True
+        config.mtp_detach_heads = False
+        config.mtp_detach_embedding = detach_embedding
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
         mtp_layer = mtp.layers[0]
 
@@ -873,9 +873,8 @@ class TestMultiTokenPredictionLayer:
             packed_seq_params=None,
         )
 
-        # decoder_input is detached from the embedding graph.
-        assert decoder_input.requires_grad is False
-        assert decoder_input.grad_fn is None
+        assert decoder_input.requires_grad is not detach_embedding
+        assert (decoder_input.grad_fn is None) is detach_embedding
         # hidden_states is still marked requires_grad so checkpointing and the MTP
         # layer parameters keep a differentiable path.
         assert returned_hidden_states.requires_grad is True
@@ -938,14 +937,26 @@ class TestMultiTokenPredictionLayer:
 
         assert (len(scattered) == 1) is expect_scatter
 
-    @pytest.mark.parametrize("detach_heads", [False, True])
-    def test_forward_detach_heads_gradient_flow(self, monkeypatch, detach_heads):
-        """Block-level check of mtp_detach_heads: with the flag on, MTP gradients must
-        not reach the main-model hidden_states or the shared embedding, while the MTP
-        layer parameters still receive gradients."""
+    @pytest.mark.parametrize(
+        ("detach_heads", "detach_embedding", "detach_backbone"),
+        [
+            (False, None, None),
+            (True, None, None),
+            (False, True, False),
+            (False, False, True),
+        ],
+    )
+    def test_forward_detach_paths_gradient_flow(
+        self, monkeypatch, detach_heads, detach_embedding, detach_backbone
+    ):
+        """Legacy and independent detach flags stop only their selected gradient paths."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         config.mtp_detach_heads = detach_heads
+        if detach_embedding is not None:
+            config.mtp_detach_embedding = detach_embedding
+        if detach_backbone is not None:
+            config.mtp_detach_backbone = detach_backbone
         # Runs on GPU because _concat_embeddings exercises the (fused) norm and
         # projection kernels; the rest of the MTP transformer layer is stubbed out.
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
@@ -994,15 +1005,19 @@ class TestMultiTokenPredictionLayer:
             assert layer.hnorm.weight.grad is not None
             assert layer.eh_proj.weight.grad is not None
 
-        if detach_heads:
-            # Gradients must not reach the main model or the shared embedding.
+        backbone_is_detached = detach_heads or bool(detach_backbone)
+        embedding_is_detached = detach_heads or bool(detach_embedding)
+        if backbone_is_detached:
             # The returned block output still includes the original hidden-state
             # chunk, so autograd may allocate a zero grad for it through cat().
             if hidden_states.grad is not None:
                 torch.testing.assert_close(hidden_states.grad, torch.zeros_like(hidden_states))
-            assert emb_weight.grad is None
         else:
             assert hidden_states.grad is not None
+            assert torch.count_nonzero(hidden_states.grad) > 0
+        if embedding_is_detached:
+            assert emb_weight.grad is None
+        else:
             assert emb_weight.grad is not None
 
     @pytest.mark.parametrize("mtp_num_layers", [1, 2])
@@ -1075,10 +1090,12 @@ class TestMultiTokenPredictionLayer:
             assert torch.count_nonzero(embedding.weight.grad[invalid_token_id]) == 0
         assert torch.count_nonzero(embedding.weight.grad[6]) > 0
 
-    @pytest.mark.parametrize("detach_heads", [False, True])
-    def test_process_mtp_loss_detaches_output_weight(self, detach_heads):
-        """process_mtp_loss must detach the output-head weight when mtp_detach_heads=True
-        so the MTP loss does not update the (shared) output projection weight."""
+    @pytest.mark.parametrize(
+        ("detach_heads", "detach_lm_head"),
+        [(False, None), (True, None), (False, False), (False, True)],
+    )
+    def test_process_mtp_loss_detaches_output_weight(self, detach_heads, detach_lm_head):
+        """The LM-head detach override is independent and preserves the legacy flag."""
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
         config = TransformerConfig(
@@ -1089,6 +1106,8 @@ class TestMultiTokenPredictionLayer:
             use_cpu_initialization=True,
             mtp_detach_heads=detach_heads,
         )
+        if detach_lm_head is not None:
+            config.mtp_detach_lm_head = detach_lm_head
 
         seq_len = 4
         batch_size = 2
@@ -1126,7 +1145,7 @@ class TestMultiTokenPredictionLayer:
         )
         result.sum().backward()
 
-        if detach_heads:
+        if detach_heads or bool(detach_lm_head):
             assert output_weight.grad is None
         else:
             assert output_weight.grad is not None

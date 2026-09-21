@@ -1085,7 +1085,7 @@ def process_mtp_loss(
         )
         derived_labels_from_input_ids = True
 
-    if config.mtp_detach_heads:
+    if getattr(config, "mtp_detach_lm_head", getattr(config, "mtp_detach_heads", False)):
         if output_weight is not None:
             output_weight = output_weight.detach()
         else:
@@ -1557,12 +1557,14 @@ class MultiTokenPredictionLayer(MegatronModule):
         ):
             decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
 
-        if self.config.mtp_detach_heads:
+        if getattr(
+            self.config, "mtp_detach_embedding", getattr(self.config, "mtp_detach_heads", False)
+        ):
             decoder_input = decoder_input.detach()
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
-        # which happens after detach() with mtp_detach_heads. Activation
+        # which happens after detaching the embedding path. Activation
         # checkpointing (CheckpointFunction.apply) requires at least one input tensor
         # with requires_grad=True to produce a differentiable output, so we ensure it
         # here to maintain gradient flow to MTP layer parameters.
@@ -2433,8 +2435,13 @@ class MultiTokenPredictionBlock(MegatronModule):
         else:
             hidden_states = hidden_states_list[offset]
 
-        if self.config.mtp_detach_heads:
-            hidden_states = hidden_states.detach()
+        if offset == 0 and getattr(
+            self.config, "mtp_detach_backbone", getattr(self.config, "mtp_detach_heads", False)
+        ):
+            # A nonzero offset is an output from a preceding MTP pipeline stage,
+            # rather than the main backbone. Keep that path connected so earlier
+            # MTP stages still receive gradients.
+            hidden_states = hidden_states.detach().requires_grad_(True)
 
         hidden_state_mixing_enabled = self.config.mtp_hsm and self.training
         if hidden_state_mixing_enabled:
