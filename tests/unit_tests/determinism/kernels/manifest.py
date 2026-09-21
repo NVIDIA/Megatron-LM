@@ -126,7 +126,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="deepseek_v41_csa2",
-        sources=("megatron/core/transformer/experimental_attention_variant/csa2.py",),
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa2.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_candidates.py",
+        ),
         tests=(K + "test_deepseek_v41_kernels.py",),
         kind="dispatch",
         notes="Native attention replay; cuDNN/FlashMLA kernels are reused from the existing CSA backend.",

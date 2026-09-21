@@ -11,7 +11,6 @@ from copy import copy
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -27,6 +26,10 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+    CSA2CandidateBlocks,
+    candidate_blocks_from_scores,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -54,7 +57,7 @@ class CSA2State:
     global_kv: torch.Tensor | None = None
     indexer_k: torch.Tensor | None = None
     global_indices: torch.Tensor | None = None
-    candidates: torch.Tensor | None = None
+    candidates: CSA2CandidateBlocks | None = None
     kv_source_layer: int | None = None
     index_source_layer: int | None = None
     candidate_source_layer: int | None = None
@@ -110,23 +113,9 @@ def select_candidate_blocks(
     dimension. The result is a position mask; the caller still applies the causal score mask
     because a selected block can include positions after the query.
     """
-    if topk_blocks <= 0 or block_size <= 0:
-        raise ValueError("CSA2 candidate block count and size must be positive.")
-    width = logits.shape[-1]
-    if width == 0:
-        return torch.zeros_like(logits, dtype=torch.bool)
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
-    num_blocks = scores.shape[-1]
-    newest_block = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == newest_block, torch.inf
+    return candidate_blocks_from_scores(logits, compress_lens, topk_blocks, block_size).to_mask(
+        logits.shape[-1]
     )
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter(
-        -1, top.indices, top.values > -torch.inf
-    )
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
 class CSA2Compressor(MegatronModule):
@@ -284,7 +273,7 @@ class CSA2Indexer(MegatronModule):
         rotary_pos_emb: nn.Module,
         *,
         indexer_k: torch.Tensor | None = None,
-        candidates: torch.Tensor | None = None,
+        candidates: CSA2CandidateBlocks | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return differentiable causal scores ``[batch, sequence, global positions]``.
 
@@ -317,13 +306,18 @@ class CSA2Indexer(MegatronModule):
         visible = torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
         causal = torch.arange(indexer_k.shape[0], device=x.device)[None, :] < visible[:, None]
         scores = scores.masked_fill(~causal, -torch.inf)
+        if isinstance(candidates, CSA2CandidateBlocks):
+            candidates = candidates.to_mask(scores.shape[-1])
         if candidates is not None:
             scores = scores.masked_fill(~candidates, -torch.inf)
         return scores
 
     def select_indices(self, scores: torch.Tensor) -> torch.Tensor:
         """Return sorted logical positions, with -1 for masked or unavailable entries."""
-        indices = scores.topk(min(self.topk, scores.shape[-1]), dim=-1, sorted=False).indices
+        # ReLU scores can tie at zero; masked future capacity must not change the winners.
+        indices = scores.argsort(dim=-1, descending=True, stable=True)[
+            ..., : min(self.topk, scores.shape[-1])
+        ]
         indices = indices.sort(dim=-1).values
         return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
 
@@ -336,7 +330,7 @@ class CSA2Indexer(MegatronModule):
         rotary_pos_emb: nn.Module,
         *,
         indexer_k: torch.Tensor | None = None,
-        candidates: torch.Tensor | None = None,
+        candidates: CSA2CandidateBlocks | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return sorted global-position indices, with ``-1`` for unavailable positions."""
         scores = self.forward_before_topk(
@@ -489,7 +483,7 @@ class CompressedSparseAttention2(MegatronModule):
                     visible = (
                         torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
                     ).unsqueeze(-1)
-                    state.candidates = select_candidate_blocks(
+                    state.candidates = candidate_blocks_from_scores(
                         scores,
                         visible,
                         self.config.csa2_candidate_topk_blocks,
