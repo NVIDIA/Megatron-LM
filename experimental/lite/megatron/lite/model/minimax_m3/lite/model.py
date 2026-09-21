@@ -9,9 +9,14 @@ Composition (see ``skills/model-compose/minimax-m3.md``):
   norm is fused into the qkv ``LayerNormLinear``, the dense-MLP input norm into
   ``gate_up``; MoE layers keep an explicit ``mlp_norm``.
 
-Reference: HF ``transformers.models.minimax_m3_vl`` (5.16.1). Position ids are 1-D
-``[B, S_local]`` global positions (zigzag shard under CP, derived when not given);
-THD/packed sequences are rejected (MSA contract).
+Reference: HF ``transformers.models.minimax_m3_vl`` (5.16.1).
+
+``msa_backend`` selects the sparse-attention path of the whole model:
+* ``"magi"`` – production path built by ``protocol.build_model``: MagiAttention MSA
+  extension + msa_v1 kernels, packed documents via ``magi_ctx``, attention TP=1.
+* ``"flex"`` – pure-torch ``flex_attention`` path; supports TP/SP and all-gather CP on
+  zigzag shards. Position ids are 1-D ``[B, S_local]`` global positions (derived when
+  not given); THD/packed sequences are rejected.
 """
 
 from __future__ import annotations

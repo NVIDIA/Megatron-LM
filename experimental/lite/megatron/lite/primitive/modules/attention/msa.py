@@ -8,7 +8,7 @@ the per-token block-sparse attention in
 :mod:`megatron.lite.primitive.kernels.msa_kernels`.
 
 Reference: HF ``transformers.models.minimax_m3_vl`` (``MiniMaxM3VLIndexer`` /
-``MiniMaxM3VLAttention``) and ``experimental/lite/ref/minimax_m3/msa_ref.py``.
+``MiniMaxM3VLAttention``).
 
 Indexer semantics
 * index-Q ``[H_idx x D_idx]`` and a single shared index-K ``[1 x D_idx]`` projected
@@ -17,8 +17,8 @@ Indexer semantics
 * token scores ``iQ . iK^T`` in fp32 (no ``1/sqrt(d)``), keys ``j > i`` masked, block
   max-pool (computed chunk-wise over KV blocks, never a dense S x S_k tensor), the
   query's own block(s) forced in, top-k per query token, ``-1`` pad.
-* The indexer is a pure selector: top-k is non-differentiable, and (P0 decision)
-  no auxiliary loss is attached, so it runs under ``torch.no_grad()``.
+* The indexer is a pure selector: top-k is non-differentiable and no auxiliary
+  loss is attached, so it runs under ``torch.no_grad()``.
 
 TP contract
 * ``index_n_heads`` must equal ``num_key_value_heads``; index heads are sharded
@@ -44,7 +44,7 @@ CP contract (all-gather CP, zigzag layout like the dense TE path)
   attention TP must be 1 (kernel shapes are fixed to 64/4/4 heads); indexer parameters
   carry ``requires_grad=False`` (``kl_loss_coeff=0`` is not a freeze).
 
-Not supported in this drop: THD / packed sequences on the dense/flex backends, MRoPE,
+Not supported in this drop: THD / packed sequences on the flex backend, MRoPE,
 output gate.
 """
 
@@ -283,7 +283,7 @@ class MSAttention(GQAttention):
                 topk_blocks=topk_blocks,
                 local_blocks=local_blocks,
             )
-            # self.core_attn (param-free TE module) is kept so state_dict keys match the flex/dense backends,
+            # self.core_attn (param-free TE module) is kept so state_dict keys match the flex backend,
             # but it is never called: Magi owns indexer + sparse attention + CP comm via magi_core.
             self.magi_core = MagiCoreAttention()
         self.indexer = MSAIndexer(
@@ -343,7 +343,7 @@ class MSAttention(GQAttention):
         if magi_ctx is not None:
             raise ValueError(f"magi_ctx was given but the MSA backend is {self.backend!r}")
         if packed_seq_params is not None:
-            raise NotImplementedError("MSA does not support THD/packed sequences in this drop")
+            raise NotImplementedError("MSA flex backend does not support THD/packed sequences in this drop")
         qkv = self.qkv(x)
         if self._replicate_kv:
             qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)

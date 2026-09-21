@@ -30,18 +30,19 @@ def msa(task, implementation, config, reference, budget):
             "indexer is a pure selector: no gradient path, no auxiliary loss (frozen, requires_grad=False)",
             "index-Q sharded like KV heads, index-K single head replicated on every TP rank",
         ],
-        "reference": reference or "HF MiniMaxM3VLAttention (fp64)",
+        "reference": reference or "HF MiniMaxM3VLAttention (bf16, same weights) and the pure-torch masked-attention "
+                                  "reference inside tests/unit/primitive/modules/attention/test_msa_reference_unit.py",
     }
     implementation_contract = {
         "details": ["MSAIndexer (Gemma-norm + partial RoPE + fp32 block max-pool + top-k); MSAIndexer.index_qk = projections only",
-                    "msa_kernels backends: dense (reference) and flex (default, exact, fwd+bwd)",
+                    "flex backend (kernels/msa_kernels.py): torch flex_attention on the per-token selection table; TP + all-gather CP",
                     "magi backend (kernels/magi_msa.py): MagiAttention MSA extension + MM-Sparse-Attention msa_v1 kernels;"
                     " MSAttention.forward bypasses indexer scoring / gather / msa_core_attention and calls calc_msa",
                     "MSAttention = GQAttention projections/QK-norm/RoPE + sparse core"],
         "state": ["index_n_heads == num_key_value_heads", "index_head_dim", "block_size", "topk_blocks", "local_blocks", "backend",
                   "magi: MagiMsaContext (runtime key, dense key, doc-local position_ids) built per micro-batch by the protocol"],
         "boundaries": ["indexer owns selection; kernels own masking; GQA owns projections and TP sharding; "
-                       "CP (dense/flex): all-gather K/V + index-K to global order (zigzag shards, any alignment); indices/causal in global positions",
+                       "CP (flex): all-gather K/V + index-K to global order (zigzag shards, any alignment); indices/causal in global positions",
                        "CP (magi): Magi owns the load-balanced token dispatch, required-K / index-K communication, indexer and sparse kernels;"
                        " mlite owns projections, norms, RoPE (by dispatched position), indexer projections (no_grad) and the output linear;"
                        " dense layers run native calc_attn on the same dispatch layout"],
@@ -49,7 +50,7 @@ def msa(task, implementation, config, reference, budget):
     usage_contract = {
         "config": require_config_keys(config, ["index_n_heads", "index_head_dim", "index_block_size", "index_topk_blocks"]),
         "choose_when": ["layer_types[i] == 'minimax_m3_sparse'"],
-        "avoid_when": ["packed/THD sequences on dense/flex (rejected; supported by magi)", "cuDNN BSA-style per-query-block metadata (not equivalent)",
+        "avoid_when": ["packed/THD sequences on flex (rejected; supported by magi)", "cuDNN BSA-style per-query-block metadata (not equivalent)",
                        "magi with attention TP>1 or shapes other than 64/4/4 heads, D=128, block 128, top-16 (kernel lock)"],
         "compose_with": ["primitive.module.gqa", "primitive.parallel.tp", "primitive.parallel.cp"],
     }
@@ -57,11 +58,12 @@ def msa(task, implementation, config, reference, budget):
     if not gqa_validation.done:
         return blocked("MSA depends on a validated GQA projection path", evidence=gqa_validation)
     validation = primitive.validate(task, primitive=implementation.msa, implementation=implementation, budget=budget)
-    risks = ["top-k ties flip under kernel/dtype changes (compare sets, fp32 gate, margin-aware)",
-             "flex BlockMask rebuilt per call (perf)", "flex is slower than dense below 128K on B200",
-             "CP all-gathers full K/V per layer (memory O(S_full) per rank, not overlapped)",
-             "indexer scores are pooled chunk-wise and the BlockMask is built from kv blocks (no S_q x S_k tensors); remaining costs are the un-overlapped CP all-gathers and the flex backward (slower than dense flash below 128K)",
-             "magi: bf16-only kernels (bf16-level agreement with flex, not the fp32 gate); indexer freeze must be requires_grad=False + no_grad "
+    risks = ["top-k ties flip under kernel/dtype changes (compare sets; bf16 flips 5-17% of rows, so gates are loose and "
+             "flip rates are printed as evidence)",
+             "flex BlockMask rebuilt per call (perf)",
+             "CP (flex) all-gathers full K/V per layer (memory O(S_full) per rank, not overlapped)",
+             "indexer scores are pooled chunk-wise and the BlockMask is built from kv blocks (no S_q x S_k tensors)",
+             "magi: bf16-only kernels; indexer freeze must be requires_grad=False + no_grad "
              "(kl_loss_coeff=0 is not a freeze) and is asserted bitwise after training; last_block_indices is None; a new cu_seqlens "
              "re-plans the runtime on the host (LRU 16, MAGI_MSA_RUNTIME_CACHE_SIZE); padding up to chunk*cp-1 tokens; "
              "recompute core_attn re-runs Magi's forward communication; dense layers run native calc_attn on FA4 (flash_attn_cute, cutlass-dsl 4.5.2); the pure-torch sdpa_ol backend is test-only (OOM beyond ~8K)",

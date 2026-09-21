@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Unit tests for the ``magi`` MSA backend (MagiAttention MSA extension + msa_v1 kernels), CP=1.
 
-The ``flex`` backend (exact, fp32-validated in ``test_msa_unit.py``) is the reference; the msa_v1
-kernels are bf16-only so thresholds are bf16-level (P1 measured official-kernel-vs-fp32 rel ~2e-3).
+The ``flex`` backend (validated against HF in ``test_msa_unit.py``) is the reference; the msa_v1
+kernels are bf16-only so thresholds are bf16-level (measured official-kernel-vs-fp32 rel ~2e-3).
 """
 
 from __future__ import annotations

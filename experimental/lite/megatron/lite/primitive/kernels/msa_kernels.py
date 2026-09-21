@@ -8,17 +8,16 @@ selection is **per query token** (not per query block) and shared by the query
 heads of a group.
 
 Backends
-* ``dense``  – reference: materialise the ``[B, H_q, S_q, S_k]`` keep-mask and run
-  masked softmax attention in the input dtype (fp64 capable). O(S^2) memory.
-* ``flex``   – default trainable path: ``torch.nn.attention.flex_attention`` with a
+* ``flex``   – pure-torch trainable path: ``torch.nn.attention.flex_attention`` with a
   per-token ``mask_mod`` reading the selection table; the BlockMask is built from
   the block-level union of the selections (no S_q x S_k intermediate) and skips
-  unselected 128x128 tiles. Exact (fp32 rel ~2e-7 with TF32 off), fwd+bwd native.
-  Caveat (torch 2.13, B200): the compiled fp32 kernel is only IEEE-exact for
-  ``head_dim == 128``; ``head_dim == 64`` runs at TF32 precision (rel ~7e-4)
-  regardless of ``ALLOW_TF32``. M3 uses 128; fp32 alignment tests must too.
+  unselected 128x128 tiles. Supports TP (index heads sharded like KV heads) and
+  all-gather CP on zigzag shards. Caveat (torch 2.13, B200): the compiled kernel is
+  only IEEE-exact in fp32 for ``head_dim == 128``; M3 uses 128.
+* ``magi``   – production path (MagiAttention MSA extension + msa_v1 kernels); it is
+  handled by ``MSAttention`` itself and never reaches :func:`msa_core_attention`.
 
-Both consume the same selection table produced by :func:`block_indices_to_table`
+The flex backend consumes the selection table produced by :func:`block_indices_to_table`
 from HF-format block indices ``[B, H_idx, S_q, K]`` (``-1`` right padding).
 """
 
@@ -39,35 +38,6 @@ def block_indices_to_table(block_idx: Tensor, n_kv_blocks: int) -> Tensor:
     table = torch.zeros(B, H, S, n_kv_blocks + 1, dtype=torch.bool, device=block_idx.device)
     table.scatter_(-1, safe, True)
     return table[..., :n_kv_blocks]
-
-
-def keep_mask_from_table(
-    table: Tensor, position_ids: Tensor, key_length: int, block_size: int, num_q_heads: int
-) -> Tensor:
-    """Dense boolean keep-mask ``[B, H_q, S_q, S_k]`` = selected block AND causal (token level)."""
-    B, H_idx, S_q, _ = table.shape
-    keep = table.repeat_interleave(block_size, dim=-1)[..., :key_length]
-    keep = keep.repeat_interleave(num_q_heads // H_idx, dim=1)
-    k_pos = torch.arange(key_length, device=table.device)
-    future = k_pos[None, None, None, :] > position_ids[:, None, :, None]
-    return keep & ~future
-
-
-def msa_dense_attention(
-    q: Tensor, k: Tensor, v: Tensor, table: Tensor, position_ids: Tensor, *, scale: float, block_size: int
-) -> Tensor:
-    """Reference backend. ``q``: ``[B, H_q, S_q, D]``; ``k``/``v``: ``[B, H_kv, S_k, D]``. Returns ``[B, H_q, S_q, D]``."""
-    B, H_q, S_q, D = q.shape
-    H_kv, S_k = k.shape[1], k.shape[2]
-    n_rep = H_q // H_kv
-    keep = keep_mask_from_table(table, position_ids, S_k, block_size, H_q)
-    k_rep = k.repeat_interleave(n_rep, dim=1)
-    v_rep = v.repeat_interleave(n_rep, dim=1)
-    scores = torch.matmul(q, k_rep.transpose(-1, -2)) * scale
-    scores = scores.masked_fill(~keep, float("-inf"))
-    acc = torch.float64 if q.dtype == torch.float64 else torch.float32
-    probs = torch.softmax(scores, dim=-1, dtype=acc).to(q.dtype)
-    return torch.matmul(probs, v_rep)
 
 
 def _get_flex():
@@ -123,13 +93,13 @@ def msa_flex_attention(
     block_size: int,
     block_mask=None,
 ) -> Tensor:
-    """flex_attention backend. Same contract as :func:`msa_dense_attention`."""
+    """``q``: ``[B, H_q, S_q, D]``; ``k``/``v``: ``[B, H_kv, S_k, D]``. Returns ``[B, H_q, S_q, D]``."""
     if block_mask is None:
         block_mask = build_flex_block_mask(table, position_ids, q.shape[1], k.shape[2], block_size)
     return _get_flex()(q, k, v, block_mask=block_mask, scale=scale, enable_gqa=q.shape[1] != k.shape[1])
 
 
-BACKENDS = ("dense", "flex", "magi")  # "magi" is handled by MSAttention itself, not by this function
+BACKENDS = ("flex", "magi")  # "magi" is handled by MSAttention itself, not by this function
 
 
 def msa_core_attention(
@@ -151,8 +121,6 @@ def msa_core_attention(
     scale = q.shape[-1] ** -0.5 if scale is None else scale
     n_kv_blocks = -(-k.shape[2] // block_size)
     table = block_indices_to_table(block_idx, n_kv_blocks)
-    if backend == "dense":
-        return msa_dense_attention(q, k, v, table, position_ids, scale=scale, block_size=block_size)
     return msa_flex_attention(q, k, v, table, position_ids, scale=scale, block_size=block_size)
 
 

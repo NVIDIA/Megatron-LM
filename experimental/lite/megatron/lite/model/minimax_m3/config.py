@@ -2,11 +2,10 @@
 """MiniMax-M3 (text / LM) model configuration.
 
 Mapped from the Hugging Face ``config.json`` of ``MiniMaxAI/MiniMax-M3``
-(``model_type: minimax_m3_vl`` with a nested ``text_config``) or from the
-text-only config emitted by ``tools/minimax_m3/slice_ckpt.py``
-(``model_type: minimax_m3_vl_text``).
+(``model_type: minimax_m3_vl`` with a nested ``text_config``) or from a
+text-only slice of it (``model_type: minimax_m3_vl_text``).
 
-Architecture facts pinned in P0 (transformers 5.16.1):
+Architecture facts (transformers 5.16.1):
 * 60 layers, hidden 6144, 64 q heads x 128, 4 kv heads, per-head Gemma QK-norm
   (``(1 + w)`` scaling, eps 1e-6), partial RoPE on the first 64 dims
   (NeoX ``rotate_half``), theta 5e6, untied embeddings, vocab 200064.

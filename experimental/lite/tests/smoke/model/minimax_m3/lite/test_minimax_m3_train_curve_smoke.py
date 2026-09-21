@@ -1,89 +1,59 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""P3: 100-step Magi training curves of Proxy-M3 under EP/PP/CP (dist_opt, bf16) vs DP.
+"""Training curves of MiniMax-M3 lite through the real runtime (Magi protocol, dist_opt, bf16), 2 GPUs.
 
-Every rank sees the same token stream, so the dp=8 run equals a single-GPU run; each parallel
-configuration starts from the same HF-format weights and must track the baseline loss curve
-(mean relative |delta| over the 100 steps < 1%, per the P3 acceptance criteria). bf16 training
-numbers are recorded; the 1% band is the plan's curve criterion, not the fp32 module gate.
+Every rank sees the same 4096-token stream, so the dp=2 run equals a single-GPU run. Each parallel
+layout (EP2, PP2, CP2) starts from the same HF-format weights and must track the DP baseline loss curve:
+mean relative |delta| over the steps and over the last 10 steps both < 1%. The indexer weights must be
+bitwise unchanged after training on every layout (frozen selector; ``kl_loss_coeff=0`` alone would not
+guarantee this).
 
-Run: torchrun --nproc-per-node=8 -m pytest -s <file> with MLITE_TEST_HARNESS=1 (megatron-core needed).
+Optional (explicit selection only):
+* ``test_bench_step_time_and_memory`` records step time / peak memory at 16K tokens; the ``all_msa`` variant
+  routes every layer through MSA to attribute the cost to the MSA path alone.
+* ``test_deterministic_mode_reproduces_bitwise``: ``ImplConfig.deterministic=True`` (ordered msa_v1
+  backward) must reproduce loss and grad-norm bitwise across two identical runs; ``deterministic=False``
+  is recorded for reference. Runs on the all-MSA model because the dense layers' fa4 backward is unordered.
 """
 
 from __future__ import annotations
 
-import os
-import sys
+import gc
+import time
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-_LITE = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 5))
-sys.path.insert(0, os.path.join(_LITE, "ref", "minimax_m3"))
-
 pytestmark = [
-    pytest.mark.gpus(8, min_architecture="blackwell"),
+    pytest.mark.gpus(2, min_architecture="blackwell"),
     pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
     pytest.mark.timeout(seconds=1800),
 ]
 
-S, STEPS, LR = 1024, 100, 1e-3
+S, STEPS, LR, CHUNK = 4096, 50, 1e-3, 512
+CURVE_REL = 1e-2
+_CASES = [("ep2", dict(tp=1, ep=2, etp=1, pp=1, cp=1)), ("pp2", dict(tp=1, ep=1, etp=1, pp=2, cp=1)),
+          ("cp2", dict(tp=1, ep=1, etp=1, pp=1, cp=2))]
 
 
-def _init_dist_or_skip():
-    import torch.distributed as dist
-
-    if not torch.cuda.is_available() or "RANK" not in os.environ:
-        pytest.skip("run with torchrun on GPUs")
+def _deps(dist):
     pytest.importorskip("megatron.core", reason="dist_opt needs megatron-core")
     pytest.importorskip("magi_attn_extensions.MSA")
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    if not dist.is_initialized():
-        dist.init_process_group("nccl")
-    if dist.get_world_size() != 8:
-        pytest.skip("training-curve smoke expects exactly 8 ranks")
-    return dist
+    pytest.importorskip("msa_v1")
+    if dist.get_world_size() != 2:
+        pytest.skip("training-curve smoke expects exactly 2 ranks")
 
 
-def _proxy_config():
-    from proxy_config import hf_proxy_text_config_kwargs
-
+def _all_msa_config(magi_hf_kwargs):
+    """Every layer through the MSA path (random init; no dense-layer calc_attn)."""
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
 
-    hf = dict(hf_proxy_text_config_kwargs(magi=True))
-    hf["model_type"] = "minimax_m3_vl_text"
-    return MiniMaxM3Config._from_hf_dict(hf)
+    cfg = MiniMaxM3Config._from_hf_dict(magi_hf_kwargs)
+    cfg.layer_types = ["minimax_m3_sparse"] * cfg.num_hidden_layers
+    return cfg
 
 
-@pytest.fixture(scope="module")
-def source_weights(tmp_path_factory):
-    """One bf16 Proxy-M3 saved in HF format so every configuration starts from identical weights."""
-    from megatron.lite.model.minimax_m3.lite.checkpoint import save_hf_weights
-    from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
-    from megatron.lite.primitive.parallel import ParallelState
-
-    dist = _init_dist_or_skip()
-    cfg = _proxy_config()
-    ps0 = ParallelState()
-    tc = SimpleNamespace(tp=1, ep=1, etp=1, pp=1, cp=1, vpp=None, use_deepep=False, fp8=False, recompute_modules=[], deterministic=True)
-    torch.manual_seed(20260911)
-    ref = MiniMaxM3Model(cfg, tc, ps0, msa_backend="flex").to(torch.bfloat16).cuda()
-    with torch.no_grad():
-        for n, p in ref.named_parameters():
-            if n.endswith("norm.weight") or n.endswith("layer_norm_weight"):
-                p.normal_(std=0.1)
-        for layer in ref.layers:
-            if layer.moe is not None:
-                layer.moe.router.expert_bias.normal_(std=0.05)
-    src = [str(tmp_path_factory.mktemp("hf_proxy_train")) if dist.get_rank() == 0 else None]
-    dist.broadcast_object_list(src, src=0)
-    save_hf_weights(ref, src[0], cfg, ps0)
-    del ref
-    torch.cuda.empty_cache()
-    return SimpleNamespace(cfg=cfg, src=src[0])
-
-
-def _build_handle(cfg, src, parallel):
+def _build_handle(cfg, src, parallel, *, load=True, deterministic=False):
     from megatron.lite.model.minimax_m3.lite import protocol
     from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
     from megatron.lite.runtime.contracts.config import OptimizerConfig
@@ -92,24 +62,21 @@ def _build_handle(cfg, src, parallel):
     impl_cfg = protocol.ImplConfig(
         parallel=parallel,
         optimizer="dist_opt",
-        optimizer_config=OptimizerConfig(optimizer="adam", lr=LR, weight_decay=0.0, clip_grad=1.0),
-        deterministic=False,
+        optimizer_config=OptimizerConfig(optimizer="adam", lr=LR, weight_decay=0.1, clip_grad=1.0),
+        deterministic=deterministic,
+        magi_chunk_size=CHUNK,
     )
     torch.manual_seed(1)
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
-    for chunk in bundle.chunks:
-        protocol.load_hf_weights(unwrap_model(chunk), src, cfg, bundle.parallel_state)
+    if load:
+        for chunk in bundle.chunks:
+            protocol.load_hf_weights(unwrap_model(chunk), src, cfg, bundle.parallel_state)
     reload = getattr(bundle.optimizer, "reload_model_params", None)
     if callable(reload):
         reload()
     extras = dict(bundle.extras)
-    extras.update(
-        model_chunks=bundle.chunks,
-        forward_step=bundle.forward_step,
-        finalize_grads=bundle.finalize_grads,
-        protocol=protocol,
-        model_cfg=cfg,
-    )
+    extras.update(model_chunks=bundle.chunks, forward_step=bundle.forward_step, finalize_grads=bundle.finalize_grads,
+                  protocol=protocol, model_cfg=cfg)
     return ModelHandle(
         model=bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks,  # as MegatronLiteRuntime.build_model
         optimizer=bundle.optimizer,
@@ -119,48 +86,29 @@ def _build_handle(cfg, src, parallel):
     )
 
 
-def _batch(cfg, step, ps):
+def _batch(cfg, step, seq_len):
     from megatron.lite.runtime.contracts.data import PackedBatch
 
     g = torch.Generator(device="cuda").manual_seed(100_000 + step)  # identical stream on every rank
-    ids = torch.randint(0, cfg.vocab_size, (1, S), device="cuda", generator=g)
-    labels = torch.randint(0, cfg.vocab_size, (1, S), device="cuda", generator=g)
-    # Magi plans and dispatches the identical global packed batch on every CP rank.
-    ids = ids.reshape(-1).contiguous()
-    labels = labels.reshape(-1).contiguous()
-    return PackedBatch(input_ids=ids, labels=labels, seq_lens=torch.tensor([ids.numel()], dtype=torch.int64, device="cuda"))
+    ids = torch.randint(0, cfg.vocab_size, (seq_len,), device="cuda", generator=g)
+    labels = torch.randint(0, cfg.vocab_size, (seq_len,), device="cuda", generator=g)
+    return PackedBatch(input_ids=ids, labels=labels, seq_lens=torch.tensor([seq_len], dtype=torch.int64, device="cuda"))
 
 
-def _train(cfg, src, parallel) -> tuple[list[float], list[float]]:
-    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+def _indexer_weights(handle):
+    from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 
-    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    handle = _build_handle(cfg, src, parallel)
-    ps = handle._parallel_state
-    losses, norms = [], []
-    for step in range(STEPS):
-        runtime.zero_grad(handle)
-        res = runtime.forward_backward(handle, iter([_batch(cfg, step, ps)]), None, num_microbatches=1)
-        ok, gnorm, _ = runtime.optimizer_step(handle)
-        assert ok, f"optimizer step {step} failed"
-        loss = res.model_output.loss
-        losses.append(float(loss.item()) if loss is not None else float("nan"))
-        norms.append(gnorm)
-    runtime.zero_grad(handle)
-    del handle, runtime
-    _reset_parallel_state(ps)
-    return losses, norms
+    chunks = handle._model if isinstance(handle._model, list) else [handle._model]
+    return {n: p.detach().clone() for c in chunks for n, p in unwrap_model(c).named_parameters() if ".indexer." in n}
 
 
-_PS_GROUP_ATTRS = ("tp_group", "ep_group", "etp_group", "cp_group", "pp_group", "pp_cpu_group", "dp_group", "dp_cp_group", "tp_ep_group", "ep_dp_group")
+_PS_GROUP_ATTRS = ("tp_group", "ep_group", "etp_group", "cp_group", "pp_group", "pp_cpu_group", "dp_group", "dp_cp_group",
+                   "tp_ep_group", "ep_dp_group")
 
 
-def _reset_parallel_state(ps) -> None:
+def _reset_parallel_state(ps):
     """dist_opt initialises mcore's global parallel state per topology; tear it (and lite's groups) down between cases."""
-    import gc
-
     import torch.distributed as dist
-
     from megatron.core import parallel_state as mpu
 
     if mpu.is_initialized():
@@ -176,51 +124,117 @@ def _reset_parallel_state(ps) -> None:
     torch.cuda.empty_cache()
 
 
-def _curve_delta(losses, base) -> tuple[float, float]:
-    import torch.distributed as dist
+def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, load=True, deterministic=False):
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
-    d = torch.tensor(losses, device="cuda")
-    b = torch.tensor(base, device="cuda")
-    rel = ((d - b).abs() / b.abs().clamp_min(1e-6))
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    handle = _build_handle(cfg, src, parallel, load=load, deterministic=deterministic)
+    ps = handle._parallel_state
+    w0 = _indexer_weights(handle)
+    losses, norms, step_times = [], [], []
+    torch.cuda.reset_peak_memory_stats()
+    for step in range(steps):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        runtime.zero_grad(handle)
+        res = runtime.forward_backward(handle, iter([_batch(cfg, step, seq_len)]), None, num_microbatches=1)
+        ok, gnorm, _ = runtime.optimizer_step(handle)
+        torch.cuda.synchronize()
+        step_times.append(time.perf_counter() - t0)
+        assert ok, f"optimizer step {step} failed"
+        loss = res.model_output.loss
+        losses.append(float(loss.item()) if loss is not None else float("nan"))
+        norms.append(gnorm)
+    peak_gib = torch.cuda.max_memory_allocated() / 2**30
+    for n, w in _indexer_weights(handle).items():
+        assert torch.equal(w, w0[n]), f"indexer weight {n} changed during training"
+    runtime.zero_grad(handle)
+    del handle, runtime
+    _reset_parallel_state(ps)
+    stats = SimpleNamespace(step_ms=1e3 * sum(step_times[2:]) / max(len(step_times) - 2, 1), peak_gib=peak_gib)
+    return losses, norms, stats
+
+
+def _curve_delta(losses, base, dist):
+    d, b = torch.tensor(losses, device="cuda"), torch.tensor(base, device="cuda")
+    rel = (d - b).abs() / b.abs().clamp_min(1e-6)
     stats = torch.stack([rel.mean(), rel[-10:].mean()])
     dist.all_reduce(stats, op=dist.ReduceOp.MAX)
     return float(stats[0]), float(stats[1])
 
 
-_CASES = [
-    ("pp2", dict(tp=1, ep=1, etp=1, pp=2, cp=1)),
-    ("ep2", dict(tp=1, ep=2, etp=1, pp=1, cp=1)),
-    ("cp2", dict(tp=1, ep=1, etp=1, pp=1, cp=2)),
-    ("ep2_cp2", dict(tp=1, ep=2, etp=1, pp=1, cp=2)),
-]
-
-
 @pytest.fixture(scope="module")
-def baseline(source_weights):
+def baseline(magi_cfg, magi_source, dist):
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
-    losses, norms = _train(source_weights.cfg, source_weights.src, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1))
-    import torch.distributed as dist
-
+    _deps(dist)
+    losses, norms, st = _train(magi_cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=1))
     if dist.get_rank() == 0:
-        print(f"\nP3 curve baseline dp8: loss[0]={losses[0]:.4f} loss[49]={losses[49]:.4f} loss[99]={losses[99]:.4f} "
-              f"gnorm[0]={norms[0]:.3f} gnorm[99]={norms[99]:.3f}", flush=True)
+        print(f"\ntrain_curve baseline dp2: loss[0]={losses[0]:.4f} loss[{STEPS // 2}]={losses[STEPS // 2]:.4f} "
+              f"loss[-1]={losses[-1]:.4f} gnorm[0]={norms[0]:.3f} gnorm[-1]={norms[-1]:.3f} | {st.step_ms:.0f} ms/step, "
+              f"peak {st.peak_gib:.2f} GiB", flush=True)
     assert all(torch.isfinite(torch.tensor(losses)))
     return losses
 
 
 @pytest.mark.parametrize("name,parallel", _CASES, ids=[c[0] for c in _CASES])
-def test_train_curve_tracks_dp_baseline(source_weights, baseline, name, parallel):
-    import torch.distributed as dist
-
+def test_train_curve_tracks_dp_baseline(magi_cfg, magi_source, baseline, dist, name, parallel):
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
-    cfg, src = source_weights.cfg, source_weights.src
-    losses, norms = _train(cfg, src, ParallelConfig(**parallel))
-    mean_rel, tail_rel = _curve_delta(losses, baseline)
+    losses, norms, st = _train(magi_cfg, magi_source, ParallelConfig(**parallel))
+    mean_rel, tail_rel = _curve_delta(losses, baseline, dist)
     if dist.get_rank() == 0:
-        print(f"P3 curve {name}: loss[0]={losses[0]:.4f} loss[49]={losses[49]:.4f} loss[99]={losses[99]:.4f} | "
-              f"mean rel|delta| {mean_rel:.3e} last-10 {tail_rel:.3e} | gnorm[99]={norms[99]:.3f}", flush=True)
+        print(f"train_curve {name}: loss[0]={losses[0]:.4f} loss[-1]={losses[-1]:.4f} | mean rel|delta| {mean_rel:.3e} "
+              f"last-10 {tail_rel:.3e} | gnorm[-1]={norms[-1]:.3f} | {st.step_ms:.0f} ms/step, peak {st.peak_gib:.2f} GiB",
+              flush=True)
     assert all(torch.isfinite(torch.tensor(losses)))
-    assert mean_rel < 1e-2, (name, mean_rel)
-    assert tail_rel < 1e-2, (name, tail_rel)
+    assert mean_rel < CURVE_REL, (name, mean_rel)
+    assert tail_rel < CURVE_REL, (name, tail_rel)
+
+
+@pytest.mark.optional
+@pytest.mark.parametrize("layers", ["full", "all_msa"])
+@pytest.mark.parametrize("cp", [1, 2])
+def test_bench_step_time_and_memory(magi_cfg, magi_hf_kwargs, magi_source, dist, layers, cp):
+    from megatron.lite.runtime.contracts.config import ParallelConfig
+
+    _deps(dist)
+    seq_len = 16384
+    cfg = magi_cfg if layers == "full" else _all_msa_config(magi_hf_kwargs)
+    _, _, st = _train(cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), steps=6, seq_len=seq_len,
+                      load=layers == "full")
+    if dist.get_rank() == 0:
+        print(f"BENCH {layers} S={seq_len} cp{cp}: {st.step_ms:.0f} ms/step, peak {st.peak_gib:.2f} GiB", flush=True)
+
+
+def _first_divergence(a, b):
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return -1
+
+
+@pytest.mark.optional
+@pytest.mark.parametrize("cp", [1, 2])
+def test_deterministic_mode_reproduces_bitwise(magi_hf_kwargs, magi_source, dist, cp):
+    from megatron.lite.runtime.contracts.config import ParallelConfig
+
+    _deps(dist)
+    steps, cfg = 20, _all_msa_config(magi_hf_kwargs)
+    runs = {}
+    for det in (True, False):
+        (l0, n0, st0), (l1, n1, st1) = [
+            _train(cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), steps=steps, load=False, deterministic=det)
+            for _ in range(2)
+        ]
+        same = torch.tensor([int(l0 == l1 and n0 == n1)], device="cuda")
+        dist.all_reduce(same, op=dist.ReduceOp.MIN)
+        runs[det] = SimpleNamespace(same=bool(same.item()), loss_div=_first_divergence(l0, l1),
+                                    norm_div=_first_divergence(n0, n1), step_ms=(st0.step_ms + st1.step_ms) / 2)
+    d, nd = runs[True], runs[False]
+    if dist.get_rank() == 0:
+        print(f"\ndeterministic all_msa cp{cp} ({steps} steps): det=True bitwise={'yes' if d.same else 'NO'} "
+              f"(first divergence {d.loss_div}/{d.norm_div}) {d.step_ms:.0f} ms/step | det=False bitwise="
+              f"{'yes' if nd.same else 'no'} (first divergence {nd.loss_div}/{nd.norm_div}) {nd.step_ms:.0f} ms/step | "
+              f"det/nondet step-time x{d.step_ms / nd.step_ms:.2f}", flush=True)
+    assert d.same, (cp, d)

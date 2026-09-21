@@ -3,8 +3,8 @@
 
 Primary source spelling is the **on-disk** ``MiniMaxAI/MiniMax-M3`` checkpoint
 (sglang-style names). The HF *module* spelling (what ``transformers`` 5.16.1
-materialises, and what ``tools/minimax_m3/slice_ckpt.py`` writes for Truncated-M3)
-is accepted as a fallback through ``hf_name_candidates`` / ``transform_hf_source``.
+materialises and ``save_pretrained`` writes) is accepted as a fallback through
+``hf_name_candidates`` / ``transform_hf_source``.
 
     disk                                                  HF module
     language_model.model.embed_tokens.weight              model.embed_tokens.weight
