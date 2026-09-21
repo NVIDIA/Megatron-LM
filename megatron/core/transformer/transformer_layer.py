@@ -1614,7 +1614,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
-                probs, routing_map = self.mlp.route(hidden_states)
+                probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
@@ -1640,7 +1640,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     hidden_states, residual = hidden_states
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
-                probs, routing_map = self.mlp.route(hidden_states)
+                probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 return residual, hidden_states, probs, shared_expert_output
 
