@@ -111,6 +111,11 @@ whole-layer training capture when the flag is omitted.
 
 ### mHC Attention Split
 
+Activation recompute inside a chunk capture always goes through Transformer Engine's checkpoint —
+full recompute, the MTP, MoE / shared-expert recompute, `core_attn` and the GDN / KDA core — because
+Megatron's own `tensor_parallel.checkpoint` runs the function without a checkpoint node while a graph
+is warmed up or captured and would silently keep the activations resident.
+
 For mHC selective recompute, `--mhc-recompute-attn-cuda-graph-split` keeps mHC aggregation and
 BDA eager and captures only the input norm and attention. The producer writes directly into
 the graph's single-stream `[s, b, C]` input, including during backward recomputation, instead

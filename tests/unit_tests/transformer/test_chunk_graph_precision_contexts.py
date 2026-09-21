@@ -46,6 +46,62 @@ class TestChunkGraphPrecisionContexts:
         assert use_te_checkpoint(_config(**_CHUNK))
 
     @pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+    def test_selective_core_attn_recompute_checkpoints_inside_chunk_capture(self):
+        """Selective ``core_attn`` recompute: eager builds one checkpoint node per layer, mcore's
+        ``tensor_parallel.checkpoint`` builds none while a graph is captured, and under chunk
+        granularity the attention uses TE's checkpoint, which does build its node in the capture."""
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer import cuda_graphs
+        from megatron.core.transformer.spec_utils import build_module
+        from tests.unit_tests.test_utilities import Utils
+
+        def checkpoint_nodes(tensor):
+            names, seen, stack = [], set(), [tensor.grad_fn]
+            while stack:
+                fn = stack.pop()
+                if fn is None or fn in seen:
+                    continue
+                seen.add(fn)
+                if "Checkpoint" in type(fn).__name__:
+                    names.append(type(fn).__name__)
+                stack.extend(next_fn for next_fn, _ in fn.next_functions)
+            return sorted(names)
+
+        def run(**overrides):
+            config = _config(
+                num_layers=1,
+                params_dtype=torch.bfloat16,
+                attention_dropout=0.0,  # graphed attention recompute asserts no dropout
+                hidden_dropout=0.0,
+                recompute_granularity="selective",
+                recompute_modules=["core_attn"],
+                **overrides,
+            )
+            layer = build_module(
+                get_gpt_layer_with_transformer_engine_spec(), config=config, layer_number=1
+            ).cuda()
+            layer.train()
+            hidden = torch.randn(16, 2, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+            output, _ = layer(hidden_states=hidden, attention_mask=None)
+            return checkpoint_nodes(output)
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        model_parallel_cuda_manual_seed(42)
+        try:
+            assert run() == ["CheckpointFunctionBackward"]  # eager: mcore's node
+            cuda_graphs._set_capture_start()
+            try:
+                assert run() == []  # mcore's checkpoint skips its node while a graph is captured
+                assert run(**_CHUNK) == ["_CheckpointFunctionBackward"]  # TE's does not
+            finally:
+                cuda_graphs._set_capture_end()
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
     def test_layer_fp8_context_opts_bf16_boundary_layers_out_of_a_chunk_capture(self):
         """Layer 0 and the last layer are BF16; inside an outer FP8 context (what the chunk
         capture applies to the whole block) their per-layer context must disable FP8."""

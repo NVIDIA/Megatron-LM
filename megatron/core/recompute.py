@@ -19,13 +19,15 @@ else:
 
 
 def use_te_checkpoint(config) -> bool:
-    """Whether activation checkpointing has to go through Transformer Engine's ``checkpoint``.
+    """Whether activation checkpointing goes through Transformer Engine's ``checkpoint``.
 
-    TE's checkpoint is required under FP8/FP4, and under chunk-granularity Transformer Engine
-    CUDA graphs for any precision: the captured block contains the checkpointed forward and its
-    recompute as one unit, whereas ``tensor_parallel.checkpoint`` runs the forward without a
-    checkpoint node during graph warm-up and capture, which would keep every activation of the
-    block alive inside the graph.
+    TE's checkpoint is used under FP8/FP4 — ``tensor_parallel.checkpoint`` recomputes outside the
+    FP8 autocast, so a TE module in the region would recompute in BF16 (or dequantize FP8
+    parameters and lose their ``main_grad``), whereas TE's checkpoint re-enters the recorded FP8
+    state — and under chunk-granularity Transformer Engine CUDA graphs for any precision: the
+    captured block contains the checkpointed forward and its recompute as one unit, whereas
+    ``tensor_parallel.checkpoint`` runs the forward without a checkpoint node during graph warm-up
+    and capture, which would keep every activation of the block alive inside the graph.
     """
     if config.fp8 or config.fp4:
         return True
@@ -34,6 +36,24 @@ def use_te_checkpoint(config) -> bool:
         and config.cuda_graph_impl == "transformer_engine"
         and getattr(config, "cuda_graph_granularity", "layer") == "chunk"
     )
+
+
+def checkpoint_activations(config, function, distribute_saved_activations, tp_group, *args):
+    """Activation checkpoint of ``function(*args)`` through the backend ``use_te_checkpoint``
+    selects — the same policy as the block-level recompute, for the sites that used
+    ``tensor_parallel.checkpoint`` unconditionally (``core_attn``, the absorbed-MLA core, the GDN /
+    KDA core). Like mcore's checkpoint, TE's saves tensor arguments only and restores the RNG
+    tracker state for the recompute.
+    """
+    if use_te_checkpoint(config):
+        return te_checkpoint(
+            function,
+            distribute_saved_activations,
+            tensor_parallel.random.get_cuda_rng_tracker,
+            tp_group,
+            *args,
+        )
+    return tensor_parallel.checkpoint(function, distribute_saved_activations, *args)
 
 
 def checkpointed_forward(

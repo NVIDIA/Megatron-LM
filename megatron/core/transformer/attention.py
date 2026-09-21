@@ -576,7 +576,12 @@ class Attention(MegatronModule, ABC):
         # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         checkpoint_inputs[5] = attn_mask_type
-        hidden_states = tensor_parallel.checkpoint(custom_forward, False, *checkpoint_inputs)
+        # import here to avoid circular import (recompute imports TransformerLayer)
+        from megatron.core.recompute import checkpoint_activations
+
+        hidden_states = checkpoint_activations(
+            self.config, custom_forward, False, self.pg_collection.tp, *checkpoint_inputs
+        )
 
         return hidden_states
 
