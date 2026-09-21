@@ -55,12 +55,23 @@ def _context(root: Path) -> dict:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-    dirty = bool(
-        subprocess.check_output(
-            ["git", "status", "--porcelain", "--untracked-files=normal"], cwd=root
+    provenance_error = None
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.PIPE
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=normal"],
+                cwd=root,
+                stderr=subprocess.PIPE,
+            )
         )
-    )
+    except (OSError, subprocess.CalledProcessError):
+        revision, dirty = None, True
+        provenance_error = (
+            "Git provenance unavailable; verify checkout ownership and repository access"
+        )
     driver: list[str] | None
     try:
         driver = sorted(
@@ -77,14 +88,21 @@ def _context(root: Path) -> dict:
     return {
         "revision": revision,
         "dirty": dirty,
+        **({"provenance_error": provenance_error} if provenance_error else {}),
         "world_size": int(os.environ.get("WORLD_SIZE", "1")),
         "python": platform.python_version(),
         "versions": versions,
         "cuda": torch.version.cuda,
         "driver": driver,
-        "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+        "gpu": (
+            torch.cuda.get_device_name(int(os.environ.get("LOCAL_RANK", "0")))
+            if torch.cuda.is_available()
+            else None
+        ),
         "capability": (
-            list(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+            list(torch.cuda.get_device_capability(int(os.environ.get("LOCAL_RANK", "0"))))
+            if torch.cuda.is_available()
+            else None
         ),
         "environment": {
             **{key: os.environ.get(key) for key in ENVIRONMENT_KEYS},

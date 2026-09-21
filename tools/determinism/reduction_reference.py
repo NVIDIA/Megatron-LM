@@ -24,6 +24,7 @@ class ReductionReference:
     rounding: str
     accumulation_dtype: torch.dtype = torch.float32
     exact_terms: bool = False
+    term_dtype: torch.dtype = torch.float32
 
     @classmethod
     def from_terms(
@@ -35,6 +36,7 @@ class ReductionReference:
         rounding: str,
         accumulation_dtype: torch.dtype = torch.float32,
         exact_terms: bool = False,
+        term_dtype: torch.dtype = torch.float32,
     ) -> ReductionReference:
         """Summarize independent terms in FP64, preserving the reduction shape."""
         if not values.is_floating_point() or not values.numel() or not rounding:
@@ -51,6 +53,7 @@ class ReductionReference:
             rounding,
             accumulation_dtype,
             exact_terms,
+            term_dtype,
         )
 
     def error_budget(
@@ -58,7 +61,8 @@ class ReductionReference:
     ) -> tuple[torch.Tensor, dict]:
         """Return a conservative component bound, not a proof of kernel accuracy.
 
-        The term budget uses the existing pointwise tolerances. The accumulation
+        The term budget allows one epsilon of the materialized term dtype;
+        output-interface atol/rtol are not multiplied across every term. The accumulation
         budget uses gamma(n-1) for the declared accumulation dtype and FP64,
         without assuming a particular parallel reduction tree. Exact input terms
         exclude pointwise term error, as in a collective over materialized inputs.
@@ -74,6 +78,7 @@ class ReductionReference:
             or self.accumulation_dtype
             not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
             or type(self.exact_terms) is not bool
+            or self.term_dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
             or self.total.dtype != torch.float64
             or self.sum_absolute_terms.dtype != torch.float64
             or self.total.shape != expected.shape
@@ -98,7 +103,9 @@ class ReductionReference:
         # Inflate the FP64 sum-of-magnitudes for its own rounding uncertainty.
         scale = self.sum_absolute_terms / (1 - gamma64)
         term_error = (
-            torch.zeros_like(scale) if self.exact_terms else self.terms * atol + rtol * scale
+            torch.zeros_like(scale)
+            if self.exact_terms
+            else torch.finfo(self.term_dtype).eps * scale
         )
         accumulation = gamma_accumulation * (scale + term_error) + gamma64 * scale
         before_cast = term_error + accumulation
@@ -114,17 +121,18 @@ class ReductionReference:
         )
         return budget, {
             "policy": (
-                "fp32_sum_absolute_terms_and_l2:v1"
+                "fp32_sum_term_epsilon_and_l2:v2"
                 if self.accumulation_dtype == torch.float32 and not self.exact_terms
-                else "declared_dtype_sum_absolute_terms_and_l2:v1"
+                else "declared_dtype_sum_term_epsilon_and_l2:v2"
             ),
             "term_count": self.terms,
             "accumulation_dtype": str(self.accumulation_dtype),
             "exact_terms": self.exact_terms,
             "reference_dtype": "torch.float64",
             "rounding": self.rounding,
-            "term_rtol": rtol,
-            "term_atol": atol,
+            "term_dtype": str(self.term_dtype),
+            "term_rtol": 0 if self.exact_terms else torch.finfo(self.term_dtype).eps,
+            "term_atol": 0,
             "gamma_fp32": gamma32,
             "gamma_accumulation": gamma_accumulation,
             "gamma_fp64": gamma64,

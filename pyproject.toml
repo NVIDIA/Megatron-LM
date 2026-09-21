@@ -298,7 +298,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-# Keep all latest-revision CI shards combinable with determinism branch tracing.
+# CI combines every unit-job database; statement and branch data cannot be mixed.
 branch = true
 concurrency = ["thread", "multiprocessing"]
 omit = [

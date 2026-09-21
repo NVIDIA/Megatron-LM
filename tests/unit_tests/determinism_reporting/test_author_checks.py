@@ -112,7 +112,7 @@ def test_missing_or_incompatible_reference_tensors_fail(problem):
     else:
         pair[0].clear()
         expected[0].clear()
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         reference_check(pair, expected, rtol=0, atol=0)
 
 
@@ -375,7 +375,9 @@ def test_incomplete_or_mismatched_checks_cannot_pass_the_author_gate(problem):
         revision = "b" * 40
     else:
         case["observations"][0]["status"] = NONDETERMINISTIC
-    assert aggregate(rows, revision)["author_requirements"][0]["status"] == UNVERIFIED
+    assert aggregate(rows, revision)["author_requirements"][0]["status"] == (
+        FAILED if problem == "extra" else UNVERIFIED
+    )
 
 
 def test_matching_failed_reference_survives_incomplete_execution_without_becoming_nondeterminism():

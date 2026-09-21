@@ -318,3 +318,42 @@ def test_failed_teardown(teardown_failure):
         "test_no_replay": UNVERIFIED,
         "test_failed_teardown": UNVERIFIED,
     }
+
+
+def test_mixed_passing_and_xfailed_mismatch_cannot_pass_strict_gate(tmp_path):
+    data = shard()
+    bad = shard(status=NONDETERMINISTIC)["cases"]["test_op[bf16]"]
+    data["cases"]["test_expected_failure"] = bad
+    (tmp_path / "rank-0.json").write_text(json.dumps(data))
+    assert (
+        main(
+            [
+                str(tmp_path),
+                "--output",
+                str(tmp_path / "report.json"),
+                "--require-verified",
+                "--forbid-nondeterministic",
+            ]
+        )
+        == 1
+    )
+
+
+def test_git_provenance_failure_retains_unverified_evidence(monkeypatch, tmp_path):
+    import subprocess
+
+    from tools.determinism import pytest_plugin
+
+    def unavailable(*args, **kwargs):
+        raise subprocess.CalledProcessError(128, "git")
+
+    monkeypatch.setattr(subprocess, "check_output", unavailable)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    context = pytest_plugin._context(tmp_path)
+    assert context["dirty"] is True
+    assert context["revision"] is None
+    data = shard()
+    data["context"] = context
+    report = aggregate([data])
+    assert report["counts"][DETERMINISTIC] == 0
+    assert "Git provenance unavailable" in str(report["cases"][0]["reasons"])

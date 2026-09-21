@@ -113,7 +113,7 @@ def check_statuses(
         ]
         if not fresh:
             status = UNVERIFIED
-        elif any(row["status"] == FAILED for group in matches for row in group):
+        elif any(row["status"] == FAILED for row in rows):
             status = FAILED
         elif (
             complete

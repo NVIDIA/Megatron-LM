@@ -60,6 +60,7 @@ def activation_reference(
             dim=0,
             keepdim=False,
             rounding="per_token_gradient_to_input_dtype_before_bias_sum",
+            term_dtype=inputs[0].dtype,
         )
     else:
         name = "in[2]" if case == "weighted_swiglu" else "in[1]"

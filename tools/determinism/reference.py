@@ -29,7 +29,7 @@ def _error_metrics(
     allowed_error: torch.Tensor | None = None,
 ) -> dict:
     if actual.shape != reference.shape or actual.dtype != reference.dtype:
-        raise AssertionError("Reference and actual tensors have different shapes or dtypes")
+        raise ValueError("Reference and actual tensors have different shapes or dtypes")
     if not actual.numel() or not actual.is_floating_point():
         raise ValueError("Reference checks require nonempty real floating-point tensors")
     values, expected = actual.detach().reshape(-1).double(), reference.detach().reshape(-1).double()
@@ -177,12 +177,12 @@ def assert_reference_close(
         if reductions.keys() - keys:
             raise ValueError("Reduction contracts contain unknown tensor keys")
         if not actual[0] or (signature.get("phase") == "forward_backward" and not actual[1]):
-            raise AssertionError(
+            raise ValueError(
                 "Reference validation requires outputs and every backward input gradient"
             )
         for category, observed, expected in zip(("output", "gradient"), actual, reference):
             if observed.keys() != expected.keys():
-                raise AssertionError(
+                raise ValueError(
                     f"Different {category} tensor keys: {sorted(observed)} vs {sorted(expected)}"
                 )
             for name, tensor in observed.items():

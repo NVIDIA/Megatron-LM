@@ -22,6 +22,7 @@ import contextlib
 import functools
 import inspect
 import json
+import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -92,6 +93,10 @@ def _recorded_replay(replay):
             options["inputs"], backward=options["backward"], configuration=options["configuration"]
         )
         protocol = {key: options[key] for key in ("replays", "contention", "restore_rng")}
+        protocol["contention_requested"] = protocol["contention"]
+        protocol["contention"] = bool(
+            protocol["contention"] and os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "8") != "1"
+        )
         if options.get("defer_comparison", False):
             protocol["comparison_timing"] = "after_all_replays"
         protocol.update(

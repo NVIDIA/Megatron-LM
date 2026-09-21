@@ -191,6 +191,8 @@ def aggregate(shards: list[dict], expected_revision: str | None = None) -> dict:
             # about the requested clean revision.
             status = UNVERIFIED
             reasons.append("Source revision is stale or has uncommitted changes")
+            if context.get("provenance_error"):
+                reasons.append(context["provenance_error"])
         elif not complete and status != NONDETERMINISTIC:
             reasons.append("Missing replay, failed test phase, incomplete session, or missing rank")
         cases.append(
@@ -352,6 +354,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--revision", help="Revision whose evidence is requested")
     parser.add_argument(
+        "--forbid-nondeterministic",
+        action="store_true",
+        help="Fail when any fresh case records a replay mismatch, including expected failures",
+    )
+    parser.add_argument(
         "--require-verified",
         action="store_true",
         help="Fail unless at least one case has passing comparisons on every rank",
@@ -386,6 +393,9 @@ def main(argv: list[str] | None = None) -> int:
     args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     args.output.with_suffix(".md").write_text(markdown_report(report))
     print(markdown_report(report))
+    if args.forbid_nondeterministic and report["counts"][NONDETERMINISTIC]:
+        print("Fresh replay evidence contains verified nondeterministic cases")
+        return 1
     if args.require_author_checks:
         required = report.get("author_requirements", [])
         if not required or any(row["status"] != PASSED for row in required):

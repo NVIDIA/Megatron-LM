@@ -353,3 +353,24 @@ CPU contract tests can run without importing the GPU test conftest:
 PYTHONPATH=. python -m pytest --confcutdir=tests/unit_tests/determinism_reporting \
   tests/unit_tests/determinism_reporting/test_coverage_evidence.py
 ```
+
+### CI attempt isolation and evidence limits
+
+Each CI attempt creates a fresh shard directory and run ID. The dedicated
+coverage session runs once with production and experimental cases together;
+flaky retries preserve earlier attempts but never aggregate their shards.
+Generated `job.sh`, `assets_dir`, and coverage data are ignored by Git. Tracked
+source changes and other untracked files still make evidence ineligible. Git
+provenance failures produce U with a reason. Dedicated recipes also reject any N,
+including an expected-failure mismatch alongside passing cases.
+
+Reports record requested and effective contention separately. The H100 policy
+`CUDA_DEVICE_MAX_CONNECTIONS=1` serializes side-stream traffic; those rows prove
+replay under that policy, not concurrent-stream stress. Global branch coverage
+is retained because CI combines all unit shards into one coverage dataset.
+
+Independent reduction budgets use the materialized term precision and FP32
+accumulation error, without multiplying output `atol` across every term. The L2
+guard and corruption controls remain required. GPU calibration of this tighter
+policy is separate from its CPU contract tests. NVFP4 remains a known dependency
+blocker until the approved Transformer Engine lifetime fix is adopted.

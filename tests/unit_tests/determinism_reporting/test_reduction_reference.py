@@ -210,3 +210,30 @@ def test_fp64_reference_matches_hand_computed_values_and_all_input_gradients(cas
     )
     assert len(expected[1]) == sum(value is not None for value in inputs)
     assert all(value.dtype == torch.float64 for group in mathematical for value in group.values())
+
+
+def test_bf16_interface_tolerance_is_not_charged_to_every_fp32_term():
+    generator = torch.Generator().manual_seed(91)
+    terms = torch.randn(64, 8192, generator=generator).double()
+    reference = ReductionReference.from_terms(
+        terms, dim=1, keepdim=True, rounding="fp32_fused_terms_before_weight_sum"
+    )
+    expected = reference.total.bfloat16()
+    budget, policy = reference.error_budget(expected, rtol=2e-2, atol=1e-3)
+    assert policy["term_atol"] == 0
+    assert policy["term_rtol"] == torch.finfo(torch.float32).eps
+    # A complete dropped token row is a realistic fault, unrelated to the budget.
+    index = int(expected.abs().argmax())
+    actual = expected.clone()
+    actual[index] = 0
+    assert budget.max() < expected.abs().max()
+    with pytest.raises(AssertionError, match="differs"):
+        assert_reference_close(
+            ({"out": torch.ones(1)}, {"w": actual}),
+            ({"out": torch.ones(1)}, {"w": expected}),
+            signature=SIGNATURE,
+            reference_id="dropped_token_control",
+            rtol=2e-2,
+            atol=1e-3,
+            reductions={"gradient:w": reference},
+        )

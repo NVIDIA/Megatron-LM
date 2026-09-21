@@ -339,6 +339,11 @@ class TestTEWrappers:
             return module(q, k, v, None, AttnMaskType.causal)
 
         try:
+            # Resolve the backend before attaching its name to replay evidence.
+            with torch.no_grad():
+                fn(q, k, v)
+            if not te_dpa._attention_backends[f"use_{backend}_attention"]:
+                pytest.skip(f"TE did not select the requested {backend} attention backend")
             assert_replays_bit_exact(
                 fn,
                 (q, k, v),
@@ -352,8 +357,6 @@ class TestTEWrappers:
                     "TP": 1,
                 },
             )
-            if not te_dpa._attention_backends[f"use_{backend}_attention"]:
-                pytest.skip(f"TE did not select the requested {backend} attention backend")
         except (RuntimeError, AssertionError) as error:
             if "backend" in str(error).lower() and "avail" in str(error).lower():
                 pytest.skip(f"TE has no {backend} attention backend here: {error}")
