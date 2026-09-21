@@ -44,6 +44,7 @@ SAFE_GLOBALS = [
     RerunMode,
     RerunState,
     BytesIO,
+    # Allow frozenset values in legacy checkpoint metadata when loading with weights_only=True.
     frozenset,
     Signals,
     torch._C.Generator,  # Needed for torch ckpt format loading after weights_only default change
