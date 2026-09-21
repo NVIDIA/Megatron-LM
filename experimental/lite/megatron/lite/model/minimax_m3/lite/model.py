@@ -68,7 +68,7 @@ def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
 
 
 def m3_activation(y: torch.Tensor, config: MiniMaxM3Config) -> torch.Tensor:
-    """Clamped SwiGLU ``(up + 1) * gate * sigmoid(1.702 gate)`` (HF ``swigluoai``), fp32 inside."""
+    """Clamped SwiGLU ``(up + 1) * gate * sigmoid(1.702 gate)`` (HF ``swigluoai``)."""
     return swiglu_with_probs(y, None, config.swiglu_limit, config.swiglu_alpha, config.swiglu_up_offset)
 
 

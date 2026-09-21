@@ -55,11 +55,15 @@ def swiglu_with_probs(
             return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
         return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
     if swiglu_alpha == _QUICK_GELU_ALPHA:
+        y2 = y.reshape(-1, y.shape[-1])
         if probs is None:
-            probs = torch.ones(*y.shape[:-1], 1, dtype=y.dtype, device=y.device)
-        return weighted_bias_quick_geglu_impl(
-            y, None, probs, linear_offset=swiglu_up_offset, clamp_value=clamp_value
+            weights = torch.ones(y2.shape[0], 1, dtype=y.dtype, device=y.device)
+        else:
+            weights = probs.reshape(-1, 1)
+        out = weighted_bias_quick_geglu_impl(
+            y2, None, weights, linear_offset=swiglu_up_offset, clamp_value=clamp_value
         )
+        return out.view(*y.shape[:-1], -1)
     gate, up = y.chunk(2, dim=-1)
     if clamp_value is not None:
         gate = gate.clamp(max=clamp_value)

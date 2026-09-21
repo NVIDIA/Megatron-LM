@@ -183,6 +183,9 @@ def test_quick_geglu_matches_hf_swigluoai_reference() -> None:
 
     actual = swiglu_with_probs(y, None, 7.0, 1.702, 1.0)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    # The dense MLP passes [B, S, 2H]; the fused kernel flattens, so the wrapper must restore the shape.
+    actual_3d = swiglu_with_probs(y.view(2, TOKENS // 2, FFN * 2), None, 7.0, 1.702, 1.0)
+    assert torch.equal(actual_3d.view(TOKENS, FFN), actual)
 
 
 @pytest.mark.gpus(1)
