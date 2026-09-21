@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 from torch import Tensor
@@ -16,6 +16,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid import HybridLayerConfigListEntry
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -105,6 +106,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
         vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
+        hybrid_layer_config_list (Sequence[HybridLayerConfigListEntry], optional): First-class
+            decoder, pipeline-split, and MTP configuration sequence. Mutually exclusive with
+            ``hybrid_layer_pattern`` and its deprecated alternatives. Defaults to None.
     """
 
     def __init__(
@@ -131,7 +135,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        hybrid_layer_config_list: Optional[Sequence[HybridLayerConfigListEntry]] = None,
     ) -> None:
+        # Snapshot the container immediately. If the root config is also used as a layer entry,
+        # detach it before applying model-level normalization so that entry remains caller-owned.
+        hybrid_layer_config_list_snapshot = (
+            tuple(hybrid_layer_config_list) if hybrid_layer_config_list is not None else None
+        )
+        if hybrid_layer_config_list_snapshot is not None and any(
+            entry is config for entry in hybrid_layer_config_list_snapshot
+        ):
+            config = type(config).from_config(config)
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
@@ -149,6 +163,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
+        self.hybrid_layer_config_list = hybrid_layer_config_list_snapshot
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
@@ -158,6 +173,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+
+        has_deprecated_ratio_input = (
+            hybrid_attention_ratio is not None or hybrid_mlp_ratio is not None
+        )
+        has_deprecated_ratio = (
+            hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0
+        ) or (hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0)
+        if self.hybrid_layer_config_list is not None and (
+            hybrid_layer_pattern is not None
+            or hybrid_override_pattern is not None
+            or has_deprecated_ratio_input
+        ):
+            raise ValueError(
+                "hybrid_layer_config_list is mutually exclusive with hybrid_layer_pattern, "
+                "hybrid_override_pattern, hybrid_attention_ratio, and hybrid_mlp_ratio"
+            )
 
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
@@ -174,9 +205,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
                     "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
                 )
-        if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
-            hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
-        ):
+        if has_deprecated_ratio:
             if hybrid_layer_pattern is not None:
                 raise ValueError(
                     "hybrid_layer_pattern cannot be used together with "
@@ -198,35 +227,121 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config.num_layers, attn_ratio, mlp_ratio
                 )
 
-        # Parse unified pattern to extract main and MTP components.
+        # Parse the selected first-class representation. The config-list path deliberately never
+        # projects configs to symbols or synthesizes a pattern string.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            parse_hybrid_layer_config_list,
             parse_hybrid_pattern,
             select_pipeline_segment,
+            select_pipeline_segment_from_config_list,
         )
 
-        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
-        self.mtp_pattern = parsed.mtp_pattern
-        self.mtp_num_depths = parsed.mtp_num_depths
-        if self.mtp_num_depths > 0:
-            if self.config.mtp_num_layers is None:
-                self.config.mtp_num_layers = self.mtp_num_depths
-            elif self.config.mtp_num_layers != self.mtp_num_depths:
+        self.mtp_pattern = None
+        self.mtp_layer_config_list = None
+        self._decoder_uses_mla = self.config.multi_latent_attention
+        self._mtp_uses_mla = self.config.multi_latent_attention
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+        mtp_overlap_configs = (self.config,)
+        if self.hybrid_layer_config_list is not None:
+            if self.config.pipeline_model_parallel_layout is not None:
                 raise ValueError(
-                    f"hybrid_layer_pattern defines {self.mtp_num_depths} MTP depths, "
-                    f"but mtp_num_layers is {self.config.mtp_num_layers}"
+                    "pipeline_model_parallel_layout cannot be used with "
+                    "hybrid_layer_config_list; use PipelineSplit markers instead"
                 )
-        if (
-            self.config.mtp_num_layers
-            and self.mtp_num_depths == 0
-            and self.config.mtp_hybrid_override_pattern is None
-        ):
-            raise ValueError(
-                "HybridModel has mtp_num_layers set but no MTP template. "
-                "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM')."
+            if (
+                self.config.account_for_embedding_in_pipeline_split
+                or self.config.account_for_loss_in_pipeline_split
+            ):
+                raise ValueError(
+                    "account_for_embedding_in_pipeline_split and "
+                    "account_for_loss_in_pipeline_split cannot be used with "
+                    "hybrid_layer_config_list"
+                )
+
+            parsed_config_list = parse_hybrid_layer_config_list(
+                self.hybrid_layer_config_list,
+                expected_num_layers=self.config.num_layers,
+                expected_mtp_num_layers=self.config.mtp_num_layers,
+            )
+            self.mtp_layer_config_list = parsed_config_list.mtp_layer_config_list
+            self.mtp_num_depths = parsed_config_list.mtp_num_depths
+            mla_config_types = {
+                layer_utils.Symbols.LAYER_CONFIG_MAP[symbol]
+                for symbol in layer_utils.Symbols.MLA_ATTENTION
+            }
+            self._decoder_uses_mla = any(
+                type(entry) in mla_config_types
+                for entry in parsed_config_list.main_layer_config_list
+            )
+            self._mtp_uses_mla = any(
+                type(entry) in mla_config_types for entry in (self.mtp_layer_config_list or ())
+            )
+            from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+            self.config._hybrid_has_moe_layers = any(
+                type(entry) is MoELayerConfig
+                for entry in (
+                    *parsed_config_list.main_layer_config_list,
+                    *(self.mtp_layer_config_list or ()),
+                )
+            )
+            if self.config.mtp_num_layers is None and self.mtp_num_depths > 0:
+                self.config.mtp_num_layers = self.mtp_num_depths
+            mtp_overlap_configs = (
+                self.config,
+                *parsed_config_list.main_layer_config_list,
+                *(self.mtp_layer_config_list or ()),
+            )
+            self.config.is_hybrid_model = True
+
+            layer_config_list, layer_offset = select_pipeline_segment_from_config_list(
+                parsed_config_list.main_layer_config_list,
+                self.pg_collection.pp,
+                vp_stage,
+                virtual_pipeline_model_parallel_size=(
+                    self.config.virtual_pipeline_model_parallel_size
+                ),
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+                **logging_pg_kwargs,
+            )
+        else:
+            parsed_pattern = parse_hybrid_pattern(self.hybrid_layer_pattern)
+            self.mtp_pattern = parsed_pattern.mtp_pattern
+            self.mtp_num_depths = parsed_pattern.mtp_num_depths
+            if self.mtp_num_depths > 0:
+                if self.config.mtp_num_layers is None:
+                    self.config.mtp_num_layers = self.mtp_num_depths
+                elif self.config.mtp_num_layers != self.mtp_num_depths:
+                    raise ValueError(
+                        f"hybrid_layer_pattern defines {self.mtp_num_depths} MTP depths, "
+                        f"but mtp_num_layers is {self.config.mtp_num_layers}"
+                    )
+            if (
+                self.config.mtp_num_layers
+                and self.mtp_num_depths == 0
+                and self.config.mtp_hybrid_override_pattern is None
+            ):
+                raise ValueError(
+                    "HybridModel has mtp_num_layers set but no MTP template. "
+                    "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM') "
+                    "or hybrid_layer_config_list with MTPSplit markers."
+                )
+            layer_config_list, layer_offset = select_pipeline_segment(
+                parsed_pattern.main_pattern or '',
+                self.config,
+                self.pg_collection.pp,
+                vp_stage,
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+                **logging_pg_kwargs,
             )
 
         # Validate the full architecture, including MTP heads on other pipeline stages.
-        if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
+        if self.mtp_num_depths > 0 and any(
+            getattr(layer_config, "overlap_moe_expert_parallel_comm", False)
+            for layer_config in mtp_overlap_configs
+        ):
             raise ValueError(
                 "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
                 "overlap scheduler does not expand the nested HybridStack."
@@ -247,9 +362,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "mtp_hsm=True requires at least two MTP heads in the HybridModel architecture."
             )
 
-        # Determine if MTP is needed (based on pattern parsing)
+        if self.hybrid_layer_config_list is not None:
+            # Synchronize model-global depths, including inferred MTP depth, on physical clones
+            # only. Caller-owned configs can be reused in models with different depths.
+            for layer_config in layer_config_list:
+                layer_config.num_layers = self.config.num_layers
+                layer_config.mtp_num_layers = self.config.mtp_num_layers
+                layer_config.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+
+        # Determine if MTP is needed from either representation.
         self.mtp_process = (
-            self.mtp_pattern is not None
+            (self.mtp_pattern is not None or self.mtp_layer_config_list is not None)
             and self.mtp_num_depths > 0
             # The following forces MTP to be on the final pipeline stage. It might be more optimal
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
@@ -264,22 +387,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 vp_size=self.config.virtual_pipeline_model_parallel_size,
             )
         )
+        list_section_needs_standard_rope = not self._decoder_uses_mla or (
+            self.mtp_process and not self._mtp_uses_mla
+        )
 
         # Validate TP communication overlap after determining whether this rank builds MTP,
         # before constructing the decoder or MTP modules.
         layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
-
-        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
-
-        layer_config_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.config,
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-            **logging_pg_kwargs,
-        )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -298,7 +412,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
         # not build standard RoPE here when using MLA.
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if self.position_embedding_type == 'rope' and (
+            list_section_needs_standard_rope
+            if self.hybrid_layer_config_list is not None
+            else not self.config.multi_latent_attention
+        ):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -307,7 +425,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and (
+            self.hybrid_layer_config_list is None or list_section_needs_standard_rope
+        ):
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
@@ -354,6 +474,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 pg_collection=self.pg_collection,
                 vp_stage=self.vp_stage,
                 mtp_layer_pattern=self.mtp_pattern,
+                mtp_layer_config_list=self.mtp_layer_config_list,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
@@ -547,7 +668,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        if self.position_embedding_type == 'rope' and hasattr(self, 'rotary_pos_emb'):
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
@@ -555,7 +676,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )
-        elif self.position_embedding_type == 'yarn':
+        elif self.position_embedding_type == 'yarn' and hasattr(self, 'rotary_pos_emb'):
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
@@ -586,6 +707,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
+        decoder_rotary_pos_emb = (
+            None
+            if self.hybrid_layer_config_list is not None and self._decoder_uses_mla
+            else rotary_pos_emb
+        )
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -597,7 +724,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hidden_states=decoder_input,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_emb=decoder_rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
@@ -653,7 +780,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mhc_multistream=mtp_inputs.mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_emb=(
+                    None
+                    if self.hybrid_layer_config_list is not None and self._mtp_uses_mla
+                    else rotary_pos_emb
+                ),
                 packed_seq_params=mtp_inputs.packed_seq_params,
                 embedding=self.embedding,
                 decoder_input=mtp_inputs.decoder_input,
