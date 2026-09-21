@@ -15,8 +15,13 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.checkpointing import (
+    _build_sharded_state_dict_metadata,
+    load_checkpoint,
+    save_checkpoint,
+)
 from megatron.training.training import preprocess_common_state_dict
+from tests.unit_tests.determinism.kernels.harness import bytes_equal
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -69,9 +74,11 @@ class HybridOptimizerModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize('precision_aware,mixed', [(False, False), (True, False), (True, True)])
-@pytest.mark.parametrize('fully_reshardable', [False, True])
+@pytest.mark.parametrize(
+    'checkpoint_format', ['dp_reshardable', 'fully_reshardable', 'dp_zero_gather_scatter', 'torch']
+)
 def test_hybrid_checkpoint_continuation(
-    tmp_path_dist_ckpt, precision_aware: bool, mixed: bool, fully_reshardable: bool
+    tmp_path_dist_ckpt, precision_aware: bool, mixed: bool, checkpoint_format: str
 ) -> None:
     """Restore step two and compare all owner states after steps three through five."""
     if Utils.world_size < 2 or Utils.world_size % 2:
@@ -126,11 +133,7 @@ def test_hybrid_checkpoint_continuation(
 
     def assert_equal(left, right):
         if isinstance(left, torch.Tensor):
-            assert left.dtype == right.dtype and left.shape == right.shape
-            assert torch.equal(
-                left.detach().contiguous().reshape(-1).view(torch.uint8),
-                right.detach().contiguous().reshape(-1).view(torch.uint8),
-            )
+            assert bytes_equal(left, right)
         elif isinstance(left, dict):
             assert left.keys() == right.keys()
             for key in left:
@@ -148,12 +151,27 @@ def test_hybrid_checkpoint_continuation(
             init_basic_mock_args(args, tp, 1, bf16=True)
             init_checkpointing_mock_args(args, directory)
             args.save_tokenizer_assets = False
-            args.dist_ckpt_optim_fully_reshardable = fully_reshardable
+            args.dist_ckpt_optim_fully_reshardable = checkpoint_format == 'fully_reshardable'
+            if checkpoint_format == 'torch':
+                args.ckpt_format = 'torch'
+                args.use_dist_ckpt = False
             args.optimizer_cpu_offload = True
             args.optimizer_offload_fraction = 0.5
             args.overlap_cpu_optimizer_d2h_h2d = True
             args.use_precision_aware_optimizer = precision_aware
-            with patch('megatron.training.checkpointing.get_args', return_value=args):
+
+            def metadata(*metadata_args, **kwargs):
+                result = _build_sharded_state_dict_metadata(*metadata_args, **kwargs)
+                if checkpoint_format == 'dp_zero_gather_scatter':
+                    result['distrib_optim_sharding_type'] = checkpoint_format
+                return result
+
+            with (
+                patch('megatron.training.checkpointing.get_args', return_value=args),
+                patch(
+                    'megatron.training.checkpointing._build_sharded_state_dict_metadata', metadata
+                ),
+            ):
                 model, optimizer = construct()
                 for step in (1, 2):
                     train_step(model, optimizer, step)

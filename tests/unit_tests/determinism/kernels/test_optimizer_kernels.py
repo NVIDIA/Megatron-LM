@@ -132,14 +132,15 @@ def test_fused_adam_step_replays():
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
 
 
-def test_hybrid_adam_step_replays() -> None:
+@pytest.mark.parametrize("gradient_dtype", [torch.float32, torch.bfloat16])
+def test_hybrid_adam_step_replays(gradient_dtype: torch.dtype) -> None:
     """Replay both owners, mixed dtypes and a skipped update with transfer overlap."""
     seeded()
     initial = [
         torch.randn(65536, device="cuda", dtype=dtype)
         for dtype in (torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.float32)
     ]
-    gradients = [torch.randn_like(value, dtype=torch.float32) for value in initial]
+    gradients = [torch.randn_like(value, dtype=gradient_dtype) for value in initial]
 
     def run_steps():
         params = [torch.nn.Parameter(value.clone()) for value in initial]

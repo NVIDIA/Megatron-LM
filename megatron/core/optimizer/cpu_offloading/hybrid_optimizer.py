@@ -80,7 +80,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
 
-    def _set_sub_optimizer_grads(self):
+    def _set_gpu_optimizer_grads(self):
         if self.param_update_in_fp32:
             for param, inner_param in self.param_to_inner_param.items():
                 if param in self.gpu_params_map_cpu_copy:
@@ -92,7 +92,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 if inner_param is not param:
                     inner_param.requires_grad = grad is not None
 
-        # Sync the grads from GPU to CPU.
+    def _set_sub_optimizer_grads(self):
+        # Sync only CPU-owned grads on the D2H stream. GPU casts must remain
+        # on the GPU optimizer's stream, including their allocator lifetime.
         for optimizer in self.cpu_optimizers:
             for param in _param_generator(optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
@@ -157,6 +159,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         # the lr, wd, etc. are up-to-date.
         self._sync_hdo_param_groups_to_sub_optimizers()
 
+        self._set_gpu_optimizer_grads()
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
             self._set_sub_optimizer_grads()

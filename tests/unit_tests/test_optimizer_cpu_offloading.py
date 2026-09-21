@@ -22,6 +22,7 @@ from megatron.core.transformer.module import (
     convert_module_to_dtype_except_fp32_marked,
     mark_keep_in_fp32,
 )
+from tests.unit_tests.determinism.kernels.harness import bytes_equal
 
 
 class Fp32MarkedToyNet(nn.Module):
@@ -78,8 +79,11 @@ class BigNet(nn.Module):
 
 @pytest.mark.parametrize('overlap', [False, True])
 @pytest.mark.parametrize('gpu_dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize('gradient_dtype', [torch.float32, torch.bfloat16])
 @pytest.mark.skipif(GPUAdam is Adam, reason='Requires TransformerEngine FusedAdam')
-def test_hybrid_decoupled_gradient_and_missing_grad(overlap: bool, gpu_dtype: torch.dtype) -> None:
+def test_hybrid_decoupled_gradient_and_missing_grad(
+    overlap: bool, gpu_dtype: torch.dtype, gradient_dtype: torch.dtype
+) -> None:
     """Route native FP32 gradients and skip absent gradients on both devices."""
     cpu_owned = nn.Parameter(torch.ones(64, device='cuda', dtype=torch.bfloat16))
     gpu_owned = nn.Parameter(torch.ones(64, device='cuda', dtype=gpu_dtype))
@@ -102,10 +106,16 @@ def test_hybrid_decoupled_gradient_and_missing_grad(overlap: bool, gpu_dtype: to
 
     for value in (1.0, None, 0.5):
         before = [parameter.detach().clone() for parameter in (cpu_owned, gpu_owned)]
-        gradient = None if value is None else torch.full_like(reference, value)
+        gradient = (
+            None if value is None else torch.full_like(reference, value, dtype=gradient_dtype)
+        )
         cpu_owned.decoupled_grad = gradient
         gpu_owned.decoupled_grad = gradient
-        reference.grad = None if gradient is None else gradient.clone()
+        reference.grad = None if gradient is None else gradient.float().clone()
+        if overlap and gradient is not None:
+            # A GPU update must not depend on a cast queued behind delayed D2H work.
+            with torch.cuda.stream(optimizer._d2h_stream):
+                torch.cuda._sleep(10_000_000)
         optimizer.step()
         reference_optimizer.step()
         torch.cuda.synchronize()
@@ -175,9 +185,7 @@ def test_hybrid_state_dict_preserves_gpu_steps(dtype: torch.dtype, overlap: bool
             assert left_state.keys() == right_state.keys()
             for key in left_state:
                 a, b = left_state[key], right_state[key]
-                assert torch.equal(
-                    a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
-                ), f"Native resume changed {key} bytes"
+                assert bytes_equal(a, b), f"Native resume changed {key} bytes"
 
 
 def setup_seed(seed):
