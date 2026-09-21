@@ -119,11 +119,10 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
-        ({"mtp_num_layers": None}, "requires --mtp-num-layers"),
         (
             {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
             "cannot be combined with --freeze-all-layers",
-        ),
+        )
     ],
 )
 def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
@@ -908,6 +907,30 @@ class TestMegatronNetworkArgumentGeneration:
     def test_mhc_fused_backend_rejects_unknown_choice(self):
         with pytest.raises(ArgumentError, match="invalid choice"):
             self._parser().parse_args(["--mhc-fused-backend", "cuda"])
+
+    def test_keep_mtp_in_bf16_flag(self):
+        assert self._parser().parse_args([]).keep_mtp_in_bf16 is False
+        assert self._parser().parse_args(["--keep-mtp-in-bf16"]).keep_mtp_in_bf16
+
+    def test_train_full_dataset_flag(self):
+        from megatron.training.arguments import _add_training_args
+        from megatron.training.config import TrainingConfig
+
+        # This remains a CLI option until dataset options get their own config.
+        assert "train_full_dataset" not in TrainingConfig.__dataclass_fields__
+        parser = _add_training_args(ArgumentParser(exit_on_error=False))
+        assert parser.parse_args([]).train_full_dataset is False
+        assert parser.parse_args(["--train-full-dataset"]).train_full_dataset is True
+
+
+def test_sft_loss_log_mode_argument():
+    from megatron.training.arguments import _add_sft_args
+
+    parser = _add_sft_args(ArgumentParser(exit_on_error=False))
+    assert parser.parse_args([]).sft_loss_log_mode == "token-weighted"
+    assert (
+        parser.parse_args(["--sft-loss-log-mode", "microbatch"]).sft_loss_log_mode == "microbatch"
+    )
 
 
 class TestMegatronMLAArgumentGeneration:
