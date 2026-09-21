@@ -701,6 +701,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 device=device,
                 use_symmetric_memory=ddp_config.nccl_ub,
                 caller_managed_grad_sync=True,
+                overlap_dp_outer_communication=ddp_config.overlap_dp_outer_communication,
             )
         else:
             if not active_context.caller_managed_grad_sync:
