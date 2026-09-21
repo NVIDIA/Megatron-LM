@@ -1,15 +1,28 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+import dataclasses
 from typing import cast
 
 import pytest
 import torch
 
+import megatron.core.transformer.moe.router as router_mod
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_observation import capture_tensor_observations
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_utils import (
+    get_updated_expert_bias,
+    router_gating_linear,
+    topk_routing_with_score_function,
+)
 from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.moe.router_diagnostics import (
+    ROUTER_DIAGNOSTIC_CHANNEL_COUNT,
+    RouterDiagnosticChannel,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -24,6 +37,14 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+class _ProcessGroup:
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
 
 
 class TestTop2Router:
@@ -63,6 +84,21 @@ class TestTop2Router:
         assert num_weights == 12 * 4, num_weights
 
     @pytest.mark.internal
+    def test_skip_muon(self):
+        assert getattr(self.router.weight, 'use_muon', True)
+
+        self.transformer_config.moe_router_skip_muon = True
+        self.transformer_config.add_bias_linear = True
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        router = cast(Router, MoELayer(self.transformer_config, submodules).router)
+
+        assert getattr(router.weight, 'use_muon', True) is False
+        assert router.bias is not None
+        assert getattr(router.bias, 'use_muon', True) is False
+
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
@@ -75,6 +111,133 @@ class TestTop2Router:
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda().bfloat16()
             scores, indices = self.router(hidden_states)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("aux_loss_fusion", [False, True])
+    def test_router_forward_observes_compact_diagnostics_when_aux_loss_is_disabled(
+        self, monkeypatch, aux_loss_fusion
+    ):
+        self.router = self.router.cuda()
+        # A complete sequence may still be marked sequence-parallel when TP has only one rank.
+        # The compact diagnostics have batch as dimension zero and therefore remain replicated.
+        self.router.config.sequence_parallel = True
+        self.router.config.moe_router_fusion = False
+        self.router.config.moe_router_aux_loss_fusion = aux_loss_fusion
+        self.router.tp_group = _ProcessGroup(1)
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+        observed = []
+        score_grad_modes = []
+        compute_scores = router_mod.compute_routing_scores_for_aux_loss
+
+        def record_score_grad_mode(*args, **kwargs):
+            score_grad_modes.append(torch.is_grad_enabled())
+            assert kwargs["fused"] is aux_loss_fusion
+            # Check flag selection independently of whether TE's fused kernel is installed.
+            kwargs["fused"] = False
+            return compute_scores(*args, **kwargs)
+
+        monkeypatch.setattr(
+            router_mod, "compute_routing_scores_for_aux_loss", record_score_grad_mode
+        )
+
+        with capture_tensor_observations(
+            lambda *args: observed.append(args), frozenset({"router_diagnostics"})
+        ):
+            self.router(hidden_states)
+
+        assert len(observed) == 1
+        assert score_grad_modes == [False]
+        owner, name, source_kind, diagnostics, tp_shard_dim, sequence_dim, batch_dim = observed[0]
+        assert owner is self.router
+        assert name == source_kind == "router_diagnostics"
+        assert tp_shard_dim is None
+        assert sequence_dim is None
+        assert batch_dim == 0
+        assert diagnostics.shape == (2, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, 4)
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.VALID_TOKEN_COUNT, 0],
+            torch.full((2,), 32.0, device="cuda"),
+        )
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.AUX_ACTUAL_OVERLAP, 0],
+            torch.ones(2, device="cuda"),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        ("sequence_parallel", "tp_size", "cp_size", "unsupported_axis"),
+        ((True, 2, 1, "tensor"), (False, 1, 2, "context")),
+    )
+    def test_router_forward_rejects_diagnostics_for_partitioned_sequences(
+        self, sequence_parallel, tp_size, cp_size, unsupported_axis
+    ):
+        self.router = self.router.cuda()
+        self.router.config.sequence_parallel = sequence_parallel
+        self.router.tp_group = _ProcessGroup(tp_size)
+        self.router.cp_group = _ProcessGroup(cp_size)
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+
+        with capture_tensor_observations(lambda *args: None, frozenset({"router_diagnostics"})):
+            with pytest.raises(
+                NotImplementedError,
+                match=rf"complete local sequences.*{unsupported_axis} parallel ranks",
+            ):
+                self.router(hidden_states)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("grad_enabled", [False, True])
+    def test_router_diagnostics_report_quantile_balancing_selection_bias(self, grad_enabled):
+        self.transformer_config.moe_router_load_balancing_type = "quantile_balancing"
+        self.router = type(self.router)(
+            self.transformer_config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        beta = torch.tensor([1.0, -2.0, 0.5, 3.0], device="cuda")
+        self.router.qb_beta.copy_(beta)
+        logits = torch.arange(64, dtype=torch.float32, device="cuda").reshape(8, 2, 4) / 32
+        expected_indices = (logits.reshape(-1, 4) - beta).topk(2, dim=-1).indices
+        expected_map = torch.zeros_like(logits.reshape(-1, 4), dtype=torch.bool)
+        expected_map.scatter_(1, expected_indices, True)
+        observed = []
+
+        with (
+            torch.set_grad_enabled(grad_enabled),
+            capture_tensor_observations(
+                lambda *args: observed.append(args), frozenset({"router_diagnostics"})
+            ),
+        ):
+            _, routing_map = self.router.routing(logits)
+
+        assert len(observed) == 1
+        torch.testing.assert_close(routing_map, expected_map)
+        diagnostics = observed[0][3]
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.EXPERT_BIAS], -beta.expand(2, -1)
+        )
+        expected_load = expected_map.reshape(8, 2, 4).float().sum(dim=0) / 16
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.ACTUAL_LOAD], expected_load
+        )
+        # The reported correction belongs to this batch, not the accumulated next-batch update.
+        torch.testing.assert_close(self.router.qb_beta, beta)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_router_forward_validates_diagnostics_during_no_grad_forward(self):
+        self.router = self.router.cuda()
+        self.router.config.sequence_parallel = True
+        self.router.tp_group = _ProcessGroup(2)
+        self.router.cp_group = _ProcessGroup(2)
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+
+        with (
+            capture_tensor_observations(lambda *args: None, frozenset({"router_diagnostics"})),
+            torch.no_grad(),
+            pytest.raises(NotImplementedError, match="complete local sequences"),
+        ):
+            self.router(hidden_states)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -174,6 +337,62 @@ class TestTop2Router:
 
             # Verify that probs for valid tokens are similar
             assert torch.equal(probs_valid_part, probs_without_mask)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("with_padding_mask", [False, True])
+    def test_expert_bias_token_counts_with_padding_mask(self, with_padding_mask):
+        """Test expert-bias counts in grad-enabled masked and unmasked forwards."""
+        config = dataclasses.replace(
+            self.transformer_config,
+            moe_router_enable_expert_bias=True,
+            moe_router_load_balancing_type="none",
+            moe_router_score_function="sigmoid",
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=config.num_moe_experts, moe_grouped_gemm=False
+            ).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        router = cast(Router, MoELayer(config, submodules).router).cuda().train()
+
+        seq_len = 5
+        batch_size = 2
+        hidden_states = torch.randn(
+            (seq_len, batch_size, config.hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
+        )
+        assert seq_len * batch_size != config.num_moe_experts
+        padding_mask = None
+        if with_padding_mask:
+            padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device="cuda")
+            padding_mask[-2:, 0] = True
+
+        probs, routing_map = router(hidden_states, padding_mask=padding_mask)
+        valid_routing_map = routing_map
+        if padding_mask is not None:
+            valid_routing_map = routing_map[~padding_mask.reshape(-1)]
+
+        expected_tokens_per_expert = valid_routing_map.sum(dim=0)
+        torch.testing.assert_close(
+            router.local_tokens_per_expert,
+            expected_tokens_per_expert.to(router.local_tokens_per_expert.dtype),
+        )
+        expected_valid_tokens = seq_len * batch_size
+        if padding_mask is not None:
+            expected_valid_tokens -= padding_mask.sum().item()
+        assert (
+            router.local_tokens_per_expert.sum() == expected_valid_tokens * config.moe_router_topk
+        )
+
+        probs.sum().backward()
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.isfinite().all()
+        assert router.weight.grad is not None
+        assert router.weight.grad.isfinite().all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -459,6 +678,25 @@ class TestAuxLossFreeTop2Router:
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_update_preserves_large_integer_count_ordering(self):
+        counts = torch.tensor([2**24 + 1, 2**24], dtype=torch.int64, device="cuda")
+        bias = torch.zeros(2, dtype=torch.float32, device="cuda")
+
+        updated_bias = get_updated_expert_bias(
+            counts, bias, self.router.config.moe_router_bias_update_rate
+        )
+
+        expected = torch.tensor([-0.1, 0.1], dtype=torch.float32, device="cuda")
+        torch.testing.assert_close(updated_bias, expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_token_counts_survive_float16_module(self):
+        wrapped = Float16Module(self.transformer_config, self.moe_layer.cuda())
+        router = cast(Router, wrapped.module.router)
+
+        assert router.local_tokens_per_expert.dtype == torch.int64
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
@@ -574,3 +812,61 @@ def test_router_gating_linear_bias(router_dtype):
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
     assert torch.allclose(bias.grad, ref_bias.grad, **tols)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("use_pre_softmax", [True, False])
+@pytest.mark.parametrize("topk", [1, 2])
+def test_topk_routing_precomputed_indices_equivalence(score_function, use_pre_softmax, topk):
+    """Passing precomputed_indices that match the function's own selection must reproduce
+    the standard output. Guards the shared post-top-k path reused by quantile balancing."""
+    if score_function != "softmax" and use_pre_softmax:
+        pytest.skip("pre_softmax only applies to softmax scoring")
+
+    torch.manual_seed(123)
+    num_tokens, num_experts = 64, 8
+    logits = torch.randn(num_tokens, num_experts)
+
+    kwargs = dict(use_pre_softmax=use_pre_softmax, score_function=score_function, fused=False)
+    probs_ref, map_ref = topk_routing_with_score_function(logits, topk, **kwargs)
+    _, top_indices = topk_routing_with_score_function(logits, topk, dense_output=True, **kwargs)
+    probs_pre, map_pre = topk_routing_with_score_function(
+        logits, topk, precomputed_indices=top_indices, **kwargs
+    )
+
+    # Natural top-k indices reproduce the standard output.
+    assert torch.equal(map_ref, map_pre)
+    torch.testing.assert_close(probs_ref, probs_pre)
+
+    # Indices that differ from the natural top-k must route to exactly those experts. This
+    # catches a regression where the precomputed_indices branch is dropped and the function
+    # silently recomputes its own top-k instead of honoring the caller's indices. Bottom-k is
+    # disjoint from top-k since 2 * topk <= num_experts.
+    alt_indices = logits.topk(topk, dim=1, largest=False).indices
+    _, map_alt = topk_routing_with_score_function(
+        logits, topk, precomputed_indices=alt_indices, **kwargs
+    )
+    expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, alt_indices, True)
+    assert torch.equal(map_alt, expected_map)
+
+
+def test_moe_router_aux_loss_fusion_defaults_to_router_fusion():
+    """Unset resolves to moe_router_fusion; an explicit value is left alone."""
+    kwargs = dict(num_layers=1, hidden_size=8, num_attention_heads=1, num_moe_experts=4)
+
+    for routing in (False, True):
+        config = TransformerConfig(moe_router_fusion=routing, **kwargs)
+        assert config.moe_router_aux_loss_fusion is routing
+
+    for routing, aux in ((True, False), (False, True)):
+        config = TransformerConfig(
+            moe_router_fusion=routing, moe_router_aux_loss_fusion=aux, **kwargs
+        )
+        assert config.moe_router_aux_loss_fusion is aux
+
+    # Resolving at construction means the value is concrete afterwards, so a child built
+    # by dataclasses.replace inherits it rather than re-deriving from its own flag.
+    parent = TransformerConfig(moe_router_fusion=False, **kwargs)
+    child = dataclasses.replace(parent, moe_router_fusion=True)
+    assert child.moe_router_aux_loss_fusion is False

@@ -9,7 +9,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --nnodes 1 \
                   --node_rank 0 \
                   --master_addr localhost \
-                  --master_port 6000"
+                  --master_port 29500"
                   
 MODEL_GEN_PATH=<PATH_OF_THE_KNOWLEDGE_GENERATION> \ 
         (e.g., /testseen_knowledge_generations.txt)

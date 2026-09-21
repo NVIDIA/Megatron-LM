@@ -37,7 +37,7 @@ RUN uv pip install --system --no-cache --break-system-packages \
     flask-restful \
     wandb \
     bitstring \
-    filetype
+    filetype \
     setuptools
 
 # Install CLIP from GitHub

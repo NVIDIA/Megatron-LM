@@ -7,8 +7,8 @@ Run with:
 """
 
 import logging
-from contextlib import ExitStack, contextmanager
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,8 +16,9 @@ import torch.distributed as dist
 from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
+from examples.mimo.training.grad_sync import configure_grad_sync
+from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -27,6 +28,7 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
@@ -35,6 +37,8 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.rerun_state_machine import RerunDataIterator, RerunMode, get_rerun_state_machine
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -52,6 +56,142 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def test_receiver_shape_prepeek_replays_rerun_batch_without_refetching():
+    """A rerun re-derives the receive shape from the buffered logical batch."""
+
+    class CountingIterator:
+        def __init__(self):
+            self.fetches = 0
+
+        def __next__(self):
+            self.fetches += 1
+            return {"batch_id": self.fetches}
+
+    source = CountingIterator()
+    data_iterator = RerunDataIterator(source)
+    prepared_batches = []
+    communicator = SimpleNamespace(
+        has_receiver_derived_bridge_shapes=True, prepare_bridge_recv_shapes=prepared_batches.append
+    )
+    rerun_state_machine = get_rerun_state_machine()
+    previous_mode = rerun_state_machine.get_mode()
+    rerun_state_machine.set_mode(RerunMode.REPORT_DETERMINISM_STATS)
+
+    try:
+        first = schedule._prepare_forward_data_iterator(
+            data_iterator, communicator, is_multimodule=True
+        )
+        assert next(first) == {"batch_id": 1}
+        assert source.fetches == 1
+
+        data_iterator.rewind()
+        replay = schedule._prepare_forward_data_iterator(
+            data_iterator, communicator, is_multimodule=True
+        )
+        assert next(replay) == {"batch_id": 1}
+        assert source.fetches == 1
+        assert prepared_batches == [{"batch_id": 1}, {"batch_id": 1}]
+    finally:
+        data_iterator.advance()
+        rerun_state_machine.set_mode(previous_mode)
+
+
+def test_bridge_receive_shape_preparation_rejects_unconsumed_shape():
+    """Double preparation fails locally before communication can use a stale shape."""
+
+    class Bridge:
+        skip_shape_exchange = True
+        src_module_name = "encoder"
+        tensor_ndim = 2
+
+    bridge = Bridge()
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+    communicator.rank_module_map = {
+        "language": SimpleNamespace(bridge_comms_as_dest_module=[bridge])
+    }
+    communicator.bridge_recv_shape_fns = {"encoder": lambda batch: (batch["rows"], 8)}
+    communicator._next_bridge_recv_shapes = {}
+
+    communicator.prepare_bridge_recv_shapes({"rows": 3})
+    with pytest.raises(RuntimeError, match="prepared more than once"):
+        communicator.prepare_bridge_recv_shapes({"rows": 4})
+
+
+def test_disabled_bridge_rejects_intermediate_module():
+    """Skipping backward on an intermediate module would strand its upstream bridge."""
+    topology = {"source": ["encoder"], "encoder": ["language"], "language": []}
+    with pytest.raises(NotImplementedError, match="graph source module"):
+        MultiModulePipelineCommunicator(
+            {module_name: object() for module_name in topology},
+            topology,
+            object(),
+            bridge_requires_backward={"encoder": False},
+        )
+
+
+def test_disabled_bridge_results_keep_explicit_none_keys():
+    """MultiModule preserves None so detached source backward is skipped by key."""
+
+    class DisabledBridge:
+        src_module_name = "encoder"
+
+        def send_forward_recv_backward(self, output):
+            del output
+            return None
+
+        def recv_backward(self):
+            return None
+
+        def send_backward_recv_forward(self, grad, forward_shape=None):
+            assert grad is None
+            assert forward_shape is None
+            return "activation"
+
+        def send_backward(self, grad):
+            assert grad is None
+
+    bridge = DisabledBridge()
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+    communicator.rank_module_map = {
+        "encoder": SimpleNamespace(
+            pp_rank=0,
+            pp_size=1,
+            bridge_comms_as_src_module=[bridge],
+            bridge_comms_as_dest_module=[],
+        )
+    }
+    assert communicator.send_forward_recv_backward({"encoder": "output"}) == {"encoder": None}
+    assert communicator.recv_backward() == {"encoder": None}
+
+    communicator.rank_module_map = {
+        "language": SimpleNamespace(
+            pp_rank=0,
+            pp_size=1,
+            bridge_comms_as_src_module=[],
+            bridge_comms_as_dest_module=[bridge],
+        )
+    }
+    communicator._next_bridge_recv_shapes = {}
+    assert communicator.send_backward_recv_forward({"encoder": None}) == {"encoder": "activation"}
+    communicator.send_backward({"encoder": None})
+
+
+def test_backward_step_skips_detached_output_with_explicit_none_grad(monkeypatch):
+    """A disabled bridge's explicit None does not seed or invoke source backward."""
+    monkeypatch.setattr(
+        torch.autograd,
+        "backward",
+        lambda *args, **kwargs: pytest.fail("detached source must not run backward"),
+    )
+    config = SimpleNamespace(grad_scale_func=None, deallocate_pipeline_outputs=False, timers=None)
+    assert (
+        schedule.backward_step_multimodule(
+            {}, {"encoder": torch.ones(2)}, {"encoder": None}, config, MIMO_LANGUAGE_MODULE_KEY
+        )
+        == {}
+    )
+
+
 # ============================================================================
 # Helper Functions (with grid tracking and PG caching from edc8159)
 # ============================================================================
@@ -60,47 +200,39 @@ _active_grids: list = []
 _embedding_pg_cache: dict = {}
 
 
-def build_no_sync_func(mimo_model):
-    """Build a no_sync_func that stacks DDP no_sync over each sub-module.
-
-    Shared by 1F1B pipeline tests and colocated-correctness tests — both need
-    DDP's gradient sync disabled during microbatches and resumed via the
-    schedule's finalize_grads_func.
-    """
-
-    @contextmanager
-    def no_sync_func():
-        with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
-            yield
-
-    return no_sync_func
-
-
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
-    """Create a HyperCommGrid with specified parallelism."""
+    """Create a HyperCommGrid (base view) plus a dense expert view, matching the topology builder.
+
+    These tests are dense (ep=1); the expert view relabels the base axes over the same ranks
+    (expt_tp=tp, ep=cp=1, expt_dp=dp), so the optimizer's expert groups resolve to the dense
+    collapse (tp_ep_pp = tp x pp, expt_dp = dp) without changing the base rank layout.
+    """
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
-        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
+        shape=[tp, cp, 1, pp, dp],
+        dim_names=["tp", "cp", "gtp_remat", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )
-    grid.create_pg(["tp"])
-    grid.create_pg(["cp"])
-    grid.create_pg(["pp"])
-    grid.create_pg(["dp"])
-    grid.create_pg(["dp", "cp"])
-    grid.create_pg(["ep"])
-    grid.create_pg(["expt_dp"])
-    # Required by _get_pg_collection_for_optimizer
-    grid.create_pg(["tp", "pp"])
-    grid.create_pg(["tp", "ep", "pp"])
-    grid.create_pg(["dp", "ep"])
-    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+    grid.register_view(
+        "expert",
+        shape=[tp, cp, 1, pp, dp],
+        dim_names=["expt_tp", "ep", "expt_gtp_remat", "pp", "expt_dp"],
+        shared_dims=["pp"],
+    )
+    for dims in (
+        ["tp"],
+        ["cp"],
+        ["gtp_remat"],
+        ["tp", "cp"],
+        ["pp"],
+        ["dp"],
+        ["dp", "cp"],
+        ["tp", "pp"],
+        ["tp", "cp", "dp", "pp"],
+    ):
+        grid.create_pg(dims)
+    for dims in (["ep"], ["expt_gtp_remat"], ["expt_dp"], ["expt_tp", "ep", "pp"]):
+        grid.create_pg(dims, view="expert")
     _active_grids.append(grid)
     return grid
 
@@ -120,11 +252,22 @@ def get_pg_collection(grid):
     pg_collection = ProcessGroupCollection()
     pg_collection.tp = grid.get_pg("tp")
     pg_collection.cp = grid.get_pg("cp")
+    pg_collection.tp_cp = grid.get_pg(["tp", "cp"])
     pg_collection.pp = grid.get_pg("pp")
-    pg_collection.ep = grid.get_pg("ep")
+    pg_collection.ep = grid.get_pg("ep", view="expert")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
-    pg_collection.expt_dp = grid.get_pg("expt_dp")
+    pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
+    pg_collection.expt_tp = pg_collection.tp
+    pg_collection.gtp_remat = grid.get_pg("gtp_remat")
+    pg_collection.expt_gtp_remat = grid.get_pg("expt_gtp_remat", view="expert")
+    # Expert groups from the expert view (dense here, so tp_ep_pp resolves to tp x pp).
+    pg_collection.mp = grid.get_pg(["tp", "pp"])
+    pg_collection.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
+    pg_collection.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+    if is_rank_in_grid(grid):
+        assert pg_collection.gtp_remat.size() == 1
+        assert pg_collection.expt_gtp_remat.size() == 1
     return pg_collection
 
 
@@ -132,29 +275,28 @@ def create_all_embedding_groups(grids):
     """Create embedding PGs for all grids upfront.
 
     dist.new_group is a collective — ALL ranks must call it, even non-members.
-    We create all embedding groups in a consistent order across all ranks to
-    avoid hangs from asymmetric new_group calls.
+    Enumerate every PP subgroup from each grid so all ranks create the same
+    deduplicated sequence of embedding groups. Looking only at ``grid.get_pg("pp")``
+    would expose the caller's local subgroup and make different ranks issue
+    different ``new_group`` calls.
 
     Args:
         grids: List of all HyperCommGrids that need embedding groups.
     """
     for grid in grids:
-        pp_group = grid.get_pg("pp")
-        if not pp_group:
-            continue
+        for pp_ranks in grid.get_rank_enum("pp"):
+            pp_ranks = sorted(pp_ranks)
+            cache_key = tuple(pp_ranks)
 
-        pp_ranks = sorted(dist.get_process_group_ranks(pp_group))
-        cache_key = tuple(pp_ranks)
-
-        if cache_key not in _embedding_pg_cache:
-            pos_embd_ranks = [pp_ranks[0]]
-            embd_ranks = [pp_ranks[0]]
-            if pp_ranks[-1] != pp_ranks[0]:
-                embd_ranks.append(pp_ranks[-1])
-            _embedding_pg_cache[cache_key] = (
-                dist.new_group(ranks=pos_embd_ranks),
-                dist.new_group(ranks=embd_ranks),
-            )
+            if cache_key not in _embedding_pg_cache:
+                pos_embd_ranks = [pp_ranks[0]]
+                embd_ranks = [pp_ranks[0]]
+                if pp_ranks[-1] != pp_ranks[0]:
+                    embd_ranks.append(pp_ranks[-1])
+                _embedding_pg_cache[cache_key] = (
+                    dist.new_group(ranks=pos_embd_ranks),
+                    dist.new_group(ranks=embd_ranks),
+                )
 
 
 def add_embedding_groups(pg_collection, is_language_model=False):
@@ -215,6 +357,7 @@ def get_language_model_spec(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    share_embeddings_and_output_weights=False,
 ):
     """Get the language model spec.
 
@@ -230,6 +373,7 @@ def get_language_model_spec(
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+    cp_size = pg_collection.cp.size() if pg_collection.cp is not None else 1
 
     pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
     extra_kwargs = {}
@@ -253,6 +397,7 @@ def get_language_model_spec(
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='native',
         calculate_per_token_loss=per_token_loss,
+        context_parallel_size=cp_size,
         **extra_kwargs,
     )
     return ModuleSpec(
@@ -264,6 +409,7 @@ def get_language_model_spec(
             "max_sequence_length": seq_len,
             "pre_process": (pp_rank == 0),
             "post_process": (pp_rank == pp_size - 1),
+            "share_embeddings_and_output_weights": share_embeddings_and_output_weights,
             "pg_collection": pg_collection,
         },
     )
@@ -279,13 +425,18 @@ def get_projection_config(hidden_size, bias=True):
     return cfg
 
 
-def get_projection_layer_spec():
+def get_projection_layer_spec(projection_type="mlp"):
     """Layer spec for the vision-projection MLP."""
     if TEColumnParallelLinear is None or TERowParallelLinear is None:
         raise RuntimeError("TEColumnParallelLinear and TERowParallelLinear are required")
     return ModuleSpec(
         module=MLP,
-        submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
+        submodules=MLPSubmodules(
+            linear_fc1=(
+                ColumnParallelLinear if projection_type == "affine" else TEColumnParallelLinear
+            ),
+            linear_fc2=TERowParallelLinear,
+        ),
     )
 
 
@@ -299,6 +450,7 @@ def get_vision_submodules_spec(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    projection_type="mlp",
 ):
     """Get the submodule spec for the vision modality.
 
@@ -351,10 +503,11 @@ def get_vision_submodules_spec(
         module=MultimodalProjector,
         params={
             "config": get_projection_config(hidden_size=language_hidden_size, bias=bias),
-            "submodules": get_projection_layer_spec().submodules,
-            "projector_type": "mlp",
+            "submodules": get_projection_layer_spec(projection_type).submodules,
+            "projector_type": projection_type,
             "input_size": vision_config.hidden_size,
             "tp_group": pg_collection.tp,
+            "pg_collection": pg_collection,
         },
     )
 
@@ -381,6 +534,14 @@ def get_mimo_model(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    use_layer_wise_distributed_optimizer=False,
+    share_embeddings_and_output_weights=False,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+    freeze_encoder=False,
+    projection_type="mlp",
+    language_pg_collection=None,
+    vision_pg_collection=None,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -400,9 +561,23 @@ def get_mimo_model(
             divides grads by the correct global divisor on both sides;
             hetero-DP callers use this to land ``1/B_full`` on both encoder
             and LLM without relying on the per-DDP built-in scaling.
+        use_layer_wise_distributed_optimizer: Whether to wrap active modules through the
+            production MIMO LayerWise parameter-layout path.
+        share_embeddings_and_output_weights: If True, tie the LLM word embedding and
+            output-layer weights (GPTModel kwarg of the same name).
     """
-    language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
-    vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
+    encoder_hidden_size = encoder_hidden_size or hidden_size
+    language_pg = language_pg_collection
+    if language_pg is None:
+        language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
+    vision_pg = vision_pg_collection
+    if vision_pg is None:
+        vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
+
+    if is_rank_in_grid(encoder_grid):
+        configure_module_rng(SimpleNamespace(seed=123), vision_pg, 10_000)
+    if is_rank_in_grid(llm_grid):
+        configure_module_rng(SimpleNamespace(seed=123), language_pg, 0)
 
     language_model_spec = get_language_model_spec(
         num_layers=num_layers,
@@ -415,10 +590,22 @@ def get_mimo_model(
         bias=bias,
         dropout=dropout,
         per_token_loss=per_token_loss,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+    )
+    language_gtp_size = (
+        llm_grid.shape[llm_grid.dim_names.index("gtp_remat")]
+        if "gtp_remat" in llm_grid.dim_names
+        else 1
+    )
+    language_config = language_model_spec.params["config"]
+    language_config.use_cpu_initialization = language_gtp_size == 1
+    language_config.gtp_weight_remat_size = language_gtp_size
+    language_config.tensor_parallel_num_weight_shards = (
+        language_config.tensor_model_parallel_size * language_gtp_size
     )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
-        hidden_size=hidden_size,
+        hidden_size=encoder_hidden_size,
         num_attention_heads=8,
         language_hidden_size=hidden_size,
         pg_collection=vision_pg,
@@ -426,7 +613,30 @@ def get_mimo_model(
         bias=bias,
         dropout=dropout,
         per_token_loss=per_token_loss,
+        projection_type=projection_type,
     )
+    language_input_projections = {}
+    if language_rank_input_projection:
+        projection_config = get_projection_config(hidden_size=hidden_size, bias=bias)
+        projection_config.tensor_model_parallel_size = llm_grid.shape[
+            llm_grid.dim_names.index("tp")
+        ]
+        projection_config.gtp_weight_remat_size = language_gtp_size
+        projection_config.tensor_parallel_num_weight_shards = (
+            projection_config.tensor_model_parallel_size * language_gtp_size
+        )
+        language_input_projections[encoder_name] = ModuleSpec(
+            module=MultimodalProjector,
+            params={
+                "config": projection_config,
+                "submodules": get_projection_layer_spec(projection_type).submodules,
+                "projector_type": projection_type,
+                "input_size": encoder_hidden_size,
+                "tp_group": language_pg.tp,
+                "pg_collection": language_pg,
+            },
+        )
+        vision_submodule_spec.submodules["input_projections"] = []
 
     module_to_grid_map = {encoder_name: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid}
     topology = {encoder_name: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []}
@@ -434,11 +644,12 @@ def get_mimo_model(
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={encoder_name: vision_submodule_spec},
+        language_model_input_projections_spec=language_input_projections,
         special_token_ids={encoder_name: 50257},
         module_to_grid_map=module_to_grid_map,
     )
 
-    mimo_model = MimoModel(mimo_config)
+    mimo_model = MimoModel(mimo_config, cp_group=language_pg.cp, tp_group=language_pg.tp)
     mimo_model.to(torch.device("cuda"))
     if bf16:
         mimo_model.to(torch.bfloat16)
@@ -446,27 +657,47 @@ def get_mimo_model(
     # Wrap with DDP (caller may override e.g. for heterogeneous-DP scaling).
     if ddp_config is None:
         ddp_config = DistributedDataParallelConfig(
-            overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+            overlap_grad_reduce=True,
+            overlap_param_gather=use_layer_wise_distributed_optimizer,
+            bucket_size=10000,
+            use_distributed_optimizer=True,
         )
 
-    if mimo_model.language_model is not None:
-        mimo_model.language_model = DistributedDataParallel(
-            config=mimo_model.language_model.config,
-            ddp_config=ddp_config,
-            module=mimo_model.language_model,
-            pg_collection=language_pg,
+    if use_layer_wise_distributed_optimizer or freeze_encoder:
+        wrap_active_modules_with_ddp(
+            SimpleNamespace(
+                mimo_encoder_ddp_overlap=False,
+                freeze_lm=False,
+                freeze_vit=freeze_encoder,
+                freeze_projection=False,
+            ),
+            mimo_model,
+            SimpleNamespace(
+                module_pgs={MIMO_LANGUAGE_MODULE_KEY: language_pg, encoder_name: vision_pg}
+            ),
+            ddp_config,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=True,
         )
-
-    if encoder_name in mimo_model.modality_submodules:
-        submodule = mimo_model.modality_submodules[encoder_name]
-        if submodule is not None:
-            submodule = DistributedDataParallel(
-                config=submodule.encoders['clip_encoder'].config,
+    else:
+        if mimo_model.language_model is not None:
+            mimo_model.language_model = DistributedDataParallel(
+                config=mimo_model.language_model.config,
                 ddp_config=ddp_config,
-                module=submodule,
-                pg_collection=vision_pg,
+                module=mimo_model.language_model,
+                pg_collection=language_pg,
             )
-            mimo_model.modality_submodules[encoder_name] = submodule
+
+        if encoder_name in mimo_model.modality_submodules:
+            submodule = mimo_model.modality_submodules[encoder_name]
+            if submodule is not None:
+                submodule = DistributedDataParallel(
+                    config=submodule.encoders['clip_encoder'].config,
+                    ddp_config=ddp_config,
+                    module=submodule,
+                    pg_collection=vision_pg,
+                )
+                mimo_model.modality_submodules[encoder_name] = submodule
 
     return mimo_model, module_to_grid_map, topology, language_pg, vision_pg
 
@@ -488,6 +719,7 @@ class DataIterator:
         encoder_name,
         image_token_id=50257,
         image_seq_length=None,
+        variable_image_seq_length=False,
     ):
         self.hidden_size = hidden_size
         self.seq_length = seq_length
@@ -496,13 +728,19 @@ class DataIterator:
         self.encoder_name = encoder_name
         self.image_token_id = image_token_id
         self.image_seq_length = image_seq_length or (seq_length // 2)
+        self.variable_image_seq_length = variable_image_seq_length
+        self.num_batches_yielded = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        self.num_batches_yielded += 1
+        image_seq_length = self.image_seq_length
+        if self.variable_image_seq_length:
+            image_seq_length -= (self.num_batches_yielded - 1) % 4
         encoder_hidden_states = torch.randn(
-            self.image_seq_length,
+            image_seq_length,
             self.micro_batch_size,
             self.hidden_size,
             device='cuda',
@@ -510,7 +748,7 @@ class DataIterator:
         )
 
         image_tokens = torch.full(
-            (self.micro_batch_size, self.image_seq_length),
+            (self.micro_batch_size, image_seq_length),
             self.image_token_id,
             dtype=torch.long,
             device='cuda',
@@ -518,7 +756,7 @@ class DataIterator:
         text_tokens = torch.randint(
             1,
             self.vocab_size,
-            (self.micro_batch_size, self.seq_length - self.image_seq_length),
+            (self.micro_batch_size, self.seq_length - image_seq_length),
             device='cuda',
         )
         input_ids = torch.cat([image_tokens, text_tokens], dim=1)
@@ -530,6 +768,13 @@ class DataIterator:
             self.micro_batch_size, self.seq_length, device='cuda', dtype=torch.float32
         )
         loss_mask[input_ids == self.image_token_id] = 0.0
+
+        flat_input_ids = input_ids.reshape(-1)
+        image_mask = flat_input_ids == self.image_token_id
+        modality_token_indices = {
+            self.encoder_name: image_mask.nonzero(as_tuple=False).flatten(),
+            "text": (~image_mask).nonzero(as_tuple=False).flatten(),
+        }
 
         return {
             "input_ids": input_ids,
@@ -544,6 +789,7 @@ class DataIterator:
                     "clip_encoder": {'hidden_states': encoder_hidden_states, 'attention_mask': None}
                 }
             },
+            "modality_token_indices": modality_token_indices,
         }
 
 
@@ -561,14 +807,27 @@ def run_mimo_1f1b_test(
     llm_pp,
     llm_dp,
     llm_offset,
+    llm_cp=1,
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
     seq_length=64,
     micro_batch_size=2,
     num_microbatches=4,
+    use_layer_wise_distributed_optimizer=False,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+    freeze_encoder=False,
+    projection_type="mlp",
+    skip_bridge_shape_exchange=False,
 ):
-    """Run MIMO model through 1F1B schedule and verify."""
+    """Run MIMO model through 1F1B schedule and verify.
+
+    Uses the production examples/mimo configure_grad_sync (calculate_per_token_loss=True)
+    as the grad-finalization hook, exercising its cross-grid token sourcing + N_global
+    broadcast on this non-colocated topology. The LayerWise variant also uses the production
+    MIMO DDP wrapper and performs a real Muon optimizer step with the default parameter layout.
+    """
     # Clear NVTE env vars that the conftest set_env fixture sets to '0'.
     # GPTModel (LanguageModule) asserts these are unset or match the attention backend.
     import os
@@ -578,11 +837,12 @@ def run_mimo_1f1b_test(
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
     encoder_name = "images"
+    encoder_hidden_size = encoder_hidden_size or hidden_size
 
     encoder_grid = create_hypercomm_grid(
         offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
     )
-    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=1, pp=llm_pp, dp=llm_dp)
+    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=llm_cp, pp=llm_pp, dp=llm_dp)
 
     # Create all embedding PGs upfront — dist.new_group is a collective that
     # requires ALL ranks to participate, so we must create them before any
@@ -599,37 +859,47 @@ def run_mimo_1f1b_test(
         num_layers=num_layers,
         vocab_size=vocab_size,
         seq_len=seq_length,
+        per_token_loss=True,
+        use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+        encoder_hidden_size=encoder_hidden_size,
+        language_rank_input_projection=language_rank_input_projection,
+        freeze_encoder=freeze_encoder,
+        projection_type=projection_type,
     )
 
-    no_sync_func = build_no_sync_func(mimo_model)
-
-    def finalize_grads_func(*args, **kwargs):
-        if mimo_model.language_model is not None:
-            finalize_model_grads(
-                [mimo_model.language_model], num_tokens=None, pg_collection=language_pg
-            )
-        for submodule in mimo_model.modality_submodules.values():
-            if submodule is not None:
-                finalize_model_grads([submodule], num_tokens=None, pg_collection=vision_pg)
-
-    mimo_model.config.no_sync_func = no_sync_func
-    mimo_model.config.finalize_model_grads_func = finalize_grads_func
-    mimo_model.config.grad_scale_func = lambda loss: (
-        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
-        if isinstance(loss, (int, float))
-        else loss
+    # Use the production grad-sync hook (finalize per module over its own groups +
+    # cross-grid N_global per-token mean) for every config.
+    grad_sync_topology = SimpleNamespace(
+        grids=module_to_grid_map,
+        module_pgs={
+            MIMO_LANGUAGE_MODULE_KEY: language_pg,
+            **{name: vision_pg for name in mimo_model.modality_submodules},
+        },
+    )
+    configure_grad_sync(
+        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=False),
+        mimo_model,
+        grad_sync_topology,
     )
 
     # Create optimizer
     opt_config = OptimizerConfig(
-        optimizer='adam',
+        optimizer='muon' if use_layer_wise_distributed_optimizer else 'adam',
         lr=1e-4,
         weight_decay=0.01,
         clip_grad=1.0,
         bf16=True,
-        use_distributed_optimizer=True,
+        use_distributed_optimizer=not use_layer_wise_distributed_optimizer,
+        use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
+    assert (
+        any(
+            isinstance(inner_optimizer, LayerWiseDistributedOptimizer)
+            for inner_optimizer in optimizer.chained_optimizers
+        )
+        == use_layer_wise_distributed_optimizer
+    )
 
     communicator = MultiModulePipelineCommunicator(
         module_to_grid_map,
@@ -637,7 +907,22 @@ def run_mimo_1f1b_test(
         mimo_model.config,
         dim_mapping={'s': 0, 'h': 2, 'b': 1},
         module_output_ndim={encoder_name: 2},
+        bridge_recv_shape_fns=(
+            {
+                encoder_name: lambda batch: (
+                    int((batch["input_ids"] == 50257).sum()),
+                    encoder_hidden_size if language_rank_input_projection else hidden_size,
+                )
+            }
+            if skip_bridge_shape_exchange
+            else None
+        ),
     )
+    if skip_bridge_shape_exchange:
+        for bridge_comm in communicator.bridge_comms:
+            bridge_comm._communicate_shapes = lambda *args, **kwargs: pytest.fail(
+                "shape exchange must not run on the receiver-derived path"
+            )
 
     # Compute per-rank micro-batch size for asymmetric DP.
     # The LLM's MBS is the schedule-level MBS. The encoder's MBS is adjusted
@@ -655,15 +940,37 @@ def run_mimo_1f1b_test(
         is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))
     )
     if encoder_needs_data and not llm_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, encoder_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            encoder_hidden_size,
+            seq_length,
+            encoder_mbs,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
+        )
     elif llm_needs_data and not encoder_needs_data:
-        data_iterator = DataIterator(hidden_size, seq_length, llm_mbs, vocab_size, encoder_name)
+        data_iterator = DataIterator(
+            encoder_hidden_size,
+            seq_length,
+            llm_mbs,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
+        )
     elif encoder_needs_data and llm_needs_data:
         # Colocated: both encoder and LLM on same rank. Use LLM's MBS since
         # the LLM drives the schedule. (encoder_dp == llm_dp when colocated)
         data_iterator = DataIterator(
-            hidden_size, seq_length, micro_batch_size, vocab_size, encoder_name
+            encoder_hidden_size,
+            seq_length,
+            micro_batch_size,
+            vocab_size,
+            encoder_name,
+            variable_image_seq_length=skip_bridge_shape_exchange,
         )
+    raw_data_iterator = data_iterator
+    if skip_bridge_shape_exchange and data_iterator is not None:
+        data_iterator = RerunDataIterator(data_iterator)
 
     # Build MultiModuleProcessGroupCollection (reuse pre-created pg_collections)
     module_pgs = {}
@@ -680,8 +987,17 @@ def run_mimo_1f1b_test(
 
     def step_func(data_iterator, model):
         def loss_func(loss_mask, output_tensor):
+            # calculate_per_token_loss=True: the schedule expects a
+            # (loss_sum, num_tokens, loss_dict) triple, with num_tokens an int tensor.
+            def _ret(loss, num_tokens, reduced):
+                return loss, num_tokens, {'loss_reduced': reduced}
+
+            zero = torch.tensor(0.0, device='cuda', requires_grad=True)
+            # num_tokens must be an int tensor: the schedule accumulates it into an
+            # int total_num_tokens when calculate_per_token_loss=True.
+            one = torch.tensor(1, device='cuda', dtype=torch.int)
             if output_tensor is None:
-                return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
+                return _ret(zero, one, 0.0)
 
             if isinstance(output_tensor, dict):
                 output = output_tensor.get(
@@ -691,10 +1007,13 @@ def run_mimo_1f1b_test(
                 output = output_tensor
 
             if output is None:
-                return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
+                return _ret(zero, one, 0.0)
 
             loss = output.float().sum()
-            return loss, {'loss_reduced': loss}
+            num_tokens = (
+                loss_mask.sum().to(torch.int).clamp(min=1) if loss_mask is not None else one
+            )
+            return _ret(loss, num_tokens, loss)
 
         batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
         output_tensor, loss_mask = model(**batch)
@@ -721,12 +1040,34 @@ def run_mimo_1f1b_test(
         assert (
             grad_norm is not None and grad_norm > 0
         ), f"Expected positive grad norm, got {grad_norm}"
+        assert torch.isfinite(
+            torch.as_tensor(grad_norm)
+        ).all(), f"Expected finite grad norm, got {grad_norm}"
+        if skip_bridge_shape_exchange:
+            schedule.forward_backward_pipelining_without_interleaving(
+                forward_step_func=step_func,
+                data_iterator=data_iterator,
+                model=[mimo_model],
+                num_microbatches=num_microbatches,
+                seq_length=seq_length,
+                micro_batch_size=micro_batch_size,
+                forward_only=True,
+                p2p_communicator=communicator,
+                pg_collection=pg_collection,
+            )
+            if raw_data_iterator is not None:
+                assert raw_data_iterator.num_batches_yielded == 2 * num_microbatches
+            assert all(
+                not bridge_comm._sent_forward_shapes for bridge_comm in communicator.bridge_comms
+            ), "Expected every remembered forward shape to be consumed by backward"
 
         # Verify results on last LLM stage
         if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
             assert len(losses) > 0, "Expected losses on last LLM stage"
             for loss_dict in losses:
                 assert 'loss_reduced' in loss_dict
+                loss = torch.as_tensor(loss_dict['loss_reduced'])
+                assert torch.isfinite(loss).all(), f"Expected finite loss, got {loss}"
 
         return losses
     finally:
@@ -845,11 +1186,15 @@ class TestMimo1F1BSchedule:
             num_microbatches=4,
         )
 
-    def test_fan_in_dp4_to_dp1_llm_tp2_pp2_8gpu(self):
-        """Fan-in 4→1: Encoder DP=4 → LLM TP=2 PP=2 DP=1, on 8 GPUs.
+    @pytest.mark.parametrize(
+        "llm_tp,llm_cp,hidden_size", [(2, 1, 256), (1, 2, 128)], ids=["tp2-cp1", "tp1-cp2"]
+    )
+    def test_fan_in_dp4_to_dp1_llm_pp2_8gpu(self, llm_tp, llm_cp, hidden_size):
+        """Fan-in 4→1: Encoder DP=4 → LLM PP=2 DP=1 with TP or CP.
 
         High fan-in ratio. Each encoder rank processes MBS=1, bridge concatenates
-        4 × [img_seq, H] → [4*img_seq, H]. LLM has both TP and PP.
+        4 × [img_seq, H] → [4*img_seq, H]. The CP2 case exercises destination
+        CP gradient reconstruction in steady-state and cooldown backward paths.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -859,11 +1204,12 @@ class TestMimo1F1BSchedule:
             encoder_pp=1,
             encoder_dp=4,
             encoder_offset=0,
-            llm_tp=2,
+            llm_tp=llm_tp,
+            llm_cp=llm_cp,
             llm_pp=2,
             llm_dp=1,
             llm_offset=4,
-            hidden_size=256,
+            hidden_size=hidden_size,
             num_layers=2,
             vocab_size=1000,
             seq_length=64,
@@ -872,7 +1218,7 @@ class TestMimo1F1BSchedule:
         )
 
     def test_fan_out_dp1_to_dp4_enc_tp2_pp2_8gpu(self):
-        """Fan-out 1→4: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.
+        """Receiver-derived fan-out: Encoder TP=2 PP=2 DP=1 → LLM DP=4, on 8 GPUs.
 
         Encoder has PP and TP. Bridge fan-out splits encoder output into
         4 parts for 4 LLM DP ranks each with MBS=1.
@@ -895,13 +1241,64 @@ class TestMimo1F1BSchedule:
             seq_length=64,
             micro_batch_size=1,
             num_microbatches=4,
+            skip_bridge_shape_exchange=True,
         )
 
-    def test_fan_in_dp2_to_dp1_llm_pp3_8gpu(self):
+    def test_fan_out_dp1_to_dp4_enc_tp2_pp2_legacy_8gpu(self):
+        """Legacy shape-exchange fan-out on the same 8-GPU topology."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=2,
+            encoder_pp=2,
+            encoder_dp=1,
+            encoder_offset=0,
+            llm_tp=1,
+            llm_pp=1,
+            llm_dp=4,
+            llm_offset=4,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=1,
+            num_microbatches=4,
+        )
+
+    def test_language_rank_input_projection_with_frozen_encoder_8gpu(self):
+        """Language ranks project unequal-width features from frozen encoder ranks."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=1,
+            encoder_pp=1,
+            encoder_dp=4,
+            encoder_offset=0,
+            llm_tp=2,
+            llm_pp=1,
+            llm_dp=2,
+            llm_offset=4,
+            hidden_size=256,
+            encoder_hidden_size=128,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=2,
+            language_rank_input_projection=True,
+            freeze_encoder=True,
+            projection_type="affine",
+        )
+
+    @pytest.mark.parametrize("use_layer_wise_distributed_optimizer", [False, True])
+    def test_fan_in_dp2_to_dp1_llm_pp3_8gpu(self, use_layer_wise_distributed_optimizer):
         """Fan-in 2→1: Encoder DP=2 → LLM TP=2 PP=3, on 8 GPUs.
 
         Tests fan-in with deep LLM pipeline (PP=3). The 2D tensor goes through
-        bridge fan-in then P2P across 3 LLM PP stages.
+        bridge fan-in then P2P across 3 LLM PP stages. Runs both the standard
+        distributed optimizer and the LayerWise optimizer path.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -921,4 +1318,5 @@ class TestMimo1F1BSchedule:
             seq_length=64,
             micro_batch_size=2,
             num_microbatches=4,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         )

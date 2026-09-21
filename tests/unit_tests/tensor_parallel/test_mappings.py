@@ -1,9 +1,19 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import pytest
 import torch
 
 from megatron.core.tensor_parallel import mappings
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 from tests.unit_tests.test_utilities import Utils
+
+
+class _FakeTPGroup:
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
 
 
 @pytest.mark.internal
@@ -76,6 +86,20 @@ def test_ScatterToModelParallelRegion():
         expected_output = expected_output + 4
     assert torch.equal(actual_output_data, expected_output)
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_gather_from_model_parallel_region_tp1_allows_inplace_use():
+    input_leaf = torch.randn(2, 3, requires_grad=True)
+    input_data = input_leaf + 0
+
+    output_data = mappings.gather_from_tensor_model_parallel_region(
+        input_data, group=_FakeTPGroup()
+    )
+    output_data.add_(1)
+    output_data.sum().backward()
+
+    torch.testing.assert_close(input_leaf.grad, torch.ones_like(input_leaf))
 
 
 @pytest.mark.internal

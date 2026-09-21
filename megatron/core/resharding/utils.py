@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Mapping, Optional
 
 import torch
 import torch.distributed as dist
+
+from megatron.core.fp8_utils import get_grouped_tensor_members, is_grouped_tensor
+from megatron.core.utils import copy_parameter_metadata
 
 if TYPE_CHECKING:
     from .transforms import ReshardTransform
@@ -33,6 +36,11 @@ class TransferOp:
     # across ranks and can be used to build richer communication schedules.
     task_id: int | None = None
 
+    # Globally deterministic execution batch. All transfers for one logical
+    # parameter share a batch so quantized destinations can be finalized before
+    # transient receive buffers are released.
+    batch_id: int = 0
+
 
 @dataclass
 class ParameterMetadata:
@@ -52,6 +60,14 @@ class ParameterMetadata:
     # lists the per-TP-rank block sizes along partition_dim.  The refit planner
     # interleaves these blocks rather than doing a simple contiguous concat.
     partition_sizes: list[int] | None = None
+
+    # GTP shards dim 0 after any TP-local layout has been formed.
+    is_gtp: bool = False
+    # Ordered global ranks that own contiguous dim-0 shards. The list position
+    # determines each owner's GTP rank and therefore its shard offset.
+    gtp_remat_group_ranks: list[int] | None = None
+    # Alignment-only rows at the tail of the TP-local layout.
+    gtp_pad_length: int = 0
 
     # EP sharding info (fused/grouped MoE)
     is_ep: bool = False
@@ -97,6 +113,40 @@ class ShardingDescriptor:
     dst_dim_ranks: list[int]
 
 
+@dataclass(frozen=True)
+class TensorReshardSpec:
+    """Backend-neutral description of one native mesh reshard.
+
+    The generic executor continues to consume ``send_ops``/``recv_ops``.  A
+    backend with a native reshard primitive can instead consume these specs
+    before the plan is lowered into point-to-point slices. Most parameters
+    produce one full-tensor spec. Packed parameters whose components are
+    independently TP-sharded produce one spec per contiguous component.
+    """
+
+    resolved_name: str
+    src_ranks: tuple[int, ...]
+    dst_ranks: tuple[int, ...]
+    global_shape: tuple[int, ...]
+    src_local_shape: tuple[int, ...]
+    dst_local_shape: tuple[int, ...]
+    dtype: torch.dtype
+    src_shard_dim: int | None
+    dst_shard_dim: int | None
+    # Raw module paths are rank-local when PP renumbers layers.  Only the
+    # member on the corresponding side has a name here.
+    src_param_name: str | None = None
+    dst_param_name: str | None = None
+    src_param_shape: tuple[int, ...] | None = None
+    dst_param_shape: tuple[int, ...] | None = None
+    # None selects the complete local parameter. Component specs select the
+    # corresponding contiguous logical tensor from the packed parameter.
+    src_slice: tuple[slice, ...] | None = None
+    dst_slice: tuple[slice, ...] | None = None
+    part_index: int = 0
+    part_count: int = 1
+
+
 @dataclass
 class ReshardPlan:
     """Reshard plan - operations for this rank."""
@@ -108,6 +158,27 @@ class ReshardPlan:
     # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
     # skip the all_gather_object + named_modules() walks on the hot path.
     buffer_dtypes: Optional[dict[str, torch.dtype]] = None
+    # Whole-tensor descriptions for transports with a native mesh-reshard
+    # primitive. None means this plan cannot be represented by that path; the
+    # accompanying error explains why.
+    tensor_reshard_specs: list[TensorReshardSpec] | None = None
+    tensor_reshard_error: str | None = None
+    # Number of globally coordinated batches in send_ops/recv_ops. Backends
+    # that require one stable model-wide registration can opt out at execution.
+    num_batches: int = 1
+    # Total number of transfers (task ids) in the global schedule, identical on
+    # every rank. Lets a copy service size its submissions from plan-global data
+    # rather than from this rank's own op count, so all ranks decide alike.
+    total_tasks: int | None = None
+    # Effective soft execution limit after ranks agree on the smallest
+    # configured value. Native backends may reuse this coordinated value for
+    # their own grouped submissions.
+    execution_batch_bytes: int | None = None
+    # Lazily populated by the generic executor so cached plans validate and
+    # group their immutable transfer schedule only once.
+    _cached_execution_batches: tuple[tuple[int, list[TransferOp], list[TransferOp]], ...] | None = (
+        field(default=None, init=False, repr=False, compare=False)
+    )
 
     def __str__(self):
         return f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"
@@ -224,9 +295,23 @@ def named_refit_tensors(module: torch.nn.Module):
     Used by the refit planner and executor to enumerate which tensors should
     travel during resharding.  Persistent buffers are included alongside
     parameters because they may carry training state (see
-    ``named_persistent_buffers``).
+    ``named_persistent_buffers``). TE single-grouped BF16/MXFP8 parameters are
+    exposed as their stable per-expert views so their names and shapes match
+    the discrete ``weight0..weightN`` representation. This also avoids passing
+    metadata-only GroupedTensor wrappers to communication backends.
     """
-    yield from module.named_parameters(recurse=True)
+    for name, param in module.named_parameters(recurse=True):
+        if not is_grouped_tensor(param):
+            yield name, param
+            continue
+
+        for index, member in enumerate(get_grouped_tensor_members(param, create_if_missing=True)):
+            # Megatron stamps expert/TP/GTP metadata on the registered grouped
+            # parameter. Its TE member views share storage but do not inherit
+            # arbitrary Python attributes, so propagate the planning metadata.
+            copy_parameter_metadata(member, param)
+            yield f"{name}{index}", member
+
     for full_name, _sub, _buf_name, buf in named_persistent_buffers(module):
         yield full_name, buf
 
@@ -334,6 +419,12 @@ def extract_param_metadata(
     if partition_sizes is not None:
         partition_sizes = list(partition_sizes)
 
+    # GTP parameters carry their actual dense/expert rematerialization group
+    # directly. Prefer that over selecting a group by parameter name or model
+    # type because it is authoritative for both GTP and expert GTP.
+    is_gtp = bool(getattr(param, 'is_gtp_weight_remat', False))
+    gtp_pad_length = int(getattr(param, 'pad_length', 0)) if is_gtp else 0
+
     # EP detection: Megatron convention - expert params are not allreduced
     is_ep = not bool(getattr(param, 'allreduce', True))
 
@@ -347,6 +438,7 @@ def extract_param_metadata(
     )
 
     tensor_parallel_group_ranks: list[int] | None = None
+    gtp_remat_group_ranks: list[int] | None = None
     expert_parallel_group_ranks: list[int] | None = None
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
@@ -367,6 +459,12 @@ def extract_param_metadata(
     def _offset_ranks(ranks: list[int]) -> list[int]:
         result = [r + rank_offset for r in ranks] if rank_offset else ranks
         return _dedup_ranks(result)
+
+    if is_gtp:
+        gtp_group = getattr(param, 'group', None)
+        if gtp_group is None:
+            raise ValueError(f"GTP parameter {param_name!r} is missing its rematerialization group")
+        gtp_remat_group_ranks = _offset_ranks(dist.get_process_group_ranks(gtp_group))
 
     if is_ep or is_expert_param:
         if is_ep:
@@ -424,6 +522,9 @@ def extract_param_metadata(
         partition_dim=partition_dim,
         partition_stride=partition_stride,
         partition_sizes=partition_sizes,
+        is_gtp=is_gtp,
+        gtp_remat_group_ranks=gtp_remat_group_ranks,
+        gtp_pad_length=gtp_pad_length,
         is_ep=is_ep,
         num_experts=num_experts,
         owner_rank=owner_rank,

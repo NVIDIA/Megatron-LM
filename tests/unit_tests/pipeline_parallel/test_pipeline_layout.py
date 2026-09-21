@@ -221,6 +221,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
+    args.save_tokenizer_assets = False
     set_args(args)
 
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):

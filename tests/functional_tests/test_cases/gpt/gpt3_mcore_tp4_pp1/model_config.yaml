@@ -51,3 +51,4 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

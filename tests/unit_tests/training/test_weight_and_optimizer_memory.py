@@ -17,6 +17,7 @@ def _make_args(**overrides):
         hidden_size=8,
         kv_channels=4,
         moe_ffn_hidden_size=16,
+        moe_latent_size=None,
         moe_layer_freq=[0, 1],
         moe_router_topk=1,
         moe_shared_expert_gate=False,
@@ -88,3 +89,21 @@ def test_weight_and_optimizer_memory_decreases_with_expert_parallelism():
     ]
 
     assert memories[0] > memories[1] > memories[2] > memories[3]
+
+
+def test_weight_and_optimizer_memory_accounts_for_latent_moe_experts():
+    args = _make_args(moe_latent_size=4)
+
+    # Latent MoE routes experts through moe_latent_size instead of hidden_size.
+    # The hidden<->latent projections are duplicated non-expert params.
+    tp_sharded_params_on_rank = ((256 + 256) + (256 + 128) + 256) / 2
+    replicated_params_on_rank = 16 + (16 + 64 + 32) + 8
+    expert_sharded_params_on_rank = 512 / (4 * 2)
+
+    # DP = 32 // 2(TP) = 16
+    # EDP = 32 // 4(ETP) // 2(EP) = 4
+    expected_memory = (tp_sharded_params_on_rank + replicated_params_on_rank) * (
+        6 + 12 / 16
+    ) + expert_sharded_params_on_rank * (6 + 12 / 4)
+
+    assert math.isclose(compute_weight_and_optimizer_memory(args), expected_memory)

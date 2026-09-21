@@ -87,6 +87,7 @@ class TestLocalCheckpointing:
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
+        mock_args.save_tokenizer_assets = False
         mock_args.use_torch_fsdp2 = use_torch_fsdp2
         # Test save_local
         state_dict = generate_state_dict(
@@ -270,6 +271,7 @@ class TestLocalCheckpointing:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         if use_ramdisk:
             tmp_path_dist_ckpt = Path("/dev/shm")
 

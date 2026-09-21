@@ -1,13 +1,17 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # syntax=docker/dockerfile:1.3-labs
 
-ARG FROM_IMAGE_NAME
-FROM ${FROM_IMAGE_NAME} as main
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.06-py3
+FROM ${FROM_IMAGE_NAME} AS main
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
+ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
-ENV PATH="/root/.local/bin:$PATH"
+ARG REINSTALL_NCCL=False
+ARG NCCL_VERSION
+ARG NCCL_EXTENSIONS_VERSION=0.1.0
+ENV PATH="/usr/local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
 ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
@@ -28,10 +32,40 @@ RUN bash -ex <<"EOF"
     esac 
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
-    curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+    case "${TARGETARCH}" in \
+      "amd64") UV_ARCH=x86_64; UV_SHA256=cfaab1b5166a6439ff66f020333d3a12bbdf622deee3b510718283e8f06c9de7 ;; \
+      "arm64") UV_ARCH=aarch64; UV_SHA256=2872fdf4785666575d129ba90590c44e6508e22584735f3e7e8a30d773dfc3db ;; \
+      *) echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac
+    UV_ARCHIVE="uv-${UV_ARCH}-unknown-linux-gnu.tar.gz"
+    curl -fLSs -o "/tmp/${UV_ARCHIVE}" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}"
+    echo "${UV_SHA256}  /tmp/${UV_ARCHIVE}" | sha256sum -c -
+    tar -xzf "/tmp/${UV_ARCHIVE}" -C /tmp
+    install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uv" /usr/local/bin/uv
+    install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uvx" /usr/local/bin/uvx
+    rm -rf "/tmp/${UV_ARCHIVE}" "/tmp/uv-${UV_ARCH}-unknown-linux-gnu"
 EOF
 
-COPY README.md pyproject.toml uv.lock /workspace/
+RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
+    bash -ex <<"EOF"
+    case "${REINSTALL_NCCL}" in
+        True)
+            if [ -z "${NCCL_VERSION}" ]; then
+                echo "NCCL_VERSION must be set when REINSTALL_NCCL=True" >&2
+                exit 1
+            fi
+            bash /opt/install_nccl.sh --NCCL_VER="${NCCL_VERSION}"
+            ;;
+        False) ;;
+        *)
+            echo "REINSTALL_NCCL must be True or False" >&2
+            exit 1
+            ;;
+    esac
+EOF
+
+COPY pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
@@ -40,9 +74,27 @@ ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
+    export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
+    test -n "$TMS_CUDA_MAJOR"
+    # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
+    # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
+    # include path) and scope the build to the target archs. Skipped for the LTS image.
+    FLASH_MLA_GROUP=""
+    if [ "$IMAGE_TYPE" != "lts" ]; then
+        FLASH_MLA_GROUP="--group no_pypi_wheels"
+        export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
+            CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
+    fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te --link-mode copy --locked \
+    # Limit per-package compiler concurrency on ARM.
+    if [ "$(uname -m)" = "aarch64" ]; then
+        export MAX_JOBS=8
+    fi
+    # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
+    UV_CONCURRENT_INSTALLS=1 uv sync -v \
+        --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+        --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -59,15 +111,43 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
+
+    # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
+    # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.
+    TE_REV=$(sed -n 's/^transformer-engine = .*rev = "\([^"]*\)".*/\1/p' /workspace/pyproject.toml)
+    test -n "${TE_REV}"
+    TE_SHORT_REV="${TE_REV:0:8}"
+    NCCL_EP_JIT_HEADERS=$(find /root/.cache/uv/git-v0/checkouts \
+        -type d \
+        -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" \
+        -print -quit)
+    test -n "${NCCL_EP_JIT_HEADERS}"
+    test -f "${NCCL_EP_JIT_HEADERS}/device/ht_ep.cuh"
+    mkdir -p /opt/nccl-ep/include
+    cp -a "${NCCL_EP_JIT_HEADERS}" /opt/nccl-ep/include/
+    cp -a "${NCCL_EP_JIT_HEADERS}/../nccl_ep.h" /opt/nccl-ep/include/
+    test -f /opt/nccl-ep/include/nccl_ep/device/ht_ep.cuh
+    test -f /opt/nccl-ep/include/nccl_ep.h
 EOF
 
+ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}
+RUN --mount=type=bind,source=docker/common/install_nccl_m2n.sh,target=/opt/install_nccl_m2n.sh \
+    bash /opt/install_nccl_m2n.sh \
+        --NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION} \
+        --PYTHON=${UV_PROJECT_ENVIRONMENT}/bin/python
+
+ENV NCCL_EP_JIT_SOURCE_DIR=/opt/nccl-ep/include/nccl_ep
+ENV NCCL_EP_JIT_BUILD_INCLUDE_DIR=/usr/include
+ENV NCCL_EP_JIT_CUDA_INCLUDE_DIR=/usr/local/cuda/include
+
 # Install DeepEP
-ARG DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
+ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
+COPY docker/patches/deepep-nvshmem.patch /workspace/deepep-nvshmem.patch
 RUN bash -ex <<"EOF"
     if [ "$IMAGE_TYPE" = "lts" ]; then
         echo "[DeepEP] skipping install for IMAGE_TYPE=lts"
@@ -83,16 +163,21 @@ RUN bash -ex <<"EOF"
     ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib
 
     cd /workspace
-    uv pip install nvidia-nvshmem-cu13==3.4.5
+    # DeepEP discovers NVSHMEM through the wheel, including the headers and
+    # static archive it needs. Keep its runtime ABI aligned with NGC PyTorch.
+    uv pip install nvidia-nvshmem-cu13==3.7.1
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so
     popd
+    python -c "import torch"
 
     git clone https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
         git fetch origin $DEEPEP_COMMIT
         git checkout FETCH_HEAD
         patch -p1 < /workspace/deepep.patch
+        # Backport deepseek-ai/DeepEP#564 for NVSHMEM 3.5 and newer.
+        patch -p1 < /workspace/deepep-nvshmem.patch
         apt-get update
         apt-get install -y --no-install-recommends libnvidia-ml-dev
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v .
@@ -103,11 +188,74 @@ RUN bash -ex <<"EOF"
     rm -rf DeepEP
 EOF
 
+# Install the local project after expensive dependency builds so README-only
+# changes do not invalidate those layers.
+COPY README.md /workspace/
+RUN uv pip install --no-build-isolation --no-deps -e /workspace
+
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
+        groupadd --gid "${RUNTIME_GID}" nemo-runtime; \
+    fi && \
+    if ! getent passwd "${RUNTIME_UID}" >/dev/null; then \
+        useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+            --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime; \
+    fi && \
+    install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
+        /home/nemo-runtime \
+        /home/gitlab-runner/data/gpt3_data \
+        /opt/megatron-lm \
+        /tmp/regent-cache \
+        /tmp/regent-cache/pip \
+        /tmp/regent-cache/uv \
+        /tmp/regent-cache/xdg \
+        /workspace/data/cache && \
+    venv_site_packages="$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c \
+        'import site; print(site.getsitepackages()[0])')" && \
+    touch "${venv_site_packages}/.nonroot-uninstall-probe" && \
+    find "${UV_PROJECT_ENVIRONMENT}" -type d \
+        -exec chown "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# The CI harness materializes an immutable test commit here rather than over
+# the dependency-build checkout in /workspace. Runtime callers select this UID
+# and set HOME/cache variables explicitly; the published image remains root by
+# default. Prove that the non-root contract works before restoring that default.
+# The cache root is probed for directory creation, not just file writes: a
+# caller pointing XDG_CACHE_HOME or HF_HOME below it materializes new
+# subdirectories, which a root-owned parent rejects even when every pre-created
+# leaf is writable.
+RUN export HOME=/home/nemo-runtime \
+        PIP_CACHE_DIR=/tmp/regent-cache/pip \
+        XDG_CACHE_HOME=/tmp/regent-cache/xdg \
+        UV_CACHE_DIR=/tmp/regent-cache/uv && \
+    test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -w "${HOME}" && \
+    test -w "${PIP_CACHE_DIR}" && \
+    test -w "${XDG_CACHE_HOME}" && \
+    test -w "${UV_CACHE_DIR}" && \
+    test -x /usr/local/bin/uv && \
+    test -x /opt/venv/bin/python && \
+    venv_site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+    rm "${venv_site_packages}/.nonroot-uninstall-probe" && \
+    touch "${venv_site_packages}/.nonroot-write-probe" && \
+    rm "${venv_site_packages}/.nonroot-write-probe" && \
+    touch /workspace/data/cache/.nonroot-write-probe && \
+    rm /workspace/data/cache/.nonroot-write-probe && \
+    touch /opt/megatron-lm/.nonroot-write-probe && \
+    rm /opt/megatron-lm/.nonroot-write-probe && \
+    mkdir /tmp/regent-cache/.nonroot-mkdir-probe && \
+    rmdir /tmp/regent-cache/.nonroot-mkdir-probe
+
+USER root
+
 ##### For NVIDIANS only #####
-FROM main as jet
+FROM main AS jet
 ARG JET_API_VERSION
 ENV PATH="$PATH:/opt/jet/bin"
 RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
@@ -125,4 +273,6 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     uv pip install --no-cache-dir --upgrade "setuptools>=80"
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
+
+USER root
 ###

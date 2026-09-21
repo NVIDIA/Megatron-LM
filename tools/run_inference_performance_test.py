@@ -8,15 +8,10 @@ import time
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.inference_request import (
-    DynamicInferenceRequestRecord,
-    InferenceRequest,
-)
+from megatron.core.inference.inference_request import DynamicInferenceRequest, InferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -26,8 +21,11 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine, get_model_for_inference
-from model_provider import model_provider
+from megatron.inference.utils import (
+    add_inference_args,
+    get_dynamic_inference_engine,
+    get_model_for_inference,
+)
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -38,8 +36,8 @@ from typing import List
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0
@@ -134,7 +132,7 @@ def generate_dynamic(
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result = inference_engine.step()
+        result = inference_engine.step_modern()
         finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
@@ -228,10 +226,11 @@ def main():
         )
     else:
         prompts = [request.prompt_tokens for request in requests]
-        records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
+        results: List[DynamicInferenceRequest] = inference_engine.generate(
             prompts=prompts, sampling_params=sampling_params
         )
-        results: List[InferenceRequest] = [record.merge() for record in records]
+        for result in results:
+            result.finalize_text(tokenizer)
 
     end_time = time.perf_counter()
     latency = end_time - start_time
@@ -254,7 +253,7 @@ def main():
                 'memory_usage_GB': memory_allocated / (1024**3),
             }
             if args.prompts is not None:
-                result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
+                result_dict['generated_output'] = result.generated_text
             print(result_dict)
 
     total_output_tokens = args.num_tokens_to_generate * args.inference_max_requests

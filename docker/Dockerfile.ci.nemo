@@ -1,8 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # syntax=docker/dockerfile:1.3-labs
 
-ARG FROM_IMAGE_NAME
-FROM ${FROM_IMAGE_NAME} as main
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.04-py3
+FROM ${FROM_IMAGE_NAME} AS main
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends gettext && \
@@ -11,7 +11,7 @@ RUN apt-get update && \
     chmod a+x /usr/local/bin/yq
 
 ##### For NVIDIANS only #####
-FROM main as jet
+FROM main AS jet
 ARG JET_API_VERSION
 RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \

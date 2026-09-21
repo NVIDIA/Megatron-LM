@@ -1,18 +1,30 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import pytest
 import torch
 
+from megatron.core import fp8_utils
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 
 class _FakeGroupedQuantizedTensor:
-    def __init__(self, members, quantized_tensors=None):
+    def __init__(self, members, quantized_tensors=None, rowwise_dtype=torch.uint8):
         self._members = members
         self.quantized_tensors = quantized_tensors
+        self.rowwise_data = torch.empty(
+            sum(member.numel() for member in members), dtype=rowwise_dtype
+        )
         self.quantizer = object()
 
     def split_into_quantized_tensors(self):
         return self._members
+
+
+@pytest.fixture(autouse=True)
+def _use_fake_grouped_tensor_class(monkeypatch):
+    """Make the CPU test double satisfy the production TE GroupedTensor type contract."""
+    monkeypatch.setattr(fp8_utils, "GroupedTensor", _FakeGroupedQuantizedTensor)
+    monkeypatch.setattr(fp8_utils, "HAVE_TE_GROUPED_TENSOR_CLASS", True)
 
 
 def test_expand_quantized_param_shard_for_cast_splits_grouped_wrapper():
@@ -58,9 +70,10 @@ def test_grouped_quantized_tensor_detection_allows_lazy_split_members():
     assert DistributedOptimizer._is_distopt_quantized_param(grouped_param)
 
 
-def test_grouped_quantized_tensor_detection_requires_quantizer():
-    grouped_param = _FakeGroupedQuantizedTensor([torch.empty(1)], quantized_tensors=None)
-    grouped_param.quantizer = None
+def test_grouped_quantized_tensor_detection_requires_quantized_storage():
+    grouped_param = _FakeGroupedQuantizedTensor(
+        [torch.empty(1)], quantized_tensors=None, rowwise_dtype=torch.bfloat16
+    )
 
     assert not DistributedOptimizer._is_grouped_quantized_tensor(grouped_param)
     assert not DistributedOptimizer._is_distopt_quantized_param(grouped_param)
