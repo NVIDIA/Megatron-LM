@@ -1108,7 +1108,12 @@ def save_checkpoint(
                     f.write('release' if release else str(iteration))
 
                 # Save run_config.yaml
-                checkpoint_name = get_checkpoint_name(save_dir, iteration=iteration, return_base_dir=True)
+                checkpoint_name = get_checkpoint_name(
+                    save_dir,
+                    release=release,
+                    iteration=iteration,
+                    return_base_dir=True,
+                )
                 if iteration > 0:
                     from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 
