@@ -34,6 +34,9 @@ from megatron.core.transformer.experimental_attention_variant.csa2_module_spec i
     csa2_attention_spec,
     get_csa2_module_spec_for_backend,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+    candidate_blocks_from_scores,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -307,7 +310,9 @@ def _reference(x, weights, config, ratio):
         ).sum(dim=2)
         global_visible = torch.arange(latent.shape[0], device=x.device) < (qi + 1) // ratio
         index_scores = index_scores.masked_fill(~global_visible, -torch.inf)
-        selected = index_scores.topk(min(config.dsa_indexer_topk, latent.shape[0]), dim=-1).indices
+        selected = index_scores.argsort(dim=-1, descending=True, stable=True)[
+            ..., : min(config.dsa_indexer_topk, latent.shape[0])
+        ]
         selected_mask = torch.zeros_like(index_scores, dtype=torch.bool).scatter(-1, selected, True)
         visible = torch.cat((visible, selected_mask & global_visible), dim=-1)
         kv = torch.cat((kv, _reference_rope(latent, config, ratio, position_stride=ratio)))
@@ -503,9 +508,10 @@ def _reference_candidates(scores, ratio, blocks_to_keep, block_size):
     newest = (visible - 1) // block_size
     for block in range(len(blocks)):
         block_scores[..., block] = torch.where(newest == block, torch.inf, block_scores[..., block])
-    top = block_scores.topk(min(blocks_to_keep, len(blocks)), dim=-1)
+    order = block_scores.argsort(dim=-1, descending=True, stable=True)
+    indices = order[..., : min(blocks_to_keep, len(blocks))]
     selected = torch.zeros_like(block_scores, dtype=torch.bool).scatter(
-        -1, top.indices, top.values > -torch.inf
+        -1, indices, block_scores.gather(-1, indices) > -torch.inf
     )
     return torch.stack([selected[..., position // block_size] for position in range(width)], -1)
 
@@ -586,9 +592,11 @@ def _reference_layer(x, weights, config, layer_idx, state):
             elif candidate_owner is not None and candidate_owner < layer_idx:
                 scores = scores.masked_fill(~state["candidates"], -torch.inf)
             state["scores"] = scores
-            top = scores.topk(min(config.dsa_indexer_topk, global_len), dim=-1)
+            indices = scores.argsort(dim=-1, descending=True, stable=True)[
+                ..., : min(config.dsa_indexer_topk, global_len)
+            ]
             state["selected"] = torch.zeros_like(scores, dtype=torch.bool).scatter(
-                -1, top.indices, top.values.isfinite()
+                -1, indices, scores.gather(-1, indices).isfinite()
             )
         visible = torch.cat((visible, state["selected"] & causal), -1)
         kv = torch.cat((kv, state["global_kv"]), 0)
@@ -787,11 +795,12 @@ def test_reindex_scores_preserve_owner_key_graph_and_candidate_mask(pg_collectio
         candidates=state.candidates,
     )
     torch.testing.assert_close(scores, ref_state["scores"], atol=3e-6, rtol=3e-5)
-    assert (~state.candidates[:, -1]).any(), "The case must actually exclude old global positions."
-    assert torch.isneginf(scores.masked_select(~state.candidates)).all()
+    candidate_mask = state.candidates.to_mask(scores.shape[-1])
+    assert (~candidate_mask[:, -1]).any(), "The case must exclude old global positions."
+    assert torch.isneginf(scores.masked_select(~candidate_mask)).all()
     selected = indexer.select_indices(scores)
     valid = selected >= 0
-    assert state.candidates.gather(-1, selected.clamp_min(0).long())[valid].all()
+    assert candidate_mask.gather(-1, selected.clamp_min(0).long())[valid].all()
     finite = scores.isfinite()
     scores[finite].square().mean().backward()
     ref_state["scores"][finite].square().mean().backward()
@@ -825,6 +834,52 @@ def test_candidate_blocks_exclude_old_blocks_and_force_newest():
     selected = select_candidate_blocks(partial, torch.tensor([[3]], device="cuda"), 2, 2)
     expected = torch.tensor([[[True, True, True, True, False, False, False]]], device="cuda")
     torch.testing.assert_close(selected, expected)
+
+
+@pytest.mark.parametrize("width", [0, 1, 3, 17, 1025])
+def test_compact_candidates_match_dense_mask_and_bound_retained_storage(width):
+    torch.manual_seed(92)
+    scores = torch.randint(-2, 3, (2, 9, width), device="cuda").float()
+    visible = torch.arange(1, 10, device="cuda").unsqueeze(-1) // 2
+    scores.masked_fill_(torch.arange(width, device="cuda") >= visible, -torch.inf)
+    compact = candidate_blocks_from_scores(scores, visible, 2, 4)
+    expected = _reference_candidates(scores, 2, 2, 4)
+    torch.testing.assert_close(compact.to_mask(width), expected)
+    assert compact.indices.dtype == torch.int32
+    assert compact.indices.shape[-1] <= 2
+    if width == 1025:
+        retained_bytes = compact.indices.numel() * compact.indices.element_size()
+        assert retained_bytes < expected.numel() * expected.element_size() / 50
+
+
+def test_tied_selection_is_independent_of_masked_future_capacity():
+    visible = torch.tensor([[0], [3], [7]], device="cuda")
+    expected_indices = torch.tensor([[-1, -1], [0, 1], [0, 1]], device="cuda", dtype=torch.int32)
+    expected_blocks = torch.tensor([[-1, -1], [0, 1], [0, 3]], device="cuda", dtype=torch.int32)
+    for width in (7, 8, 31, 128):
+        scores = torch.zeros(3, width, device="cuda")
+        scores.masked_fill_(torch.arange(width, device="cuda") >= visible, -torch.inf)
+        indices = CSA2Indexer.select_indices(SimpleNamespace(topk=2), scores)
+        compact = candidate_blocks_from_scores(scores, visible, 2, 2)
+        torch.testing.assert_close(indices, expected_indices)
+        torch.testing.assert_close(compact.indices, expected_blocks)
+        # Repeated invalid slots must not overwrite the valid first block in other rows.
+        assert not compact.to_mask(width)[0].any()
+        assert compact.to_mask(width)[1, :3].all()
+
+
+def test_tied_shared_indexers_preserve_prefix_when_sequence_grows(pg_collection):
+    torch.manual_seed(93)
+    layers = _layers(pg_collection)
+    with torch.no_grad():
+        for layer in layers:
+            indexer = layer.core_attention.indexer
+            if indexer is not None:
+                indexer.linear_weights_proj.weight.zero_()
+        x = torch.randn(17, 2, layers[0].config.hidden_size, device="cuda")
+        prefix, _ = _stack(layers, x[:9], CSA2State())
+        extended, _ = _stack(layers, x, CSA2State())
+    torch.testing.assert_close(prefix, extended[:9], atol=3e-6, rtol=3e-5)
 
 
 def _groups():
@@ -1062,7 +1117,7 @@ def test_shared_keys_accumulate_consumer_auxiliary_gradients_without_backbone_gr
     ]
     assert records[0][0] is records[1][0] is records[2][0]
     assert state.indexer_k.requires_grad
-    assert state.candidates is not None and not state.candidates.requires_grad
+    assert state.candidates is not None and not state.candidates.indices.requires_grad
     losses = []
     for core, (global_kv, indices, scores) in zip((owner, first, second), records):
         query = torch.randn(7, 2, 4, 16, requires_grad=True)

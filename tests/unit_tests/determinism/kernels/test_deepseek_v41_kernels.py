@@ -9,6 +9,9 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_attention_spec,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+    candidate_blocks_from_scores,
+)
 from megatron.core.transformer.hyper_connection import HyperConnectionModule, SinglePassMHCState
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -57,6 +60,18 @@ def test_single_pass_mhc_replay(groups, fused):
     )
     with deterministic_algorithms(True):
         assert_module_replays_bit_exact(module, inputs)
+
+
+def test_csa2_candidate_replay(groups):
+    """Replay tied block selection and expansion, including duplicate invalid slots."""
+    scores = torch.zeros(2, 9, 257, device="cuda")
+    visible = torch.arange(9, device="cuda").unsqueeze(-1)
+    scores.masked_fill_(torch.arange(257, device="cuda") >= visible, -torch.inf)
+    with deterministic_algorithms(True):
+        first = candidate_blocks_from_scores(scores, visible, 4, 2)
+        second = candidate_blocks_from_scores(scores, visible, 4, 2)
+        for a, b in zip((first.indices, first.to_mask(257)), (second.indices, second.to_mask(257))):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
 def test_csa2_module_replay(groups, monkeypatch):
