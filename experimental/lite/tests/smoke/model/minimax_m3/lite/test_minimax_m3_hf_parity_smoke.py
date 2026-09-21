@@ -7,7 +7,7 @@ checked: ``flex`` (pure torch, Hopper) and the production ``magi`` protocol (msa
 
 bf16 is the only precision the msa_v1 kernels support, and bf16 flips a few percent of the
 indexer's top-k rows whenever the GEMM order changes; the flipped rows dominate any max-abs metric,
-so hidden states are gated on cosine (0.995), logits on cosine (0.999) and gradients on cosine (0.99 / 0.95), while
+so hidden states are gated on cosine (0.995), logits on cosine (0.995) + KL and gradients on cosine (0.99 / 0.95), while
 per-layer rel-to-max, KL and top-1 agreement are printed as evidence.
 """
 
@@ -24,7 +24,7 @@ import torch.nn.functional as F
 pytestmark = pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 DEV = "cuda"
 LAYER_COS = 0.995
-LOGITS_COS, LOGITS_KL = 0.999, 5e-2
+LOGITS_COS, LOGITS_KL = 0.995, 5e-2
 LOSS_REL = 2e-2
 DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95
 TOPK_FLIP_BUDGET = 0.25

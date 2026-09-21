@@ -83,7 +83,7 @@ def _grad_cosines(got, want):
     for n, g in got.items():
         w = want[n]
         if _is_routed_expert(n):
-            a, b = groups.setdefault(n.split(".experts.")[0] + ".experts[all]", ([], []))
+            a, b = groups.setdefault(n.split(".experts.")[0] + ".experts.all", ([], []))
             a.append(g.float().flatten())
             b.append(w.float().flatten())
         elif w.norm() > 0:
