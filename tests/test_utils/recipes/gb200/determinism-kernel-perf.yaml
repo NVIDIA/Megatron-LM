@@ -31,8 +31,10 @@ spec:
     set -euo pipefail
     export CUDA_DEVICE_MAX_CONNECTIONS=32
     cd /opt/megatron-lm
+    mkdir -p "{assets_dir}/logs"
+    ATTEMPT=$(mktemp -d "{assets_dir}/logs/kernel-leaderboard.XXXXXX")
     uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/kernel_leaderboard.py \
-      --output "{assets_dir}/logs/kernel-leaderboard"
+      --output "$ATTEMPT"
 
 products:
   # Report-only pilot; calibration is required before imposing per-kernel budgets.

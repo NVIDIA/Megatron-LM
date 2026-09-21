@@ -694,3 +694,14 @@ assert megatron.ORIGIN == 'base'
     )
     environment["PYTHONPATH"] = os.pathsep.join([str(SCRIPTS), str(base)])
     subprocess.run([sys.executable, "-c", code], cwd=base, env=environment, check=True, timeout=30)
+
+
+def test_lazy_nccl_resolution_does_not_create_a_second_group(adapter):
+    requested = {
+        "group_ranks": [0, 1],
+        "group_options": {"config": {"blocking": -(2**31)}},
+        "nccl_environment": {},
+    }
+    observed = copy.deepcopy(requested)
+    observed["group_options"]["config"]["blocking"] = 1
+    assert adapter.group_key(requested) == adapter.group_key(observed)

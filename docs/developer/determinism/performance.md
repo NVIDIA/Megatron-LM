@@ -571,3 +571,37 @@ CPU tests:
 PYTHONPATH=. python -m pytest --confcutdir=tests/unit_tests/determinism_reporting \
   tests/unit_tests/determinism_reporting/test_paired_performance.py
 ```
+
+### CI rollout and retry behavior
+
+Land this PR after #7419, #7317, and #7260. The operator pilots intentionally fail
+on missing or incompatible evidence, including on label-triggered runs. Ordinary
+unlabelled PR cadence does not select the operator pilots. The training benchmark
+wrapper uses `--report-only` until per-recipe budgets are calibrated: confidence
+intervals and limit violations remain in the report, while malformed measurements
+and missing provenance still fail. Three pairs have an empirical interval bounded
+by the minimum and maximum observed ratios; use more pairs for calibration.
+
+Each training/kernel attempt has a separate output directory. A byte-identical
+GitHub upload retry with the same producer ID is deduplicated with both receipts;
+different contents or independent producers remain ambiguous and cannot pass.
+Coverage stamps select the dev environment. Stamping failures do not fail ordinary
+unit jobs, but a selected pilot's consumer still requires the artifact.
+
+Full reporting tests require CPU PyTorch and run with:
+
+```bash
+python -m pytest --confcutdir=tests/unit_tests/determinism_reporting tests/unit_tests/determinism_reporting
+```
+
+Runtime/driver/SKU matching stays strict so timing is joined to evidence from the
+same configuration. Heterogeneous nodes need their own coverage producers.
+
+The kernel pilot receives a 150-minute action timeout inside a 180-minute job
+budget; other integration jobs keep their existing limits. Actual calibration
+wall time still needs current CI measurement.
+
+Replay reports distinguish requested side-stream contention from effective
+contention. With `CUDA_DEVICE_MAX_CONNECTIONS=1`, the serialized replay remains
+eligible only for that same runtime policy and is not evidence of concurrent
+stream stress.

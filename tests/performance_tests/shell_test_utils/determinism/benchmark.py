@@ -241,6 +241,8 @@ def markdown_report(report: dict) -> str:
             "",
         ]
     )
+    if report.get("report_only"):
+        lines.append("Report-only: budget and uncertainty diagnostics do not gate CI.\n")
     if report.get("error"):
         lines.append(f"Error: {report['error']}\n")
     return "\n".join(lines)
@@ -259,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--base-checkout", type=Path)
     parser.add_argument("--pairs", type=int, default=3)
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Retain budget diagnostics without enforcing uncalibrated limits",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--recipe", choices=("dense", "moe", "hybrid"), default="dense")
@@ -323,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": 1,
         "kind": "determinism_kernel_performance" if args.kernel_case else "determinism_performance",
         "status": "incomplete",
+        "report_only": args.report_only,
         "sources": sources,
         "machine": _machine(),
         "measurement": {
@@ -434,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         _write(report, output)
     print(markdown_report(report))
+    if args.report_only and report["status"] != "error" and "error" not in report:
+        return 0
     return {"pass": 0, "reported": 0, "diagnostic": 0, "fail": 1, "error": 1, "inconclusive": 2}[
         report["status"]
     ]

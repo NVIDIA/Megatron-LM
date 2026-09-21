@@ -156,7 +156,8 @@ def test_training_arguments_differ_only_by_policy_flag(recipe):
 
 
 @pytest.mark.parametrize("incomplete", [False, True])
-def test_subprocess_measurements_and_artifacts(tmp_path, monkeypatch, incomplete):
+@pytest.mark.parametrize("report_only", [False, True])
+def test_subprocess_measurements_and_artifacts(tmp_path, monkeypatch, incomplete, report_only):
     monkeypatch.setattr(
         benchmark,
         "_source",
@@ -182,6 +183,7 @@ if os.environ.get('FIXTURE_INCOMPLETE'):
         [
             "--output",
             str(output),
+            *(["--report-only", "--max-overhead-ratio", "1.1"] if report_only else []),
             "--pairs",
             "3",
             "--warmup",
@@ -202,7 +204,7 @@ if os.environ.get('FIXTURE_INCOMPLETE'):
         assert "Missing iterations" in report["error"]
     else:
         assert rc == 0
-        assert report["status"] == "pass"
+        assert report["status"] == ("fail" if report_only else "pass")
         assert [run["mode"] for run in report["runs"]] == [
             "default",
             "det",

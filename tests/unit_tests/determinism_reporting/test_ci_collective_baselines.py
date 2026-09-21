@@ -141,7 +141,9 @@ def test_selected_collective_artifacts_require_matching_provenance_and_bytes(
     metadata = directory / ci.METADATA
     record = json.loads(metadata.read_text())
     if fault == "duplicate":
-        shutil.copytree(directory, root / (directory.name + "-retry"))
+        retry = root / (directory.name + "-retry")
+        shutil.copytree(directory, retry)
+        (retry / "changed.log").write_text("different bytes")
     elif fault == "failed":
         record["producer_outcome"] = "failure"
     elif fault == "wrong_revision":

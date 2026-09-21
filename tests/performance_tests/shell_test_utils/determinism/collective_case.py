@@ -13,6 +13,7 @@ import statistics
 import sys
 from pathlib import Path
 
+from author_evidence import replay_contention_supported
 from benchmark import DEFAULT_ENV, MODE_ENV, summarize
 
 ADAPTER = "captured_collective_v1"
@@ -21,8 +22,8 @@ NCCL_UNDEFINED_INT = -(2**31)
 
 
 def group_key(collective: dict) -> str:
-    """Retain the captured requested options as the communicator identity."""
-    return json.dumps([collective["group_ranks"], collective["group_options"]], sort_keys=True)
+    """Use the effective options, including c10d lazy resolution, as identity."""
+    return json.dumps([collective["group_ranks"], resolved_options(collective)], sort_keys=True)
 
 
 def resolved_options(collective: dict) -> dict:
@@ -198,7 +199,7 @@ def validate_evidence(captures: list[dict], indices: list[int], evidence: dict) 
                     or type(protocol.get("replays")) is not int
                     or protocol["replays"] < 2
                     or protocol.get("warn_only") is not False
-                    or protocol.get("contention") is not True
+                    or not replay_contention_supported(protocol, evidence["context"])
                     or type(observation.get("compared_outputs")) is not int
                     or type(observation.get("compared_gradients")) is not int
                     or observation.get("compared_outputs") != 1

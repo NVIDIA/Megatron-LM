@@ -113,6 +113,20 @@ def _input(directory: Path, expected: dict) -> dict:
     }
 
 
+def _tree_hash(directory: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix().encode()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(b"d" if path.is_dir() else b"f")
+        if path.is_file():
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _one(directory: Path, filename: str) -> Path:
     found = list(directory.rglob(filename))
     if len(found) != 1 or not found[0].is_file():
@@ -181,6 +195,7 @@ def collect(
         "platforms": [],
     }
     sources: dict[tuple[str, str], list[Path]] = {}
+    producers: dict[str, dict] = {}
     for directory in sorted(artifacts.iterdir()) if artifacts.is_dir() else []:
         try:
             source = _input(directory, expected)
@@ -199,6 +214,20 @@ def collect(
                 or record["producer_exit_code"] != 0
             ):
                 raise ValueError("Producer did not complete successfully")
+            source["tree_sha256"] = _tree_hash(directory)
+            previous = producers.get(record["artifact_name"])
+            if previous is not None:
+                if source["tree_sha256"] != previous["tree_sha256"]:
+                    raise ValueError("Retry upload differs from the original producer tree")
+                report["ignored_inputs"].append(
+                    {
+                        **source,
+                        "reason": "Byte-identical retry upload",
+                        "duplicate_of": previous["artifact"],
+                    }
+                )
+                continue
+            producers[record["artifact_name"]] = source
             report["inputs"].append(source)
             sources.setdefault((record["platform"], CASES[record["test_case"]]), []).append(
                 directory

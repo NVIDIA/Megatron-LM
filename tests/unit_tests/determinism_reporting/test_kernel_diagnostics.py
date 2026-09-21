@@ -138,7 +138,7 @@ def test_timing_precedes_profiles_and_sampler_stops_on_errors(tmp_path, monkeypa
         return [1.0, 2.0, 3.0]
 
     def profile(*args):
-        assert events.index("timing") < len(events)
+        assert "timing" in events and "profile" not in events
         events.append("profile")
         (args[-1] / "profile-0.json").write_text("retained partial profile")
         if failure == "profile":

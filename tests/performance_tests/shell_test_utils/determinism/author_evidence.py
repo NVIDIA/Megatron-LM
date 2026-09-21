@@ -136,7 +136,16 @@ def _limit(report: dict, name: str) -> float | None:
     return value
 
 
-def _numerically_verified(case: dict) -> bool:
+def replay_contention_supported(protocol: dict, context: dict) -> bool:
+    """Accept serialized replay only when the recorded launch policy requires it."""
+    return protocol.get("contention") is True or (
+        protocol.get("contention") is False
+        and protocol.get("contention_requested") is True
+        and context.get("environment", {}).get("CUDA_DEVICE_MAX_CONNECTIONS") == "1"
+    )
+
+
+def _numerically_verified(case: dict, context: dict) -> bool:
     """Reject summaries contradicted by missing or failing raw observations/checks."""
     if case["status"] != VERIFIED or any(
         case.get("check_status", {}).get(kind) != "passed" for kind in ("reference", "sensitivity")
@@ -158,7 +167,7 @@ def _numerically_verified(case: dict) -> bool:
             observation.get("status") != VERIFIED
             or observation.get("protocol", {}).get("replays", 0) < 2
             or observation.get("protocol", {}).get("warn_only") is not False
-            or observation.get("protocol", {}).get("contention") is not True
+            or not replay_contention_supported(observation.get("protocol", {}), context)
             or any(
                 type(observation.get(key)) is not int or observation[key] < 1
                 for key in ("compared_outputs", "compared_gradients")
@@ -354,7 +363,7 @@ def join(coverage: dict, reports: list[dict], revision: str) -> dict:
                 row["phases"][phase] = _timing(candidates[0], contract, revision, phase)
             except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
                 row["phases"][phase] = {"evidence_status": UNKNOWN, "reason": str(error)}
-        numeric = _numerically_verified(case) and requirement.get("status") == "passed"
+        numeric = _numerically_verified(case, context) and requirement.get("status") == "passed"
         if numeric and all(
             value["evidence_status"] == "complete" for value in row["phases"].values()
         ):

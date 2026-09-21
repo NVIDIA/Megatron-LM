@@ -517,3 +517,17 @@ def test_invalid_artifacts_keep_diagnostics_instead_of_crashing(author, tmp_path
     saved = json.loads(target.read_text())
     assert saved["status"] == "not_verified"
     assert saved.get("error") or saved["requirements"][0].get("reason")
+
+
+@pytest.mark.parametrize("connections,expected", [("1", True), ("32", False), (None, False)])
+def test_serialized_replay_requires_explicit_launch_constraint(author, connections, expected):
+    protocol = {"contention": False, "contention_requested": True}
+    assert (
+        author.replay_contention_supported(
+            protocol, {"environment": {"CUDA_DEVICE_MAX_CONNECTIONS": connections}}
+        )
+        is expected
+    )
+    assert not author.replay_contention_supported(
+        {"contention": False}, {"environment": {"CUDA_DEVICE_MAX_CONNECTIONS": connections}}
+    )

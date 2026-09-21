@@ -146,6 +146,8 @@ def test_missing_or_ambiguous_attempts_are_not_silently_selected(ci, tmp_path, p
     else:
         duplicate = root / (path.parent.name + "-retry")
         shutil.copytree(path.parent, duplicate)
+        if problem == "upload_retry":
+            (duplicate / "changed.log").write_text("different bytes")
         if problem in ("second_producer", "failed_duplicate"):
             record = ci.stamp(
                 duplicate,
@@ -316,3 +318,15 @@ def test_actual_producer_shell_stamps_failure_without_changing_it(tmp_path, test
         == subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     )
     assert (tmp_path / "outputs").read_text() == f"name={record['artifact_name']}\n"
+
+
+def test_byte_identical_retry_is_deduplicated_with_both_receipts(ci, tmp_path):
+    root = inputs(ci, tmp_path)
+    original = metadata(root, "performance").parent
+    shutil.copytree(original, root / (original.name + "-retry"))
+    report = consume(ci, root, tmp_path / "result")
+    assert report["status"] == "complete"
+    assert len(report["inputs"]) == 2
+    (duplicate,) = report["ignored_inputs"]
+    assert duplicate["duplicate_of"] == original.name
+    assert duplicate["reason"] == "Byte-identical retry upload"

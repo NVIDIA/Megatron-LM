@@ -217,12 +217,17 @@ def main(argv: list[str] | None = None) -> int:
                 steps=measurement["steps"],
             )
             # Recheck runtime, group and captured blobs after uninstrumented timing.
-            prepare_replay(
-                {**event, "signature": signature},
-                capture_root / f"rank-{rank}",
-                group,
-                max_bytes=measurement["max_bytes"],
-            )
+            error = None
+            try:
+                prepare_replay(
+                    {**event, "signature": signature},
+                    capture_root / f"rank-{rank}",
+                    group,
+                    max_bytes=measurement["max_bytes"],
+                )
+            except (ValueError, RuntimeError, OSError) as caught:
+                error = f"{type(caught).__name__}: {caught}"
+            _exchange_error(torch, error, world)
             result["rows"][str(index)] = {
                 "capture_signature": event["signature"],
                 "actual_signature": actual,
@@ -234,15 +239,20 @@ def main(argv: list[str] | None = None) -> int:
                 "phase": phase,
                 "samples_ms": samples,
             }
-        result["context_after"] = source_context(torch)
-        if any(
-            digest(head / path) != expected for path, expected in measurement["tooling"].items()
-        ):
-            raise ValueError("Head timing helpers changed during the arm")
-        path = args.request.parent / f"rank-{rank}.json"
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
-        temporary.replace(path)
+        error = None
+        try:
+            result["context_after"] = source_context(torch)
+            if any(
+                digest(head / path) != expected for path, expected in measurement["tooling"].items()
+            ):
+                raise ValueError("Head timing helpers changed during the arm")
+            path = args.request.parent / f"rank-{rank}.json"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+            temporary.replace(path)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as caught:
+            error = f"{type(caught).__name__}: {caught}"
+        _exchange_error(torch, error, world)
         torch.distributed.barrier()
     finally:
         torch.cuda.synchronize()

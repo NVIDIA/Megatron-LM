@@ -993,7 +993,7 @@ jobs:
           echo "integration-tests-h100=$(cat integration-tests-h100.json)" | tee -a "$GITHUB_OUTPUT"
 
   cicd-integration-tests-latest-h100:
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.test_case == 'determinism_kernel_perf' && 180 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1026,7 +1026,7 @@ jobs:
           test_case: ${{ matrix.test_case }}
           model: ${{ matrix.model }}
           tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
+          timeout: ${{ matrix.test_case == 'determinism_kernel_perf' && 150 || matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           scope: ${{ needs.configure.outputs.scope }}
@@ -1091,7 +1091,7 @@ jobs:
           echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
 
   cicd-integration-tests-latest-gb200:
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.test_case == 'determinism_kernel_perf' && 180 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1126,7 +1126,7 @@ jobs:
           test_case: ${{ matrix.test_case }}
           model: ${{ matrix.model }}
           tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
+          timeout: ${{ matrix.test_case == 'determinism_kernel_perf' && 150 || matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           scope: ${{ needs.configure.outputs.scope }}

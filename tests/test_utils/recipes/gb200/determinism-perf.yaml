@@ -30,6 +30,7 @@ spec:
     unset RO_API_TOKEN
     set -euo pipefail
     cd /opt/megatron-lm
+    export CUDA_DEVICE_MAX_CONNECTIONS=32
     export DETERMINISM_PERF_RECIPE={perf_recipe}
     export DETERMINISM_PERF_GPUS={gpus}
     bash tests/performance_tests/shell_test_utils/determinism/perf_breakdown.sh \

@@ -294,8 +294,9 @@ runs:
 
     - name: Record determinism artifact provenance
       id: determinism-artifact
+      continue-on-error: true
       if: >-
-        always() && inputs.tag == 'latest' &&
+        always() && inputs.tag == 'latest' && inputs.environment == 'dev' &&
         (inputs.test_case == 'tests/unit_tests/determinism/kernels/**/*.py' ||
          inputs.test_case == 'determinism_kernel_perf' ||
          inputs.test_case == 'determinism_collective_perf')
