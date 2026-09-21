@@ -1116,7 +1116,7 @@ def save_checkpoint(
 
                 # Save run_config.yaml
                 checkpoint_name = get_checkpoint_name(save_dir, iteration=iteration, return_base_dir=True)
-                if args.ckpt_format == 'torch_dist' and iteration > 0:
+                if iteration > 0:
                     from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
