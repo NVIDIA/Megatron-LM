@@ -3,12 +3,15 @@
 out of the block-wide FP8 context, and activation checkpointing must go through TE's checkpoint
 (mcore's tensor_parallel.checkpoint skips the checkpoint node while a graph is captured)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_recipe, get_layer_fp8_context
 from megatron.core.recompute import use_te_checkpoint
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -126,6 +129,13 @@ class TestChunkGraphPrecisionContexts:
             # The MTP stack numbers its layers from 1: layer 0 there is an FP8 layer, not the
             # first BF16 decoder layer.
             with get_layer_fp8_context(config, 0, is_mtp_layer=True):
+                assert FP8GlobalStateManager.is_fp8_enabled()
+            # The block's per-layer context is this helper (layers are numbered from 1).
+            block = object.__new__(TransformerBlock)
+            object.__setattr__(block, "config", config)
+            with block._get_inner_quantization_context(SimpleNamespace(layer_number=1)):
+                assert not FP8GlobalStateManager.is_fp8_enabled()
+            with block._get_inner_quantization_context(SimpleNamespace(layer_number=2)):
                 assert FP8GlobalStateManager.is_fp8_enabled()
         # During warm-up and capture, TE's autocast wrapper on the graphed block *class* runs
         # the MTP stack (same class, but captured inside the post-process block's graph rather

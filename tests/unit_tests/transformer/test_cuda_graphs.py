@@ -2441,13 +2441,6 @@ class TestChunkGranularity:
         with pytest.raises(ValueError, match=match):
             _base_cuda_graph_config(cuda_graph_granularity='chunk', **overrides)
 
-    def test_chunk_granularity_cli(self, monkeypatch):
-        args, _, _ = _validated_cuda_graph_cli_args(
-            monkeypatch,
-            ['--cuda-graph-impl', 'transformer_engine', '--cuda-graph-granularity', 'chunk'],
-        )
-        assert args.cuda_graph_granularity == 'chunk'
-
     def test_chunk_uses_outer_block_callable(self):
         config = SimpleNamespace(cuda_graph_granularity='chunk')
         for block_type in (TransformerBlock, HybridStack):
@@ -2459,37 +2452,6 @@ class TestChunkGranularity:
         layer = object.__new__(TransformerLayer)
         object.__setattr__(layer, 'config', config)
         assert not _layer_is_graphable(layer, config)
-
-    def test_chunk_disables_fp8_for_bf16_boundary_layers(self, monkeypatch):
-        disabled_context = object()
-        fp8_context = object()
-        # The block delegates to fp8_utils.get_layer_fp8_context, which resolves these two
-        # names in fp8_utils at call time.
-        monkeypatch.setattr(
-            'megatron.core.fp8_utils.get_fp8_disabled_context', lambda config: disabled_context
-        )
-        monkeypatch.setattr(
-            'megatron.core.fp8_utils.get_fp8_context', lambda config, layer_idx: fp8_context
-        )
-        block = object.__new__(TransformerBlock)
-        object.__setattr__(
-            block,
-            'config',
-            SimpleNamespace(
-                fp8='e4m3',
-                fp4=None,
-                cuda_graph_granularity='chunk',
-                first_last_layers_bf16=True,
-                num_layers=4,
-                num_layers_at_start_in_bf16=1,
-                num_layers_at_end_in_bf16=1,
-            ),
-        )
-        assert (
-            block._get_inner_quantization_context(SimpleNamespace(layer_number=1))
-            is disabled_context
-        )
-        assert block._get_inner_quantization_context(SimpleNamespace(layer_number=2)) is fp8_context
 
 
 class TestPartialCudaGraph:

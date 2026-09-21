@@ -1242,8 +1242,10 @@ class TestDecomposeReconstruct:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_reconstruct_preserves_cu_tensors_and_uses_conservative_padding_flag(self):
-        """Reconstruction preserves cu tensors and uses a graph-static padding flag."""
+    @pytest.mark.parametrize("scope", ["layer", "block"])
+    def test_reconstruct_preserves_cu_tensors_and_uses_conservative_padding_flag(self, scope):
+        """Reconstruction preserves cu tensors and uses a graph-static padding flag — for a layer
+        callable and for the chunk-granularity block callable alike."""
         psp = _make_psp([100, 50, 30])
         orig = {
             k: getattr(psp, k).clone()
@@ -1254,7 +1256,10 @@ class TestDecomposeReconstruct:
                 'cu_seqlens_kv_padded',
             )
         }
-        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        if scope == "layer":
+            layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        else:
+            layer = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8).decoder
         # Use the non-default mode so losing it during reconstruction is observable.
         layer.config.cp_partition_mode = "contiguous"
         kw = {'packed_seq_params': psp, 'other': 'kept'}
@@ -1307,119 +1312,6 @@ class TestDecomposeReconstruct:
         assert set(kw.keys()) == keys
 
 
-def _build_chunk_model(H, nh, nkv, ffn, max_seqlen, max_num_seqs):
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-    from megatron.core.models.gpt.gpt_model import GPTModel
-
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=H,
-        num_attention_heads=nh,
-        num_query_groups=nkv,
-        ffn_hidden_size=ffn,
-        max_seqlen_per_dp_cp_rank=max_seqlen,
-        thd_max_packed_sequences=max_num_seqs,
-        bf16=True,
-        cuda_graph_impl="transformer_engine",
-        cuda_graph_granularity="chunk",
-        cuda_graph_modules=[],
-        cuda_graph_dynamic_microbatches=True,
-        sequence_packing_scheduler="dp_balanced",
-        pad_packed_seq_alignment="max",
-        use_cpu_initialization=True,
-    )
-    model_parallel_cuda_manual_seed(42)
-    return GPTModel(
-        config=config,
-        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-        vocab_size=128,
-        max_sequence_length=max_seqlen,
-        position_embedding_type="rope",
-    ).cuda()
-
-
-@pytest.mark.internal
-class TestChunkStaticInputs:
-
-    def setup_method(self):
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
-
-    def teardown_method(self):
-        Utils.destroy_model_parallel()
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_chunk_static_inputs_and_packed_sequence_round_trip(self):
-        block = _build_chunk_model(256, 4, 4, 1024, 128, 8).decoder
-
-        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
-        assert static_inputs["hidden_states"].shape == (128, 1, 256)
-        assert static_inputs["cu_seqlens_q"].shape == (9,)
-        assert static_inputs["cu_seqlens_kv_padded"].shape == (9,)
-        assert static_inputs["padding_mask"].shape == (1, 128)
-        assert not static_inputs["padding_mask"].any()
-
-        packed_seq_params = _make_psp([64, 32])
-        kwargs = {'packed_seq_params': packed_seq_params}
-        block._decompose_packed_seq_params_to_kwargs(kwargs)
-        block._reconstruct_packed_seq_params_from_kwargs(kwargs)
-        reconstructed = kwargs['packed_seq_params']
-        assert reconstructed.pad_between_seqs is True
-        assert reconstructed.max_seqlen_q == 128
-        assert torch.equal(reconstructed.cu_seqlens_q, packed_seq_params.cu_seqlens_q)
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_postprocess_block_is_attached_and_excluded_from_state_dict(self):
-        model = _build_chunk_model(256, 4, 4, 1024, 128, 8)
-        block = model.postprocess_block
-        assert block is not None and block.post_process and not block.pre_process
-        assert block.output_layer is model.output_layer
-        assert not any(key.startswith('postprocess_block.') for key in model.state_dict())
-        assert not any(key.startswith('postprocess_block.') for key in model.sharded_state_dict())
-        # Loading the model's own state dict must not report the shared block parameters missing.
-        model.load_state_dict(model.state_dict(), strict=True)
-        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
-        assert static_inputs["labels"].shape == (1, 128)
-        assert static_inputs["hidden_states"].shape == (128, 1, 256)
-        # Without MTP the post-process consumes neither the tokens nor the padding mask, and a
-        # last stage without MTP does not even receive tokens / position ids (a captured keyword
-        # that is None at replay would make the graphed callable raise).
-        assert "input_ids" not in static_inputs
-        assert "position_ids" not in static_inputs
-        assert "padding_mask" not in static_inputs
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_postprocess_static_inputs_follow_mtp_and_sequence_parallel(self):
-        """With MTP on the stage the token inputs are captured. Under sequence parallelism the
-        decoder output is scattered but the padding mask keeps its full length: the model hands the
-        post-process the caller's mask (the MTP rolls it alongside input_ids), not the scattered
-        copy the decoder gets."""
-        model = _build_chunk_model(256, 4, 4, 1024, 128, 8)
-        block = model.postprocess_block
-        config = model.config
-        saved = (config.mtp_num_layers, config.sequence_parallel, config.tensor_model_parallel_size)
-        saved_mtp_process = model.mtp_process
-        try:
-            model.mtp_process = True
-            config.mtp_num_layers = 1
-            config.sequence_parallel = True
-            config.tensor_model_parallel_size = 2  # sizing only; no real TP group is needed
-            static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
-            assert static_inputs["input_ids"].shape == (1, 128)
-            assert static_inputs["position_ids"].shape == (1, 128)
-            assert static_inputs["labels"].shape == (1, 128)
-            assert static_inputs["hidden_states"].shape == (64, 1, 256)
-            assert static_inputs["padding_mask"].shape == (1, 128)
-            assert not static_inputs["padding_mask"].any()
-        finally:
-            model.mtp_process = saved_mtp_process
-            config.mtp_num_layers, config.sequence_parallel, config.tensor_model_parallel_size = (
-                saved
-            )
-
-
 def _build_chunk_gpt_model(
     H, nh, nkv, ffn, max_seqlen, max_num_seqs, *, tp=1, sp=False, mtp_layers=0, vocab=128
 ):
@@ -1468,6 +1360,49 @@ def _build_chunk_gpt_model(
         position_embedding_type="rope",
         mtp_block_spec=mtp_spec,
     ).cuda()
+
+
+@pytest.mark.internal
+class TestChunkStaticInputs:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_decoder_static_inputs(self):
+        block = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8).decoder
+
+        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        assert static_inputs["hidden_states"].shape == (128, 1, 256)
+        assert static_inputs["cu_seqlens_q"].shape == (9,)
+        assert static_inputs["cu_seqlens_kv_padded"].shape == (9,)
+        assert static_inputs["padding_mask"].shape == (1, 128)
+        assert not static_inputs["padding_mask"].any()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_postprocess_block_is_attached_and_excluded_from_state_dict(self):
+        model = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8)
+        block = model.postprocess_block
+        assert block is not None and block.post_process and not block.pre_process
+        assert block.output_layer is model.output_layer
+        assert not any(key.startswith('postprocess_block.') for key in model.state_dict())
+        assert not any(key.startswith('postprocess_block.') for key in model.sharded_state_dict())
+        # Loading the model's own state dict must not report the shared block parameters missing.
+        model.load_state_dict(model.state_dict(), strict=True)
+        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        assert static_inputs["labels"].shape == (1, 128)
+        assert static_inputs["hidden_states"].shape == (128, 1, 256)
+        # Without MTP the post-process consumes neither the tokens nor the padding mask, and a
+        # last stage without MTP does not even receive tokens / position ids (a captured keyword
+        # that is None at replay would make the graphed callable raise).
+        assert "input_ids" not in static_inputs
+        assert "position_ids" not in static_inputs
+        assert "padding_mask" not in static_inputs
 
 
 def _thd_batch(seqlens, vocab, seed, capacity, max_num_seqs):
@@ -1550,7 +1485,8 @@ class TestChunkGraphRegression:
 
     @_REQUIRES_TWO_RANKS
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_thd_tp2_sp_mtp_capture_replay_matches_eager(self, monkeypatch):
+    @pytest.mark.parametrize("mtp_layers", [1, 0])
+    def test_thd_tp2_sp_mtp_capture_replay_matches_eager(self, monkeypatch, mtp_layers):
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
             init_num_microbatches_calculator,
@@ -1573,10 +1509,21 @@ class TestChunkGraphRegression:
         try:
             tokens, max_num_seqs, vocab = 128, 4, 128
             model = _build_chunk_gpt_model(
-                256, 4, 4, 512, tokens, max_num_seqs, tp=2, sp=True, mtp_layers=1, vocab=vocab
+                256,
+                4,
+                4,
+                512,
+                tokens,
+                max_num_seqs,
+                tp=2,
+                sp=True,
+                mtp_layers=mtp_layers,
+                vocab=vocab,
             )
             model.train()
-            assert model.postprocess_block is not None  # MTP + LM head + loss are captured too
+            # LM head + loss (+ MTP when present) are captured as the post-process callable.
+            assert model.postprocess_block is not None
+            assert model.mtp_process == bool(mtp_layers)
             # The helper's post-capture reset calls the DDP wrapper's zero_grad_buffer(); this
             # test drives the bare model and zeroes gradients itself in _train_step.
             model.zero_grad_buffer = lambda: None
