@@ -14,6 +14,33 @@ world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
+def test_destroy_model_parallel_clears_cached_topology_state():
+    """Destroying a topology must invalidate every cached group/rank descriptor."""
+    cached_state = {
+        '_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS': [object()],
+        '_HYBRID_DP_CP_GROUPS': {2: object()},
+        '_DATA_PARALLEL_GLOBAL_RANKS': [0, 1],
+        '_DATA_PARALLEL_GLOBAL_RANKS_WITH_CP': [0, 1],
+        '_MODEL_PARALLEL_GLOBAL_RANKS': [0],
+        '_TENSOR_MODEL_PARALLEL_GLOBAL_RANKS': [0],
+        '_PIPELINE_GLOBAL_RANKS': [0],
+        '_EMBEDDING_GLOBAL_RANKS': [0],
+        '_EXPERT_MODEL_PARALLEL_RANKS': [0],
+        '_MPU_DATA_PARALLEL_WORLD_SIZE': 2,
+        '_MPU_DATA_PARALLEL_RANK': 1,
+    }
+    for name, value in cached_state.items():
+        setattr(ps, name, value)
+
+    ps.destroy_model_parallel()
+
+    assert ps._HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is None
+    assert ps._HYBRID_DP_CP_GROUPS == {}
+    for name in cached_state:
+        if name != '_HYBRID_DP_CP_GROUPS':
+            assert getattr(ps, name) is None, name
+
+
 def test_inject_gtp_remat_axis():
     # Decoder/dense axis: GTP_remat is injected after 'cp', so CP keeps the more-local
     # (smaller-stride) placement and GTP_remat sits one step further out.
@@ -618,6 +645,26 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
         assert group.size() == group_size
 
     Utils.destroy_model_parallel()
+
+
+def test_hybrid_dp_cp_groups_include_non_power_of_two_domain_sizes(monkeypatch):
+    """Dynamic CP groups must include every usable power of two below an odd domain size."""
+
+    class FakeGroup:
+        def __init__(self, ranks):
+            self.ranks = ranks
+
+    monkeypatch.setattr(ps, "create_group", lambda ranks, **kwargs: FakeGroup(ranks))
+
+    groups = ps.create_hybrid_dp_cp_groups(rank=0, ranks=list(range(6)), pg_options=None)
+
+    assert sorted(groups) == [2, 4]
+    assert groups[2].ranks == [0, 1]
+    assert groups[4].ranks == [0, 1, 2, 3]
+
+    tail_groups = ps.create_hybrid_dp_cp_groups(rank=4, ranks=list(range(6)), pg_options=None)
+    assert sorted(tail_groups) == [2]
+    assert tail_groups[2].ranks == [4, 5]
 
 
 def test_separate_all_gather_group():
