@@ -55,6 +55,8 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
+        {"moe_shared_expert_gate": True},
+        {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
             "fp8": "hybrid",
             "fp8_recipe": "mxfp8",
