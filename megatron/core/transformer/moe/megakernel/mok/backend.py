@@ -241,7 +241,8 @@ class MoKMegakernel(MegakernelBackend):
             or not output_gate.is_contiguous()
         ):
             raise RuntimeError(
-                "MOK shared output gate must be a native contiguous BF16 Parameter with shape [1, H]"
+                "MOK shared output gate must be a native contiguous BF16 Parameter "
+                "with shape [1, H]"
             )
         # Include the same gate Parameter in MOK's param-gather hooks. Its native
         # shared_experts owner still saves/loads the only checkpoint entry.
