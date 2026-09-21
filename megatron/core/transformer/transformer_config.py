@@ -15,7 +15,10 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    PACKED_DSA_CP_CUDA_GRAPH_WARNING,
+    cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
+    is_packed_dsa_cp_cuda_graph_experimental,
     is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -393,6 +396,57 @@ class TransformerConfig(ModelParallelConfig):
     path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
     backend. The final index scores remain FP32 independently of this option. This option does
     not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
+
+    dsa_cp_balance_indexer: bool = False
+    """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
+    causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
+    each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
+    existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
+    contiguous order. Balancing requires the per-sequence zigzag and the fused indexer kernel
+    backend. Eligibility is decided from the actual microbatch: its per-rank row count must be
+    even, and every padded sequence length (including any capacity tail) must be divisible by
+    ``2 * cp_size``. ``pad_packed_seq_alignment`` only controls capacity rounding and may be
+    ``None``, ``"max"``, or an integer; it is not an eligibility guarantee. An ineligible eager
+    pack takes the contiguous reference path for that microbatch, so eager runs may switch paths
+    and capacities between packs. The current
+    fused kernel package silently corrupts any fused call above 32768 query rows that is
+    not the process's first fused call (verified on GB200, cudnn-frontend 1.26.0): the
+    balanced two-half-call path therefore fails closed above per-rank capacities of
+    2 * 32768 rows, balanced-run reference fallbacks above 32768 rows take the unfused
+    implementation, and pre-existing paths keep their behavior with a once-per-process
+    correctness warning. Whether balancing is worthwhile for a workload is decided once,
+    at recipe level, by this flag.
+    Selection Q inherits the effective per-layer precision. Only delayed-scaling selection
+    uses a stateless nonquantized projection; its canonical local projection still records once
+    in eval/no-grad checkpoint forwards so amax and recompute metadata remain consistent.
+    Compact BF16/MXFP8 scoring returns its sparse-loss prediction with the selected indices in
+    the existing combine collectives. MXFP8 never takes an unfused BF16 fallback.
+    For Transformer Engine CUDA graphs that capture attention, fixed-capacity dynamic-pack routing
+    is enabled automatically when ``sequence_packing_scheduler="dp_balanced"``. Data preparation
+    then builds one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack
+    copies its two typed metadata owners once into a fixed-address graph-slot arena shared by all
+    captured DSA callables. Staged route inputs retain their originating slot so replay cannot
+    follow mutable layer microbatch state; this does not change the existing CUDA-graph/recompute
+    compatibility matrix. PP/VPP also requires ``cuda_graph_dynamic_microbatches`` so a graph input
+    slot cannot be reused while its forward remains live. Dynamic CP, local CUDA graphs, and
+    full-iteration CUDA graphs do not use dynamic-pack routing. A step batch-size schedule may not
+    increase the source global batch size after capture; doing so would require retaining graph
+    instances sized for the largest future schedule entry. Other graph configurations retain the
+    static-composition behavior."""
+
+    @property
+    def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
+        """Whether CUDA-graphed balanced DSA routing supports varying pack compositions.
+
+        This is derived rather than user-configurable so data preparation, graph capture, and
+        replay always agree on whether fixed-capacity dynamic route metadata is required.
+        """
+        return bool(
+            self.dsa_cp_balance_indexer
+            and self.cuda_graph_impl == "transformer_engine"
+            and cuda_graph_captures_attention(self)
+            and self.sequence_packing_scheduler == "dp_balanced"
+        )
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -1282,7 +1336,9 @@ class TransformerConfig(ModelParallelConfig):
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
     This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
     packing, capture uses a conservative upper bound on the packed microbatch count so graph
-    replay can cover iterations whose real packed microbatch count changes."""
+    replay can cover iterations whose real packed microbatch count changes at a fixed source
+    global batch size. Increasing the source global batch size with step_batch_size_schedule
+    after capture is rejected rather than retaining an unbounded number of graph instances."""
 
     ####################
     # Hyper-Connection Configuration
@@ -1348,6 +1404,12 @@ class TransformerConfig(ModelParallelConfig):
     group is outside the attention graph either way and is unaffected. The split additionally
     constrains the configuration (see ``__post_init__``), which is why it is opt-in rather than
     implied by ``recompute_modules=[mhc]``.
+
+    Supported for GPT mHC layers and HybridStack attention-only mHC wrappers. Other HybridStack
+    layer families remain eager with the attention-only graph scope. ``mla_up_proj`` may also
+    be included in ``recompute_modules``; its checkpoint stays inside the attention consumer,
+    independently of the eager mHC recompute group. Packed (THD) sequences use the same
+    fixed-capacity sequence metadata inputs as ordinary attention CUDA graphs.
     """
 
     ####################
@@ -1569,6 +1631,8 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        # Dynamic CP can assign a multi-rank group even when configured CP is one.
+        has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1717,7 +1781,7 @@ class TransformerConfig(ModelParallelConfig):
                     "follow-up change."
                 )
 
-        if self.context_parallel_size > 1:
+        if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":
                 if (
                     self.multi_latent_attention
@@ -1749,6 +1813,13 @@ class TransformerConfig(ModelParallelConfig):
                         "DSv4 Hybrid with context parallelism requires "
                         "cp_partition_mode='contiguous'."
                     )
+
+        if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
+            # The flag is consumed only by the CSA indexer; on any other model the
+            # data-step prebuild would burn per-microbatch host syncs for nothing.
+            raise ValueError(
+                "dsa_cp_balance_indexer requires " "experimental_attention_variant='dsv4_hybrid'."
+            )
 
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately
@@ -1804,6 +1875,39 @@ class TransformerConfig(ModelParallelConfig):
                 "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
+        if self.dsa_cp_balance_indexer:
+            # Startup preconditions for the flag to be meaningful. The per-pack verdict in
+            # cp_balanced_indexer does the actual routing; ineligible packs take the
+            # contiguous reference path. The alignment setting is intentionally absent
+            # here because it is only a capacity-rounding policy, not proof that the
+            # current pack's sequence boundaries are zigzag-representable.
+            # Evaluated after the deprecated apply_dsa_kernel_fusion switch is folded
+            # into dsa_kernel_backend above, so the predicate sees the final backend.
+            from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                use_fused_dsa_kernels,
+            )
+
+            if not use_fused_dsa_kernels(self):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires the fused DSA indexer backend "
+                    "(dsa_kernel_backend != 'none' and attention_backend != unfused): "
+                    "the balanced zigzag scorer is fused-only."
+                )
+            if not (self.context_parallel_size > 1 or self.dynamic_context_parallel):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires active context parallelism "
+                    "(context_parallel_size > 1 or dynamic_context_parallel=True)."
+                )
+            ratios = self.csa_compress_ratios or []
+            if self.csa_dense_mode or 4 not in ratios:
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires a DSA indexer to exist: "
+                    "CompressedSparseAttention builds one only for compress-ratio-4 "
+                    "layers with csa_dense_mode=False "
+                    f"(csa_dense_mode={self.csa_dense_mode}, "
+                    f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
+                    "flag would only add per-microbatch prebuild work."
+                )
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -1852,7 +1956,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
             if (
-                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+                self.experimental_attention_variant == "kda" or has_context_parallelism
             ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
                 raise ValueError(
                     f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
@@ -1864,11 +1968,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"got {self.gdn_conv_pad_alignment}."
                 )
 
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
-                        "linear_cp_mode='chunkwise' when context_parallel_size > 1. "
+                        "linear_cp_mode='chunkwise' with context parallelism. "
                         "Padding chunk-local GDN causal-conv inputs can change later "
                         "chunk numerics."
                     )
@@ -1901,7 +2005,7 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type
                     if isinstance(self.cp_comm_type, list)
@@ -2884,9 +2988,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
+            mtp_was_standalone = self.mtp_standalone
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
+            if self.mtp_standalone and not mtp_was_standalone:
+                # The base config cannot see layout-derived standalone MTP. Warn once when this
+                # post-layout transition makes the fixed-shape flag a no-op.
+                self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
 
         # Uneven PP
         elif (
@@ -3568,12 +3677,10 @@ class TransformerConfig(ModelParallelConfig):
         if (
             use_mhc_recompute
             and not self.mhc_recompute_attn_cuda_graph_split
-            and not self.is_hybrid_model  # hybrid cannot take the switch this
-            # message recommends (rejected above); hybrid_block emits its own
-            # capture-scope warning instead
+            and not self.is_hybrid_model  # hybrid_block emits its own capture-scope warning
             and self.cuda_graph_impl == "transformer_engine"
             and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
-            and list(self.recompute_modules) == ["mhc"]
+            and set(self.recompute_modules) <= {"mhc", "mla_up_proj"}
         ):
             # Exactly the shape that ran the #5841 split implicitly: such configs
             # hit this branch when they omit the new switch, and whole-attention
@@ -3581,18 +3688,14 @@ class TransformerConfig(ModelParallelConfig):
             # captured (its checkpoint no longer pays) and the static hidden input
             # grows from [s, b, C] to [s, b, n*C]. Say so once at config time,
             # since the alternative is a silent memory regression relative to the
-            # split. Deliberately narrow: broader attn-containing shapes (extra
-            # graph scopes, extra recompute modules) never ran the split, and the
-            # switch this message recommends is rejected for them.
+            # split. Only recommend the switch for supported recompute modules.
             warnings.warn(
                 "mHC recompute with an attn-scope Transformer Engine CUDA Graph is "
                 "capturing the whole attention range: the captured mHC producer's "
                 "checkpoint is not recovered and the static graph input is "
                 "[s, b, n*C]. Set mhc_recompute_attn_cuda_graph_split=True for the "
                 "attention-only split, which keeps the producer eager and shrinks "
-                "the captured input to [s, b, C]. (The split's replay does not yet "
-                "forward THD captured kwargs; on packed sequences keep the switch "
-                "off.)",
+                "the captured input to [s, b, C].",
                 UserWarning,
                 stacklevel=2,
             )
@@ -3612,16 +3715,6 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if use_mhc_recompute and self.mhc_recompute_attn_cuda_graph_split:
-            if self.is_hybrid_model:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split is not implemented for "
-                    "HybridStack mHC layers: HyperConnectionHybridLayer always "
-                    "captures the whole wrapper (mHC aggregate included) with an "
-                    "[s, b, n*C] static input and has no attention-consumer split "
-                    "path, so the switch would silently change nothing while the "
-                    "config claims the split is on. Keep the switch off for "
-                    "hybrid models."
-                )
             if self.cuda_graph_impl != "transformer_engine":
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
@@ -3629,25 +3722,17 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.cuda_graph_impl!r}: the split is a Transformer Engine "
                     "per-layer capture."
                 )
-            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or set(
                 self.recompute_modules
-            ) != ["mhc"]:
+            ) - {"mhc", "mla_up_proj"}:
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
-                    "cuda_graph_modules=[attn] with recompute_modules=[mhc]: the split "
+                    "cuda_graph_modules=[attn] with recompute_modules=[mhc] or "
+                    "[mhc, mla_up_proj]: the split "
                     "captures input-layernorm plus self-attention only, so the eager mHC "
                     "producer stays outside the captured consumer. Clear "
                     "mhc_recompute_attn_cuda_graph_split to capture the whole attention "
                     "range instead."
-                )
-            if self.sequence_packing_scheduler is not None:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split does not support packed "
-                    "(THD) sequences: THD capture takes cu_seqlens_*/padding_mask "
-                    "as captured kwargs and the split's replay does not forward "
-                    "them, so the first replay fails at the Transformer Engine "
-                    "boundary. Keep the switch off on packed-sequence runs to "
-                    "capture the whole attention range instead."
                 )
             if self.fine_grained_activation_offloading:
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
@@ -3676,18 +3761,96 @@ class TransformerConfig(ModelParallelConfig):
                         f"offload_modules, or clear mhc_recompute_attn_cuda_graph_split."
                     )
 
-        cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (
-            self.cuda_graph_impl in ("local", "transformer_engine")
-            and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
-        )
+        graph_captures_attention = cuda_graph_captures_attention(self)
+
+        if self.dsa_cp_balance_indexer_graph_dynamic_packs:
+            if self.dynamic_context_parallel or self.context_parallel_size <= 1:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires fixed context "
+                    "parallelism with context_parallel_size > 1 and dynamic_context_parallel=False."
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires "
+                    "max_seqlen_per_dp_cp_rank to define the fixed per-rank graph capacity."
+                )
+            if self.max_seqlen_per_dp_cp_rank <= 0:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires a positive "
+                    "max_seqlen_per_dp_cp_rank."
+                )
+            if self.max_seqlen_per_dp_cp_rank % 2 != 0:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires an even "
+                    "max_seqlen_per_dp_cp_rank because every rank scores two fixed-size halves."
+                )
+            from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+                FUSED_INDEXER_MAX_SAFE_ROWS,
+            )
+
+            if self.max_seqlen_per_dp_cp_rank // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing would issue fused "
+                    "indexer calls "
+                    f"with {self.max_seqlen_per_dp_cp_rank // 2} rows, above the verified-safe "
+                    f"limit of {FUSED_INDEXER_MAX_SAFE_ROWS}. Increase CP or reduce "
+                    "max_seqlen_per_dp_cp_rank."
+                )
+            graph_dynamic_pp_vpp = (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            )
+            if graph_dynamic_pp_vpp and not self.cuda_graph_dynamic_microbatches:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP requires "
+                    "cuda_graph_dynamic_microbatches=True so each in-flight forward owns a "
+                    "distinct CUDA graph input slot until its backward completes."
+                )
+            if self.overlap_moe_expert_parallel_comm or self.delay_wgrad_compute:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing does not yet support "
+                    "overlap_moe_expert_parallel_comm or delay_wgrad_compute: those modes force "
+                    "CUDA graph capture back to the runtime microbatch count instead of the THD "
+                    "packing upper bound, so a still-live graph input slot could be reused."
+                )
+        if (
+            self.dsa_cp_balance_indexer
+            and not self.dsa_cp_balance_indexer_graph_dynamic_packs
+            and graph_captures_attention
+            and (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            )
+        ):
+            # The legacy graph path pins one static pack composition and cannot
+            # disambiguate the different PackedSeqParams views hosted by PP/VPP.
+            raise ValueError(
+                "dsa_cp_balance_indexer with attention-capturing CUDA graphs currently "
+                "supports PP/VPP only when dynamic-pack routing is inferred from "
+                "cuda_graph_impl='transformer_engine' and "
+                "sequence_packing_scheduler='dp_balanced'. Use those settings, disable "
+                "attention capture, or disable pipeline parallelism."
+            )
+
+        if is_packed_dsa_cp_cuda_graph_experimental(
+            experimental_attention_variant=self.experimental_attention_variant,
+            sequence_packing_scheduler=self.sequence_packing_scheduler,
+            dynamic_context_parallel=self.dynamic_context_parallel,
+            context_parallel_size=self.context_parallel_size,
+            cuda_graph_impl=self.cuda_graph_impl,
+        ):
+            warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
 
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
+        # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
+        # indexer operates natively on the contiguous layout and performs no
+        # module-local THD CP layout conversion.)
         if (
             (self.context_parallel_size > 1 or self.dynamic_context_parallel)
             and self.sequence_packing_scheduler is not None
-            and cuda_graph_captures_attention
+            and graph_captures_attention
             and cp_layout_conversion_required
         ):
             raise ValueError(
@@ -4069,7 +4232,7 @@ class TransformerConfig(ModelParallelConfig):
                 'ep_overlap_use_scheduled_tensor_release'
             )
 
-        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+        if has_context_parallelism and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
@@ -4138,7 +4301,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.fallback_to_eager_attn or self.transformer_impl == "local":
-            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+            if has_context_parallelism and self.cp_comm_type is not None:
                 all_cp_comm_types_are_all_gather = (
                     all(item == "all_gather" for item in self.cp_comm_type)
                     if isinstance(self.cp_comm_type, list)
