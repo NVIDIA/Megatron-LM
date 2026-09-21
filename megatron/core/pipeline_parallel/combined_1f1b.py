@@ -1,5 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Combined 1F1B schedules for fine-grained expert-parallel overlap.
+
+The schedule decomposes a model chunk into nodes and co-schedules forward and
+backward nodes from different microbatches on compute and communication streams.
+"""
+
 import contextlib
 from contextlib import nullcontext
 from typing import List, Union

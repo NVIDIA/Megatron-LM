@@ -38,17 +38,23 @@ from megatron.core.transformer.utils import (
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
-    build_cp_context = None
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
+
+# fla.ops.cp is only needed for chunkwise context parallelism and is missing from
+# some FLA builds. Import it separately so its absence does not disable GDN
+# entirely; the CP paths check for None and raise with an actionable message.
+try:
+    from fla.ops.cp import build_cp_context
+except ImportError:
+    build_cp_context = None
 
 __all__ = [
     "HAVE_FLA",
@@ -116,6 +122,12 @@ class _GDNBase(MegatronModule):
     A_log: nn.Parameter
 
     gated_delta_rule: GatedDeltaRuleInterface
+
+    uses_attention_mask: bool = False
+    """GDN occupies the ``self_attention`` slot but is a linear-attention variant: it
+    accepts ``attention_mask`` only for signature compatibility with
+    ``TransformerLayer`` and never reads it, and it has no ``attn_mask_type``. See
+    ``Attention.uses_attention_mask`` for the contract."""
 
     def __init__(
         self,

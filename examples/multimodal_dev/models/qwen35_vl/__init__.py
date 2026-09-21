@@ -26,10 +26,7 @@ from examples.multimodal_dev.models.qwen35_vl.factory import (
 )
 from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
-from examples.multimodal_dev.models.qwen35_vl.specs import (
-    get_qwen35_vl_language_spec,
-    get_qwen35_vl_vision_spec,
-)
+from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
     Qwen35VLPatchEmbed,
     Qwen35VLPatchMerger,
@@ -53,7 +50,6 @@ __all__ = [
     "get_qwen35_vl_vision_config",
     "get_qwen35_vl_language_config",
     # Spec helpers
-    "get_qwen35_vl_language_spec",
     "get_qwen35_vl_vision_spec",
     # MRoPE
     "get_rope_index",
