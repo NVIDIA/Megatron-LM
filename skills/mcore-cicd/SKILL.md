@@ -80,6 +80,28 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 Adding a label does not itself start `cicd-main.yml`; apply it before the next
 synthetic PR push or rerun the workflow after applying it.
 
+### Changes that skip GPU unit tests
+
+PR pushes and merge groups skip H100 and GB200 unit tests when every changed
+path is one of:
+
+- `tests/functional_tests/test_cases/<model>/<case>/golden_values*.json`
+- `tests/functional_tests/test_cases/<model>/<case>/model_config.yaml`
+- `tests/test_utils/recipes/{h100,gb200}/*.yaml`, excluding `unit-tests.yaml`
+- `examples/**/*.sh` (standalone shell launch/config scripts)
+
+The classifier checks the complete base-to-tested-commit diff, including
+deleted files and both sides of renames. Mixed or empty changesets, missing
+history, and failed PR-label lookups retain unit tests. Manual and scheduled
+runs retain unit tests; on PR pushes, `Run tests`, `force-run-all`, or
+`container::lts` also retain them. `Run functional tests` still permits the
+skip so that functional-only PRs can request full functional validation.
+
+The test approval queue, container build, linting/golden validation, and
+functional-test selection remain in place. The final status accepts only an
+intentional unit-test skip; functional failures still fail CI. Coverage reports
+an explicit skipped-coverage status instead of looking for absent artifacts.
+
 ### Which label to attach when opening a PR
 
 | Changed paths / nature of change | Label to attach |

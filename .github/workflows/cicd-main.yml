@@ -197,6 +197,7 @@ jobs:
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
+      skip_unit_tests: ${{ steps.unit-test-scope.outputs.skip_unit_tests || 'false' }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -331,6 +332,22 @@ jobs:
 
           DEV=true
 
+          # Only PR validation can skip units based on its complete changeset.
+          # Merge groups compare the entire group to its base; manual/nightly
+          # runs retain full coverage. A functional-test label does not force
+          # unrelated unit tests, but explicit full/LTS validation does.
+          UNIT_TEST_SKIP_ELIGIBLE=false
+          if [[ "$FORCE_RUN_ALL" != "true" \
+            && "$HAS_RUN_TESTS" != "true" \
+            && "$HAS_LTS" != "true" \
+            && ( "$EVENT_NAME" == "merge_group" \
+              || ( "$LABELS_VALID" == "true" \
+                && "$EVENT_NAME" == "push" \
+                && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ ) ) ]]; then
+            UNIT_TEST_SKIP_ELIGIBLE=true
+          fi
+          echo "unit_test_skip_eligible=$UNIT_TEST_SKIP_ELIGIBLE" | tee -a "$GITHUB_OUTPUT"
+
           # Labeled PRs only read the shared main baseline. A missing or
           # incompatible cache runs the full bucket without recording a database.
           UNIT_TESTMON_ELIGIBLE=false
@@ -423,6 +440,23 @@ jobs:
           - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
           SUMMARY
 
+      - name: Checkout changeset for unit-test scope
+        if: steps.configure.outputs.unit_test_skip_eligible == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.resolve-sha.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine unit-test scope
+        id: unit-test-scope
+        if: steps.configure.outputs.unit_test_skip_eligible == 'true'
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          HEAD_SHA: ${{ steps.resolve-sha.outputs.sha }}
+        run: |
+          python3 .github/scripts/unit_test_scope.py --base "$BASE_SHA" --head "$HEAD_SHA" | tee -a "$GITHUB_OUTPUT"
+
   linting:
     runs-on: ubuntu-latest
     needs: [pre-flight]
@@ -461,6 +495,11 @@ jobs:
 
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
+
+      - name: Test unit-test skip policy and CI gates
+        run: |
+          python3 .github/scripts/test_unit_test_scope.py
+          uv run --no-project --with pyyaml==6.0.3 python .github/scripts/test_unit_test_skip_workflow.py
 
       - name: Get PR info
         id: get-pr-info
@@ -747,7 +786,8 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_unit_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -785,7 +825,8 @@ jobs:
     timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
+      needs.configure.outputs.skip_unit_tests != 'true'
+      && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -832,7 +873,8 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
-      needs.pre-flight.result != 'cancelled'
+      needs.configure.outputs.skip_unit_tests != 'true'
+      && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -872,7 +914,8 @@ jobs:
     timeout-minutes: 60
     name: "${{ matrix.bucket }} - gb200 latest"
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
+      needs.configure.outputs.skip_unit_tests != 'true'
+      && needs.is-not-external-contributor.result != 'cancelled'
       && needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -917,9 +960,9 @@ jobs:
   #       (PR-push env approval), OR we're in a regime where it skips by
   #       design: merge_group, ci_workload (schedule / workflow_dispatch),
   #       or an explicit force_run_all override.
-  #   (B) Unit-test gate — unit tests must have succeeded on PR push and
-  #       merge_group; scheduled / force-run workflows bypass this for
-  #       full nightly coverage.
+  #   (B) Unit-test gate — unit tests must have succeeded or been intentionally
+  #       skipped for an allowlisted changeset. Scheduled / force-run workflows
+  #       bypass this for full nightly coverage.
   # Downstream integration jobs consume `outputs.should_run` instead of
   # duplicating this logic four times.
   cicd-integration-gate:
@@ -944,6 +987,8 @@ jobs:
         env:
           WAIT_RESULT: ${{ needs.cicd-wait-in-queue.result }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
+          SKIP_UNIT_TESTS: ${{ needs.configure.outputs.skip_unit_tests }}
+          BUILD_RESULT: ${{ needs.cicd-container-build.result }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
@@ -960,6 +1005,7 @@ jobs:
           # (B) Unit-test gate
           unit=false
           if [ "$UNIT_RESULT" = "success" ] \
+             || { [ "$SKIP_UNIT_TESTS" = "true" ] && [ "$UNIT_RESULT" = "skipped" ] && [ "$BUILD_RESULT" = "success" ]; } \
              || [ "$IS_CI_WORKLOAD" = "true" ] \
              || [ "$FORCE_RUN_ALL" = "true" ]; then
             unit=true
@@ -973,7 +1019,7 @@ jobs:
           echo "approval=$approval unit=$unit -> should_run=$should_run"
           echo "  (wait-in-queue=$WAIT_RESULT, unit-tests=$UNIT_RESULT,"
           echo "   is_merge_group=$IS_MERGE_GROUP, is_ci_workload=$IS_CI_WORKLOAD,"
-          echo "   force_run_all=$FORCE_RUN_ALL)"
+          echo "   force_run_all=$FORCE_RUN_ALL, skip_unit_tests=$SKIP_UNIT_TESTS, build=$BUILD_RESULT)"
 
   cicd-parse-integration-tests-h100:
     runs-on: ubuntu-latest
@@ -1174,6 +1220,7 @@ jobs:
   Nemo_CICD_Test:
     needs:
       - pre-flight
+      - configure
       - is-not-external-contributor
       - cicd-unit-tests-latest
       - cicd-unit-tests-latest-gb200
@@ -1208,6 +1255,7 @@ jobs:
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
+          SKIP_UNIT_TESTS: ${{ needs.configure.outputs.skip_unit_tests }}
           UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
@@ -1228,7 +1276,9 @@ jobs:
             FORCE_INTEGRATION=true
           fi
 
-          if [ "$UNIT_RESULT" != "success" ]; then
+          if [ "$SKIP_UNIT_TESTS" == "true" ] && [ "$UNIT_RESULT" == "skipped" ]; then
+            echo "✅ Unit tests intentionally skipped for a functional/launch-only changeset"
+          elif [ "$UNIT_RESULT" != "success" ]; then
             echo "❌ cicd-unit-tests-latest: $UNIT_RESULT"
             FAILED=true
             # On PR-push / merge_group, integration was skipped by design —
@@ -1246,13 +1296,13 @@ jobs:
 
           # GB200 tests are required only when explicitly enabled.
           if [ "$ENABLE_GB200_TESTING" == "true" ]; then
-            # GB200 tests may be skipped only for non-maintainer PRs
-            # (no GB200 runners available); maintainer runs must always succeed.
+            # GB200 integration still runs for maintainers. Unit tests may also
+            # skip when the entire changeset is allowlisted.
             if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
               echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
-            if [ "$UNIT_GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+            if [ "$UNIT_GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ] && [ "$SKIP_UNIT_TESTS" != "true" ]; then
               echo "❌ cicd-unit-tests-latest-gb200: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
@@ -1294,11 +1344,12 @@ jobs:
 
   Coverage_Fake:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight]
+    needs: [Nemo_CICD_Test, pre-flight, configure]
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
         || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+        || needs.configure.outputs.skip_unit_tests == 'true'
       )
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
@@ -1322,19 +1373,20 @@ jobs:
               repo: context.repo.repo,
               sha: context.sha,
               state: 'success',
-              description: 'No code changes - coverage check skipped',
+              description: 'Unit tests not required - coverage check skipped',
               context: 'codecov/patch'
             });
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test]
+    needs: [Nemo_CICD_Test, pre-flight, configure]
     if: |
       (
         (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
         || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
         || success()
       )
+      && needs.configure.outputs.skip_unit_tests != 'true'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
