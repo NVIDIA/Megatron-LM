@@ -30,16 +30,19 @@ def get_packed_seq_params_cp_partition_cu_seqlens(
 def finalize_packed_seq_params(
     packed_seq_params: Optional["PackedSeqParams"], *, sequence_parallel: bool = False
 ) -> Optional["PackedSeqParams"]:
-    """Resolve CP metadata and prebuild the THD layout routes for a microbatch.
+    """Resolve CP metadata and prebuild the THD layout route for a microbatch.
+
+    Exactly one route is prebuilt (see ``prebuild_thd_cp_partition_routes``).
 
     Args:
         packed_seq_params: Metadata for this microbatch, or None for unpacked input.
         sequence_parallel: Whether the model shards the sequence over tensor parallelism.
             Only then are the CP-local THD tensors sequence-parallel shards whose layout
-            conversion exchanges them over the TP x CP group, so the fused TP x CP route
-            is prebuilt only when set. Without it (or when this flag is not passed) the
-            route is built lazily from the cached host ``cu_seqlens`` if a module ever
-            needs it, without an extra device-to-host copy.
+            conversion exchanges them over the TP x CP group, so the TP groups are passed
+            to the prebuild only when set and it builds the fused TP x CP route; otherwise
+            it builds the CP-only route. A route the prebuild did not anticipate is built
+            lazily from the cached host ``cu_seqlens`` without an extra device-to-host
+            copy, provided the microbatch does not already carry the other kind.
     """
     if packed_seq_params is None:
         return None
@@ -69,8 +72,8 @@ def finalize_packed_seq_params(
     else:
         tp_cp_group = get_tensor_and_context_parallel_group(check_initialized=False)
     # Sequence-parallel THD layout conversion exchanges shards directly over that TP x CP
-    # group. Prebuild the route from the same host copy of cu_seqlens while the CUDA queue
-    # is still shallow; only sequence-parallel shards ever need it.
+    # group. Prebuild the route while the CUDA queue is still shallow: the fused TP x CP
+    # route for sequence-parallel shards, otherwise the CP-only route.
     tp_group = (
         get_tensor_model_parallel_group(check_initialized=False) if sequence_parallel else None
     )

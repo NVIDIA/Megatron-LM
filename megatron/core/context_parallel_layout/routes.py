@@ -613,32 +613,21 @@ def get_thd_tp_cp_partition_route(
     if route is not None:
         return route
 
-    cu_q = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
-    if cu_q is None:
-        return None
-    host_cu = _thd_route_host_cu_seqlens(packed_seq_params)
-    if host_cu is None:
+    if _thd_route_host_cu_seqlens(packed_seq_params) is None:
         warnings.warn(
             "THD PackedSeqParams is missing the precomputed TP x CP layout route and the "
-            "host cu_seqlens of a CP route prebuild. Building the route here synchronizes "
+            "host cu_seqlens of a route prebuild. Building the route here synchronizes "
             "cu_seqlens to CPU; prebuild routes when constructing the batch "
             "(prebuild_thd_cp_partition_routes with tp_group and tp_cp_group).",
             FutureWarning,
             stacklevel=2,
         )
-        host_cu = _compact_thd_cu_seqlens_to_list(cu_q)
-    with nvtx_range("cp_layout/thd/tp_cp_route"):
-        route = _build_thd_tp_cp_partition_route_from_host(
-            host_cu,
-            cp_group.size(),
-            cp_group.rank(),
-            tp_group.size(),
-            tp_group.rank(),
-            group_rank_by_logical_rank,
-            device=cu_q.device,
-        )
-    packed_seq_params.tp_cp_partition_route = route
-    return route
+    # The lazy build goes through the single prebuild entry point so that the
+    # one-route-per-microbatch check covers it; cached host boundaries are reused.
+    prebuild_thd_cp_partition_routes(
+        packed_seq_params, cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
+    )
+    return getattr(packed_seq_params, "tp_cp_partition_route", None)
 
 
 def prebuild_thd_cp_partition_routes(
@@ -649,12 +638,21 @@ def prebuild_thd_cp_partition_routes(
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     device: Optional[torch.device] = None,
 ) -> None:
-    """Prebuild the THD CP layout route for a packed microbatch.
+    """Prebuild the THD layout route of a packed microbatch: exactly one per call.
 
-    When ``tp_group`` (with more than one rank) and ``tp_cp_group`` are supplied and
-    form a Cartesian product with ``cp_group``, the fused TP x CP route used by
-    sequence-parallel layout conversion is prebuilt as well, from the same host copy
-    of ``cu_seqlens``.
+    When ``tp_group`` (with more than one rank) and a ``tp_cp_group`` that forms a
+    Cartesian product with ``cp_group`` are supplied, the microbatch's token-dimension
+    tensors are sequence-parallel shards and only the fused TP x CP route is built,
+    into ``tp_cp_partition_route``. Otherwise (no TP, no sequence parallelism, or
+    groups that cannot be fused, where the composed fallback needs the CP-only route)
+    only the CP-only route is built, into ``cp_partition_route``. Within one
+    microbatch every conversion is one or the other, never a mix, so a metadata object
+    that ends up carrying both routes raises ``RuntimeError``; that also catches a stale
+    route of the other kind left on a reused ``PackedSeqParams``.
+
+    The compacted ``cu_seqlens`` are cached as host lists
+    (``thd_cp_host_cu_seqlens_q`` / ``thd_cp_host_cu_seqlens_kv``) and reused by later
+    builds, so a lazy build after a prebuild adds no device-to-host copy.
     """
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         return
@@ -687,28 +685,49 @@ def prebuild_thd_cp_partition_routes(
         if cu_kv_padded is not None
         else getattr(packed_seq_params, "cu_seqlens_kv", None)
     )
+    host_q = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+    host_kv = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_kv", None)
     with nvtx_range("cp_layout/thd/route"):
-        host_q, host_kv = _materialize_compact_thd_qkv_cu_seqlens(cu_q, cu_kv)
-        route = _build_thd_cp_partition_route_from_host(host_q, cp_size, cp_rank, device=device)
-
-    packed_seq_params.cp_partition_route = route
+        if host_q is None:
+            host_q, host_kv = _materialize_compact_thd_qkv_cu_seqlens(cu_q, cu_kv)
+        elif host_kv is None:
+            host_kv = (
+                host_q if cu_kv is None or cu_kv is cu_q else _compact_thd_cu_seqlens_to_list(cu_kv)
+            )
     packed_seq_params.thd_cp_host_cu_seqlens_q = host_q
     packed_seq_params.thd_cp_host_cu_seqlens_kv = host_kv
 
-    if tp_group is None or tp_group.size() <= 1:
-        return
-    group_rank_by_logical_rank = resolve_tp_cp_group_rank_by_logical_rank(
-        cp_group, tp_group, tp_cp_group
-    )
-    if group_rank_by_logical_rank is None:
-        return
-    with nvtx_range("cp_layout/thd/tp_cp_route"):
-        packed_seq_params.tp_cp_partition_route = _build_thd_tp_cp_partition_route_from_host(
-            host_q,
-            cp_size,
-            cp_rank,
-            tp_group.size(),
-            tp_group.rank(),
-            group_rank_by_logical_rank,
-            device=device,
+    group_rank_by_logical_rank = None
+    if tp_group is not None and tp_group.size() > 1:
+        group_rank_by_logical_rank = resolve_tp_cp_group_rank_by_logical_rank(
+            cp_group, tp_group, tp_cp_group
+        )
+    if group_rank_by_logical_rank is not None:
+        # Sequence-parallel shards: the fused TP x CP exchange is the only conversion.
+        with nvtx_range("cp_layout/thd/tp_cp_route"):
+            packed_seq_params.tp_cp_partition_route = _build_thd_tp_cp_partition_route_from_host(
+                host_q,
+                cp_size,
+                cp_rank,
+                tp_group.size(),
+                tp_group.rank(),
+                group_rank_by_logical_rank,
+                device=device,
+            )
+    else:
+        # CP-local sequences (or the composed fallback of unfusable groups): CP-only route.
+        with nvtx_range("cp_layout/thd/route"):
+            packed_seq_params.cp_partition_route = _build_thd_cp_partition_route_from_host(
+                host_q, cp_size, cp_rank, device=device
+            )
+
+    if (
+        getattr(packed_seq_params, "cp_partition_route", None) is not None
+        and getattr(packed_seq_params, "tp_cp_partition_route", None) is not None
+    ):
+        raise RuntimeError(
+            "PackedSeqParams carries both cp_partition_route and tp_cp_partition_route. A "
+            "microbatch converts either CP-local sequences (CP-only route) or "
+            "sequence-parallel shards (fused TP x CP route), never both; a route of the "
+            "other kind left on a reused PackedSeqParams must be cleared before rebuilding."
         )

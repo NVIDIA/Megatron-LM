@@ -1411,6 +1411,18 @@ def test_mixed_gdn_gqa_model_cp_correctness(
 
         assert reference_grad_names == candidate_grad_names
         assert candidate_packed_seq_params.cp_partition_mode == "contiguous"
+        # A microbatch carries exactly one route kind: the fused TP x CP route for
+        # sequence-parallel shards, the CP-only route otherwise. Ranks that process their
+        # sequences alone under dynamic CP (a CP group of size 1) convert nothing and
+        # carry no route at all.
+        if candidate_packed_seq_params.cp_group.size() == 1:
+            assert candidate_packed_seq_params.tp_cp_partition_route is None
+            assert candidate_packed_seq_params.cp_partition_route is None
+        else:
+            assert (
+                candidate_packed_seq_params.tp_cp_partition_route is not None
+            ) == sequence_parallel
+            assert (candidate_packed_seq_params.cp_partition_route is None) == sequence_parallel
         torch.testing.assert_close(candidate_loss, reference_loss, atol=5e-3, rtol=0.0)
         if mtp_num_layers:
             torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
@@ -1419,7 +1431,9 @@ def test_mixed_gdn_gqa_model_cp_correctness(
         if sequence_parallel:
             # Model-level check that the fused TP x CP all-to-all and the composed
             # TP gather -> CP all-to-all -> TP scatter path agree: force the fallback
-            # and rerun the same model on the same batch.
+            # and rerun the same model on the same batch. The metadata is prepared
+            # afresh under the patch: a microbatch carries exactly one route kind, and
+            # the composed fallback needs the CP-only route.
             candidate_model.zero_grad(set_to_none=True)
             for module in (cp_layout_conversion, cp_layout_routes):
                 monkeypatch.setattr(
@@ -1427,11 +1441,21 @@ def test_mixed_gdn_gqa_model_cp_correctness(
                     "resolve_tp_cp_group_rank_by_logical_rank",
                     lambda cp_group, tp_group, tp_cp_group: None,
                 )
+            fallback_batch, fallback_packed_seq_params = _prepare_mixed_model_batch(
+                candidate_seq_indices,
+                candidate_cp_group,
+                candidate_config,
+                candidate_model.vocab_size,
+            )
+            assert fallback_packed_seq_params.tp_cp_partition_route is None
+            assert (fallback_packed_seq_params.cp_partition_route is not None) == (
+                fallback_packed_seq_params.cp_group.size() > 1
+            )
             with pytest.warns(RuntimeWarning, match="naive TP gather"):
                 fallback_stats = _run_mixed_model(
                     candidate_model,
-                    candidate_batch,
-                    candidate_packed_seq_params,
+                    fallback_batch,
+                    fallback_packed_seq_params,
                     candidate_dp_cp_group,
                 )
             fallback_loss, _, fallback_grad_names, fallback_grads = fallback_stats

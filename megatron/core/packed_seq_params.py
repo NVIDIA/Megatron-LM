@@ -20,10 +20,12 @@ class PackedSeqParams:
     ``cp_partition_route`` is a per-microbatch THD CP layout conversion route over the
     CP group. ``tp_cp_partition_route`` is the same kind of plan for the fused TP x CP
     conversion of sequence-parallel shards, with split sizes in TP x CP group order.
-    ``tp_cp_group`` is set under dynamic CP only: the TP x sub-group that pairs with
-    ``cp_group``; static CP leaves it None and modules use their own TP x CP group.
-    Metadata annotation helpers update the current partition mode in-place while
-    preserving the route identities.
+    Exactly one of them is set per microbatch: its token-dimension tensors are either
+    CP-local sequences or sequence-parallel shards, never a mix
+    (``prebuild_thd_cp_partition_routes`` enforces this). ``tp_cp_group`` is set under
+    dynamic CP only: the TP x sub-group that pairs with ``cp_group``; static CP leaves
+    it None and modules use their own TP x CP group. Metadata annotation helpers update
+    the current partition mode in-place while preserving the route identity.
     '''
 
     qkv_format: str = None
