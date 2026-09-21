@@ -193,7 +193,10 @@ def test_forward_step_rejects_inconsistent_packed_batches():
 
 def test_weight_spec_maps_native_names_to_hf_disk_names(tiny_hf_kwargs):
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
-    from megatron.lite.model.minimax_m3.lite.checkpoint import MiniMaxM3WeightSpec, disk_to_module_name
+    from megatron.lite.model.minimax_m3.lite.checkpoint import (
+        MiniMaxM3WeightSpec,
+        disk_to_module_name,
+    )
 
     cfg = MiniMaxM3Config._from_hf_dict(tiny_hf_kwargs)
     spec = MiniMaxM3WeightSpec(cfg)

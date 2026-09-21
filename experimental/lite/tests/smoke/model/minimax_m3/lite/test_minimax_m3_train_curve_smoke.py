@@ -108,6 +108,7 @@ _PS_GROUP_ATTRS = ("tp_group", "ep_group", "etp_group", "cp_group", "pp_group", 
 def _reset_parallel_state(ps):
     """dist_opt initialises mcore's global parallel state per topology; tear it (and lite's groups) down between cases."""
     import torch.distributed as dist
+
     from megatron.core import parallel_state as mpu
 
     if mpu.is_initialized():

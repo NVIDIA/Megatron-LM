@@ -126,7 +126,10 @@ def _hf_grad_lookup(hf_grads: dict, mod: str) -> torch.Tensor:
 
 def _lite_grads_by_hf_name(model, cfg, ps) -> dict[str, torch.Tensor]:
     """Lite parameter gradients keyed by the HF *module* name (export path re-used on ``.grad``)."""
-    from megatron.lite.model.minimax_m3.lite.checkpoint import disk_to_module_name, export_hf_weights
+    from megatron.lite.model.minimax_m3.lite.checkpoint import (
+        disk_to_module_name,
+        export_hf_weights,
+    )
 
     params = list(model.named_parameters())
     saved = [p.data for _, p in params]
