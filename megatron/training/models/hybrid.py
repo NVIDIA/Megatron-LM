@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
     hybrid_inference_stack_spec,
@@ -51,6 +52,8 @@ class HybridModelConfig(ModelConfig):
 
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
+    engram_config: EngramConfig | None = None
+    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers."""
     fp16_lm_cross_entropy: bool = False
     logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
@@ -172,6 +175,19 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             )
         else:
             padded_vocab_size = self._model_config.vocab_size
+
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            # The padded vocabulary is only known here; the stack spec carries the memory to
+            # every transformer layer type, and TransformerLayer builds it only for the
+            # configured global layer numbers.
+            engram_config.validate_vocabulary(padded_vocab_size)
+            hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
+                hybrid_stack_spec,
+                engram_config,
+                self._model_config.hybrid_layer_pattern,
+                self._model_config.transformer,
+            )
 
         pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
         post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)

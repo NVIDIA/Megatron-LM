@@ -586,6 +586,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
+        decoder_extra_block_kwargs = {}
+        if self.config.engram_enabled:
+            # Checked here rather than in the Engram layers: every pipeline stage runs this,
+            # so an unsupported input fails the job instead of hanging the stages that do not
+            # own an Engram layer in their pipeline collectives.
+            if inference_context is not None:
+                raise ValueError("Engram does not support inference or generation.")
+            if input_ids is None:
+                raise ValueError("Engram requires input token IDs on every pipeline stage.")
+            decoder_extra_block_kwargs['input_ids'] = input_ids
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -602,6 +613,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask=padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **decoder_extra_block_kwargs,
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output

@@ -25,6 +25,8 @@ from megatron.training.utils.common_utils import (
     get_nvtx_range,
     has_nvrx_installed,
     has_nvrx_checkpointing_async_support,
+    prepare_tokens_for_pipeline,
+    get_pipeline_prefetched_tokens,
 )
 
 from megatron.training.utils.log_utils import append_to_progress_log

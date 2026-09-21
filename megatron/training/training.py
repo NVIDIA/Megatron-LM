@@ -15,6 +15,7 @@ import dataclasses
 import functools
 import gc
 import inspect
+import json
 import logging
 import math
 import os
@@ -76,6 +77,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
+    get_engram_config_overrides,
     get_megatron_optimizer,
     get_mup_config_overrides,
     get_standard_config_overrides,
@@ -167,7 +169,11 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
-from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
+from megatron.training.utils import (
+    is_gtp_remat_active,
+    is_hybrid_model,
+    prepare_tokens_for_pipeline,
+)
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -2790,6 +2796,14 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+    if getattr(args, "engram_enabled", False):
+        config_overrides.update(
+            get_engram_config_overrides(
+                config,
+                lr_multiplier=args.engram_embedding_lr_multiplier,
+                weight_decay=args.engram_embedding_weight_decay,
+            )
+        )
 
     return config, config_overrides
 
@@ -2918,6 +2932,7 @@ def setup_model_and_optimizer(
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
+    _report_engram_memory_state(model, None, "after_model_ddp")
 
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
@@ -2980,6 +2995,7 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        _report_engram_memory_state(model, optimizer, "after_optimizer_construction")
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
@@ -3240,6 +3256,274 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
+def _model_parameter_checksum(model):
+    """Return FP64 sum and square-sum checksums for all local model parameters."""
+    first_parameter = next(unwrap_model(model[0]).parameters())
+    checksum = torch.zeros(2, dtype=torch.float64, device=first_parameter.device)
+    for model_chunk in model:
+        for parameter in unwrap_model(model_chunk).parameters():
+            value = parameter.detach()
+            checksum[0] += value.sum(dtype=torch.float64)
+            checksum[1] += value.float().square().sum(dtype=torch.float64)
+    return checksum
+
+
+def _capture_engram_table_training_state(model):
+    """Capture scalar evidence before an Engram optimizer step.
+
+    A pipeline stage may legitimately own no Engram layer, so an empty snapshot list is a
+    valid capture; verification keeps its collectives symmetric across all ranks.
+    """
+    snapshots = []
+    for model_chunk in model:
+        for name, parameter in unwrap_model(model_chunk).named_parameters():
+            if not getattr(parameter, 'is_engram_embedding', False):
+                continue
+            gradient = getattr(parameter, 'main_grad', None)
+            if gradient is None:
+                gradient = parameter.grad
+            grad_square_sum = (
+                torch.zeros((), dtype=torch.float32, device=parameter.device)
+                if gradient is None
+                else gradient.detach().float().square().sum()
+            )
+            value = parameter.detach().float()
+            checksum = torch.stack((value.sum(), value.square().sum()))
+            snapshots.append((name, parameter, grad_square_sum, checksum))
+    return snapshots, _model_parameter_checksum(model)
+
+
+def _find_engram_main_parameter(optimizer_part, parameter):
+    """Locate the optimizer's main (master) parameter for a model parameter.
+
+    Supports the distributed optimizer (``model_param_group_index_map``), the mixed-precision
+    optimizer (``float16_groups`` -> ``fp32_from_float16_groups``), and FP32 training where the
+    model parameter is its own main parameter. Returns None when this optimizer part does not
+    own the parameter.
+    """
+    group_map = getattr(optimizer_part, "model_param_group_index_map", None)
+    if group_map is not None:
+        if parameter not in group_map:
+            return None
+        group_index, group_order = group_map[parameter]
+        return optimizer_part.optimizer.param_groups[group_index]["params"][group_order]
+
+    float16_groups = getattr(optimizer_part, "float16_groups", None)
+    if float16_groups is not None:
+        for group_index, group in enumerate(float16_groups):
+            for group_order, candidate in enumerate(group):
+                if candidate is parameter:
+                    return optimizer_part.fp32_from_float16_groups[group_index][group_order]
+        for group in getattr(optimizer_part, "fp32_from_fp32_groups", []):
+            for candidate in group:
+                if candidate is parameter:
+                    return parameter
+        return None
+
+    # FP32 optimizer: the model parameter is the main parameter.
+    for group in optimizer_part.optimizer.param_groups:
+        for candidate in group["params"]:
+            if candidate is parameter:
+                return parameter
+    return None
+
+
+def _report_engram_memory_state(model, optimizer, phase):
+    """Write exact rank-local Engram model and optimizer tensor bytes for profiling runs."""
+    args = get_args()
+    if (
+        not getattr(args, "record_memory_history", False)
+        or getattr(args, "engram_vocab_sizes", None) is None
+    ):
+        return
+
+    torch.cuda.synchronize()
+    rank = torch.distributed.get_rank()
+    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    group_names = ("tp", "pp", "ep", "dp_cp", "expt_dp")
+    topology = {
+        name: {
+            "size": get_pg_size(getattr(pg_collection, name, None)),
+            "rank": get_pg_rank(getattr(pg_collection, name, None)),
+        }
+        for name in group_names
+    }
+
+    optimizer_parts = []
+    if optimizer is not None:
+        optimizer_parts = getattr(optimizer, "chained_optimizers", [optimizer])
+
+    table_records = []
+    for model_chunk_id, model_chunk in enumerate(model):
+        for name, parameter in unwrap_model(model_chunk).named_parameters():
+            if not getattr(parameter, "is_engram_embedding", False):
+                continue
+
+            record = {
+                "name": f"model_chunk{model_chunk_id}.{name}",
+                "shape": list(parameter.shape),
+                "model_numel": parameter.numel(),
+                "model_bytes": parameter.numel() * parameter.element_size(),
+                "main_numel": 0,
+                "main_bytes": 0,
+                "optimizer_state_numel": {},
+                "optimizer_state_bytes": {},
+            }
+            for optimizer_part in optimizer_parts:
+                main_parameter = _find_engram_main_parameter(optimizer_part, parameter)
+                if main_parameter is None:
+                    continue
+                inner_optimizer = optimizer_part.optimizer
+                record["main_numel"] = main_parameter.numel()
+                record["main_bytes"] = main_parameter.numel() * main_parameter.element_size()
+                for state_name, state_value in inner_optimizer.state.get(
+                    main_parameter, {}
+                ).items():
+                    if isinstance(state_value, torch.Tensor):
+                        record["optimizer_state_numel"][state_name] = state_value.numel()
+                        record["optimizer_state_bytes"][state_name] = (
+                            state_value.numel() * state_value.element_size()
+                        )
+                break
+            table_records.append(record)
+
+    state_names = sorted(
+        {state_name for record in table_records for state_name in record["optimizer_state_bytes"]}
+    )
+    totals = {
+        "model_numel": sum(record["model_numel"] for record in table_records),
+        "model_bytes": sum(record["model_bytes"] for record in table_records),
+        "main_numel": sum(record["main_numel"] for record in table_records),
+        "main_bytes": sum(record["main_bytes"] for record in table_records),
+        "optimizer_state_numel": {
+            state_name: sum(
+                record["optimizer_state_numel"].get(state_name, 0) for record in table_records
+            )
+            for state_name in state_names
+        },
+        "optimizer_state_bytes": {
+            state_name: sum(
+                record["optimizer_state_bytes"].get(state_name, 0) for record in table_records
+            )
+            for state_name in state_names
+        },
+    }
+    cuda_memory = {
+        "allocated_bytes": torch.cuda.memory_allocated(),
+        "reserved_bytes": torch.cuda.memory_reserved(),
+        "max_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "max_reserved_bytes": torch.cuda.max_memory_reserved(),
+    }
+    # The report is written next to the snapshots and already names its own rank.
+    report_path = Path(args.memory_snapshot_path).with_name(f"engram_memory_rank-{rank}.jsonl")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "phase": phase,
+        "global_rank": rank,
+        "world_size": torch.distributed.get_world_size(),
+        "topology": topology,
+        "cuda_memory": cuda_memory,
+        "totals": totals,
+        "tables": table_records,
+    }
+    with report_path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(report, sort_keys=True) + "\n")
+    print(
+        "[Engram memory] "
+        f"rank={rank} phase={phase} ep_size={topology['ep']['size']} "
+        f"expert_dp_size={topology['expt_dp']['size']} "
+        f"model_bytes={totals['model_bytes']} main_bytes={totals['main_bytes']} "
+        f"optimizer_state_bytes={sum(totals['optimizer_state_bytes'].values())} "
+        f"allocated_bytes={cuda_memory['allocated_bytes']} "
+        f"reserved_bytes={cuda_memory['reserved_bytes']} "
+        f"max_allocated_bytes={cuda_memory['max_allocated_bytes']} "
+        f"max_reserved_bytes={cuda_memory['max_reserved_bytes']}",
+        flush=True,
+    )
+
+
+def _verify_engram_table_training_state(training_state, model, iteration):
+    """Verify Engram tables receive finite gradients and update during the optimizer step.
+
+    Every rank participates in every collective — including ranks whose pipeline stage owns no
+    Engram layer — so the check never desynchronizes the job. Failure conditions are global:
+    a non-finite gradient anywhere, a globally zero Engram gradient, or no table changing at
+    all. A single quiet shard (zero hash hits this step) is reported but is not an error.
+    """
+    snapshots, model_checksum_before = training_state
+    device = model_checksum_before.device
+    local_grad_square_sum = torch.zeros((), dtype=torch.float32, device=device)
+    local_table_checksums = torch.zeros(4, dtype=torch.float32, device=device)
+    local_num_tables = 0
+    local_zero_grad_tables = 0
+    local_nonfinite_tables = 0
+    local_changed_tables = 0
+    for _, parameter, grad_square_sum, old_checksum in snapshots:
+        value = parameter.detach().float()
+        new_checksum = torch.stack((value.sum(), value.square().sum()))
+        local_grad_square_sum += grad_square_sum
+        local_table_checksums[:2] += old_checksum
+        local_table_checksums[2:] += new_checksum
+        local_num_tables += 1
+        if not bool(torch.isfinite(grad_square_sum).item()):
+            local_nonfinite_tables += 1
+        elif grad_square_sum.item() == 0.0:
+            local_zero_grad_tables += 1
+        if not torch.equal(old_checksum, new_checksum):
+            local_changed_tables += 1
+
+    table_counts = torch.tensor(
+        [local_num_tables, local_zero_grad_tables, local_nonfinite_tables, local_changed_tables],
+        dtype=torch.int64,
+        device=device,
+    )
+    peak_memory = torch.tensor(torch.cuda.max_memory_allocated(), dtype=torch.int64, device=device)
+    model_checksums = torch.cat((model_checksum_before, _model_parameter_checksum(model)))
+    torch.distributed.all_reduce(local_grad_square_sum, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(local_table_checksums, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(model_checksums, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(table_counts, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(peak_memory, op=torch.distributed.ReduceOp.MAX)
+    global_grad_square_sum = local_grad_square_sum  # summed in place across all ranks above
+
+    # Each Engram table gradient is replicated across the dense-TP and expert-DP dimensions
+    # after gradient finalization, so undo the replication for an honest global norm.
+    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    replication = get_pg_size(pg_collection.tp) * get_pg_size(pg_collection.expt_dp)
+    global_grad_norm = (global_grad_square_sum / replication).sqrt().item()
+
+    num_tables, zero_grad_tables, nonfinite_tables, changed_tables = table_counts.tolist()
+    if torch.distributed.get_rank() == 0:
+        print(
+            "[Engram verify] "
+            f"iteration={iteration} global_grad_norm={global_grad_norm:.8e} "
+            f"num_tables={num_tables} zero_grad_tables={zero_grad_tables} "
+            f"nonfinite_tables={nonfinite_tables} changed_tables={changed_tables} "
+            f"table_sum_before={local_table_checksums[0].item():.8e} "
+            f"table_square_sum_before={local_table_checksums[1].item():.8e} "
+            f"table_sum_after={local_table_checksums[2].item():.8e} "
+            f"table_square_sum_after={local_table_checksums[3].item():.8e} "
+            f"model_sum_before={model_checksums[0].item():.16e} "
+            f"model_square_sum_before={model_checksums[1].item():.16e} "
+            f"model_sum_after={model_checksums[2].item():.16e} "
+            f"model_square_sum_after={model_checksums[3].item():.16e} "
+            f"peak_memory_bytes={peak_memory.item()}",
+            flush=True,
+        )
+    if num_tables == 0:
+        raise RuntimeError("Engram training verification found no sparse table parameters.")
+    if nonfinite_tables > 0:
+        raise RuntimeError(
+            f"Engram sparse-table verification failed: {nonfinite_tables} table shard(s) "
+            "received a non-finite gradient."
+        )
+    if global_grad_square_sum.item() == 0.0 or changed_tables == 0:
+        raise RuntimeError(
+            "Engram sparse-table verification failed: the global Engram gradient is zero or "
+            "no table shard changed during the optimizer step."
+        )
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -3337,6 +3621,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             scheduled_num_microbatches = get_num_microbatches()
 
+        # Every pipeline stage needs the raw token IDs, but only the first one reads the data
+        # iterator, so broadcast them down the pipeline before the schedule starts. Keep it in
+        # a separate name: the rerun state machine sanitizes `data_iterator` downstream and
+        # requires it to still be a RerunDataIterator.
+        forward_backward_data_iterator = data_iterator
+        if args.engram_enabled:
+            forward_backward_data_iterator = prepare_tokens_for_pipeline(
+                data_iterator,
+                scheduled_num_microbatches,
+                args.micro_batch_size,
+                args.seq_length,
+                mpu.get_pipeline_model_parallel_group(),
+                mpu.get_tensor_model_parallel_group(),
+            )
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -3352,7 +3651,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         with grad_context, _fb_cm:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
                 seq_length=args.seq_length,
@@ -3423,6 +3722,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    engram_training_state = (
+        _capture_engram_table_training_state(model) if args.engram_verify_training else None
+    )
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     _opt_cm = (
         span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
@@ -3430,10 +3732,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     )
     with _opt_cm as _opt_span:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        if engram_training_state is not None:
+            _verify_engram_table_training_state(engram_training_state, model, iteration + 1)
         if _opt_span is not None:
             _otel_set_attrs(_opt_span, {
                 "megatron.update_successful": bool(update_successful),
             })
+    if args.record_memory_history and (iteration == 0 or iteration + 1 == args.train_iters):
+        phase = "after_first_optimizer_step" if iteration == 0 else "after_steady_state"
+        _report_engram_memory_state(model, optimizer, phase)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -4888,7 +5195,14 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
-    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
+    nsys_nvtx_context = None  # reference to context for nsys profiling, so it can be cleaned up
+    standalone_nvtx_ranges = (
+        args.nvtx_ranges
+        and not args.profile
+        and (len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks)
+    )
+    if standalone_nvtx_ranges:
+        configure_nvtx_profiling(True)
     if (
         args.profile
         and (len(args.profile_ranks) == 0 or
@@ -5458,6 +5772,9 @@ def train(
         if should_exit:
             break
 
+    if standalone_nvtx_ranges:
+        configure_nvtx_profiling(False)
+
     # Early-exit paths (exit-duration / exit-interval / signal handler) sys.exit()
     # below before the normal-path logging, so record the train-loop finish time here.
     if should_exit:
@@ -5572,6 +5889,16 @@ def evaluate(
     args = get_args()
     timers = get_timers()
 
+    if (
+        args.engram_enabled
+        and process_non_loss_data_func is not None
+        and non_loss_data_func is None
+    ):
+        # This extra pass runs a last-rank-only forward, so the collective Engram token
+        # prefetch cannot be prepared for it. Raise on every rank so the job fails cleanly
+        # instead of hanging the peers at their next collective.
+        raise RuntimeError("Engram does not support process_non_loss_data_func evaluation.")
+
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
     step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
 
@@ -5660,6 +5987,16 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
+
+            if args.engram_enabled:
+                packed_data_iterator = prepare_tokens_for_pipeline(
+                    packed_data_iterator,
+                    scheduled_eval_num_microbatches,
+                    eval_micro_batch_size,
+                    args.seq_length,
+                    mpu.get_pipeline_model_parallel_group(),
+                    mpu.get_tensor_model_parallel_group(),
+                )
 
             ft_integration.on_eval_step_start()
 
