@@ -71,6 +71,8 @@ class HybridStackSubmodules:
     csa_qk_layernorm_layer: ModuleSpec | type | None = None
     mla_layer: Union[ModuleSpec, type] = IdentityOp
     mla_fused_down_proj_layer: ModuleSpec | None = None
+    qsa_layer: ModuleSpec | type | None = None
+    qsa_qk_layernorm_layer: ModuleSpec | type | None = None
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -283,6 +285,28 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                    )
+                elif type(layer_config) is layer_utils.QSALayerConfig:
+                    # Qwen Sparse Attention (GQA + block-sparse indexer mask).
+                    qsa_layer_spec = (
+                        submodules.qsa_qk_layernorm_layer
+                        if layer_config.qk_layernorm
+                        else submodules.qsa_layer
+                    )
+                    assert qsa_layer_spec is not None, (
+                        "Hybrid pattern contains a 'Q' (QSA) layer but the stack spec does not "
+                        "provide a QSA layer spec. Use a stack spec that wires qsa_layer / "
+                        "qsa_qk_layernorm_layer."
+                    )
+                    layer = build_module(
+                        qsa_layer_spec,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     layer = build_module(

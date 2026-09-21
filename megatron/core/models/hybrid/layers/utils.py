@@ -8,6 +8,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layer_config i
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import (
+    QSALayerConfig,
+)
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,6 +27,7 @@ class Symbols:
     HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
     MLA = "+"
     WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0)
+    QSA = "Q"  # Qwen Sparse Attention (GQA-based block-sparse attention; not MLA-family)
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
@@ -37,12 +41,19 @@ class Symbols:
         HCA: CSALayerConfig,
         MLA: MLALayerConfig,
         WINDOW: CSALayerConfig,
+        QSA: QSALayerConfig,
         MLP: MLPLayerConfig,
         MOE: MoELayerConfig,
     }
     DSV4_COMPRESS_RATIO_MAP = {CSA: 4, HCA: 128, WINDOW: 0}
     MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
-    ATTENTION_LAYER_CONFIGS = {AttentionLayerConfig, DSALayerConfig, CSALayerConfig, MLALayerConfig}
+    ATTENTION_LAYER_CONFIGS = {
+        AttentionLayerConfig,
+        DSALayerConfig,
+        CSALayerConfig,
+        MLALayerConfig,
+        QSALayerConfig,
+    }
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:

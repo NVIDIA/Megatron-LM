@@ -3566,8 +3566,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
 
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and active indexer modules (CSA or QSA) for loss logging."""
     tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
+
+    if (getattr(args, "qsa_indexer_loss_coeff", None) or 0) > 0:
+        # QSA carries exactly one indexer per 'Q' layer of the hybrid pattern. QSA is
+        # hybrid-only, so without a pattern there is nothing to count and the logger
+        # falls back to counting whatever reported a loss.
+        if args.hybrid_layer_pattern is None:
+            return tracker_layers, None
+        return tracker_layers, (args.hybrid_layer_pattern.count("Q") or None)
+
     if args.csa_compress_ratios is None:
         return tracker_layers, None
 
@@ -3865,7 +3874,9 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    dsa_loss_on = args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0
+    qsa_loss_on = (getattr(args, "qsa_indexer_loss_coeff", None) or 0) > 0
+    if dsa_loss_on or qsa_loss_on:
         indexer_loss_scale = 1 / get_num_microbatches()
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             assert pg_collection.has_language_model(), (

@@ -53,6 +53,12 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa import (
+    QSAIndexer,
+    QSAIndexerSubmodules,
+    QSASelfAttention,
+    QSASelfAttentionSubmodules,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -94,6 +100,42 @@ _csa_indexer = partial(
     ),
 )
 _csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+
+# QSA (Qwen Sparse Attention). The indexer consumes the same post-input-layernorm hidden
+# states as the main q/k/v projections (HF semantics), so the input layernorm stays
+# unfused (``fuse_input_layernorm=False`` + a separate ``input_layernorm=TENorm``) and
+# ``linear_qkv`` is a plain column-parallel linear rather than the fused-LN form.
+_qsa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+_qsa_indexer = ModuleSpec(
+    module=QSAIndexer,
+    submodules=QSAIndexerSubmodules(
+        index_qk_proj=TELinear, q_layernorm=_qsa_qk_norm, k_layernorm=_qsa_qk_norm
+    ),
+)
+
+
+def _qsa_layer_spec(qk_layernorm: bool) -> ModuleSpec:
+    qk_norm = _qsa_qk_norm if qk_layernorm else IdentityOp
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm,
+            self_attention=ModuleSpec(
+                module=QSASelfAttention,
+                params={"attn_mask_type": AttnMaskType.arbitrary},
+                submodules=QSASelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=qk_norm,
+                    k_layernorm=qk_norm,
+                    indexer=_qsa_indexer,
+                ),
+                metainfo={"fuse_input_layernorm": False},
+            ),
+            self_attn_bda=get_bias_dropout_add,
+        ),
+    )
 
 
 # MTP block spec - provides norms and projection only.
@@ -333,6 +375,8 @@ hybrid_stack_spec = ModuleSpec(
         # Started with spec from gpt_layer_specs.py
         # Using the TE spec because we had problems getting the non-TE spec
         # working
+        qsa_layer=_qsa_layer_spec(qk_layernorm=False),
+        qsa_qk_layernorm_layer=_qsa_layer_spec(qk_layernorm=True),
         mlp_layer=ModuleSpec(
             module=MLPLayer,
             submodules=TransformerLayerSubmodules(

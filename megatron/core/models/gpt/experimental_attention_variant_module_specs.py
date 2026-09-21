@@ -14,6 +14,9 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant import (
+    qsa_module_specs as qsa_specs,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -148,6 +151,8 @@ def get_experimental_attention_variant_module_spec(
         return dsv4_hybrid_specs.get_dsv4_hybrid_module_spec_for_backend(
             config=config, backend=backend
         )
+    elif config.experimental_attention_variant == "qsa":
+        return qsa_specs.get_qsa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"

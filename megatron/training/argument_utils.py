@@ -350,7 +350,13 @@ def core_transformer_config_from_args(args, config_class=None):
         has_dsv4_attention = any(
             symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
         )
+        has_qsa = Symbols.QSA in pattern
         variant = getattr(args, 'experimental_attention_variant', None)
+        if has_dsv4_attention and has_qsa:
+            raise ValueError(
+                "Hybrid pattern mixes DSv4 C/H/W attention with QSA 'Q' layers, which require "
+                f"different experimental_attention_variant values: {pattern!r}."
+            )
         if has_dsv4_attention:
             if variant not in (None, 'dsv4_hybrid'):
                 raise ValueError(
@@ -358,6 +364,15 @@ def core_transformer_config_from_args(args, config_class=None):
                     f"got {variant!r} for pattern {pattern!r}."
                 )
             kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+        elif has_qsa:
+            # 'Q' runs Qwen Sparse Attention, which needs the 'qsa' contract (GQA-only,
+            # indexer budget/compress-ratio validation) to run in transformer_config.
+            if variant not in (None, 'qsa'):
+                raise ValueError(
+                    "Hybrid 'Q' attention requires experimental_attention_variant='qsa', "
+                    f"got {variant!r} for pattern {pattern!r}."
+                )
+            kw_args['experimental_attention_variant'] = 'qsa'
         elif variant is None and Symbols.DS_ATTENTION in pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
 

@@ -325,9 +325,11 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net', 'qsa']
     ] = None
-    """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
+    """Type of attention variant to use. Supports gdn, gdn2, dsa, dsv4_hybrid, and qsa.
+    'qsa' is the GQA-based Qwen Sparse Attention variant (streaming indexer + block-granular
+    sparse selection); it also selects the layer built for hybrid pattern symbol 'Q'.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
     channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
     Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
@@ -401,6 +403,43 @@ class TransformerConfig(ModelParallelConfig):
     csa_dense_mode: bool = False
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
+
+    ####################
+    # QSA (Qwen Sparse Attention)
+    ####################
+    qsa_indexer_n_heads: int = 4
+    """Number of QSA indexer query heads (MQA over one shared index key head)."""
+
+    qsa_indexer_head_dim: int = 128
+    """Dimension per QSA indexer head (query heads and the shared key head)."""
+
+    qsa_indexer_budget: int = 2048
+    """QSA token budget: number of KV tokens each query attends to through block
+    selection. Selected block count is ``qsa_indexer_budget // qsa_indexer_compress_ratio``.
+    Sequences no longer than the budget degenerate to dense causal attention."""
+
+    qsa_indexer_compress_ratio: int = 4
+    """QSA block size in tokens: index keys are mean-pooled (parameter-free) over
+    fixed, causal-prefix-aligned groups of this many tokens; selection is block-granular."""
+
+    qsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the QSA indexer sparse-KL distillation loss (teacher = the main
+    attention distribution aggregated to blocks, normalized over the selected block set
+    only). None or 0 disables indexer training."""
+
+    qsa_use_sparse_attention: bool = False
+    """Use the sparse GQA Triton kernel path (gathered block-sparse attention over the
+    selected 4-token blocks; supports BSHD and packed THD). When False, the dense-mask
+    bridge is used: the selection is materialized as a [b, s, s] bool mask fed to dense
+    core attention — functionally identical, no sparsity speedup, BSHD only."""
+
+    qsa_cp_packing_layout: Literal["per_document", "per_sequence"] = "per_document"
+    """How packed THD batches are zigzag-sharded across context-parallel ranks for QSA.
+    'per_document' splits every document independently into 2*cp chunks (each document
+    length must divide 2*cp); 'per_sequence' zigzags the flattened pack (what
+    per-sequence balancing / inter-document masking dataloaders produce). This is a
+    caller contract — both layouts are legal for the same cu_seqlens and cannot be
+    inferred. Ignored for cp=1 and for BSHD inputs."""
 
     ####################
     # linear attention
@@ -1779,6 +1818,61 @@ class TransformerConfig(ModelParallelConfig):
                         "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
             self.hetereogenous_dist_checkpoint = True
+
+        elif self.experimental_attention_variant == "qsa":
+            if self.multi_latent_attention:
+                raise ValueError(
+                    "QSA is GQA-based and is incompatible with multi_latent_attention."
+                )
+            if self.qsa_indexer_compress_ratio < 1:
+                raise ValueError(
+                    "qsa_indexer_compress_ratio must be positive, got "
+                    f"{self.qsa_indexer_compress_ratio}."
+                )
+            if (
+                self.qsa_indexer_budget < 1
+                or self.qsa_indexer_budget % self.qsa_indexer_compress_ratio != 0
+            ):
+                raise ValueError(
+                    f"qsa_indexer_budget ({self.qsa_indexer_budget}) must be a positive "
+                    f"multiple of qsa_indexer_compress_ratio ({self.qsa_indexer_compress_ratio})."
+                )
+            if self.qsa_indexer_n_heads < 1 or self.qsa_indexer_head_dim < 1:
+                raise ValueError(
+                    "qsa_indexer_n_heads and qsa_indexer_head_dim must be positive, got "
+                    f"{self.qsa_indexer_n_heads} and {self.qsa_indexer_head_dim}."
+                )
+            if self.qsa_indexer_loss_coeff is not None and self.qsa_indexer_loss_coeff < 0:
+                raise ValueError(
+                    f"qsa_indexer_loss_coeff must be non-negative, got "
+                    f"{self.qsa_indexer_loss_coeff}."
+                )
+            # Note: the indexer reuses the main attention's rotary frequencies. Their dim
+            # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
+            # dim; this is asserted at runtime in QSAIndexer.forward.
+            if self.qsa_cp_packing_layout not in ("per_document", "per_sequence"):
+                raise ValueError(
+                    "qsa_cp_packing_layout must be 'per_document' or 'per_sequence', got "
+                    f"{self.qsa_cp_packing_layout!r}."
+                )
+            if self.context_parallel_size > 1:
+                # QSA CP is allgather-only: the indexer all-gathers the shared raw index
+                # key head and the sparse path all-gathers K/V; queries stay local at
+                # their zigzag positions. Ring (p2p) attention is not implemented.
+                if not self.qsa_use_sparse_attention:
+                    raise ValueError(
+                        "QSA with context parallelism requires qsa_use_sparse_attention=True "
+                        "(the dense-mask bridge is single-rank only)."
+                    )
+                cp_comm_types = (
+                    self.cp_comm_type if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                if any(c not in (None, "all_gather", "allgather") for c in cp_comm_types):
+                    raise ValueError(
+                        "QSA context parallelism supports cp_comm_type='all_gather' only, "
+                        f"got {self.cp_comm_type!r}."
+                    )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling

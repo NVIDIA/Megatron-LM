@@ -25,6 +25,9 @@ from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import (
+    QSALayerConfig,
+)
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
 )
@@ -41,6 +44,7 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
     Symbols.HCA: CSALayerConfig,
     Symbols.MLA: MLALayerConfig,
     Symbols.WINDOW: CSALayerConfig,
+    Symbols.QSA: QSALayerConfig,
     Symbols.MLP: MLPLayerConfig,
     Symbols.MOE: MoELayerConfig,
 }
@@ -459,6 +463,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -474,6 +479,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 1,
             'E': 1,
+            'Q': 0,
             'W': 0,
         }
         assert get_hybrid_layer_counts("MGD-E") == {
@@ -486,6 +492,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 1,
             'E': 1,
+            'Q': 0,
             'W': 0,
         }
         assert get_hybrid_layer_counts("MG+-E") == {
@@ -498,6 +505,7 @@ class TestGetHybridLayerCounts:
             '+': 1,
             '-': 1,
             'E': 1,
+            'Q': 0,
             'W': 0,
         }
 
@@ -513,6 +521,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
@@ -525,6 +534,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 4,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -540,6 +550,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -556,6 +567,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 4,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -570,6 +582,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 2,
+            'Q': 0,
             'W': 0,
         }
 
@@ -585,6 +598,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -599,6 +613,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -614,6 +629,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -628,6 +644,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -642,6 +659,7 @@ class TestGetHybridLayerCounts:
             '+': 2,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -656,6 +674,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
