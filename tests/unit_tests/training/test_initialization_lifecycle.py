@@ -298,8 +298,10 @@ def test_missing_tokenizer_vocabulary_fails_before_model_construction(adapter):
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
 @pytest.mark.parametrize("raw_vocab", [None, 133])
+@pytest.mark.parametrize("padded_vocab_present", [False, True])
+@pytest.mark.parametrize("vocab_kwargs", [{}, {"vocab_size_from_tokenizer": True}])
 def test_tokenizer_vocabulary_is_authoritative_when_padding(
-    monkeypatch, isolated_globals, adapter, raw_vocab
+    monkeypatch, isolated_globals, adapter, raw_vocab, padded_vocab_present, vocab_kwargs
 ):
     """Tokenizer metadata/special tokens may differ from an optional CLI size."""
     from megatron.core.tokenizers import MegatronTokenizer
@@ -312,13 +314,16 @@ def test_tokenizer_vocabulary_is_authoritative_when_padding(
     args.vocab_size = raw_vocab
     args.tensor_model_parallel_size = 2
     args.make_vocab_size_divisible_by = 128
+    if not padded_vocab_present:
+        # YAML namespaces do not inherit argparse's None default for this field.
+        del args.padded_vocab_size
     tokenizer = SimpleNamespace(vocab_size=261)
     factory = Mock(return_value=tokenizer)
     monkeypatch.setattr(MegatronTokenizer, "from_pretrained", factory)
     model = adapter(
         args,
         config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
-        vocab_size_from_tokenizer=True,
+        **vocab_kwargs,
     )
     assert model.vocab_size is None
     factory.assert_not_called()
@@ -362,9 +367,7 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     checkpointing.load_args_from_checkpoint(args)
     assert args.iteration == 17
     model = adapter(
-        args,
-        config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
-        vocab_size_from_tokenizer=True,
+        args, config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     )
     assert model.vocab_size == expected
     cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
@@ -379,16 +382,24 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
-def test_known_unpadded_vocabulary_needs_no_tokenizer_for_config(adapter):
+@pytest.mark.parametrize("padded_vocab_present", [False, True])
+@pytest.mark.parametrize(
+    "pad_vocab,vocab_kwargs", [(False, {}), (True, {"vocab_size_from_tokenizer": False})]
+)
+def test_known_unpadded_vocabulary_needs_no_tokenizer_for_config(
+    adapter, padded_vocab_present, pad_vocab, vocab_kwargs
+):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.vocab_size = 133
-    args.pad_vocab_size = False
+    args.pad_vocab_size = pad_vocab
+    if not padded_vocab_present:
+        del args.padded_vocab_size
     model = adapter(
         args,
         config=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
-        vocab_size_from_tokenizer=True,
+        **vocab_kwargs,
     )
     assert model.vocab_size == 133
     # Preserve the existing model-builder padding policy for raw vocabulary.
