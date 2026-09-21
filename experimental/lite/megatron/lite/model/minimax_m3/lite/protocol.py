@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import warnings
+
 import torch
 import torch.nn as nn
 
@@ -257,6 +259,14 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         local_blocks=model_cfg.index_local_blocks,
     )
     magi_msa.validate_device()
+    if impl_cfg.deterministic and impl_cfg.magi_dense_kernel_backend == "fa4":
+        warnings.warn(
+            "ImplConfig.deterministic=True orders the msa_v1 (MSA layer) backward, but the dense layers' "
+            "fa4 calc_attn backward stays unordered (Magi: 'FA4 backend is not compatible with deterministic "
+            "mode'); runs are not bitwise reproducible end to end. Use magi_dense_kernel_backend='sdpa_ol' "
+            "(O(S^2) memory, short sequences only) for a fully deterministic run.",
+            stacklevel=2,
+        )
     magi_settings = magi_msa.MagiMsaSettings(
         chunk_size=impl_cfg.magi_chunk_size,
         high_precision_reduce=impl_cfg.magi_high_precision_reduce,

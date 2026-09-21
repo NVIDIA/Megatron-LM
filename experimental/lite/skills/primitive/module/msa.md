@@ -64,7 +64,8 @@ def msa(task, implementation, config, reference, budget):
              "magi: bf16-only kernels (bf16-level agreement with flex, not the fp32 gate); indexer freeze must be requires_grad=False + no_grad "
              "(kl_loss_coeff=0 is not a freeze) and is asserted bitwise after training; last_block_indices is None; a new cu_seqlens "
              "re-plans the runtime on the host (LRU 16, MAGI_MSA_RUNTIME_CACHE_SIZE); padding up to chunk*cp-1 tokens; "
-             "recompute core_attn re-runs Magi's forward communication; dense layers run native calc_attn on FA4 (flash_attn_cute, cutlass-dsl 4.5.2); the pure-torch sdpa_ol backend is test-only (OOM beyond ~8K)"]
+             "recompute core_attn re-runs Magi's forward communication; dense layers run native calc_attn on FA4 (flash_attn_cute, cutlass-dsl 4.5.2); the pure-torch sdpa_ol backend is test-only (OOM beyond ~8K)",
+             "deterministic=True (ImplConfig -> MagiMsaSettings -> MsaConfig; Magi-MSA >= c829982): ordered msa_v1 backward, MSA path bitwise reproducible at CP1/2/4 (kernel bwd ~4x, all-MSA step ~1.5x); the dense layers' fa4 backward stays unordered, so full-model bitwise needs dense sdpa_ol"]
     if not validation.done:
         return blocked("MSA validation failed", evidence=validation)
     return done(principle=principle, implementation_contract=implementation_contract,
