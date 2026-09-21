@@ -273,7 +273,8 @@ def _log_comparison_errors(
         np.divide(
             absolute_error, np.abs(golden.astype(np.float64)), out=relative_error, where=golden != 0
         )
-    relative_error[finite & (absolute_error == 0)] = 0
+    # Define an exact zero/zero match as zero relative error.
+    relative_error[finite & (golden == 0) & (actual == 0)] = 0
 
     outside_tolerance = np.flatnonzero(~is_close)
     logger.info(
@@ -292,16 +293,17 @@ def _log_comparison_errors(
     samples = {}
     finite_indices = np.flatnonzero(finite)
     if len(finite_indices):
-        samples["max_absolute_error"] = int(finite_indices[np.argmax(absolute_error[finite])])
+        index = int(finite_indices[np.argmax(absolute_error[finite])])
+        samples[index] = ["max_absolute_error"]
     relative_indices = np.flatnonzero(finite & ~np.isnan(relative_error))
     if len(relative_indices):
-        samples["max_relative_error"] = int(
-            relative_indices[np.argmax(relative_error[relative_indices])]
-        )
-    if len(outside_tolerance) and outside_tolerance[0] not in samples.values():
-        samples["first_outside_tolerance"] = int(outside_tolerance[0])
+        index = int(relative_indices[np.argmax(relative_error[relative_indices])])
+        samples.setdefault(index, []).append("max_relative_error")
+    if len(outside_tolerance) and outside_tolerance[0] not in samples:
+        samples[int(outside_tolerance[0])] = ["first_outside_tolerance"]
 
-    for label, index in samples.items():
+    value_format = ".5f" if precision == ValuePrecision.ROUNDED_5_DECIMAL_PLACES else ".17g"
+    for index, labels in samples.items():
         if not finite[index]:
             abs_text = rel_text = allowed_text = "n/a (non-finite or missing)"
         else:
@@ -313,12 +315,12 @@ def _log_comparison_errors(
             )
             allowed_text = f"{test.atol + test.rtol * abs(float(golden[index])):.9g}"
         logger.info(
-            "  %s at %s: golden=%.17g, actual=%.17g, absolute_error=%s, "
+            "  %s at %s: golden=%s, actual=%s, absolute_error=%s, "
             "relative_error=%s, allowed_absolute_error=%s",
-            label,
+            ", ".join(labels),
             steps[index],
-            golden[index],
-            actual[index],
+            format(golden[index], value_format),
+            format(actual[index], value_format),
             abs_text,
             rel_text,
             allowed_text,
@@ -453,6 +455,8 @@ def pipeline(
                     passing,
                 )
                 if not passing:
+                    logger.info("Actual values: %s", actual_value_list)
+                    logger.info("Golden values: %s", golden_value_list)
                     raise test.error_message(metric_name)
 
                 result = f"{test.type_of_test_result.name} test for metric {metric_name}: PASSED"

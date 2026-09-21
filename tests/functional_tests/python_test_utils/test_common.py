@@ -454,6 +454,7 @@ class TestGoldenErrorDiagnostics:
         assert "max_relative_error at 30:" in caplog.text
         assert "absolute_error=0.01, relative_error=1 (100%)" in caplog.text
         assert "allowed_absolute_error=0" in caplog.text
+        assert "first_outside_tolerance" not in caplog.text
 
     def test_reports_small_difference_that_passes_tolerance(self, caplog):
         caplog.set_level("INFO", logger=common.__name__)
@@ -519,8 +520,33 @@ class TestGoldenErrorDiagnostics:
                 {"loss": [DeterministicTest()]},
             )
 
-        assert "max_absolute_error at 10:" in caplog.text
+        assert "max_absolute_error, max_relative_error at 10:" in caplog.text
         assert "first_outside_tolerance at 5:" in caplog.text
+        assert "absolute_error=n/a (non-finite or missing)" in caplog.text
+
+    def test_single_sample_extrema_share_one_precision_appropriate_row(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError):
+            run(
+                {"loss": make_metric({5: 10.83456})},
+                {"loss": make_metric({5: 10.83457})},
+                {"loss": [ApproximateTest(atol=0, rtol=0)]},
+            )
+        assert caplog.text.count(" at 5: golden=") == 1
+        assert "max_absolute_error, max_relative_error at 5:" in caplog.text
+        assert "golden=10.83456, actual=10.83457," in caplog.text
+        assert "Actual values: [10.83457]" in caplog.text
+        assert "Golden values: [10.83456]" in caplog.text
+
+    def test_legacy_golden_placeholder_retains_undefined_diagnostics(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError):
+            run(
+                {"loss": make_metric({5: "nan", 10: 1.0})},
+                {"loss": make_metric({5: 0.9, 10: 1.0})},
+                {"loss": [DeterministicTest()]},
+            )
+        assert "first_outside_tolerance at 5: golden=inf" in caplog.text
         assert "absolute_error=n/a (non-finite or missing)" in caplog.text
 
     def test_full_precision_error_is_not_rounded_away(self, caplog):
@@ -557,7 +583,7 @@ class TestGoldenErrorDiagnostics:
         )
 
         assert "[APPROXIMATE]: PASSED; 1/100 samples outside tolerance" in caplog.text
-        assert "max_absolute_error at 100:" in caplog.text
+        assert "max_absolute_error, max_relative_error at 100:" in caplog.text
 
     def test_timing_error_is_labelled_as_a_median(self, caplog):
         caplog.set_level("INFO", logger=common.__name__)
@@ -568,7 +594,9 @@ class TestGoldenErrorDiagnostics:
                 {"iteration-time": [ApproximateTest(rtol=0.05)]},
             )
 
-        assert "max_absolute_error at median over steps 5, 10, 15:" in caplog.text
+        assert (
+            "max_absolute_error, max_relative_error at median over steps 5, 10, 15:" in caplog.text
+        )
         assert "absolute_error=0.25, relative_error=1 (100%)" in caplog.text
         assert "precision=full" in caplog.text
 
