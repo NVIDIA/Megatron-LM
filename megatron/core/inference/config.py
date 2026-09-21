@@ -284,9 +284,9 @@ class ImageProcessingConfig:
     num_img_embeddings_per_tile: int = 0
     dynamic_resolution_model_length: Optional[int] = None
     """Model-length budget used by processors that divide capacity across images."""
-    dynamic_resolution_rounding_mode: str = "ceil"
+    dynamic_resolution_rounding_mode: Literal["ceil", "round_plus_half"] = "ceil"
     """Patch-grid rounding contract: ``ceil`` or ``round_plus_half``."""
-    dynamic_resolution_resize_mode: str = "pil"
+    dynamic_resolution_resize_mode: Literal["pil", "torch_bicubic_antialias"] = "pil"
     """Resize contract: ``pil`` or ``torch_bicubic_antialias``."""
 
     def __post_init__(self):
