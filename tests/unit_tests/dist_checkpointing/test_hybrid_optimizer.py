@@ -82,7 +82,7 @@ class HybridOptimizerModel(torch.nn.Module):
     'checkpoint_format', ['dp_reshardable', 'fully_reshardable', 'dp_zero_gather_scatter', 'torch']
 )
 def test_hybrid_checkpoint_continuation(
-    tmp_path_dist_ckpt, precision_aware: bool, mixed: bool, checkpoint_format: str
+    tmp_path_dist_ckpt, monkeypatch, precision_aware: bool, mixed: bool, checkpoint_format: str
 ) -> None:
     """Restore step two and compare all owner states after steps three through five."""
     if Utils.world_size < 2 or Utils.world_size % 2:
@@ -159,6 +159,10 @@ def test_hybrid_checkpoint_continuation(
             if checkpoint_format == 'torch':
                 args.ckpt_format = 'torch'
                 args.use_dist_ckpt = False
+                # Only unpickle the checkpoint created by this test. Legacy Torch
+                # checkpoints include Namespace/RNG objects, not just tensor weights.
+                monkeypatch.delenv('TORCH_FORCE_WEIGHTS_ONLY_LOAD', raising=False)
+                monkeypatch.setenv('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
             args.optimizer_cpu_offload = True
             args.optimizer_offload_fraction = 0.5
             args.overlap_cpu_optimizer_d2h_h2d = True
