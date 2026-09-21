@@ -845,7 +845,11 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size=local_cp_size,
         cp_group=cp_group,
         cp_partition_mode=cp_partition_mode,
-        pad_between_seqs=True,
+        # Only claim padding between sequences when the padded boundaries differ from
+        # the real ones: TE's FlashAttention and unfused backends reject THD inputs
+        # flagged as padded, which would leave models without a cuDNN-eligible head
+        # size (e.g. head_dim 256) with no attention backend at all.
+        pad_between_seqs=not torch.equal(cu_seqlens, cu_seqlens_padded),
     )
 
     # Dummy metadata is appended after CP slicing as an ordinary sequence.
