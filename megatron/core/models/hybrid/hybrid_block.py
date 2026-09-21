@@ -823,6 +823,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         if mhc_recompute_manager is None:
             mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
+        # The n-gram memory is added to the n-stream tensor *before* the read gate, mirroring
+        # HyperConnectionTransformerLayer on the GPT path: its output belongs to the residual
+        # streams, not to the wrapped layer's branch delta. The wrapper has to do it because
+        # both inner paths below bypass that part of TransformerLayer.forward -- the fast path
+        # calls the sublayer helpers directly, and the fallback path is told to skip it via
+        # _called_from_hybrid_mhc_wrapper.
+        if getattr(self.inner_layer, "engram", None) is not None:
+            hidden_states = self.inner_layer._maybe_apply_engram(
+                hidden_states, input_ids, packed_seq_params
+            )
+
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
@@ -1098,6 +1109,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -1118,6 +1130,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
@@ -1128,6 +1141,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )

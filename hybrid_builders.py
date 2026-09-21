@@ -1,5 +1,6 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
+from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
@@ -25,9 +26,8 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     # _dim == v_head_dim). Apply it for any DSv4 MLA attention: experimental_attention_variant
     # == dsv4_hybrid, OR the layer pattern uses a DSv4 attention symbol (D/C/H/W). Idempotent.
     _pattern = getattr(args, "hybrid_layer_pattern", None) or ""
-    _uses_dsv4_attn = (
-        getattr(args, "experimental_attention_variant", None) == "dsv4_hybrid"
-        or any(sym in _pattern for sym in ("C", "H", "W"))
+    _uses_dsv4_attn = getattr(args, "experimental_attention_variant", None) == "dsv4_hybrid" or any(
+        sym in _pattern for sym in ("C", "H", "W")
     )
     if _uses_dsv4_attn:
         derived = config.v_head_dim - config.qk_pos_emb_head_dim
@@ -74,6 +74,13 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
             hybrid_stack_spec = hybrid_stack_spec(config)
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
+
+    engram_config = EngramConfig.from_args(args, config)
+    if engram_config is not None:
+        engram_config.validate_vocabulary(args.padded_vocab_size)
+        hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
+            hybrid_stack_spec, engram_config, args.hybrid_layer_pattern, config
+        )
 
     model = HybridModel(
         config=config,

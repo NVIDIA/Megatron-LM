@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
 
+from megatron.core.models.engram import EngramConfig, apply_engram_to_layer_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
@@ -160,6 +161,8 @@ class GPTModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.gpt.GPTModelBuilder"
     transformer: TransformerConfig
     transformer_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
+    engram_config: EngramConfig | None = None
+    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers."""
 
     ### vocab padding related ###
     vocab_size: int | None = None
@@ -315,6 +318,15 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             )
         else:
             padded_vocab_size = self._model_config.vocab_size
+
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            # The padded vocabulary is only known here; MTP layers ignore the submodule
+            # because TransformerLayer skips Engram construction for them.
+            engram_config.validate_vocabulary(padded_vocab_size)
+            transformer_layer_spec = apply_engram_to_layer_spec(
+                transformer_layer_spec, engram_config
+            )
 
         mtp_spec = mtp_block_spec(self._model_config, transformer_layer_spec, vp_stage=vp_stage)
 
