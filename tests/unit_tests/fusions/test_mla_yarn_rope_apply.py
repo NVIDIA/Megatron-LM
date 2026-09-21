@@ -22,6 +22,7 @@ try:
         fused_mla_rope_kv_backward_out,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
+        fused_mla_rope_q_out,
         fused_mla_rope_q_backward_inplace,
     )
 except Exception:
@@ -30,6 +31,7 @@ except Exception:
     fused_mla_rope_kv_backward_out = None
     fused_mla_rope_kv_split = None
     fused_mla_rope_out_of_place = None
+    fused_mla_rope_q_out = None
     fused_mla_rope_q_backward_inplace = None
 
 
@@ -606,7 +608,6 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
         for allocator in allocators:
             allocator.close()
         pytest.skip(f"VMM-localized rotary outputs are unavailable: {exc}")
-    q_localized.copy_(q_seed)
 
     ordinary_inputs = [
         q_ordinary.view(seqlen, -1),
@@ -677,6 +678,7 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
 
     @torch.no_grad()
     def localized_rotary():
+        fused_mla_rope_q_out(q_seed, q_localized, cos, sin, nope_dim, emb_dim)
         parent_stream = torch.cuda.current_stream(device)
         fork_event, join_events = rotary_events()
         fork_event.record(parent_stream)
@@ -686,15 +688,6 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
             row_end = row_start + rows_per_domain
             stream.wait_event(fork_event)
             with torch.cuda.stream(stream):
-                # Q RoPE is in-place, so its upstream buffer must already be
-                # VMM-backed. KV reads ordinary memory and writes each VMM half.
-                fused_mla_rope_inplace(
-                    q_localized[row_start:row_end],
-                    cos[row_start:row_end],
-                    sin[row_start:row_end],
-                    nope_dim,
-                    emb_dim,
-                )
                 fused_mla_rope_kv_split(
                     kv[row_start:row_end],
                     k_pos_emb[row_start:row_end],
@@ -750,7 +743,6 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
     localized_pipeline_ms = _benchmark_ms(localized_pipeline_fn)
 
     q_ordinary.copy_(q_seed)
-    q_localized.copy_(q_seed)
     ordinary_pipeline_fn()
     localized_pipeline_fn()
     torch.cuda.synchronize()
@@ -1101,6 +1093,49 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)
 
     inverse_output.backward(torch.randn_like(inverse_output).contiguous())
     torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not _localization_available(), reason="CUDA localization is unavailable")
+def test_q_rope_reads_ordinary_input_and_writes_vmm_output():
+    """The localized Q kernel must preserve its ordinary input."""
+    from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
+
+    assert fused_mla_rope_q_out is not None
+    seqlen = 1024
+    num_heads = 32
+    nope_dim = 128
+    emb_dim = 64
+    dtype = torch.bfloat16
+    shape = (seqlen, 1, num_heads, nope_dim + emb_dim)
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    freqs, mscale = yarn_rope(seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    input_tensor = torch.randn(shape, dtype=dtype, device="cuda", requires_grad=True)
+    original_input = input_tensor.detach().clone()
+    reference_input = original_input.clone().requires_grad_(True)
+    reference = fused_mla_rope_inplace(reference_input, cos, sin, nope_dim, emb_dim)
+
+    allocator = VMMRowSplitAllocator("cuda")
+    try:
+        output_buffer = allocator.allocate(shape, dtype)
+        output = fused_mla_rope_q_out(
+            input_tensor, output_buffer, cos, sin, nope_dim, emb_dim
+        )
+        grad = torch.randn_like(output)
+        reference.backward(grad)
+        output.backward(grad)
+
+        torch.testing.assert_close(input_tensor, original_input, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(output, reference, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            input_tensor.grad, reference_input.grad, atol=0.0, rtol=0.0
+        )
+    finally:
+        allocator.close()
 
 
 @pytest.mark.experimental
