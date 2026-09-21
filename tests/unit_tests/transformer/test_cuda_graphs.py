@@ -1097,7 +1097,9 @@ class TestHybridTECudaGraphDiscovery:
         torch.nn.Module.__init__(wrapper)
         # Intentionally minimal: individual CPU mocks provide only the state they exercise.
         wrapper.config = SimpleNamespace(
-            cuda_graph_modules=[CudaGraphModule.attn], fine_grained_activation_offloading=True
+            cuda_graph_modules=[CudaGraphModule.attn],
+            fine_grained_activation_offloading=True,
+            mhc_single_pass=False,
         )
         object.__setattr__(wrapper, '_offload_module_in_cuda_graph_cached', None)
         if offload_in_graph is not None:
@@ -1105,6 +1107,65 @@ class TestHybridTECudaGraphDiscovery:
                 wrapper, '_compute_offload_module_in_cuda_graph', lambda: offload_in_graph
             )
         return wrapper
+
+    @pytest.mark.parametrize('single_pass', [False, True])
+    def test_hybrid_mhc_direct_write_arena_dispatch(self, single_pass):
+        """Hybrid enables fixed-input liveness checks through its own split contract."""
+        wrapper = self._bare_hybrid_wrapper()
+        wrapper.config.mhc_single_pass = single_pass
+        wrapper.config.cuda_graph_impl = 'transformer_engine'
+        wrapper.config.recompute_granularity = 'selective'
+        wrapper.config.recompute_modules = ['mhc']
+        wrapper.config.mhc_recompute_attn_cuda_graph_split = False
+        wrapper.config.is_hybrid_model = True
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = wrapper.config
+        helper.flattened_callables = [torch.nn.Identity(), wrapper]
+
+        assert helper._uses_mhc_direct_write_arena() is single_pass
+
+    @pytest.mark.parametrize('gpt_split', [False, True])
+    def test_non_hybrid_mhc_direct_write_arena_dispatch(self, gpt_split):
+        """Keep GPT's explicit split and the ordinary non-Hybrid path unchanged."""
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            is_hybrid_model=False,
+            mhc_recompute_attn_cuda_graph_split=gpt_split,
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity='selective',
+            recompute_modules=['mhc'],
+        )
+        helper.flattened_callables = [torch.nn.Identity()]
+
+        assert helper._uses_mhc_direct_write_arena() is gpt_split
+
+    def test_hybrid_mhc_static_input_aliases_require_disjoint_liveness(self):
+        """Check the production pointer/lifetime contract using CPU backing storage."""
+        wrapper = self._bare_hybrid_wrapper()
+        wrapper.config.mhc_single_pass = True
+        wrapper.config.cuda_graph_impl = 'transformer_engine'
+        wrapper.config.recompute_granularity = 'selective'
+        wrapper.config.recompute_modules = ['mhc']
+        wrapper.config.mhc_recompute_attn_cuda_graph_split = False
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = wrapper.config
+        helper.flattened_callables = [wrapper]
+
+        backing = torch.empty(3, 4, 2, 8)
+        shared = backing[1]
+        sample_args = [(shared,), (backing[2],), (shared.detach(),)]
+        helper._mhc_sample_order_intervals = {0: [0, 3], 1: [1, 4], 2: [5, 6]}
+        helper._validate_mhc_static_hidden_inputs(sample_args)
+
+        for intervals, message in (
+            ({0: [0, 5], 1: [1, 4], 2: [3, 6]}, 'windows overlap'),
+            ({0: [0, None], 1: [1, 4], 2: [3, 6]}, 'windows overlap'),
+            ({1: [1, 4]}, 'no recorded'),
+        ):
+            helper._mhc_sample_order_intervals = intervals
+            with pytest.raises(RuntimeError, match=message):
+                helper._validate_mhc_static_hidden_inputs(sample_args)
 
     @staticmethod
     def _bare_transformer_inner(*, has_attention, offload_core_attn, is_moe=False):
@@ -1220,6 +1281,112 @@ class TestHybridTECudaGraphDiscovery:
         helper._uses_mhc_direct_write_arena = lambda: False
         monkeypatch.setattr(cuda_graphs_module, 'is_te_min_version', lambda _version: True)
         return helper, rotary_pos_emb
+
+    @pytest.mark.parametrize('input_name', ['hidden_states', 'pre_mix'])
+    @pytest.mark.parametrize('first_requires_grad', [False, True])
+    def test_static_input_reuse_preserves_requires_grad(
+        self, monkeypatch, input_name, first_requires_grad
+    ):
+        helper, _ = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='hybrid',
+            position_embedding_type='rope',
+            has_attention=False,
+            num_layers=2,
+        )
+        layers = helper.flattened_callables
+        for layer, requires_grad in zip(layers, (first_requires_grad, not first_requires_grad)):
+
+            def static_inputs(_seq_length, _micro_batch_size, requires_grad=requires_grad):
+                inputs = {'hidden_states': torch.ones(8, 1, 8, requires_grad=True)}
+                inputs[input_name] = torch.ones(8, 1, 8, requires_grad=requires_grad)
+                return inputs
+
+            monkeypatch.setattr(layer, 'get_layer_static_inputs', static_inputs)
+
+        helper.num_model_chunks = 2
+        helper.num_microbatches = 2
+        helper.num_layers_per_chunk = [1, 1]
+        helper.callables_per_chunk = [[layers[0]], [layers[1]]]
+        helper.chunks_with_decoder *= 2
+
+        # Each backward retires its buffers before the next chunk starts. The
+        # chunks have identical tensor shapes but different autograd input surfaces.
+        args, kwargs = helper._get_sample_arguments([1, -1, 2, -2, 1, -1, 2, -2])
+        inputs = (
+            [sample[0] for sample in args]
+            if input_name == 'hidden_states'
+            else [sample[input_name] for sample in kwargs]
+        )
+        # Samples are stored by chunk, then microbatch. Matching autograd inputs
+        # still reuse storage; a later chunk must not inherit the wrong gradient flag.
+        assert inputs[0] is inputs[1]
+        assert inputs[2] is inputs[3]
+        assert inputs[0] is not inputs[2]
+        assert [value.requires_grad for value in inputs] == [
+            first_requires_grad,
+            first_requires_grad,
+            not first_requires_grad,
+            not first_requires_grad,
+        ]
+
+    def test_state_adapter_extends_static_input_surface(self, monkeypatch):
+        helper, _ = self._rotary_sample_helper(
+            monkeypatch, layer_kind='hybrid', position_embedding_type='rope', has_attention=False
+        )
+        seen_hidden_inputs = []
+
+        def adapt_static_inputs(inputs):
+            seen_hidden_inputs.append(inputs['hidden_states'])
+            return {
+                **inputs,
+                'pre_mix': torch.ones(8, 1, 4, requires_grad=True),
+                'global_indices': torch.zeros(8, 2, dtype=torch.int32),
+            }
+
+        helper.flattened_callables[0]._te_cuda_graph_adapter = SimpleNamespace(
+            get_static_inputs=adapt_static_inputs
+        )
+        args, kwargs = helper._get_sample_arguments([1, -1])
+
+        assert len(args[0]) == 1
+        assert args[0][0] is seen_hidden_inputs[0]
+        assert kwargs[0]['pre_mix'].shape == (8, 1, 4)
+        assert kwargs[0]['pre_mix'].requires_grad
+        assert kwargs[0]['global_indices'].dtype == torch.int32
+        assert not kwargs[0]['global_indices'].requires_grad
+
+    @pytest.mark.parametrize('has_state_adapter', [False, True])
+    def test_state_adapter_disables_te_secondary_buffer_reuse(self, monkeypatch, has_state_adapter):
+        import megatron.core.pipeline_parallel.schedules as schedules
+
+        helper, _ = self._rotary_sample_helper(
+            monkeypatch, layer_kind='hybrid', position_embedding_type='rope', has_attention=False
+        )
+        helper.config.microbatch_group_size_per_vp_stage = 1
+        helper.config.overlap_moe_expert_parallel_comm = False
+        helper.config.cuda_graph_retain_backward_graph = False
+        helper.config.cuda_graph_warmup_steps = 3
+        helper.config.fp8 = helper.config.fp4 = False
+        helper.config.fine_grained_activation_offloading = False
+        helper.pp_group = SimpleNamespace(size=lambda: 1)
+        helper.p2p_communicator = None
+        if has_state_adapter:
+            helper.flattened_callables[0]._te_cuda_graph_adapter = SimpleNamespace(
+                get_static_inputs=lambda inputs: inputs
+            )
+        monkeypatch.setattr(
+            schedules, 'get_pp_rank_microbatches', lambda *args, **kwargs: (0, 0, 0, 0)
+        )
+        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+        monkeypatch.setattr(cuda_graphs_module, 'get_num_microbatches', lambda: 1)
+        monkeypatch.setattr(cuda_graphs_module, 'log_on_each_pipeline_stage', lambda **kwargs: None)
+
+        _, capture_kwargs = helper._get_cuda_graph_input_data()
+
+        assert (
+            capture_kwargs.get('_reuse_graph_input_output_buffers', False) is not has_state_adapter
+        )
 
     @pytest.mark.parametrize(
         ('has_attention', 'position_embedding_type', 'multi_latent_attention', 'expects_rotary'),
@@ -1434,6 +1601,24 @@ class TestHybridTECudaGraphDiscovery:
         assert head._get_active_te_cuda_graph_group_tail() is tail
         head.eval()
         assert head._get_active_te_cuda_graph_group_tail() is None
+
+    @pytest.mark.parametrize('adapted_index', [0, 1])
+    def test_state_adapter_keeps_adjacent_graph_callables_separate(
+        self, monkeypatch, adapted_index
+    ):
+        def unexpected_group(_tail):
+            pytest.fail('Grouping bypasses the state adapter on the tail callable')
+
+        head = SimpleNamespace(
+            _can_group_te_cuda_graph_with=lambda _tail: True,
+            _set_te_cuda_graph_group_tail=unexpected_group,
+        )
+        tail = SimpleNamespace()
+        layers = [head, tail]
+        layers[adapted_index]._te_cuda_graph_adapter = object()
+        monkeypatch.setattr(cuda_graphs_module, '_layer_is_graphable', lambda *_args: True)
+
+        assert cuda_graphs_module._get_graphable_te_callables(layers, None) == layers
 
     def test_capture_group_does_not_cross_first_last_bf16_boundary(self):
         from megatron.core.transformer.identity_op import IdentityOp
@@ -1921,9 +2106,13 @@ class TestTECudaGraphHelper:
         sample_keys_to_indices = {}
         for idx, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
             # Create sample_keys similar to the function
-            args_keys = tuple((t.shape, t.dtype, t.layout) for t in args_item if torch.is_tensor(t))
+            args_keys = tuple(
+                (t.shape, t.dtype, t.layout, t.requires_grad)
+                for t in args_item
+                if torch.is_tensor(t)
+            )
             kwargs_keys = tuple(
-                (k, v.shape, v.dtype, v.layout)
+                (k, v.shape, v.dtype, v.layout, v.requires_grad)
                 for k, v in sorted(kwargs_item.items())
                 if torch.is_tensor(v)
             )
@@ -1935,7 +2124,7 @@ class TestTECudaGraphHelper:
 
         # Check that buffers with same signature share references (memory optimization)
         # The optimization reuses buffers when:
-        # 1. They have the same signature (shape, dtype, layout)
+        # 1. They have the same signature (shape, dtype, layout, requires_grad)
         # 2. The backward pass of the original buffer has completed
         # 3. A new forward pass with matching signature needs a buffer
         # Count how many times each tensor is reused

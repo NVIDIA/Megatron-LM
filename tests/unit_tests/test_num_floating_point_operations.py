@@ -19,6 +19,7 @@ import torch
 
 import megatron.training.training as training_module
 from megatron.training.training import (
+    _dsv41_self_attention_flops,
     consume_seqlen_stats_in_iteration,
     consume_vision_model_flops_stats,
     num_floating_point_operations,
@@ -1625,6 +1626,328 @@ class TestDSv4HybridMatchesStandard:
         std_flops = num_floating_point_operations(standard, batch_size)
         hyb_flops = num_floating_point_operations(hybrid, batch_size)
         assert hyb_flops == std_flops
+
+
+def _make_dsv41_pair(*, seq_length=11, moe=False, loss_coeff=0.01, sparse_loss=True):
+    """Equivalent fused and split stacks: SWA, Full r2, Reuse, Full r1, Reindex, Reuse."""
+    ratios = [0, 2, 2, 1, 1, 1]
+    standard, hybrid = _make_dsv4_pair(ratios=[0] * len(ratios), mtp=0, moe=moe)
+    for args in (standard, hybrid):
+        args.dsv4_version = "v4.1"
+        args.seq_length = seq_length
+        args.hidden_size = 8
+        args.num_attention_heads = 2
+        args.v_head_dim = 4
+        args.q_lora_rank = 3
+        args.o_groups = 2
+        args.o_lora_rank = 2
+        args.csa_window_size = 3
+        args.dsa_indexer_n_heads = 2
+        args.dsa_indexer_head_dim = 2
+        args.dsa_indexer_topk = 2
+        args.dsa_indexer_loss_coeff = loss_coeff
+        args.dsa_indexer_use_sparse_loss = sparse_loss
+        args.csa2_candidate_topk_blocks = 2
+        args.csa2_candidate_block_size = 2
+        args.ffn_hidden_size = 12
+        args.padded_vocab_size = 16
+        if moe:
+            args.num_experts = 8
+            args.moe_router_topk = 2
+            args.moe_ffn_hidden_size = 12
+            args.moe_shared_expert_intermediate_size = 6
+
+    standard.csa_compress_ratios = ratios
+    standard.csa2_kv_source_layers = [1, 3]
+    standard.csa2_index_source_layers = [1, 3, 4]
+    standard.csa2_candidate_source_layer = 3
+    ffn = "E" if moe else "-"
+    hybrid.hybrid_layer_pattern = "W" + ffn + ("D" + ffn) * 5
+    hybrid.num_layers = 2 * len(ratios)
+    # Owner IDs and ratios use the full split-layer coordinates, including FFNs.
+    hybrid.csa_compress_ratios = [ratio for r in ratios for ratio in (r, 0)]
+    hybrid.csa2_kv_source_layers = [2, 6]
+    hybrid.csa2_index_source_layers = [2, 6, 8]
+    hybrid.csa2_candidate_source_layer = 6
+    return standard, hybrid
+
+
+def _dsv41_v4_convention_attention_flops(args, total_tokens, sum_sq, attention_layers):
+    """Integrate V4's continuous causal approximation using midpoint samples.
+
+    Cap crossings fall on integer token boundaries, so midpoint integration is
+    exact for this piecewise-linear approximation without reproducing its closed
+    form. V4 counts a fixed local window and amortizes compression over all
+    tokens; neither contribution uses exact sequence-boundary/tail accounting.
+    """
+    h, n, v = args.hidden_size, args.num_attention_heads, args.v_head_dim
+    idx_h, idx_d = args.dsa_indexer_n_heads, args.dsa_indexer_head_dim
+    supervised = (args.dsa_indexer_loss_coeff or 0) > 0
+    index_projection_passes = 2 if supervised else 1
+    length = args.seq_length
+    token_cost = scoring_cost = 0
+    for layer, ratio in attention_layers:
+        full = layer in args.csa2_kv_source_layers
+        index_source = layer in args.csa2_index_source_layers
+        candidate_limited = (
+            args.csa2_candidate_source_layer is not None
+            and layer > args.csa2_candidate_source_layer
+        )
+        for query in range(length):
+            # Query down/up, local KV and grouped output projections. The
+            # q-rank and v terms retain DSv4's latent norm accounting.
+            token_cost += 6 * (
+                h * args.q_lora_rank
+                + args.q_lora_rank * n * v
+                + args.q_lora_rank
+                + h * v
+                + v
+                + n * v * args.o_lora_rank
+                + args.o_groups * args.o_lora_rank * h
+            )
+            visible = (query + 0.5) / ratio if ratio else 0
+            selected = min(visible, args.dsa_indexer_topk, length // ratio) if ratio else 0
+            token_cost += 12 * n * v * (args.csa_window_size + selected)
+            if full:
+                # r2 has both a value and gate projection; r1 only value.
+                token_cost += 6 * h * v * (2 if ratio == 2 else 1)
+                token_cost += 2 * index_projection_passes * v * idx_d / ratio
+            if index_source:
+                token_cost += (
+                    2 * index_projection_passes * (args.q_lora_rank * idx_h * idx_d + h * idx_h)
+                )
+                capacity = (
+                    args.csa2_candidate_topk_blocks * args.csa2_candidate_block_size
+                    if candidate_limited
+                    else None
+                )
+                # A nonbinding cap preserves V4's full continuous causal triangle.
+                candidates = (
+                    min(visible, capacity)
+                    if capacity is not None and capacity < length // ratio
+                    else visible
+                )
+                scoring_cost += 2 * idx_h * idx_d * candidates
+                if supervised:
+                    loss_capacity = capacity
+                    if args.dsa_indexer_use_sparse_loss:
+                        loss_capacity = min(
+                            args.dsa_indexer_topk,
+                            capacity if capacity is not None else args.dsa_indexer_topk,
+                        )
+                    loss_keys = (
+                        min(visible, loss_capacity)
+                        if loss_capacity is not None and loss_capacity < length // ratio
+                        else visible
+                    )
+                    scoring_cost += 4 * idx_h * idx_d * loss_keys
+    return token_cost * total_tokens / length + scoring_cost * sum_sq / length**2
+
+
+class TestDSv41Flops:
+    """CSA2 ownership, V4 approximations and packed/Hybrid entry regressions."""
+
+    @pytest.mark.parametrize("length", [1, 5, 11])
+    @pytest.mark.parametrize(
+        "loss_coeff,sparse_loss", [(None, False), (0.0, False), (0.01, False), (0.01, True)]
+    )
+    def test_matches_v4_continuous_causal_convention(self, length, loss_coeff, sparse_loss):
+        args, _ = _make_dsv41_pair(
+            seq_length=length, loss_coeff=loss_coeff, sparse_loss=sparse_loss
+        )
+        batch_size = 2
+        attention = _dsv41_v4_convention_attention_flops(
+            args,
+            length * batch_size,
+            length**2 * batch_size,
+            list(enumerate(args.csa_compress_ratios)),
+        )
+        ffn_and_logits = (
+            6
+            * batch_size
+            * length
+            * args.hidden_size
+            * (3 * args.ffn_hidden_size * args.num_layers + args.padded_vocab_size)
+        )
+        assert num_floating_point_operations(args, batch_size) == pytest.approx(
+            attention + ffn_and_logits, rel=1e-12, abs=0
+        )
+
+    @pytest.mark.parametrize("moe", [False, True])
+    @pytest.mark.parametrize("layout", ["plain", "pp", "vpp"])
+    def test_standard_and_hybrid_layouts_match(self, moe, layout):
+        standard, hybrid = _make_dsv41_pair(moe=moe)
+        pattern = hybrid.hybrid_layer_pattern
+        if layout == "pp":
+            hybrid.hybrid_layer_pattern = pattern[:6] + "|" + pattern[6:]
+        elif layout == "vpp":
+            hybrid.hybrid_layer_pattern = "|".join(pattern[i : i + 2] for i in range(0, 12, 2))
+        assert num_floating_point_operations(hybrid, 2) == pytest.approx(
+            num_floating_point_operations(standard, 2), rel=1e-12, abs=0
+        )
+
+    @pytest.mark.parametrize("version", ["v4", "v4.1"])
+    def test_version_alone_does_not_enable_hybrid_d_layers(self, version):
+        _, args = _make_dsv41_pair(moe=True)
+        args.experimental_attention_variant = None
+        args.dsv4_version = version
+        with pytest.raises(AssertionError, match="hybrid-model path"):
+            num_floating_point_operations(args, 2)
+
+    @pytest.mark.parametrize("version", ["v4", "v4.1"])
+    @pytest.mark.parametrize("hybrid_model", [False, True])
+    def test_version_alone_preserves_ordinary_mla(self, version, hybrid_model):
+        args = _make_dsv41_pair()[int(hybrid_model)]
+        args.experimental_attention_variant = None
+        if hybrid_model:
+            args.hybrid_layer_pattern = args.hybrid_layer_pattern.replace("W", "+").replace(
+                "D", "+"
+            )
+        del args.dsv4_version
+        ordinary_mla = num_floating_point_operations(args, 2)
+        args.dsv4_version = version
+        assert num_floating_point_operations(args, 2) == ordinary_mla
+
+    def test_d_symbol_can_describe_swa_only_layer(self):
+        _, hybrid = _make_dsv41_pair(moe=True)
+        expected = num_floating_point_operations(hybrid, 2)
+        hybrid.hybrid_layer_pattern = hybrid.hybrid_layer_pattern.replace("W", "D")
+        assert num_floating_point_operations(hybrid, 2) == pytest.approx(expected, rel=1e-12, abs=0)
+
+    @pytest.mark.parametrize("role", ["full", "reindex", "reuse"])
+    def test_only_owners_pay_compressor_and_indexer_work(self, role):
+        args, _ = _make_dsv41_pair()
+        if role == "full":
+            args.csa2_kv_source_layers = [1, 2, 3]
+        if role != "reuse":
+            args.csa2_index_source_layers = [1, 2, 3, 4]
+        attention_layers = list(enumerate(args.csa_compress_ratios))
+        expected = _dsv41_v4_convention_attention_flops(args, 11, 121, attention_layers)
+        token_linear, core = _dsv41_self_attention_flops(args)
+        assert 6 * (token_linear * 11 + core * 121) == pytest.approx(expected, rel=1e-12, abs=0)
+
+    @pytest.mark.parametrize("has_reindex", [False, True])
+    def test_candidate_source_itself_still_scores_all_visible_keys(self, has_reindex):
+        args, _ = _make_dsv41_pair()
+        if not has_reindex:
+            args.csa2_index_source_layers = [1, 3]
+        attention_layers = list(enumerate(args.csa_compress_ratios))
+        token_linear, core = _dsv41_self_attention_flops(args)
+        limited = 6 * (token_linear * 11 + core * 121)
+        assert limited == pytest.approx(
+            _dsv41_v4_convention_attention_flops(args, 11, 121, attention_layers), rel=1e-12, abs=0
+        )
+        args.csa2_candidate_source_layer = None
+        args.csa2_candidate_topk_blocks = args.csa2_candidate_block_size = 0
+        token_linear, core = _dsv41_self_attention_flops(args)
+        unlimited = 6 * (token_linear * 11 + core * 121)
+        assert unlimited == pytest.approx(
+            _dsv41_v4_convention_attention_flops(args, 11, 121, attention_layers), rel=1e-12, abs=0
+        )
+        if has_reindex:
+            assert limited < unlimited
+        else:
+            assert limited == pytest.approx(unlimited, rel=1e-12, abs=0)
+
+    @pytest.mark.parametrize("hybrid_model", [False, True])
+    def test_packed_stats_scale_v4_token_and_scoring_terms(self, hybrid_model):
+        args = _make_dsv41_pair(seq_length=16)[int(hybrid_model)]
+        # Three real length-five sequences, held in differently padded packs.
+        stats = dict(seqlen_squared_sum_in_batch=75, total_real_tokens_in_batch=15)
+        packed = num_floating_point_operations(args, 2, **stats)
+        assert num_floating_point_operations(args, 1, **stats) == pytest.approx(
+            packed, rel=1e-12, abs=0
+        )
+        doubled = num_floating_point_operations(
+            args, 2, seqlen_squared_sum_in_batch=150, total_real_tokens_in_batch=30
+        )
+        assert doubled == pytest.approx(2 * packed, rel=1e-12, abs=0)
+        # The same 15 tokens repartitioned into lengths ten and five.
+        longer_sequences = num_floating_point_operations(
+            args, 2, seqlen_squared_sum_in_batch=125, total_real_tokens_in_batch=15
+        )
+        layer_ids = range(0, 12, 2) if hybrid_model else range(6)
+        attention_layers = [(i, args.csa_compress_ratios[i]) for i in layer_ids]
+        extra_scoring = _dsv41_v4_convention_attention_flops(args, 0, 50, attention_layers)
+        assert longer_sequences - packed == pytest.approx(extra_scoring, rel=1e-12, abs=0)
+
+    @pytest.mark.parametrize("hybrid_model", [False, True])
+    def test_empty_real_batch_has_zero_work(self, hybrid_model):
+        args = _make_dsv41_pair()[int(hybrid_model)]
+        assert (
+            num_floating_point_operations(
+                args, 2, seqlen_squared_sum_in_batch=0, total_real_tokens_in_batch=0
+            )
+            == 0
+        )
+
+    @pytest.mark.parametrize("hybrid_model", [False, True])
+    @pytest.mark.parametrize(
+        "activation,moe_frequency,shared_width,latent_width",
+        [
+            pytest.param("swiglu", None, None, None, id="dense-swiglu"),
+            pytest.param("gelu", None, None, None, id="dense-gelu"),
+            pytest.param("swiglu", 2, None, None, id="mixed-moe-frequency"),
+            pytest.param("swiglu", [1, 0, 0, 1, 0, 1], 6, None, id="mixed-shared-experts"),
+            pytest.param("gelu", 2, 6, 4, id="mixed-latent-experts"),
+            pytest.param("situ_glu", [0, 1, 0, 1, 1, 0], 6, 4, id="mixed-situ-glu"),
+        ],
+    )
+    def test_ffn_and_logits_keep_generic_accounting(
+        self, hybrid_model, activation, moe_frequency, shared_width, latent_width
+    ):
+        """Changing attention families must preserve the existing FFN/logits estimate."""
+        moe = moe_frequency is not None
+        args = _make_dsv41_pair(moe=moe)[int(hybrid_model)]
+        args.swiglu = activation == "swiglu"
+        args.situ_glu = activation == "situ_glu"
+        args.moe_shared_expert_intermediate_size = shared_width
+        args.moe_latent_size = latent_width
+        # Exercise the existing fallback from an unset expert width to FFN width.
+        args.moe_ffn_hidden_size = None
+        if moe:
+            args.moe_layer_freq = moe_frequency
+            moe_layers = (
+                [int(i % moe_frequency == 0) for i in range(6)]
+                if isinstance(moe_frequency, int)
+                else moe_frequency
+            )
+            if hybrid_model:
+                attention_symbols = args.hybrid_layer_pattern[::2]
+                args.hybrid_layer_pattern = "".join(
+                    attention + ("E" if is_moe else "-")
+                    for attention, is_moe in zip(attention_symbols, moe_layers)
+                )
+
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+        layer_ids = range(0, 12, 2) if hybrid_model else range(6)
+        attention_layers = [(i, args.csa_compress_ratios[i]) for i in layer_ids]
+        v41_attention = _dsv41_v4_convention_attention_flops(
+            args, total_tokens, sum_sq, attention_layers
+        )
+
+        # Compute the same FFN/logits with the unchanged generic MHA branch and
+        # remove its known QKV/O + core-attention contribution independently.
+        generic = SimpleNamespace(**vars(args))
+        generic.dsv4_version = "v4"
+        generic.experimental_attention_variant = None
+        generic.multi_latent_attention = False
+        generic.kv_channels = args.hidden_size // args.num_attention_heads
+        if hybrid_model:
+            generic.hybrid_layer_pattern = args.hybrid_layer_pattern.replace("W", "*").replace(
+                "D", "*"
+            )
+        projected_width = generic.kv_channels * generic.num_attention_heads
+        mha_attention = (
+            6
+            * 6
+            * (total_tokens * 4 * generic.hidden_size * projected_width + sum_sq * projected_width)
+        )
+        assert num_floating_point_operations(args, batch_size) - v41_attention == pytest.approx(
+            num_floating_point_operations(generic, batch_size) - mha_attention, rel=1e-12, abs=0
+        )
 
 
 def _make_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_loss=False):

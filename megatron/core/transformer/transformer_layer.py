@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
+    from megatron.core.transformer.hyper_connection import SinglePassMHCState
 
 import torch
 import torch.distributed
@@ -218,6 +219,37 @@ def get_transformer_layer_offset(
     else:
         offset = 0
     return offset
+
+
+class CrossLayerState(Protocol):
+    """Model-owned working state, passed explicitly rather than retained on modules.
+
+    A fresh instance belongs to each forward and each checkpoint invocation.
+    Producers and consumers define the data and its lifetime; the layer loop
+    only transports the state and protects its autograd boundaries. Custom
+    non-Transformer layers opt in with ``supports_cross_layer_state = True``
+    and accept the ``cross_layer_state`` keyword.
+
+    Pipeline, full-recompute and CUDA Graph state use the module's boundary
+    declarations and codec. This protocol only covers the layer's native access
+    and selective-recompute consumers.
+    """
+
+    def attention_kwargs(self) -> dict[str, Any]:
+        """Return model-specific arguments for a TransformerLayer's self-attention.
+
+        The attention implementation must accept these arguments. Return an
+        empty dict when only custom layers consume this state.
+        """
+        ...
+
+    def recompute_boundary_tensors(self) -> tuple[Tensor, ...]:
+        """Snapshot live side outputs whose gradients may precede the local output.
+
+        Return tensor references now, not a callback that reads mutable state
+        during backward. Do not detach them: every consumer must reach its producer.
+        """
+        ...
 
 
 class MlpInterface(Protocol):
@@ -620,6 +652,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return output
 
+    def _discard_input_layernorm_checkpoint(
+        self, attention_output: Tensor, cross_layer_state: CrossLayerState | None
+    ) -> None:
+        """Restore a norm output before any of its independent consumers runs backward."""
+        hook_tensors = (attention_output,)
+        if cross_layer_state is not None:
+            # Shared outputs can receive a gradient before the local attention
+            # output, or without it. This applies to both Hybrid and GPT layers.
+            hook_tensors += cross_layer_state.recompute_boundary_tensors()
+        self.input_layernorm_checkpoint.discard_output_and_register_recompute(hook_tensors)
+
     def _forward_self_attention_output_with_bias(
         self,
         hidden_states: Tensor,
@@ -635,6 +678,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        cross_layer_state: CrossLayerState | None = None,
     ):
         """Run input norm + self-attention and return the raw output before BDA."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -687,12 +731,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **(cross_layer_state.attention_kwargs() if cross_layer_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
         if checkpoint_input_layernorm:
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
+            self._discard_input_layernorm_checkpoint(
+                attention_output_with_bias[0], cross_layer_state
             )
 
         return attention_output_with_bias, attn_norm_manager, residual
@@ -715,6 +760,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        cross_layer_state: CrossLayerState | None = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -791,14 +837,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **(cross_layer_state.attention_kwargs() if cross_layer_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
+            self._discard_input_layernorm_checkpoint(
+                attention_output_with_bias[0], cross_layer_state
             )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -2215,6 +2262,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             input_ids=kwargs.get("input_ids", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
             mhc_recompute_manager=mhc_recompute_manager,
+            **({"mhc_state": kwargs["mhc_state"]} if kwargs.get("mhc_state") is not None else {}),
         )
         return output, context
 
@@ -2344,6 +2392,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        cross_layer_state: CrossLayerState | None = None,
+        mhc_state: SinglePassMHCState | None = None,
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -2351,7 +2401,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
             self.self_attention_hyper_connection(
-                hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                hidden_states,
+                mhc_recompute_manager=mhc_recompute_manager,
+                **({"mhc_state": mhc_state} if mhc_state is not None else {}),
             )
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
@@ -2386,12 +2438,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **(cross_layer_state.attention_kwargs() if cross_layer_state is not None else {}),
         )
         nvtx_range_pop(suffix="self_attention")
 
         if checkpoint_input_layernorm:
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
+            self._discard_input_layernorm_checkpoint(
+                attention_output_with_bias[0], cross_layer_state
             )
 
         nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
@@ -2439,6 +2492,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         input_ids=None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+        mhc_state: SinglePassMHCState | None = None,
     ):
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
@@ -2449,7 +2503,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states,
+            mhc_recompute_manager=mhc_recompute_manager,
+            **({"mhc_state": mhc_state} if mhc_state is not None else {}),
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
         # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical

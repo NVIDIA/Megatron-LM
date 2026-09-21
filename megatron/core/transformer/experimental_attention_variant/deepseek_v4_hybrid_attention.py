@@ -8,7 +8,10 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    fused_mla_rope_inplace,
+    fused_mla_rope_out_of_place,
+)
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -21,6 +24,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+    build_csa2_thd_layout,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -118,7 +124,9 @@ class DSv4HybridAttention(Attention):
             compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
         # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
         # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
-        use_compressed_yarn = compress_ratio > 1
+        use_compressed_yarn = compress_ratio > 1 or (
+            self.config.dsv4_version == "v4.1" and compress_ratio == 1
+        )
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
@@ -130,6 +138,7 @@ class DSv4HybridAttention(Attention):
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
                 rotary_base=rope_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
         else:
@@ -142,6 +151,7 @@ class DSv4HybridAttention(Attention):
                 beta_slow=self.config.beta_slow,
                 mscale=self.config.mscale,
                 mscale_all_dim=self.config.mscale_all_dim,
+                use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
 
@@ -176,10 +186,11 @@ class DSv4HybridAttention(Attention):
         _linear_o_group_proj = torch.empty(
             group_proj_out_size,
             group_proj_in_size,
-            device=torch.cuda.current_device(),
+            device="cpu" if self.config.use_cpu_initialization else torch.cuda.current_device(),
             dtype=self.config.params_dtype,
         )
-        self.config.init_method(_linear_o_group_proj)
+        if self.config.perform_initialization:
+            self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
@@ -232,6 +243,7 @@ class DSv4HybridAttention(Attention):
         sequence_len_offset=None,
         *,
         inference_params=None,
+        csa2_state=None,
     ):
         """Forward pass for DeepSeek-v4 Hybrid Attention"""
         assert (
@@ -255,7 +267,10 @@ class DSv4HybridAttention(Attention):
         # Restore the static group before returning.
         _orig_cp_group = self.pg_collection.cp
         cp_group = _orig_cp_group
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        if packed_seq_params is not None and (
+            packed_seq_params.local_cp_size is not None
+            or (self.config.dsv4_version == "v4.1" and packed_seq_params.cp_group is not None)
+        ):
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             cp_group = packed_seq_params.cp_group
 
@@ -266,6 +281,16 @@ class DSv4HybridAttention(Attention):
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
         if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
+
+        thd_layout = None
+        if use_thd_cp and self.config.dsv4_version == "v4.1":
+            thd_layout = build_csa2_thd_layout(
+                packed_seq_params, hidden_states.shape[0], cp_group=cp_group
+            )
+            # Clear logical padding before projections and boundary exchange;
+            # masking projected outputs alone can leave NaN weight gradients.
+            hidden_states = hidden_states.masked_fill(~thd_layout.valid_tokens[:, None, None], 0)
+
         self.pg_collection.cp = cp_group
 
         boundary_hidden = None
@@ -319,6 +344,8 @@ class DSv4HybridAttention(Attention):
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                **({"csa2_state": csa2_state} if csa2_state is not None else {}),
+                **({"thd_layout": thd_layout} if thd_layout is not None else {}),
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -332,26 +359,162 @@ class DSv4HybridAttention(Attention):
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            core_attn_out = core_attn_out.reshape(
+                core_attn_out.size(0), 1, self.query_projection_size
+            )
 
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
+        if self.qkv_up_checkpoint is not None:
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
-        # ``core_attention`` already applied the inverse RoPE to the last
-        # qk_pos_emb_head_dim of each head, fusing it into the sparse-attention
-        # Function where that path allows it.
+        # CSA applies inverse RoPE inside core attention; CSA2 still returns
+        # unrotated output and needs its original output rotation here.
+        if self.config.dsv4_version == "v4.1":
+            # inverse RoPE on last qk_pos_emb_head_dim of each head
+            seq_len = core_attn_out.size(0)
+            n_heads = self.num_attention_heads_per_partition
+            pos_dim = self.config.qk_pos_emb_head_dim
+            nope_dim = self.config.v_head_dim - pos_dim
+            core_attn_out = core_attn_out.view(
+                seq_len, core_attn_out.size(1), n_heads, self.config.v_head_dim
+            )
+            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            skip_csa2_rope = (
+                self.config.dsv4_version == "v4.1"
+                and packed_seq
+                and (
+                    seq_len == 0
+                    or packed_seq_params.max_seqlen_kv == 0
+                    or packed_seq_params.cu_seqlens_kv.numel() < 2
+                )
+            )
+            if packed_seq:
+                cu_seqlens_kv = (
+                    packed_seq_params.cu_seqlens_kv_padded
+                    if packed_seq_params.cu_seqlens_kv_padded is not None
+                    else packed_seq_params.cu_seqlens_kv
+                )
+                rope_seqlen = packed_seq_params.max_seqlen_kv
+                rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+            else:
+                cu_seqlens_kv = None
+                rope_seqlen = seq_len
+                rope_max_seqlen_kv = None
+            # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+            # concentration factor (mscale) is NOT part of the DSv4 model contract --
+            # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+            mscale = 1.0
+            rotary_pos_cos = None
+            rotary_pos_sin = None
+            if self.config.apply_rope_fusion:
+                # ``mscale=1.0`` strips yarn's concentration factor from the
+                # cached cos/sin so the fused kernel matches the unfused
+                # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                    rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                )
+                rotary_pos_emb = None
+                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+                assert (
+                    fused_mla_rope_inplace is not None
+                ), "Fused MLA RoPE apply is not imported successfully"
+            elif self._dsv4_uses_yarn_rope:
+                rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            else:
+                rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            if skip_csa2_rope:
+                pass
+            elif self.config.apply_rope_fusion:
+                if use_thd_cp:
+                    global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
+                    core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
+                        core_attn_out,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        nope_dim,
+                        pos_dim,
+                        cu_seqlens_kv,
+                        global_start,
+                        inverse=True,
+                    )
+                else:
+                    if packed_seq:
+                        core_attn_out = core_attn_out.squeeze(1)
+                    # Fused DSA backward retains the raw attention output O. Applying
+                    # inverse RoPE to its view in-place corrupts the retained O used by
+                    # the softmax backward, so this call needs private storage.
+                    core_attn_out = fused_mla_rope_out_of_place(
+                        core_attn_out,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        nope_dim,
+                        pos_dim,
+                        cu_seqlens_kv,
+                        self.pg_collection.cp.rank(),
+                        self.pg_collection.cp.size(),
+                        inverse=True,
+                        remove_interleaving=True,
+                    )
+                    if packed_seq:
+                        core_attn_out = core_attn_out.unsqueeze(1)
+            elif use_thd_cp:
+                global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
+                core_attn_out = cp_utils.apply_thd_cp_local_rope_unfused(
+                    core_attn_out,
+                    rotary_pos_emb,
+                    nope_dim,
+                    pos_dim,
+                    cu_seqlens_kv,
+                    global_start,
+                    self.config,
+                    inverse=True,
+                )
+            else:
+                content_part, rot_part = torch.split(
+                    core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
+                )
+                # ``_apply_rotary_pos_emb_thd`` documents 3-D ``(total, h, d)`` input
+                # and adds its own batch dim internally; drop the dummy ``b=1`` axis
+                # for THD before the rope and add it back after.
+                if packed_seq:
+                    rot_part_in = rot_part.squeeze(1)
+                else:
+                    rot_part_in = rot_part
+                rot_part_out = apply_rotary_pos_emb(
+                    rot_part_in,
+                    rotary_pos_emb,
+                    self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=self.pg_collection.cp,
+                    mla_rotary_interleaved=True,
+                    inverse=True,
+                    mla_output_remove_interleaving=True,
+                    max_seqlen=rope_max_seqlen_kv,
+                )
+                if packed_seq:
+                    rot_part = rot_part_out.unsqueeze(1)
+                else:
+                    rot_part = rot_part_out
+                core_attn_out = torch.cat([content_part, rot_part], dim=-1)
+            core_attn_out = core_attn_out.view(
+                seq_len, core_attn_out.size(1), self.query_projection_size
+            )
 
         # Grouped output
         core_attn_out = core_attn_out.view(
-            core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
+            core_attn_out.size(0),
+            core_attn_out.size(1),
+            self.o_local_groups,
+            self.query_projection_size // self.o_local_groups,
         )
         wo_a_weight = self.linear_o_group_proj.view(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = core_attn_out.reshape(
+            *core_attn_out.shape[:-2], self.o_local_groups * self.config.o_lora_rank
+        )
 
         # =================
         # Output. [sq, b, h]
@@ -508,6 +671,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        skip_csa2_rope = (
+            self.config.dsv4_version == "v4.1"
+            and packed_seq
+            and (
+                hidden_states.shape[0] == 0
+                or packed_seq_params.max_seqlen_q == 0
+                or packed_seq_params.cu_seqlens_q.numel() < 2
+            )
+        )
         if self.config.apply_rope_fusion:
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
@@ -593,7 +765,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            if self.config.dsv4_version == "v4":
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:
@@ -611,7 +784,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             cp_size = cp_group.size()
-            if self.config.apply_rope_fusion:
+            if skip_csa2_rope:
+                query = q
+                kv = kv.unsqueeze(-2)
+                if boundary_kv_compressed is not None:
+                    boundary_kv, kv = kv[:boundary_rows], kv[boundary_rows:]
+                key = value = kv
+            elif self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
                     cp_rank = cp_group.rank()
                     # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
@@ -626,6 +805,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         global_start,
                     )
                     kv = kv.unsqueeze(-2)
+                    if self.config.dsv4_version == "v4.1":
+                        # Learned KV RMSNorm backward retains the pre-RoPE output.
+                        kv = kv.clone()
                     kv = cp_utils.apply_thd_cp_local_rope_fused(
                         kv,
                         rotary_pos_cos,
@@ -652,7 +834,14 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         remove_interleaving=True,
                     )
                     kv = kv.unsqueeze(-2)
-                    kv = fused_mla_rope_inplace(
+                    # V4.1 uses a learned KV RMSNorm whose backward may retain
+                    # its output. Preserve that pre-RoPE storage.
+                    apply_kv_rope = (
+                        fused_mla_rope_out_of_place
+                        if self.config.dsv4_version == "v4.1"
+                        else fused_mla_rope_inplace
+                    )
+                    kv = apply_kv_rope(
                         kv,
                         rotary_pos_cos,
                         rotary_pos_sin,
@@ -748,7 +937,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 return query, key, value
             return query, key, value, boundary_kv
 
-        if self.recompute_up_proj:
+        if self.recompute_up_proj and self.training and torch.is_grad_enabled():
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             if boundary_kv_compressed is None:
@@ -819,3 +1008,14 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         """Set the attention layer for recompute input_layernorm. Only needed for fp8/fp4."""
         set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_proj)
+        if self.config.dsv4_version == "v4.1":
+            # CSA2 adds consumers of the same normalized hidden states. Keep the
+            # original input so norm recompute also saves their FP8 activation copies.
+            compressor = self.core_attention.compressor
+            if compressor is not None:
+                set_save_original_input(compressor.linear_wkv)
+                if compressor.linear_wgate is not None:
+                    set_save_original_input(compressor.linear_wgate)
+            indexer = self.core_attention.indexer
+            if indexer is not None:
+                set_save_original_input(indexer.linear_weights_proj)

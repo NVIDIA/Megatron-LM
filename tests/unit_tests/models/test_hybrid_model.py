@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 import os
+from copy import deepcopy
 from datetime import timedelta
 from itertools import accumulate
 from types import SimpleNamespace
@@ -10,9 +11,11 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
@@ -27,16 +30,29 @@ from megatron.core.models.hybrid.hybrid_block import (
     HybridStackSubmodules,
     HyperConnectionHybridLayer,
 )
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec, hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.experimental_attention_variant.csa2 import CompressedSparseAttention2
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+)
 from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.moe.experts import SequentialMLP
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
+from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import (
+    _make_config as _make_dsv41_config,
+)
 
 try:
     from fast_hadamard_transform import hadamard_transform as _hadamard_transform
@@ -1663,3 +1679,305 @@ class TestHybridModelWithYarn:
                 # StaticInferenceContext always sets materialize_only_last_token_logits=True.
                 assert logits.shape[1] == 1
                 assert logits.shape[2] == self.model.vocab_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Production Hybrid model requires CUDA")
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not installed")
+class TestHybridDSv41Model:
+    """Exercise the V4.1 text backbone with real attention, mHC, MoE, and LM endpoints."""
+
+    @pytest.fixture
+    def pg_collection(self, monkeypatch):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(1234)
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", {})
+        monkeypatch.setattr(
+            DSAIndexerLossAutoScaler, "main_loss_backward_scale", torch.ones((), device="cuda")
+        )
+        try:
+            yield ProcessGroupCollection.use_mpu_process_groups()
+        finally:
+            Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_model(pg_collection, dtype, *, indexer_loss_coeff=0.0, sparse_loss=False):
+        # Hybrid numbers attention and MoE sublayers independently. Zero entries on
+        # the E sublayers are placeholders, not additional attention modules.
+        config = _make_dsv41_config(
+            params_dtype=dtype,
+            num_layers=12,
+            csa_compress_ratios=[0, 0, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0],
+            csa2_kv_source_layers=[2, 6],
+            csa2_index_source_layers=[2, 6, 8],
+            csa2_candidate_source_layer=6,
+            dsa_indexer_loss_coeff=indexer_loss_coeff,
+            dsa_indexer_use_sparse_loss=sparse_loss,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0,
+            moe_shared_expert_gate=False,
+            moe_shared_expert_overlap=False,
+            moe_token_dispatcher_type="allgather",
+            moe_grouped_gemm=False,
+            cross_entropy_loss_fusion=False,
+        )
+        model_config = HybridModelConfig(
+            transformer=config,
+            hybrid_stack_spec=hybrid_dsv4_stack_spec(config),
+            hybrid_layer_pattern="DE" * 6,
+            vocab_size=64,
+            seq_length=16,
+            position_embedding_type="none",
+            share_embeddings_and_output_weights=False,
+            parallel_output=False,
+        )
+        bare_model = HybridModelBuilder(model_config).build_model(pg_collection).cuda()
+        # Use the training wrapper, which preserves the FP32-marked compressor,
+        # attention sink, and mHC tensors. A blanket .bfloat16() would change them.
+        model = Float16Module(config, bare_model) if dtype == torch.bfloat16 else bare_model
+        model.train()
+        return model, bare_model
+
+    @staticmethod
+    def _batch(length):
+        tokens = torch.arange(2 * (length + 1), device="cuda").view(2, length + 1) % 64
+        input_ids = tokens[:, :-1].contiguous()
+        labels = tokens[:, 1:].contiguous()
+        position_ids = torch.arange(length, device="cuda").expand_as(input_ids)
+        loss_mask = torch.ones_like(labels, dtype=torch.float32)
+        loss_mask[:, 1::3] = 0
+        return dict(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+
+    @staticmethod
+    def _masked_loss(token_losses, loss_mask):
+        # HybridModel returns per-token CE. The training loss function owns masking
+        # and reduction; the model's loss_mask argument also serves the MTP path.
+        return (token_losses.float() * loss_mask).sum() / loss_mask.sum()
+
+    @staticmethod
+    def _assert_live_gradient(parameter, name):
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.float().abs().sum() > 0, name
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_hybrid_dsv41_logits_masked_ce_and_backbone_gradients(self, pg_collection, dtype):
+        """The configured DE stack reaches both LM endpoints and every trained branch."""
+        model, bare_model = self._build_model(pg_collection, dtype)
+        assert bare_model.pg_collection is pg_collection
+        assert bare_model.embedding.word_embeddings.weight is not bare_model.output_layer.weight
+        assert bare_model.embedding.word_embeddings.weight.dtype == dtype
+        assert bare_model.output_layer.weight.dtype == dtype
+        assert len(bare_model.decoder.layers) == 12
+        assert all(
+            isinstance(layer, HyperConnectionHybridLayer) for layer in bare_model.decoder.layers
+        )
+        assert not any("hc_head_" in name for name, _ in bare_model.named_parameters())
+
+        marked_parameters = [
+            parameter
+            for parameter in bare_model.parameters()
+            if getattr(parameter, "keep_in_fp32", False)
+        ]
+        assert marked_parameters
+        assert all(parameter.dtype == torch.float32 for parameter in marked_parameters)
+
+        attention_layers = [
+            layer.inner_layer.self_attention for layer in bare_model.decoder.layers[::2]
+        ]
+        moe_layers = [layer.inner_layer.mlp for layer in bare_model.decoder.layers[1::2]]
+        assert all(
+            isinstance(layer.core_attention, CompressedSparseAttention2)
+            for layer in attention_layers
+        )
+        assert all(isinstance(layer, MoELayer) for layer in moe_layers)
+        assert all(isinstance(layer.experts, SequentialMLP) for layer in moe_layers)
+        assert all(isinstance(layer.shared_experts, SharedExpertMLP) for layer in moe_layers)
+
+        batch = self._batch(7)
+        with torch.no_grad():
+            logits = model(**{key: value for key, value in batch.items() if key != "labels"})
+        assert logits.shape == (2, 7, 64)
+        assert logits.dtype == torch.float32
+        expected_losses = F.cross_entropy(
+            logits.flatten(0, 1), batch["labels"].flatten(), reduction="none"
+        ).view_as(batch["labels"])
+
+        selected_experts = {}
+
+        def record_routing(router, inputs, output):
+            # Router flattens [sequence, batch]. Experts used only by masked final
+            # tokens can correctly receive zero gradient, so require supervised use.
+            supervised_tokens = batch["loss_mask"].T.reshape(-1).bool()
+            selected_experts[router] = output[1].detach()[supervised_tokens].any(dim=0)
+
+        handles = [layer.router.register_forward_hook(record_routing) for layer in moe_layers]
+        try:
+            token_losses = model(**batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+        assert token_losses.shape == batch["labels"].shape
+        tolerance = 2e-4 if dtype == torch.bfloat16 else 2e-6
+        torch.testing.assert_close(token_losses, expected_losses, atol=tolerance, rtol=tolerance)
+        token_losses.retain_grad()
+        loss = self._masked_loss(token_losses, batch["loss_mask"])
+        torch.testing.assert_close(
+            loss, expected_losses[batch["loss_mask"].bool()].mean(), atol=tolerance, rtol=tolerance
+        )
+        loss.backward()
+        torch.testing.assert_close(
+            token_losses.grad, batch["loss_mask"] / batch["loss_mask"].sum(), atol=0, rtol=0
+        )
+
+        self._assert_live_gradient(bare_model.embedding.word_embeddings.weight, "embedding")
+        self._assert_live_gradient(bare_model.output_layer.weight, "LM head")
+        self._assert_live_gradient(bare_model.decoder.final_norm.weight, "final norm")
+        for index, layer in enumerate(bare_model.decoder.layers):
+            self._assert_live_gradient(layer.hyper_connection.mapping_proj.weight, f"mHC {index}")
+        for index, attention in enumerate(attention_layers):
+            # Checking the main query projection reaches all attention modes without
+            # requiring an auxiliary indexer loss in this backbone integration step.
+            self._assert_live_gradient(attention.linear_q_up_proj.weight, f"attention Q {index}")
+            indexer = attention.core_attention.indexer
+            if indexer is not None:
+                assert all(parameter.grad is None for parameter in indexer.parameters())
+            compressor = attention.core_attention.compressor
+            if compressor is not None:
+                self._assert_live_gradient(compressor.linear_wkv.weight, f"global KV owner {index}")
+                if compressor.linear_wgate is not None:
+                    self._assert_live_gradient(
+                        compressor.linear_wgate.weight, f"KV compressor gate {index}"
+                    )
+        for index, moe in enumerate(moe_layers):
+            self._assert_live_gradient(moe.router.weight, f"router {index}")
+            self._assert_live_gradient(moe.shared_experts.linear_fc1.weight, f"shared FC1 {index}")
+            self._assert_live_gradient(moe.shared_experts.linear_fc2.weight, f"shared FC2 {index}")
+            selected = selected_experts[moe.router].nonzero().flatten().tolist()
+            assert selected
+            for expert_index in selected:
+                expert = moe.experts.local_experts[expert_index]
+                self._assert_live_gradient(
+                    expert.linear_fc1.weight, f"expert FC1 {index}/{expert_index}"
+                )
+                self._assert_live_gradient(
+                    expert.linear_fc2.weight, f"expert FC2 {index}/{expert_index}"
+                )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("indexer_loss_coeff", [0.0, 0.1], ids=["lm_only", "lm_and_indexer"])
+    def test_hybrid_dsv41_live_forwards_and_state_dict_roundtrip(
+        self, pg_collection, dtype, indexer_loss_coeff
+    ):
+        """Restored serial execution matches two live graphs backpropagated in reverse."""
+        model, bare_model = self._build_model(
+            pg_collection, dtype, indexer_loss_coeff=indexer_loss_coeff
+        )
+        restored, restored_bare = self._build_model(
+            pg_collection, dtype, indexer_loss_coeff=indexer_loss_coeff
+        )
+        incompatible = restored_bare.load_state_dict(deepcopy(bare_model.state_dict()), strict=True)
+        assert not incompatible.missing_keys and not incompatible.unexpected_keys
+        batches = [self._batch(5), self._batch(7)]
+
+        # Both CSA2 sharing and Single-Pass mHC must keep the earlier graph intact.
+        outputs = [model(**batch) for batch in batches]
+        forward_tolerance = 2e-4 if dtype == torch.bfloat16 else 2e-6
+        for index in (1, 0):
+            expected = restored(**batches[index])
+            torch.testing.assert_close(
+                outputs[index], expected, atol=forward_tolerance, rtol=forward_tolerance
+            )
+            self._masked_loss(expected, batches[index]["loss_mask"]).backward()
+            self._masked_loss(outputs[index], batches[index]["loss_mask"]).backward()
+
+        restored_parameters = dict(restored_bare.named_parameters())
+        tolerance = dict(atol=2e-6, rtol=2e-5)
+        if dtype == torch.bfloat16:
+            tolerance = dict(atol=2e-5, rtol=2e-2)
+        for name, parameter in bare_model.named_parameters():
+            expected_gradient = restored_parameters[name].grad
+            if expected_gradient is None:
+                assert parameter.grad is None, name
+            else:
+                assert parameter.grad is not None, name
+                assert torch.isfinite(parameter.grad).all(), name
+                torch.testing.assert_close(parameter.grad, expected_gradient, **tolerance, msg=name)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("sparse_loss", [False, True], ids=["dense", "sparse"])
+    def test_hybrid_dsv41_indexer_aux_loss_preserves_backbone_gradients(
+        self, pg_collection, dtype, sparse_loss
+    ):
+        """One LM backward also trains the shared indexer, without updating its input producers."""
+        lm_only, lm_bare = self._build_model(pg_collection, dtype, sparse_loss=sparse_loss)
+        model, bare_model = self._build_model(
+            pg_collection, dtype, indexer_loss_coeff=0.1, sparse_loss=sparse_loss
+        )
+        bare_model.load_state_dict(deepcopy(lm_bare.state_dict()), strict=True)
+        batch = self._batch(7)
+        forward_tolerance = 2e-4 if dtype == torch.bfloat16 else 2e-6
+
+        with torch.no_grad():
+            inputs = {key: value for key, value in batch.items() if key != "labels"}
+            expected_logits = lm_only(**inputs)
+            logits = model(**inputs)
+        torch.testing.assert_close(
+            logits, expected_logits, atol=forward_tolerance, rtol=forward_tolerance
+        )
+        expected_losses = lm_only(**batch)
+        token_losses = model(**batch)
+        torch.testing.assert_close(
+            token_losses, expected_losses, atol=forward_tolerance, rtol=forward_tolerance
+        )
+        # The model exposes the unchanged LM loss. The real CSA2 KL terms are
+        # attached by DSAIndexerLossAutoScaler and participate in this same backward.
+        self._masked_loss(expected_losses, batch["loss_mask"]).backward()
+        self._masked_loss(token_losses, batch["loss_mask"]).backward()
+
+        index_source_layers = bare_model.config.csa2_index_source_layers
+        tracker_values = DSAIndexerLossLoggingHelper.tracker["values"]
+        assert torch.isfinite(tracker_values).all()
+        assert (tracker_values[index_source_layers] > 0).all()
+        inactive = torch.ones_like(tracker_values, dtype=torch.bool)
+        inactive[index_source_layers] = False
+        assert torch.count_nonzero(tracker_values[inactive]) == 0
+
+        for layer_index in index_source_layers:
+            indexer = bare_model.decoder.layers[
+                layer_index
+            ].inner_layer.self_attention.core_attention.indexer
+            self._assert_live_gradient(indexer.linear_wq_b.weight, f"indexer query {layer_index}")
+            self._assert_live_gradient(
+                indexer.linear_weights_proj.weight, f"indexer weights {layer_index}"
+            )
+            if indexer.owns_k:
+                self._assert_live_gradient(
+                    indexer.linear_wk.weight, f"shared indexer key {layer_index}"
+                )
+                self._assert_live_gradient(
+                    indexer.k_norm.weight, f"shared indexer key norm {layer_index}"
+                )
+            else:
+                assert indexer.linear_wk is None and indexer.k_norm is None
+
+        reference_parameters = dict(lm_bare.named_parameters())
+        tolerance = dict(atol=2e-6, rtol=2e-5)
+        if dtype == torch.bfloat16:
+            tolerance = dict(atol=2e-5, rtol=2e-2)
+        for name, parameter in bare_model.named_parameters():
+            reference_gradient = reference_parameters[name].grad
+            if ".indexer." in name:
+                assert reference_gradient is None, name
+            elif reference_gradient is None:
+                assert parameter.grad is None, name
+            else:
+                assert parameter.grad is not None, name
+                torch.testing.assert_close(
+                    parameter.grad, reference_gradient, **tolerance, msg=name
+                )

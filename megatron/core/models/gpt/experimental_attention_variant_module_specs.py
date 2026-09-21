@@ -24,6 +24,12 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexer,
     CSAIndexerSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.csa2 import (
+    CompressedSparseAttention2,
+    CSA2Compressor,
+    CSA2Indexer,
+    CSA2IndexerSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
     DSv4HybridSelfAttentionSubmodules,
@@ -179,6 +185,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
     """Helper function to get module spec for DSv4 Hybrid Sparse Attention."""
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+    is_csa2 = config.dsv4_version == "v4.1"
 
     # Adjust for RMS norm.
     rms_norm = config.normalization == "RMSNorm"
@@ -189,7 +196,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
     )
 
     compressor_spec = ModuleSpec(
-        module=Compressor,
+        module=CSA2Compressor if is_csa2 else Compressor,
         submodules=CompressorSubmodules(
             linear_wkv=backend.linear(),
             linear_wgate=backend.linear(),
@@ -197,17 +204,28 @@ def get_dsv4_hybrid_module_spec_for_backend(
         ),
     )
 
-    indexer_spec = ModuleSpec(
-        module=CSAIndexer,
-        submodules=CSAIndexerSubmodules(
-            linear_wq_b=backend.linear(),
-            linear_weights_proj=backend.linear(),
-            compressor=compressor_spec,
-        ),
-    )
+    if is_csa2:
+        indexer_spec = ModuleSpec(
+            module=CSA2Indexer,
+            submodules=CSA2IndexerSubmodules(
+                linear_wq_b=backend.linear(),
+                linear_wk=backend.linear(),
+                k_norm=backend.layer_norm(rms_norm=True, for_qk=True),
+                linear_weights_proj=backend.linear(),
+            ),
+        )
+    else:
+        indexer_spec = ModuleSpec(
+            module=CSAIndexer,
+            submodules=CSAIndexerSubmodules(
+                linear_wq_b=backend.linear(),
+                linear_weights_proj=backend.linear(),
+                compressor=compressor_spec,
+            ),
+        )
 
     core_attention = ModuleSpec(
-        module=CompressedSparseAttention,
+        module=CompressedSparseAttention2 if is_csa2 else CompressedSparseAttention,
         submodules=CompressedSparseAttentionSubmodules(
             compressor=compressor_spec, indexer=indexer_spec
         ),

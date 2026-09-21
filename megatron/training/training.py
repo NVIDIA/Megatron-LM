@@ -808,6 +808,142 @@ def _dsv4_hybrid_self_attention_flops(
     return token_linear, core
 
 
+def _dsv41_self_attention_flops(args):
+    """CSA2 attention coefficients using the same aggregation contract as DSv4.
+
+    Returns ``(token_linear, core)`` for the caller to multiply by the real
+    token count and sum of squared sequence lengths, then by FMA x2 and the
+    common forward/backward factor x3. These are forward-equivalent coefficients:
+    detached indexer projections pay only forward (or forward + wgrad with
+    supervision), so their contribution is normalized by that common x3.
+
+    Each consumer pays for attention, but only Full owners project compressed
+    KV and indexer K, and only Full/Reindex layers compute indexer queries and scores.
+    Hybrid owner IDs count FFN sublayers too; pipeline separators do not count.
+
+    As in DSv4/DSA accounting, this measures model work rather than kernel work:
+    sorting, candidate construction, auxiliary teacher/loss operations and
+    recomputation are excluded. Main Q/KV normalization follows the existing
+    DSv4 projection estimate. Indexer scoring backward is charged only when
+    supervision is enabled, over top-k for sparse loss.
+
+    Follow V4's sequence-length approximation: charge the full sliding window,
+    estimate top-k work using configured seq_length, and omit corrections for
+    incomplete compression groups at sequence tails. Real packed token counts and squared
+    sequence-length sums are applied only by the caller. Candidate capacity is
+    an upper bound when a selected block is partial.
+    """
+    assert not args.mtp_num_layers, "V4.1 backbone FLOPs do not include MTP/DSpark layers."
+    ratios = args.csa_compress_ratios
+    if args.hybrid_layer_pattern is not None:
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+        layers = args.hybrid_layer_pattern.replace(Symbols.PIPE, "")
+        assert (
+            Symbols.MTP_SEPARATOR not in layers
+        ), "V4.1 backbone FLOPs do not include MTP/DSpark layers."
+        assert set(layers) <= {
+            Symbols.DS_ATTENTION,
+            Symbols.WINDOW,
+            Symbols.MLP,
+            Symbols.MOE,
+        }, "V4.1 Hybrid FLOPs require D/W attention and E/- FFN layers."
+        assert ratios is not None and len(ratios) == len(
+            layers
+        ), "V4.1 csa_compress_ratios must contain one entry per Hybrid sublayer."
+        assert all(
+            ratio == 0 for symbol, ratio in zip(layers, ratios) if symbol != Symbols.DS_ATTENTION
+        ), "V4.1 non-D sublayers require compression ratio zero."
+        attention_layers = [
+            (layer, ratios[layer])
+            for layer, symbol in enumerate(layers)
+            if symbol in (Symbols.DS_ATTENTION, Symbols.WINDOW)
+        ]
+    else:
+        assert (
+            ratios is not None and len(ratios) == args.num_layers
+        ), "V4.1 csa_compress_ratios must contain one entry per Transformer layer."
+        attention_layers = list(enumerate(ratios))
+
+    seq_length = args.seq_length
+
+    def average_topk_keys(ratio, topk):
+        # Match the continuous causal top-k approximation in the V4 helper.
+        effective_topk = min(topk, seq_length // ratio)
+        return effective_topk * (1 - effective_topk * ratio / (2 * seq_length))
+
+    def scoring_fraction(ratio, cap):
+        # Unrestricted scoring uses the causal half of the compressed matrix.
+        # A cap covering every compressed key leaves that estimate unchanged.
+        if cap is None or cap >= seq_length // ratio:
+            return 1 / (2 * ratio)
+        return average_topk_keys(ratio, cap) / seq_length
+
+    hidden, heads, dim = args.hidden_size, args.num_attention_heads, args.v_head_dim
+    main_projection = (
+        args.q_lora_rank * (hidden + heads * dim + 1)
+        + hidden * dim
+        + dim
+        + heads * dim * args.o_lora_rank
+        + args.o_groups * args.o_lora_rank * hidden
+    )
+    kv_sources = set(args.csa2_kv_source_layers)
+    index_sources = set(args.csa2_index_source_layers)
+    compressed_layers = {layer for layer, ratio in attention_layers if ratio > 0}
+    assert kv_sources <= index_sources <= compressed_layers, (
+        "V4.1 FLOPs source IDs must refer to compressed attention layers, and "
+        "every KV source must also be an index source."
+    )
+    candidate_source = getattr(args, "csa2_candidate_source_layer", None)
+    candidate_capacity = (
+        args.csa2_candidate_topk_blocks * args.csa2_candidate_block_size
+        if candidate_source is not None
+        else None
+    )
+    loss_enabled = (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0
+    sparse_loss = getattr(args, "dsa_indexer_use_sparse_loss", False)
+    # Normalize detached projection work to the caller's common x3 multiplier.
+    index_projection_factor = (2 if loss_enabled else 1) / 3
+
+    token_linear, core = 0.0, 0.0
+    for layer, ratio in attention_layers:
+        assert ratio in (0, 1, 2), "V4.1 FLOPs require compression ratios 0, 1 or 2."
+        average_keys = args.csa_window_size
+        if ratio:
+            average_keys += average_topk_keys(ratio, args.dsa_indexer_topk)
+        token_linear += main_projection + 2 * heads * dim * average_keys
+        if not ratio:
+            continue
+
+        if layer in kv_sources:
+            # Like V4, count compressor projections per input token and K at 1/r.
+            # r1 has one projection; r2 has both KV and gate projections.
+            token_linear += hidden * dim * (2 if ratio == 2 else 1)
+            token_linear += index_projection_factor * dim * args.dsa_indexer_head_dim / ratio
+        if layer not in index_sources:
+            continue
+
+        index_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+        token_linear += index_projection_factor * (
+            args.q_lora_rank * index_dim + hidden * args.dsa_indexer_n_heads
+        )
+        # The candidate source itself scores all causal keys. Only later Reindex
+        # layers restrict scoring to its selected blocks.
+        cap = (
+            candidate_capacity
+            if candidate_source is not None and layer > candidate_source and layer not in kv_sources
+            else None
+        )
+        scoring = scoring_fraction(ratio, cap)
+        if loss_enabled:
+            if sparse_loss:
+                cap = args.dsa_indexer_topk if cap is None else min(cap, args.dsa_indexer_topk)
+            # Scoring has both query and key gradients when supervised.
+            scoring += 2 * scoring_fraction(ratio, cap)
+        core += index_dim * scoring / 3
+    return token_linear, core
+
+
 _vision_flops_missing_runtime_stats_warned: bool = False
 
 
@@ -1340,24 +1476,27 @@ def num_floating_point_operations(
         # Self-attention (already summed over all attention layers, fwd-equivalent
         # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
         if experimental_attention_variant == "dsv4_hybrid":
-            # DSv4 uses sparse MLA attention. Keep the shared helper as the
-            # single source of truth for both HybridModel and GPTModel.
-            dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
-                hidden_size=hidden_size,
-                num_attention_heads=num_attn_heads,
-                v_head_dim=v_head_dim,
-                q_lora_rank=q_lora_rank,
-                o_groups=o_groups,
-                o_lora_rank=o_lora_rank,
-                csa_window_size=csa_window_size,
-                seq_length=seq_length,
-                n_layers_r0=dsv4_n_layers_r0,
-                n_layers_r4=dsv4_n_layers_r4,
-                n_layers_r128=dsv4_n_layers_r128,
-                dsa_indexer_n_heads=dsa_indexer_n_heads,
-                dsa_indexer_head_dim=dsa_indexer_head_dim,
-                dsa_indexer_topk=dsa_indexer_topk,
-            )
+            # Both HybridModel and GPTModel use the same version-specific
+            # DSv4 sparse-attention coefficient helpers.
+            if getattr(args, "dsv4_version", None) == "v4.1":
+                dsv4_token_term, dsv4_core_term = _dsv41_self_attention_flops(args)
+            else:
+                dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
+                    hidden_size=hidden_size,
+                    num_attention_heads=num_attn_heads,
+                    v_head_dim=v_head_dim,
+                    q_lora_rank=q_lora_rank,
+                    o_groups=o_groups,
+                    o_lora_rank=o_lora_rank,
+                    csa_window_size=csa_window_size,
+                    seq_length=seq_length,
+                    n_layers_r0=dsv4_n_layers_r0,
+                    n_layers_r4=dsv4_n_layers_r4,
+                    n_layers_r128=dsv4_n_layers_r128,
+                    dsa_indexer_n_heads=dsa_indexer_n_heads,
+                    dsa_indexer_head_dim=dsa_indexer_head_dim,
+                    dsa_indexer_topk=dsa_indexer_topk,
+                )
             attn_flops_total = 2 * (
                 dsv4_token_term * total_tokens + dsv4_core_term * seqlen_squared_sum
             )
@@ -1531,7 +1670,7 @@ def num_floating_point_operations(
             if args.experimental_attention_variant == "dsv4_hybrid":
                 ## DSv4 hybrid: the MLA projections AND the sparse attention that
                 ## replaces full core attention are both computed together by
-                ## ``_dsv4_hybrid_self_attention_flops`` in the dsv4_hybrid branch
+                ## the version-specific DSv4 helper in the dsv4_hybrid branch
                 ## below (the single source of truth shared with ``hybrid_flops``).
                 ## Zero the standard MLA terms here so they are not double-counted.
                 standard_self_attn_term = 0
@@ -1702,7 +1841,7 @@ def num_floating_point_operations(
         elif args.experimental_attention_variant == "dsv4_hybrid":
             # DSv4 hybrid: MLA projections + sparse attention (window /
             # compressed-KV), main compressor, and learned indexer (DSA) are all
-            # computed by the shared ``_dsv4_hybrid_self_attention_flops`` helper.
+            # computed by the version-specific attention coefficient helper.
             # The standard MLA terms were zeroed above to avoid double-counting.
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -1714,24 +1853,27 @@ def num_floating_point_operations(
                 f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
                 f"expected num_layers + mtp_num_layers ({num_layers})."
             )
-            # ratio == 0: window-only; ratio == 4: window + topk compressed KV
-            # (compressor + indexer); ratio == 128: window + all compressed KV.
-            dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
-                hidden_size=args.hidden_size,
-                num_attention_heads=args.num_attention_heads,
-                v_head_dim=args.v_head_dim,
-                q_lora_rank=args.q_lora_rank,
-                o_groups=args.o_groups,
-                o_lora_rank=args.o_lora_rank,
-                csa_window_size=args.csa_window_size,
-                seq_length=args.seq_length,
-                n_layers_r0=sum(1 for r in compress_ratios if r == 0),
-                n_layers_r4=sum(1 for r in compress_ratios if r == 4),
-                n_layers_r128=sum(1 for r in compress_ratios if r == 128),
-                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
-                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
-                dsa_indexer_topk=args.dsa_indexer_topk,
-            )
+            if getattr(args, "dsv4_version", None) == "v4.1":
+                dsv4_token_term, dsv4_core_term = _dsv41_self_attention_flops(args)
+            else:
+                # ratio == 0: window-only; ratio == 4: window + topk compressed KV
+                # (compressor + indexer); ratio == 128: window + all compressed KV.
+                dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
+                    hidden_size=args.hidden_size,
+                    num_attention_heads=args.num_attention_heads,
+                    v_head_dim=args.v_head_dim,
+                    q_lora_rank=args.q_lora_rank,
+                    o_groups=args.o_groups,
+                    o_lora_rank=args.o_lora_rank,
+                    csa_window_size=args.csa_window_size,
+                    seq_length=args.seq_length,
+                    n_layers_r0=sum(1 for r in compress_ratios if r == 0),
+                    n_layers_r4=sum(1 for r in compress_ratios if r == 4),
+                    n_layers_r128=sum(1 for r in compress_ratios if r == 128),
+                    dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                    dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                    dsa_indexer_topk=args.dsa_indexer_topk,
+                )
             dsv4_hybrid_extra_term = (
                 forward_backward_expansion_factor * fma_expansion_factor * dsv4_token_term
             )
@@ -1897,13 +2039,17 @@ def num_floating_point_operations(
         dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
         if args.experimental_attention_variant == "dsv4_hybrid":
             assert num_mla_layers == 0, "dsv4_hybrid does not support dense + MLA layers"
-            assert num_attn_layers == (dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128), (
-                "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
-                f"got {num_attn_layers} attention layers but only "
-                f"{dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128} are W/C/H."
-            )
+            if getattr(args, "dsv4_version", None) != "v4.1":
+                assert num_attn_layers == (
+                    dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128
+                ), (
+                    "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
+                    f"got {num_attn_layers} attention layers but only "
+                    f"{dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128} are W/C/H."
+                )
 
-        # DSA accounting (top-k sparse core attention + indexer) is only
+        # CSA2 'D' layers are handled above by the dsv4_hybrid branch.
+        # Other DSA accounting (top-k sparse core attention + indexer) is only
         # implemented on the standard-model path in ``transformer_flops``. A
         # 'D' pattern here would silently fall through to the dense full-MLA
         # estimate below -- overcounting core attention at long context and
@@ -1913,9 +2059,9 @@ def num_floating_point_operations(
         # kwargs (``arguments.py``/``argument_utils.py`` write it into
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
-        assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+        assert args.experimental_attention_variant != "dsa" and (
+            layer_counts[Symbols.DS_ATTENTION] == 0
+            or args.experimental_attention_variant == "dsv4_hybrid"
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -4115,9 +4261,13 @@ def training_log(
             total_loss_dict=total_loss_dict,
             num_layers=args.num_layers + (args.mtp_num_layers or 0),
             num_indexer_layers=(
-                sum(ratio == 4 for ratio in args.csa_compress_ratios)
-                if args.csa_compress_ratios is not None
-                else None
+                len(args.csa2_index_source_layers)
+                if getattr(args, "dsv4_version", None) == "v4.1"
+                else (
+                    sum(ratio == 4 for ratio in args.csa_compress_ratios)
+                    if args.csa_compress_ratios is not None
+                    else None
+                )
             ),
             preserve_groups=args.cuda_graph_impl != "none",
         )
