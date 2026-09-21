@@ -212,22 +212,41 @@ class FusedCombine(torch.autograd.Function):
     """Fused combine operation for MoE output combining computation and communication."""
 
     @staticmethod
-    def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
-        """Forward pass of fused combine."""
-        previous_event = None
-        if async_finish:
-            previous_event = EventOverlap(EventHandle())
-        buffer = get_buffer(group, get_hidden_bytes(x))
-        combined_x, _, after_event = buffer.combine(
-            x,
-            handle=handle,
-            async_finish=async_finish,
-            previous_event=previous_event,
-            allocate_on_comm_stream=allocate_on_comm_stream,
-        )
-        # Make sure current stream is synchronized
-        if async_finish:
-            after_event.current_stream_wait()
+    def forward(
+        ctx,
+        x,
+        group,
+        handle,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        skip_compute=False,
+        num_tokens=None,
+    ):
+        """Forward pass of fused combine.
+
+        ``skip_compute`` (an activation-recompute re-run, see ``dead_recompute.py``): the combined
+        values are read by nobody and the backward is the cached dispatch through ``handle``, so
+        return an uninitialised tensor of the combined shape ``[num_tokens, hidden]`` without
+        communicating.
+        """
+        if skip_compute:
+            assert num_tokens is not None, "skip_compute needs the number of tokens to combine to"
+            combined_x = torch.empty((num_tokens, x.shape[-1]), dtype=x.dtype, device=x.device)
+        else:
+            previous_event = None
+            if async_finish:
+                previous_event = EventOverlap(EventHandle())
+            buffer = get_buffer(group, get_hidden_bytes(x))
+            combined_x, _, after_event = buffer.combine(
+                x,
+                handle=handle,
+                async_finish=async_finish,
+                previous_event=previous_event,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+            # Make sure current stream is synchronized
+            if async_finish:
+                after_event.current_stream_wait()
 
         ctx.handle = handle
         ctx.group = group
@@ -252,7 +271,7 @@ class FusedCombine(torch.autograd.Function):
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
-        return grad_x, None, None, None, None
+        return grad_x, None, None, None, None, None, None
 
 
 if HAVE_DEEP_EP:
@@ -289,7 +308,15 @@ if HAVE_DEEP_EP:
             allocate_on_comm_stream,
         )
 
-    def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+    def fused_combine(
+        x,
+        group,
+        handle,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+        skip_compute=False,
+        num_tokens=None,
+    ):
         """Perform fused combine operation if deep_ep is available.
 
         Args:
@@ -297,11 +324,16 @@ if HAVE_DEEP_EP:
             group: Process group
             handle: Communication handle
             previous_event: Previous CUDA event
+            skip_compute: return a tensor of the combined shape without communicating (an
+                activation-recompute re-run whose combined values nobody reads)
+            num_tokens: the number of tokens to combine to (required with skip_compute)
 
         Returns:
             Result of FusedCombine
         """
-        return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
+        return FusedCombine.apply(
+            x, group, handle, async_finish, allocate_on_comm_stream, skip_compute, num_tokens
+        )
 
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP"""
