@@ -13,6 +13,12 @@ The `V` symbol selects CSA2; it can be composed with dense MLPs (`V-`), experts
 (`VE`), or other supported layers. `CSA2HybridAdapter` owns the forward-local
 sharing lifecycle. It does not replace the stack or own parameters.
 
+Hierarchical candidates are shared as compact block IDs; consumers expand their
+own masks while scoring. Equal scores select earlier positions and blocks, with
+the newest visible block always retained. This makes selection independent of
+masked future capacity and can change results where earlier versions had ties.
+The native indexer still materializes dense scores.
+
 Single-pass mHC is independently available through `TransformerConfig` with
 `enable_mhc_connections=True, mhc_single_pass=True`. `HyperConnectionModule`,
 `HyperConnectionHybridLayer`, and `HyperConnectionTransformerLayer` share the
