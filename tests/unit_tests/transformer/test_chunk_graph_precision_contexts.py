@@ -111,9 +111,15 @@ class TestChunkGraphPrecisionContexts:
         import transformer_engine.pytorch as te
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
+        fp8_available, reason = FP8GlobalStateManager.is_fp8_available()
+        if not fp8_available:
+            pytest.skip(f"FP8 not available on this device: {reason}")
+        # The test observes the FP8 *state* only, so any recipe first_last_layers_bf16 accepts
+        # will do: MXFP8 needs Blackwell, per-tensor current scaling also runs on Hopper.
+        recipe = "mxfp8" if FP8GlobalStateManager.is_mxfp8_available()[0] else "tensorwise"
         config = _config(
             fp8="e4m3",
-            fp8_recipe="mxfp8",
+            fp8_recipe=recipe,
             first_last_layers_bf16=True,
             num_layers_at_start_in_bf16=1,
             num_layers_at_end_in_bf16=1,
