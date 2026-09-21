@@ -23,6 +23,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
+from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
 
 # NOTE: ``get_model`` below does a ``from model import model_provider`` for the
@@ -236,7 +237,10 @@ def get_model(is_vlm: bool) -> MegatronModule:
         from gpt_builders import gpt_builder  # examples/inference/gpt
         from model_provider import model_provider
 
-        model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
+        model = _get_model(
+            partial(model_provider, gpt_builder, profiling=profiling_config_from_args(args)),
+            wrap_with_ddp=False,
+        )
 
     assert args.load is not None
     args.exit_on_missing_checkpoint = True

@@ -133,13 +133,16 @@ def load_checkpoint_to_model(args):
     from model_provider import model_provider
     from gpt_builders import gpt_builder
     from transformers import MixtralForCausalLM, MixtralConfig
+    from megatron.training.argument_utils import profiling_config_from_args
 
     # Load Huggingface model.
 
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
+    model = model_provider(
+        gpt_builder, pre_process=True, post_process=True, profiling=profiling_config_from_args(args)
+    ).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -239,7 +242,7 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
-    
+
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
     fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)

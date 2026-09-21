@@ -18,6 +18,7 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.global_vars import initialize_runtime_services
@@ -25,7 +26,6 @@ from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
-
 
 
 def add_ar_validation_args(parser):
@@ -89,14 +89,13 @@ def report_current_memory_info():
     torch.distributed.barrier()
 
 
-
-
 if __name__ == "__main__":
     args = parse_and_validate_args(extra_args_provider=add_ar_validation_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
         })
+    profiling = profiling_config_from_args(args)
     initialize_runtime_services(args)
     initialize_megatron()
 
@@ -118,14 +117,16 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_hf_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder, profiling=profiling),
+        wrap_with_ddp=False,
+    )
 
     report_current_memory_info()
 
     if args.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
-
 
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()

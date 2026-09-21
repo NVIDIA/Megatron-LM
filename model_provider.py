@@ -9,6 +9,7 @@ import torch
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.training import get_args, print_rank_0
+from megatron.training.config import ProfilingConfig
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -18,7 +19,14 @@ except ImportError:
 
 
 def model_provider(
-    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
+    model_builder: Callable,
+    pre_process=True,
+    post_process=True,
+    vp_stage: Optional[int] = None,
+    config=None,
+    pg_collection=None,
+    *,
+    profiling: ProfilingConfig,
 ) -> Union[GPTModel, HybridModel]:
     """Builds the model.
 
@@ -34,7 +42,7 @@ def model_provider(
     """
     args = get_args()
 
-    if args.record_memory_history:
+    if profiling.record_memory_history:
         torch.cuda.memory._record_memory_history(
             True,
             # keep 100,000 alloc/free events from before the snapshot
@@ -47,7 +55,7 @@ def model_provider(
             # snapshot right after an OOM happened
             print('saving allocated state during OOM')
 
-            filename = f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}"
+            filename = f"oom_rank-{torch.distributed.get_rank()}_{profiling.memory_snapshot_path}"
             torch.cuda.memory._dump_snapshot(filename)
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)

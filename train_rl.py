@@ -431,5 +431,5 @@ if __name__ == "__main__":
         None,  # we don't need to build any datasets for RL training
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, _model_builder),
+        partial(model_provider, _model_builder, profiling=full_config.profiling),
     )

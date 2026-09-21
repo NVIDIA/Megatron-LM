@@ -16,6 +16,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from megatron.training.training import setup_model_and_optimizer
 from megatron.training.utils import is_first_or_last_pipeline_stage
@@ -100,9 +101,10 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
         model_type=ModelType.encoder_or_decoder,
-        model_provider_func=partial(model_provider, hybrid_builder),
+        model_provider_func=partial(model_provider, hybrid_builder, profiling=ProfilingConfig()),
         cfg_container=cfg_container,
         pg_collection=pg_collection,
+        profiling=cfg_container.profiling,
     )
     return model, optimizer
 

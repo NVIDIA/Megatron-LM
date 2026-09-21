@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+from dataclasses import fields
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -30,6 +31,7 @@ from megatron.training.checkpointing import (
     read_metadata,
     save_checkpoint,
 )
+from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -396,6 +398,13 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
     """Test save_checkpoint."""
     args = create_args
     args.ckpt_format = ckpt_format
+    profiling = ProfilingConfig(
+        use_nsys_profiler=True, profile_ranks=[0], memory_snapshot_path="owned.pickle"
+    )
+    # Runtime config owns these fields, even if the legacy namespace disagrees.
+    args.profile = False
+    args.profile_ranks = [99]
+    args.memory_snapshot_path = "stale.pickle"
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -425,7 +434,12 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         set_args(args)
 
         save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+            iteration,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            profiling=profiling,
         )
 
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
@@ -440,6 +454,12 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+        state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
+        for field in fields(profiling):
+            name = "profile" if field.name == "use_nsys_profiler" else field.name
+            assert getattr(state["args"], name) == getattr(profiling, field.name)
+        assert args.profile is False and args.profile_ranks == [99]
+        assert args.memory_snapshot_path == "stale.pickle"
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
@@ -471,7 +491,12 @@ def test_load_checkpoint(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+            iteration,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            profiling=ProfilingConfig(),
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
@@ -534,7 +559,12 @@ def test_load_checkpoint_override_opt_param_scheduler(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+            iteration,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            profiling=ProfilingConfig(),
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
@@ -597,7 +627,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
-            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_fp_ops,
+                profiling=ProfilingConfig(),
+            )
 
         second_job_mock_metadata = {
             **base_metadata,
@@ -613,7 +650,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             assert optimizer._called_metadata[-1] == first_job_mock_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
-            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_fp_ops,
+                profiling=ProfilingConfig(),
+            )
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
         assert optimizer._called_metadata == model._called_metadata

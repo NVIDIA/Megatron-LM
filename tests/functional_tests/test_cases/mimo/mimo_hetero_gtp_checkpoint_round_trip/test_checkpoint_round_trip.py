@@ -208,6 +208,7 @@ def _install_checkpoint_resave_hook() -> None:
             dp_group=pg_collection.dp if pg_collection is not None else None,
             expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+            profiling=kwargs["profiling"],
         )
         dist.barrier()
         raise SystemExit(0)

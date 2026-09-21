@@ -45,6 +45,7 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import initialize_runtime_services
@@ -177,6 +178,7 @@ if __name__ == "__main__":
             "no_load_optim": True,
         },
     )
+    profiling = profiling_config_from_args(args)
     initialize_runtime_services(args)
     initialize_megatron()
 
@@ -192,8 +194,7 @@ if __name__ == "__main__":
         modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
     )
     model = get_model(
-        functools.partial(model_provider, prune_builder),
-        wrap_with_ddp=False,
+        functools.partial(model_provider, prune_builder, profiling=profiling), wrap_with_ddp=False
     )
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")
@@ -291,7 +292,7 @@ if __name__ == "__main__":
     print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model) / 1e9:.2f}B")
 
     if args.save is not None:
-        save_checkpoint(1, model, None, None, 0)
+        save_checkpoint(1, model, None, None, 0, profiling=profiling)
 
     # Free pruning-side memory before the sanity-check generation (do this after saving in case it causes issues)
     gc.collect()

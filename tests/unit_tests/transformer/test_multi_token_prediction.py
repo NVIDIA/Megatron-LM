@@ -59,6 +59,7 @@ from megatron.core.utils import (
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
@@ -2413,7 +2414,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
+            ModelType.encoder_or_decoder, self.model_provider, profiling=ProfilingConfig()
         )
         output_ref = gpt_model_ref[0].forward(
             input_ids=tokens,
@@ -2445,6 +2446,7 @@ class TestMultiTokenPrediction:
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
+                profiling=ProfilingConfig(),
             )
 
             expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
@@ -2460,7 +2462,7 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                ModelType.encoder_or_decoder, self.model_provider
+                ModelType.encoder_or_decoder, self.model_provider, profiling=ProfilingConfig()
             )
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
@@ -2520,7 +2522,7 @@ class TestMultiTokenPrediction:
         model_parallel_cuda_manual_seed(_SEED)
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
+            ModelType.encoder_or_decoder, self.model_provider, profiling=ProfilingConfig()
         )
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         output = gpt_model[0].forward(
@@ -2593,7 +2595,7 @@ class TestMultiTokenPrediction:
             batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
+            ModelType.encoder_or_decoder, self.model_provider, profiling=ProfilingConfig()
         )
         assert unwrap_model(gpt_model[0]).mtp.config.mtp_hsm
         assert gpt_model[0].training, "HSM only runs in training mode"
@@ -2641,7 +2643,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
+            ModelType.encoder_or_decoder, self.model_provider, profiling=ProfilingConfig()
         )
 
         output = gpt_model[0].forward(
@@ -2692,6 +2694,7 @@ class TestMultiTokenPrediction:
             self.model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
+            profiling=cfg_container.profiling,
         )
 
         # Forward pass with packed sequences
@@ -2760,6 +2763,7 @@ class TestMultiTokenPrediction:
             self.model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
+            profiling=cfg_container.profiling,
         )
 
         output = gpt_model[0].forward(
@@ -3329,6 +3333,7 @@ class TestMultiTokenPredictionHybrid:
             self.model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
+            profiling=cfg_container.profiling,
         )
 
         mtp_layers = [
@@ -3822,6 +3827,7 @@ class TestMultiTokenPredictionHybrid:
             self.model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
+            profiling=cfg_container.profiling,
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -3852,6 +3858,7 @@ class TestMultiTokenPredictionHybrid:
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
+                profiling=ProfilingConfig(),
             )
 
             expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
@@ -3872,6 +3879,7 @@ class TestMultiTokenPredictionHybrid:
                 self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
+                profiling=cfg_container.profiling,
             )
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 

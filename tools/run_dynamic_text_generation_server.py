@@ -56,6 +56,7 @@ from megatron.inference.utils import (  # noqa: E402
     get_inference_config_from_model_and_args,
 )
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
+from megatron.training.argument_utils import profiling_config_from_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
 from megatron.training.global_vars import initialize_runtime_services
@@ -440,7 +441,8 @@ if __name__ == "__main__":
         # --profile and --nvtx-ranges are set). Otherwise the engine-side
         # nvtx_range_push labels (bookkeeping, Decode, _ep_establish_consensus,
         # etc.) are no-ops and the inter-step gap is unattributable in nsys.
-        if args.profile and args.nvtx_ranges:
+        profiling = profiling_config_from_args(args)
+        if profiling.use_nsys_profiler and profiling.nvtx_ranges:
             configure_nvtx_profiling(True)
 
         # Already requested via --return-log-probs default above; keep this

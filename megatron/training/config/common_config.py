@@ -43,10 +43,10 @@ class ProfilingConfig:
 
     pytorch_profiler_collect_shapes: bool = False
     """Collect tensor shape in pytorch profiler."""
-  
+
     pytorch_profiler_collect_callstack: bool = False
     """Collect callstack in pytorch profiler."""
-  
+
     pytorch_profiler_collect_chakra: bool = False
     """Collect chakra trace in pytorch profiler."""
 
@@ -65,6 +65,17 @@ class ProfilingConfig:
     nvtx_ranges: bool = False
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate the active profiler's requirements for CLI and native configs."""
+        # Match torch.profiler.schedule's active-window requirement. Inactive
+        # options and CUDA-profiler windows retain their existing CLI behavior.
+        if self.use_nsys_profiler and self.use_pytorch_profiler:
+            if self.profile_step_end <= self.profile_step_start:
+                raise ValueError("PyTorch profiling requires profile_step_end > profile_step_start")
 
 
 @dataclass(kw_only=True)

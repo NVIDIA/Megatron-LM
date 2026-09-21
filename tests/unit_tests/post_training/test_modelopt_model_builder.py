@@ -52,6 +52,7 @@ def test_model_provider_switches_to_modelopt_builder(monkeypatch):
         vp_stage=1,
         config="cfg",
         pg_collection="pg",
+        profiling=mp.ProfilingConfig(),
     )
 
     assert returned is modelopt_result

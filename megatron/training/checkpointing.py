@@ -3,6 +3,8 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
+import dataclasses
 import inspect
 import multiprocessing
 import os
@@ -60,7 +62,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training.argument_utils import _default_config_from_args
-from megatron.training.config import TokenizerConfig
+from megatron.training.config import ProfilingConfig, TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
@@ -640,6 +642,8 @@ def save_checkpoint(
     dp_gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
+    *,
+    profiling: ProfilingConfig,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -817,7 +821,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                args,
+                checkpoint_args_snapshot(args, profiling=profiling),
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1599,6 +1603,20 @@ def maybe_save_dataloader_state(
     dataloader_save_dict = {}
     dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
     torch.save(dataloader_save_dict, data_state_save_path)
+
+
+def checkpoint_args_snapshot(args: Namespace, *, profiling: ProfilingConfig) -> Namespace:
+    """Project config-owned settings into a separate legacy checkpoint snapshot.
+
+    Profiling settings describe the saving run, but are not restored by
+    load_args_from_checkpoint: the resumed run keeps its own profiling policy.
+    Never update live args or retain mutable config fields in an async save.
+    """
+    snapshot = copy.copy(args)
+    for config_field in dataclasses.fields(profiling):
+        name = "profile" if config_field.name == "use_nsys_profiler" else config_field.name
+        setattr(snapshot, name, copy.deepcopy(getattr(profiling, config_field.name)))
+    return snapshot
 
 
 def generate_state_dict(

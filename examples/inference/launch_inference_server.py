@@ -29,6 +29,7 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, initialize_megatron
+from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.global_vars import initialize_runtime_services
 
@@ -110,7 +111,8 @@ def main():
     args = get_args()
 
     # Match the legacy tool's NVTX gating.
-    if args.profile and args.nvtx_ranges:
+    profiling = profiling_config_from_args(args)
+    if profiling.use_nsys_profiler and profiling.nvtx_ranges:
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)
