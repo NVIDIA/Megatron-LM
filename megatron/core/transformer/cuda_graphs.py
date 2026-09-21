@@ -31,6 +31,9 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -2431,7 +2434,7 @@ class TECudaGraphHelper:
                     config_type = type(layer.config)
                     if config_type is AttentionLayerConfig:
                         uses_mla = False
-                    elif config_type in (MLALayerConfig, DSALayerConfig):
+                    elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
                         uses_mla = True
                 if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(

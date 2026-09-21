@@ -1,12 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -18,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
+    compute_normalized_router_scores,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
@@ -27,6 +30,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.transformer.moe.router_diagnostics import build_router_diagnostics
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -761,9 +765,8 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape [seq_length, bsz]. True = padding,
-                                                   False = valid. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask of shape `[seq_length, bsz]`.
+                `True` marks padding. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -771,6 +774,22 @@ class TopKRouter(Router):
                 with shape [num_tokens, num_experts].
         """
         seq_length, bsz = logits.shape[:2]
+        observe_router_diagnostics = is_observing_tensor("router_diagnostics")
+        if self.training and observe_router_diagnostics:
+            # The compact summaries normalize within each sequence and cannot reconstruct a
+            # complete sequence after it has been partitioned across ranks.
+            partitioned_sequence_axes = []
+            if self.config.sequence_parallel and self.tp_group.size() > 1:
+                partitioned_sequence_axes.append("tensor")
+            if self.cp_group.size() > 1:
+                partitioned_sequence_axes.append("context")
+            if partitioned_sequence_axes:
+                raise NotImplementedError(
+                    "Router diagnostic observations require complete local sequences and do not "
+                    "yet support sequence partitioning across "
+                    + " and ".join(partitioned_sequence_axes)
+                    + " parallel ranks."
+                )
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Flatten padding_mask to [num_tokens] if provided
@@ -813,36 +832,65 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
-            # Calculate scores and routing_map for aux loss
-            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                self.score_function,
-                fused=self.config.moe_router_aux_loss_fusion,
-                padding_mask=padding_mask,
-            )
-            probs = self._apply_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_seq_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                seq_length,
-                bsz,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_global_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
+        # Reuse the unbiased aux-loss routing calculation for due router diagnostics.
+        aux_loss_enabled = self.is_aux_loss_enabled()
+        apply_aux_loss = torch.is_grad_enabled() and aux_loss_enabled
+        compute_aux_inputs = self.training and (observe_router_diagnostics or apply_aux_loss)
+        if compute_aux_inputs:
+            score_context = nullcontext() if apply_aux_loss else torch.no_grad()
+            with score_context:
+                routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                    logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_aux_loss_fusion,
+                    padding_mask=padding_mask,
+                )
+            if observe_router_diagnostics:
+                # Report the additive selection correction: QB subtracts beta from logits,
+                # whereas ordinary bias routing adds expert_bias to the routing scores.
+                selection_bias = (
+                    -self.qb_beta if self.routing_type == "quantile_balancing" else self.expert_bias
+                )
+                diagnostics = build_router_diagnostics(
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    routing_map,
+                    selection_bias,
+                    seq_length,
+                    bsz,
+                    padding_mask=padding_mask,
+                )
+                observe_tensor(
+                    self,
+                    "router_diagnostics",
+                    "router_diagnostics",
+                    diagnostics,
+                    tp_shard_dim=None,
+                    sequence_dim=None,
+                    batch_dim=0,
+                )
+            if apply_aux_loss:
+                probs = self._apply_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
+                probs = self._apply_seq_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    seq_length,
+                    bsz,
+                    with_padding_mask=padding_mask is not None,
+                )
+                probs = self._apply_global_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
@@ -859,17 +907,52 @@ class TopKRouter(Router):
         """
         Forward pass of the router.
 
+        Raw router observations exclude padding when a mask is supplied. Their shape is then
+        `[valid_tokens, num_experts]`, with sequence and batch populations both on dimension zero.
+        Without a mask, observations retain the original sequence and batch dimensions. Routing
+        itself always receives the full logits and the original mask.
+
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape [seq_length, bsz]. True = padding,
-                                                   False = valid. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask of shape `[seq_length, bsz]`.
+                `True` marks padding. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+        observe_logits = is_observing_tensor("router_logits")
+        observe_scores = is_observing_tensor("router_scores")
+        if observe_logits or observe_scores:
+            with torch.no_grad():
+                observed_logits = logits.detach()
+                if padding_mask is not None:
+                    observed_logits = observed_logits[~padding_mask]
+                tp_shard_dim = 0 if self.config.sequence_parallel else None
+                batch_dim = 0 if padding_mask is not None else 1
+                if observe_logits:
+                    observe_tensor(
+                        self,
+                        "router_logits",
+                        "router_logits",
+                        observed_logits,
+                        tp_shard_dim=tp_shard_dim,
+                        sequence_dim=0,
+                        batch_dim=batch_dim,
+                    )
+                # Materialize the full decision distribution only for a due metric.
+                if observe_scores:
+                    scores = compute_normalized_router_scores(observed_logits, self.score_function)
+                    observe_tensor(
+                        self,
+                        "router_scores",
+                        "router_scores",
+                        scores,
+                        tp_shard_dim=tp_shard_dim,
+                        sequence_dim=0,
+                        batch_dim=batch_dim,
+                    )
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark

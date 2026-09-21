@@ -25,6 +25,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
@@ -265,7 +266,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             self.mtp_layer_config_list = parsed_config_list.mtp_layer_config_list
             self.mtp_num_depths = parsed_config_list.mtp_num_depths
-            mla_config_types = {layer_utils.MLALayerConfig, layer_utils.DSALayerConfig}
+            mla_config_types = {
+                layer_utils.Symbols.LAYER_CONFIG_MAP[symbol]
+                for symbol in layer_utils.Symbols.MLA_ATTENTION
+            }
             self._decoder_uses_mla = any(
                 type(entry) in mla_config_types
                 for entry in parsed_config_list.main_layer_config_list
@@ -660,6 +664,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        use_precomputed_mtp_embeddings = decoder_input is not None
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -780,6 +786,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,
@@ -787,7 +794,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
             )
-            assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None
+            if mtp_inputs.decoder_input is None:
+                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
+                    "MTP requires both input_ids and position_ids when precomputed "
+                    "decoder_input embeddings are not provided."
+                )
             mtp_hidden_states = self.mtp(
                 input_ids=mtp_inputs.input_ids,
                 position_ids=mtp_inputs.position_ids,
@@ -802,6 +813,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ),
                 packed_seq_params=mtp_inputs.packed_seq_params,
                 embedding=self.embedding,
+                decoder_input=mtp_inputs.decoder_input,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
@@ -880,6 +892,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         logits = self._scale_logits(logits)
+        gather_output = (
+            self.output_layer.gather_output
+            if runtime_gather_output is None
+            else runtime_gather_output
+        )
+        observe_tensor(
+            self.output_layer,
+            "output_logits",
+            "output_logits",
+            logits,
+            tp_shard_dim=None if gather_output else -1,
+            sequence_dim=0,
+            batch_dim=1,
+        )
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

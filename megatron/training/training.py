@@ -103,6 +103,7 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
+    get_pp_last_rank,
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
@@ -139,6 +140,12 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
+from megatron.training.callbacks import (
+    Callback,
+    CallbackContext,
+    CallbackManager,
+    normalize_callbacks,
+)
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -153,6 +160,12 @@ from megatron.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
     write_args_to_tensorboard,
+)
+
+# Retain the training.py import path used by existing multimodal callers.
+from megatron.training.logging.packed_sequence_stats import (
+    consume_packed_sequence_stats_in_iteration,
+    update_packed_sequence_stats,
 )
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
@@ -839,29 +852,35 @@ def num_floating_point_operations(
         seqlen_squared_sum_in_batch: ``sum_i(L_i ** 2)`` across all REAL
             (unpadded) sub-sequences in the global batch. Drives the
             core-attention L^2 FLOPs. For BSHD this equals
-            ``batch_size * args.seq_length ** 2`` (the default when ``None``).
+            ``batch_size * llm_seq_length ** 2`` (the default when ``None``).
             For THD it is the actual ragged sum and is strictly less than the
             BSHD value, reflecting per-chunk causal masking AND the fact that
             padding tokens do not contribute to attention scores.
         total_real_tokens_in_batch: ``sum_i(L_i)``, the TOTAL REAL (unpadded)
             token count across the global batch. Drives all token-linear FLOPs
             (QKV+output projections, MLP, MoE, MTP norms/projs, logits). For
-            BSHD this equals ``batch_size * args.seq_length`` (the default when
+            BSHD this equals ``batch_size * llm_seq_length`` (the default when
             ``None``). For THD it equals the real token count -- strictly less
-            than ``batch_size * args.seq_length`` whenever the dataloader added
+            than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
         model_flops_estimator: Optional model-owned estimator receiving the resolved
             token counts above as keyword arguments. Returning None selects the legacy
             args-based estimator.
     """
+    # Multimodal --seq-length describes the encoder, while the language model
+    # runs at --decoder-seq-length. Plain language models leave the latter unset.
+    llm_seq_length = (
+        args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length
+    )
+
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
-    # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
+    # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
     # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
     if seqlen_squared_sum_in_batch is None:
-        seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
+        seqlen_squared_sum_in_batch = batch_size * llm_seq_length * llm_seq_length
     if total_real_tokens_in_batch is None:
-        total_real_tokens_in_batch = batch_size * args.seq_length
+        total_real_tokens_in_batch = batch_size * llm_seq_length
 
     if model_flops_estimator is not None:
         model_flops = model_flops_estimator(
@@ -1104,7 +1123,7 @@ def num_floating_point_operations(
         ffn_expansion_factor = 3 if args.swiglu else 2
 
         # self_attn is split into a token-linear part (projections, multiplied by
-        # ``batch_size * args.seq_length`` like all other token-linear work) and a
+        # ``batch_size * llm_seq_length`` like all other token-linear work) and a
         # core-attention part (``QK^T`` and ``softmax(QK^T) V``) whose compute scales
         # with ``sum_i(L_i ** 2)`` instead of ``batch * seq^2``. With unpacked BSHD the
         # two are equal, so the BSHD result is unchanged. With THD/packed sequences
@@ -1381,7 +1400,7 @@ def num_floating_point_operations(
         if mtp_num_layers is None:
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
-        return hybrid_flops(
+        return int(hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
@@ -1416,10 +1435,10 @@ def num_floating_point_operations(
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-        )
+        ))
     else:
         # Compute standard Transformer model FLOPs.
-        return transformer_flops()
+        return int(transformer_flops())
 
 
 def get_start_time_from_progress_log():
@@ -1557,6 +1576,7 @@ def pretrain(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
+    callbacks: list[Callback] | CallbackManager | None = None,
 ):
     """Main training program.
 
@@ -1603,6 +1623,8 @@ def pretrain(
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+
+    callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1859,6 +1881,43 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.trigger("on_setup_start")
+
+    if args.train_full_dataset:
+        if not getattr(
+            train_valid_test_dataset_provider, 'supports_train_full_dataset', False
+        ):
+            raise ValueError(
+                "--train-full-dataset requires a dataset provider that declares "
+                "supports_train_full_dataset"
+            )
+        if args.train_iters is not None or args.train_samples is not None:
+            raise ValueError(
+                "--train-full-dataset cannot be combined with --train-iters or --train-samples"
+            )
+
+        # The scheduler must know the training horizon before model and optimizer setup.
+        # External multimodal providers expose the underlying finite loader through
+        # ``_dataloader`` even though their public iterator is cyclic.
+        args.iteration = 0
+        train_data_iterator, _, _ = train_valid_test_dataset_provider(None)
+        local_num_samples = (
+            len(train_data_iterator._dataloader)
+            if hasattr(train_data_iterator, '_dataloader')
+            else None
+        )
+        total_num_samples = reduce_max_stat_across_model_parallel_group(
+            _reduce_sum_across_data_parallel_group(
+                local_num_samples,
+                with_context_parallel=getattr(
+                    args, 'deduplicate_dataloader_across_context_parallel', False
+                ),
+            )
+        )
+        if total_num_samples is None:
+            raise ValueError("--train-full-dataset resolved to an empty training dataset")
+        args.train_samples = int(total_num_samples)
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
@@ -1972,6 +2031,11 @@ def pretrain(
                 "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
+    callback_manager.callback_context.model = model
+    callback_manager.callback_context.optimizer = optimizer
+    callback_manager.callback_context.scheduler = opt_param_scheduler
+    callback_manager.trigger("on_data_init_start")
+
     # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
     # index building or loading from the cache) can be a multi-second chunk of
     # startup on its own -- the 'data_loading' span group exists exactly for this.
@@ -2083,6 +2147,7 @@ def pretrain(
                     inference_model,
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
+                    callback_manager=callback_manager,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2152,7 +2217,9 @@ def pretrain(
                 iteration, process_non_loss_data_func, model_cfg,
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
                 non_loss_data_func=non_loss_data_func,
-                pg_collection=pg_collection, p2p_communicator=p2p_communicator
+                pg_collection=pg_collection, p2p_communicator=p2p_communicator,
+                callback_manager=callback_manager,
+                is_test=False,
             )
 
     if args.do_test:
@@ -2170,6 +2237,8 @@ def pretrain(
             non_loss_data_func=non_loss_data_func,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=True,
         )
 
     wandb_writer = get_wandb_writer()
@@ -2608,14 +2677,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for disable in per_chunk_disable_bucketing
         ]
 
+        current_stream = torch.cuda.current_stream()
         if config.cuda_graph_impl == "full_iteration":
             # DDP initialization must use the full-iteration capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
+        elif config.cuda_graph_impl == "none":
+            # Eager initialization is serialized with the current stream. A one-shot side stream
+            # can leave cached blocks unavailable to later allocations on the current stream.
+            ddp_stream = current_stream
         else:
             # Preserve a dedicated initialization stream for all other implementations.
             ddp_stream = torch.cuda.Stream()
-        ddp_stream.wait_stream(torch.cuda.current_stream())
+        if ddp_stream is not current_stream:
+            ddp_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
@@ -2633,8 +2708,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # Ensure initialization-stream work completes before touching params on the default stream.
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+        # Ensure side-stream initialization completes before touching params on the current stream.
+        if ddp_stream is not current_stream:
+            current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -2698,6 +2774,20 @@ def get_optimizer_param_scheduler(optimizer):
     )
 
     return opt_param_scheduler
+
+
+def _reduce_sum_across_data_parallel_group(
+    stat: float | None, with_context_parallel: bool = False
+) -> float | None:
+    """Sum an optional scalar across the data-parallel group, optionally including CP."""
+    value = 0.0 if stat is None else stat
+    value = torch.tensor([value], dtype=torch.float32, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(
+        value,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_data_parallel_group(with_context_parallel=with_context_parallel),
+    )
+    return None if value.item() == 0.0 else value.item()
 
 
 def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
@@ -3104,6 +3194,64 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _pop_samples_seen(losses_reduced):
+    """Remove and sum per-microbatch sample-count metadata from reduced losses."""
+    samples_seen = [
+        loss.pop("_samples_seen") for loss in losses_reduced if "_samples_seen" in loss
+    ]
+    if not samples_seen:
+        return None
+    if len(samples_seen) != len(losses_reduced):
+        raise ValueError("_samples_seen must be reported by every microbatch or none of them")
+
+    total = sum(samples_seen)
+    if isinstance(total, torch.Tensor) and total.numel() != 1:
+        raise ValueError("_samples_seen must be a scalar")
+    return total
+
+
+def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
+    """Return the global sample count and synchronize it across pipeline stages."""
+    local_samples_seen = _pop_samples_seen(losses_reduced)
+    is_last_stage = is_pp_last_stage(pg_collection.pp)
+
+    if is_last_stage and local_samples_seen is not None:
+        samples_seen = (
+            torch.as_tensor(local_samples_seen).detach().to(dtype=torch.int64).view(1)
+        )
+        torch.distributed.all_reduce(
+            samples_seen,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
+        )
+    else:
+        samples_seen = torch.tensor([-1], dtype=torch.int64, device=torch.cuda.current_device())
+
+    if get_pg_size(pg_collection.pp) > 1:
+        torch.distributed.broadcast(
+            samples_seen, src=get_pp_last_rank(pg_collection.pp), group=pg_collection.pp
+        )
+
+    samples_seen_value = samples_seen.item()
+    if samples_seen_value >= 0:
+        return int(samples_seen_value)
+    return (
+        get_num_microbatches()
+        * args.micro_batch_size
+        * args.data_parallel_size
+        * args.gtp_weight_remat_size
+    )
+
+
+def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
+    """Return the scheduler increment for the configured training horizon."""
+    if args.train_iters and args.train_samples is None:
+        # Keep iteration-based schedules tied to optimizer steps. The requested
+        # global batch size may be rounded down when batch-size decrease is enabled.
+        return get_current_running_global_batch_size()
+    return samples_seen_in_iteration
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -3267,7 +3415,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, None
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -3277,6 +3425,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if model_pg_collection is None:
+        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    samples_seen_in_iteration = _get_samples_seen_in_iteration(
+        losses_reduced, args, model_pg_collection
+    )
 
     # Update parameters.
 
@@ -3335,14 +3490,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update learning rate.
     if update_successful:
-        # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
-        # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so multiply it
-        # back in for the sample count.
-        increment = (
-            get_num_microbatches()
-            * args.micro_batch_size
-            * args.data_parallel_size
-            * args.gtp_weight_remat_size
+        increment = _get_optimizer_param_scheduler_increment(
+            args, samples_seen_in_iteration
         )
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
@@ -3360,11 +3509,44 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                # there is one dict per microbatch. in new reporting, we average
-                # over the total number of tokens across the global batch.
-                val = torch.vstack(val).sum(dim=0)
-                torch.distributed.all_reduce(val, group=dp_cp_group)
-                loss_reduced[key] = val[0] / val[1]
+                if args.sft and args.sft_loss_log_mode == 'microbatch':
+                    # Some CP shards can legitimately contain no trainable tokens.
+                    # Average only the valid per-microbatch losses.
+                    val = torch.vstack(val)
+                    numerators = val[:, 0]
+                    denominators = val[:, 1]
+                    valid = denominators > 0
+                    if valid.any():
+                        local_sum = (numerators[valid] / denominators[valid]).sum()
+                        local_count = torch.tensor(
+                            float(valid.sum().item()),
+                            dtype=local_sum.dtype,
+                            device=local_sum.device,
+                        )
+                    else:
+                        local_sum = torch.zeros_like(numerators[0])
+                        local_count = torch.zeros_like(denominators[0])
+
+                    torch.distributed.all_reduce(local_sum, group=dp_cp_group)
+                    torch.distributed.all_reduce(local_count, group=dp_cp_group)
+                    loss_reduced[key] = torch.where(
+                        local_count > 0,
+                        local_sum / local_count.clamp(min=1),
+                        torch.zeros_like(local_sum),
+                    )
+                elif args.sft:
+                    # Average over the total number of tokens across the global batch.
+                    val = torch.vstack(val).sum(dim=0)
+                    torch.distributed.all_reduce(val, group=dp_cp_group)
+                    loss_reduced[key] = torch.where(
+                        val[1] > 0,
+                        val[0] / val[1].clamp(min=1),
+                        torch.zeros_like(val[0]),
+                    )
+                else:
+                    val = torch.vstack(val).sum(dim=0)
+                    torch.distributed.all_reduce(val, group=dp_cp_group)
+                    loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -3380,8 +3562,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            samples_seen_in_iteration,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return (
+        {},
+        skipped_iter,
+        should_checkpoint,
+        should_exit,
+        exit_code,
+        grad_norm,
+        num_zeros_in_grad,
+        log_max_attention_logit,
+        samples_seen_in_iteration,
+    )
 
 
 def _hybrid_config_list_moe_logging_metadata(
@@ -3496,6 +3689,9 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    model=None,
+    callback_manager: CallbackManager | None = None,
+    packed_sequence_stats: Optional[Dict[str, float]] = None,
     moe_logging_metadata: tuple[list[str], int, int, bool] | None = None,
     num_floating_point_operations_in_batch: float | None = None,
 ):
@@ -3505,6 +3701,7 @@ def training_log(
     and whether the model has MoE layers. If omitted, use the legacy args-based
     metadata. Likewise, compute batch FLOPs from args only if no count is supplied.
     """
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -3512,8 +3709,11 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # total_loss_dict sums over a log interval and is reset once printed. The first
+    # iteration always prints: under --log-interval 100 that is an extra line inside an
+    # interval still accumulating, so it must not reset; under --log-interval 1 that line
+    # *is* the interval, so it must, or the next print covers two iterations.
+    should_reset = not is_first_iteration or iteration % args.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -3545,6 +3745,8 @@ def training_log(
     timers_to_log = []
     if args.timing_log_level >= 1:
         timers_to_log.extend([
+            'dataloader-next',
+            'batch-generator',
             'forward-backward',
             'layernorm-grads-all-reduce',
             'embedding-grads-all-reduce',
@@ -3560,7 +3762,6 @@ def training_log(
         ])
     if args.timing_log_level >= 2:
         timers_to_log.extend([
-            'batch-generator',
             'forward-compute',
             'backward-compute',
             'forward-recv',
@@ -3591,6 +3792,8 @@ def training_log(
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
+    if packed_sequence_stats and wandb_writer:
+        wandb_writer.log(packed_sequence_stats, iteration)
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     _lr_mp_group = pg_collection.mp if pg_collection is not None else None
@@ -3839,7 +4042,14 @@ def training_log(
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
-        log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
+        if args.train_samples:
+            log_string += ' consumed samples: {:12d}/{:12d} ({:.2f}%) |'.format(
+                args.consumed_train_samples,
+                args.train_samples,
+                args.consumed_train_samples / args.train_samples * 100,
+            )
+        else:
+            log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
         if has_rl_utils and args.rl_use_sequence_packing:
             log_string += rl_utils.get_sequence_packing_log_info(args)
         if args.skipped_train_samples > 0:
@@ -3923,6 +4133,12 @@ def training_log(
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+
+        log_fragments: list[str] = []
+        callback_manager.callback_context.log_fragments = log_fragments
+        callback_manager.callback_context.timers_to_log = timers_to_log
+        callback_manager.trigger("on_log")
+        log_string += "".join(log_fragments)
         print_rank_last(log_string)
 
         # OTel: emit training metrics at log interval (export rank only). Loss and
@@ -3990,6 +4206,18 @@ def training_log(
         timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
     return report_memory_flag
+
+
+def _should_compute_params_norm(args, iteration, is_first_iteration):
+    """Whether this iteration can emit the parameter norm."""
+    return args.log_params_norm and (
+        is_first_iteration
+        or iteration % args.log_interval == 0
+        or (
+            bool(args.tensorboard_dir)
+            and iteration % args.tensorboard_log_interval == 0
+        )
+    )
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
@@ -4127,7 +4355,10 @@ def save_checkpoint_and_time(
         ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
         tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
         pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
+        cp_group = getattr(ckpt_pgc, "cp", None) if ckpt_pgc is not None else None
         dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+        # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
+        dp_gtp_remat_group = getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
         # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
         dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
         expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
@@ -4139,7 +4370,8 @@ def save_checkpoint_and_time(
 
         if should_report_memory:
             # Track memory before checkpoint save.
-            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
+            # Gate on the full data-distribution group so gtp_remat peers do not each report.
+            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
 
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
@@ -4157,8 +4389,10 @@ def save_checkpoint_and_time(
                 pp_group=pp_group,
                 dp_cp_group=dp_cp_group,
                 dp_group=dp_group,
+                dp_gtp_remat_group=dp_gtp_remat_group,
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
+                cp_group=cp_group,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -4168,7 +4402,7 @@ def save_checkpoint_and_time(
         if should_report_memory:
             # Track memory after checkpoint save.
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True):
-                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
+                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
         num_checkpoints_memory_reported += 1
 
         if args.fp8:
@@ -4441,6 +4675,7 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    callback_manager: CallbackManager | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4449,6 +4684,7 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     """
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
     hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
@@ -4839,9 +5075,16 @@ def train(
     _end_otel_startup_span()
     _start_otel_train_span()
 
+    def _finished_training(iteration):
+        return (args.train_iters and iteration >= args.train_iters) or (
+            args.train_samples and args.consumed_train_samples >= args.train_samples
+        )
+
+    callback_manager.trigger("on_train_start")
+
     # Run training iterations till done.
     buffered_rollouts = None
-    while iteration < args.train_iters:
+    while not _finished_training(iteration):
         # At each checkpoint-interval boundary, re-root into a new trace so this
         # pass's iteration + (this interval's) checkpoint/eval/sniff form one compact
         # trace instead of accreting into a run-long one. Must be the first thing in
@@ -4904,6 +5147,8 @@ def train(
                     f"going from {num_microbatches} to {get_num_microbatches()}"
                 )
                 if args.save is not None:
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                                 "transition, saving checkpoint before exiting.")
                     save_checkpoint_and_time(
                         iteration,
                         model,
@@ -4913,6 +5158,16 @@ def train(
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
                     )
+                    print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
+                                 "exiting so the run can be relaunched at the new batch size.")
+                    # Break here rather than leaving it to the `should_exit` check further
+                    # down the loop body, which sits after train_step and would run one more
+                    # iteration at the new microbatch count before stopping.
+                    should_exit = True
+                    break
+                print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                             "transition but --save is unset, so there is no checkpoint to "
+                             "relaunch from; continuing at the new batch size.")
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
@@ -4985,8 +5240,12 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            samples_seen_in_iteration = None
             _step_span = None
         else:
+
+            callback_manager.trigger("on_train_step_start")
+
             # OTel: dedicated span for the first iteration actually executed in this
             # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
             # just the first one that runs. Kept separate from the per-step span below
@@ -5012,6 +5271,7 @@ def train(
                     grad_norm,
                     num_zeros_in_grad,
                     max_attention_logit,
+                    samples_seen_in_iteration,
                 ) = train_step(
                     forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
@@ -5031,6 +5291,12 @@ def train(
                     _otel_safe_set_attrs(
                         _step_span, {'megatron.skipped': bool(skipped_iter)}
                     )
+
+            callback_manager.callback_context.loss_dict = loss_dict
+            callback_manager.callback_context.grad_norm = grad_norm
+            callback_manager.callback_context.skipped_iter = bool(skipped_iter)
+            callback_manager.trigger("on_train_step_end")
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -5101,6 +5367,8 @@ def train(
                 _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             args.consumed_train_bins += bin_count
+        elif samples_seen_in_iteration is not None:
+            iteration_sequences = samples_seen_in_iteration
         else:
             batch_size = (
                 _dp_world_size() * args.micro_batch_size * get_num_microbatches()
@@ -5129,6 +5397,9 @@ def train(
         total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
             consume_seqlen_stats_in_iteration()
         )
+        packed_sequence_stats = None
+        if getattr(args, 'log_packed_sequence_stats', False):
+            packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
@@ -5166,7 +5437,7 @@ def train(
                 loss_scale = 1.0
             params_norm = None
 
-            if args.log_params_norm:
+            if _should_compute_params_norm(args, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
                 # + all-reduce that BLOCKS the training loop -- exposed goodput cost
                 # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
@@ -5194,6 +5465,11 @@ def train(
                     max_attention_logit,
                     pg_collection=model_pg_collection,
                     is_first_iteration=is_first_iteration,
+                    seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                    total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    model=model,
+                    callback_manager=callback_manager,
+                    packed_sequence_stats=packed_sequence_stats,
                     moe_logging_metadata=moe_logging_metadata,
                     num_floating_point_operations_in_batch=num_floating_point_operations_in_batch,
                 )
@@ -5253,7 +5529,8 @@ def train(
                                        config, verbose=False, write_to_tensorboard=True,
                                        non_loss_data_func=non_loss_data_func,
                                        pg_collection=pg_collection,
-                                       p2p_communicator=p2p_communicator)
+                                       p2p_communicator=p2p_communicator,
+                                       callback_manager=callback_manager, is_test=False)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -5342,6 +5619,8 @@ def train(
     if args.rl_profile:
         shutdown_rl_profiler()
 
+    callback_manager.trigger("on_train_end")
+
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
         # Deregister NCCL user-buffer memory pools before exit.
@@ -5402,10 +5681,16 @@ def evaluate(
     eval_iters=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Evaluation."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     timers = get_timers()
+
+    step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
+    step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -5481,7 +5766,7 @@ def evaluate(
 
             # Don't care about timing during evaluation
             config.timers = None
-            ft_integration.on_eval_step_start()
+
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
                     (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
@@ -5492,6 +5777,11 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
+
+            ft_integration.on_eval_step_start()
+
+            callback_manager.trigger(step_start_event)
+
             with _otel_managed_span('evaluate', 'megatron.evaluate.step',
                                     **{'megatron.eval_iteration': iteration}):
                 loss_dicts = forward_backward_func(
@@ -5507,6 +5797,9 @@ def evaluate(
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                 )
+
+            callback_manager.trigger(step_end_event)
+
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
 
@@ -5615,13 +5908,19 @@ def evaluate_and_print_results(
     non_loss_data_func=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Helper function to evaluate and dump results on screen."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
         writer = None
+
+    start_event = "on_test_start" if is_test else "on_eval_start"
+    end_event = "on_test_end" if is_test else "on_eval_end"
 
     wandb_writer = get_wandb_writer()
 
@@ -5655,6 +5954,8 @@ def evaluate_and_print_results(
             f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
             f"the number of validation datasets ({len(data_iterators)})"
 
+    callback_manager.trigger(start_event)
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
@@ -5662,6 +5963,7 @@ def evaluate_and_print_results(
                 suffix = f"-{args.validation_set_names[index]}"
             else:
                 suffix = f"-{index}"
+
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
@@ -5673,6 +5975,8 @@ def evaluate_and_print_results(
             eval_iters=iterations,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=is_test,
         )
         # Timelimit hit during evaluation
         if timelimit:
@@ -5706,6 +6010,9 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+    callback_manager.callback_context.total_loss_dict = total_loss_dict
+    callback_manager.trigger(end_event)
 
 
 def cyclic_iter(iterable):

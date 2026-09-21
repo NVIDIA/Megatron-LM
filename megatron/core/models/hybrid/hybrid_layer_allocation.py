@@ -104,10 +104,11 @@ def _validate_layer_config_sequence(
         config_types.add(type(layer_config))
 
     attention_type = Symbols.LAYER_CONFIG_MAP[Symbols.ATTENTION]
-    dsa_type = Symbols.LAYER_CONFIG_MAP[Symbols.DS_ATTENTION]
-    mla_type = Symbols.LAYER_CONFIG_MAP[Symbols.MLA]
-    if attention_type in config_types and (dsa_type in config_types or mla_type in config_types):
-        raise ValueError(f"Not supported to have both Attention and MLA/DSA in the {section_name}")
+    mla_types = {Symbols.LAYER_CONFIG_MAP[symbol] for symbol in Symbols.MLA_ATTENTION}
+    if attention_type in config_types and config_types & mla_types:
+        raise ValueError(
+            f"Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in the {section_name}"
+        )
 
 
 def parse_hybrid_layer_config_list(
@@ -317,10 +318,10 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'D': 0, 'G': 0, 'M': 2, '+': 0, '-': 0, 'E': 0}
+        {'*': 2, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'W': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'D': 0, 'G': 0, 'M': 8, '+': 0, '-': 4, 'E': 0}
+        {'*': 1, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'W': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
@@ -409,6 +410,8 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
             )
 
     _validate_pattern(mtp_pattern)
+    # Decoder and MTP share the model's MLA mode and positional embeddings.
+    _validate_pattern(main_pattern + mtp_pattern, allow_pipe=True)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
@@ -434,9 +437,11 @@ def _validate_pattern(pattern: str, allow_pipe: bool = False) -> None:
                 f"Valid symbols are: {Symbols.LAYER_CONFIG_MAP.keys()}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # MLA variants may coexist, but standard attention cannot share a model with them.
+    if Symbols.ATTENTION in pattern and any(symbol in pattern for symbol in Symbols.MLA_ATTENTION):
+        raise ValueError(
+            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
+        )
 
 
 def validate_segment_layers(segment: str, config: TransformerConfig) -> List[TransformerConfig]:
