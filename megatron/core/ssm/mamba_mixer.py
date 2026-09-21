@@ -48,6 +48,14 @@ from megatron.core.utils import (
 from .mamba_context_parallel import MambaContextParallel
 
 try:
+    from .ops.ssd_state_passing_cp import MambaStatePassingCPAdapter
+
+    HAVE_MAMBA_STATE_PASSING_CP = True
+except ImportError:
+    MambaStatePassingCPAdapter = None
+    HAVE_MAMBA_STATE_PASSING_CP = False
+
+try:
     from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
@@ -221,6 +229,10 @@ class MambaMixer(MegatronModule):
                 "mamba_training_ssm_states_dtype is set, but the installed mamba_ssm does "
                 "not accept the `state_dtype` argument. Upgrade mamba_ssm or unset the option."
             )
+        self.use_mamba_state_passing_cp = self.config.use_mamba_state_passing_cp
+        self.mamba_state_passing_cp_load_balancing = (
+            self.config.mamba_state_passing_cp_load_balancing
+        )
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -459,6 +471,9 @@ class MambaMixer(MegatronModule):
             D_has_hdim=self.D_has_hdim,
         )
         self.tp_group = pg_collection.tp
+        self.state_passing_cp_adapter = (
+            MambaStatePassingCPAdapter(self) if HAVE_MAMBA_STATE_PASSING_CP else None
+        )
 
     def forward(
         self,
@@ -499,9 +514,16 @@ class MambaMixer(MegatronModule):
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
+        use_state_passing_cp = self._use_mamba_state_passing_cp(
+            in_inference_mode, packed_seq_params
+        )
+        if not use_state_passing_cp:
+            zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
-        if in_inference_mode or not self.use_mem_eff_path:
+        if use_state_passing_cp:
+            assert ssm_state is None
+            y = self.state_passing_cp_adapter.forward(zxBCdt)
+        elif in_inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
             assert packed_seq_params is None, (
                 "Training with packed sequences is not supported "
@@ -726,6 +748,30 @@ class MambaMixer(MegatronModule):
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
+
+    def _use_mamba_state_passing_cp(
+        self, in_inference_mode: bool, packed_seq_params: Optional[PackedSeqParams]
+    ) -> bool:
+        if not self.use_mamba_state_passing_cp or self.cp.cp_size == 1:
+            return False
+        assert HAVE_MAMBA_STATE_PASSING_CP, "state-passing Mamba CP helper is unavailable"
+        assert self.use_mem_eff_path, "state-passing Mamba CP is only wired for training fast path"
+        assert not in_inference_mode, "state-passing Mamba CP is not supported for inference yet"
+        assert (
+            packed_seq_params is None
+        ), "state-passing Mamba CP does not support packed sequences yet"
+        assert (
+            not self.config.hybrid_context_parallel and not self.config.dynamic_context_parallel
+        ), "state-passing Mamba CP does not support hybrid/dynamic (variable-length) CP yet"
+        assert (
+            self.config.mamba_training_ssm_states_dtype is None
+        ), "state-passing Mamba CP does not support --mamba-training-ssm-states-dtype yet"
+        assert self.mamba_state_passing_cp_load_balancing != "none", (
+            "standard Megatron CP always produces front/back load-balanced sequence shards; "
+            "use 'permute_p2p', 'permute_a2a', or 'virtual'. Mode 'none' is only valid for "
+            "direct state-passing calls whose input is already contiguous."
+        )
+        return True
 
     def _ssm_training(
         self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
