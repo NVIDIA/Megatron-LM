@@ -10,6 +10,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.kda import HAVE_FLA_KDA
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -35,11 +36,13 @@ def test_gate_parameter_precision_through_bf16_wrapper(variant):
             bf16=True,
             normalization="RMSNorm",
             activation_func=torch.nn.functional.silu,
-            kda_two_stage_gates=variant == "kda",
-            kda_safe_gate=True,
-            kda_lower_bound=-5.0,
             perform_initialization=True,
         )
+        if variant.startswith("kda"):
+            config = KDALayerConfig.from_config(config)
+            config.kda_two_stage_gates = variant == "kda"
+            config.kda_safe_gate = True
+            config.kda_lower_bound = -5.0
         layer_spec = getattr(
             hybrid_stack_spec.submodules, f"{variant.removesuffix('_direct')}_layer"
         ).submodules.self_attention
