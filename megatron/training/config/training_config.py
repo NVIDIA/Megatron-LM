@@ -516,8 +516,8 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
-    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
-    """Which async save strategy to use. Available strategies: nvrx, mcore."""
+    async_strategy: Literal["nvrx"] = "nvrx"
+    """Which async save strategy to use. Deprecated and will be removed."""
 
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
@@ -651,15 +651,11 @@ class CheckpointConfig:
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
-        assert self.async_strategy in ["nvrx", "mcore"], \
-            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
-
-        if not self.async_save:
-            self.async_strategy = "mcore"
+        assert self.async_strategy in ["nvrx"], \
+            f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
         if (
             self.async_save
-            and self.async_strategy == "nvrx"
             and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
         ):
             assert has_nvrx_checkpointing_async_support(), (

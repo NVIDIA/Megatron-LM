@@ -244,6 +244,124 @@ def test_vlm_and_omni_wrappers_expand_video_markers_consistently():
     assert vlm_masks[0][1:-1] == list(range(504))
 
 
+@pytest.mark.internal
+def test_omni_text_forward_does_not_treat_generated_image_token_as_media():
+    """A decode token matching the image-token ID has no projected feature."""
+    tokens = torch.tensor([[18]])
+    position_ids = torch.tensor([[7]])
+    language_embeddings = torch.empty((1, 1, 8))
+    output = torch.empty((1, 1, 16))
+    language_model = mock.Mock(return_value=output)
+    language_model.embedding = mock.Mock(return_value=language_embeddings)
+    model = SimpleNamespace(
+        image_token_index=18, language_model=language_model, sequence_parallel_lm=False
+    )
+    wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    wrapper.model = model
+    wrapper.inference_context = mock.sentinel.inference_context
+
+    result = wrapper._forward(
+        {"tokens": tokens, "position_ids": position_ids, "attention_mask": None}
+    )
+
+    assert result is output
+    assert language_model.embedding.call_args.kwargs["input_ids"] is tokens
+    language_model.assert_called_once()
+
+
+@pytest.mark.internal
+def test_omni_raw_image_forward_calls_full_model():
+    """Manually supplied raw images use NemotronOmniModel.forward."""
+    tokens = torch.tensor([[7, 18, 9]])
+    position_ids = torch.tensor([[0, 1, 2]])
+    images = torch.empty((1, 3, 16, 16))
+    imgs_sizes = torch.tensor([[16, 16]])
+    output = torch.empty((1, 3, 16))
+    wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    wrapper.model = mock.Mock(return_value=(output, None))
+    wrapper.inference_context = mock.sentinel.inference_context
+
+    result = wrapper._forward(
+        {
+            "tokens": tokens,
+            "position_ids": position_ids,
+            "attention_mask": None,
+            "images": images,
+            "imgs_sizes": imgs_sizes,
+        }
+    )
+
+    assert result is output
+    call_kwargs = wrapper.model.call_args.kwargs
+    assert call_kwargs["images"] is images
+    assert call_kwargs["input_ids"] is tokens
+    assert call_kwargs["imgs_sizes"] is imgs_sizes
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("wrapper_cls", [VLMInferenceWrapper, NemotronOmniInferenceWrapper])
+def test_image_token_mask_takes_precedence_over_raw_images(wrapper_cls):
+    """A dynamic media mask selects the LM-only path even when raw images are present."""
+    tokens = torch.tensor([[7, -200, 9]])
+    position_ids = torch.tensor([[0, 1, 2]])
+    images = torch.empty((1, 3, 16, 16))
+    output = torch.empty((1, 3, 16))
+    wrapper = object.__new__(wrapper_cls)
+    wrapper.model = mock.Mock()
+    wrapper.inference_context = mock.sentinel.inference_context
+    wrapper._forward_dynamic = mock.Mock(return_value=output)
+
+    inference_input = {
+        "tokens": tokens,
+        "position_ids": position_ids,
+        "attention_mask": None,
+        "images": images,
+        "num_tiles": torch.tensor([1]),
+        "image_token_mask": torch.tensor([[-1, 0, -1]]),
+        "image_embeddings": torch.empty((1, 1, 16)),
+    }
+    result = wrapper._forward(inference_input)
+
+    assert result is output
+    wrapper._forward_dynamic.assert_called_once_with(inference_input)
+    wrapper.model.assert_not_called()
+
+
+@pytest.mark.internal
+def test_llava_text_forward_embeds_generated_image_token_as_text():
+    """Media-free decode must not replace a generated image-token ID with token 0."""
+    tokens = torch.tensor([[18]])
+    position_ids = torch.tensor([[7]])
+    language_embeddings = torch.empty((1, 1, 8))
+    output = torch.empty((1, 1, 16))
+    embedding = mock.Mock(return_value=language_embeddings)
+    model = SimpleNamespace(
+        image_token_index=18,
+        language_model=SimpleNamespace(embedding=embedding),
+        forward_lm_only=mock.Mock(return_value=output),
+    )
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = model
+    wrapper.inference_context = mock.sentinel.inference_context
+    wrapper.pp_group = None
+    wrapper._recv_only_vision_embeds = False
+
+    with mock.patch(
+        "megatron.core.inference.model_inference_wrappers.multimodal."
+        "vlm_inference_wrapper.is_pipeline_first_stage",
+        return_value=True,
+    ):
+        result = wrapper._forward(
+            {"tokens": tokens, "position_ids": position_ids, "attention_mask": None}
+        )
+
+    assert result is output
+    embedded_input_ids = embedding.call_args.kwargs["input_ids"]
+    assert torch.equal(embedded_input_ids, tokens)
+    assert embedded_input_ids is not tokens
+    model.forward_lm_only.assert_called_once()
+
+
 class TestVLMTextGenerationController:
 
     @pytest.mark.internal  # The model is under active development and its methods may change.

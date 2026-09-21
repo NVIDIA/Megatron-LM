@@ -740,7 +740,7 @@ try:
     bp = Blueprint('chat_completions_api', __name__)
 
     def apply_parsers(
-        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
+        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None, finished=True
     ):
         """Runs CPU-intensive text parsing."""
         for parser in parsers_list:
@@ -767,6 +767,7 @@ try:
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
                 implicit_reasoning_end_markers=implicit_reasoning_end_markers,
+                finished=finished,
             )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
@@ -1124,13 +1125,14 @@ try:
                     else ()
                 )
 
-                def parse_streaming_text(text):
+                def parse_streaming_text(text, finished=False):
                     parsed_text, metadata = apply_parsers(
                         text,
                         tools,
                         parsers,
                         tools_requested,
                         chat_template_kwargs=chat_template_kwargs,
+                        finished=finished,
                     )
                     metadata["tool_calls"] = _maybe_filter_parallel_tool_calls(
                         metadata.get("tool_calls", []), parallel_tool_calls
