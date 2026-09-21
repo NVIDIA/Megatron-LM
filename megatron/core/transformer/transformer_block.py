@@ -772,8 +772,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
-        # Only contract if the final layer norm is in this stage
-        if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
+        # Only contract if the final layer norm is in this stage. A final "layer norm" module
+        # that declares `contracts_mhc_streams` (e.g. GatedResidualOutputMixer) consumes the
+        # n-stream tensor itself and performs a learned contraction instead of the mean.
+        if (
+            self.config.enable_mhc_connections
+            and self.has_final_layernorm_in_this_stage()
+            and not getattr(self.final_layernorm, "contracts_mhc_streams", False)
+        ):
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]
