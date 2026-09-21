@@ -2210,13 +2210,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                     assert sum(model_numels) == sum(checkpoint_numels)
                 for key in ("param",) + self.optimizer_state_keys:
-                    legacy_world_tensors = self._update_legacy_world_tensors(
-                        state_dict[gbuf_idx][torch.float32][key],
-                        [
-                            self.buffers[gbuf_idx].buckets[bi].numel_unpadded
-                            for bi in range(len(gbuf_range_map_for_all_buckets))
-                        ],
-                    )
+                    legacy_world_tensors = None
+                    if data_parallel_rank == 0:
+                        legacy_world_tensors = self._update_legacy_world_tensors(
+                            state_dict[gbuf_idx][torch.float32][key],
+                            [
+                                self.buffers[gbuf_idx].buckets[bi].numel_unpadded
+                                for bi in range(len(gbuf_range_map_for_all_buckets))
+                            ],
+                        )
                     offset_in_world_tensors = 0
                     for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                         # Compute local DP contiguous shard's size.
@@ -2288,6 +2290,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             tensor_to_copy_into.data.copy_(
                                 recv_tensor[gbuf_local_start:gbuf_local_end]
                             )
+                            if key == "param" and isinstance(self.optimizer, HybridDeviceOptimizer):
+                                # Legacy conversion also needs the FP32 owner copy;
+                                # the model/main parameter alone can be lower precision.
+                                master = self.optimizer.state[main_param].get("master_param")
+                                if master is not None:
+                                    master.copy_(recv_tensor[gbuf_local_start:gbuf_local_end])
+
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     def load_parameter_state_from_dp_zero(self, state_dict, *, update_legacy_format=False):
         """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank,
