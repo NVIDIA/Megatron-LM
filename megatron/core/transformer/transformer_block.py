@@ -305,12 +305,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
 
         if (
-            config.pipeline_model_parallel_size > 1
-            and config.experimental_attention_variant == "dsv4_hybrid"
+            config.experimental_attention_variant == "dsv4_hybrid"
             and config.dsv4_version == "v4.1"
+            and (
+                config.pipeline_model_parallel_size > 1
+                or config.virtual_pipeline_model_parallel_size is not None
+                or config.recompute_granularity == "full"
+                or config.cuda_graph_impl != "none"
+            )
         ):
             raise ValueError(
-                "V4.1 pipeline parallelism requires HybridModel and its payload adapter"
+                "CSA2 support for pipeline, full recompute and CUDA Graphs requires "
+                "HybridModel and its state adapter"
             )
 
         if pg_collection is None:

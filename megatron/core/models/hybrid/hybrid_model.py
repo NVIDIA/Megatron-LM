@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+from dataclasses import replace
 from typing import Literal, Optional
 
 from torch import Tensor
@@ -16,6 +17,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.hybrid_state import HybridStateDeclaration
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -33,7 +35,7 @@ from megatron.core.transformer.multi_token_prediction import (
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_module
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -42,6 +44,38 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def get_hybrid_state_components(
+    config: TransformerConfig,
+    components: tuple[ModuleSpec | type[HybridStateDeclaration], ...] = (),
+) -> tuple[ModuleSpec | type[HybridStateDeclaration], ...]:
+    """Assemble enabled model state alongside explicitly supplied components.
+
+    HybridModel applies this to its private copy of the spec. Config-aware specs
+    and standalone HybridStack callers can use the same function. Explicit
+    subclasses/ModuleSpecs take precedence over their built-in implementation;
+    unrelated declarations are preserved for the host's ownership validation.
+    """
+    required = []
+    if config.mhc_single_pass:
+        from megatron.core.transformer.hyper_connection import SinglePassMHCBoundary
+
+        required.append(SinglePassMHCBoundary)
+    if config.experimental_attention_variant == "dsv4_hybrid" and config.dsv4_version == "v4.1":
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
+            CSA2HybridAdapter,
+        )
+
+        required.append(CSA2HybridAdapter)
+    result = list(components)
+    modules = tuple(get_module(component) for component in components)
+    for declaration in required:
+        if not any(
+            isinstance(module, type) and issubclass(module, declaration) for module in modules
+        ):
+            result.append(declaration)
+    return tuple(result)
 
 
 def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
@@ -187,6 +221,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             HybridModel.mup_warning_printed = True
 
+        if hasattr(hybrid_stack_spec.submodules, "state_components"):
+            hybrid_stack_spec = replace(
+                hybrid_stack_spec,
+                submodules=replace(
+                    hybrid_stack_spec.submodules,
+                    state_components=get_hybrid_state_components(
+                        config, hybrid_stack_spec.submodules.state_components
+                    ),
+                ),
+            )
         self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -372,10 +416,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         adapter = getattr(self.decoder, "forward_adapter", None)
         configure_pipeline = getattr(adapter, "configure_distributed_pipeline", None)
         self.pipeline_payload_factory = (
-            configure_pipeline(self.hybrid_layer_pattern, self.pg_collection.pp, self.vp_stage)
+            configure_pipeline(parsed.main_pattern, self.pg_collection.pp, self.vp_stage)
             if configure_pipeline is not None
             else None
         )
+        if adapter is not None:
+            adapter.configure_cuda_graphs(self.decoder.layers)
         self.pipeline_payload_spec = getattr(adapter, "pipeline_payload_spec", None)
         if (
             self.config.mhc_single_pass
@@ -655,11 +701,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         #   be None, so this assert will succeed.
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
-        # Pass input_ids to decoder for hash-based MoE routing.
-        decoder_extra_block_kwargs = {}
-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
-            decoder_extra_block_kwargs['input_ids'] = input_ids
-
         # Run decoder.
         decoder_output = self.decoder(
             hidden_states=decoder_input,
@@ -668,7 +709,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
-            **decoder_extra_block_kwargs,
+            input_ids=input_ids,
         )
         # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
         # (hidden_states, mhc_multistream) in exactly one case: enable_hyper_connections and

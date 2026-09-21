@@ -62,6 +62,11 @@ class DSv4HybridSelfAttentionSubmodules:
 class DSv4HybridAttention(Attention):
     """DeepSeek-v4 Hybrid Attention layer."""
 
+    @property
+    def uses_attention_mask(self) -> bool:
+        """CSA2 visibility comes from sparse indices and packed sequence metadata."""
+        return self.config.dsv4_version != "v4.1"
+
     def __init__(
         self,
         config: MLATransformerConfig,

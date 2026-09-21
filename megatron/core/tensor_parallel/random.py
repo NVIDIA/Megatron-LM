@@ -756,10 +756,9 @@ class BoundaryCheckpointFunction(torch.autograd.Function):
             ctx.rng_states = _get_all_rng_states()
             ctx.set_materialize_grads(False)
             with torch.no_grad():
-                outputs = function(*args)
+                outputs = policy.apply(function(*args))
             ctx.single_output = isinstance(outputs, torch.Tensor)
             outputs = (outputs,) if ctx.single_output else tuple(outputs)
-            policy.outputs.validate(outputs)
             inactive = tuple(
                 output
                 for output, field in zip(outputs, policy.outputs.packed_fields)
@@ -787,9 +786,8 @@ class BoundaryCheckpointFunction(torch.autograd.Function):
             with _fork_rng():
                 _set_all_rng_states(*ctx.rng_states)
                 with torch.enable_grad():
-                    outputs = ctx.run_function(*inputs)
+                    outputs = ctx.policy.apply(ctx.run_function(*inputs))
             outputs = (outputs,) if ctx.single_output else tuple(outputs)
-            ctx.policy.outputs.validate(outputs)
             roots, seeds = [], []
             for index in ctx.policy.outputs.grad_tensor_indices:
                 grad, output = output_grads[index], outputs[index]
@@ -826,11 +824,7 @@ def checkpoint(
                 raise ValueError(
                     "Boundary checkpoint needs a differentiable input; use eager execution"
                 )
-            outputs = function(*args)
-            boundary_policy.outputs.validate(
-                (outputs,) if isinstance(outputs, torch.Tensor) else outputs
-            )
-            return outputs
+            return boundary_policy.apply(function(*args))
         return BoundaryCheckpointFunction.apply(function, boundary_policy, *args)
 
     # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of

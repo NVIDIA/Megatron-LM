@@ -2,11 +2,12 @@
 
 """CSA2 state declarations for the common Hybrid execution boundaries."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torch import Tensor
 from torch.nn import Module
 
+from megatron.core.models.hybrid.hybrid_state import HybridStateDeclaration
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.csa2 import (
@@ -33,12 +34,17 @@ from megatron.core.transformer.state_boundary import (
     StateBoundary,
     StatePlacement,
     StateRegion,
-    prepare_boundaries,
+    prepare_state_region,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
+
+if TYPE_CHECKING:
+    from megatron.core.models.hybrid.hybrid_state import HybridRuntimeContext
+    from megatron.core.transformer.module import CudaGraphCaptureRegion
 
 
-class CSA2HybridAdapter:
+class CSA2HybridAdapter(HybridStateDeclaration):
     """Declare native fields, sources and cache semantics without owning a backend."""
 
     context_attribute = "cross_layer_state"
@@ -71,13 +77,39 @@ class CSA2HybridAdapter:
         """Use the host's existing order to identify the last attention at a cut."""
         self.pattern, self.placement = pattern, placement
 
-    def graph_state(self, layer: Module, symbol: str) -> CSA2GraphState:
+    def validate_runtime(self, runtime: "HybridRuntimeContext") -> None:
+        """Keep native CSA2 restrictions separate from Hybrid/backend capabilities."""
+        if runtime.tensor_parallel_size != 1 or runtime.sequence_parallel:
+            raise ValueError("CSA2 state requires TP=1 without sequence parallelism")
+        if runtime.context_parallel_size > 1 and self.cp_group is None:
+            raise ValueError("CSA2 state with context parallelism requires an explicit CP group")
+        if self.cp_group is not None and self.cp_group.size() != runtime.context_parallel_size:
+            raise ValueError("CSA2 state CP group size must match the runtime configuration")
+
+    def layer_kwargs(self, layer: Module, state: CSA2State) -> dict[str, dict[str, Any]]:
+        """Bind only branches that implement the cross-layer attention contract."""
+        if isinstance(layer, TransformerLayer):
+            return {"attention": state.attention_kwargs()}
+        if getattr(layer, "supports_cross_layer_state", False):
+            return {"layer": {"cross_layer_state": state}}
+        return {}
+
+    def recompute_boundary_tensors(self, state: CSA2State) -> tuple[Tensor, ...]:
+        """Protect native shared activations during selective recompute."""
+        return state.recompute_boundary_tensors()
+
+    def graph_state(
+        self, layer: Module, symbol: str, region: "CudaGraphCaptureRegion"
+    ) -> CSA2GraphState | None:
         """Supply native graph fields and auxiliary-loss/cache publication."""
+        if "attention" not in region.branches or symbol not in ("D", "W"):
+            return None
         return CSA2GraphState(
             self.config,
             layer_number=layer.layer_number,
             is_attention=symbol in ("D", "W"),
             cp_group=self.cp_group,
+            placement=self.placement,
         )
 
     def initial_state(self, hidden: Tensor, packed_seq_params: PackedSeqParams | None) -> CSA2State:
@@ -151,19 +183,9 @@ class CSA2HybridAdapter:
         """Describe a host-selected full-recompute group without changing its layer order."""
         start, end = start + self.layer_offset, end + self.layer_offset
         config, layout = self.config, state.thd_layout
-        # Placement here describes a local compute region, not a new PP route.
-        # Preserve the actual chunk boundary so a caller cannot checkpoint across it.
-        positions = (
-            0,
-            self.layer_offset,
-            self.layer_offset + len(self.layer_pattern),
-            config.num_layers,
-        )
-        positions = tuple(sorted(set(positions)))
-        placement = tuple(
-            StatePlacement(2 * a, 2 * b, 0, i)
-            for i, (a, b) in enumerate(zip(positions, positions[1:]))
-        )
+        if not self.placement:
+            raise ValueError("Bind CSA2 placement before querying checkpoint regions")
+        placement = self.placement
         factory = csa2_field_factory(
             config,
             hidden.shape[0],
@@ -173,12 +195,14 @@ class CSA2HybridAdapter:
             num_sequences=None if layout is None else layout.cu_seqlens.numel() - 1,
             cp_size=1 if layout is None else layout.cp_size,
         )
-        dependencies = csa2_state_dependencies(config, factory, placement)
         boundary = StateBoundary(
             f"csa2.decoder/checkpoint:{start}:{end}", "checkpoint", 2 * start, 2 * end
         )
-        (schema,) = prepare_boundaries(dependencies, (boundary,), placement)
-        codec = CSA2StateCodec(indexer_k_differentiable=(config.dsa_indexer_loss_coeff or 0) > 0)
+        region = prepare_state_region(
+            csa2_state_dependencies(config, factory, placement), boundary, placement, self.codec
+        )
+        schema = region.schema
+        codec = self.codec
         metadata = dict(codec.metadata(state))
         metadata.update(
             sequence_length=hidden.shape[0],
@@ -191,15 +215,7 @@ class CSA2HybridAdapter:
         # physical indices instead of closing over cached tensors from another call.
         prefixes = tuple(f for f in codec.fields(state) if "/cu_seqlens" in f.key)
         inputs = (*schema.inputs, *prefixes)
-        retained = (
-            tuple(
-                dep.field
-                for dep in dependencies
-                if dep.available_at < 2 * start
-                and any(reader >= 2 * end for reader in dep.consumed_at)
-            )
-            + prefixes
-        )
+        retained = (*region.retained_fields, *prefixes)
         input_metadata = tuple(metadata.items())
         for layer in range(start, end):
             symbol = self.layer_pattern[layer - self.layer_offset]

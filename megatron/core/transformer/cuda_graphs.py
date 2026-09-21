@@ -2417,10 +2417,7 @@ class TECudaGraphHelper:
             contains_self_attn = (
                 isinstance(attention_layer, TransformerLayer)
                 and not isinstance(attention_layer.self_attention, IdentityOp)
-                and (
-                    not self.config.cuda_graph_modules
-                    or CudaGraphModule.attn in self.config.cuda_graph_modules
-                )
+                and "attention" in layer.get_te_cuda_graph_capture_region().branches
             )
 
             if contains_self_attn and not self.config.multi_latent_attention:
@@ -2486,6 +2483,8 @@ class TECudaGraphHelper:
                 )
             else:
                 _sample_args = (static_inputs.pop("hidden_states"),)
+            if adapter is not None:
+                adapter.finalize_sample_inputs(_sample_args, _sample_kwargs)
             return _sample_args, _sample_kwargs
 
         # Calculate the starting index of each chunk in callables for future use.

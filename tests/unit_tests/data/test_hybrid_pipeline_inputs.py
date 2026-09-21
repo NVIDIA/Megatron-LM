@@ -40,6 +40,57 @@ def _adapter(config, **kwargs):
     )
 
 
+@pytest.mark.parametrize("cp_rank", [0, 1])
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_fixed_sbhd_pp_plan_matches_cp_local_mhc_payload(cp_rank, forward_only):
+    from megatron.core.models.hybrid.hybrid_state import build_hybrid_state_pipeline_plan
+    from tests.unit_tests.ssm.test_hybrid_state_adapter import _config, _stack
+
+    config = _config(
+        context_parallel_size=2, pipeline_model_parallel_size=2, pipeline_dtype=torch.float32
+    )
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank)
+    plan = build_hybrid_state_pipeline_plan(config, "*-*|-*-", pp_size=2)
+    first, second = [_stack(config, chunk) for chunk in plan]
+    for rank, stack in enumerate((first, second)):
+        stack.forward_adapter.cp_group = cp_group
+        stack.forward_adapter.configure_distributed_pipeline(
+            "*-*|-*-", SimpleNamespace(size=lambda: 2, rank=lambda: rank)
+        )
+    args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        context_parallel_size=2,
+        seq_length=16,
+        micro_batch_size=1,
+        sft=False,
+        dataloader_inter_document_masking=False,
+        sequence_packing_scheduler=None,
+    )
+    plans = []
+    for stack in (first, second):
+        model = SimpleNamespace(
+            pipeline_payload_spec=stack.forward_adapter.pipeline_payload_spec, vp_stage=None
+        )
+        prepared = hybrid_pipeline.prepare_hybrid_pipeline_inputs(
+            None,
+            model,
+            1,
+            args=args,
+            get_batch=lambda *_: None,
+            get_timers=lambda: _Timers(),
+            batch_context=nullcontext,
+            forward_only=forward_only,
+        )
+        plans.append(prepared.pipeline_payload_plan)
+    with torch.set_grad_enabled(not forward_only):
+        payload = first(torch.randn(8, 1, config.hidden_size), None)
+        assert payload.tensors[0].shape == (8, 1, 32)
+        assert payload.descriptor == plans[0].outgoing[0] == plans[1].incoming[0]
+        received = second.forward_adapter.make_pipeline_payload(payload.tensors, payload.descriptor)
+        second.set_input_tensor(received)
+        assert second(None, None).shape == (8, 1, config.hidden_size)
+
+
 @pytest.mark.parametrize("stage", [0, 1, 2, 3])
 @pytest.mark.parametrize("layout", ["sbhd", "packed", "raw-prefixes"])
 @pytest.mark.parametrize("forward_only", [False, True])
@@ -162,6 +213,93 @@ def test_training_prepares_each_batch_once_and_rebuilds_plans_on_rerun(
         assert len(fetched) == (run + 1) * len(batches)
         iterator.rewind()
     assert all(timer.started == timer.stopped for timer in timers.values())
+
+
+@pytest.mark.parametrize("cp_rank", [0, 1])
+@pytest.mark.parametrize("layout", ["raw-prefixes", "scheduled-tail"])
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_packed_pp_cp_middle_stage_uses_local_physical_capacity(
+    monkeypatch, cp_rank, layout, forward_only
+):
+    from megatron.core.models.hybrid.hybrid_state import build_hybrid_state_pipeline_plan
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from tests.unit_tests.ssm.test_hybrid_state_adapter import _config, _stack
+
+    config = _config(
+        context_parallel_size=2, pipeline_model_parallel_size=3, pipeline_dtype=torch.float32
+    )
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: cp_rank)
+    monkeypatch.setattr(
+        hybrid_pipeline,
+        "finalize_packed_seq_params",
+        lambda params: setattr(params, "cp_group", cp_group),
+    )
+    args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        context_parallel_size=2,
+        seq_length=16,
+        micro_batch_size=1,
+        sft=True,
+        dataloader_inter_document_masking=False,
+        sequence_packing_scheduler=None if layout == "raw-prefixes" else "pack_by_seq",
+    )
+    local_capacity = 8 if layout == "raw-prefixes" else 12
+    prefix = torch.tensor([0, 8, 16], dtype=torch.int32)
+    chunks = build_hybrid_state_pipeline_plan(config, "*-|*-|*-", pp_size=3, qkv_format="thd")
+    stacks, plans, params = [], [], []
+    for rank, chunk in enumerate(chunks):
+        stack = _stack(config, chunk)
+        stack.forward_adapter.cp_group = cp_group
+        stack.forward_adapter.configure_distributed_pipeline(
+            "*-|*-|*-", SimpleNamespace(size=lambda: 3, rank=lambda: rank)
+        )
+        batch = [None] * 12
+        if layout == "raw-prefixes":
+            batch[1], batch[2], batch[7] = prefix.unsqueeze(0), prefix.unsqueeze(0), torch.tensor(8)
+        else:
+            batch[-1] = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=prefix,
+                cu_seqlens_kv=prefix,
+                cu_seqlens_q_padded=prefix,
+                cu_seqlens_kv_padded=prefix,
+                max_seqlen_q=8,
+                max_seqlen_kv=8,
+                total_tokens=local_capacity,
+                cp_group=cp_group,
+                local_cp_size=2,
+            )
+        if rank in (0, 2):
+            batch[9 if rank == 0 else 4] = torch.zeros(1, local_capacity, dtype=torch.long)
+        prepared = hybrid_pipeline.prepare_hybrid_pipeline_inputs(
+            None,
+            SimpleNamespace(
+                pipeline_payload_spec=stack.forward_adapter.pipeline_payload_spec, vp_stage=None
+            ),
+            1,
+            args=args,
+            get_batch=lambda *_: tuple(batch),
+            get_timers=lambda: _Timers(),
+            batch_context=nullcontext,
+            forward_only=forward_only,
+        )
+        stacks.append(stack)
+        plans.append(prepared.pipeline_payload_plan)
+        params.append(next(prepared)[-1])
+    for sender, receiver in zip(plans, plans[1:]):
+        assert sender.outgoing[0] == receiver.incoming[0]
+        assert sender.outgoing[0].tensor_specs[0].shape == (local_capacity, 1, 32)
+    # Consume all three stages with the same declared local capacity. The CPU
+    # attention fixture exercises payload/state flow, not distributed CP math.
+    with torch.set_grad_enabled(not forward_only):
+        output = torch.randn(local_capacity, 1, config.hidden_size)
+        for rank, stack in enumerate(stacks):
+            if rank:
+                stack.set_input_tensor(output)
+            output = stack(output if rank == 0 else None, None, packed_seq_params=params[rank])
+            if rank < 2:
+                assert output.descriptor == plans[rank].outgoing[0]
+        assert output.shape == (local_capacity, 1, config.hidden_size)
 
 
 def test_static_middle_stage_keeps_none_data_iterator(monkeypatch):

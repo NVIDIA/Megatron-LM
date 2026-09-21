@@ -17,7 +17,12 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class TensorField:
-    """One field in a batch-specific schema, including configured absent fields."""
+    """One field in a batch-specific schema, including configured absent fields.
+
+    ``differentiable`` is static gradient eligibility for this execution mode,
+    independent of whether a producer tensor has a live edge (e.g. frozen weights).
+    A no-grad evaluation uses a schema without backward eligibility.
+    """
 
     key: str
     shape: tuple[int, ...]
@@ -96,6 +101,14 @@ class TensorSchema:
             ):
                 raise ValueError(f"State field {field.key} has incompatible shape/dtype/layout")
 
+    def detach_ineligible(self, tensors: Sequence[Tensor]) -> tuple[Tensor, ...]:
+        """Apply input eligibility without changing eligible tensor identities."""
+        self.validate(tensors)
+        return tuple(
+            tensor if field.differentiable or not tensor.requires_grad else tensor.detach()
+            for field, tensor in zip(self.packed_fields, tensors)
+        )
+
     def validate_peer(self, other: "TensorSchema") -> None:
         """Reject different identities, layouts, packing or gradient qualifications."""
         if self != other:
@@ -163,6 +176,24 @@ class StateCodec(Protocol):
         ...
 
 
+def validate_shared_input(field: TensorField, previous: Tensor, tensor: Tensor) -> None:
+    """Require one autograd edge, or equal immutable snapshots, for a shared input."""
+    schema = TensorSchema((field,))
+    schema.validate((previous,))
+    schema.validate((tensor,))
+    if previous is tensor:
+        return
+    if field.differentiable or previous.requires_grad or tensor.requires_grad:
+        raise ValueError(f"Shared input {field.key} must refer to the same tensor in every codec")
+    message = f"Shared input {field.key} has conflicting snapshots"
+    if previous.device != tensor.device or tensor.is_meta:
+        raise ValueError(message)
+    if tensor.is_cuda:
+        torch._assert_async((previous == tensor).all(), message)
+    elif not torch.equal(previous, tensor):
+        raise ValueError(message)
+
+
 class CompositeStateCodec:
     """Dispatch declared fields to native codecs using one boundary implementation.
 
@@ -175,11 +206,21 @@ class CompositeStateCodec:
         self,
         bindings: tuple[tuple[str, tuple[TensorField, ...], StateCodec], ...],
         factory: Callable,
+        *,
+        shared_inputs: tuple[str, ...] = (),
     ) -> None:
         self.bindings, self.factory = bindings, factory
         names = [name for name, _, _ in bindings]
         if len(set(names)) != len(names):
             raise ValueError("State codecs must declare unique context attributes")
+        owners = {}
+        for name, fields, _ in bindings:
+            for field in fields:
+                if field.key in owners and field.key not in shared_inputs:
+                    raise ValueError(
+                        f"Duplicate state field {field.key} owned by {owners[field.key]} and {name}"
+                    )
+                owners[field.key] = name
 
     def _partition(self, fields):
         selected = tuple(
@@ -196,7 +237,11 @@ class CompositeStateCodec:
         for (name, _, codec), selected in zip(self.bindings, self._partition(fields)):
             if selected:
                 tensors = codec.export(getattr(state, name), selected)
-                values.update(zip((f.key for f in selected if f.present), tensors))
+                TensorSchema(selected).validate(tensors)
+                for field, tensor in zip((f for f in selected if f.present), tensors):
+                    if field.key in values:
+                        validate_shared_input(field, values[field.key], tensor)
+                    values[field.key] = tensor
         return tuple(values[f.key] for f in fields if f.present)
 
     def restore(
@@ -218,9 +263,21 @@ class CompositeStateCodec:
 
 
 def compose_state_regions(
-    boundary_id: str, regions: Sequence[tuple[str, "StateRegion"]], factory: Callable[[], Any]
+    boundary_id: str,
+    regions: Sequence[tuple[str, "StateRegion"]],
+    factory: Callable[[], Any],
+    *,
+    shared_inputs: tuple[str, ...] = (),
 ) -> "StateRegion":
-    """Combine native declarations, deduplicating shared prepared tensor inputs."""
+    """Combine native declarations with explicitly shared prepared inputs.
+
+    Each field has one owner unless the host declares it in shared_inputs.
+    Shared fields must be inputs of every participating component; they may be
+    retained or relayed through a pipeline boundary, but cannot introduce a
+    second producer. Export verifies differentiable tensor identity so distinct
+    autograd edges cannot silently replace each other. Non-differentiable
+    metadata snapshots must have equal values.
+    """
 
     def merge(groups):
         result = {}
@@ -234,6 +291,11 @@ def compose_state_regions(
         return tuple(result.values())
 
     regions = tuple(regions)
+    for name, region in regions:
+        inputs = {f.key for f in region.schema.inputs}
+        for field in (*region.schema.outputs, *region.retained_fields):
+            if field.key in shared_inputs and field.key not in inputs:
+                raise ValueError(f"Shared input {field.key} cannot be produced by {name}")
     return StateRegion(
         BoundarySchema(
             boundary_id,
@@ -246,82 +308,12 @@ def compose_state_regions(
                 for name, r in regions
             ),
             factory,
+            shared_inputs=shared_inputs,
         ),
         tuple((name, r.input_metadata) for name, r in regions),
         tuple((name, r.output_metadata) for name, r in regions),
         merge(r.retained_fields for _, r in regions),
     )
-
-
-class StateGraphAdapter:
-    """One tensor-only capture/replay boundary for any set of native state declarations.
-
-    A declaration supplies native input restoration, output export and publication
-    (including feature-owned side effects). This class alone calls the graph,
-    packs/unpacks side outputs, validates static inputs and orders publication
-    before the caller resumes its eager continuation.
-    """
-
-    def __init__(self, components: Sequence[Any]) -> None:
-        self.components = tuple(components)
-        self._static_names = ()
-        self._static_schema = None
-
-    def get_static_inputs(self, inputs: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Combine declared sample inputs and retain only their static descriptors."""
-        for component in self.components:
-            inputs = component.get_static_inputs(inputs)
-        self._static_names = tuple(inputs)
-        fields = tuple(
-            TensorField(name, tuple(t.shape), t.dtype, "strided", t.requires_grad)
-            for name, t in inputs.items()
-        )
-        self._static_schema = StaticTensorSchema.from_tensors(fields, tuple(inputs.values()))
-        return inputs
-
-    def capture(self, function: Callable, *args, **kwargs) -> tuple[Tensor, ...]:
-        """Restore all native states, execute the original region once, then export."""
-        hidden = args[0] if args else kwargs["hidden_states"]
-        states = [component.restore_inputs(hidden, kwargs) for component in self.components]
-        outputs = tuple(function(*args, **kwargs))
-        for component, state in zip(self.components, states):
-            outputs += component.export_outputs(state)
-        return outputs
-
-    def replay(self, function: Callable, *args, **kwargs) -> Any:
-        """Refresh tensor inputs and publish every component before the eager tail."""
-        if not torch.is_grad_enabled():
-            return function.__self__.forward(*args, **kwargs)
-        hidden = args[0] if args else kwargs["hidden_states"]
-        publications = [component.prepare_replay(hidden, kwargs) for component in self.components]
-        params = kwargs.pop("packed_seq_params", None)
-        if params is not None:
-            for suffix in ("q", "kv", "q_padded", "kv_padded"):
-                name = "cu_seqlens_" + suffix
-                if name in self._static_names:
-                    value = getattr(params, name)
-                    kwargs[name] = (
-                        getattr(params, name.removesuffix("_padded")) if value is None else value
-                    )
-        if self._static_schema is not None:
-            values = dict(kwargs, hidden_states=hidden)
-            for name, field in zip(self._static_names, self._static_schema.schema.fields):
-                if name in ("padding_mask", "attention_mask") and values.get(name) is None:
-                    values[name] = kwargs[name] = torch.zeros(
-                        field.shape, dtype=field.dtype, device=hidden.device
-                    )
-            self._static_schema.validate(tuple(values.get(name) for name in self._static_names))
-        count = sum(size for size, _ in publications)
-
-        def publish(outputs):
-            result = outputs[:-count] if count else outputs
-            position = len(result)
-            for size, update in publications:
-                result = update(result, outputs[position : position + size])
-                position += size
-            return result
-
-        return function(*args, **kwargs, _te_graph_output_handler=publish)
 
 
 def validate_metadata(metadata: Any) -> None:
@@ -367,7 +359,7 @@ def prepare_boundaries(
 ) -> tuple[BoundarySchema, ...]:
     """Derive side schemas without changing placement, checkpoint groups or execution.
 
-    Pipeline delivery supports adjacent, non-interleaved placement. Checkpoint
+    Pipeline delivery follows adjacent logical chunks, including VPP. Checkpoint
     and capture regions exclude host preparation and carry only values they read
     or produce for an external reader. Unread relay values remain in parent state.
     """
@@ -402,8 +394,10 @@ def prepare_boundaries(
                 dep.origin == "activation" and position == dep.available_at
             ):
                 raise ValueError(f"State source must precede its consumers: {dep.field.key}")
-            if dep.delivery == "local" and owner(position).pp_rank != source.pp_rank:
-                raise ValueError(f"Local state has a remote consumer: {dep.field.key}")
+            if dep.delivery == "local" and owner(position) != source:
+                raise ValueError(
+                    f"Local state has a consumer in another rank or chunk: {dep.field.key}"
+                )
             owner(position)
 
     schemas = []
@@ -414,17 +408,13 @@ def prepare_boundaries(
                 part.end for part in placement[:-1]
             }:
                 raise ValueError("Pipeline boundary must be an existing placement cut")
-            ranks = [part.pp_rank for part in placement]
-            if len(set(ranks)) != len(ranks) or ranks != sorted(ranks):
-                raise ValueError("Generic pipeline state delivery does not support VPP placement")
             for dep in dependencies:
                 if (
                     dep.delivery == "pipeline"
                     and dep.consumed_at
-                    and dep.available_at <= boundary.start < dep.consumed_at[-1]
-                    # A host-prepared input at the receiving stage's entry
-                    # already lives there; it cannot be sent by the previous rank.
-                    and dep.source_pp_rank < owner(boundary.start).pp_rank
+                    # A consumer at the cut belongs to the receiving chunk;
+                    # a source at that cut is already local to the receiver.
+                    and dep.available_at < boundary.start <= dep.consumed_at[-1]
                 ):
                     inputs.append(dep.field)
             outputs = inputs.copy()
@@ -456,10 +446,35 @@ def prepare_boundaries(
 
 @dataclass(frozen=True)
 class CheckpointBoundaryPolicy:
-    """Explicit packed output contract for the restricted full-region checkpoint path."""
+    """Output contract shared by checkpoint backends.
+
+    Non-differentiable fields must not acquire autograd edges. An unused output
+    keeps a None gradient; an explicitly supplied zero still executes backward.
+    """
 
     outputs: TensorSchema
     strict: bool = False
+
+    def apply(self, result: Tensor | tuple[Tensor, ...]) -> Tensor | tuple[Tensor, ...]:
+        """Validate outputs and give each slot independent gradient eligibility.
+
+        Eager execution can still create edges to closed-over parameters when
+        every input is frozen. Repeated Tensor objects need distinct identities
+        before a checkpoint backend assigns output numbers or marks a slot as
+        non-differentiable. Zero-copy views separate those slots without changing
+        values or duplicating the producer's computation.
+        """
+        single = isinstance(result, Tensor)
+        tensors = (result,) if single else tuple(result)
+        self.outputs.validate(tensors)
+        seen, outputs = set(), []
+        for field, tensor in zip(self.outputs.packed_fields, tensors):
+            repeated = id(tensor) in seen
+            seen.add(id(tensor))
+            if repeated:
+                tensor = tensor.view_as(tensor)
+            outputs.append(tensor if field.differentiable else tensor.detach())
+        return outputs[0] if single else tuple(outputs)
 
 
 @dataclass(frozen=True)
@@ -476,6 +491,40 @@ class StateRegion:
         validate_metadata(self.input_metadata)
         validate_metadata(self.output_metadata)
         TensorSchema((*self.retained_fields, *self.schema.outputs))
+
+
+def prepare_state_region(
+    dependencies: Sequence[StateDependency],
+    boundary: StateBoundary,
+    placement: Sequence[StatePlacement],
+    codec: StateCodec,
+    *,
+    input_metadata: tuple = (),
+    output_metadata: tuple = (),
+) -> StateRegion:
+    """Bind a codec to planned inputs/outputs and fields that bypass a region.
+
+    An incoming value stays in the parent state if a later region still consumes
+    it, even when this region never reads it. Prepared values available at entry
+    also survive until their last consumer. Pipeline schemas already contain all
+    live relay fields, so they need no separate retained fields.
+    """
+    dependencies = tuple(dependencies)
+    (schema,) = prepare_boundaries(dependencies, (boundary,), placement)
+    retained = (
+        tuple(
+            dep.field
+            for dep in dependencies
+            if (
+                dep.available_at < boundary.start
+                or (dep.origin == "prepared" and dep.available_at == boundary.start)
+            )
+            and any(reader >= boundary.end for reader in dep.consumed_at)
+        )
+        if boundary.kind != "pipeline"
+        else ()
+    )
+    return StateRegion(schema, codec, input_metadata, output_metadata, retained)
 
 
 @dataclass(frozen=True)

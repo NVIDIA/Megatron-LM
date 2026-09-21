@@ -15,11 +15,19 @@ from torch import nn
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec, hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel, get_hybrid_state_components
 from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStateAdapter, HybridStatePayload
+from megatron.core.models.hybrid.hybrid_state import (
+    HybridGraphState,
+    HybridStateDeclaration,
+    HybridTensorGraphState,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.pipeline_payload import backward_pipeline_payload
+from megatron.core.pipeline_parallel.pipeline_payload import (
+    PipelinePayloadSpec,
+    backward_pipeline_payload,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionSubmodules,
@@ -39,8 +47,16 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pip
     build_csa2_pipeline_plan,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.state_boundary import (
+    BoundarySchema,
+    StateRegion,
+    TensorField,
+    TensorMappingCodec,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from tests.unit_tests.ssm.test_hybrid_cross_layer_state import _MemoryDeclaration
+from tests.unit_tests.ssm.test_hybrid_state_adapter import cpu_graph_slots as cpu_graph_slots
 from tests.unit_tests.transformer.experimental_attention_variant.test_csa2 import (
     _CPUFrequencyTable,
     _groups,
@@ -73,6 +89,23 @@ def _config(dtype=torch.float32, coefficient=0.3, enable_hyper_connections=True)
 def _pattern(cuts, pattern="DE" * 6):
     points = (0, *cuts, len(pattern))
     return "|".join(pattern[start:end] for start, end in zip(points, points[1:]))
+
+
+@pytest.mark.parametrize("mhc", [False, True])
+def test_native_dsv41_spec_registers_enabled_states_without_changing_default(monkeypatch, mhc):
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+    from megatron.core.models.gpt import experimental_attention_variant_module_specs as specs
+
+    # Building the spec needs no TE execution; expose its provider on CPU too.
+    monkeypatch.setattr(specs, "_get_backend_spec_provider", lambda config: TESpecProvider())
+    config = _config(enable_hyper_connections=mhc)
+    spec = hybrid_dsv4_stack_spec(config)
+    components = spec.submodules.state_components
+    assert tuple(c.context_attribute for c in components) == (
+        ("mhc_state", "cross_layer_state") if mhc else ("cross_layer_state",)
+    )
+    assert get_hybrid_state_components(config, components) == components
+    assert hybrid_stack_spec.submodules.state_components == ()
 
 
 @pytest.mark.parametrize(
@@ -190,6 +223,8 @@ def test_invalid_plan(pattern, kwargs, message):
 class _Attention(nn.Module):
     """Native QKV/output projections around actual CSA2, avoiding TE/GPU setup."""
 
+    uses_attention_mask = False
+
     def __init__(self, config, layer_number, pg_collection, **kwargs):
         super().__init__()
         self.config = config
@@ -248,13 +283,13 @@ class _FFN(nn.Module):
         return self.proj(x).tanh(), None
 
 
-def _stack(config, chunk=None, attention=_Attention):
+def _stack(config, chunk=None, attention=_Attention, *, state_components=()):
     groups = _groups()
     groups.pp = groups.tp
     stack = HybridStack(
         config,
         HybridStackSubmodules(
-            forward_adapter=CSA2HybridAdapter,
+            state_components=get_hybrid_state_components(config, state_components),
             dsa_layer=ModuleSpec(
                 TransformerLayer,
                 submodules=TransformerLayerSubmodules(
@@ -278,8 +313,271 @@ def _stack(config, chunk=None, attention=_Attention):
         pg_collection=groups,
     )
     if chunk is not None:
+        boundary = chunk.incoming or chunk.outgoing
+        if getattr(boundary, "placement", ()):
+            stack.forward_adapter.bind_placement("DE" * 6, boundary.placement)
+            stack.forward_adapter.configure_cuda_graphs(stack.layers)
         stack.forward_adapter.configure_pipeline(chunk)
     return stack
+
+
+class _LookupDeclaration(_MemoryDeclaration):
+    """A third component binds an unrelated context attribute to its native branch."""
+
+    context_attribute = "lookup_owner"
+
+    def __init__(self, config, *, layer_type_list, **kwargs):
+        super().__init__(
+            config, layer_type_list=["*" if s == "D" else "-" for s in layer_type_list], **kwargs
+        )
+
+    @staticmethod
+    def _key(last_layer):
+        return f"lookup/value:L{last_layer}"
+
+    def pipeline_region(self, boundary, hidden, params, *, requires_grad=True):
+        from megatron.core.transformer.state_boundary import BoundarySchema, StateRegion
+
+        last = (boundary.layer_offset - 1) // 2 * 2 + 1
+        field = replace(self._field(hidden, last), differentiable=requires_grad)
+        return StateRegion(BoundarySchema("lookup", (field,), (field,)), self, (last,), (last,))
+
+    def graph_state(self, layer, symbol, region) -> HybridGraphState | None:
+        if "attention" not in region.branches or symbol != "D":
+            return None
+        declaration = _LookupDeclaration(
+            self.config, layer_type_list=[symbol], pp_layer_offset=layer.layer_number - 1
+        )
+        return HybridTensorGraphState(
+            lambda hidden, context: declaration._graph_region(hidden),
+            lambda context: context["cross_layer_state"].attention_kwargs()["memory_state"],
+            self._publish_graph_state,
+        )
+
+    @staticmethod
+    def _publish_graph_state(state, restored):
+        state.memory, state.last_layer = restored.memory, restored.last_layer
+
+    def _graph_region(self, hidden):
+        from megatron.core.transformer.state_boundary import (
+            BoundarySchema,
+            StateRegion,
+            TensorMappingCodec,
+        )
+
+        if self.pattern != ["*"]:
+            return StateRegion(BoundarySchema("lookup/graph", (), ()), TensorMappingCodec())
+        previous = max(0, self.offset - 1)
+        return StateRegion(
+            BoundarySchema(
+                "lookup/graph",
+                (self._field(hidden, previous),),
+                (self._field(hidden, self.offset + 1),),
+            ),
+            self,
+            (previous,),
+            (self.offset + 1,),
+        )
+
+
+class _LookupAttention(_Attention):
+    """Native attention consumes two independent states through an unmodified layer."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lookup_weight = nn.Parameter(torch.tensor(0.2))
+
+    def forward(self, hidden, *, memory_state, **kwargs):
+        previous = 0 if memory_state.memory is None else memory_state.memory * 0.1
+        memory_state.memory = self.lookup_weight * hidden.sin() + previous
+        memory_state.last_layer = self.core.layer_idx + 1
+        return super().forward(hidden + memory_state.memory.square(), **kwargs)
+
+
+class _PrefixDeclaration(HybridStateDeclaration):
+    """Independent consumer of the same prepared prefixes as CSA2."""
+
+    context_attribute = "prefix_reader"
+
+    def __init__(self, config, **kwargs):
+        pass
+
+    @staticmethod
+    def _inputs(params):
+        physical = params.cu_seqlens_q_padded
+        return {
+            "host/cu_seqlens:batch": params.cu_seqlens_q,
+            "host/cu_seqlens_padded:batch": (params.cu_seqlens_q if physical is None else physical),
+        }
+
+    def initial_state(self, hidden, packed_seq_params):
+        return {key: tensor.clone() for key, tensor in self._inputs(packed_seq_params).items()}
+
+    def layer_kwargs(self, layer, state):
+        return {"attention": {"prefix_state": state}}
+
+    def recompute_boundary_tensors(self, state):
+        return ()
+
+    @staticmethod
+    def _region(boundary_id, state, *, relay):
+        fields = tuple(
+            TensorField(key, tuple(value.shape), value.dtype, "thd", False)
+            for key, value in state.items()
+        )
+        return StateRegion(
+            BoundarySchema(boundary_id, fields, fields if relay else ()),
+            TensorMappingCodec(),
+            retained_fields=() if relay else fields,
+        )
+
+    def pipeline_region(self, boundary, hidden, params, *, requires_grad=True):
+        return self._region("prefix/pp", self._inputs(params), relay=True)
+
+    def checkpoint_region(self, start, end, hidden, state):
+        return self._region(f"prefix/checkpoint:{start}:{end}", state, relay=False)
+
+
+class _PrefixAttention(_Attention):
+    """Use both prepared inputs in a trainable branch of real CSA2 attention."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.prefix_weight = nn.Parameter(torch.tensor(0.2))
+
+    def forward(self, hidden, *, prefix_state, **kwargs):
+        logical = prefix_state["host/cu_seqlens:batch"]
+        physical = prefix_state["host/cu_seqlens_padded:batch"]
+        scale = (logical.sum() + 2 * physical.sum()).to(hidden.dtype) * 0.01
+        return super().forward(hidden + self.prefix_weight * scale, **kwargs)
+
+
+@pytest.mark.parametrize("pattern", [None, "DEDE|DEDEDEDE", "DE|DE|DE|DEDEDE"])
+@pytest.mark.parametrize("method", ["uniform", "block"])
+def test_csa2_shared_prefix_component_full_recompute(monkeypatch, cpu_graph_slots, pattern, method):
+    """Shared prefix inputs survive real checkpoint groups and PP/VPP handoffs."""
+    from megatron.core.tensor_parallel import random as checkpoint_runtime
+
+    if not torch.cuda.is_available():
+        monkeypatch.setattr(checkpoint_runtime, "_get_cuda_rng_state", lambda **kwargs: None)
+        monkeypatch.setattr(checkpoint_runtime, "_set_cuda_rng_state", lambda *args, **kwargs: None)
+    _record_losses(monkeypatch)
+    torch.manual_seed(712)
+    config = _config()
+    components = (_PrefixDeclaration,)
+    reference = _stack(config, attention=_PrefixAttention, state_components=components)
+    runtime = replace(
+        config, recompute_granularity="full", recompute_method=method, recompute_num_layers=3
+    )
+    plan = (
+        (None,)
+        if pattern is None
+        else build_csa2_pipeline_plan(runtime, pattern, pp_size=2, qkv_format="thd")
+    )
+    stacks = [
+        _stack(runtime, chunk, attention=_PrefixAttention, state_components=components)
+        for chunk in plan
+    ]
+    for stack, chunk in zip(stacks, plan):
+        offset = 0 if chunk is None else chunk.layer_offset
+        for i, layer in enumerate(stack.layers):
+            layer.load_state_dict(reference.layers[offset + i].state_dict())
+
+    pairs = []
+    for lengths, capacities in (([3, 0, 4], [4, 0, 4]), ([2, 0, 5], [3, 0, 5])):
+        params, _, valid = _packed(lengths, capacities, tail=2)
+        x = torch.randn(valid.numel(), 1, config.hidden_size, requires_grad=True)
+        ref_x = x.detach().clone().requires_grad_()
+        expected = reference(ref_x, None, packed_seq_params=params)
+        if pattern is None:
+            actual = stacks[0](x, None, packed_seq_params=params)
+        else:
+            actual, payloads = _run_chunks(stacks, plan, x, params)
+            for payload in payloads:
+                keys = [spec.field.key for spec in payload.tensor_specs]
+                for key in _PrefixDeclaration._inputs(params):
+                    assert keys.count(key) == 1
+        torch.testing.assert_close(actual, expected)
+        pairs.append((x, ref_x, actual, expected))
+
+    # Both forwards stay live; reverse backward catches retained-state leakage.
+    for x, ref_x, actual, expected in reversed(pairs):
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(x.grad, ref_x.grad)
+    for stack, chunk in zip(stacks, plan):
+        offset = 0 if chunk is None else chunk.layer_offset
+        for i, layer in enumerate(stack.layers):
+            for name, parameter in layer.named_parameters():
+                expected = reference.layers[offset + i].get_parameter(name)
+                torch.testing.assert_close(parameter.grad, expected.grad, atol=3e-6, rtol=5e-5)
+                if name.endswith("prefix_weight"):
+                    assert parameter.grad is not None and parameter.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("pattern", ["DEDE|DEDEDEDE", "DE|DE|DE|DEDEDE"])
+@pytest.mark.parametrize("mode", ["eager", "full", "selective"])
+@pytest.mark.parametrize("objective", ["lookup", "both"])
+def test_component_list_runs_csa2_mhc_and_third_state_in_real_hybrid_loop(
+    monkeypatch, cpu_graph_slots, pattern, mode, objective
+):
+    """Declarations alone compose real forward, PP export and recompute hooks."""
+    from megatron.core.tensor_parallel import random as checkpoint_runtime
+
+    if not torch.cuda.is_available():
+        monkeypatch.setattr(checkpoint_runtime, "_get_cuda_rng_state", lambda **kwargs: None)
+        monkeypatch.setattr(checkpoint_runtime, "_set_cuda_rng_state", lambda *args, **kwargs: None)
+    _record_losses(monkeypatch)
+    torch.manual_seed(311)
+    config = _config()
+    reference = _stack(config, state_components=(_LookupDeclaration,), attention=_LookupAttention)
+    runtime = replace(config)
+    if mode == "full":
+        runtime.recompute_granularity, runtime.recompute_method, runtime.recompute_num_layers = (
+            "full",
+            "uniform",
+            3,
+        )
+    elif mode == "selective":
+        runtime.recompute_granularity, runtime.recompute_modules = "selective", ["mhc"]
+        runtime.mhc_recompute_layer_num = 3
+    plan = build_csa2_pipeline_plan(runtime, pattern, pp_size=2)
+    stacks = [
+        _stack(runtime, chunk, state_components=(_LookupDeclaration,), attention=_LookupAttention)
+        for chunk in plan
+    ]
+    for stack, chunk in zip(stacks, plan):
+        assert len(stack.forward_adapter.components) == 3
+        for i, layer in enumerate(stack.layers):
+            layer.load_state_dict(reference.layers[chunk.layer_offset + i].state_dict())
+
+    for stack in (reference, stacks[-1]):
+        finalize = stack.forward_adapter.finalize_forward
+
+        def observe(output, params, context, finalize=finalize):
+            return finalize(output, params, context), context.lookup_owner.memory
+
+        stack.forward_adapter.finalize_forward = observe
+    pairs = []
+    for length in (5, 7):
+        x = torch.randn(length, 1, config.hidden_size, requires_grad=True)
+        ref_x = x.detach().clone().requires_grad_()
+        expected = reference(ref_x, None)
+        actual, _ = _run_chunks(stacks, plan, x)
+        torch.testing.assert_close(actual, expected)
+        pairs.append((x, ref_x, actual, expected))
+    for x, ref_x, actual, expected in reversed(pairs):
+        for values in (actual, expected):
+            sum(
+                t.square().sum() for t in (values if objective == "both" else values[1:])
+            ).backward()
+        torch.testing.assert_close(x.grad, ref_x.grad)
+    for stack, chunk in zip(stacks, plan):
+        for i, layer in enumerate(stack.layers):
+            for actual, expected in zip(
+                layer.parameters(), reference.layers[chunk.layer_offset + i].parameters()
+            ):
+                torch.testing.assert_close(actual.grad, expected.grad, atol=3e-6, rtol=5e-5)
 
 
 def _split_stacks(full, plan):
@@ -568,9 +866,7 @@ def test_unconfigured_stack_preserves_tensor_input_contract(monkeypatch):
 
 
 @pytest.mark.parametrize("enable_hyper_connections", [False, True], ids=["residual", "mhc"])
-def test_generic_stack_without_adapter_preserves_tensor_input_and_gradients(
-    enable_hyper_connections,
-):
+def test_generic_stack_preserves_tensor_input_and_gradients(enable_hyper_connections):
     config = TransformerConfig(
         num_layers=2,
         hidden_size=8,
@@ -589,12 +885,13 @@ def test_generic_stack_without_adapter_preserves_tensor_input_and_gradients(
     stack = HybridStack(
         config,
         HybridStackSubmodules(
+            state_components=get_hybrid_state_components(config),
             mlp_layer=ModuleSpec(
                 TransformerLayer,
                 submodules=TransformerLayerSubmodules(
                     pre_mlp_layernorm=_RMSNorm, mlp=_FFN, mlp_bda=get_bias_dropout_add
                 ),
-            )
+            ),
         ),
         layer_type_list=["-", "-"],
         pre_process=False,
@@ -606,7 +903,7 @@ def test_generic_stack_without_adapter_preserves_tensor_input_and_gradients(
         if enable_hyper_connections
         else stack.forward_adapter is None
     )
-    assert hybrid_stack_spec.submodules.forward_adapter is None
+    assert hybrid_stack_spec.submodules.state_components == ()
     width = config.hidden_size * (config.num_residual_streams if enable_hyper_connections else 1)
     x = torch.randn(5, 2, width, requires_grad=True)
     stack.set_input_tensor(x)
@@ -630,7 +927,12 @@ def test_payload_preserves_residual_and_mixing_dtypes(monkeypatch, mix_dtype):
     hidden, mix, *shared = payload.tensors
     specs = tuple(
         (
-            replace(s, dtype=(torch.float32 if s.name == "hidden_states" else mix_dtype))
+            replace(
+                s,
+                field=replace(
+                    s.field, dtype=(torch.float32 if s.name == "hidden_states" else mix_dtype)
+                ),
+            )
             if s.name in ("hidden_states", "pre_mix")
             else s
         )
@@ -690,7 +992,9 @@ def test_received_leaf_joint_backward_matches_unsplit(
                 t.detach().clone().requires_grad_(spec.requires_grad)
                 for t, spec in zip(output.tensors, output.tensor_specs)
             )
-            payload = stacks[i + 1].forward_adapter.make_pipeline_payload(tensors, output.metadata)
+            payload = stacks[i + 1].forward_adapter.make_pipeline_payload(
+                tensors, output.descriptor
+            )
             assert all(t.is_leaf for t in payload.tensors)
             if release:
                 output.release_output()
@@ -739,7 +1043,24 @@ def test_distributed_adapter_binds_both_layouts_and_rejects_other_boundaries():
     assert set(adapter._pipeline_chunks) == {"sbhd", "thd"}
     assert factory is not None
     with pytest.raises(ValueError, match="incoming boundary"):
-        factory((), (-1, -1))
+        factory((), PipelinePayloadSpec((), (-1, -1)))
+
+
+@pytest.mark.parametrize("mode", ["full", "graph", "pipeline"])
+def test_csa2_nonhybrid_capabilities_do_not_depend_on_mhc(mode):
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    config = _config(enable_hyper_connections=False)
+    assert not config.mhc_single_pass
+    if mode == "full":
+        config.recompute_granularity = "full"
+        config.recompute_method, config.recompute_num_layers = "uniform", 1
+    elif mode == "graph":
+        config.cuda_graph_impl = "transformer_engine"
+    else:
+        config.pipeline_model_parallel_size = 2
+    with pytest.raises(ValueError, match="CSA2.*requires HybridModel"):
+        TransformerBlock(config, None)
 
 
 def test_v41_ordinary_pp_config_and_nonhybrid_guard():
@@ -874,7 +1195,7 @@ def test_third_state_uses_same_pipeline_boundary_as_csa2_and_mhc(monkeypatch, la
         TensorMappingCodec,
     )
 
-    class LookupState:
+    class LookupState(HybridStateDeclaration):
         context_attribute = "lookup_state"
 
         def pipeline_region(self, boundary, hidden, params, *, requires_grad=True):
@@ -901,7 +1222,7 @@ def test_third_state_uses_same_pipeline_boundary_as_csa2_and_mhc(monkeypatch, la
     for stack in (first, second):
         stack.forward_adapter.components += (LookupState(),)
     outgoing = first.forward_adapter.finalize_forward(hidden, params, context)
-    received = second.forward_adapter.make_pipeline_payload(outgoing.tensors, outgoing.metadata)
+    received = second.forward_adapter.make_pipeline_payload(outgoing.tensors, outgoing.descriptor)
     restored_hidden, restored, _ = received.restore()
     assert restored.lookup_state is not context.lookup_state
     assert (

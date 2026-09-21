@@ -409,6 +409,7 @@ def hybrid_dsv4_stack_spec(config):
         _get_backend_spec_provider,
         get_dsv4_hybrid_module_spec_for_backend,
     )
+    from megatron.core.models.hybrid.hybrid_model import get_hybrid_state_components
 
     backend = _get_backend_spec_provider(config)
     dsv4_attention = get_dsv4_hybrid_module_spec_for_backend(config, backend)
@@ -438,13 +439,8 @@ def hybrid_dsv4_stack_spec(config):
         csa_layer=_wrap_dsv4_layer(compress_ratio=4),  # 'C': CSA
         hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
         window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
+        state_components=get_hybrid_state_components(config),
     )
-    if config.dsv4_version == "v4.1":
-        from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
-            CSA2HybridAdapter,
-        )
-
-        submodules.forward_adapter = CSA2HybridAdapter
     if config.dsv4_version == "v4.1" and config.num_moe_experts is not None:
         # V4.1's native path must honor the configured expert implementation instead of
         # inheriting the grouped-GEMM MoE from the default Hybrid spec.

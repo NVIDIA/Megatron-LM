@@ -14,34 +14,44 @@ from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 
 @dataclass(frozen=True)
 class PipelineTensorSpec:
-    """Concrete tensor descriptor, snapshotted for one boundary and microbatch."""
+    """A pipeline display name bound to the common tensor contract.
+
+    Shape, dtype, layout, presence and gradient eligibility have one source of
+    truth: ``field``. ``requires_grad`` is an eligibility alias for transport;
+    the producer tensor's actual autograd state is evaluated during backward.
+    """
 
     name: str
-    shape: tuple[int, ...]
-    dtype: torch.dtype
-    requires_grad: bool
-    layout: str = "strided"
-    present: bool = True
-    key: str | None = None
+    field: TensorField
 
     @property
-    def field(self) -> TensorField:
-        """Expose the common schema while retaining the existing typed-payload API."""
-        return TensorField(
-            self.key or self.name,
-            self.shape,
-            self.dtype,
-            self.layout,
-            self.requires_grad,
-            self.present,
-        )
+    def key(self) -> str:
+        return self.field.key
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.field.shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.field.dtype
+
+    @property
+    def requires_grad(self) -> bool:
+        return self.field.differentiable
+
+    @property
+    def layout(self) -> str:
+        return self.field.layout
+
+    @property
+    def present(self) -> bool:
+        return self.field.present
 
     @classmethod
     def from_field(cls, field: TensorField) -> "PipelineTensorSpec":
-        """Bind a common field without changing its identity or gradient qualification."""
-        return cls(
-            field.key, field.shape, field.dtype, field.differentiable, field.layout, field.present
-        )
+        """Use the canonical field key as the default display name."""
+        return cls(field.key, field)
 
 
 @dataclass(frozen=True)
@@ -219,7 +229,7 @@ class PipelineGradientMessage:
 # Factories and tensor_specs may inspect only shapes, dtypes and host metadata:
 # with overlap, receive buffers are populated after payload construction. The
 # schedule waits the receive handle before model execution or state restoration.
-PipelinePayloadFactory = Callable[[tuple[torch.Tensor, ...], tuple[int, ...]], PipelinePayload]
+PipelinePayloadFactory = Callable[[tuple[torch.Tensor, ...], PipelinePayloadSpec], PipelinePayload]
 
 
 def backward_pipeline_payload(
@@ -259,10 +269,12 @@ def backward_pipeline_payload(
         outputs, grads, positions = [], [], {}
         for root, spec, grad in zip(roots, specs, output_grad):
             if spec.requires_grad and grad is not None:
-                if not root.requires_grad:
-                    raise ValueError(f"Active pipeline field {spec.name} has no autograd edge")
                 if tuple(grad.shape) != spec.shape or grad.dtype != spec.dtype:
                     raise ValueError(f"Invalid gradient for pipeline field {spec.name}")
+                # Receivers allocate leaves using static eligibility. A frozen
+                # sender has no local edge even when the receiver used the value.
+                if not root.requires_grad:
+                    continue
                 # Two declared outputs may be the very same Tensor. Sum their
                 # contributions by identity, never by storage/data_ptr aliases.
                 key = id(root)

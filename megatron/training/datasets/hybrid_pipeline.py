@@ -15,7 +15,7 @@ from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelinePayloadPlan,
 )
 from megatron.core.timers import Timers
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import divide, get_attr_wrapped_model
 
 
 class _HybridBatch(NamedTuple):
@@ -105,7 +105,9 @@ def prepare_hybrid_pipeline_inputs(
     vp_stage = get_attr_wrapped_model(model, "vp_stage")
     if not (args.sft or args.dataloader_inter_document_masking or args.sequence_packing_scheduler):
         incoming, outgoing = describe(
-            args.seq_length, args.micro_batch_size, requires_grad=not forward_only
+            divide(args.seq_length, args.context_parallel_size),
+            args.micro_batch_size,
+            requires_grad=not forward_only,
         )
         return PipelineDataIterator(
             partial(get_batch, data_iterator, vp_stage),
@@ -118,11 +120,12 @@ def prepare_hybrid_pipeline_inputs(
         with batch_context():
             for _ in range(num_microbatches):
                 batch = _HybridBatch(*get_batch(data_iterator, vp_stage))
+                raw_prefixes = batch.packed_seq_params is None and batch.cu_seqlens is not None
                 params = get_hybrid_packed_seq_params(batch, tokens_per_sample=args.seq_length)
                 batch = batch._replace(packed_seq_params=params)
-                # Packing has already split tokens/labels/masks across CP. Their
-                # local shapes include tail padding; global prefix endpoints do not
-                # describe these receive buffers and must not be used as a fallback.
+                # Prefer actual CP-local physical buffers, including scheduler
+                # tail padding. Metadata-only stages must interpret capacities
+                # in the coordinate system used by their loader below.
                 shape_source = next(
                     (t for t in (batch.tokens, batch.labels, batch.padding_mask) if t is not None),
                     None,
@@ -133,8 +136,19 @@ def prepare_hybrid_pipeline_inputs(
                     seq_length, batch_size = params.total_tokens, 1
                     if type(seq_length) is not int:
                         raise ValueError("Packed pipeline batches require a host token capacity")
+                    if raw_prefixes:
+                        # Raw SFT prefixes describe the global physical pack. The
+                        # scheduler instead supplies an already local capacity,
+                        # which can include tail padding beyond the prefix end.
+                        cp_size = (
+                            params.cp_group.size()
+                            if params.cp_group is not None
+                            else params.local_cp_size or args.context_parallel_size
+                        )
+                        seq_length = divide(seq_length, cp_size)
                 else:
-                    seq_length, batch_size = args.seq_length, args.micro_batch_size
+                    seq_length = divide(args.seq_length, args.context_parallel_size)
+                    batch_size = args.micro_batch_size
                 recv_spec, send_spec = describe(
                     seq_length, batch_size, params, requires_grad=not forward_only
                 )

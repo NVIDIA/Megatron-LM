@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions import transformer_engine as te_runtime
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid import hybrid_block as hybrid_runtime
 from megatron.core.models.hybrid import hybrid_stack_adapter as recompute_runtime
@@ -44,6 +45,9 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 from megatron.training.arguments import _add_network_size_args
+from tests.unit_tests.tensor_parallel.test_boundary_checkpoint import (
+    cpu_te_checkpoint as cpu_te_checkpoint,
+)
 from tests.unit_tests.transformer.experimental_attention_variant.test_csa2 import (
     _CPUFrequencyTable,
     _groups,
@@ -744,10 +748,12 @@ def test_full_recompute_frozen_hidden_input_preserves_parameter_gradients(monkey
 @pytest.mark.usefixtures("cpu_checkpoint_rng")
 @pytest.mark.parametrize("quantization", ["fp8", "fp4", "quant_recipe"])
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
-def test_full_recompute_quantization_dispatch_and_layer_context(monkeypatch, quantization, layout):
+def test_full_recompute_quantization_dispatch_and_layer_context(
+    monkeypatch, cpu_te_checkpoint, quantization, layout
+):
     """Validate TE checkpoint dispatch and global layer contexts without quantized kernels."""
     torch.manual_seed(437)
-    _record_losses(monkeypatch)
+    records = _record_losses(monkeypatch)
     reference = _stack(_config())
     config = _full_config(reference.config, "uniform", 3)
     stacks, plan = _stacks(reference, config, (5,), layout)
@@ -767,11 +773,13 @@ def test_full_recompute_quantization_dispatch_and_layer_context(monkeypatch, qua
         contexts.append((layer_number, torch.is_grad_enabled()))
         yield
 
-    def te_checkpoint(function, distribute, rng_tracker, tp_group, *inputs):
+    def te_checkpoint(function, distribute, rng_tracker, tp_group, *inputs, boundary_policy):
         assert rng_tracker is checkpoint_runtime.get_cuda_rng_tracker
         assert any(tp_group is stack.pg_collection.tp for stack in stacks)
         checkpoint_calls.append(len(inputs))
-        return checkpoint_runtime.checkpoint(function, distribute, *inputs)
+        return te_runtime.te_checkpoint(
+            function, distribute, rng_tracker, tp_group, *inputs, boundary_policy=boundary_policy
+        )
 
     monkeypatch.setattr(recompute_runtime, "te_checkpoint", te_checkpoint)
     monkeypatch.setattr(hybrid_runtime, "get_fp8_context", quantization_context)
@@ -780,10 +788,16 @@ def test_full_recompute_quantization_dispatch_and_layer_context(monkeypatch, qua
     x = torch.randn(9, 2 if params is None else 1, reference.config.hidden_size, requires_grad=True)
     reference_x = x.detach().clone().requires_grad_()
     actual, _ = _run_chunks(stacks, plan, x, params)
+    assert not records  # The original TE body still runs under no-grad.
     expected = reference(reference_x, None, packed_seq_params=params)
+    expected_records = {r["layer_number"]: r["loss"] for r in records}
+    records.clear()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     actual.square().sum().backward()
     expected.square().sum().backward()
+    assert len(records) == len(expected_records)
+    for record in records:
+        torch.testing.assert_close(record["loss"], expected_records[record["layer_number"]])
     _assert_gradient(x.grad, reference_x.grad)
     _assert_parameter_gradients(reference, stacks, plan)
     assert len(checkpoint_calls) == 5

@@ -11,24 +11,18 @@ from dataclasses import dataclass, replace
 import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-from megatron.core.models.hybrid.hybrid_stack_adapter import (
+from megatron.core.models.hybrid.hybrid_state import (
     HybridPipelineBoundary,
     HybridPipelineChunk,
     build_hybrid_state_pipeline_plan,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.csa2 import (
-    csa2_dependency_edges,
     csa2_field_factory,
-    csa2_state_dependencies,
     csa2_state_key,
+    prepare_csa2_boundary,
 )
-from megatron.core.transformer.state_boundary import (
-    StateBoundary,
-    StatePlacement,
-    TensorField,
-    prepare_boundaries,
-)
+from megatron.core.transformer.state_boundary import StateBoundary, StatePlacement, TensorField
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 
@@ -150,32 +144,39 @@ class CSA2PipelineBoundary(HybridPipelineBoundary):
             num_sequences=logical.numel() - 1 if packed else None,
             cp_size=cp_size,
         )
-        for name in self.field_names:
-            if name in prefixes:
-                continue
-            source = int(self.field_key(name).rsplit(":L", 1)[1])
-            field = factory(name, source)
-            fields[name] = replace(field, differentiable=requires_grad and field.differentiable)
-        # The generic dependency checker validates ordinary PP. For VPP, source
-        # liveness is evaluated at each cut in the host's logical chunk order.
-        ranks = [p.pp_rank for p in self.placement]
-        if self.placement and len(set(ranks)) == len(ranks):
-            dependencies = csa2_state_dependencies(config, factory, self.placement)
-            (schema,) = prepare_boundaries(
-                dependencies,
-                (
-                    StateBoundary(
-                        f"csa2.decoder/pp:{self.layer_offset}",
-                        "pipeline",
-                        2 * self.layer_offset,
-                        2 * self.layer_offset,
-                    ),
+        if self.placement:
+            schema, _ = prepare_csa2_boundary(
+                config,
+                factory,
+                StateBoundary(
+                    f"csa2.decoder/pp:{self.layer_offset}",
+                    "pipeline",
+                    2 * self.layer_offset,
+                    2 * self.layer_offset,
                 ),
                 self.placement,
             )
             expected = {self.field_key(name) for name in self.field_names if name not in prefixes}
             if {f.key for f in schema.inputs} != expected:
                 raise ValueError("CSA2 pipeline boundary disagrees with its state dependencies")
+            # The bound planner already supplies the concrete wire fields. Use
+            # them directly instead of reconstructing them from parsed source IDs.
+            planned = {field.key: field for field in schema.inputs}
+            fields = {
+                name: planned[self.field_key(name)]
+                for name in self.field_names
+                if name not in prefixes
+            }
+        else:
+            # Compatibility for standalone boundaries without a bound placement.
+            for name in self.field_names:
+                if name not in prefixes:
+                    source = int(self.field_key(name).rsplit(":L", 1)[1])
+                    fields[name] = factory(name, source)
+        fields = {
+            name: replace(field, differentiable=requires_grad and field.differentiable)
+            for name, field in fields.items()
+        }
         for name, prefix in prefixes.items():
             fields[name] = TensorField(
                 self.field_key(name), tuple(prefix.shape), prefix.dtype, self.qkv_format, False
@@ -234,12 +235,25 @@ def csa2_pipeline_boundary(
     placement: tuple[StatePlacement, ...] = (),
 ) -> CSA2PipelineBoundary:
     """Bind native source facts to an existing host cut; never choose placement."""
-    sources = {}
-    for name, dependencies in csa2_dependency_edges(config).items():
-        live = {source for source, consumer in dependencies if source < offset <= consumer}
-        if len(live) > 1:
+    # Source identities need no real batch allocation. The same dependency
+    # planner selects live fields for PP and VPP and later checks their capacities.
+    positions = placement or (
+        StatePlacement(0, 2 * offset, 0),
+        StatePlacement(2 * offset, 2 * config.num_layers, 0, 1),
+    )
+    schema, _ = prepare_csa2_boundary(
+        config,
+        csa2_field_factory(config, 0, 1),
+        StateBoundary(f"csa2.decoder/pp:{offset}", "pipeline", 2 * offset, 2 * offset),
+        positions,
+    )
+    sources = dict.fromkeys(("global_kv", "indexer_k", "global_indices", "candidate_indices"))
+    for field in schema.inputs:
+        name, version = field.key.split("/", 1)[1].split(":L")
+        source = int(version)
+        if sources.get(name) not in (None, source):
             raise ValueError(f"CSA2 boundary has multiple live {name} sources")
-        sources[name] = next(iter(live), None)
+        sources[name] = source
     kv = sources["global_kv"]
     return CSA2PipelineBoundary(
         layer_offset=offset,
@@ -253,7 +267,7 @@ def csa2_pipeline_boundary(
         ),
         kv_source_layer=kv,
         index_source_layer=sources["global_indices"],
-        candidate_source_layer=sources["candidates"],
+        candidate_source_layer=sources["candidate_indices"],
         needs_indexer_k=sources["indexer_k"] is not None,
         compress_ratio=None if kv is None else config.csa_compress_ratios[kv],
         qkv_format=qkv_format,

@@ -35,9 +35,6 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_hybrid_adapter import (
-    CSA2HybridAdapter,
-)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_pipeline import (
     build_csa2_pipeline_plan,
 )
@@ -75,7 +72,6 @@ def _model(
         HybridStack,
         params={"post_layer_norm": False},
         submodules=HybridStackSubmodules(
-            forward_adapter=CSA2HybridAdapter,
             dsa_layer=ModuleSpec(
                 TransformerLayer,
                 submodules=TransformerLayerSubmodules(
@@ -364,6 +360,9 @@ def test_csa2_1f1b_matches_single_stage(
                 if isinstance(incoming, PipelinePayload):
                     references.append(weakref.ref(incoming))
                     assert all(t.is_leaf for t in incoming.tensors)
+                    if forward_only:
+                        assert not any(s.requires_grad for s in incoming.tensor_specs)
+                        assert not any(t.requires_grad for t in incoming.tensors)
                 # Intermediate chunks restore THD metadata from the wire only.
                 output = stage(
                     tokens if stage.pre_process else None,
@@ -375,6 +374,9 @@ def test_csa2_1f1b_matches_single_stage(
                 assert stage.decoder.input_tensor is None
                 if isinstance(output, PipelinePayload):
                     references.append(weakref.ref(output))
+                    if forward_only:
+                        assert not any(s.requires_grad for s in output.tensor_specs)
+                        assert not any(t.requires_grad for t in output.tensors)
 
                 def loss_func(losses):
                     loss = (losses.float() * valid).sum() / valid.sum()

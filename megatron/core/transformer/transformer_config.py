@@ -2086,6 +2086,14 @@ class TransformerConfig(ModelParallelConfig):
             if not isinstance(self, MLATransformerConfig) or not self.multi_latent_attention:
                 raise ValueError("V4.1 requires MLATransformerConfig with multi_latent_attention")
             self._validate_dsv41_config()
+            if self.experimental_attention_variant_loss_scale_func is None:
+                from megatron.core.transformer.experimental_attention_variant.dsa import (
+                    DSAIndexerLossAutoScaler,
+                )
+
+                self.experimental_attention_variant_loss_scale_func = (
+                    DSAIndexerLossAutoScaler.set_loss_scale
+                )
             self.hetereogenous_dist_checkpoint = True
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):

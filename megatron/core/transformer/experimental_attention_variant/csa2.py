@@ -91,10 +91,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.state_boundary import (
+    BoundarySchema,
+    StateBoundary,
     StateDependency,
     StatePlacement,
     TensorField,
     TensorSchema,
+    prepare_boundaries,
     validate_metadata,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -283,6 +286,18 @@ def csa2_state_dependencies(
                 for field in names
             )
     return tuple(dependencies)
+
+
+def prepare_csa2_boundary(
+    config: "MLATransformerConfig",
+    field_factory: Callable[[str, int], TensorField],
+    boundary: StateBoundary,
+    placement: tuple[StatePlacement, ...],
+) -> tuple[BoundarySchema, tuple[StateDependency, ...]]:
+    """Bind native fields to a host boundary, retaining dependencies for checkpoint relays."""
+    dependencies = csa2_state_dependencies(config, field_factory, placement)
+    (schema,) = prepare_boundaries(dependencies, (boundary,), placement)
+    return schema, dependencies
 
 
 def csa2_field_factory(

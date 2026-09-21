@@ -159,7 +159,7 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
 
 @pytest.mark.parametrize("variant,model_version", [("dsa", None), ("dsv4_hybrid", "v4.1")])
 @pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 3.5), (True, 7.0)])
-def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config(
+def test_indexer_loss_scale_uses_registered_hook_without_mutating_config(
     monkeypatch, variant, model_version, calculate_per_token_loss, expected_scale
 ):
     from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -176,6 +176,19 @@ def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config(
         mtp_num_layers=None,
         timers=None,
     )
+    if model_version == "v4.1":
+        from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import (
+            _make_config,
+        )
+
+        config.experimental_attention_variant_loss_scale_func = (
+            _make_config().experimental_attention_variant_loss_scale_func
+        )
+        assert (
+            config.experimental_attention_variant_loss_scale_func
+            == DSAIndexerLossAutoScaler.set_loss_scale
+        )
+    original_hook = config.experimental_attention_variant_loss_scale_func
 
     monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
     schedule.forward_step_calc_loss(
@@ -191,7 +204,7 @@ def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config(
         is_last_stage=True,
     )
 
-    assert config.experimental_attention_variant_loss_scale_func is None
+    assert config.experimental_attention_variant_loss_scale_func is original_hook
     torch.testing.assert_close(
         DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([expected_scale])
     )
@@ -203,8 +216,8 @@ def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config(
     torch.testing.assert_close(indexer_loss.grad, torch.tensor(expected_scale))
 
 
-@pytest.mark.parametrize("model_version", [None, "v4"])
-def test_dsv4_indexer_loss_scale_default_is_unchanged(model_version):
+@pytest.mark.parametrize("model_version", [None, "v4", "v4.1"])
+def test_schedule_does_not_select_loss_scale_by_model_version(model_version):
     config = SimpleNamespace(
         experimental_attention_variant="dsv4_hybrid", dsv4_version=model_version
     )
@@ -212,14 +225,12 @@ def test_dsv4_indexer_loss_scale_default_is_unchanged(model_version):
 
 
 def test_dsv41_indexer_loss_scale_explicit_hook_takes_precedence():
+    from tests.unit_tests.transformer.experimental_attention_variant.test_dsv41 import _make_config
+
     def loss_scale_hook(scale):
         return scale
 
-    config = SimpleNamespace(
-        experimental_attention_variant="dsv4_hybrid",
-        dsv4_version="v4.1",
-        experimental_attention_variant_loss_scale_func=loss_scale_hook,
-    )
+    config = _make_config(experimental_attention_variant_loss_scale_func=loss_scale_hook)
     assert schedule._get_experimental_attention_variant_loss_scale_func(config) is loss_scale_hook
 
 

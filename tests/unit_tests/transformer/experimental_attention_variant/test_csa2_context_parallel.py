@@ -25,6 +25,7 @@ import pretrain_hybrid as hybrid_entry
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_model import get_hybrid_state_components
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelineDataIterator,
@@ -300,7 +301,7 @@ def _stack(config, groups, attention):
     return HybridStack(
         config,
         HybridStackSubmodules(
-            forward_adapter=CSA2HybridAdapter,
+            state_components=get_hybrid_state_components(config),
             dsa_layer=ModuleSpec(
                 TransformerLayer,
                 submodules=TransformerLayerSubmodules(
@@ -1910,7 +1911,10 @@ def _install_cp_graph_callables(stacks, monkeypatch, *, joint_backward=False, nu
 
 @pytest.mark.parametrize("cp_size,cp_rank", [(2, 0), (2, 1), (4, 0), (4, 3)])
 def test_cp_cuda_graph_static_shapes_and_group_validation(cp_size, cp_rank):
-    from megatron.core.transformer.state_boundary import StateGraphAdapter
+    from functools import partial
+
+    from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStateGraphAdapter
+    from megatron.core.transformer.transformer_layer import TransformerLayer
 
     config = _cp_graph_config(cp_size)
     group = _LayoutGroup(cp_size, cp_rank)
@@ -1924,7 +1928,15 @@ def test_cp_cuda_graph_static_shapes_and_group_validation(cp_size, cp_rank):
         component = CSA2GraphState(
             config, layer_number=index + 1, is_attention=True, cp_group=group
         )
-        adapter = StateGraphAdapter((component,))
+        adapter = HybridStateGraphAdapter(
+            (component,),
+            lambda states: {"cross_layer_state": states[0]},
+            restore_packed=partial(
+                TransformerLayer._reconstruct_packed_seq_params_from_kwargs,
+                SimpleNamespace(config=config, _uses_graph_dynamic_dsa_route=lambda: False),
+            ),
+            cp_group=group,
+        )
         static = {"hidden_states": torch.empty(32 // cp_size, 1, 128, device="meta")}
         static.update(
             {
@@ -1933,7 +1945,11 @@ def test_cp_cuda_graph_static_shapes_and_group_validation(cp_size, cp_rank):
             }
         )
         values = adapter.get_static_inputs(static)
-        params = component._packed_params(static)
+        adapter.finalize_sample_inputs(
+            (values["hidden_states"],),
+            {name: tensor for name, tensor in values.items() if name != "hidden_states"},
+        )
+        params = component._packed_params(adapter._call_context(static))
         assert params.max_seqlen_q == params.max_seqlen_kv == 32
         assert params.cp_group is group and params.local_cp_size == cp_size
         for name, tensor in values.items():
@@ -2122,6 +2138,7 @@ def _install_real_cp_graph_callables(stack):
             )
             sample_args.append((values.pop("hidden_states"),))
             sample_kwargs.append(values)
+            layer._te_cuda_graph_adapter.finalize_sample_inputs(sample_args[-1], sample_kwargs[-1])
     options = dict(
         sample_kwargs=tuple(sample_kwargs),
         _order=[1, 1, -1, -1],

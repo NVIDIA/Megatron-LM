@@ -7,7 +7,7 @@ Each capture invocation reconstructs fresh Python state. Replay publishes graph
 outputs to the caller's forward-local state before the ordinary layer continuation.
 """
 
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 import torch
 from torch import Tensor
@@ -18,7 +18,7 @@ from megatron.core.transformer.experimental_attention_variant.csa2 import (
     CSA2StateCodec,
     csa2_field_factory,
     csa2_source_layers,
-    csa2_state_dependencies,
+    prepare_csa2_boundary,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
     CSA2CandidateBlocks,
@@ -40,8 +40,9 @@ from megatron.core.transformer.state_boundary import (
     BoundarySchema,
     StateBoundary,
     StatePlacement,
+    StateRegion,
     TensorField,
-    prepare_boundaries,
+    TensorSchema,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
@@ -67,8 +68,14 @@ class CSA2GraphState:
         layer_number: int,
         is_attention: bool,
         cp_group: torch.distributed.ProcessGroup | None = None,
+        placement: tuple[StatePlacement, ...] | None = None,
     ) -> None:
         self.config = config
+        # Standalone callers describe one local graph. Hybrid always supplies
+        # its complete bound physical/virtual placement to every backend.
+        self.placement = (
+            (StatePlacement(0, 2 * config.num_layers, 0),) if placement is None else placement
+        )
         if config.context_parallel_size > 1 and cp_group is None:
             raise ValueError("CSA2 CP CUDA Graphs require an explicit CP group")
         self.cp_group = cp_group
@@ -86,20 +93,18 @@ class CSA2GraphState:
         self.candidate = config.csa2_candidate_source_layer
         self.kv_source, self.index_source = csa2_source_layers(config, self.layer_idx)
         self.codec = CSA2StateCodec(indexer_k_differentiable=self.indexer_loss_enabled)
-        self._side_schema = self._state_schema(0, 1, None)
-        inputs, outputs = [], []
-        inputs.extend(self._field_name(field) for field in self._side_schema.inputs)
-        outputs.extend(self._field_name(field) for field in self._side_schema.outputs)
-        if self.reindex and self.indexer_loss_enabled:
-            outputs.append("indexer_loss")
-        self.input_fields, self.output_fields = tuple(inputs), tuple(outputs)
+        self.input_fields = tuple(
+            self._field_name(field) for field in self._state_schema(0, 1, None).inputs
+        )
+        # Cache tensor-free declarations only. Every capture/replay still restores
+        # or binds that invocation's native state and packed batch tensors.
+        self._graph_regions: dict[tuple, StateRegion] = {}
 
     @staticmethod
     def _field_name(field: TensorField) -> str:
         return field.key.split("/", 1)[1].split(":", 1)[0]
 
     def _state_schema(self, seq, batch, params) -> BoundarySchema:
-        placement = (StatePlacement(0, 2 * self.config.num_layers, 0),)
         factory = csa2_field_factory(
             self.config,
             seq,
@@ -109,35 +114,20 @@ class CSA2GraphState:
             num_sequences=None if params is None else params.cu_seqlens_q.numel() - 1,
             cp_size=self.cp_size,
         )
-        dependencies = csa2_state_dependencies(self.config, factory, placement)
         boundary = StateBoundary(
             f"csa2.decoder/capture:L{self.layer_idx}",
             "capture",
             2 * self.layer_idx,
             2 * self.layer_idx + 2,
         )
-        return prepare_boundaries(dependencies, (boundary,), placement)[0]
+        schema, _ = prepare_csa2_boundary(self.config, factory, boundary, self.placement)
+        return schema
 
-    def _packed_params(self, kwargs: dict) -> PackedSeqParams | None:
+    def _packed_params(self, kwargs: Mapping[str, Any]) -> PackedSeqParams | None:
         if not self.is_attention:
             return None
         if kwargs.get("packed_seq_params") is not None:
             params = kwargs["packed_seq_params"]
-        elif "cu_seqlens_q" in kwargs:
-            max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.cp_size
-            params = PackedSeqParams(
-                qkv_format="thd",
-                cu_seqlens_q=kwargs["cu_seqlens_q"],
-                cu_seqlens_kv=kwargs["cu_seqlens_kv"],
-                cu_seqlens_q_padded=kwargs["cu_seqlens_q_padded"],
-                cu_seqlens_kv_padded=kwargs["cu_seqlens_kv_padded"],
-                max_seqlen_q=max_seqlen,
-                max_seqlen_kv=max_seqlen,
-                cp_partition_mode=self.config.cp_partition_mode,
-                local_cp_size=self.cp_size if self.cp_size > 1 else None,
-                cp_group=self.cp_group if self.cp_size > 1 else None,
-                pad_between_seqs=True,
-            )
         elif self.cp_size > 1:
             raise ValueError("CSA2 CP CUDA Graphs require contiguous THD metadata")
         else:
@@ -156,26 +146,103 @@ class CSA2GraphState:
                 raise ValueError("CSA2 CUDA Graph replay must use the captured CP group")
         return params
 
-    def get_static_inputs(self, static_inputs: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Extend DSv4 sample inputs with this layer's actual shared dependencies."""
-        # CSA2 uses sparse indices and packed prefixes for visibility, never this mask.
-        static_inputs.pop("attention_mask", None)
-        hidden = static_inputs["hidden_states"]
-        seq, batch = hidden.shape[:2]
-        params = self._packed_params(static_inputs)
-        self._side_schema = self._state_schema(seq, batch, params)
-        shapes = {**{self._field_name(field): field.shape for field in self._side_schema.inputs}}
-        for name in self.input_fields:
-            dtype, requires_grad, fill = self.config.params_dtype, True, 0
-            if name == "indexer_k":
-                requires_grad = self.indexer_loss_enabled
-            elif name in ("global_indices", "candidate_indices", "candidate_lengths"):
-                dtype, requires_grad = torch.int32, False
-                fill = 0 if name == "candidate_lengths" else -1
-            static_inputs[_PREFIX + name] = torch.full(
-                shapes[name], fill, dtype=dtype, device=hidden.device, requires_grad=requires_grad
+    def _graph_region(
+        self, hidden: Tensor, params: PackedSeqParams | None, *, prepare: bool = False
+    ) -> StateRegion:
+        packed_profile = None
+        if params is not None:
+            if (
+                params.qkv_format != "thd"
+                or type(params.max_seqlen_q) is not int
+                or type(params.max_seqlen_kv) is not int
+                or type(params.cp_partition_mode) not in (str, type(None))
+            ):
+                raise ValueError("CSA2 graph profiles require THD host metadata")
+            logical = params.cu_seqlens_q
+            physical = params.cu_seqlens_q_padded
+            physical = logical if physical is None else physical
+            packed_profile = (
+                params.qkv_format,
+                params.max_seqlen_q,
+                params.max_seqlen_kv,
+                params.cp_partition_mode,
+                tuple(logical.shape),
+                logical.dtype,
+                tuple(physical.shape),
+                physical.dtype,
             )
-        return static_inputs
+        profile = (*hidden.shape[:2], packed_profile)
+        region = self._graph_regions.get(profile)
+        if region is None:
+            if not prepare:
+                raise ValueError(
+                    "CSA2 graph replay requires a prepared static shape/layout profile"
+                )
+            region = self._build_graph_region(hidden, params)
+            self._graph_regions[profile] = region
+        return region
+
+    def _build_graph_region(self, hidden: Tensor, params: PackedSeqParams | None) -> StateRegion:
+        """Plan dependencies only while preparing samples or capturing a new profile."""
+        schema = self._state_schema(*hidden.shape[:2], params)
+        outputs = list(schema.outputs)
+        if self.reindex and self.indexer_loss_enabled:
+            outputs.append(
+                TensorField(
+                    f"csa2.decoder/indexer_loss:L{self.layer_idx}",
+                    (),
+                    torch.float32,
+                    "thd" if params is not None else "sbhd",
+                    True,
+                )
+            )
+        if params is not None:
+            prefix = params.cu_seqlens_q
+            padded = params.cu_seqlens_q_padded
+            padded = prefix if padded is None else padded
+            capacity = (
+                get_thd_compressed_capacity(
+                    hidden.shape[0] * self.cp_size,
+                    params.max_seqlen_q,
+                    prefix.numel() - 1,
+                    self.ratio,
+                )
+                if self.ratio
+                else 0
+            )
+            for group, names, length in (
+                ("layout", _LAYOUT_FIELDS, hidden.shape[0]),
+                ("compressed", _COMPRESSED_FIELDS if self.ratio else (), capacity),
+            ):
+                for name in names:
+                    if name in ("cu_seqlens", "cu_seqlens_padded"):
+                        value = prefix if name == "cu_seqlens" else padded
+                        shape, dtype = tuple(value.shape), value.dtype
+                    else:
+                        shape = (length, self.ratio) if name == "source_indices" else (length,)
+                        dtype = torch.bool if name.startswith("valid_") else torch.int64
+                    outputs.append(
+                        TensorField(f"csa2.graph/{group}.{name}:batch", shape, dtype, "thd", False)
+                    )
+        return StateRegion(BoundarySchema(schema.boundary_id, schema.inputs, tuple(outputs)), self)
+
+    def get_static_inputs(self, static_inputs: Mapping[str, Any]) -> dict[str, Tensor]:
+        """Extend DSv4 sample inputs with this layer's actual shared dependencies."""
+        owned = {}
+        hidden = static_inputs["hidden_states"]
+        params = self._packed_params(static_inputs)
+        schema = self._graph_region(hidden, params, prepare=True).schema
+        for field in schema.inputs:
+            name = self._field_name(field)
+            fill = -1 if name in ("global_indices", "candidate_indices") else 0
+            owned[_PREFIX + name] = torch.full(
+                field.shape,
+                fill,
+                dtype=field.dtype,
+                device=hidden.device,
+                requires_grad=field.differentiable,
+            )
+        return owned
 
     @staticmethod
     def _value(name: str, state: CSA2State) -> Tensor | None:
@@ -184,11 +251,12 @@ class CSA2GraphState:
         return getattr(state, name)
 
     def restore_inputs(
-        self, hidden: Tensor, kwargs: dict
-    ) -> tuple[CSA2State, CSA2THDLayout | None]:
+        self, hidden: Tensor, kwargs: Mapping[str, Any]
+    ) -> tuple[StateRegion, CSA2State]:
         """Restore CSA2 input fields and bind only its native attention argument."""
-        values = {name: kwargs.pop(_PREFIX + name) for name in self.input_fields}
+        values = {name: kwargs[_PREFIX + name] for name in self.input_fields}
         params = self._packed_params(kwargs)
+        region = self._graph_region(hidden, params, prepare=True)
         layout = (
             build_csa2_thd_layout(params, hidden.shape[0], cp_group=self.cp_group)
             if params is not None
@@ -214,7 +282,7 @@ class CSA2GraphState:
             candidate_block_size=self.config.csa2_candidate_block_size,
             packed_kv=use_fused_dsa_kernels(self.config),
         )
-        schema = self._state_schema(hidden.shape[0], hidden.shape[1], params)
+        schema = region.schema
         prefixes = self.codec.fields(template)
         prefix_tensors = self.codec.export(template, prefixes)
         state = self.codec.restore(
@@ -222,45 +290,40 @@ class CSA2GraphState:
             (*(values[self._field_name(field)] for field in schema.inputs), *prefix_tensors),
             tuple(metadata.items()),
         )
-        if self.is_attention:
-            kwargs["cross_layer_state"] = state
-            if params is not None:
-                # The inner layer may reconstruct raw prefixes without a CP group.
-                # Bind this capture's static communicator before its attention runs.
-                for suffix in ("q", "kv", "q_padded", "kv_padded"):
-                    kwargs.pop("cu_seqlens_" + suffix, None)
-                kwargs["packed_seq_params"] = params
-        return state, layout
+        return region, state
 
-    def export_outputs(self, snapshot) -> tuple[Tensor, ...]:
-        """Export canonical CSA2 outputs and graph-produced layout caches."""
-        state, layout = snapshot
-        canonical = {self._field_name(field): field for field in self.codec.fields(state)}
-        names = self.output_fields
-        exported = self.codec.export(state, tuple(canonical[name] for name in names))
-        exported = dict(zip(names, exported))
-        shared = tuple(exported[name] for name in self.output_fields)
-        if any(value is None for value in shared):
-            raise RuntimeError("CSA2 CUDA Graph capture did not produce its declared state")
-        # Preserve the selection-only contract even if TE wraps floating outputs
-        # in an autograd Function because its other outputs require gradients.
-        if "indexer_k" in self.output_fields and not self.indexer_loss_enabled:
-            shared = tuple(
-                value.detach() if name == "indexer_k" else value
-                for name, value in zip(self.output_fields, shared)
-            )
-        if layout is not None:
-            shared += tuple(getattr(state.thd_layout, name) for name in _LAYOUT_FIELDS)
-            if self.ratio:
-                shared += tuple(
-                    getattr(state.compressed_layout, name) for name in _COMPRESSED_FIELDS
-                )
-        return shared
+    def export(self, state: CSA2State, fields: tuple[TensorField, ...]) -> tuple[Tensor, ...]:
+        """Use the declared field order for canonical values and graph-produced caches."""
+        tensors = []
+        for field in TensorSchema(fields).packed_fields:
+            name = self._field_name(field)
+            if name.startswith("layout."):
+                tensor = getattr(state.thd_layout, name.split(".", 1)[1])
+            elif name.startswith("compressed."):
+                tensor = getattr(state.compressed_layout, name.split(".", 1)[1])
+            else:
+                tensor = self.codec.export(state, (field,))[0]
+            tensors.append(tensor)
+        TensorSchema(fields).validate(tensors)
+        return tuple(tensors)
 
-    def prepare_replay(self, hidden: Tensor, kwargs: dict) -> tuple[int, Callable]:
+    def restore(
+        self, fields: tuple[TensorField, ...], tensors: tuple[Tensor, ...], metadata: tuple
+    ) -> dict[str, Tensor]:
+        """Decode named publications; the owning component applies native cache semantics."""
+        schema = TensorSchema(fields)
+        schema.validate(tensors)
+        return {
+            self._field_name(field): tensor for field, tensor in zip(schema.packed_fields, tensors)
+        }
+
+    def prepare_replay(
+        self, hidden: Tensor, kwargs: Mapping[str, Any]
+    ) -> tuple[StateRegion, dict[str, Tensor], Callable]:
         """Declare inputs and the native state/cache publication for one replay."""
-        state = kwargs.pop("cross_layer_state", None)
-        kwargs.pop("attention_mask", None)
+        bindings = kwargs.get("cross_layer_state")
+        state = None if bindings is None else bindings.attention_kwargs().get("csa2_state")
+        owned = {}
         params = self._packed_params(kwargs)
         if self.is_attention:
             if state is None or (
@@ -282,7 +345,7 @@ class CSA2GraphState:
                 raise ValueError(f"CSA2 CUDA Graph replay requires {name}")
             if name == "indexer_k" and not self.indexer_loss_enabled:
                 value = value.detach()
-            kwargs[_PREFIX + name] = value
+            owned[_PREFIX + name] = value
         if params is not None:
             if (
                 params.qkv_format != "thd"
@@ -290,17 +353,8 @@ class CSA2GraphState:
                 or params.max_seqlen_kv != params.max_seqlen_q
             ):
                 raise ValueError("CSA2 CUDA Graph THD requires the configured static max_seqlen")
-            for suffix in ("q", "kv"):
-                logical = getattr(params, "cu_seqlens_" + suffix)
-                physical = getattr(params, "cu_seqlens_" + suffix + "_padded")
-                kwargs["cu_seqlens_" + suffix] = logical
-                kwargs["cu_seqlens_" + suffix + "_padded"] = (
-                    logical if physical is None else physical
-                )
-        kwargs.pop("packed_seq_params", None)
 
-        def restore(result, shared):
-            values = dict(zip(self.output_fields, shared))
+        def restore(result, values):
             if "indexer_loss" in values:
                 # TE jointly backpropagates every graph output, including zeros
                 # for unused ones. Keep the unconditional auxiliary gradient
@@ -351,8 +405,7 @@ class CSA2GraphState:
                 state.sequence_length, state.batch_size = hidden.shape[:2]
                 state.device, state.dtype = hidden.device, self.config.params_dtype
                 if params is not None:
-                    start = len(self.output_fields)
-                    layout_values = dict(zip(_LAYOUT_FIELDS, shared[start:]))
+                    layout_values = {name: values["layout." + name] for name in _LAYOUT_FIELDS}
                     state.thd_layout = CSA2THDLayout(
                         total_tokens=hidden.shape[0],
                         max_seqlen=params.max_seqlen_q,
@@ -361,9 +414,9 @@ class CSA2GraphState:
                         **layout_values,
                     )
                     if self.ratio:
-                        compressed_values = dict(
-                            zip(_COMPRESSED_FIELDS, shared[start + len(_LAYOUT_FIELDS) :])
-                        )
+                        compressed_values = {
+                            name: values["compressed." + name] for name in _COMPRESSED_FIELDS
+                        }
                         state.compressed_layout = CSA2THDCompressionLayout(
                             ratio=self.ratio,
                             total_tokens=hidden.shape[0] * self.cp_size,
@@ -379,7 +432,4 @@ class CSA2GraphState:
                     state.fused_window_indices = None
             return result
 
-        count = len(self.output_fields)
-        if params is not None:
-            count += len(_LAYOUT_FIELDS) + (len(_COMPRESSED_FIELDS) if self.ratio else 0)
-        return count, restore
+        return self._graph_region(hidden, params), owned, restore

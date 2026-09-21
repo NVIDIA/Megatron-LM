@@ -1266,7 +1266,15 @@ class TestHybridTECudaGraphDiscovery:
             multi_latent_attention=multi_latent_attention,
             cuda_graph_modules=cuda_graph_modules,
             context_parallel_size=context_parallel_size,
+            mhc_single_pass=False,
+            mhc_recompute_attn_cuda_graph_split=False,
         )
+        for layer in layers:
+            layer.config = helper.config
+            inner = getattr(layer, 'inner_layer', layer)
+            inner.config = helper.config
+            inner.is_moe_layer = False
+            inner.mlp = IdentityOp()
         helper.seq_length = 8
         helper.micro_batch_size = 1
         helper.num_model_chunks = 1
@@ -1335,6 +1343,7 @@ class TestHybridTECudaGraphDiscovery:
             monkeypatch, layer_kind='hybrid', position_embedding_type='rope', has_attention=False
         )
         seen_hidden_inputs = []
+        finalized = []
 
         def adapt_static_inputs(inputs):
             seen_hidden_inputs.append(inputs['hidden_states'])
@@ -1345,7 +1354,8 @@ class TestHybridTECudaGraphDiscovery:
             }
 
         helper.flattened_callables[0]._te_cuda_graph_adapter = SimpleNamespace(
-            get_static_inputs=adapt_static_inputs
+            get_static_inputs=adapt_static_inputs,
+            finalize_sample_inputs=lambda args, kwargs: finalized.append((args, kwargs)),
         )
         args, kwargs = helper._get_sample_arguments([1, -1])
 
@@ -1355,6 +1365,8 @@ class TestHybridTECudaGraphDiscovery:
         assert kwargs[0]['pre_mix'].requires_grad
         assert kwargs[0]['global_indices'].dtype == torch.int32
         assert not kwargs[0]['global_indices'].requires_grad
+        assert len(finalized) == 1
+        assert finalized[0][0] is args[0] and finalized[0][1] is kwargs[0]
 
     @pytest.mark.parametrize('has_state_adapter', [False, True])
     def test_state_adapter_disables_te_secondary_buffer_reuse(self, monkeypatch, has_state_adapter):
@@ -1373,7 +1385,7 @@ class TestHybridTECudaGraphDiscovery:
         helper.p2p_communicator = None
         if has_state_adapter:
             helper.flattened_callables[0]._te_cuda_graph_adapter = SimpleNamespace(
-                get_static_inputs=lambda inputs: inputs
+                get_static_inputs=lambda inputs: inputs, finalize_sample_inputs=lambda *_args: None
             )
         monkeypatch.setattr(
             schedules, 'get_pp_rank_microbatches', lambda *args, **kwargs: (0, 0, 0, 0)

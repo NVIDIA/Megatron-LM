@@ -39,7 +39,12 @@ from megatron.core.pipeline_parallel.typed_p2p_communication import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _spec(name, shape, dtype, requires_grad, layout="strided", present=True):
+    return PipelineTensorSpec(name, TensorField(name, shape, dtype, layout, requires_grad, present))
 
 
 @dataclass(frozen=True)
@@ -53,7 +58,7 @@ class _Payload(PipelinePayload):
     @property
     def tensor_specs(self):
         return tuple(
-            PipelineTensorSpec(str(i), tuple(t.shape), t.dtype, t.requires_grad)
+            _spec(str(i), tuple(t.shape), t.dtype, t.requires_grad)
             for i, t in enumerate(self.tensors)
         )
 
@@ -143,12 +148,12 @@ def test_terminal_payload_backward_scales_loss_once():
 
 def test_header_preserves_mixed_dtypes_empty_shapes_and_host_metadata():
     specs = (
-        PipelineTensorSpec("hidden", (9, 1, 128), torch.bfloat16, True),
-        PipelineTensorSpec("mix", (9, 1, 4), torch.float32, True),
-        PipelineTensorSpec("empty", (0, 1, 16), torch.bfloat16, True),
-        PipelineTensorSpec("ids", (9, 3), torch.int32, False),
-        PipelineTensorSpec("prefixes", (5,), torch.int64, False),
-        PipelineTensorSpec("scalar", (), torch.float64, False),
+        _spec("hidden", (9, 1, 128), torch.bfloat16, True),
+        _spec("mix", (9, 1, 4), torch.float32, True),
+        _spec("empty", (0, 1, 16), torch.bfloat16, True),
+        _spec("ids", (9, 3), torch.int32, False),
+        _spec("prefixes", (5,), torch.int64, False),
+        _spec("scalar", (), torch.float64, False),
     )
     values = _pack_header(specs, (12345, 4), 7)
     decoded, metadata = _unpack_header(values, 7)
@@ -162,7 +167,7 @@ def test_header_preserves_mixed_dtypes_empty_shapes_and_host_metadata():
 
 def test_generic_schema_has_no_csa2_field_dimension_or_metadata_limit():
     specs = tuple(
-        PipelineTensorSpec(
+        _spec(
             f"feature/value:L{i}",
             (2, 1, 3, 1),
             torch.float32,
@@ -318,7 +323,7 @@ def test_generic_packed_fields_actual_transport(monkeypatch, prepared):
     monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
     descriptor = PipelinePayloadSpec(
         tuple(
-            PipelineTensorSpec(
+            _spec(
                 f"example/value:L{i}",
                 (2, 1, 3, 1),
                 torch.float32 if i % 3 == 0 else torch.int64,
@@ -337,8 +342,8 @@ def test_generic_packed_fields_actual_transport(monkeypatch, prepared):
         metadata = descriptor.metadata
         boundary_id = descriptor.boundary_id
 
-        def __init__(self, tensors, metadata):
-            assert metadata == self.metadata
+        def __init__(self, tensors, spec):
+            assert spec == descriptor
             self.tensors = tensors
 
     config = TransformerConfig(
@@ -384,7 +389,7 @@ def test_generic_packed_fields_actual_transport(monkeypatch, prepared):
                 )
                 for i in descriptor.schema.present_spec_indices
             )
-            outgoing = Payload(tensors, descriptor.metadata)
+            outgoing = Payload(tensors, descriptor)
             gradients = transport.send_forward_recv_backward(outgoing, None, False)
             backward_pipeline_payload(None, outgoing, gradients)
             assert (x.grad is not None) == (activity != "inactive")
@@ -405,21 +410,15 @@ def test_generic_packed_fields_actual_transport(monkeypatch, prepared):
     transport.finish()
 
 
-@pytest.mark.parametrize(
-    "spec",
-    [
-        PipelineTensorSpec("bad", (-1, 3), torch.float32, True),
-        PipelineTensorSpec("bad", (1,), torch.int32, True),
-    ],
-)
-def test_invalid_wire_descriptors(spec):
+@pytest.mark.parametrize("shape,dtype", [((-1, 3), torch.float32), ((1,), torch.int32)])
+def test_invalid_wire_descriptors(shape, dtype):
     with pytest.raises(ValueError):
-        _pack_header((spec,), (0, 0), 0)
+        _pack_header((_spec("bad", shape, dtype, True),), (0, 0), 0)
 
 
-def _make_payload(tensors, metadata):
+def _make_payload(tensors, descriptor):
     payload = _Payload(tensors)
-    assert payload.metadata == metadata
+    assert payload.descriptor == descriptor
     return payload
 
 
@@ -521,10 +520,10 @@ def test_overlap_constructs_payload_after_header_and_waits_before_data_use(
                 )
         return result
 
-    def factory(tensors, metadata):
+    def factory(tensors, descriptor):
         assert all(request.wait_count == 1 for request in requests[:2])
         assert len(requests) == 2  # Length and descriptor precede allocation/data receive.
-        return _make_payload(tensors, metadata)
+        return _make_payload(tensors, descriptor)
 
     monkeypatch.setattr(
         "megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post_receive
@@ -602,9 +601,9 @@ def test_warmup_prefetch_defers_header_and_preserves_peer_order(
                     request.received_value = current_header if is_header else 7
         return result
 
-    def factory(tensors, metadata):
-        factories.append(metadata)
-        return _make_payload(tensors, metadata)
+    def factory(tensors, descriptor):
+        factories.append(descriptor.metadata)
+        return _make_payload(tensors, descriptor)
 
     monkeypatch.setattr(
         "megatron.core.pipeline_parallel.typed_p2p_communication._p2p_ops", post_receive
@@ -778,11 +777,15 @@ def test_prepared_receive_posts_all_fields_without_waiting_for_a_header(
 
 
 @pytest.mark.parametrize("mismatch", ["shape", "dtype", "grad", "metadata"])
-def test_prepared_sender_rejects_stale_plan_before_posting(delayed_transport, mismatch):
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_prepared_sender_rejects_stale_plan_before_posting(
+    delayed_transport, mismatch, forward_only
+):
     communicator, requests, _ = delayed_transport
+    communicator.forward_only = forward_only
     source = _Payload((torch.ones(3, requires_grad=True), torch.empty(0)))
     spec = source.tensor_specs[0]
-    replacement = PipelineTensorSpec(
+    replacement = _spec(
         spec.name,
         (5,) if mismatch == "shape" else spec.shape,
         torch.bfloat16 if mismatch == "dtype" else spec.dtype,
@@ -990,9 +993,7 @@ def test_typed_1f1b_actual_transport(
                     ]
                     descriptors.append(
                         PipelinePayloadSpec(
-                            tuple(
-                                PipelineTensorSpec(str(i), *field) for i, field in enumerate(fields)
-                            ),
+                            tuple(_spec(str(i), *field) for i, field in enumerate(fields)),
                             (rows, rows // 2),
                         )
                     )

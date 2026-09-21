@@ -26,6 +26,7 @@ from megatron.core.pipeline_parallel.pipeline_payload import (
     PipelinePayloadSpec,
     PipelineTensorSpec,
 )
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.utils import nvtx_decorator
 
 # Dynamic callers first send one length, followed by an unbounded host descriptor.
@@ -87,7 +88,9 @@ def _decode_header(values, microbatch, chunk_id=0):
         if any(type(field[2]) is not int or not 0 <= field[2] < len(_DTYPES) for field in fields):
             raise ValueError("Invalid typed pipeline tensor dtype")
         specs = tuple(
-            PipelineTensorSpec(name, tuple(shape), _DTYPES[dtype], grad, layout, present, key)
+            PipelineTensorSpec(
+                name, TensorField(key or name, tuple(shape), _DTYPES[dtype], layout, grad, present)
+            )
             for name, shape, dtype, grad, layout, present, key in fields
         )
         descriptor = PipelinePayloadSpec(specs, tuple(metadata), boundary)
@@ -339,7 +342,7 @@ class TypedP2PCommunicator(P2PCommunicator):
         return self._allocate_payload(descriptor, chunk_id, microbatch)
 
     def _allocate_payload(self, descriptor, chunk_id, microbatch=0):
-        specs, metadata = descriptor.tensor_specs, descriptor.metadata
+        specs = descriptor.tensor_specs
         tensors = tuple(
             torch.empty(
                 spec.shape, dtype=spec.dtype, device=self.device, requires_grad=spec.requires_grad
@@ -347,7 +350,7 @@ class TypedP2PCommunicator(P2PCommunicator):
             for spec in specs
             if spec.present
         )
-        payload = self.make_payloads[chunk_id](tensors, metadata)
+        payload = self.make_payloads[chunk_id](tensors, descriptor)
         if payload.descriptor != descriptor:
             raise ValueError("Received schema or gradient slots disagree with the model payload")
         if not self.forward_only:
@@ -373,14 +376,7 @@ class TypedP2PCommunicator(P2PCommunicator):
         ):
             raise ValueError("Outgoing pipeline payload disagrees with the prepared metadata")
         for spec, planned in zip(actual, expected.tensor_specs):
-            if (spec.name, spec.key, spec.shape, spec.dtype, spec.layout, spec.present) != (
-                planned.name,
-                planned.key,
-                planned.shape,
-                planned.dtype,
-                planned.layout,
-                planned.present,
-            ) or (not self.forward_only and spec.requires_grad != planned.requires_grad):
+            if spec != planned:
                 raise ValueError(
                     f"Pipeline chunk {chunk_id}, microbatch {microbatch}, field {spec.name}: "
                     f"actual {spec} disagrees with prepared {planned}"

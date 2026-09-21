@@ -3,6 +3,7 @@
 """Megatron Module."""
 
 from copy import copy as shallow_copy
+from dataclasses import dataclass
 from functools import partial
 from typing import Optional, Tuple
 
@@ -28,6 +29,14 @@ _TE_CUDA_GRAPH_ROUTE_SLOT_ATTR = "_te_cuda_graph_route_slot"
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
+
+
+@dataclass(frozen=True)
+class CudaGraphCaptureRegion:
+    """Branch entry points executed by a layer's TE capture body."""
+
+    branches: frozenset[str]
+    partial_mlp: bool = False
 
 
 class MegatronModule(torch.nn.Module):
@@ -705,6 +714,10 @@ class GraphableMegatronModule(MegatronModule):
         """
         return self.forward(*args, **kwargs)
 
+    def get_te_cuda_graph_capture_region(self) -> CudaGraphCaptureRegion:
+        """Describe this callable's capture body; custom partial captures override it."""
+        return CudaGraphCaptureRegion(frozenset({"layer"}))
+
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """
         CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
@@ -713,32 +726,32 @@ class GraphableMegatronModule(MegatronModule):
         Hence, check if the arguments are all tensors.
         """
         try:
-            # State adapters publish side outputs before the eager layer tail resumes.
-            # This forward-local callback stays outside TE's tensor-only input surface.
-            output_handler = kwargs.pop('_te_graph_output_handler', None)
-            for arg in args:
-                assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
-            for _, value in kwargs.items():
-                assert value is None or isinstance(
-                    value, torch.Tensor
-                ), "CUDA graph accepts only Tensor inputs."
-
-            replay_state = getattr(self, "_te_cuda_graph_route_replay_state", None)
-            microbatch_idx = (
-                replay_state[0]
-                if replay_state is not None
-                else getattr(self, 'current_microbatch', 0)
-            )
-            cg_index = microbatch_idx % len(self.cuda_graphs)
-            cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
-            cudagraph_kwargs['is_first_microbatch'] = microbatch_idx == 0
-
-            for hook, hook_args in self.cuda_graph_manual_hooks:
-                hook(*hook_args)
-            outputs = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
-            return output_handler(outputs) if output_handler is not None else outputs
+            adapter = getattr(self, '_te_cuda_graph_adapter', None)
+            if adapter is not None:
+                return adapter.replay(self._te_cuda_graph_replay_region, *args, **kwargs)
+            return self._te_cuda_graph_replay_region(*args, **kwargs)
         finally:
             self._te_cuda_graph_route_replay_state = None
+
+    def _te_cuda_graph_replay_region(self, *args, **kwargs):
+        """Invoke only the captured region; the layer owns eager prefixes and tails."""
+        for arg in args:
+            assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
+        for _, value in kwargs.items():
+            assert value is None or isinstance(
+                value, torch.Tensor
+            ), "CUDA graph accepts only Tensor inputs."
+
+        replay_state = getattr(self, "_te_cuda_graph_route_replay_state", None)
+        microbatch_idx = (
+            replay_state[0] if replay_state is not None else getattr(self, 'current_microbatch', 0)
+        )
+        cg_index = microbatch_idx % len(self.cuda_graphs)
+        cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+        cudagraph_kwargs['is_first_microbatch'] = microbatch_idx == 0
+        for hook, hook_args in self.cuda_graph_manual_hooks:
+            hook(*hook_args)
+        return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""
@@ -799,8 +812,8 @@ class GraphableMegatronModule(MegatronModule):
             else:
                 # Do CUDA Graphs replay.
                 cuda_graph_func = self._te_cuda_graph_replay
-                if adapter is not None:
-                    return adapter.replay(cuda_graph_func, *args, **kwargs)
+                if adapter is not None and not torch.is_grad_enabled():
+                    return self.forward(*args, **kwargs)
             return cuda_graph_func(*args, **kwargs)
         return super().__call__(*args, **kwargs)
 

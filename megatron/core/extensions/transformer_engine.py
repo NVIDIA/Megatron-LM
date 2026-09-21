@@ -52,6 +52,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.state_boundary import CheckpointBoundaryPolicy
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -3336,10 +3337,88 @@ class TECudaRNGStatesTracker(te.pytorch.distributed.CudaRNGStatesTracker):
         self._is_initialized = True
 
 
+class _TECheckpointBoundary(torch.autograd.Function):
+    """Preserve active output roots around TE's existing reentrant checkpoint.
+
+    TE may materialize missing seeds as zeros. The outer boundary observes None
+    first and detaches those outputs during TE replay, so they cannot become
+    backward roots. The body still runs once under no-grad and once on replay;
+    router statistics, auxiliary logging and TE quantization keep that lifecycle.
+    """
+
+    @staticmethod
+    def forward(ctx, checkpoint, function, policy, kwargs, *args):
+        ctx.set_materialize_grads(False)
+        # The inner TE graph is independent of the outer graph. Return its input
+        # gradients through this Function's edges exactly once.
+        inputs = tuple(t.detach().requires_grad_(t.requires_grad) for t in args)
+        activity = [None]
+
+        def forward(*values, **forward_kwargs):
+            result = policy.apply(function(*values, **forward_kwargs))
+            tensors = (result,) if isinstance(result, torch.Tensor) else tuple(result)
+            if activity[0] is not None:
+                # An active constant is an independent leaf, so TE has a legal
+                # root while gradients to all original inputs remain None.
+                tensors = tuple(
+                    (
+                        (tensor if tensor.requires_grad else tensor.detach().requires_grad_())
+                        if active
+                        else tensor.detach()
+                    )
+                    for tensor, active in zip(tensors, activity[0])
+                )
+            return tensors[0] if isinstance(result, torch.Tensor) else tensors
+
+        with torch.enable_grad():
+            result = checkpoint(forward, *inputs, **kwargs)
+        ctx.single_output = isinstance(result, torch.Tensor)
+        tensors = (result,) if ctx.single_output else tuple(result)
+        ctx.save_for_backward(*inputs, *tensors)
+        ctx.num_inputs, ctx.policy, ctx.activity = len(inputs), policy, activity
+        outputs = tuple(t.detach() for t in tensors)
+        ctx.mark_non_differentiable(
+            *(
+                t
+                for field, t in zip(policy.outputs.packed_fields, outputs)
+                if not field.differentiable
+            )
+        )
+        return outputs[0] if ctx.single_output else outputs
+
+    @staticmethod
+    def backward(ctx, *grads):
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError("TE boundary checkpoint requires backward(), not autograd.grad()")
+        saved = ctx.saved_tensors
+        inputs, outputs = saved[: ctx.num_inputs], saved[ctx.num_inputs :]
+        for tensor in inputs:
+            tensor.grad = None
+        active = tuple(
+            field.differentiable and grad is not None
+            for field, grad in zip(ctx.policy.outputs.packed_fields, grads)
+        )
+        ctx.activity[0] = active
+        roots = tuple(t for t, used in zip(outputs, active) if used)
+        if roots:
+            # The outer saved-tensor lifetime releases this small TE graph, or
+            # preserves it if the caller requested retain_graph on the boundary.
+            torch.autograd.backward(
+                roots, tuple(g for g, used in zip(grads, active) if used), retain_graph=True
+            )
+        return (None, None, None, None, *(t.grad for t in inputs))
+
+
 def te_checkpoint(
-    forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
+    forward_func,
+    distribute_saved_activations,
+    get_rng_state_tracker,
+    tp_group,
+    *args,
+    boundary_policy: CheckpointBoundaryPolicy | None = None,
+    **kwargs,
 ):
-    """Checkpointing with Transformer-Engine."""
+    """Checkpoint with TE, optionally preserving the shared state boundary contract."""
     if not HAVE_TE:
         raise ImportError(
             "Transformer Engine is not installed. "
@@ -3347,6 +3426,36 @@ def te_checkpoint(
         )
 
     from transformer_engine.pytorch.distributed import checkpoint
+
+    if boundary_policy is not None:
+        if not is_te_min_version("1.5.0"):
+            raise ValueError("TE state boundary checkpoint requires Transformer Engine >= 1.5")
+        if distribute_saved_activations or not kwargs.get("use_reentrant", True):
+            raise ValueError(
+                "TE state boundaries require reentrant checkpoint without distributed saved activations"
+            )
+        if any(not isinstance(tensor, torch.Tensor) for tensor in args):
+            raise TypeError("TE state boundary checkpoint requires explicit tensor inputs")
+        if not torch.is_grad_enabled() or not any(tensor.requires_grad for tensor in args):
+            if torch.is_grad_enabled() and boundary_policy.strict:
+                raise ValueError("TE state boundary checkpoint requires a differentiable input")
+            kwargs.pop("use_reentrant", None)
+            context_fn = kwargs.pop("context_fn", None)
+            kwargs.pop("determinism_check", None)
+            kwargs.pop("debug", None)
+            with context_fn()[0] if context_fn is not None else nullcontext():
+                result = forward_func(*args, **kwargs)
+            return boundary_policy.apply(result)
+        options = dict(
+            kwargs,
+            use_reentrant=True,
+            distribute_saved_activations=False,
+            get_rng_state_tracker=get_rng_state_tracker,
+            tp_group=tp_group,
+        )
+        return _TECheckpointBoundary.apply(
+            checkpoint, forward_func, boundary_policy, options, *args
+        )
 
     if is_te_min_version("1.5.0"):
         return checkpoint(
