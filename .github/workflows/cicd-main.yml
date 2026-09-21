@@ -36,7 +36,7 @@ env:
 
 jobs:
   ephemeral-runner-routing:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@4fe957d4ea5816af1d67fae130bbab4b434c10b3 # v1.9.2
     with:
       lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
       legacy_label: nvidia-ci-aws-gpu-x8-ephemeral
@@ -50,7 +50,7 @@ jobs:
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
-      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || needs.ephemeral-runner-routing.outputs.runner_label }}
+      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || needs.ephemeral-runner-routing.outputs.runner_label_base }}
       selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
@@ -195,6 +195,8 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
+      target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+      unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -238,17 +240,29 @@ jobs:
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
-          # Fetch all labels in a single API call; fall back to empty list if no PR
-          LABELS=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json labels --jq '[.labels[].name]') || LABELS='[]'
+          # Fetch all labels in a single API call. A failed lookup is safe for
+          # the existing scope defaults, but must disable selective unit tests.
+          LABELS_VALID=true
+          if ! LABELS=$(gh pr view "$PR_NUMBER" --repo ${{ github.repository }} --json labels --jq '[.labels[].name]'); then
+            LABELS='[]'
+            LABELS_VALID=false
+          fi
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
+          HAS_UNIT_TESTMON=$(echo "$LABELS"   | jq 'any(. == "Run selective unit tests")')
+          # Synthetic PR pushes have no pull_request event payload for preflight.
+          if echo "$LABELS" | jq -e 'any(. == "force-run-all")' > /dev/null; then
+            FORCE_RUN_ALL=true
+          fi
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
             SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
@@ -317,6 +331,20 @@ jobs:
 
           DEV=true
 
+          # Labeled PRs only read the shared main baseline. A missing or
+          # incompatible cache runs the full bucket without recording a database.
+          UNIT_TESTMON_ELIGIBLE=false
+          if [[ "$LABELS_VALID" == "true" \
+            && "$HAS_UNIT_TESTMON" == "true" \
+            && "$EVENT_NAME" == "push" \
+            && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
+            && "$HAS_RUN_TESTS" != "true" \
+            && "$HAS_RUN_FUNCTIONAL" != "true" \
+            && "$FORCE_RUN_ALL" != "true" \
+            && "$HAS_LTS" != "true" ]]; then
+            UNIT_TESTMON_ELIGIBLE=true
+          fi
+
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -327,6 +355,7 @@ jobs:
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
+          echo "unit_testmon_eligible=$UNIT_TESTMON_ELIGIBLE" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -355,6 +384,8 @@ jobs:
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
+          | \`unit_testmon_requested\` | \`$HAS_UNIT_TESTMON\` |
+          | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
 
           ### Decision tree
 
@@ -425,6 +456,9 @@ jobs:
       - name: Test queue approval topology
         run: .github/scripts/test_approve_test_queue.sh
 
+      - name: Test DCO gate publisher
+        run: python3 .github/scripts/test_dco_gate.py
+
       - name: Test superseded merge-group cleanup
         run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
 
@@ -440,8 +474,10 @@ jobs:
         run: |
           BASE_REF="${BASE_REF#refs/heads/}"
           git fetch origin "$BASE_REF"
+          # Pure renames (-M100%) carry no new values and are skipped; a renamed and
+          # edited file shows up as an addition and is checked.
           mapfile -t GOLDEN_VALUES_FILES < <(
-            git diff --name-only --diff-filter=ACMR \
+            git diff --name-only --diff-filter=ACM -M100% \
               --merge-base "origin/$BASE_REF" -- \
               ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
           )
@@ -452,6 +488,22 @@ jobs:
           fi
 
           python3 tools/check_golden_values.py "${GOLDEN_VALUES_FILES[@]}"
+
+      - name: Require determinism tests for kernel changes
+        # PR pushes only: a merge-group head also contains the PRs queued ahead of
+        # it, whose kernel changes were gated (and possibly labelled) on their own PRs.
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        env:
+          BASE_REF: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+          # Labels come with the PR object; no extra API call or token permission needed.
+          LABELS: ${{ join(fromJSON(steps.get-pr-info.outputs.pr-info || '{}').labels.*.name, ',') }}
+        run: |
+          BASE_REF="${BASE_REF#refs/heads/}"
+          git fetch origin "$BASE_REF"
+
+          python3 tools/check_kernel_determinism_coverage.py \
+            --base-ref "origin/$BASE_REF" \
+            --labels "$LABELS"
 
       - name: Run linting
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
@@ -680,7 +732,7 @@ jobs:
     uses: ./.github/workflows/_build_ci_container.yml
     with:
       is-maintainer: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' }}
-      selected-runner: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+      selected-runner: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
       selected-runner-gb200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
@@ -729,7 +781,7 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    runs-on: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
     timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
@@ -766,6 +818,8 @@ jobs:
           is_unit_test: "true"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -854,6 +908,8 @@ jobs:
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
@@ -982,7 +1038,7 @@ jobs:
       - configure
       - cicd-integration-gate
       - cicd-parse-integration-tests-h100
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    runs-on: ${{ startsWith(needs.is-not-external-contributor.outputs.selected_runner, 'ephe-v2-') && format('{0}-a{1}', needs.is-not-external-contributor.outputs.selected_runner, github.run_attempt) || needs.is-not-external-contributor.outputs.selected_runner }}
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
