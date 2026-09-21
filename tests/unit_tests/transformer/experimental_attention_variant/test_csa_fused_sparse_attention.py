@@ -878,7 +878,14 @@ class TestGetTopkAlignment:
 # Without aligning before ``save_for_backward``, cuDNN sparse-attention bwd still
 # sees the raw data-dependent width and recompiles. ``_align_topk_width`` runs at
 # the autograd boundary so the saved tensor (and therefore backward) inherits a
-# stable 64-bucket width. Backward itself is unchanged.
+# stable architecture-dependent bucket width (64 on SM100+, 128 on older GPUs).
+# Backward itself is unchanged.
+
+
+def _padded_topk_width(width: int) -> int:
+    """Round ``width`` up to the current GPU's FlashMLA TopK alignment."""
+    align = _get_topk_alignment()
+    return (width + align - 1) // align * align
 
 
 def _aligned_topk_make_inputs(width: int, n: int = 64, h: int = 8, d: int = 64):
@@ -930,22 +937,27 @@ def _run_aligned_topk_fwd_bwd(recorder, topk_length, width):
 
 
 @pytest.mark.parametrize("topk_length", [None, torch.full((64,), 100, dtype=torch.int32)])
-def test_backward_topk_widths_collapse_to_64_buckets(topk_length):
-    """Widths 130 and 189 both reach backward as 192 (stable compile key)."""
+def test_backward_topk_widths_collapse_to_aligned_buckets(topk_length):
+    """Distinct raw widths collapse to one architecture-aligned compile key."""
+    expected = _padded_topk_width(130)
+    assert _padded_topk_width(189) == expected
     recorder = _RecordingDSATopkWidth()
     for width in (130, 189, 130):
         _run_aligned_topk_fwd_bwd(recorder, topk_length, width)
     assert len(recorder.calls) == 3
     seen_widths = [t.shape[-1] for t in recorder.calls]
     assert seen_widths == [
-        192,
-        192,
-        192,
-    ], f"backward topk widths must be 64-aligned stable buckets, got {seen_widths}"
+        expected,
+        expected,
+        expected,
+    ], (
+        f"backward topk widths must collapse to {_get_topk_alignment()}-aligned "
+        f"stable buckets, got {seen_widths}"
+    )
 
 
 def test_backward_topk_aligned_width_unchanged():
-    """Already-64-aligned widths are passed through untouched."""
+    """Already-aligned widths are passed through untouched."""
     recorder = _RecordingDSATopkWidth()
     _, topk_idxs = _run_aligned_topk_fwd_bwd(recorder, None, 256)
     (seen,) = recorder.calls
@@ -959,7 +971,7 @@ def test_backward_topk_padding_values(topk_length):
     recorder = _RecordingDSATopkWidth()
     _, topk_idxs = _run_aligned_topk_fwd_bwd(recorder, topk_length, 130)
     (seen,) = recorder.calls
-    assert seen.shape[-1] == 192
+    assert seen.shape[-1] == _padded_topk_width(130)
     assert torch.equal(seen[:, :130], topk_idxs)
     assert (seen[:, 130:] == -1).all()
 
