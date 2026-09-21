@@ -267,7 +267,7 @@ class TopKRouter(Router):
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
-            self.router_replay = RouterReplay()
+            self.router_replay = RouterReplay(is_mtp_layer=self.is_mtp_layer)
 
     def _maintain_float32_expert_bias(self):
         """

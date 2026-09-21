@@ -137,14 +137,21 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize(
-        "async_sched_mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC]
+        ("async_sched_mode", "num_cuda_graphs"),
+        [
+            pytest.param(AsyncScheduleMode.LEGACY, None, id="legacy-eager"),
+            pytest.param(AsyncScheduleMode.ASYNC, None, id="async-eager"),
+            pytest.param(AsyncScheduleMode.ASYNC, 1, id="async-cuda-graph"),
+        ],
     )
     @torch.inference_mode()
-    def test_non_greedy_sampling_with_mamba_mtp_ep(self, async_sched_mode):
-        """Run cumulative Mamba, MTP, and EP sampling support to completion.
+    def test_non_greedy_sampling_with_mamba_mtp_ep(self, async_sched_mode, num_cuda_graphs):
+        """Run cumulative Mamba, MTP, EP, and routing capture to completion.
 
         Args:
             async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
+            num_cuda_graphs (Optional[int]): Number of CUDA graph buckets, or
+                ``None`` for eager execution.
         """
         skip_if_mamba_sequence_packing_not_available("hybrid")
         if int(os.environ.get("WORLD_SIZE", "1")) < 2:
@@ -167,6 +174,11 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             skip_prompt_log_probs=True,
             context_max_requests=8,
             async_sched_mode=async_sched_mode,
+            moe_enable_routing_replay=True,
+            moe_pad_experts_for_cuda_graph_inference=num_cuda_graphs is not None,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
         )
 
         assert all(request.status == Status.COMPLETED for request in env.requests)
