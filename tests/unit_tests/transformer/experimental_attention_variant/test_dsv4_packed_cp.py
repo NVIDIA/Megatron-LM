@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Packed DSv4 CP parity against per-document SBHD; run on at least 4 GPUs."""
 
+import json
 from copy import copy
 from dataclasses import replace
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -35,8 +36,8 @@ class _CP1:
 def _assert_match(actual, expected):
     assert actual.shape == expected.shape
     assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
-    # BF16 GEMMs change their reduction tiling when CP changes the token count.
-    # Bound both relative RMS error and normalized direction, including tiny grads.
+    # Keep both relative-norm and elementwise gates while the diagnostic
+    # controls separate BF16 accumulation, backend and CP effects.
     delta = (actual.float() - expected.float()).square().sum()
     energy = expected.float().square().sum().clamp_min(1e-12)
     assert delta / energy < 2e-3
@@ -55,6 +56,65 @@ def _reference_per_document(model, hidden, physical, real):
             # Keep padding gradients explicitly zero in the reference input.
             outputs.append(hidden[start + length : end] * 0)
     return torch.cat(outputs, dim=0)
+
+
+def _run_attention(model, hidden, grad, packed, *, documents=None, cp_group=None):
+    """Collect real TE FP32 wgrads, or ordinary grads when fusion is disabled."""
+    fused_weights = set()
+    for module in model.modules():
+        if isinstance(module, TELinear) and module.fuse_wgrad_accumulation:
+            module.weight.main_grad = torch.zeros_like(module.weight, dtype=torch.float32)
+            fused_weights.add(id(module.weight))
+    hidden = hidden.detach().clone().requires_grad_()
+    if documents is None:
+        output, _ = model(hidden, attention_mask=None, packed_seq_params=packed)
+    else:
+        output = _reference_per_document(model, hidden, *documents)
+    output.backward(grad)
+    result = {"output": output.detach(), "input_grad": hidden.grad.detach()}
+    for name, param in model.named_parameters():
+        value = param.main_grad if id(param) in fused_weights else param.grad
+        assert value is not None, f"Missing gradient: {name}"
+        value = value.detach().to(dtype=torch.float32, copy=True)
+        if cp_group is not None:
+            dist.all_reduce(value, group=cp_group)
+        result[f"param:{name}"] = value
+    return result
+
+
+def _compare_results(actual, expected, label, failures, rows=None):
+    """Report every tensor before failing, keeping both existing error gates."""
+    assert actual.keys() == expected.keys(), label
+    for name, value in actual.items():
+        reference = expected[name]
+        if rows is not None and not name.startswith("param:"):
+            reference = reference[rows]
+        a, b = value.float(), reference.float()
+        delta = a - b
+        energy = b.square().sum().clamp_min(1e-12)
+        stats = {
+            "comparison": label,
+            "tensor": name,
+            "dtype": str(value.dtype),
+            "reference_dtype": str(reference.dtype),
+            "relative_l2": (delta.square().sum() / energy).sqrt().item(),
+            "max_abs": delta.abs().max().item(),
+            "mismatch_fraction": (delta.abs() > 0.06 + 0.06 * b.abs()).float().mean().item(),
+            "reference_norm": b.norm().item(),
+            "cosine": (
+                1.0
+                if torch.equal(a, b)
+                else torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
+            ),
+        }
+        try:
+            _assert_match(value, reference)
+        except AssertionError as error:
+            failures.append(f"{label}/{name}: {error}")
+            stats["passed"] = False
+        else:
+            stats["passed"] = True
+        print("DSV4_CP_PARITY " + json.dumps(stats), flush=True)
 
 
 @pytest.mark.skipif(
@@ -113,6 +173,7 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
             linear_cp_layout="contiguous",
             qk_layernorm=True,
             apply_rope_fusion=True,
+            gradient_accumulation_fusion=True,
             recompute_granularity="selective" if recompute else None,
             recompute_modules=["mla_up_proj"] if recompute else [],
         )
@@ -124,6 +185,8 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
             dsa_kernel_backend="none",
             calculate_per_token_loss=True,
             dsa_indexer_loss_coeff=coeff / real_cu[-1],
+            recompute_granularity=None,
+            recompute_modules=[],
         )
         model = _build_attention(cfg, 1, pg).cuda()
         reference = _build_attention(ref_cfg, 1, ref_pg).cuda()
@@ -140,28 +203,69 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
             max_seqlen_kv=1024,
         )
         whole = torch.randn(2048, 1, 256, dtype=torch.bfloat16, device="cuda")
+        grad = torch.randn_like(whole)
         count = whole.shape[0] // cp_size
         rows = slice(pg.cp.rank() * count, (pg.cp.rank() + 1) * count)
-        local = whole[rows].clone().requires_grad_()
-        whole = whole.requires_grad_()
-        output, _ = model(local, attention_mask=None, packed_seq_params=packed)
-        expected = _reference_per_document(reference, whole, physical_cu, real_cu)
-        _assert_match(output, expected[rows])
-        grad = torch.randn_like(expected)
-        output.backward(grad[rows])
-        expected.backward(grad)
-        _assert_match(local.grad, whole.grad[rows])
-        ref_params = dict(reference.named_parameters())
-        for name, param in model.named_parameters():
-            assert param.grad is not None, name
-            # Avoid extra BF16 rounding when summing CP rank contributions.
-            total_grad = param.grad.detach().to(dtype=torch.float32, copy=True)
-            dist.all_reduce(total_grad, group=pg.cp)
-            try:
-                _assert_match(total_grad, ref_params[name].grad.float())
-            except AssertionError as error:
-                raise AssertionError(f"Parameter gradient mismatch: {name}\n{error}") from error
-            if ratio == 4 and coeff == 0 and ".indexer." in name:
-                assert torch.count_nonzero(total_grad) == 0
+        documents = (physical_cu, real_cu)
+        actual = _run_attention(model, whole[rows], grad[rows], packed, cp_group=pg.cp)
+        expected = _run_attention(reference, whole, grad, packed, documents=documents)
+        failures = []
+        label = f"ratio={ratio}:cp={cp_size}:fp32_wgrad"
+        _compare_results(actual, expected, f"{label}:cp_vs_native", failures, rows)
+        if ratio == 4 and coeff == 0:
+            for name, value in actual.items():
+                if ".indexer." in name:
+                    assert torch.count_nonzero(value) == 0, name
+
+        # Limit extra controls to the problematic sparse/recompute case. They
+        # separate CP, recompute and backend effects without expanding the matrix.
+        if ratio == 4 and sparse and recompute:
+            state = model.state_dict()
+
+            def run_control(config, groups, *, native=False):
+                attention = _build_attention(config, 1, groups).cuda()
+                attention.load_state_dict(state)
+                is_cp = config.context_parallel_size > 1
+                return _run_attention(
+                    attention,
+                    whole[rows] if is_cp else whole,
+                    grad[rows] if is_cp else grad,
+                    packed,
+                    documents=documents if native else None,
+                    cp_group=pg.cp if is_cp else None,
+                )
+
+            eager_cfg = replace(cfg, recompute_granularity=None, recompute_modules=[])
+            eager = run_control(eager_cfg, pg)
+            fused_cp1 = run_control(replace(eager_cfg, context_parallel_size=1), ref_pg)
+            _compare_results(actual, eager, f"{label}:recompute_vs_eager", failures)
+            _compare_results(eager, fused_cp1, f"{label}:cp_vs_fused_cp1", failures, rows)
+            _compare_results(fused_cp1, expected, f"{label}:fused_cp1_vs_native", failures)
+
+            # Keep the old BF16-wgrad result visible as a diagnostic baseline;
+            # correctness gates above use FP32 accumulation from the TE GEMM onward.
+            bf16_actual = run_control(replace(cfg, gradient_accumulation_fusion=False), pg)
+            bf16_expected = run_control(
+                replace(
+                    ref_cfg,
+                    gradient_accumulation_fusion=False,
+                    recompute_granularity=cfg.recompute_granularity,
+                    recompute_modules=cfg.recompute_modules,
+                ),
+                ref_pg,
+                native=True,
+            )
+            baseline_failures = []
+            _compare_results(
+                bf16_actual,
+                bf16_expected,
+                f"ratio={ratio}:cp={cp_size}:bf16_wgrad_baseline",
+                baseline_failures,
+                rows,
+            )
+            for result in (bf16_actual, bf16_expected):
+                for name, value in result.items():
+                    assert torch.isfinite(value).all(), f"Non-finite BF16 baseline: {name}"
+        assert not failures, "\n\n".join(failures)
     finally:
         Utils.destroy_model_parallel()
