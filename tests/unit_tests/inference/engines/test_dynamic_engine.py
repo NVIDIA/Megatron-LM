@@ -676,7 +676,6 @@ class DynamicEngineTestConfig:
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
-    moe_pad_experts_for_cuda_graph_inference: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -984,9 +983,6 @@ class DynamicInferenceEngineTestBase:
                     test_config.inference_moe_token_dispatcher_type
                 ),
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
-                moe_pad_experts_for_cuda_graph_inference=(
-                    test_config.moe_pad_experts_for_cuda_graph_inference
-                ),
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -1082,9 +1078,6 @@ class DynamicInferenceEngineTestBase:
                     test_config.inference_moe_token_dispatcher_type
                 ),
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
-                moe_pad_experts_for_cuda_graph_inference=(
-                    test_config.moe_pad_experts_for_cuda_graph_inference
-                ),
                 normalization=(
                     "RMSNorm"
                     if is_gdn or test_config.transformer_impl == "inference_optimized"
