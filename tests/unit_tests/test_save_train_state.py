@@ -162,7 +162,9 @@ def _save_a_checkpoint(
 
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model = MockModel(config)
-    optimizer = MockState({"optimizer": "optimizer_state"})
+    # Mirrors the shape of a real optimizer state dict (["state"] is accessed
+    # unconditionally by handle_swiglu_in_state_dict() on the fsdp_dtensor save path).
+    optimizer = MockState({"state": {}, "param_groups": []})
     opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
 
     save_checkpoint(
