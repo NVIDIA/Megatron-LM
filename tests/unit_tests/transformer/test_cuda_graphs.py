@@ -30,7 +30,10 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
 )
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -40,10 +43,16 @@ from megatron.core.transformer.cuda_graph_config import validate_moe_cuda_graph_
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
+    VisionTECudaGraphHelper,
     _CudagraphGlobalRecord,
     _layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
+    DSAIndexerLossLoggingHelper,
+    get_dsa_metric_tracker_size,
+    initialize_dsa_metric_tracker,
+)
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
@@ -117,6 +126,284 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    def test_initialize_dsa_tracker_finalizes_pp_agreed_capacity(self, monkeypatch):
+        class MetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = True
+
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 5
+                self.config = SimpleNamespace(
+                    dsa_indexer_loss_coeff=0.1, num_layers=2, mtp_num_layers=1
+                )
+
+        model = torch.nn.Module()
+        model.add_module("metric", MetricModule())
+        pp_group = object()
+        model_pg_collection = SimpleNamespace(pp=pp_group)
+        schedule_pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"language": model_pg_collection}, language_model_module_name="language"
+        )
+        calls = []
+        tracker = {}
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def pp_max(tensor, op=None, group=None):
+            calls.append((op, group))
+            tensor.fill_(7)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", pp_max)
+
+        assert initialize_dsa_metric_tracker([model], schedule_pg_collection) == 7
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert tracker["values"].shape == (7,)
+        assert tracker["agreed_size"] == 7
+
+        fixed_storage = tracker["values"]
+        assert initialize_dsa_metric_tracker([model], schedule_pg_collection) == 7
+        assert tracker["values"] is fixed_storage
+        assert len(calls) == 1
+
+        with pytest.raises(RuntimeError, match="different PP group"):
+            initialize_dsa_metric_tracker([model], SimpleNamespace(pp=object()))
+
+        with pytest.raises(RuntimeError):
+            DSAIndexerLossLoggingHelper.ensure_tracker_size(8)
+        assert tracker["values"] is fixed_storage
+        assert tracker["values"].shape == (7,)
+
+    def test_initialize_dsa_tracker_skips_multi_module_rank_without_language_model(
+        self, monkeypatch
+    ):
+        """An encoder-only MIMO rank neither scans nor joins the language PP collective."""
+        values = torch.ones(2)
+        tracker = {"values": values, "agreed_size": 2, "agreed_size_pp_group": object()}
+        pg_collection = MultiModuleProcessGroupCollection(
+            module_pgs={"encoder": SimpleNamespace(pp=object())}, language_model_module_name=None
+        )
+
+        class UnexpectedModel:
+            def modules(self):
+                pytest.fail("encoder-only rank scanned a model for DSA writers")
+
+        original_tracker = tracker.copy()
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda *args, **kwargs: pytest.fail("encoder-only rank joined DSA initialization"),
+        )
+
+        assert initialize_dsa_metric_tracker(UnexpectedModel(), pg_collection) == 0
+        assert tracker.keys() == original_tracker.keys()
+        assert all(tracker[key] is value for key, value in original_tracker.items())
+        assert tracker["values"] is values
+
+    def test_initialize_dsa_tracker_caches_zero_capacity(self, monkeypatch):
+        """A writer-free language PP group finalizes zero without allocating storage."""
+        pp_group = object()
+        tracker = {}
+        calls = []
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_reduce",
+            lambda tensor, op=None, group=None: calls.append((op, group)),
+        )
+
+        pg_collection = SimpleNamespace(pp=pp_group)
+        assert initialize_dsa_metric_tracker(torch.nn.Module(), pg_collection) == 0
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert tracker["agreed_size"] == 0
+        assert "values" not in tracker
+
+        assert initialize_dsa_metric_tracker(torch.nn.Module(), pg_collection) == 0
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert "values" not in tracker
+
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(num_layers=17, pp_group=pp_group)
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert "values" not in tracker
+
+    def test_initialize_dsa_tracker_rejects_existing_zero_length_storage(self, monkeypatch):
+        """Even empty lazy storage means a metric write preceded lifecycle initialization."""
+        pp_group = object()
+        tracker = {"values": torch.zeros(0)}
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+        with pytest.raises(RuntimeError, match="before its first metric write"):
+            initialize_dsa_metric_tracker(torch.nn.Module(), SimpleNamespace(pp=pp_group))
+
+        assert tracker["values"].shape == (0,)
+        assert "agreed_size" not in tracker
+
+    def test_initialize_dsa_tracker_empty_pp_stage_uses_peer_writer_size(self, monkeypatch):
+        """A language PP stage without a local writer allocates the peer-agreed capacity."""
+        pp_group = object()
+        tracker = {}
+        calls = []
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def pp_max(tensor, op=None, group=None):
+            calls.append((op, group))
+            tensor.fill_(4)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", pp_max)
+
+        assert initialize_dsa_metric_tracker(torch.nn.Module(), SimpleNamespace(pp=pp_group)) == 4
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert tracker["values"].shape == (4,)
+        assert tracker["agreed_size"] == 4
+
+    def test_dsa_tracker_size_ignores_disabled_metric_writers(self):
+        """A DSA/CSA module with loss logging disabled cannot write tracker storage."""
+
+        class DisabledMetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = True
+
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 3
+                self.config = SimpleNamespace(
+                    dsa_indexer_loss_coeff=0.0, num_layers=4, mtp_num_layers=1
+                )
+
+        assert get_dsa_metric_tracker_size(DisabledMetricModule()) == 0
+
+    @pytest.mark.parametrize(
+        ("cuda_graph_modules", "expected"),
+        [([], True), ([CudaGraphModule.attn], True), ([CudaGraphModule.mlp], False)],
+    )
+    def test_te_dsa_tracker_capture_follows_attention_scope(
+        self, monkeypatch, cuda_graph_modules, expected
+    ):
+        """TE requires an initialized tracker only when its graph records DSA metric writes."""
+
+        class MetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = True
+
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 1
+                self.config = SimpleNamespace(
+                    dsa_indexer_loss_coeff=0.1, num_layers=1, mtp_num_layers=None
+                )
+
+        metric_module = MetricModule()
+
+        def discover_layers(helper):
+            helper.flattened_callables = [metric_module]
+
+        from megatron.core.pipeline_parallel import p2p_communication
+
+        monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
+        monkeypatch.setattr(TECudaGraphHelper, "_discover_layers", discover_layers)
+        monkeypatch.setattr(p2p_communication, "P2PCommunicator", lambda **_kwargs: object())
+
+        helper = TECudaGraphHelper(
+            model=[torch.nn.Module()],
+            config=SimpleNamespace(
+                cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
+            ),
+            seq_length=1,
+            micro_batch_size=1,
+            pg_collection=SimpleNamespace(tp=object(), dp=object(), dp_cp=object(), pp=object()),
+        )
+
+        assert helper._captures_dsa_metric_writes is expected
+
+    def test_te_reset_after_capture_cleans_dsa_tracker_in_place(self, monkeypatch):
+        from importlib import import_module
+
+        from megatron.core.transformer.moe import moe_logging
+
+        finalize_model_grads_module = import_module(
+            "megatron.core.distributed.finalize_model_grads"
+        )
+
+        reduce_group = object()
+        avg_group = object()
+        values = torch.tensor([7.0, 11.0])
+        dsa_tracker = {
+            'values': values,
+            'reduce_group': reduce_group,
+            'avg_group': avg_group,
+            'agreed_size': 2,
+        }
+        calls = []
+
+        class FakeModelChunk:
+            @staticmethod
+            def zero_grad_buffer():
+                calls.append('zero_grad_buffer')
+
+        class FakeOptimizer:
+            @staticmethod
+            def zero_grad():
+                calls.append('zero_grad')
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [FakeModelChunk()]
+        helper.optimizers = [FakeOptimizer()]
+        helper.config = SimpleNamespace()
+
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', dsa_tracker)
+        monkeypatch.setattr(
+            moe_logging,
+            'get_moe_metrics_tracker',
+            lambda: SimpleNamespace(clear=lambda: calls.append('clear_moe_tracker')),
+        )
+        monkeypatch.setattr(
+            finalize_model_grads_module,
+            'reset_model_temporary_tensors',
+            lambda config, model: calls.append(('reset_model_temporary_tensors', config, model)),
+        )
+
+        helper._reset_after_capture()
+
+        assert calls[:3] == ['zero_grad_buffer', 'zero_grad', 'clear_moe_tracker']
+        assert calls[3] == ('reset_model_temporary_tensors', helper.config, helper.model)
+        assert dsa_tracker['values'] is values
+        assert torch.equal(dsa_tracker['values'], torch.zeros(2))
+        assert dsa_tracker['reduce_group'] is reduce_group
+        assert dsa_tracker['avg_group'] is avg_group
+        assert dsa_tracker['agreed_size'] == 2
+
+    def test_te_capture_requires_initialized_dsa_tracker(self, monkeypatch):
+        """A custom TE caller cannot lazily allocate tracker storage during capture."""
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace()
+        helper._captures_dsa_metric_writes = True
+        helper._start_capturing = lambda: pytest.fail("capture started before validation")
+
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", {})
+        monkeypatch.setattr(
+            cuda_graphs_module, "validate_moe_cuda_graph_support", lambda _cfg: None
+        )
+
+        with pytest.raises(RuntimeError, match="initialized before CUDA Graph capture"):
+            helper.create_cudagraphs()
+
+    def test_vision_te_reset_does_not_clear_language_dsa_tracker(self, monkeypatch):
+        """Vision capture leaves cleanup to the language-model TE helper."""
+        reduce_group = object()
+        values = torch.tensor([7.0, 11.0])
+        tracker = {"values": values, "reduce_group": reduce_group, "agreed_size": 2}
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+
+        helper = object.__new__(VisionTECudaGraphHelper)
+        helper._reset_after_capture()
+
+        assert tracker["values"] is values
+        assert torch.equal(tracker["values"], torch.tensor([7.0, 11.0]))
+        assert tracker["reduce_group"] is reduce_group
+        assert tracker["agreed_size"] == 2
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
@@ -1701,7 +1988,11 @@ class TestTECudaGraphHelper:
 
         helper = object.__new__(TECudaGraphHelper)
         helper.config = _te_whole_moe_paged_stash_config(cuda_graph_modules=cuda_graph_modules)
+        helper.model = []
+        helper.pg_collection = SimpleNamespace(pp=object())
+        helper.pp_group = object()
         helper.flattened_callables = [layer]
+        helper._captures_dsa_metric_writes = False
         helper.callables_per_chunk = []
         helper.num_microbatches = 1
         helper._start_capturing = lambda: 0.0

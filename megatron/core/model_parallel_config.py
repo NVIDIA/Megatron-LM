@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass, field
@@ -340,6 +340,18 @@ class ModelParallelConfig:
     in 1f1b phase of pipelining or non-pipelining schedule.
     """
 
+    ep_overlap_use_scheduled_tensor_release: bool = False
+    """Use scheduled cross-stream tensor release for fine-grained EP overlap.
+
+    When enabled, each model-chunk plan binds tensors produced by schedule nodes to
+    their creation stream and hands them back through the existing event chain.
+    External and detached gradients keep using allocator ``record_stream`` release.
+    Enable this option only for the sync-free combined 1F1B path with
+    ``overlap_moe_expert_parallel_comm`` enabled, where schedule nodes pass tensors
+    across CUDA streams.  Other schedules should leave it disabled and use the
+    default allocator ``record_stream`` release path.  This option is experimental.
+    """
+
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
@@ -375,6 +387,26 @@ class ModelParallelConfig:
     """Support for variable sequence lengths across microbatches. Setting this communicates the size
         of tensors during pipeline parallelism communication, because of this extra overhead it
         should only be set if the sequence length varies by microbatch within a global batch.
+    """
+
+    pipeline_p2p_fixed_shape: bool = False
+    """Skip pipeline shape exchange when packed tensors are padded to a fixed local size.
+
+    This preserves variable-sequence-length semantics for sequence packing while using
+    ``max_seqlen_per_dp_cp_rank`` to determine the pipeline receive-buffer shape. It requires a
+    sequence-packing scheduler, maximum-size packed-sequence padding, and static context
+    parallelism.
+
+    Supported only by ``forward_backward_pipelining_without_interleaving``, the sole caller of
+    ``get_tensor_shapes()`` where the fixed packed shape is derived. The interleaved (VPP)
+    schedule computes its own ``seq_length // cp_size`` buffer, so any non-``None``
+    ``virtual_pipeline_model_parallel_size`` is rejected rather than silently posting mismatched
+    receive buffers. ``TransformerConfig`` repeats this check after resolving a flexible pipeline
+    layout, which can derive VPP after this base class has initialized.
+
+    ``mtp_standalone=True`` keeps the dynamic shape protocol unconditionally, making this flag a
+    no-op; ``__post_init__`` warns in that case so the absent speedup is not mistaken for a
+    regression.
     """
 
     overlap_p2p_comm: bool = False
@@ -489,6 +521,16 @@ class ModelParallelConfig:
        the user adds a level 1 timer that is not called by all ranks.
     """
 
+    def _warn_if_pipeline_p2p_fixed_shape_has_no_effect(self) -> None:
+        """Warn when standalone MTP keeps the dynamic shape protocol enabled."""
+        if self.pipeline_p2p_fixed_shape and self.mtp_standalone:
+            warnings.warn(
+                "pipeline_p2p_fixed_shape has no effect when mtp_standalone=True: the "
+                "dynamic pipeline shape protocol stays enabled, so the shape-exchange "
+                "synchronization is not removed.",
+                stacklevel=2,
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -549,6 +591,48 @@ class ModelParallelConfig:
                         f"({self.max_seqlen_per_dp_cp_rank}), got "
                         f"{self.pad_packed_seq_alignment}."
                     )
+
+        if self.pipeline_p2p_fixed_shape:
+            if self.sequence_packing_scheduler is None:
+                raise ValueError("pipeline_p2p_fixed_shape requires a sequence_packing_scheduler.")
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape is not supported with dynamic_context_parallel."
+                )
+            # Must precede the alignment comparison below: when both fields are unset that
+            # comparison is `None not in ("max", None)` -> False, so validation would pass and
+            # get_tensor_shapes() would then derive the pipeline buffer from a None sequence
+            # length. Checking here turns that into a clear configuration error rather than a
+            # fixed-size buffer receiving genuinely variable-length sends.
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires max_seqlen_per_dp_cp_rank to be set; it "
+                    "defines the fixed pipeline receive-buffer sequence length."
+                )
+            # `is not None`, not `> 1`: get_forward_backward_func() selects the interleaved
+            # schedule on `vp_size is not None`, so a size of 1 already routes there even
+            # though it looks degenerate. arguments.py normalizes 1 -> None for the training
+            # entrypoints, but a config built directly against mcore does not get that.
+            if (
+                self.sequence_parallel
+                and self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size != 0
+            ):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape with sequence_parallel requires "
+                    "max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}) to be divisible by "
+                    f"tensor_model_parallel_size ({self.tensor_model_parallel_size}); the "
+                    "pipeline buffer is scattered along the sequence dimension and floor "
+                    "division would under-allocate it."
+                )
+            self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
+            if self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires pad_packed_seq_alignment='max' or "
+                    "pad_packed_seq_alignment equal to max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}), got "
+                    f"{self.pad_packed_seq_alignment}."
+                )
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

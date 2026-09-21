@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.pipeline_parallel.combined_1f1b_tensor_release import Combined1F1BTensorRelease
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -196,7 +197,16 @@ class TransformerLayerSchedulePlan:
     mhc_recompute = None
     mtp_post_process = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
+    def __init__(
+        self,
+        layer,
+        event,
+        chunk_state,
+        comp_stream,
+        comm_stream,
+        extra_args={},
+        tensor_release=None,
+    ):
         """Initializes a transformer layer schedule plan.
 
         Args:
@@ -226,7 +236,9 @@ class TransformerLayerSchedulePlan:
         self.recompute_segment = None
 
         # get callable nodes for transformer/mtp layer
-        self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
+        self._build_callable_nodes(
+            event, comp_stream, comm_stream, extra_args, tensor_release=tensor_release
+        )
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
@@ -275,7 +287,9 @@ class TransformerLayerSchedulePlan:
                 self.layer._mhc_recompute_manager = None
             del self.layer
 
-    def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
+    def _build_callable_nodes(
+        self, event, comp_stream, comm_stream, extra_args, tensor_release=None
+    ):
         """
         Builds the callable nodes for the transformer/mtp layer:
             attn, mlp, moe_dispatch, moe_combine, and mtp_post_process.
@@ -314,6 +328,7 @@ class TransformerLayerSchedulePlan:
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
                 extra_args=extra_args,
+                tensor_release=tensor_release,
             )
 
         (
@@ -363,6 +378,7 @@ class TransformerLayerSchedulePlan:
                 event,
                 name="mhc_recompute",
                 forward_nvtx_name=f"mhc/recompute/{module_tag}/group_{group_index}/B",
+                tensor_release=tensor_release,
             )
         else:
             self.mhc_recompute = None
@@ -663,6 +679,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._event = torch.cuda.Event()
+        self._tensor_release = (
+            Combined1F1BTensorRelease()
+            if model.config.ep_overlap_use_scheduled_tensor_release
+            else None
+        )
         self.pre_process = None
         self.post_process = None
         self.vp_stage = model.vp_stage
@@ -763,6 +784,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 comp_stream,
                 comm_stream,
                 extra_args,
+                tensor_release=self._tensor_release,
             )
             self._transformer_layers.append(layer_plan)
 
@@ -823,6 +845,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def event(self):
         """Gets the CUDA event for synchronization."""
         return self._event
+
+    @property
+    def tensor_release(self):
+        """Gets the optional combined 1F1B scheduled tensor-release state."""
+        return self._tensor_release
 
     def record_current_stream(self):
         """Records the current CUDA stream in the event."""
@@ -991,6 +1018,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+            if f_schedule_plan.tensor_release is not None:
+                # Post-processing is outside the managed layer-node chain.  Its input
+                # remains live, but no later managed node should consume this binding.
+                f_schedule_plan.tensor_release.export(f_input)
             if f_schedule_plan.recompute_full and f_input is not None and not f_input.requires_grad:
                 # The last layer ran under no_grad, so post_process needs a grad-tracking
                 # leaf to seed the replayed last segment's backward.
@@ -998,6 +1029,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:
+            if b_schedule_plan.tensor_release is not None:
+                # Pre-processing is the backward boundary of the managed layer-node chain.
+                b_schedule_plan.tensor_release.export(b_grad)
             b_schedule_plan.pre_process.backward(b_grad)
 
         # The forward output has been consumed (PP send / post_process), so the
@@ -1007,8 +1041,16 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()
+            if f_schedule_plan.tensor_release is not None:
+                f_schedule_plan.tensor_release.finalize_phase(
+                    f_schedule_plan.event, phase="forward", outputs=f_input
+                )
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
+            if b_schedule_plan.tensor_release is not None:
+                b_schedule_plan.tensor_release.finalize_phase(
+                    b_schedule_plan.event, phase="backward"
+                )
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 

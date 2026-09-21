@@ -1021,6 +1021,31 @@ class CompressorSubmodules:
     norm: Union[ModuleSpec, type] = None
 
 
+def _weight_requires_single_cp_projection(weight: nn.Parameter) -> bool:
+    """True when fused wgrad will overwrite ``main_grad`` for this weight.
+
+    ``overwrite_main_grad`` is the runtime contract, but Megatron FSDP only sets
+    it inside the linear pre-forward unshard hook. ``optim_grads`` and
+    fine-grained param-gather wrapping therefore look unset on the first
+    compressor forward, even though both backward GEMMs will copy into the same
+    buffer. Fall back using FSDP state that exists as soon as the wrapper is
+    constructed. ``is_first_microbatch=None`` cannot override that copy.
+    """
+    if getattr(weight, "overwrite_main_grad", False):
+        return True
+    fsdp = getattr(weight, "_megatron_fsdp_model", None)
+    if fsdp is None:
+        return False
+    strategy = getattr(fsdp, "data_parallel_sharding_strategy", "no_shard")
+    if strategy == "no_shard":
+        return False
+    if getattr(fsdp, "enable_fine_grained_param_gather_hook", False):
+        return True
+    # These strategies do not install TransformerLayer FSDP units, so the
+    # unshard hook (and overwrite_main_grad) runs on the linear itself.
+    return strategy in ("optim", "optim_grads")
+
+
 class Compressor(MegatronModule):
     """Gated pooling compressor for CSA and HCA sparse attention.
 
@@ -1215,6 +1240,92 @@ class Compressor(MegatronModule):
             kv = rotate_activation(kv)
         return kv
 
+    def _cp_requires_single_projection(self) -> bool:
+        """Whether wgrad's per-call contract requires the original CP projection.
+
+        FSDP sets ``overwrite_main_grad`` in the linear pre-forward unshard hook.
+        ``_forward_thd_cp`` inspects the flag before that hook runs, so also use
+        wrapping state that exists as soon as FSDP is constructed.
+        """
+        if self.config.delay_wgrad_compute:
+            return True
+        return any(
+            _weight_requires_single_cp_projection(linear.weight)
+            for linear in (self.linear_wkv, self.linear_wgate)
+        )
+
+    def _forward_thd_cp(
+        self,
+        x: torch.Tensor,
+        boundary_hidden: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        layout: thd_layout_kernels.CPCompressorLayout,
+        max_seqlen_q: int,
+        pre_compacted_hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Project original CP inputs before compacting the much narrower KV/gate.
+
+        The linear backward saves the original local hidden storage, which is
+        already retained by attention, instead of a separate hidden-size compact
+        buffer. Only the required compressor halo is projected. Attention and
+        indexer compressors share the integer layout, including its inverse map.
+        ``pre_compacted_hidden`` keeps the fallback's high-dimensional input
+        shared across the two compressors as well.
+        """
+        linears = (self.linear_wkv, self.linear_wgate)
+        # Deferred wgrad stores one GEMM per backward_dw call. FSDP can likewise
+        # request a single overwrite of main_grad. Preserve their single-call
+        # contract instead of splitting a projection into two invocations.
+        projected_kv_score = None
+        if pre_compacted_hidden is not None:
+            x = pre_compacted_hidden
+        elif self._cp_requires_single_projection():
+            x, *_ = cp_utils.prepare_cp_compressor_input(
+                x,
+                boundary_hidden,
+                cu_seqlens,
+                layout.global_start,
+                layout.cp_size,
+                self.compress_ratio,
+            )
+        else:
+            if boundary_hidden.shape[0] < layout.boundary_rows:
+                raise ValueError("CP boundary is shorter than the compressor halo.")
+            boundary = boundary_hidden[-layout.boundary_rows :]
+            projections = []
+            with get_fp8_disabled_context(self.config):
+                for linear in linears:
+                    # BF16 has no quantized weight transpose to cache. Passing
+                    # is_first_microbatch=None via TELinear also makes both GEMMs
+                    # accumulate into the zeroed main_grad: otherwise backward's
+                    # last GEMM can overwrite the other half on microbatch one.
+                    # FSDP's overwrite_main_grad still forces a copy, so this
+                    # path must not run when FSDP wrapping will set that flag.
+                    cache_setting = getattr(linear, "disable_parameter_transpose_cache", None)
+                    if cache_setting is not None:
+                        linear.disable_parameter_transpose_cache = True
+                    try:
+                        local, _ = linear(x)
+                        halo, _ = linear(boundary)
+                    finally:
+                        if cache_setting is not None:
+                            linear.disable_parameter_transpose_cache = cache_setting
+                    projections.append((local, halo))
+            (local_kv, boundary_kv), (local_score, boundary_score) = projections
+            projected_kv_score = thd_layout_kernels.CompressorProjectionCompact.apply(
+                local_kv, local_score, boundary_kv, boundary_score, layout
+            )
+        return self._forward_thd(
+            x,
+            cu_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            compressed_group_ids=layout.group_ids,
+            compressed_position_ids=layout.position_ids,
+            pre_grouped_cu_seqlens=layout.local_cu_seqlens,
+            pre_grouped_cu_seqlens_compressed=layout.local_cu_seqlens_compressed,
+            projected_kv_score=projected_kv_score,
+        )
+
     def _forward_thd(
         self,
         x: torch.Tensor,
@@ -1225,6 +1336,7 @@ class Compressor(MegatronModule):
         compressed_position_ids: Optional[torch.Tensor] = None,
         pre_grouped_cu_seqlens: Optional[torch.Tensor] = None,
         pre_grouped_cu_seqlens_compressed: Optional[torch.Tensor] = None,
+        projected_kv_score: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """THD per-segment compression — fully vectorized.
 
@@ -1252,6 +1364,9 @@ class Compressor(MegatronModule):
             pre_grouped_cu_seqlens/pre_grouped_cu_seqlens_compressed: local
                 token/group prefixes describing the physical pre-grouped buffer.
                 Supplying both enables the regular THD fused compressor for CP.
+            projected_kv_score: pre-grouped CP projections. When supplied, ``x``
+                provides only the device/dtype; its high-dimensional rows have
+                not been compacted.
 
         Returns:
             ``(compressed_thd, cu_seqlens_compressed)`` where
@@ -1266,6 +1381,8 @@ class Compressor(MegatronModule):
         device = x.device
         dtype = x.dtype
         pre_grouped = compressed_group_ids is not None
+        if projected_kv_score is not None and not pre_grouped:
+            raise ValueError("Precomputed compressor projections require pre-grouped metadata.")
         has_pre_grouped_metadata = (
             pre_grouped_cu_seqlens is not None and pre_grouped_cu_seqlens_compressed is not None
         )
@@ -1300,10 +1417,13 @@ class Compressor(MegatronModule):
             return None, cu_seqlens_compressed
 
         # Run the compressor GEMMs in high precision (BF16) even under FP8 training.
-        with get_fp8_disabled_context(self.config):
-            # Token-wise projections on the FULL flat input — no boundary issue.
-            kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
-            score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
+        if projected_kv_score is None:
+            with get_fp8_disabled_context(self.config):
+                # Token-wise projections on the FULL flat input — no boundary issue.
+                kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
+                score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
+        else:
+            kv, score = projected_kv_score
 
         # Additive fused fast path (CuTe DSL, one kernel per direction) for the
         # gather / overlap-window / softmax / weighted-sum region below. Returns None
@@ -1900,6 +2020,8 @@ class CompressedSparseAttention(MegatronModule):
     * ``ratio == 4``:  window + 4x compressed + learned Indexer (both built)
     * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
     """
+
+    logs_dsa_indexer_loss = True
 
     def __init__(
         self,
@@ -3121,23 +3243,22 @@ class CompressedSparseAttention(MegatronModule):
         local_compressed_kv_grad_edge = None
         compressed_kv_rs_state = None
         if self.compressor is not None and ratio > 1:
-            # ---- Step 3: build fixed-capacity compressor input ----------------
-
-            # ``hidden_compact`` packs the local and boundary tokens needed by the
-            # Compressor. The same two CuTe launches also emit local prefixes for
-            # the fused pooling kernel, RoPE positions, global compressed prefixes,
-            # and the sequence-major -> rank-major gather map.
-            (
-                hidden_compact,
-                compressed_group_ids,
-                compressed_position_ids,
-                local_cu_seqlens,
-                local_cu_seqlens_compressed,
-                cu_seqlens_compressed,
-                seq_to_rank_row,
-            ) = cp_utils.prepare_cp_compressor_input(
-                x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
+            # ---- Step 3: build shared fixed-capacity compressor row maps ------
+            # Keep high-dimensional hidden states in their original storage.
+            # Both compressors project first, then compact their narrow KV/gate
+            # with these maps. Pooling, RoPE and gathered row ownership are unchanged.
+            compressor_layout = thd_layout_kernels.build_cp_compressor_layout(
+                cu_seqlens, global_start, l_local, cp_size, ratio
             )
+            cu_seqlens_compressed = compressor_layout.cu_seqlens_compressed
+            seq_to_rank_row = compressor_layout.seq_to_rank_row
+            hidden_compact = None
+            if self.compressor._cp_requires_single_projection() or (
+                indexer is not None and indexer.compressor._cp_requires_single_projection()
+            ):
+                hidden_compact, *_ = cp_utils.prepare_cp_compressor_input(
+                    x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
+                )
 
             if indexer is not None:
                 # ---- Step 4: optional indexer compressed path -----------------
@@ -3175,14 +3296,15 @@ class CompressedSparseAttention(MegatronModule):
                 # PackedSeqParams.cp_partition_mode is not "contiguous".
 
                 nvtx_range_push("dsv4_cp_indexer_k_compressor")
-                indexer_compressed_local, _ = indexer.compressor._forward_thd(
-                    hidden_compact.detach(),
+                indexer_compressed_local, _ = indexer.compressor._forward_thd_cp(
+                    indexer_x,
+                    boundary_hidden.detach(),
                     cu_seqlens,
+                    compressor_layout,
                     max_seqlen_q=max_seqlen_q,
-                    compressed_group_ids=compressed_group_ids,
-                    compressed_position_ids=compressed_position_ids,
-                    pre_grouped_cu_seqlens=local_cu_seqlens,
-                    pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
+                    pre_compacted_hidden=(
+                        hidden_compact.detach() if hidden_compact is not None else None
+                    ),
                 )
                 nvtx_range_pop("dsv4_cp_indexer_k_compressor")
                 # Build this edge before the independent attention
@@ -3203,14 +3325,13 @@ class CompressedSparseAttention(MegatronModule):
 
             # ---- Step 5: attention compressed KV path -------------------------
             nvtx_range_push("dsv4_cp_attention_kv_compressor")
-            compressed_kv_local, _ = self.compressor._forward_thd(
-                hidden_compact,
+            compressed_kv_local, _ = self.compressor._forward_thd_cp(
+                x,
+                boundary_hidden,
                 cu_seqlens,
+                compressor_layout,
                 max_seqlen_q=max_seqlen_q,
-                compressed_group_ids=compressed_group_ids,
-                compressed_position_ids=compressed_position_ids,
-                pre_grouped_cu_seqlens=local_cu_seqlens,
-                pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
+                pre_compacted_hidden=hidden_compact,
             )
             nvtx_range_pop("dsv4_cp_attention_kv_compressor")
             if indexer is not None:
