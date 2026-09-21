@@ -1106,13 +1106,6 @@ def save_checkpoint(
                             prev_iteration = int(f.read().strip())
                 with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write('release' if release else str(iteration))
-                print_rank_0(
-                    f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
-                    f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
-                    f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
-                    f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
-                )
 
                 # Save run_config.yaml
                 checkpoint_name = get_checkpoint_name(save_dir, iteration=iteration, return_base_dir=True)
@@ -1136,6 +1129,14 @@ def save_checkpoint(
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
+
+                print_rank_0(
+                    f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
+                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
+                    f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
+                    f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
+                    f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
+                )
 
                 if save_retain_interval is not None:
                     if (
