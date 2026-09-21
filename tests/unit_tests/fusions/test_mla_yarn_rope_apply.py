@@ -22,7 +22,6 @@ try:
         fused_mla_rope_kv_backward_out,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
-        fused_mla_rope_q_backward_inplace,
     )
 except Exception:
     fused_apply_mla_rope_for_q = None
@@ -30,7 +29,6 @@ except Exception:
     fused_mla_rope_kv_backward_out = None
     fused_mla_rope_kv_split = None
     fused_mla_rope_out_of_place = None
-    fused_mla_rope_q_backward_inplace = None
 
 
 def dtype_tols(dtype):
@@ -560,15 +558,14 @@ def test_mla_vmm_scratch_reused_across_graph_captures():
     os.getenv("RUN_BENCHMARK_TESTS") != "1",
     reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
 )
-def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
-    """Compare the profiled rotary Q/K/V plus three MXFP8 quant pattern."""
+def test_mla_rope_kv_two_mxfp8_quant_localization_performance():
+    """Compare the profiled rotary KV plus K/V MXFP8 quant pattern."""
     import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
 
     seqlen = 4096
     batch_size = 1
     num_heads = 128
-    nope_dim = 128
     emb_dim = 64
     k_dim = 128
     v_dim = 128
@@ -580,12 +577,9 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
     cos = (torch.cos(freqs) * mscale).to(dtype)
     sin = (torch.sin(freqs) * mscale).to(dtype)
 
-    q_shape = (seqlen, batch_size, num_heads, nope_dim + emb_dim)
     kv_shape = (seqlen, batch_size, num_heads, k_dim + v_dim)
     key_shape = (seqlen, batch_size, num_heads, k_dim + emb_dim)
     value_shape = (seqlen, batch_size, num_heads, v_dim)
-    q_seed = torch.randn(q_shape, dtype=dtype, device=device)
-    q_ordinary = q_seed.clone()
     kv = torch.randn(kv_shape, dtype=dtype, device=device)
     k_pos_emb = torch.randn(
         (seqlen, batch_size, 1, emb_dim), dtype=dtype, device=device
@@ -596,25 +590,20 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
     allocators = [
         VMMRowSplitAllocator(device),
         VMMRowSplitAllocator(device),
-        VMMRowSplitAllocator(device),
     ]
     try:
-        q_localized = allocators[0].allocate(q_shape, dtype)
-        key_localized = allocators[1].allocate(key_shape, dtype)
-        value_localized = allocators[2].allocate(value_shape, dtype)
+        key_localized = allocators[0].allocate(key_shape, dtype)
+        value_localized = allocators[1].allocate(value_shape, dtype)
     except (RuntimeError, ValueError) as exc:
         for allocator in allocators:
             allocator.close()
         pytest.skip(f"VMM-localized rotary outputs are unavailable: {exc}")
-    q_localized.copy_(q_seed)
 
     ordinary_inputs = [
-        q_ordinary.view(seqlen, -1),
         key_ordinary.view(seqlen, -1),
         value_ordinary.view(seqlen, -1),
     ]
     localized_inputs = [
-        q_localized.view(seqlen, -1),
         key_localized.view(seqlen, -1),
         value_localized.view(seqlen, -1),
     ]
@@ -662,7 +651,6 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
 
     @torch.no_grad()
     def ordinary_rotary():
-        fused_mla_rope_inplace(q_ordinary, cos, sin, nope_dim, emb_dim)
         fused_mla_rope_kv_split(
             kv,
             k_pos_emb,
@@ -686,15 +674,6 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
             row_end = row_start + rows_per_domain
             stream.wait_event(fork_event)
             with torch.cuda.stream(stream):
-                # Q RoPE is in-place, so its upstream buffer must already be
-                # VMM-backed. KV reads ordinary memory and writes each VMM half.
-                fused_mla_rope_inplace(
-                    q_localized[row_start:row_end],
-                    cos[row_start:row_end],
-                    sin[row_start:row_end],
-                    nope_dim,
-                    emb_dim,
-                )
                 fused_mla_rope_kv_split(
                     kv[row_start:row_end],
                     k_pos_emb[row_start:row_end],
@@ -749,12 +728,9 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
     ordinary_pipeline_ms = _benchmark_ms(ordinary_pipeline_fn)
     localized_pipeline_ms = _benchmark_ms(localized_pipeline_fn)
 
-    q_ordinary.copy_(q_seed)
-    q_localized.copy_(q_seed)
     ordinary_pipeline_fn()
     localized_pipeline_fn()
     torch.cuda.synchronize()
-    torch.testing.assert_close(q_localized, q_ordinary, atol=0.0, rtol=0.0)
     torch.testing.assert_close(key_localized, key_ordinary, atol=0.0, rtol=0.0)
     torch.testing.assert_close(value_localized, value_ordinary, atol=0.0, rtol=0.0)
     for ordinary_output, workspace in zip(ordinary_quantized, localized_workspaces):
@@ -773,11 +749,11 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
 
     execution = "CUDA Graph" if use_cuda_graph else "eager"
     print(
-        f"\nMLA rotary Q/K/V + three MXFP8 quant ({execution}):"
+        f"\nMLA rotary KV + two MXFP8 quant ({execution}):"
         f"\n  ordinary-memory rotary:       {ordinary_rotary_ms:.3f} ms"
         f"\n  green VMM-output rotary:      {localized_rotary_ms:.3f} ms"
-        f"\n  full-chip three quant:        {ordinary_quant_ms:.3f} ms"
-        f"\n  localized three quant:        {localized_quant_ms:.3f} ms"
+        f"\n  full-chip two quant:          {ordinary_quant_ms:.3f} ms"
+        f"\n  localized two quant:          {localized_quant_ms:.3f} ms"
         f"\n  ordinary full pipeline:       {ordinary_pipeline_ms:.3f} ms"
         f"\n  localized full pipeline:      {localized_pipeline_ms:.3f} ms"
         f"\n  end-to-end speedup:           "
@@ -797,17 +773,15 @@ def test_mla_rope_qkv_three_mxfp8_quant_localization_performance():
     os.getenv("RUN_BENCHMARK_TESTS") != "1",
     reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1",
 )
-def test_mla_rope_qkv_backward_two_mxfp8_quant_localization_performance():
-    """Compare rotary Q/KV backward plus the two large MXFP8 dgrad inputs."""
+def test_mla_rope_kv_backward_mxfp8_quant_localization_performance():
+    """Compare rotary KV backward plus its MXFP8 dgrad input."""
     import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.vmm import VMMRowSplitAllocator
 
     assert fused_mla_rope_kv_backward_out is not None
-    assert fused_mla_rope_q_backward_inplace is not None
     seqlen = 4096
     batch_size = 1
     num_heads = 128
-    nope_dim = 128
     emb_dim = 64
     k_dim = 128
     v_dim = 128
@@ -819,35 +793,28 @@ def test_mla_rope_qkv_backward_two_mxfp8_quant_localization_performance():
     cos = (torch.cos(freqs) * mscale).to(dtype)
     sin = (torch.sin(freqs) * mscale).to(dtype)
 
-    q_shape = (seqlen, batch_size, num_heads, nope_dim + emb_dim)
     key_shape = (seqlen, batch_size, num_heads, k_dim + emb_dim)
     value_shape = (seqlen, batch_size, num_heads, v_dim)
     kv_shape = (seqlen, batch_size, num_heads, k_dim + v_dim)
     emb_shape = (seqlen, batch_size, 1, emb_dim)
-    dq_seed = torch.randn(q_shape, dtype=dtype, device=device)
     dk = torch.randn(key_shape, dtype=dtype, device=device)
     dv = torch.randn(value_shape, dtype=dtype, device=device)
-    dq_ordinary = dq_seed.clone()
     dkv_ordinary = torch.empty(kv_shape, dtype=dtype, device=device)
     demb_ordinary = torch.empty(emb_shape, dtype=dtype, device=device)
     demb_localized = torch.empty_like(demb_ordinary)
 
-    allocators = [VMMRowSplitAllocator(device), VMMRowSplitAllocator(device)]
+    allocators = [VMMRowSplitAllocator(device)]
     try:
-        dq_localized = allocators[0].allocate(q_shape, dtype)
-        dkv_localized = allocators[1].allocate(kv_shape, dtype)
+        dkv_localized = allocators[0].allocate(kv_shape, dtype)
     except (RuntimeError, ValueError) as exc:
         for allocator in allocators:
             allocator.close()
         pytest.skip(f"VMM-localized rotary gradients are unavailable: {exc}")
-    dq_localized.copy_(dq_seed)
 
     ordinary_inputs = [
-        dq_ordinary.view(seqlen, -1),
         dkv_ordinary.view(seqlen, -1),
     ]
     localized_inputs = [
-        dq_localized.view(seqlen, -1),
         dkv_localized.view(seqlen, -1),
     ]
     quantizers = []
@@ -894,13 +861,6 @@ def test_mla_rope_qkv_backward_two_mxfp8_quant_localization_performance():
 
     @torch.no_grad()
     def ordinary_rotary_backward():
-        fused_mla_rope_q_backward_inplace(
-            dq_ordinary,
-            cos,
-            sin,
-            nope_dim,
-            emb_dim,
-        )
         fused_mla_rope_kv_backward_out(
             dk,
             dv,
@@ -924,13 +884,6 @@ def test_mla_rope_qkv_backward_two_mxfp8_quant_localization_performance():
             row_end = row_start + rows_per_domain
             stream.wait_event(fork_event)
             with torch.cuda.stream(stream):
-                fused_mla_rope_q_backward_inplace(
-                    dq_localized[row_start:row_end],
-                    cos[row_start:row_end],
-                    sin[row_start:row_end],
-                    nope_dim,
-                    emb_dim,
-                )
                 fused_mla_rope_kv_backward_out(
                     dk[row_start:row_end],
                     dv[row_start:row_end],
@@ -985,12 +938,9 @@ def test_mla_rope_qkv_backward_two_mxfp8_quant_localization_performance():
     ordinary_pipeline_ms = _benchmark_ms(ordinary_pipeline_fn)
     localized_pipeline_ms = _benchmark_ms(localized_pipeline_fn)
 
-    dq_ordinary.copy_(dq_seed)
-    dq_localized.copy_(dq_seed)
     ordinary_pipeline_fn()
     localized_pipeline_fn()
     torch.cuda.synchronize()
-    torch.testing.assert_close(dq_localized, dq_ordinary, atol=0.0, rtol=0.0)
     torch.testing.assert_close(dkv_localized, dkv_ordinary, atol=0.0, rtol=0.0)
     torch.testing.assert_close(demb_localized, demb_ordinary, atol=0.0, rtol=0.0)
     for ordinary_output, workspace in zip(ordinary_quantized, localized_workspaces):
@@ -1009,11 +959,11 @@ def test_mla_rope_qkv_backward_two_mxfp8_quant_localization_performance():
 
     execution = "CUDA Graph" if use_cuda_graph else "eager"
     print(
-        f"\nMLA rotary Q/KV backward + two MXFP8 quant ({execution}):"
+        f"\nMLA rotary KV backward + MXFP8 quant ({execution}):"
         f"\n  ordinary-memory rotary bwd:   {ordinary_rotary_ms:.3f} ms"
         f"\n  green VMM-output rotary bwd:  {localized_rotary_ms:.3f} ms"
-        f"\n  full-chip two quant:          {ordinary_quant_ms:.3f} ms"
-        f"\n  localized two quant:          {localized_quant_ms:.3f} ms"
+        f"\n  full-chip quant:              {ordinary_quant_ms:.3f} ms"
+        f"\n  localized quant:              {localized_quant_ms:.3f} ms"
         f"\n  ordinary full pipeline:       {ordinary_pipeline_ms:.3f} ms"
         f"\n  localized full pipeline:      {localized_pipeline_ms:.3f} ms"
         f"\n  end-to-end speedup:           "
