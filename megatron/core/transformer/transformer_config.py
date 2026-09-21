@@ -1769,17 +1769,6 @@ class TransformerConfig(ModelParallelConfig):
                     "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
                     "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
                 )
-            if (
-                (self.mtp_num_layers or 0) > 0
-                and self.tensor_model_parallel_size > 1
-                and self.sequence_parallel
-            ):
-                raise ValueError(
-                    "MTP with tensor_model_parallel_size > 1, sequence_parallel=True, and "
-                    "cp_partition_mode='contiguous' has a known token-side padding-mask layout "
-                    "bug. This combination is temporarily unsupported and will be fixed in a "
-                    "follow-up change."
-                )
 
         if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":

@@ -1298,7 +1298,7 @@ def _run_mixed_model(model, batch, packed_seq_params, dp_cp_group):
 def test_mixed_gdn_gqa_model_cp_correctness(
     monkeypatch, model_type, dynamic_context_parallel, tp_size
 ):
-    """Compare mixed GDN/GQA(/MTP) models against a THD CP=1 baseline.
+    """Compare mixed GDN/GQA/MTP models against a THD CP=1 baseline.
 
     Each of the {fixed THD CP, DCP} x {GPTModel, HybridModel} x {TP1, TP2+SP} cases
     uses a no-CP reference with the same TP layout that processes one complete
@@ -1312,9 +1312,9 @@ def test_mixed_gdn_gqa_model_cp_correctness(
 
     seed = 1234
     sequence_parallel = tp_size > 1
-    # MTP with TP>1, SP and the contiguous CP layout is rejected by the config until
-    # its padding-mask layout issue is fixed, so the TP cases run without MTP.
-    mtp_num_layers = 0 if sequence_parallel else 1
+    # MTP runs in every case, including TP2+SP with the contiguous layout: MTP rolls the
+    # padding mask in the CP-local layout of its other token-side fields.
+    mtp_num_layers = 1
     reference_config = _make_mixed_model_config(
         linear_cp_mode="chunkwise",
         cp_partition_mode="zigzag",
@@ -1424,8 +1424,7 @@ def test_mixed_gdn_gqa_model_cp_correctness(
             ) == sequence_parallel
             assert (candidate_packed_seq_params.cp_partition_route is None) == sequence_parallel
         torch.testing.assert_close(candidate_loss, reference_loss, atol=5e-3, rtol=0.0)
-        if mtp_num_layers:
-            torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
+        torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
         assert_close("aggregated parameter gradients", candidate_grads, reference_grads, False)
 
         if sequence_parallel:

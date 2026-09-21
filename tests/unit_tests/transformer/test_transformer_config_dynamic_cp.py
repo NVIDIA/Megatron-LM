@@ -78,6 +78,17 @@ def cp_config(request):
             dict(
                 cp_partition_mode="contiguous",
                 experimental_attention_variant="gdn",
+                mtp_num_layers=1,
+                tensor_model_parallel_size=2,
+                sequence_parallel=True,
+            ),
+            None,
+            id="mtp-tp-sp-contiguous",
+        ),
+        pytest.param(
+            dict(
+                cp_partition_mode="contiguous",
+                experimental_attention_variant="gdn",
                 linear_cp_mode="headwise",
             ),
             "incompatible with GDN-family linear_cp_mode='headwise'",
