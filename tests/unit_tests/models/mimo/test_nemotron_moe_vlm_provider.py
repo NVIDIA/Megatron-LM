@@ -586,7 +586,12 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
 
     # Deliberately disagree with the grid to catch inheritance of stock CP.
     args = SimpleNamespace(
-        mimo_llm_ep=1, mimo_llm_expt_tp=1, vocab_size=64, seq_length=32, hybrid_layer_pattern="*"
+        mimo_llm_ep=1,
+        mimo_llm_expt_tp=1,
+        vocab_size=64,
+        seq_length=32,
+        hybrid_layer_pattern="*",
+        logit_dtype=None,
     )
     monkeypatch.setattr(
         provider,
