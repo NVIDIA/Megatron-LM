@@ -60,10 +60,7 @@ class ImplConfig:
     cross_entropy_fusion: bool = False
     hf_path: str = ""
     router_aux_loss_coef: float | None = None
-    # Forwarded to the primitives and to ``MagiMsaSettings.deterministic``: ordered (writer-rank/semaphore)
-    # accumulation in the msa_v1 backward instead of unordered atomics -> bitwise-reproducible runs (~4x slower
-    # MSA backward).
-    deterministic: bool = False
+    deterministic: bool = False  # also selects the ordered (bitwise-reproducible) msa_v1 backward
     optimizer_config: OptimizerConfig | None = None
     # Magi CP dispatch chunk (tokens; batch padded to chunk*cp), FP32 dK group-reduce, and the kernel
     # backend of the dense layers' native calc_attn. ``fa4`` is the production path; ``sdpa_ol`` is
@@ -260,13 +257,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
     )
     magi_msa.validate_device()
     if impl_cfg.deterministic and impl_cfg.magi_dense_kernel_backend == "fa4":
-        warnings.warn(
-            "ImplConfig.deterministic=True orders the msa_v1 (MSA layer) backward, but the dense layers' "
-            "fa4 calc_attn backward stays unordered (Magi: 'FA4 backend is not compatible with deterministic "
-            "mode'); runs are not bitwise reproducible end to end. Use magi_dense_kernel_backend='sdpa_ol' "
-            "(O(S^2) memory, short sequences only) for a fully deterministic run.",
-            stacklevel=2,
-        )
+        warnings.warn("deterministic=True: fa4 dense backward is not deterministic; use sdpa_ol for bitwise runs", stacklevel=2)
     magi_settings = magi_msa.MagiMsaSettings(
         chunk_size=impl_cfg.magi_chunk_size,
         high_precision_reduce=impl_cfg.magi_high_precision_reduce,

@@ -84,9 +84,7 @@ class MagiMsaSettings:
     chunk_size: int = 2048  # CP dispatch granularity (tokens); total tokens are padded to chunk_size * cp
     high_precision_reduce: bool = False  # FP32 required-dK group-reduce in backward
     dense_kernel_backend: str = "fa4"  # MAGI_ATTENTION_KERNEL_BACKEND for the dense layers' calc_attn (fa4 | sdpa_ol)
-    # Ordered (writer-rank/semaphore) FP32 accumulation in the msa_v1 sparse/KL backward and score-ordered indexer
-    # top-k: bitwise-reproducible dQ at the cost of the unordered atomic fast path.
-    deterministic: bool = False
+    deterministic: bool = False  # ordered msa_v1 backward (bitwise-reproducible, slower)
 
 
 def validate_kernel_shapes(
