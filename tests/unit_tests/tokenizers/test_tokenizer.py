@@ -447,6 +447,8 @@ def test_own_metadata_class(tmp_path):
 
 def test_multimodal_tokenizer():
     """Test MegatronMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     prompt_format = "qwen2p0"
     special_tokens = ["<image>"]
     image_tag_type = "nvlm"
@@ -461,11 +463,12 @@ def test_multimodal_tokenizer():
     assert (
         tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
     ), "encode-decode roundtrip failed"
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello! Can you summarize this image for me?"},
-        {"role": "user", "content": "<image>"},
+        {"role": "user", "content": [{"type": "image"}]},
         {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
         {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
@@ -485,10 +488,10 @@ def test_multimodal_tokenizer():
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
 
-    assert tokenizer._tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
-    assert tokenizer._tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
-        {"role": "user", "content": "<Image><image></Image>hello"}
-    ]
+    # Structured media parts keep the image sentinel between the configured tags.
+    [image_index] = np.flatnonzero(conv_tokens == DEFAULT_IMAGE_TOKEN_INDEX)
+    assert tokenizer.detokenize(conv_tokens[:image_index]).endswith("<Image>")
+    assert tokenizer.detokenize(conv_tokens[image_index + 1 :]).startswith("</Image>")
 
 
 def test_multimodal_gigatoken_tokenizer():
@@ -515,7 +518,7 @@ def test_multimodal_gigatoken_tokenizer():
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello! Can you summarize this image for me?"},
-        {"role": "user", "content": "<image>"},
+        {"role": "user", "content": [{"type": "image"}]},
         {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
         {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
@@ -535,13 +538,14 @@ def test_multimodal_gigatoken_tokenizer():
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
 
-    assert tokenizer._tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
-    assert tokenizer._tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
-        {"role": "user", "content": "<Image><image></Image>hello"}
-    ]
+    [image_index] = np.flatnonzero(conv_tokens == tokenizer.image_token_index)
+    assert tokenizer.detokenize(conv_tokens[:image_index]).endswith("<Image>")
+    assert tokenizer.detokenize(conv_tokens[image_index + 1 :]).startswith("</Image>")
 
 
-def test_multimodal_matches_gigatoken_tokenizer():
+@pytest.mark.parametrize("structured_image", [False, True])
+@pytest.mark.parametrize("skip_chat_template", [False, True])
+def test_multimodal_matches_gigatoken_tokenizer(structured_image, skip_chat_template):
     """Test default MegatronMultimodalTokenizer matches gigatoken."""
     prompt_format = "qwen2p0"
     special_tokens = ["<image>"]
@@ -566,17 +570,28 @@ def test_multimodal_matches_gigatoken_tokenizer():
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello! Can you summarize this image for me?"},
-        {"role": "user", "content": "<image>"},
+        {"role": "user", "content": [{"type": "image"}]},
         {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
         {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
 
+    if not structured_image:
+        conversation[2]["content"] = "An ordinary text message."
+
+    original_conversation = json.loads(json.dumps(conversation))
+
     # Test tokenization with return_target=False
     conv_tokens_default = tokenizer_default.tokenize_conversation(
-        conversation, return_target=False, add_generation_prompt=False
+        conversation,
+        return_target=False,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
     )
     conv_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
-        conversation, return_target=False, add_generation_prompt=False
+        conversation,
+        return_target=False,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
     )
     assert (
         conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
@@ -595,10 +610,16 @@ def test_multimodal_matches_gigatoken_tokenizer():
 
     # Test tokenization with return_target=True
     conv_tokens_default, target_tokens_default = tokenizer_default.tokenize_conversation(
-        conversation, return_target=True, add_generation_prompt=False
+        conversation,
+        return_target=True,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
     )
     conv_tokens_gigatoken, target_tokens_gigatoken = tokenizer_gigatoken.tokenize_conversation(
-        conversation, return_target=True, add_generation_prompt=False
+        conversation,
+        return_target=True,
+        add_generation_prompt=False,
+        skip_chat_template=skip_chat_template,
     )
     assert (
         conv_tokens_default.tolist() == conv_tokens_gigatoken.tolist()
@@ -607,9 +628,13 @@ def test_multimodal_matches_gigatoken_tokenizer():
         target_tokens_default.tolist() == target_tokens_gigatoken.tolist()
     ), "default and gigatoken tokenization do not match."
 
+    assert conversation == original_conversation, "Tokenization mutated the caller's input"
+
 
 def test_null_multimodal_tokenizer():
     """Test MegatronNullMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     vocab_size = 10000
     tokenizer = MegatronTokenizer.from_pretrained(
         metadata_path={"library": "null-multimodal"}, vocab_size=vocab_size
@@ -620,6 +645,7 @@ def test_null_multimodal_tokenizer():
     assert tokenizer.tokenize("1 22 333") == [1, 22, 333], "tokenization is failed."
 
     assert tokenizer.detokenize([1, 22, 333]) == "1 22 333", "detokenization is failed."
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
 
 def test_sft_tokenizer():

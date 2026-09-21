@@ -734,6 +734,50 @@ def _te_general_gemm(*args, **kwargs):
     return te_general_gemm(*args, **kwargs)
 
 
+@pytest.mark.parametrize("supported", [False, True])
+def test_te_native_device_metadata_workspace(monkeypatch, supported):
+    """Restrict the full-workspace exception and keep graph layouts isolated."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+
+    if not hasattr(te_gemm, "_get_grouped_cublas_workspace"):
+        # Exercise the compatibility hook even with TE releases predating the
+        # device-metadata API used in production.
+        def _mock_grouped_workspace(device, layout):
+            del layout
+            return torch.empty(
+                te_gemm.get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device
+            )
+
+        monkeypatch.setattr(
+            te_gemm, "_get_grouped_cublas_workspace", _mock_grouped_workspace, raising=False
+        )
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+        "te_supports_batch_invariant_grouped_gemm",
+        lambda device: supported,
+    )
+    unrestricted_bytes = te_gemm.get_cublas_workspace_size_bytes()
+    original_grouped_workspace = te_gemm._get_grouped_cublas_workspace
+    with set_batch_invariant_mode(True, backend="te_native"):
+        assert te_gemm.get_cublas_workspace_size_bytes() == 1024
+        device = torch.cuda.current_device()
+        if supported:
+            workspaces = [
+                te_gemm._get_grouped_cublas_workspace(device, layout)
+                for layout in ("TN", "NN", "NT")
+            ]
+            assert all(ws.numel() == unrestricted_bytes for ws in workspaces)
+            assert len({ws.data_ptr() for ws in workspaces}) == 3
+            assert te_gemm._get_grouped_cublas_workspace(device, "TN") is workspaces[0]
+        else:
+            with pytest.raises(RuntimeError, match="moe_use_grouped_tensor=False"):
+                te_gemm._get_grouped_cublas_workspace(device, "TN")
+
+    assert te_gemm._get_grouped_cublas_workspace is original_grouped_workspace
+    assert te_gemm.get_cublas_workspace_size_bytes() == unrestricted_bytes
+
+
 # ============================================================================
 # Numerical Tests for General GEMM
 # ============================================================================

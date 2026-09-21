@@ -65,7 +65,7 @@ RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_n
     esac
 EOF
 
-COPY README.md pyproject.toml uv.lock /workspace/
+COPY pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
@@ -94,6 +94,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
     UV_CONCURRENT_INSTALLS=1 uv sync -v \
         --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+        --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -121,10 +122,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" \
         -print -quit)
     test -n "${NCCL_EP_JIT_HEADERS}"
-    test -f "${NCCL_EP_JIT_HEADERS}/device/hybrid_ep.cuh"
+    test -f "${NCCL_EP_JIT_HEADERS}/device/ht_ep.cuh"
     mkdir -p /opt/nccl-ep/include
     cp -a "${NCCL_EP_JIT_HEADERS}" /opt/nccl-ep/include/
-    test -f /opt/nccl-ep/include/nccl_ep/device/hybrid_ep.cuh
+    cp -a "${NCCL_EP_JIT_HEADERS}/../nccl_ep.h" /opt/nccl-ep/include/
+    test -f /opt/nccl-ep/include/nccl_ep/device/ht_ep.cuh
+    test -f /opt/nccl-ep/include/nccl_ep.h
 EOF
 
 ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}
@@ -138,7 +141,7 @@ ENV NCCL_EP_JIT_BUILD_INCLUDE_DIR=/usr/include
 ENV NCCL_EP_JIT_CUDA_INCLUDE_DIR=/usr/local/cuda/include
 
 # Install DeepEP
-ARG DEEPEP_COMMIT=de0dd1185142c727b9c118aeb4cc4702e34deeba
+ARG DEEPEP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
@@ -184,6 +187,11 @@ RUN bash -ex <<"EOF"
     popd
     rm -rf DeepEP
 EOF
+
+# Install the local project after expensive dependency builds so README-only
+# changes do not invalidate those layers.
+COPY README.md /workspace/
+RUN uv pip install --no-build-isolation --no-deps -e /workspace
 
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
