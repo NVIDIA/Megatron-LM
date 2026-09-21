@@ -2,6 +2,8 @@
 
 """Tests for configurable defaults on the dynamic text generation server."""
 
+import os
+
 import pytest
 
 quart = pytest.importorskip("quart")
@@ -132,6 +134,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
 
     async def fake_run_text_gen_server(*args):
         captured["run_args"] = args
+        args[-1].send(True)  # the replica signals once it listens
 
     class FakeProcess:
         pid = 123
@@ -141,6 +144,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
             self.args = args
             self.daemon = daemon
             self.started = False
+            self.sentinel = os.pipe()[0]  # never readable: the fake replica stays alive
 
         def start(self):
             self.started = True
@@ -179,8 +183,9 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
     )
 
     # The port is taken from the socket; no fd is handed to the replica, which
-    # binds its own listener on that port.
-    assert captured["run_args"] == (
+    # binds its own listener on that port and reports readiness over the pipe.
+    *run_args, _ready_conn = captured["run_args"]
+    assert tuple(run_args) == (
         "tcp://coord:5555",
         tokenizer,
         3,
@@ -236,6 +241,9 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     class FakeListener:
         def fileno(self):
             return 23
+
+        def listen(self, backlog):
+            pass
 
         def close(self):
             captured["listener_closed"] = True
