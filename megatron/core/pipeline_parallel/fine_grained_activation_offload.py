@@ -1762,5 +1762,5 @@ class FineGrainedActivationOffloadingInterface:
 
     @staticmethod
     def end_block_capture_chunk(record_decoder_end=True):
-        """Close a capture-time forward (releases pending blocks; decoder: records the group end)."""
+        """Close a capture-time forward: release pending blocks; a decoder records its group end."""
         PipelineOffloadManager.get_instance().end_block_capture_chunk(record_decoder_end)

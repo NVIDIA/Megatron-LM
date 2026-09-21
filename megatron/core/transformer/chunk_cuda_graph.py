@@ -407,7 +407,8 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
         self._add_graph_dynamic_dsa_route_static_inputs(inputs, cu_seqlens, max_tokens)
         if mtp_on_this_stage:
             # Full length on every stage: the model hands the post-process the caller's padding
-            # mask (the MTP rolls it alongside input_ids); only the decoder gets the SP-scattered copy.
+            # mask (the MTP rolls it alongside input_ids); only the decoder gets the SP-scattered
+            # copy.
             inputs["padding_mask"] = torch.zeros(1, tokens, dtype=torch.bool, device=device)
         return inputs
 
