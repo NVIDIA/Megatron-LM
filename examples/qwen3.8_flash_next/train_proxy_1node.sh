@@ -22,6 +22,23 @@ cd "$MLM" || exit 2
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Megatron asserts lr_warmup_steps < lr_decay_steps, and lr_decay_steps follows
+# --train-iters. The defaults below are 200/20; a short smoke run such as
+#   ./train_proxy_1node.sh --train-iters 3
+# would therefore trip that assertion on an argument the caller never touched. Scale the
+# warmup with the requested iteration count so the documented smoke command works, while
+# still letting an explicit --lr-warmup-iters later on the command line win.
+TRAIN_ITERS=200
+LR_WARMUP_ITERS=20
+_prev=""
+for _arg in "$@"; do
+    if [ "$_prev" = "--train-iters" ]; then TRAIN_ITERS="$_arg"; fi
+    _prev="$_arg"
+done
+if [ "$TRAIN_ITERS" -le "$LR_WARMUP_ITERS" ]; then
+    LR_WARMUP_ITERS=$(( TRAIN_ITERS > 1 ? TRAIN_ITERS - 1 : 0 ))
+fi
+
 python -m torch.distributed.run --nproc_per_node 4 --nnodes 1 pretrain_hybrid.py \
     --hybrid-layer-pattern GEGEGEQEGEGEGEQE/QE \
     --spec megatron.core.models.hybrid.hybrid_layer_specs gated_residual_hybrid_stack_spec \
@@ -55,8 +72,8 @@ python -m torch.distributed.run --nproc_per_node 4 --nnodes 1 pretrain_hybrid.py
     --micro-batch-size 1 --global-batch-size 16 \
     --bf16 --transformer-impl transformer_engine --enable-experimental \
     --cross-entropy-loss-fusion --cross-entropy-fusion-impl native \
-    --train-iters 200 --lr 3.0e-4 --min-lr 3.0e-5 --lr-decay-style cosine \
-    --lr-warmup-iters 20 --lr-warmup-init 0.0 --weight-decay 0.1 --clip-grad 1.0 \
+    --train-iters "$TRAIN_ITERS" --lr 3.0e-4 --min-lr 3.0e-5 --lr-decay-style cosine \
+    --lr-warmup-iters "$LR_WARMUP_ITERS" --lr-warmup-init 0.0 --weight-decay 0.1 --clip-grad 1.0 \
     --adam-beta1 0.9 --adam-beta2 0.95 --init-method-std 0.02 --seed 1234 \
     --log-interval 1 --log-memory-interval 1 --log-throughput \
     --eval-iters 0 --eval-interval 100 \
