@@ -2985,6 +2985,78 @@ def test_cudnn_sparse_attention_declines_without_safe_backward_tile(monkeypatch,
     assert output is None
 
 
+def test_cudnn_attention_backward_real_kernel_handles_infinite_lse_empty_row():
+    _skip_if_fused_dsa_unavailable()
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    sq = 2
+    batch_size = 1
+    num_heads = 64
+    attn_dim = 576
+    value_dim = 512
+    skv = 64
+    topk_width = 64
+
+    q_flat = torch.randn(
+        (sq * batch_size, num_heads, attn_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    kv_flat = torch.randn((skv * batch_size, attn_dim), dtype=torch.bfloat16, device="cuda")
+    attn_sink = torch.full((num_heads,), float("-inf"), dtype=torch.float32, device="cuda")
+    global_idxs = torch.zeros((sq * batch_size, topk_width), dtype=torch.int32, device="cuda")
+    out_flat = torch.zeros(
+        (sq * batch_size, num_heads, value_dim), dtype=torch.bfloat16, device="cuda"
+    )
+
+    def run_backward(lse, topk_length, grad_output):
+        return dsa_cudnn_kernels._run_sparse_attention_backward(
+            q_flat=q_flat,
+            kv_flat=kv_flat,
+            attn_sink=attn_sink,
+            global_idxs=global_idxs,
+            out_flat=out_flat,
+            lse=lse,
+            topk_length=topk_length,
+            softmax_scale=attn_dim**-0.5,
+            sq=sq,
+            b=batch_size,
+            num_heads=num_heads,
+            d=attn_dim,
+            skv=skv,
+            grad_output=grad_output,
+        )
+
+    grad_output = torch.randn(
+        (sq, batch_size, num_heads, value_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    baseline_grad_output = grad_output.clone()
+    baseline_grad_output[1] = 0
+    baseline_grad_query, baseline_grad_kv = run_backward(
+        torch.zeros((sq * batch_size, num_heads), dtype=torch.float32, device="cuda"),
+        torch.ones((sq * batch_size,), dtype=torch.int32, device="cuda"),
+        baseline_grad_output,
+    )
+
+    topk_length = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
+    lse = torch.zeros((sq * batch_size, num_heads), dtype=torch.float32, device="cuda")
+    lse[1] = float("inf")
+    original_topk_length = topk_length.clone()
+    original_lse = lse.clone()
+    original_grad_output = grad_output.clone()
+    grad_query, grad_kv = run_backward(lse, topk_length, grad_output)
+
+    assert torch.isfinite(grad_query).all()
+    assert torch.isfinite(grad_kv).all()
+    assert torch.count_nonzero(baseline_grad_query[0]).item() > 0
+    assert torch.count_nonzero(baseline_grad_kv).item() > 0
+    assert torch.count_nonzero(grad_query[1]).item() == 0
+    torch.testing.assert_close(grad_query[0], baseline_grad_query[0], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(grad_kv, baseline_grad_kv, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, original_lse)
+    torch.testing.assert_close(grad_output, original_grad_output)
+    torch.testing.assert_close(topk_length, original_topk_length)
+
+
 # Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
 # case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
 # kernel/build root cause is resolved.
@@ -3050,11 +3122,7 @@ def test_cudnn_attention_backward_supports_small_local_head_count():
     assert weights.grad is None
 
 
-# Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
-# case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the
-# kernel/build root cause is resolved.
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for head padding")
 def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
     seen = {}
 
@@ -3071,28 +3139,36 @@ def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
                 attn_sink.shape,
                 indices.shape,
             )
+            seen["grad_out"] = grad_out.detach().clone()
+            seen["lse"] = lse.detach().clone()
+            seen["topk_length"] = _kwargs["topk_length"].detach().clone()
             return {"dq": torch.zeros_like(q), "dkv": torch.zeros_like(kv)}
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
 
     sq, batch_size, num_heads, attn_dim, value_dim, skv = 2, 1, 8, 4, 3, 4
+    lse = torch.zeros((sq * batch_size, num_heads), device="cuda")
+    topk_length = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    grad_output = torch.zeros((sq, batch_size, num_heads, value_dim), device="cuda")
+    grad_output[0] = float("nan")
+    original_grad_output = grad_output.clone()
+
     grad_query, grad_kv = dsa_cudnn_kernels._run_sparse_attention_backward(
         q_flat=torch.zeros((sq * batch_size, num_heads, attn_dim), device="cuda"),
         kv_flat=torch.zeros((skv * batch_size, attn_dim), device="cuda"),
         attn_sink=torch.zeros(num_heads, device="cuda"),
         global_idxs=torch.zeros((sq * batch_size, 2), dtype=torch.int32, device="cuda"),
         out_flat=torch.zeros((sq * batch_size, num_heads, value_dim), device="cuda"),
-        lse=torch.zeros((sq * batch_size, num_heads), device="cuda"),
-        topk_length=torch.full((sq * batch_size,), 2, dtype=torch.int32, device="cuda"),
+        lse=lse,
+        topk_length=topk_length,
         softmax_scale=1.0,
         sq=sq,
         b=batch_size,
         num_heads=num_heads,
         d=attn_dim,
         skv=skv,
-        grad_output=torch.zeros((sq, batch_size, num_heads, value_dim), device="cuda"),
-        all_topk_rows_nonempty=True,
+        grad_output=grad_output,
     )
 
     assert seen["shapes"] == (
@@ -3103,6 +3179,14 @@ def test_cudnn_attention_backward_pads_small_local_head_count(monkeypatch):
         torch.Size([64]),
         torch.Size([2, 2]),
     )
+    torch.testing.assert_close(seen["grad_out"][0], torch.zeros_like(seen["grad_out"][0]))
+    torch.testing.assert_close(seen["lse"][0], torch.full_like(seen["lse"][0], float("inf")))
+    torch.testing.assert_close(
+        seen["topk_length"], torch.tensor([1, 2], dtype=torch.int32, device="cuda")
+    )
+    torch.testing.assert_close(grad_output, original_grad_output, equal_nan=True)
+    torch.testing.assert_close(lse, torch.zeros_like(lse))
+    torch.testing.assert_close(topk_length, torch.tensor([0, 2], dtype=torch.int32, device="cuda"))
     assert grad_query.shape == (sq, batch_size, num_heads, attn_dim)
     assert grad_kv.shape == (skv, batch_size, attn_dim)
 

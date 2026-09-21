@@ -2446,10 +2446,17 @@ def _run_sparse_attention_backward(
     if not all_topk_rows_nonempty:
         empty_rows = topk_length <= 0
         topk_length = topk_length.masked_fill(empty_rows, 1)
-        bwd_dO_flat = bwd_dO_flat.masked_fill(empty_rows[:, None, None], 0)
         # FlashMLA already returns zero output and LSE=+inf for empty rows. Preserve
         # that LSE invariant after promoting them to one safe tile so probabilities stay zero.
-        bwd_lse = bwd_lse.masked_fill(empty_rows[:, None], float("inf"))
+        if padded_num_heads != num_heads:
+            # Head padding allocated private buffers above, so masking them in-place avoids
+            # copying the padded dO and LSE a second time.
+            bwd_dO_flat.masked_fill_(empty_rows[:, None, None], 0)
+            bwd_lse.masked_fill_(empty_rows[:, None], float("inf"))
+        else:
+            # Without padding these alias grad_output and the saved forward LSE.
+            bwd_dO_flat = bwd_dO_flat.masked_fill(empty_rows[:, None, None], 0)
+            bwd_lse = bwd_lse.masked_fill(empty_rows[:, None], float("inf"))
 
     attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
         bwd_q_flat,
