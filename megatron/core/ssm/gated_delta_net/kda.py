@@ -26,10 +26,10 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     get_parameter_local_cp,
 )
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -65,7 +65,7 @@ class KimiDeltaAttention(_GDNBase):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: KDALayerConfig,
         submodules: KimiDeltaAttentionSubmodules,
         layer_number: int | None = None,
         bias: bool = False,
