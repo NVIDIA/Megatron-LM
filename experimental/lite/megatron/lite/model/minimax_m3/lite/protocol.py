@@ -245,6 +245,8 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         raise NotImplementedError(
             "MiniMax-M3 Magi requires tp=1 in this drop (msa_v1 kernels are fixed to 64/4/4 heads); use CP/EP/PP"
         )
+    if p.vpp > 1:
+        raise NotImplementedError("MiniMax-M3 Magi requires vpp=1: interleaved VPP uses a fixed inter-stage shape")
     magi_msa.validate_kernel_shapes(
         num_attention_heads=model_cfg.num_attention_heads,
         num_key_value_heads=model_cfg.num_key_value_heads,
@@ -361,7 +363,6 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         forward_step=_forward_step,
         extras={
             "model_cfg": model_cfg,
-            "magi_settings": magi_settings,
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
             "pre_forward_hook": _make_aux_loss_hook(),

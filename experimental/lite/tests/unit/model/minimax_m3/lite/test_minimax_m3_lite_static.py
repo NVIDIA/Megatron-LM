@@ -95,7 +95,7 @@ def test_impl_config_defaults_to_the_magi_production_path():
     assert cfg.optimizer == "dist_opt"
 
 
-def test_protocol_rejects_tensor_parallel_and_thd():
+def test_protocol_rejects_tensor_parallel_thd_and_vpp():
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
     from megatron.lite.model.minimax_m3.lite import protocol as P
     from megatron.lite.runtime.contracts import ParallelConfig
@@ -104,6 +104,8 @@ def test_protocol_rejects_tensor_parallel_and_thd():
         P.build_model(MiniMaxM3Config(), impl_cfg=P.ImplConfig(parallel=ParallelConfig(tp=2), optimizer=None))
     with pytest.raises(NotImplementedError, match="use_thd"):
         P.build_model(MiniMaxM3Config(), impl_cfg=P.ImplConfig(use_thd=True, optimizer=None))
+    with pytest.raises(NotImplementedError, match="vpp=1"):
+        P.build_model(MiniMaxM3Config(), impl_cfg=P.ImplConfig(parallel=ParallelConfig(pp=2, vpp=2), optimizer=None))
 
 
 def test_protocol_builds_the_magi_backend(monkeypatch):
@@ -136,8 +138,8 @@ def test_protocol_builds_the_magi_backend(monkeypatch):
     bundle = P.build_model(MiniMaxM3Config(), impl_cfg=P.ImplConfig(optimizer=None))
     assert seen["msa_backend"] == "magi"
     assert bundle.forward_step is P._forward_step
-    assert bundle.extras["magi_settings"] is not None
-    assert bundle.extras["magi_settings"].deterministic is False
+    assert "magi_settings" not in bundle.extras
+    assert bundle.chunks[0].magi_settings.deterministic is False
 
 
 def test_forward_step_pads_and_dispatches_the_packed_batch(monkeypatch):
