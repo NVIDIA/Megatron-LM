@@ -3,6 +3,7 @@
 """THD context-parallel route helpers."""
 
 import warnings
+from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -16,7 +17,10 @@ from megatron.core.utils import nvtx_range
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
 
+# (global_start, length, local_start): a run of packed tokens that one rank holds locally.
 _ThdLayoutSegment = Tuple[int, int, int]
+# (source_local_start, target_local_start, length, global_start)
+_ThdLayoutIntersection = Tuple[int, int, int, int]
 
 
 def _materialize_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
@@ -121,10 +125,72 @@ def _build_thd_layout_segments(
     return segments, local_start
 
 
+def _restrict_thd_layout_segments(
+    segments: List[_ThdLayoutSegment], window_start: int, window_length: int
+) -> List[_ThdLayoutSegment]:
+    """Keep the part of a rank's layout that falls into one window of its local rows.
+
+    The window is a contiguous range of the CP rank's local token order, i.e. one
+    sequence-parallel shard. Local starts of the returned segments are relative to
+    the window, so the result describes the rows the shard owner actually holds.
+    """
+    window_end = window_start + window_length
+    restricted: List[_ThdLayoutSegment] = []
+    for global_start, length, local_start in segments:
+        local_end = local_start + length
+        overlap_start = max(local_start, window_start)
+        overlap_end = min(local_end, window_end)
+        if overlap_start < overlap_end:
+            restricted.append(
+                (
+                    global_start + overlap_start - local_start,
+                    overlap_end - overlap_start,
+                    overlap_start - window_start,
+                )
+            )
+    return restricted
+
+
+def _build_thd_tp_cp_layout_segments(
+    cu: List[int], cp_size: int, tp_size: int, cp_partition_mode: CpPartitionMode
+) -> Tuple[List[List[_ThdLayoutSegment]], int]:
+    """Return the local segments of every (cp_rank, tp_rank) sequence-parallel shard.
+
+    The result is indexed by the logical rank ``cp_rank * tp_size + tp_rank`` and also
+    returns the shard length shared by all ranks. Sequence parallelism splits each CP
+    rank's local packed sequence into ``tp_size`` equal contiguous windows.
+    """
+    segments_by_logical_rank: List[List[_ThdLayoutSegment]] = []
+    shard_length: Optional[int] = None
+    for cp_rank in range(cp_size):
+        segments, local_length = _build_thd_layout_segments(cu, cp_size, cp_rank, cp_partition_mode)
+        if local_length % tp_size != 0:
+            raise ValueError(
+                "Sequence-parallel THD CP layout conversion requires the CP rank-local token "
+                f"count ({local_length}) to be divisible by tp_size={tp_size} "
+                f"(cp_size={cp_size}, layout={cp_partition_mode!r})."
+            )
+        rank_shard_length = local_length // tp_size
+        if shard_length is None:
+            shard_length = rank_shard_length
+        elif shard_length != rank_shard_length:
+            raise ValueError(
+                "THD CP layouts must give every CP rank the same local token count, got "
+                f"{shard_length * tp_size} and {local_length} for layout {cp_partition_mode!r}."
+            )
+        for tp_rank in range(tp_size):
+            segments_by_logical_rank.append(
+                _restrict_thd_layout_segments(
+                    segments, tp_rank * rank_shard_length, rank_shard_length
+                )
+            )
+    return segments_by_logical_rank, shard_length or 0
+
+
 def _intersect_thd_layout_segments(
     source_segments: List[_ThdLayoutSegment], target_segments: List[_ThdLayoutSegment]
-) -> List[Tuple[int, int, int]]:
-    intersections: List[Tuple[int, int, int]] = []
+) -> List[_ThdLayoutIntersection]:
+    intersections: List[_ThdLayoutIntersection] = []
     source_index = 0
     target_index = 0
     while source_index < len(source_segments) and target_index < len(target_segments):
@@ -141,6 +207,7 @@ def _intersect_thd_layout_segments(
                     source_local_start + overlap_start - source_global_start,
                     target_local_start + overlap_start - target_global_start,
                     overlap_end - overlap_start,
+                    overlap_start,
                 )
             )
 
@@ -158,15 +225,22 @@ def _build_thd_layout_side_route(
     *,
     device: torch.device,
 ) -> Tuple[Optional[torch.Tensor], List[int]]:
+    """Order one rank's local rows by communication peer.
+
+    ``target_segments_by_rank`` must be ordered by the communication group's rank order.
+    Within one peer, rows are ordered by global token position; both sides of an exchange
+    derive their order from the same intersections, so the k-th row sent to a peer is the
+    k-th row that peer expects from us. For the zigzag and contiguous layouts every rank's
+    local order is already monotonic in global position, so this equals the previous
+    target-local ordering and the CP-only routes are unchanged.
+    """
     row_order: List[int] = []
     split_sizes: List[int] = []
-    for peer_rank in range(len(target_segments_by_rank)):
-        intersections = _intersect_thd_layout_segments(
-            local_segments, target_segments_by_rank[peer_rank]
-        )
-        intersections.sort(key=lambda item: item[1])
+    for peer_segments in target_segments_by_rank:
+        intersections = _intersect_thd_layout_segments(local_segments, peer_segments)
+        intersections.sort(key=lambda item: item[3])
         split_size = 0
-        for source_row, _, length in intersections:
+        for source_row, _, length, _ in intersections:
             row_order.extend(range(source_row, source_row + length))
             split_size += length
         split_sizes.append(split_size)
@@ -248,6 +322,192 @@ def build_thd_cp_partition_route(
         return _build_thd_cp_partition_route_from_host(cu, cp_size, cp_rank, device=device)
 
 
+def _validate_group_rank_by_logical_rank(
+    group_rank_by_logical_rank: Tuple[int, ...], cp_size: int, tp_size: int
+) -> None:
+    group_size = cp_size * tp_size
+    if sorted(group_rank_by_logical_rank) != list(range(group_size)):
+        raise ValueError(
+            "group_rank_by_logical_rank must be a permutation of the TP x CP group ranks "
+            f"(group_size={group_size}), got {group_rank_by_logical_rank}."
+        )
+
+
+def _build_thd_tp_cp_partition_route_from_host(
+    cu: List[int],
+    cp_size: int,
+    cp_rank: int,
+    tp_size: int,
+    tp_rank: int,
+    group_rank_by_logical_rank: Tuple[int, ...],
+    *,
+    device: torch.device,
+) -> ThdCpRoute:
+    """Build the fused TP x CP THD route of one sequence-parallel shard from host boundaries.
+
+    The shard held by ``(tp_rank, cp_rank)`` is exchanged directly with every other
+    ``(tp_rank', cp_rank')`` shard of the TP x CP group, replacing the TP gather ->
+    CP all-to-all -> TP scatter composition with a single all-to-all-v. The result is a
+    plain :class:`ThdCpRoute` whose split sizes follow the TP x CP group's rank order.
+    """
+    _validate_thd_route_partitioning(cu, cp_size)
+    _validate_group_rank_by_logical_rank(group_rank_by_logical_rank, cp_size, tp_size)
+
+    zigzag_by_logical_rank, zigzag_shard_length = _build_thd_tp_cp_layout_segments(
+        cu, cp_size, tp_size, "zigzag"
+    )
+    contiguous_by_logical_rank, contiguous_shard_length = _build_thd_tp_cp_layout_segments(
+        cu, cp_size, tp_size, "contiguous"
+    )
+    if zigzag_shard_length != contiguous_shard_length:
+        raise ValueError(
+            "THD CP layout conversion must preserve the sequence-parallel shard length, got "
+            f"zigzag={zigzag_shard_length}, contiguous={contiguous_shard_length} for "
+            f"cp_size={cp_size}, tp_size={tp_size}."
+        )
+
+    group_size = cp_size * tp_size
+    zigzag_by_group_rank: List[List[_ThdLayoutSegment]] = [[] for _ in range(group_size)]
+    contiguous_by_group_rank: List[List[_ThdLayoutSegment]] = [[] for _ in range(group_size)]
+    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+        zigzag_by_group_rank[group_rank] = zigzag_by_logical_rank[logical_rank]
+        contiguous_by_group_rank[group_rank] = contiguous_by_logical_rank[logical_rank]
+
+    local_logical_rank = cp_rank * tp_size + tp_rank
+    zigzag_index, zigzag_split_sizes = _build_thd_layout_side_route(
+        zigzag_by_logical_rank[local_logical_rank], contiguous_by_group_rank, device=device
+    )
+    contiguous_index, contiguous_split_sizes = _build_thd_layout_side_route(
+        contiguous_by_logical_rank[local_logical_rank], zigzag_by_group_rank, device=device
+    )
+
+    for name, split_sizes in (
+        ("Zigzag", zigzag_split_sizes),
+        ("Contiguous", contiguous_split_sizes),
+    ):
+        if sum(split_sizes) != zigzag_shard_length:
+            raise ValueError(
+                f"{name} THD TP x CP route split sizes do not match the sequence-parallel shard "
+                f"length: splits={split_sizes}, shard_length={zigzag_shard_length}."
+            )
+
+    return ThdCpRoute(
+        zigzag_index=zigzag_index,
+        zigzag_split_sizes=zigzag_split_sizes,
+        contiguous_index=contiguous_index,
+        contiguous_split_sizes=contiguous_split_sizes,
+    )
+
+
+def build_thd_tp_cp_partition_route(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    tp_size: int,
+    tp_rank: int,
+    group_rank_by_logical_rank: Tuple[int, ...],
+    *,
+    device: Optional[torch.device] = None,
+) -> ThdCpRoute:
+    """Precompute the fused TP x CP THD route of this rank's sequence-parallel shard.
+
+    ``group_rank_by_logical_rank[cp_rank * tp_size + tp_rank]`` is the rank of that
+    coordinate inside the TP x CP communication group (see
+    :func:`get_tp_cp_group_rank_by_logical_rank`).
+    """
+    if cp_size < 1 or tp_size < 1:
+        raise ValueError(f"cp_size and tp_size must be >= 1, got {cp_size} and {tp_size}.")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}.")
+    if device is None:
+        device = cu_seqlens.device
+
+    with nvtx_range("cp_layout/thd/tp_cp_route"):
+        cu = _compact_thd_cu_seqlens_to_list(cu_seqlens)
+        return _build_thd_tp_cp_partition_route_from_host(
+            cu, cp_size, cp_rank, tp_size, tp_rank, tuple(group_rank_by_logical_rank), device=device
+        )
+
+
+@lru_cache(maxsize=None)
+def build_tp_cp_group_rank_by_logical_rank(
+    cp_global_ranks: Tuple[int, ...],
+    tp_global_ranks: Tuple[int, ...],
+    tp_cp_global_ranks: Tuple[int, ...],
+    current_global_rank: int,
+) -> Tuple[int, ...]:
+    """Map logical ``cp_rank * tp_size + tp_rank`` coordinates to TP x CP group ranks.
+
+    The TP and CP groups of the calling rank span a Cartesian product inside the
+    TP x CP group: the global rank at logical coordinate ``(cp_rank, tp_rank)`` is
+    ``cp_global_ranks[cp_rank] + tp_global_ranks[tp_rank] - current_global_rank``.
+    Raises ``RuntimeError`` when the supplied groups do not form that product
+    (for example a dynamic CP sub-group paired with the static TP x CP group).
+    """
+    group_rank_by_global_rank = {
+        global_rank: group_rank for group_rank, global_rank in enumerate(tp_cp_global_ranks)
+    }
+    if len(group_rank_by_global_rank) != len(cp_global_ranks) * len(tp_global_ranks):
+        raise RuntimeError("TP and CP process groups do not form the expected Cartesian product")
+    group_rank_by_logical_rank = []
+    for cp_global_rank in cp_global_ranks:
+        for tp_global_rank in tp_global_ranks:
+            target_global_rank = cp_global_rank + tp_global_rank - current_global_rank
+            if target_global_rank not in group_rank_by_global_rank:
+                raise RuntimeError(
+                    "TP and CP process groups do not form the expected Cartesian product"
+                )
+            group_rank_by_logical_rank.append(group_rank_by_global_rank[target_global_rank])
+    if len(set(group_rank_by_logical_rank)) != len(group_rank_by_logical_rank):
+        raise RuntimeError("TP and CP process groups do not form the expected Cartesian product")
+    return tuple(group_rank_by_logical_rank)
+
+
+def get_tp_cp_group_rank_by_logical_rank(
+    cp_group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
+    tp_cp_group: torch.distributed.ProcessGroup,
+) -> Tuple[int, ...]:
+    """Return the logical-to-group rank mapping of the calling rank's TP x CP group."""
+    return build_tp_cp_group_rank_by_logical_rank(
+        cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(cp_group)),
+        tp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_group)),
+        tp_cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_cp_group)),
+        current_global_rank=torch.distributed.get_rank(),
+    )
+
+
+def resolve_tp_cp_group_rank_by_logical_rank(
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    tp_cp_group: Optional[torch.distributed.ProcessGroup],
+) -> Optional[Tuple[int, ...]]:
+    """Return the TP x CP rank mapping, or None when the groups cannot be fused.
+
+    None means the caller has to fall back to composing TP and CP collectives: no
+    TP x CP group was supplied, or the CP group is not the one the TP x CP group was
+    built from (dynamic context parallelism swaps in a sub-group per microbatch).
+    """
+    if cp_group is None or tp_group is None or tp_cp_group is None:
+        return None
+    if tp_cp_group.size() != cp_group.size() * tp_group.size():
+        return None
+    try:
+        return get_tp_cp_group_rank_by_logical_rank(cp_group, tp_group, tp_cp_group)
+    except RuntimeError:
+        return None
+
+
+def _thd_route_host_cu_seqlens(packed_seq_params: "PackedSeqParams") -> Optional[List[int]]:
+    """Return the compact host boundaries stored by a previous route prebuild, if any."""
+    host_cu = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+    if host_cu is None:
+        return None
+    return list(host_cu)
+
+
 def get_thd_cp_partition_route(
     packed_seq_params: Optional["PackedSeqParams"],
     source_partition_mode: CpPartitionMode,
@@ -292,13 +552,84 @@ def get_thd_cp_partition_route(
     return getattr(packed_seq_params, "cp_partition_route", None)
 
 
+def get_thd_tp_cp_partition_route(
+    packed_seq_params: Optional["PackedSeqParams"],
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    tp_cp_group: Optional[torch.distributed.ProcessGroup],
+) -> Optional[ThdCpRoute]:
+    """Return the fused TP x CP route of this rank's sequence-parallel THD shard.
+
+    Like :func:`get_thd_cp_partition_route`, this returns the route stored on
+    ``packed_seq_params`` (``tp_cp_partition_route``) when present and otherwise
+    builds and caches one. Building reuses the compact host boundaries left by the
+    CP route prebuild when present, so it does not add a device-to-host copy in that
+    case. Returns None when no conversion is needed, the input is not THD, or the
+    groups cannot be fused (see :func:`resolve_tp_cp_group_rank_by_logical_rank`),
+    in which case the caller falls back to the composed CP-only conversion.
+    """
+    if source_partition_mode == target_partition_mode:
+        return None
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return None
+    if tp_group is None or tp_group.size() <= 1 or cp_group is None or cp_group.size() <= 1:
+        return None
+    group_rank_by_logical_rank = resolve_tp_cp_group_rank_by_logical_rank(
+        cp_group, tp_group, tp_cp_group
+    )
+    if group_rank_by_logical_rank is None:
+        return None
+
+    route = getattr(packed_seq_params, "tp_cp_partition_route", None)
+    if route is not None:
+        return route
+
+    cu_q = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
+    if cu_q is None:
+        return None
+    host_cu = _thd_route_host_cu_seqlens(packed_seq_params)
+    if host_cu is None:
+        warnings.warn(
+            "THD PackedSeqParams is missing the precomputed TP x CP layout route and the "
+            "host cu_seqlens of a CP route prebuild. Building the route here synchronizes "
+            "cu_seqlens to CPU; prebuild routes when constructing the batch "
+            "(prebuild_thd_cp_partition_routes with tp_group and tp_cp_group).",
+            FutureWarning,
+            stacklevel=2,
+        )
+        host_cu = _compact_thd_cu_seqlens_to_list(cu_q)
+    with nvtx_range("cp_layout/thd/tp_cp_route"):
+        route = _build_thd_tp_cp_partition_route_from_host(
+            host_cu,
+            cp_group.size(),
+            cp_group.rank(),
+            tp_group.size(),
+            tp_group.rank(),
+            group_rank_by_logical_rank,
+            device=cu_q.device,
+        )
+    packed_seq_params.tp_cp_partition_route = route
+    return route
+
+
 def prebuild_thd_cp_partition_routes(
     packed_seq_params: Optional["PackedSeqParams"],
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     device: Optional[torch.device] = None,
 ) -> None:
-    """Prebuild the THD CP layout route for a packed microbatch."""
+    """Prebuild the THD CP layout route for a packed microbatch.
+
+    When ``tp_group`` (with more than one rank) and ``tp_cp_group`` are supplied and
+    form a Cartesian product with ``cp_group``, the fused TP x CP route used by
+    sequence-parallel layout conversion is prebuilt as well, from the same host copy
+    of ``cu_seqlens``.
+    """
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
         return
     if cp_group is None:
@@ -337,3 +668,21 @@ def prebuild_thd_cp_partition_routes(
     packed_seq_params.cp_partition_route = route
     packed_seq_params.thd_cp_host_cu_seqlens_q = host_q
     packed_seq_params.thd_cp_host_cu_seqlens_kv = host_kv
+
+    if tp_group is None or tp_group.size() <= 1:
+        return
+    group_rank_by_logical_rank = resolve_tp_cp_group_rank_by_logical_rank(
+        cp_group, tp_group, tp_cp_group
+    )
+    if group_rank_by_logical_rank is None:
+        return
+    with nvtx_range("cp_layout/thd/tp_cp_route"):
+        packed_seq_params.tp_cp_partition_route = _build_thd_tp_cp_partition_route_from_host(
+            host_q,
+            cp_size,
+            cp_rank,
+            tp_group.size(),
+            tp_group.rank(),
+            group_rank_by_logical_rank,
+            device=device,
+        )

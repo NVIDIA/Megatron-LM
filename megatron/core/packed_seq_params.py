@@ -17,9 +17,11 @@ class PackedSeqParams:
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
 
-    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route over the
+    CP group. ``tp_cp_partition_route`` is the same kind of plan for the fused TP x CP
+    conversion of sequence-parallel shards, with split sizes in TP x CP group order.
     Metadata annotation helpers update the current partition mode in-place while
-    preserving the route identity.
+    preserving the route identities.
     '''
 
     qkv_format: str = None
@@ -37,6 +39,7 @@ class PackedSeqParams:
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    tp_cp_partition_route: Optional["ThdCpRoute"] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
