@@ -683,7 +683,13 @@ class CheckpointFunction(torch.autograd.Function):
         # Copy the rng states.
         ctx.rng_states = _get_all_rng_states()
 
-        with torch.no_grad():
+        # the run and its re-run in backward are paired by this token: a MoE layer may keep its
+        # forward dispatch bookkeeping for the re-run (moe_cached_recompute_dispatch,
+        # moe/cached_recompute.py)
+        from megatron.core.transformer.moe.cached_recompute import checkpoint_scope
+
+        ctx.cached_recompute_key = object()
+        with torch.no_grad(), checkpoint_scope(ctx.cached_recompute_key, recompute=False):
             outputs = run_function(*args)
 
         # Divide hidden states across model parallel group and only keep
@@ -725,7 +731,10 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            from megatron.core.transformer.moe.cached_recompute import checkpoint_scope
+
+            # the re-run of the forward run this ctx recorded (cached_recompute.py)
+            with torch.enable_grad(), checkpoint_scope(ctx.cached_recompute_key, recompute=True):
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
