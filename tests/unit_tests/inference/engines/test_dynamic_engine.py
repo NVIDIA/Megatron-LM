@@ -1728,6 +1728,40 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     assert request.image_token_mask is None
 
 
+def test_finished_vlm_reply_omits_input_only_tensors():
+    request = DynamicVLMInferenceRequest(
+        request_id=31,
+        prompt_tokens=torch.tensor([99, 5]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        num_frames=torch.tensor([1]),
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(1, 1, 4),
+        image_token_mask=torch.tensor([0, -1]),
+    )
+    request.generated_tokens = [7]
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.payload_stager = None
+
+    serialized = engine._serialize_finished_request(request, None)
+
+    assert serialized["generated_tokens"] == [7]
+    for key in (
+        "imgs",
+        "num_tiles",
+        "imgs_sizes",
+        "num_frames",
+        "image_embeddings",
+        "image_token_mask",
+    ):
+        assert key in serialized
+        assert serialized[key] is None
+
+
 def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.allow_stale_multimodal_embeddings = True

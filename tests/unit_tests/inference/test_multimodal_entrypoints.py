@@ -51,6 +51,16 @@ class _ToyTokenizer:
     def detokenize(self, token_ids):
         return " ".join(str(token_id) for token_id in token_ids)
 
+    def tokenize(self, text):
+        parts = text.split("<image>")
+        tokens = []
+        for index, part in enumerate(parts):
+            if part:
+                tokens.append(42)
+            if index < len(parts) - 1:
+                tokens.append(_MEDIA_TOKEN_ID)
+        return tokens
+
 
 class _InlineLoopManager:
     async def run_async(self, awaitable):
@@ -77,6 +87,8 @@ def _toy_preprocessed_media(modality):
             "imgs": torch.ones(2, 3, 4, 4),
             "imgs_sizes": torch.tensor([[4, 4], [4, 4]], dtype=torch.int32),
             "num_frames": torch.tensor([2], dtype=torch.int32),
+            "video_frame_indices": [[0, 1]],
+            "video_fps": [1.0],
         }
     return {"imgs": torch.ones(1, 3, 4, 4), "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32)}
 

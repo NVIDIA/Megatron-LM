@@ -1451,5 +1451,7 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     image_token_mask: Optional[torch.Tensor] = None  # 1D, -1=text, >=0=image index
     imgs_sizes: Optional[torch.Tensor] = None
     num_frames: Optional[torch.Tensor] = None
+    video_frame_indices: Optional[List[List[int]]] = None
+    video_fps: Optional[List[float]] = None
     media_tokens_preexpanded: bool = False
     media_cache_key: Optional[str] = None

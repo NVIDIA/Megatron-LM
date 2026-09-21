@@ -10,9 +10,11 @@ can import it without circular dependencies.
 import io
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
@@ -39,7 +41,7 @@ def _resolve_pixel_stats(vision_model_type: str):
 
 
 def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional[bytes]):
-    """Load PIL images from a configured frame-sequence manifest."""
+    """Load frames and timing metadata from a configured frame-sequence manifest."""
     if not frame_manifest_magic or not payload.startswith(frame_manifest_magic):
         return None
 
@@ -59,13 +61,32 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
         or not all(isinstance(path, str) and path for path in frame_paths)
     ):
         raise ValueError("Frame-sequence manifest requires non-empty string frame_paths.")
+    metadata = manifest.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("Frame-sequence manifest metadata must be an object.")
+    frame_indices = metadata.get("frames_indices", list(range(len(frame_paths))))
+    fps = metadata.get("fps", 1.0)
+    if (
+        not isinstance(frame_indices, list)
+        or len(frame_indices) != len(frame_paths)
+        or any(type(index) is not int or index < 0 for index in frame_indices)
+    ):
+        raise ValueError(
+            "Frame-sequence manifest metadata.frames_indices must contain one "
+            "non-negative integer per frame."
+        )
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps):
+        raise ValueError("Frame-sequence manifest metadata.fps must be a finite number.")
+    fps = float(fps)
+    if fps <= 0:
+        raise ValueError("Frame-sequence manifest metadata.fps must be positive.")
 
     frames = []
     for frame_path in frame_paths:
         resolved = Path(frame_path).expanduser().resolve()
         with Image.open(resolved) as image:
             frames.append(image.convert("RGB").copy())
-    return frames
+    return frames, frame_indices, fps
 
 
 def dynamic_res_preprocess(
@@ -77,6 +98,7 @@ def dynamic_res_preprocess(
     pixel_shuffle=False,
     spatial_merge_size=1,
     video_maintain_aspect_ratio=None,
+    rounding_mode="ceil",
 ):
     """Resize image to fit within [min_patches, max_patches] preserving aspect ratio.
 
@@ -86,13 +108,10 @@ def dynamic_res_preprocess(
     For pixel_shuffle, patch grid dimensions are rounded to even numbers for
     compatibility.
 
-    NOTE: Training uses ``DynamicResolutionImageTilingStrategy._process_single``
-    (in megatron.energon.task_encoder.multimodal.image_tiling) as the canonical
-    resize. The math here is intentionally a subset of that strategy and could
-    drift if energon's implementation changes (e.g. ``min_side`` floor, tiling
-    augmentation). For full parity, inference should call into the energon
-    strategy directly — TODO once we have a clean way to import it that doesn't
-    require energon at engine-drain time.
+    ``rounding_mode`` makes the source processor's grid contract explicit.
+    The default preserves MCore/Energon ceil behavior; ``round_plus_half``
+    reproduces HF processors that intentionally use Python's half-to-even
+    ``round(x + 0.5)`` rule.
     """
     orig_width, orig_height = image.size
 
@@ -122,17 +141,33 @@ def dynamic_res_preprocess(
                 target_patch_width = max(grid_multiple, target_patch_width - width_remainder)
     else:
         grid_multiple = max(2 if pixel_shuffle else 1, spatial_merge_size)
-        # Use math.ceil, not round(x + 0.5) — the latter is banker's rounding and
-        # produces off-by-one, non-monotonic patch counts on exactly-aligned sides.
-        closest_patch_height = math.ceil(orig_height / res_step)
-        closest_patch_width = math.ceil(orig_width / res_step)
+        if rounding_mode == "ceil":
+            closest_patch_height = math.ceil(orig_height / res_step)
+            closest_patch_width = math.ceil(orig_width / res_step)
+        elif rounding_mode == "round_plus_half":
+            # Some HF processors intentionally use Python's half-to-even
+            # ``round(x + 0.5)`` contract. Preserve it exactly: replacing this
+            # with ceil changes the projected-token count for aligned odd grids.
+            closest_patch_height = round(orig_height / res_step + 0.5)
+            closest_patch_width = round(orig_width / res_step + 0.5)
+        else:
+            raise ValueError(
+                "rounding_mode must be 'ceil' or 'round_plus_half', got "
+                f"{rounding_mode!r}."
+            )
         patches = closest_patch_height * closest_patch_width
 
         factor = min(math.sqrt(max_patches / patches), factor_max)
         target_patch_height = math.floor(factor * closest_patch_height)
         target_patch_width = math.floor(factor * closest_patch_width)
 
-        if target_patch_height * target_patch_width < min_patches:
+        should_enforce_minimum = (
+            rounding_mode != "round_plus_half" or max_patches > min_patches
+        )
+        if (
+            should_enforce_minimum
+            and target_patch_height * target_patch_width < min_patches
+        ):
             up_factor = math.sqrt(min_patches / max(target_patch_height * target_patch_width, 1))
             target_patch_height = math.ceil(up_factor * target_patch_height)
             target_patch_width = math.ceil(up_factor * target_patch_width)
@@ -174,6 +209,7 @@ def preprocess_image(
         ) from exc
 
     img = image.convert("RGB")
+    source_img = img
 
     patch_dim = config.patch_dim
 
@@ -188,6 +224,7 @@ def preprocess_image(
             res_step=patch_dim,
             pixel_shuffle=config.pixel_shuffle,
             spatial_merge_size=config.spatial_merge_size,
+            rounding_mode=config.dynamic_resolution_rounding_mode,
         )
 
     vision_type = config.vision_model_type
@@ -196,9 +233,38 @@ def preprocess_image(
     if pixel_mean is None or pixel_std is None:
         pixel_mean, pixel_std = _resolve_pixel_stats(vision_type)
 
-    transform = T.Compose([T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)])
+    if config.dynamic_resolution_resize_mode == "pil":
+        transform = T.Compose(
+            [T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)]
+        )
+        img_tensor = transform(img)  # [C, H, W]
+    elif config.dynamic_resolution_resize_mode == "torch_bicubic_antialias":
+        import torch.nn.functional as F
 
-    img_tensor = transform(img)  # [C, H, W]
+        target_hw = (img.height, img.width)
+        source_array = np.asarray(source_img, dtype=np.uint8)
+        img_tensor = (
+            torch.from_numpy(source_array)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(dtype=torch.float32)
+        )
+        if img_tensor.shape[-2:] != target_hw:
+            img_tensor = F.interpolate(
+                img_tensor,
+                size=target_hw,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        mean = torch.tensor(pixel_mean, dtype=img_tensor.dtype).view(1, -1, 1, 1)
+        std = torch.tensor(pixel_std, dtype=img_tensor.dtype).view(1, -1, 1, 1)
+        img_tensor = ((img_tensor / 255.0 - mean) / std).squeeze(0)
+    else:
+        raise ValueError(
+            "dynamic_resolution_resize_mode must be 'pil' or "
+            f"'torch_bicubic_antialias', got {config.dynamic_resolution_resize_mode!r}."
+        )
     C, H, W = img_tensor.shape
 
     py, px = H // patch_dim, W // patch_dim
@@ -272,6 +338,27 @@ def preprocess_image_bytes_list(
             "dynamic-resolution path that stays in-core."
         )
 
+    if config.dynamic_resolution_model_length is not None:
+        model_length = int(config.dynamic_resolution_model_length)
+        if model_length <= 4:
+            raise ValueError("dynamic_resolution_model_length must be greater than 4.")
+        merge_size = max(int(config.spatial_merge_size), 1)
+        model_patch_budget = (model_length - 4) * (merge_size * merge_size)
+        request_patch_budget = max(
+            model_patch_budget,
+            int(config.dynamic_resolution_min_patches) * len(image_bytes_list),
+        )
+        configured_max = int(config.dynamic_resolution_max_patches)
+        if configured_max > 0:
+            request_patch_budget = min(configured_max, request_patch_budget)
+        config = replace(
+            config,
+            dynamic_resolution_max_patches=max(
+                int(config.dynamic_resolution_min_patches),
+                request_patch_budget,
+            ),
+        )
+
     # Preprocess each image independently so its aspect ratio is preserved.
     # Downstream (llava_model._preprocess_data / vision encoder pack) handles
     # per-image cu_seqlens, so ragged patch counts are fine.
@@ -289,7 +376,12 @@ def _video_sample_indices(total_frames: int, config: VideoProcessingConfig) -> l
     """Return the existing uniformly spaced sample indices for a video."""
     import numpy as np
 
-    sample_count = min(config.num_frames, total_frames)
+    if total_frames <= 0:
+        return []
+    if total_frames < config.temporal_patch_size:
+        sample_count = min(config.num_frames, config.temporal_patch_size)
+    else:
+        sample_count = min(config.num_frames, total_frames)
     if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
         rounded_down = (sample_count // config.temporal_patch_size) * config.temporal_patch_size
         sample_count = (
@@ -299,35 +391,43 @@ def _video_sample_indices(total_frames: int, config: VideoProcessingConfig) -> l
 
 
 def _decode_sampled_video_frames(encoded_video: bytes, config: VideoProcessingConfig):
-    """Decode the stream while converting only uniformly sampled frames to RGB."""
+    """Decode sampled frames once and retain their source indices and FPS."""
     import av
 
     def decode_selected(total_frames: int):
         sample_indices = _video_sample_indices(total_frames, config)
         wanted = set(sample_indices)
-        sampled_frames = []
+        sampled_frames_by_index = {}
         decoded_count = 0
         with av.open(io.BytesIO(encoded_video)) as container:
             stream = container.streams.video[0]
             for index, frame in enumerate(container.decode(stream)):
                 decoded_count = index + 1
                 if index in wanted:
-                    sampled_frames.append(frame.to_image().convert("RGB"))
-        return sampled_frames, decoded_count
+                    sampled_frames_by_index[index] = frame.to_image().convert("RGB")
+        sampled_frames = [
+            sampled_frames_by_index[index]
+            for index in sample_indices
+            if index in sampled_frames_by_index
+        ]
+        return sampled_frames, decoded_count, sample_indices
 
     # Prefer container metadata so indexed streams need only one decode pass.
     with av.open(io.BytesIO(encoded_video)) as container:
-        declared_frames = int(container.streams.video[0].frames or 0)
+        stream = container.streams.video[0]
+        declared_frames = int(stream.frames or 0)
+        average_rate = stream.average_rate
+        fps = float(average_rate) if average_rate is not None else 0.0
 
     if declared_frames > 0:
-        sampled_frames, decoded_count = decode_selected(declared_frames)
+        sampled_frames, decoded_count, sample_indices = decode_selected(declared_frames)
         if decoded_count == declared_frames:
-            return sampled_frames
+            return sampled_frames, sample_indices, fps
         # Some containers report an inaccurate frame count. Redecode using the
         # observed count to preserve the original exact uniform indices.
         if decoded_count > 0:
-            sampled_frames, _ = decode_selected(decoded_count)
-        return sampled_frames
+            sampled_frames, _, sample_indices = decode_selected(decoded_count)
+        return sampled_frames, sample_indices, fps
 
     # Unindexed streams need a count-only pass before exact uniform indices can
     # be selected. No AVFrame or RGB image is retained during this pass.
@@ -337,9 +437,9 @@ def _decode_sampled_video_frames(encoded_video: bytes, config: VideoProcessingCo
         for total_frames, _ in enumerate(container.decode(stream), start=1):
             pass
     if total_frames == 0:
-        return []
-    sampled_frames, _ = decode_selected(total_frames)
-    return sampled_frames
+        return [], [], fps
+    sampled_frames, _, sample_indices = decode_selected(total_frames)
+    return sampled_frames, sample_indices, fps
 
 
 def preprocess_video_bytes_list(
@@ -363,20 +463,28 @@ def preprocess_video_bytes_list(
         )
 
     def decode_frames(encoded_video):
-        frames = _load_frame_sequence_manifest(encoded_video, config.frame_manifest_magic)
-        if frames is not None:
-            return frames, True
+        manifest_result = _load_frame_sequence_manifest(
+            encoded_video, config.frame_manifest_magic
+        )
+        if manifest_result is not None:
+            frames, frame_indices, fps = manifest_result
+            return frames, frame_indices, fps, True
 
-        return _decode_sampled_video_frames(encoded_video, config), False
+        frames, frame_indices, fps = _decode_sampled_video_frames(encoded_video, config)
+        return frames, frame_indices, fps, False
 
     packed_videos = []
     packed_sizes = []
     frame_counts = []
+    video_frame_indices = []
+    video_fps = []
 
     for encoded_video in video_bytes_list:
         if not isinstance(encoded_video, (bytes, bytearray)):
             raise TypeError("video payloads must contain only bytes.")
-        frames, is_frame_sequence = decode_frames(bytes(encoded_video))
+        frames, frame_indices, fps, is_frame_sequence = decode_frames(
+            bytes(encoded_video)
+        )
         if not frames:
             raise ValueError("Decoded video contains no frames.")
 
@@ -387,6 +495,10 @@ def preprocess_video_bytes_list(
             )
         sampled_frames = frames
         sample_count = len(sampled_frames)
+        if len(frame_indices) != sample_count:
+            raise ValueError(
+                "Video timing metadata must contain one frame index per sampled frame."
+            )
 
         frame_tensors = []
         frame_sizes = []
@@ -410,9 +522,13 @@ def preprocess_video_bytes_list(
         packed_videos.append(torch.cat(frame_tensors, dim=1))
         packed_sizes.append(torch.cat(frame_sizes, dim=0))
         frame_counts.append(sample_count)
+        video_frame_indices.append(frame_indices)
+        video_fps.append(fps)
 
     return {
         "imgs": torch.cat(packed_videos, dim=1),
         "imgs_sizes": torch.cat(packed_sizes, dim=0),
         "num_frames": torch.tensor(frame_counts, dtype=torch.int32, device=packed_videos[0].device),
+        "video_frame_indices": video_frame_indices,
+        "video_fps": video_fps,
     }

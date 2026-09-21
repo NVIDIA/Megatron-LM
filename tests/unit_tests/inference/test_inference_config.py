@@ -141,14 +141,55 @@ class TestInferenceConfig:
         config = MultimodalPromptConfig.from_dict(
             {
                 "image_spec": {"model_token": "<image>", "prefix": "<img>"},
-                "video_spec": {"model_token": "<video>", "suffix": "</video>"},
+                "video_spec": {
+                    "model_token": "<video>",
+                    "suffix": "</video>",
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                },
             }
         )
 
         assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
-        assert config.get_spec("video") == MediaPromptSpec(model_token="<video>", suffix="</video>")
+        assert config.get_spec("video") == MediaPromptSpec(
+            model_token="<video>",
+            suffix="</video>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
         with pytest.raises(ValueError, match="Unsupported media modality"):
             config.get_spec("audio")
+
+    def test_multimodal_prompt_config_partial_override_preserves_wrapper_defaults(self):
+        defaults = MultimodalPromptConfig(
+            video_spec=MediaPromptSpec(
+                model_token="<image>", prefix="<img>", suffix="</img>"
+            )
+        )
+
+        config = MultimodalPromptConfig.from_dict(
+            {
+                "video_spec": {
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                }
+            },
+            defaults=defaults,
+        )
+
+        assert config.video_spec == MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+
+    def test_media_prompt_timestamps_require_temporal_expansion(self):
+        with pytest.raises(ValueError, match="requires"):
+            MediaPromptSpec(
+                include_frame_timestamps_for_nemotron_vl=True
+            )
 
     def test_video_processing_config_preserves_image_contract_and_defaults(self):
         image_config = ImageProcessingConfig(
