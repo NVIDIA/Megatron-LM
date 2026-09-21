@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
@@ -81,10 +82,7 @@ def _reset_parameters(module: torch.nn.Module) -> None:
                 )
             if original_local.data_ptr() != replacement_local.data_ptr():
                 original_local.copy_(
-                    replacement_local.to(
-                        device=original_local.device,
-                        dtype=original_local.dtype,
-                    )
+                    replacement_local.to(device=original_local.device, dtype=original_local.dtype)
                 )
             module._parameters[name] = original
 
@@ -456,6 +454,10 @@ class MegatronLiteRuntime(RuntimeBase):
         training_transfer = model and grad
         if device == "cpu":
             if model:
+                # Optional model-owned cleanup; errors must stop the transfer.
+                before_offload = handle._extras.get("before_model_offload")
+                if before_offload is not None:
+                    before_offload()
                 offload_model_to_cpu(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
