@@ -14,7 +14,7 @@ import math
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import torch
