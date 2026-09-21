@@ -125,15 +125,12 @@ def get_grad_norm_fp32(
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            for index, dtype_grads in enumerate(_group_grads_by_dtype(grads_for_norm)):
+            for group_grads in _group_grads_by_dtype(grads_for_norm):
                 grad_norm, _ = multi_tensor_applier(
-                    l2_norm_impl, dummy_overflow_buf, [dtype_grads], False
+                    l2_norm_impl, dummy_overflow_buf, [group_grads], False  # no per-tensor norms
                 )
                 # Combine local squared norms before the existing collectives.
-                if index == 0:
-                    total_norm = grad_norm**norm_type
-                else:
-                    total_norm += grad_norm**norm_type
+                total_norm += grad_norm**norm_type
         else:
             for grad in grads_for_norm:
                 grad_norm = torch.norm(grad, norm_type)
@@ -198,17 +195,17 @@ def clip_grad_by_total_norm_fp32(
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
-        for dtype_grads in _group_grads_by_dtype(grads):
+        for group_grads in _group_grads_by_dtype(grads):
             multi_tensor_applier(
                 multi_tensor_scale_tensor_impl,
                 dummy_overflow_buf,
-                [dtype_grads, dtype_grads],
+                [group_grads, group_grads],
                 clip_coeff,
             )
     elif clip_coeff < 1.0:
-        for dtype_grads in _group_grads_by_dtype(grads):
+        for group_grads in _group_grads_by_dtype(grads):
             multi_tensor_applier(
-                multi_tensor_scale_impl, dummy_overflow_buf, [dtype_grads, dtype_grads], clip_coeff
+                multi_tensor_scale_impl, dummy_overflow_buf, [group_grads, group_grads], clip_coeff
             )
 
 

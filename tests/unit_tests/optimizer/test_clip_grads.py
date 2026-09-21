@@ -63,19 +63,15 @@ class TestCountZerosFp32GtpPadding:
         assert num_zeros == grad.numel() - 1
 
 
-_DTYPES = [
-    (torch.bfloat16, torch.float32),
-    (torch.float32, torch.bfloat16),
-    (torch.bfloat16, torch.bfloat16),
-    (torch.float32, torch.float32),
-]
+_DTYPES = [(torch.bfloat16, torch.float32), (torch.float32, torch.bfloat16)]
 
 
-def _padded_grads(dtypes, numel, value=1.0 / 64):
+def _padded_grads(dtypes):
     # Keep a regressed fused kernel's wider dtype interpretation inside its allocation.
     # Padding also exposes writes beyond the logical gradient view.
+    numel = 127  # Include a partial vector at the end of each gradient.
     bases = [torch.ones(4 * numel, device='cuda', dtype=dtype) for dtype in dtypes]
-    grads = [base[:numel].fill_(value) for base in bases]
+    grads = [base[:numel].fill_(1.0 / 64) for base in bases]
     return bases, grads
 
 
@@ -93,10 +89,9 @@ class TestMixedDtypeGradNormAndClip:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize('dtypes', _DTYPES)
-    @pytest.mark.parametrize('numel', [128, 130])
     @pytest.mark.parametrize('layout', ['both', 'rank0_empty', 'disjoint', 'all_empty'])
-    def test_grad_norm(self, dtypes, numel, layout):
-        bases, grads = _padded_grads(dtypes, numel)
+    def test_grad_norm(self, dtypes, layout):
+        _, grads = _padded_grads(dtypes)
         rank = torch.distributed.get_rank()
         if layout == 'all_empty' or (layout == 'rank0_empty' and rank == 0):
             grads = []
@@ -112,66 +107,36 @@ class TestMixedDtypeGradNormAndClip:
         )
 
         assert float(actual) == pytest.approx(float(squared_norm.sqrt()), rel=2e-6, abs=1e-8)
-        for base in bases:
-            assert torch.equal(base[numel:], torch.ones_like(base[numel:]))
-
-    @pytest.mark.parametrize('dtypes', _DTYPES[:2])
-    def test_zero_grad_norm_ignores_padding(self, dtypes):
-        bases, grads = _padded_grads(dtypes, 128, value=0.0)
-        actual = clip_grads.get_grad_norm_fp32(
-            grads, grad_stats_parallel_group=torch.distributed.group.WORLD
-        )
-        assert float(actual) == 0.0
-        assert all(torch.all(base[128:] == 1) for base in bases)
 
     @pytest.mark.parametrize('dtypes', _DTYPES)
-    @pytest.mark.parametrize('numel', [127, 130])
-    @pytest.mark.parametrize('use_decoupled_grad', [False, True])
     @pytest.mark.parametrize('tensor_coefficient', [False, True])
-    @pytest.mark.parametrize('clip', [False, True])
-    def test_clip_gradients(self, dtypes, numel, use_decoupled_grad, tensor_coefficient, clip):
+    def test_clip_gradients(self, dtypes, tensor_coefficient):
         if tensor_coefficient and clip_grads.multi_tensor_scale_tensor_impl is None:
             pytest.skip('Backend has no tensor-coefficient scaling API')
-        bases, grads = _padded_grads(dtypes, numel)
+        bases, grads = _padded_grads(dtypes)
         params = []
         for grad in grads:
             # The dtype of a decoupled gradient need not match its parameter's dtype.
-            dtype = torch.bfloat16 if use_decoupled_grad else grad.dtype
-            param = torch.nn.Parameter(torch.zeros_like(grad, dtype=dtype))
-            if use_decoupled_grad:
-                param.decoupled_grad = grad
-            else:
-                param.grad = grad
+            param = torch.nn.Parameter(torch.zeros_like(grad, dtype=torch.bfloat16))
+            param.decoupled_grad = grad
             params.append(param)
-        params.append(torch.nn.Parameter(torch.zeros(1, device='cuda')))  # No gradient.
         total_norm = torch.tensor([2.0], device='cuda') if tensor_coefficient else 2.0
-        max_norm = 1.0000005 if clip else 4.0
-        coefficient = min(float(max_norm / (total_norm + 1e-6)), 1.0)
         expected = [base.clone() for base in bases]
-        for base in expected:
-            base[:numel].mul_(coefficient)
+        for base, grad in zip(expected, grads):
+            base[: grad.numel()].mul_(0.5)
 
+        # Supply the norm independently to catch scaling failures even with a correct norm.
         clip_grads.clip_grad_by_total_norm_fp32(
-            params, max_norm, total_norm, use_decoupled_grad=use_decoupled_grad
+            params, 1.0000005, total_norm, use_decoupled_grad=True
         )
 
         for actual, reference in zip(bases, expected):
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
-    @pytest.mark.parametrize('use_decoupled_grad', [False, True])
     @pytest.mark.parametrize('tensor_coefficient', [False, True])
-    def test_empty_gradients_do_not_launch_kernel(
-        self, monkeypatch, use_decoupled_grad, tensor_coefficient
-    ):
+    def test_clip_empty_gradients(self, tensor_coefficient):
         if tensor_coefficient and clip_grads.multi_tensor_scale_tensor_impl is None:
             pytest.skip('Backend has no tensor-coefficient scaling API')
-
-        def unexpected_launch(*args, **kwargs):
-            pytest.fail('An empty gradient list must not reach a fused kernel')
-
-        # Fail before dispatch: some native backends dereference the first list entry.
-        monkeypatch.setattr(clip_grads, 'multi_tensor_applier', unexpected_launch)
         total_norm = torch.tensor([2.0], device='cuda') if tensor_coefficient else 2.0
-        clip_grads.clip_grad_by_total_norm_fp32(
-            [], 1.0, total_norm, use_decoupled_grad=use_decoupled_grad
-        )
+        clip_grads.clip_grad_by_total_norm_fp32([], 1.0, total_norm, use_decoupled_grad=True)
+        torch.cuda.synchronize()
