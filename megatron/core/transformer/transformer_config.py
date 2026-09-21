@@ -435,19 +435,6 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
     layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
 
-    kda_disable_fp8: bool = False
-    """Force KDA projections to BF16 even under FP8 training,
-    (KDA projections are BF16 in the checkpoint)."""
-
-    kda_safe_gate: bool = False
-    """Whether the KDA kernel should use bounded gate values."""
-
-    kda_lower_bound: Optional[float] = None
-    """Optional lower bound for KDA's bounded gate values."""
-
-    kda_two_stage_gates: bool = False
-    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
-
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 
