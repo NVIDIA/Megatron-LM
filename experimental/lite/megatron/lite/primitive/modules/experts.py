@@ -63,7 +63,7 @@ def swiglu_with_probs(
         out = weighted_bias_quick_geglu_impl(
             y2, None, weights, linear_offset=swiglu_up_offset, clamp_value=clamp_value
         )
-        return out.view(*y.shape[:-1], -1)
+        return out.view(*y.shape[:-1], y.shape[-1] // 2)
     gate, up = y.chunk(2, dim=-1)
     if clamp_value is not None:
         gate = gate.clamp(max=clamp_value)

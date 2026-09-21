@@ -186,6 +186,9 @@ def test_quick_geglu_matches_hf_swigluoai_reference() -> None:
     # The dense MLP passes [B, S, 2H]; the fused kernel flattens, so the wrapper must restore the shape.
     actual_3d = swiglu_with_probs(y.view(2, TOKENS // 2, FFN * 2), None, 7.0, 1.702, 1.0)
     assert torch.equal(actual_3d.view(TOKENS, FFN), actual)
+    # An EP rank may own zero tokens.
+    empty = swiglu_with_probs(y[:0], None, 7.0, 1.702, 1.0)
+    assert empty.shape == (0, FFN)
 
 
 @pytest.mark.gpus(1)
