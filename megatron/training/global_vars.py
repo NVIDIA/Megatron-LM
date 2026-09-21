@@ -22,7 +22,7 @@ from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
-_GLOBAL_FULL_CONFIG = None
+_GLOBAL_RUN_CONFIG = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None

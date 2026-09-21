@@ -178,7 +178,7 @@ from .global_vars import (
     get_tensorboard_writer,
     get_timers,
     get_wandb_writer,
-    set_full_config,
+    set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1625,7 +1625,7 @@ def pretrain(
     timestamp_after_initialize_megatron = time.time()
 
     args = get_args()
-    set_full_config(cfg_container)
+    set_run_config(cfg_container)
     timers = get_timers()
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
