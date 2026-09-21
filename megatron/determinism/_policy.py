@@ -71,8 +71,8 @@ ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset(
 #     any other value breaks reproducibility.
 #   - ``TRITON_CACHE_AUTOTUNING``: the consumer tests it as ``== "1"``, so any
 #     other truthy spelling ("true", "yes") would silently read as opted out.
-#     Both settings are deterministic, so both are accepted and neither is
-#     defaulted -- see :func:`apply_determinism_env` for the pairing rule.
+#     Both settings are accepted. The complete startup API defaults to 0;
+#     the legacy environment helper leaves it unset. See the pairing rule below.
 ACCEPTED_ENV_VAR_VALUES: dict[str, frozenset[str]] = {
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": frozenset({"0"}),
     "CUBLAS_WORKSPACE_CONFIG": frozenset({":4096:8", ":16:8"}),
@@ -170,7 +170,8 @@ def validate_determinism_config(config: object) -> dict:
     )
     if read("deterministic_mode", False) is not True:
         raise AssertionError(
-            "configure_determinism requires deterministic_mode=True in the model config"
+            "configure_determinism requires deterministic_mode=True in the model config "
+            "(or --deterministic-mode for a training CLI, including when using the early launcher)"
         )
     # Verification only — read each option's effective value and never flip it,
     # so a default that drifts to a bad value breaks the run instead of silently
@@ -271,6 +272,23 @@ def configure_determinism(config: object) -> dict:
         torch.distributed.is_available() and torch.distributed.is_initialized()
     )
     if initialized:
+        changes = []
+        if _configured_pid != os.getpid():
+            changes.append("this process has no recorded early policy")
+        else:
+            current = _environment_signature(os.environ)
+            previous = _configured_environment or {}
+            for key in sorted(previous.keys() | environment.keys() | current.keys()):
+                if previous.get(key) != current.get(key):
+                    changes.append(f"{key}: {previous.get(key)!r} -> {current.get(key)!r}")
+        for name, active in (
+            ("torch.deterministic_algorithms", torch.are_deterministic_algorithms_enabled()),
+            ("torch.warn_only=False", not torch.is_deterministic_algorithms_warn_only_enabled()),
+            ("cudnn.deterministic", torch.backends.cudnn.deterministic),
+            ("cudnn.benchmark=False", not torch.backends.cudnn.benchmark),
+        ):
+            if not active:
+                changes.append(name)
         if (
             _configured_pid != os.getpid()
             or _configured_environment != environment
@@ -279,7 +297,7 @@ def configure_determinism(config: object) -> dict:
         ):
             raise RuntimeError(
                 "Determinism policy must be configured before CUDA or process-group "
-                "initialization; start a fresh process and call "
+                "initialization; " + "; ".join(changes) + ". Start a fresh process and call "
                 "megatron.determinism.configure_determinism before importing Core/Bridge, "
                 "or launch the entrypoint with python -m megatron.determinism."
             )
@@ -314,5 +332,5 @@ def configure_determinism(config: object) -> dict:
             "Startup settings only; caller owns seeding, data order, state and replay validation"
         ),
     }
-    logger.info("Determinism policy: %s", json.dumps(policy, sort_keys=True))
+    logger.debug("Determinism policy: %s", json.dumps(policy, sort_keys=True))
     return policy

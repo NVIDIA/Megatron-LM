@@ -19,7 +19,7 @@ python pretrain_hybrid.py \
   <other args ...>
 ```
 
-GPT, Hybrid, VLM, BERT, T5, MIMO and elastification pretraining scripts bootstrap `megatron.determinism.configure_determinism` before heavy imports. The deprecated Mamba entrypoint delegates to Hybrid. YAML uses the effective `deterministic_mode` from the root, `model_parallel`, then `language_model` settings, with later sections taking precedence, as in full YAML validation. Full CLI/YAML validation rechecks the resolved config and logs policy on rank zero. A config cannot silently disable deterministic mode after the process opted in.
+The pretraining, RL, inference, ModelOpt and multimodal CLI scripts bootstrap `megatron.determinism.configure_determinism` before heavy imports. The deprecated Mamba entrypoint delegates to Hybrid. For YAML, put `deterministic_mode: true` in `model_parallel` or `language_model`, which feed the model configuration. A root-only setting is rejected; `language_model` takes precedence during early validation. Full CLI/YAML validation rechecks the resolved config and logs policy on rank zero. A config cannot silently disable deterministic mode after the process opted in.
 
 For custom scripts or module entrypoints, use the explicit early launcher:
 
@@ -62,7 +62,7 @@ The startup API explicitly sets `TRITON_CACHE_AUTOTUNING=0` when unset, preservi
 
 Startup enables `torch.use_deterministic_algorithms(True, warn_only=False)`, sets `torch.backends.cudnn.deterministic=True`, and disables cuDNN benchmarking. This removes benchmark-driven algorithm selection and asks PyTorch to reject operations without a supported deterministic implementation. See [PyTorch's reproducibility guidance](https://docs.pytorch.org/docs/stable/notes/randomness.html). These settings can affect performance and need measurement on the target recipe.
 
-The returned dictionary is JSON-serializable and is also logged at INFO. It records the validated options, tracked environment (including Triton block overrides), Torch version and effective Torch/cuDNN settings. It is a settings record, not replay evidence. In particular, a cache path does not establish cache-content agreement, and selecting `Ring` does not pin NCCL's physical reduction order across allocations.
+The returned dictionary is JSON-serializable and is logged at DEBUG by the library; training logs the resolved policy on rank zero. It records the validated options, tracked environment (including Triton block overrides), Torch version and effective Torch/cuDNN settings. It is a settings record, not replay evidence. In particular, a cache path does not establish cache-content agreement, and selecting `Ring` does not pin NCCL's physical reduction order across allocations.
 
 The API does not seed RNGs. The caller still owns Python, NumPy, Torch CPU/CUDA and model-parallel RNG state, data order, precision state, optimizer/scheduler state and checkpoint restore order. Megatron training retains its existing seed initialization. Validate independent runs and checkpoint resume separately; this API alone does not establish full-state equality. Bridge recipes need the same early call or launcher before Bridge imports, followed by validation of their resolved model options.
 
@@ -136,3 +136,5 @@ Note the limit: a rank only logs when it *tunes*, so a run where some ranks hit 
 The bit-exact correctness suite lives at `tests/unit_tests/determinism/correctness/`. It parametrizes over model presets (GPT-like, Llama-like, Hybrid/Mamba) × parallelism cells (TP, PP, VPP, EP, FSDP, and composites) and asserts that two runs of the same configuration produce bit-identical outputs and gradients. FP8 / FP4 recipes (`tensorwise`, `delayed`, `mxfp8`, `nvfp4`) are covered by `tests/unit_tests/determinism/correctness/test_fp8_determinism.py`; the Blackwell-only recipes are capability-skipped on Hopper.
 
 The cost of `--deterministic-mode` is measured outside pytest by an nsys-driven per-NVTX-range breakdown: `tests/performance_tests/shell_test_utils/determinism/run_nsys_breakdown.sh` wraps any training entry point (e.g. `pretrain_hybrid.py --profile`) under nsys for a det-vs-nondet comparison, and `tests/performance_tests/shell_test_utils/determinism/print_nsys_leaderboard.py` joins the two CSVs into a side-by-side table. The CI invocation lives at `tests/test_utils/recipes/h100/determinism-perf.yaml`.
+
+`CUDA_DEVICE_MAX_CONNECTIONS`, `NCCL_PROTO`, `TRITON_CACHE_DIR` and `TRITON_AUTOTUNE_BLOCK_*` are recorded without imposing new values. Set them before GPU imports: after initialization, changing a tracked key can change dispatch or reductions and is rejected with a per-key diagnostic. Before initialization, validation can record updated launcher settings.

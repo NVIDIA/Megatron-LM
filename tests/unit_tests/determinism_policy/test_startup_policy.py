@@ -6,6 +6,7 @@ The public early package imports without the Core GPU dependencies. The separate
 library integration test exercises subsequent Core and training imports on GPU.
 """
 
+import ast
 import importlib.util
 import json
 import logging
@@ -19,6 +20,15 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def clean_environment():
+    """Keep inherited device placement while isolating policy-specific overrides."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("NCCL_", "NVTE_", "CUBLAS_", "MAMBA_", "CAUSAL_CONV1D_", "TRITON_"))
+    }
 
 
 def load_module(name, path):
@@ -62,7 +72,7 @@ def test_strict_policy_reports_effective_settings_without_seeding(policy, caplog
     torch.utils.deterministic.fill_uninitialized_memory = True
     torch.backends.cudnn.benchmark = True
     config = {"deterministic_mode": True}
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.DEBUG):
         report = policy.configure_determinism(config)
     assert report["torch"]["deterministic_algorithms"] is True
     assert report["torch"]["warn_only"] is False
@@ -265,7 +275,13 @@ for action in (
         continue
     raise RuntimeError('Validation was optimized away')
 '''
-    subprocess.run([sys.executable, "-O", "-c", script], cwd=ROOT, check=True, timeout=60)
+    subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        cwd=ROOT,
+        env=clean_environment(),
+        check=True,
+        timeout=60,
+    )
 
 
 def test_public_early_import_needs_no_core_and_does_not_initialize_cuda():
@@ -288,7 +304,9 @@ assert torch.equal(state, torch.get_rng_state())
 assert not any(name == 'megatron.core' or name.startswith(('megatron.core.', 'transformer_engine'))
                for name in sys.modules)
 '''
-    subprocess.run([sys.executable, "-c", script], cwd=ROOT, check=True, timeout=60)
+    subprocess.run(
+        [sys.executable, "-c", script], cwd=ROOT, env=clean_environment(), check=True, timeout=60
+    )
 
 
 def test_cli_bootstrap_only_applies_when_requested(policy):
@@ -308,10 +326,89 @@ def test_cli_bootstrap_only_applies_when_requested(policy):
     assert argv == ["--deterministic-mode", "--train-iters", "2"]
 
 
+def test_root_only_yaml_mode_is_rejected(policy, tmp_path):
+    from megatron.determinism import bootstrap_training_determinism
+
+    path = tmp_path / "config.yaml"
+    path.write_text("deterministic_mode: true\n")
+    with pytest.raises(ValueError, match="model_parallel or language_model"):
+        bootstrap_training_determinism(["--yaml-cfg", str(path)])
+    assert not policy.is_determinism_configured()
+
+
+def _training_entrypoints():
+    candidates = [
+        *ROOT.glob("*.py"),
+        *(ROOT / "examples").rglob("*.py"),
+        *(ROOT / "tools").rglob("*.py"),
+    ]
+    return sorted(
+        str(path.relative_to(ROOT))
+        for path in candidates
+        if "__main__" in (source := path.read_text())
+        and any(name in source for name in ("initialize_megatron", "pretrain(", "finetune("))
+    )
+
+
+@pytest.mark.parametrize("entrypoint", _training_entrypoints())
+def test_every_training_cli_bootstraps_before_gpu_imports(policy, monkeypatch, entrypoint):
+    path = ROOT / entrypoint
+    tree = ast.parse(path.read_text())
+    bootstrap = next(
+        (
+            index
+            for index, node in enumerate(tree.body)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.ImportFrom) and child.module == "megatron.determinism"
+                for child in node.body
+            )
+        ),
+        None,
+    )
+    assert bootstrap is not None, f"Missing early policy: {entrypoint}"
+    for node in ast.walk(ast.Module(body=tree.body[:bootstrap], type_ignores=[])):
+        if isinstance(node, ast.ImportFrom):
+            assert not (node.module or "").startswith(
+                ("megatron.core", "megatron.training", "transformer_engine")
+            )
+    monkeypatch.setattr(sys, "argv", [str(path), "--deterministic-mode"])
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    prefix = ast.Module(body=tree.body[: bootstrap + 1], type_ignores=[])
+    exec(compile(prefix, str(path), "exec"), {"__name__": "__main__", "__file__": str(path)})
+    assert policy.is_determinism_configured()
+
+
+def test_late_drift_error_identifies_environment_key(policy, monkeypatch):
+    policy.configure_determinism({"deterministic_mode": True})
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "32"
+    with pytest.raises(RuntimeError, match="CUDA_DEVICE_MAX_CONNECTIONS"):
+        policy.configure_determinism({"deterministic_mode": True})
+
+
+def test_installed_dataset_helpers_load_without_make(monkeypatch):
+    path = ROOT / "megatron/core/datasets/utils.py"
+    function = next(
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "compile_helpers"
+    )
+    namespace = {"__file__": str(path), "__package__": "megatron.core.datasets"}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    monkeypatch.setattr(os.path, "isfile", lambda _: False)
+    loaded = []
+    monkeypatch.setattr(importlib, "import_module", lambda name: loaded.append(name))
+    monkeypatch.setattr(
+        subprocess, "run", lambda *args, **kwargs: pytest.fail("wheel must not run make")
+    )
+    namespace["compile_helpers"]()
+    assert loaded == ["megatron.core.datasets.helpers_cpp"]
+
+
 @pytest.mark.parametrize(
     "yaml_text,enabled",
     [
-        ("deterministic_mode: true", True),
         ("deterministic_mode: false", False),
         ("model_parallel:\n  deterministic_mode: true", True),
         ("deterministic_mode: true\nmodel_parallel:\n  deterministic_mode: false", False),
@@ -351,7 +448,7 @@ assert startup_sibling.VALUE == 17
 Path(sys.argv[1]).write_text(json.dumps(sys.argv))
 ''')
     report_path = tmp_path / "argv.json"
-    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(ROOT), str(tmp_path)]))
+    env = dict(clean_environment(), PYTHONPATH=os.pathsep.join([str(ROOT), str(tmp_path)]))
     command = [sys.executable, "-m", "megatron.determinism"]
     command += ["-m", "startup_target"] if module_mode else [str(target)]
     result = subprocess.run(
