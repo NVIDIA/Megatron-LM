@@ -38,9 +38,6 @@ def _expert_nvtx_range(name: str):
         torch.cuda.nvtx.range_pop()
 
 
-_QUICK_GELU_ALPHA = 1.702  # sigmoid slope of Core's quick_gelu
-
-
 def swiglu_with_probs(
     y: torch.Tensor,
     probs: torch.Tensor | None,
@@ -48,30 +45,18 @@ def swiglu_with_probs(
     swiglu_alpha: float = 1.0,
     swiglu_up_offset: float = 0.0,
 ) -> torch.Tensor:
-    """``act(clamp(gate)) * (clamp(up) + offset) * probs`` via Core's fused swiglu / quick_geglu kernels."""
+    """SwiGLU (alpha=1) or quick-GEGLU (alpha=1.702) with optional expert probability scaling."""
     clamp_value = swiglu_limit if swiglu_limit > 0 else None
-    if swiglu_alpha == 1.0 and swiglu_up_offset == 0.0:
-        if probs is not None:
-            return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
-        return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
-    if swiglu_alpha == _QUICK_GELU_ALPHA:
-        y2 = y.reshape(-1, y.shape[-1])
-        if probs is None:
-            weights = torch.ones(y2.shape[0], 1, dtype=y.dtype, device=y.device)
-        else:
-            weights = probs.reshape(-1, 1)
-        out = weighted_bias_quick_geglu_impl(
-            y2, None, weights, linear_offset=swiglu_up_offset, clamp_value=clamp_value
+    if swiglu_alpha == 1.702:  # Core quick_gelu
+        weights = probs if probs is not None else y.new_ones(y.numel() // y.shape[-1], 1)
+        return weighted_bias_quick_geglu_impl(
+            y, None, weights, linear_offset=swiglu_up_offset, clamp_value=clamp_value
         )
-        return out.view(*y.shape[:-1], y.shape[-1] // 2)
-    gate, up = y.chunk(2, dim=-1)
-    if clamp_value is not None:
-        gate = gate.clamp(max=clamp_value)
-        up = up.clamp(min=-clamp_value, max=clamp_value)
-    out = gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_up_offset)
+    if swiglu_alpha != 1.0 or swiglu_up_offset != 0.0:
+        raise ValueError("only swiglu (alpha=1) and quick_geglu (alpha=1.702) are supported")
     if probs is not None:
-        out = out * probs
-    return out.to(dtype=y.dtype)
+        return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
+    return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
 
 
 class _AllReduceETP(torch.autograd.Function):
@@ -210,7 +195,12 @@ class Experts(nn.Module):
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
                 h = act_ckpt.checkpoint(
-                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit, self.swiglu_alpha, self.swiglu_up_offset
+                    swiglu_with_probs,
+                    fc1_out,
+                    probs,
+                    self.swiglu_limit,
+                    self.swiglu_alpha,
+                    self.swiglu_up_offset,
                 )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
