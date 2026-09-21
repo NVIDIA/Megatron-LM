@@ -264,9 +264,14 @@ def test_magi_deterministic_mode_reproduces_bitwise(source_weights, name, parall
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
     steps = int(os.environ.get("MLITE_MAGI_DET_STEPS", STEPS))
+    # MLITE_MAGI_DET_ALL_MSA=1: every layer through the MSA path (random init) to attribute residual nondeterminism
+    # to the dense layers' native calc_attn backend.
+    all_msa = os.environ.get("MLITE_MAGI_DET_ALL_MSA") == "1"
+    cfg = _proxy_config(all_msa=True) if all_msa else source_weights.cfg
+    name = f"{name}{'/all_msa' if all_msa else ''}/dense={os.environ.get('MAGI_ATTENTION_KERNEL_BACKEND', 'fa4')}"
     runs = {}
     for det in (True, False):
-        pair = [_train(source_weights.cfg, source_weights.src, ParallelConfig(**parallel), steps=steps, deterministic=det)
+        pair = [_train(cfg, source_weights.src, ParallelConfig(**parallel), steps=steps, deterministic=det, load=not all_msa)
                 for _ in range(2)]
         (l0, n0, st0), (l1, n1, st1) = pair
         same = torch.tensor([int(l0 == l1 and n0 == n1)], device="cuda")
