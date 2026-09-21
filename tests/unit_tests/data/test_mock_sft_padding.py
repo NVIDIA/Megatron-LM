@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """The mock SFT packer must never put an unembeddable id in the input stream.
 
@@ -36,8 +36,7 @@ def _dataset(pad_id, *, pack_length=64, row_len=20, vocab_size=128):
     ds.num_samples = 1
     ds.padding_divisor = 1
     ds.config = SimpleNamespace(
-        sequence_length=pack_length,
-        tokenizer=SimpleNamespace(eod=vocab_size - 1, pad=pad_id),
+        sequence_length=pack_length, tokenizer=SimpleNamespace(eod=vocab_size - 1, pad=pad_id)
     )
     return ds
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """QSA Megatron-module parity vs the reference oracle (QSA-2 dense-mask bridge).
 
@@ -18,10 +18,10 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.experimental_attention_variant.qsa_module_specs import (
     get_qsa_module_spec_for_backend,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -86,9 +86,7 @@ def copy_weights_to_oracle(attn, config):
         for h in range(hpg):
             q_rows.append(q_g[h * d : (h + 1) * d])
             gate_rows.append(gate_g[h * d : (h + 1) * d])
-    q_proj = torch.cat(
-        [torch.cat([q_rows[h], gate_rows[h]], dim=0) for h in range(N_HEADS)], dim=0
-    )
+    q_proj = torch.cat([torch.cat([q_rows[h], gate_rows[h]], dim=0) for h in range(N_HEADS)], dim=0)
 
     ap = QSAAttentionParams(
         q_proj_weight=q_proj,
@@ -158,9 +156,9 @@ class TestQSAAttentionParity:
         oracle_visible = batched_indexer_selected_mask(
             self.hidden.permute(1, 0, 2).float().cpu(), ip
         )  # [b, s, s], True = visible
-        assert torch.equal(~mega_mask.squeeze(1).cpu(), oracle_visible), (
-            "indexer selected-token sets diverge from the oracle"
-        )
+        assert torch.equal(
+            ~mega_mask.squeeze(1).cpu(), oracle_visible
+        ), "indexer selected-token sets diverge from the oracle"
         # sanity: the sparse regime is real (late queries drop visible blocks)
         n_visible_last = int(oracle_visible[0, -1].sum())
         assert n_visible_last < SEQ - 1
@@ -176,9 +174,9 @@ class TestQSAAttentionParity:
         visible = batched_indexer_selected_mask(hidden_bsh, ip)
         expect = reference_attention_forward(hidden_bsh, ap, visible)  # [b, s, h]
         got = out.permute(1, 0, 2).float().cpu()
-        assert torch.allclose(got, expect, atol=5e-4, rtol=5e-4), (
-            f"max abs err {(got - expect).abs().max().item():.3e}"
-        )
+        assert torch.allclose(
+            got, expect, atol=5e-4, rtol=5e-4
+        ), f"max abs err {(got - expect).abs().max().item():.3e}"
 
     def test_backward_flows_and_indexer_detached(self):
         freqs = self.rope(SEQ)
@@ -320,9 +318,9 @@ class TestQSATensorParallel:
         torch.distributed.all_gather(gathered, grad.contiguous(), group=tp_group)
         # Gradients are only allclose, not bitwise: the loss's torch.gather backward
         # is a scatter-add (atomic) outside deterministic mode.
-        assert torch.allclose(gathered[0], gathered[1], rtol=1e-4, atol=1e-6), (
-            "indexer KL gradients diverge across TP ranks beyond scatter-add noise"
-        )
+        assert torch.allclose(
+            gathered[0], gathered[1], rtol=1e-4, atol=1e-6
+        ), "indexer KL gradients diverge across TP ranks beyond scatter-add noise"
 
 
 class TestQSASparseKernel(TestQSAAttentionParity):
@@ -357,12 +355,12 @@ class TestQSASparseKernel(TestQSAAttentionParity):
         sparse.float().square().mean().backward()
         g2 = h2.grad
         w2 = self.attn.linear_qkv.weight.grad
-        assert torch.allclose(g1, g2, atol=5e-4, rtol=5e-3), (
-            f"dgrad err {(g1 - g2).abs().max().item():.3e}"
-        )
-        assert torch.allclose(w1, w2, atol=5e-3, rtol=5e-3), (
-            f"wgrad err {(w1 - w2).abs().max().item():.3e}"
-        )
+        assert torch.allclose(
+            g1, g2, atol=5e-4, rtol=5e-3
+        ), f"dgrad err {(g1 - g2).abs().max().item():.3e}"
+        assert torch.allclose(
+            w1, w2, atol=5e-3, rtol=5e-3
+        ), f"wgrad err {(w1 - w2).abs().max().item():.3e}"
 
     def test_sparse_repeat_bitwise(self):
         with torch.no_grad():
@@ -509,14 +507,11 @@ class TestQSAIndexerSparseKL(TestQSAAttentionParity):
         h = self.hidden.permute(1, 0, 2).float().cpu()
         B, S, _ = h.shape
         q = rms_norm(
-            (h @ ap.q_proj_weight.t())
-            .view(B, S, ap.n_heads, ap.head_dim * 2)
-            .chunk(2, dim=-1)[0],
+            (h @ ap.q_proj_weight.t()).view(B, S, ap.n_heads, ap.head_dim * 2).chunk(2, dim=-1)[0],
             ap.q_norm_weight,
         )
         kk = rms_norm(
-            (h @ ap.k_proj_weight.t()).view(B, S, ap.n_kv_heads, ap.head_dim),
-            ap.k_norm_weight,
+            (h @ ap.k_proj_weight.t()).view(B, S, ap.n_kv_heads, ap.head_dim), ap.k_norm_weight
         )
         pos = torch.arange(S).expand(B, S)
         cos, sin = build_rope_cos_sin(pos, ap.rotary_dim, ap.rope_theta, h.dtype)
@@ -584,9 +579,9 @@ class TestQSAIndexerSparseKL(TestQSAAttentionParity):
             # (small tolerance: the kernel scores use a fused ieee dot).
             s0, s1 = student[..., :-1], student[..., 1:]
             both = sel.picked[..., :-1] & sel.picked[..., 1:]
-            assert bool((s0 >= s1 - 1e-4)[both].all()), (
-                "KL student scores disagree with the route's score order"
-            )
+            assert bool(
+                (s0 >= s1 - 1e-4)[both].all()
+            ), "KL student scores disagree with the route's score order"
             # (b) Temperature: dropping the 1/sqrt(d) scale changes the student
             # distribution even though it cannot change the route.
             lp = masked_log_softmax(student, sel.picked)
@@ -615,9 +610,9 @@ class TestQSAIndexerSparseKL(TestQSAAttentionParity):
         # (atomic) outside deterministic mode, so even one path is not repeatable
         # at the last bit. The selection and the loss inputs are identical by
         # construction; anything beyond atomic noise means the paths diverged.
-        assert torch.allclose(g_bridge, g_sparse, rtol=1e-4, atol=1e-6), (
-            f"max abs diff {(g_bridge - g_sparse).abs().max().item():.3e}"
-        )
+        assert torch.allclose(
+            g_bridge, g_sparse, rtol=1e-4, atol=1e-6
+        ), f"max abs diff {(g_bridge - g_sparse).abs().max().item():.3e}"
 
 
 class TestQSAContextParallel:
@@ -738,14 +733,12 @@ class TestQSAContextParallel:
         freqs = rope(max_len, packed_seq=True)
         with torch.no_grad():
             sel_cp = attn.indexer.select(shard, freqs, cu_seqlens=cu)
-            out, _ = attn(
-                shard, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp
-            )
+            out, _ = attn(shard, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp)
 
         ref_out, ref_sel = self._reference_full(attn, h, freqs, psp=psp)
-        assert torch.equal(sel_cp.order, ref_sel.order[:, rows]), (
-            f"CP selection diverged ({layout})"
-        )
+        assert torch.equal(
+            sel_cp.order, ref_sel.order[:, rows]
+        ), f"CP selection diverged ({layout})"
         assert torch.equal(sel_cp.picked, ref_sel.picked[:, rows])
         err = (out - ref_out.index_select(0, rows)).abs().max().item()
         assert err < 1e-4, f"CP2 THD ({layout}) vs single-rank max abs err {err:.3e}"

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Portions adapted from HuggingFace transformers (Apache-2.0),
 # src/transformers/models/qwen4_exp/modeling_qwen4_exp.py @ 99e19a9a
@@ -182,8 +182,7 @@ class QSAAttentionParams:
             )
 
         o = (
-            torch.randn(hidden_size, n_heads * head_dim, generator=g)
-            * (n_heads * head_dim) ** -0.5
+            torch.randn(hidden_size, n_heads * head_dim, generator=g) * (n_heads * head_dim) ** -0.5
         ).to(device=device, dtype=dtype)
         return QSAAttentionParams(
             q_proj_weight=w(n_heads * head_dim * 2),

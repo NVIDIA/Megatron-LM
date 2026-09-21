@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """QSA (Qwen Sparse Attention) — GQA-based block-sparse attention.
 
@@ -43,13 +43,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_indexer_loss import (
+    normalize_indexer_target_,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
     build_packed_allgather_cp_query_positions_and_key_reorder,
     build_zigzag_allgather_cp_key_reorder,
     build_zigzag_cp_local_positions,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa_indexer_loss import (
-    normalize_indexer_target_,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     masked_log_softmax,
@@ -217,10 +217,7 @@ class QSAIndexer(MegatronModule):
         ).squeeze(2)
 
     def select(
-        self,
-        hidden_states: Tensor,
-        rotary_pos_emb: Tensor,
-        cu_seqlens: Optional[Tensor] = None,
+        self, hidden_states: Tensor, rotary_pos_emb: Tensor, cu_seqlens: Optional[Tensor] = None
     ) -> QSASelection:
         """Run the indexer and return the deterministic block selection.
 
@@ -258,7 +255,7 @@ class QSAIndexer(MegatronModule):
             # attention-kernel block space: ceil blocks + 1 so the own block of a
             # multiple-of-r position (fully in the future) has a valid, empty range
             nb_attn = s // r + 1
-            attn_bases = (torch.arange(nb_attn, device=device, dtype=torch.int32) * r)
+            attn_bases = torch.arange(nb_attn, device=device, dtype=torch.int32) * r
             attn_ends = torch.clamp(attn_bases + r, max=s)
             return QSASelection(
                 q=q,
@@ -388,10 +385,7 @@ class QSAIndexer(MegatronModule):
         )
 
     def _select_cp(
-        self,
-        hidden_states: Tensor,
-        rotary_pos_emb: Tensor,
-        cu_seqlens: Optional[Tensor] = None,
+        self, hidden_states: Tensor, rotary_pos_emb: Tensor, cu_seqlens: Optional[Tensor] = None
     ) -> QSASelection:
         """Allgather-CP selection: local queries, globally ordered block keys.
 
@@ -423,10 +417,7 @@ class QSAIndexer(MegatronModule):
             # it applies to the local queries directly; the block keys need the
             # rebuilt GLOBAL table.
             q = apply_rotary_pos_emb(
-                q_all,
-                rotary_pos_emb[:s_loc],
-                config=self.config,
-                cp_group=self.pg_collection.cp,
+                q_all, rotary_pos_emb[:s_loc], config=self.config, cp_group=self.pg_collection.cp
             )
             if n_blocks > 0:
                 global_freqs = self._cp_global_freqs(rotary_pos_emb, s_loc, reorder)
@@ -679,9 +670,9 @@ class QSASelfAttention(SelfAttention):
         **kwargs,
     ):
         """Run the indexer, then self-attention restricted to the selected tokens."""
-        assert inference_context is None and kwargs.get("inference_params") is None, (
-            "QSA does not implement an inference path (pretrain/continue-pretrain scope)."
-        )
+        assert (
+            inference_context is None and kwargs.get("inference_params") is None
+        ), "QSA does not implement an inference path (pretrain/continue-pretrain scope)."
         assert key_value_states is None, "QSA is self-attention only."
         freqs = rotary_pos_emb[0] if isinstance(rotary_pos_emb, tuple) else rotary_pos_emb
         assert freqs is not None, "QSA requires rotary position embeddings."
@@ -699,9 +690,7 @@ class QSASelfAttention(SelfAttention):
             # the block selection already implies, and is therefore not consumed here.
             # Padded batches are NOT supported on the sparse path: pad tokens would be
             # attended and eligible for selection. Use unpadded BSHD or packed THD.
-            output, bias, selection = self._sparse_forward(
-                hidden_states, freqs, packed_seq_params
-            )
+            output, bias, selection = self._sparse_forward(hidden_states, freqs, packed_seq_params)
         else:
             assert packed_seq_params is None, (
                 "QSA dense-mask bridge supports BSHD only; use "
@@ -790,9 +779,7 @@ class QSASelfAttention(SelfAttention):
             f = freqs.index_select(0, pos).contiguous()
         else:
             f = freqs[: query.shape[0]]
-        query = apply_rotary_pos_emb(
-            query, f, config=self.config, cp_group=self.pg_collection.cp
-        )
+        query = apply_rotary_pos_emb(query, f, config=self.config, cp_group=self.pg_collection.cp)
         key = apply_rotary_pos_emb(key, f, config=self.config, cp_group=self.pg_collection.cp)
         return query, key
 
@@ -825,19 +812,16 @@ class QSASelfAttention(SelfAttention):
             # torch.equal would force a device sync per layer; check identity/shape and
             # rely on PackedSeqParams construction for element equality.
             cu_kv = packed_seq_params.cu_seqlens_kv
-            assert cu_kv is None or cu_kv is cu_seqlens or cu_kv.shape == cu_seqlens.shape, (
-                "QSA is self-attention only (cu_seqlens_q must equal cu_seqlens_kv)."
-            )
+            assert (
+                cu_kv is None or cu_kv is cu_seqlens or cu_kv.shape == cu_seqlens.shape
+            ), "QSA is self-attention only (cu_seqlens_q must equal cu_seqlens_kv)."
 
         # THD inputs arrive as [t, 1, h]; SelfAttention would squeeze them later, we
         # keep the [s, b, ...] convention throughout and reshape for the kernel.
         selection = self.indexer.select(hidden_states, freqs, cu_seqlens=cu_seqlens)
 
         qkv = self.get_query_key_value_tensors(
-            hidden_states,
-            None,
-            split_qkv=True,
-            output_gate=self.config.attention_output_gate,
+            hidden_states, None, split_qkv=True, output_gate=self.config.attention_output_gate
         )
         if self.config.attention_output_gate:
             query, key, value, gate = qkv
@@ -957,9 +941,7 @@ class QSASelfAttention(SelfAttention):
         with torch.no_grad():
             for g0 in range(0, s, stage):
                 g1 = min(g0 + stage, s)
-                mass = torch.zeros(
-                    b, g1 - g0, k, r, dtype=torch.float32, device=order.device
-                )
+                mass = torch.zeros(b, g1 - g0, k, r, dtype=torch.float32, device=order.device)
                 for c0 in range(g0, g1, chunk):
                     c1 = min(c0 + chunk, g1)
                     order_c = order[:, c0:c1]  # [b, c, k]
@@ -975,13 +957,11 @@ class QSASelfAttention(SelfAttention):
                     ).view(b, c, k * r, ng_local, d)
 
                     q_c = q_bt[:, c0:c1].view(b, c, ng_local, hpg, d)
-                    teacher = torch.einsum(
-                        "bcghd,bctgd->bcght", q_c.float(), k_sel.float()
-                    ) * scale  # [b, c, g, h, T]
+                    teacher = (
+                        torch.einsum("bcghd,bctgd->bcght", q_c.float(), k_sel.float()) * scale
+                    )  # [b, c, g, h, T]
                     valid_t = picked_c.repeat_interleave(r, dim=-1)  # [b, c, T]
-                    probs = masked_softmax(
-                        teacher, valid_t[:, :, None, None, :].expand_as(teacher)
-                    )
+                    probs = masked_softmax(teacher, valid_t[:, :, None, None, :].expand_as(teacher))
                     # [b, c, T] — head sum (local heads), staged before the TP reduce
                     mass[:, c0 - g0 : c1 - g0] = probs.sum(dim=(2, 3)).view(b, c, k, r)
                 if tp_size > 1:

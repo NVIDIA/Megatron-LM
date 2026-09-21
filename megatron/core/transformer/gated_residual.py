@@ -196,9 +196,7 @@ class GatedResidualModule(MegatronModule):
         )
         self.input_mix_weight_down = nn.Linear(nC, self.lowrank, bias=False)
         self.input_mix_weight_up = nn.Linear(self.lowrank, nC, bias=False)
-        self.block_inject_weight = (
-            nn.Linear(nC, self.n, bias=False) if use_combine else None
-        )
+        self.block_inject_weight = nn.Linear(nC, self.n, bias=False) if use_combine else None
 
         # The norm gamma and the write gate generate bounded mixing
         # coefficients; keep them fp32 like mHC's mapping path. The two large
@@ -358,9 +356,9 @@ class GatedResidualModule(MegatronModule):
             s, b, nC = residual.shape
             x_expanded = (h_post.unsqueeze(-1) * x.unsqueeze(2)).view(s, b, nC)
             if optional_bias:
-                bias_expanded = (
-                    h_post.unsqueeze(-1) * optional_bias[0].view(1, 1, 1, -1)
-                ).view(s, b, nC)
+                bias_expanded = (h_post.unsqueeze(-1) * optional_bias[0].view(1, 1, 1, -1)).view(
+                    s, b, nC
+                )
             else:
                 bias_expanded = None
             return bda_func((x_expanded, bias_expanded), residual, dropout_prob)

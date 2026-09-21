@@ -126,7 +126,11 @@ class TestGatedResidualMTPHead:
         for stream in range(STREAMS):
             xs = x.view(SEQ, BATCH, STREAMS, HIDDEN)[:, :, stream]
             gamma = layer.hnorm.weight[stream * HIDDEN : (stream + 1) * HIDDEN]
-            ref.append(xs * torch.rsqrt(xs.pow(2).mean(-1, keepdim=True) + config.layernorm_epsilon) * (1 + gamma))
+            ref.append(
+                xs
+                * torch.rsqrt(xs.pow(2).mean(-1, keepdim=True) + config.layernorm_epsilon)
+                * (1 + gamma)
+            )
         torch.testing.assert_close(out, torch.stack(ref, dim=2), atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(
             out.reshape(SEQ, BATCH, -1),

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Self-contained Triton kernels for the QSA sparse-GQA attention path.
 
@@ -48,9 +48,7 @@ ID_BITS = 21  # block-id field width in the int64 sort keys (supports 2M blocks)
 # ---------------------------------------------------------------------------
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=w) for w in [4, 8]], key=['BM', 'BN', 'DI']
-)
+@triton.autotune(configs=[triton.Config({}, num_warps=w) for w in [4, 8]], key=['BM', 'BN', 'DI'])
 @triton.jit
 def qsa_indexer_keys_kernel(
     q,  # [s, NH, DI] indexer queries (post norm/RoPE)
@@ -76,9 +74,9 @@ def qsa_indexer_keys_kernel(
     m_n = o_n < cb
 
     # [DI, BN] block-key tile for this chunk
-    b_k = tl.load(
-        bk + (j0 + o_n)[None, :] * DI + o_d[:, None], mask=m_n[None, :], other=0.0
-    ).to(tl.float32)
+    b_k = tl.load(bk + (j0 + o_n)[None, :] * DI + o_d[:, None], mask=m_n[None, :], other=0.0).to(
+        tl.float32
+    )
 
     b_acc = tl.zeros([BM, BN], dtype=tl.float32)
     for h in tl.static_range(NH):
@@ -230,9 +228,7 @@ def build_qsa_query_csr(
     b, s, S = block_indices.shape
     device = block_indices.device
     slot_valid = torch.arange(S, device=device) < block_counts.unsqueeze(-1)
-    batch_ix = (
-        torch.arange(b, device=device).view(b, 1, 1).expand(b, s, S)[slot_valid]
-    )
+    batch_ix = torch.arange(b, device=device).view(b, 1, 1).expand(b, s, S)[slot_valid]
     t_ix = torch.arange(s, device=device).view(1, s, 1).expand(b, s, S)[slot_valid]
     blk = block_indices.long()[slot_valid]
     key = batch_ix * num_blocks + blk
@@ -250,9 +246,7 @@ def build_qsa_query_csr(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=st) for w in [4, 8] for st in [1, 2, 3]
-    ],
+    configs=[triton.Config({}, num_warps=w, num_stages=st) for w in [4, 8] for st in [1, 2, 3]],
     key=['BK', 'BV', 'GP', 'BQ'],
 )
 @triton.jit
@@ -335,9 +329,7 @@ def qsa_fwd_kernel(
         b_s = tl.dot(b_q, b_k)
         # membership: [BQ, CB] -> broadcast to [R, CBT]
         mem = tl.load(
-            membership + o_e[None, :] * BQ + tl.arange(0, BQ)[:, None],
-            mask=m_e[None, :],
-            other=0,
+            membership + o_e[None, :] * BQ + tl.arange(0, BQ)[:, None], mask=m_e[None, :], other=0
         )
         m_mem = (
             tl.reshape(
@@ -371,9 +363,7 @@ def qsa_fwd_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=st) for w in [4, 8] for st in [1, 2]
-    ],
+    configs=[triton.Config({}, num_warps=w, num_stages=st) for w in [4, 8] for st in [1, 2]],
     key=['BK', 'BV', 'GP', 'BQ'],
 )
 @triton.jit
@@ -464,9 +454,7 @@ def qsa_bwd_dq_kernel(
 
         b_s = tl.dot(b_q, b_k)
         mem = tl.load(
-            membership + o_e[None, :] * BQ + tl.arange(0, BQ)[:, None],
-            mask=m_e[None, :],
-            other=0,
+            membership + o_e[None, :] * BQ + tl.arange(0, BQ)[:, None], mask=m_e[None, :], other=0
         )
         m_mem = (
             tl.reshape(
@@ -810,20 +798,16 @@ def qsa_sparse_attention(
     if tile_queries is None:
         tile_queries = qsa_choose_tile_queries(HQ, H)
     if q_positions is None:
-        assert q.shape[1] == k.shape[1], (
-            "q_positions is required when the query rows are a CP shard (TQ != TK)."
-        )
+        assert (
+            q.shape[1] == k.shape[1]
+        ), "q_positions is required when the query rows are a CP shard (TQ != TK)."
         q_positions = torch.arange(q.shape[1], device=q.device, dtype=torch.int64)
     num_blocks = block_bases.shape[0]
     supersets = build_qsa_supersets(
         block_indices, block_counts, block_bases, block_ends, num_blocks, tile_queries
     )
-    needs_grad = torch.is_grad_enabled() and (
-        q.requires_grad or k.requires_grad or v.requires_grad
-    )
-    query_csr = (
-        build_qsa_query_csr(block_indices, block_counts, num_blocks) if needs_grad else None
-    )
+    needs_grad = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
+    query_csr = build_qsa_query_csr(block_indices, block_counts, num_blocks) if needs_grad else None
     return QSASparseAttnFunction.apply(
         q.contiguous(),
         k.contiguous(),

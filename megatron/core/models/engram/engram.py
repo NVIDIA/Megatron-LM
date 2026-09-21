@@ -23,8 +23,8 @@ from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_r
 from .config import EngramConfig
 from .cp_layout import (
     gather_sequence,
-    restore_zigzag,
     gather_sequence_thd,
+    restore_zigzag,
     scatter_sequence,
     scatter_sequence_thd,
     select_zigzag,

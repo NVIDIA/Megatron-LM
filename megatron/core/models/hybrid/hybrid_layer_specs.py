@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 from functools import partial
 
@@ -668,9 +668,7 @@ def _strip_input_norms(spec: ModuleSpec) -> ModuleSpec:
     sub.moe_layer.submodules.pre_mlp_layernorm = IdentityOp
     sub.mlp_layer.submodules.mlp = partial(
         MLP.as_mlp_submodule,
-        submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
-        ),
+        submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
     )
     # Lets a builder that was handed this spec explicitly (via --spec) tell it apart from an
     # arbitrary user spec, which must still be warned about as possibly double-normalizing.

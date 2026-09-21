@@ -31,9 +31,10 @@ def test_sigmoid_switches_only_the_gate():
 
 
 def test_silu_is_explicit_default():
-    assert resolve_output_gate_activation(
-        SimpleNamespace(gdn_output_gate_activation="silu"), F.gelu
-    ) is F.silu
+    assert (
+        resolve_output_gate_activation(SimpleNamespace(gdn_output_gate_activation="silu"), F.gelu)
+        is F.silu
+    )
 
 
 def test_unknown_activation_is_rejected():
@@ -43,10 +44,7 @@ def test_unknown_activation_is_rejected():
 
 def test_transformer_config_accepts_the_knob():
     config = TransformerConfig(
-        num_layers=1,
-        hidden_size=64,
-        num_attention_heads=4,
-        gdn_output_gate_activation="sigmoid",
+        num_layers=1, hidden_size=64, num_attention_heads=4, gdn_output_gate_activation="sigmoid"
     )
     assert config.gdn_output_gate_activation == "sigmoid"
     assert resolve_output_gate_activation(config, F.silu) is torch.sigmoid

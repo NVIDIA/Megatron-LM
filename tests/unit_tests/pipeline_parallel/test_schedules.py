@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from contextlib import contextmanager
@@ -1318,9 +1318,7 @@ def test_mhc_p2p_hidden_size_is_inert_without_mhc():
     config = _mhc_config(enabled=False)
     for is_recv in (True, False):
         assert (
-            schedule._mhc_p2p_hidden_size(
-                config, pp_group=_FakePPGroup(1, 2), is_recv=is_recv
-            )
+            schedule._mhc_p2p_hidden_size(config, pp_group=_FakePPGroup(1, 2), is_recv=is_recv)
             == config.hidden_size
         )
     # No pipeline group (single stage, or a caller that cannot supply one) is also inert.

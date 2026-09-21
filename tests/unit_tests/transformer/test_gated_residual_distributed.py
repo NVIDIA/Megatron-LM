@@ -114,9 +114,7 @@ class TestGatedResidualContextParallelGrads:
     """
 
     def setup_method(self, method):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, context_parallel_size=2
-        )
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
         model_parallel_cuda_manual_seed(_SEED)
 
     def teardown_method(self, method):

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -8,9 +8,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layer_config i
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
 )
-from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import (
-    QSALayerConfig,
-)
+from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import QSALayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig

@@ -1893,7 +1893,8 @@ class TransformerConfig(ModelParallelConfig):
                         "(the dense-mask bridge is single-rank only)."
                     )
                 cp_comm_types = (
-                    self.cp_comm_type if isinstance(self.cp_comm_type, list)
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
                     else [self.cp_comm_type]
                 )
                 if any(c not in (None, "all_gather", "allgather") for c in cp_comm_types):
@@ -2595,8 +2596,10 @@ class TransformerConfig(ModelParallelConfig):
                     "output contract and per-sublayer norms, which the gated-residual "
                     "variant replaces; wiring it there would silently take the wrong branch."
                 )
-            if not isinstance(self.hc_lowrank, int) or isinstance(self.hc_lowrank, bool) or (
-                self.hc_lowrank < 1
+            if (
+                not isinstance(self.hc_lowrank, int)
+                or isinstance(self.hc_lowrank, bool)
+                or (self.hc_lowrank < 1)
             ):
                 raise ValueError("hc_lowrank must be a positive integer for gated_residual.")
             if self.transformer_impl != "transformer_engine":
@@ -2610,11 +2613,7 @@ class TransformerConfig(ModelParallelConfig):
                     "use_fused_mhc applies only to mhc_connection_variant='mhc'; the "
                     "gated-residual variant uses its own native kernels."
                 )
-            if (
-                self.cuda_graph_impl != "none"
-                or self.enable_cuda_graph
-                or self.external_cuda_graph
-            ):
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
                 raise ValueError(
                     "CUDA graphs are not supported with "
                     "mhc_connection_variant='gated_residual' yet: the partial-MoE "

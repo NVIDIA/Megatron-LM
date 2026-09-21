@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import List, Optional
@@ -10,12 +10,10 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
 )
+from megatron.core.transformer.experimental_attention_variant import qsa_module_specs as qsa_specs
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
-)
-from megatron.core.transformer.experimental_attention_variant import (
-    qsa_module_specs as qsa_specs,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,

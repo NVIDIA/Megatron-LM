@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
 import operator
@@ -25,12 +25,10 @@ from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
-from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import (
-    QSALayerConfig,
-)
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import QSALayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig

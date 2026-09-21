@@ -67,8 +67,14 @@ class RefRMSNorm(nn.Module):
 class RefGatedResidual(nn.Module):
     """Qwen4ExpTextGatedResidual with the config object replaced by scalars."""
 
-    def __init__(self, hidden_size: int, hc_count: int, hc_lowrank: int, eps: float = 1e-6,
-                 use_combine: bool = True):
+    def __init__(
+        self,
+        hidden_size: int,
+        hc_count: int,
+        hc_lowrank: int,
+        eps: float = 1e-6,
+        use_combine: bool = True,
+    ):
         super().__init__()
         self.hc_count = hc_count
         self.hidden_size = hidden_size
@@ -348,6 +354,7 @@ class TestGatedResidualParity:
         )
         assert out.shape == residual.shape
 
+
 class TestGatedResidualRecompute:
 
     def setup_method(self, method):
@@ -368,7 +375,7 @@ class TestGatedResidualRecompute:
         # Eager reference pass through gates + write-back.
         mixed, h_res, g_write, residual = module(x)
         out = module.fused_h_res_h_post_bda(h_res, residual, g_write, (y, None), 0.0, True, False)
-        loss_ref = (out.float().square().sum() + mixed.float().square().sum())
+        loss_ref = out.float().square().sum() + mixed.float().square().sum()
         loss_ref.backward()
         grads_ref = {n: p.grad.detach().clone() for n, p in module.named_parameters()}
         x_grad_ref = x.grad.detach().clone()
