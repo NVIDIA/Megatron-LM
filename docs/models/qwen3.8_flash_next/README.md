@@ -6,7 +6,7 @@ architecture preview): 48 hybrid layers of Gated DeltaNet (3 per block) and Qwen
 streams, a hashed n-gram memory (PLE) on decoder layer 2 with a ~51 B-parameter table, and one
 multi-token-prediction depth. The vision tower of the released checkpoint is not modelled.
 
-This folder is the entry point for the `lit/qwen4` branch. It ties together the three component
+This folder is the entry point for the `lit/main_qwen4` branch. It ties together the three component
 documents that live one level up and adds what is specific to assembling and running the whole
 model.
 

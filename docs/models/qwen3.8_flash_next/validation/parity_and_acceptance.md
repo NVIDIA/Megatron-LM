@@ -1,6 +1,6 @@
 # Numerical parity and acceptance
 
-What has been checked on the `lit/qwen4` branch, with the numbers. Reference implementation:
+What has been checked on the `lit/main_qwen4` branch, with the numbers. Reference implementation:
 HF `transformers` `modeling_qwen4_exp.py` (5.17). All fp32 comparisons run with TF32 disabled on
 **both** sides (`NVIDIA_TF32_OVERRIDE=0`, `TRITON_F32_DEFAULT=ieee`, `torch.backends.*.allow_tf32=False`);
 HF's "torch" gated delta rule dispatches to the fla Triton kernel when fla is importable, so the

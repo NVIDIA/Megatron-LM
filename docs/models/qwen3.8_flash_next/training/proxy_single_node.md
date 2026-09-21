@@ -67,7 +67,7 @@ drop both together for real data (`--data-path ... --split 99,1,0`) and switch t
 
 ## Verified
 
-The command above was run on 4 GB300s (2026-09-15, `lit/qwen4`): 8 iterations, finite
+The command above was run on 4 GB300s (2026-09-15, `lit/main_qwen4`): 8 iterations, finite
 `lm loss` / `mtp_1 loss` / `load_balancing_loss` / `indexer loss`, **71.9 GiB peak allocated** per
 GPU at seq 4096. The same command with flag overrides is what produced the
 [support matrix](../validation/support_matrix.md) — run it before trusting a new branch.

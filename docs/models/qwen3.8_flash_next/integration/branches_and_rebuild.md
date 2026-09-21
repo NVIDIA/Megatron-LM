@@ -1,33 +1,46 @@
-# How `lit/qwen4` is built
+# How `lit/main_qwen4` is built
 
-`lit/qwen4` is an **integration branch**: it is rebuilt from feature branches rather than edited
-in place, so that each feature keeps a readable history of its own and the integration branch
-stays short. On dev `bb5dfd08f` (2026-09-14) it is five commits:
+`lit/main_qwen4` is an **integration branch**: it is rebuilt from feature branches rather than
+edited in place, so that each feature keeps a readable history of its own and the integration
+branch stays short. On `origin/main` `5f4c9ac90` (2026-09-20) it is seven commits:
 
 ```
-fix(hybrid): compose the QSA layer with the gated-residual stack spec   <- the one glue commit
-feat(gdn): add a separate activation switch for the GDN output gate     <- standalone (lit/gdn_output_gate)
-feat(engram): squash-merge the n-gram memory and its Qwen PLE variant  <- lit/n_gram (15 commits)
-feat(transformer): squash-merge the gated-residual variant             <- lit/gated_residual (4 commits)
-feat(qsa): squash-merge QSA sparse attention                           <- lit/qsa (8 commits)
+fix(examples): let the Qwen3.8 proxy script accept a short --train-iters
+examples/docs: port the parity harness and model docs
+fix(hybrid): forward --sft-mock-dataset-config-json to the dataset config
+feat(transformer): gated-residual variant       <- lit/main_gr       (4 commits + 1 port commit)
+feat(engram): hashed n-gram memory              <- lit/main_n_gram  (15 commits + 1 port commit)
+feat(gdn): separate GDN output-gate activation  <- lit/main_gdn_gate (1 commit)
+feat(qsa): Qwen Sparse Attention                <- lit/main_qsa      (8 commits + 1 port commit)
 ```
 
 | Feature | Branch | Owns | Doc |
 |---|---|---|---|
-| QSA | `lit/qsa` | `experimental_attention_variant/qsa.py`, `dsa_layout.py`, `ops/triton_qsa.py`, the `Q` hybrid symbol, `hybrid_qsa_stack_spec` | [`../../qsa.md`](../../qsa.md) |
-| Gated residual | `lit/gated_residual` | `transformer/gated_residual.py`, `mhc_connection_variant`, `gated_residual_hybrid_stack_spec`, the GR branches of `HyperConnectionHybridLayer`, no-final-norm on all three paths, the grouped MTP `hnorm` | [`../../gated_residual.md`](../../gated_residual.md) |
-| n-gram memory / PLE | `lit/n_gram` | `megatron/core/models/engram/`, GPT and hybrid integration, qwen variant + HF PLE converter, packed-document boundaries, recompute, VPP prefetch, CP (unpacked rows), memory inside the hyper-connection wrapper, MTP on the hybrid path, fp32 | [`../../engram.md`](../../engram.md) |
-| GDN output gate | `lit/gdn_output_gate` | `gdn_output_gate_activation` (`ssm/gated_delta_net/common.py`) + test | [`../architecture/config_mapping.md`](../architecture/config_mapping.md) |
+| QSA | `lit/main_qsa` | `experimental_attention_variant/qsa.py`, `qsa_module_specs.py`, `qsa_layer_config.py`, `dsa_layout.py`, `ops/triton_qsa.py`, the `Q` hybrid symbol, the static `qsa_layer` / `qsa_qk_layernorm_layer` entries of `hybrid_stack_spec` | [`../../qsa.md`](../../qsa.md) |
+| Gated residual | `lit/main_gr` | `transformer/gated_residual.py`, `mhc_connection_variant`, `gated_residual_hybrid_stack_spec`, the GR branch of `HyperConnectionHybridLayer`, no-final-norm on the HybridStack and MTP exits, the grouped MTP `hnorm` | [`../../gated_residual.md`](../../gated_residual.md) |
+| n-gram memory / PLE | `lit/main_n_gram` | `megatron/core/models/engram/`, GPT and hybrid integration, qwen variant + HF PLE converter, packed-document boundaries, recompute, VPP prefetch, CP (unpacked rows), memory inside the hyper-connection wrapper, MTP on the hybrid path, fp32 | [`../../engram.md`](../../engram.md) |
+| GDN output gate | `lit/main_gdn_gate` | `gdn_output_gate_activation` (`ssm/gated_delta_net/common.py`) + test | [`../architecture/config_mapping.md`](../architecture/config_mapping.md) |
 
-## The glue commit
+## There is no QSA-into-GR glue commit on this base
 
-`hybrid_qsa_stack_spec` and `gated_residual_hybrid_stack_spec` each deep-copy the default hybrid
-stack and mutate it, so selecting one drops the other's symbol: a pattern with `Q` built with the
-GR spec would leave `qsa_layer = IdentityOp`. The glue makes the GR builder start from the
-QSA-extended stack when `experimental_attention_variant == "qsa"` and strip the QSA layer's
-`input_layernorm` along with the other explicit-norm layers. It needs both features, which is why
-it lives here and not in either branch. Any third config-aware spec builder will hit the same
-problem; the composition has to be explicit (or the builders have to accept a base spec).
+On the `dev`-based lineage, `gated_residual_hybrid_stack_spec(config)` and
+`hybrid_qsa_stack_spec(config)` were **config-aware factories** that each deep-copied the default
+hybrid stack and mutated it, so selecting one dropped the other's symbol: a pattern with `Q`
+built with the GR spec would leave `qsa_layer = IdentityOp`. A glue commit had to teach the GR
+builder to start from the QSA-extended stack.
+
+`main` forbids that shape. `megatron/core/models/hybrid/CLAUDE.md` requires module specs to be
+comptime-available, and `hybrid_builder` enforces it (`--spec must refer to a static ModuleSpec`).
+So on this base:
+
+* QSA is wired **statically into `hybrid_stack_spec`** as `qsa_layer` / `qsa_qk_layernorm_layer`,
+  exactly the way `main` wires `csa_layer` / `csa_qk_layernorm_layer`;
+* `gated_residual_hybrid_stack_spec` is a **module-level object**, built once at import by
+  `_strip_input_norms(hybrid_stack_spec)`.
+
+Because the strip runs over the one stack that already contains the QSA layers, the composition
+the glue commit used to perform happens by construction. `--spec … gated_residual_hybrid_stack_spec`
+is unchanged for callers; it now resolves to an object rather than a function.
 
 ## Rebuild procedure
 
@@ -35,11 +48,11 @@ A squash merge records no merge relationship, so the integration branch cannot b
 incrementally — a second `merge --squash` of the same feature replays its whole diff. Every round:
 
 ```bash
-git tag qwen4/r<N> lit/qwen4                      # keep the working round
-git branch -f lit/qwen4 <new dev base>
-git merge --squash lit/qsa            && git commit -s -S
-git merge --squash lit/gated_residual && git commit -s -S
-git merge --squash lit/n_gram         && git commit -s -S
+git tag qwen4/r<N> lit/main_qwen4                      # keep the working round
+git branch -f lit/main_qwen4 <new dev base>
+git merge --squash lit/main_qsa            && git commit -s -S
+git merge --squash lit/main_gr && git commit -s -S
+git merge --squash lit/main_n_gram         && git commit -s -S
 git cherry-pick -x <gdn output gate>  # until it is upstream
 git cherry-pick -x <the glue commit>
 ```
