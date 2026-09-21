@@ -33,7 +33,16 @@ class HyperConnectionHybridLayer(MegatronModule):
         super().__init__(config=config)
         self.inner_layer = layer
         self.layer_number = layer.layer_number
-        self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
+        if config.mhc_connection_variant == "gated_residual":
+            from megatron.core.transformer.gated_residual import GatedResidualModule
+
+            self.hyper_connection = GatedResidualModule(
+                config=config, layer_number=self.layer_number
+            )
+        else:
+            self.hyper_connection = HyperConnectionModule(
+                config=config, layer_number=self.layer_number
+            )
         if config.params_dtype is not None:
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):

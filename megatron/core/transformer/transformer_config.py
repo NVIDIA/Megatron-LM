@@ -1285,6 +1285,23 @@ class TransformerConfig(ModelParallelConfig):
     mhc_num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
+    mhc_connection_variant: str = "mhc"
+    """Which hyper-connection mathematics to use when enable_mhc_connections=True.
+
+    "mhc": Manifold-Constrained Hyper-Connections (Sinkhorn doubly-stochastic
+    cross-stream mixing + per-stream scalar read gate). The default; existing
+    behaviour is unchanged.
+    "gated_residual": the Qwen4-Exp variant — low-rank per-channel read gate
+    over group-RMS-normalized streams, per-stream scalar write gate, identity
+    residual (no cross-stream mixing). Removes the per-sublayer pre-norms
+    (the gated-residual group norm takes over that role).
+    """
+
+    hc_lowrank: int = 320
+    """Bottleneck width of the gated-residual read gate's two projections
+    ((n*C) -> hc_lowrank -> (n*C)). Only used with
+    mhc_connection_variant="gated_residual"."""
+
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
@@ -2560,6 +2577,85 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mhc_init_gating_factor must be non-negative, got "
                     f"{self.mhc_init_gating_factor}."
+                )
+
+        # Validation for mhc_connection_variant
+        if self.mhc_connection_variant not in ("mhc", "gated_residual"):
+            raise ValueError(
+                f"mhc_connection_variant must be 'mhc' or 'gated_residual', got "
+                f"{self.mhc_connection_variant!r}."
+            )
+        if self.mhc_connection_variant != "mhc" and not self.enable_mhc_connections:
+            warnings.warn(
+                f"mhc_connection_variant={self.mhc_connection_variant!r} has no "
+                "effect without enable_mhc_connections=True.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.enable_mhc_connections and self.mhc_connection_variant == "gated_residual":
+            if not self.is_hybrid_model:
+                raise ValueError(
+                    "mhc_connection_variant='gated_residual' is only implemented for the "
+                    "HybridModel architecture (set is_hybrid_model=True / pass "
+                    "--hybrid-layer-pattern). The GPT decoder path builds its own static "
+                    "output contract and per-sublayer norms, which the gated-residual "
+                    "variant replaces; wiring it there would silently take the wrong branch."
+                )
+            if (
+                self.virtual_pipeline_model_parallel_size is not None
+                and self.virtual_pipeline_model_parallel_size > 1
+            ):
+                raise ValueError(
+                    "Virtual pipeline parallelism is not supported with "
+                    "mhc_connection_variant='gated_residual': the pipeline schedule still "
+                    "sizes stage-to-stage tensors as [s, b, hidden_size] while the "
+                    "multi-stream hidden state is [s, b, n*hidden_size] (see BLOCKERS.md "
+                    "B1). Use virtual_pipeline_model_parallel_size=None."
+                )
+            if self.pipeline_model_parallel_size > 1:
+                raise ValueError(
+                    "Pipeline parallelism is not supported with "
+                    "mhc_connection_variant='gated_residual' on this base: the pipeline "
+                    "schedule computes stage-to-stage tensor shapes as "
+                    "[s, b, hidden_size], but the multi-stream hidden state is "
+                    "[s, b, n*hidden_size], so the receive buffers are undersized. Use "
+                    "pipeline_model_parallel_size=1."
+                )
+            if not isinstance(self.hc_lowrank, int) or isinstance(self.hc_lowrank, bool) or (
+                self.hc_lowrank < 1
+            ):
+                raise ValueError("hc_lowrank must be a positive integer for gated_residual.")
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError(
+                    "mhc_connection_variant='gated_residual' requires "
+                    "transformer_impl='transformer_engine': the norm-free layer specs are "
+                    "only built for the TE backend."
+                )
+            if self.use_fused_mhc:
+                raise ValueError(
+                    "use_fused_mhc applies only to mhc_connection_variant='mhc'; the "
+                    "gated-residual variant uses its own native kernels."
+                )
+            if (
+                self.cuda_graph_impl != "none"
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
+            ):
+                raise ValueError(
+                    "CUDA graphs are not supported with "
+                    "mhc_connection_variant='gated_residual' yet: the partial-MoE "
+                    "capture paths pack the 4-tuple's h_res slot as a graph output, "
+                    "which the gated-residual variant returns as None. Disable CUDA "
+                    "graphs to train with gated residuals."
+                )
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                warnings.warn(
+                    "mhc_connection_variant='gated_residual' with tensor parallelism "
+                    "but without sequence_parallel duplicates the gated-residual "
+                    "computation (~10% of forward FLOPs) on every TP rank. Enable "
+                    "sequence_parallel so each rank processes s/TP of the sequence.",
+                    UserWarning,
+                    stacklevel=2,
                 )
 
         if self.fine_grained_activation_offloading:

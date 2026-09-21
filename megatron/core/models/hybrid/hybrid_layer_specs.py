@@ -1,4 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+import copy
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -635,3 +636,57 @@ gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 # Preserve the existing --spec import path; C/H/W use the standard static stack spec.
 hybrid_dsv4_stack_spec = hybrid_stack_spec
+
+
+def _strip_input_norms(spec: ModuleSpec) -> ModuleSpec:
+    """Return a copy of ``spec`` with every pre-sublayer normalization removed.
+
+    Gated-residual layers carry no pre-sublayer norms (the gated-residual group norm owns
+    that role), so fused-LN projections (GDN ``in_proj``, attention ``linear_qkv``, dense-MLP
+    ``linear_fc1``) become plain column-parallel linears and explicit ``input_layernorm`` /
+    ``pre_mlp_layernorm`` entries become ``IdentityOp``.
+
+    This runs once at import time, not per model construction: the result below is a single
+    concrete ModuleSpec with one precise behavior, as `hybrid/CLAUDE.md` requires.
+    """
+    spec = copy.deepcopy(spec)
+    sub = spec.submodules
+
+    for name in ("gdn_layer", "gdn2_layer"):
+        layer = getattr(sub, name, None)
+        if layer is not None and hasattr(layer, "submodules"):
+            layer.submodules.self_attention.submodules.in_proj = TEColumnParallelLinear
+    for name in ("attention_layer", "qsa_layer", "qsa_qk_layernorm_layer"):
+        layer = getattr(sub, name, None)
+        if layer is not None and layer is not IdentityOp and hasattr(layer, "submodules"):
+            layer.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+            layer.submodules.input_layernorm = IdentityOp
+    for name in ("mla_layer", "dsa_layer", "csa_layer", "csa_qk_layernorm_layer"):
+        layer = getattr(sub, name, None)
+        if layer is not None and layer is not IdentityOp and hasattr(layer, "submodules"):
+            layer.submodules.input_layernorm = IdentityOp
+    sub.moe_layer.submodules.pre_mlp_layernorm = IdentityOp
+    sub.mlp_layer.submodules.mlp = partial(
+        MLP.as_mlp_submodule,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+        ),
+    )
+    # Lets a builder that was handed this spec explicitly (via --spec) tell it apart from an
+    # arbitrary user spec, which must still be warned about as possibly double-normalizing.
+    spec.metainfo = {**(spec.metainfo or {}), "gated_residual_norm_free": True}
+    return spec
+
+
+# Norm-free stack for ``mhc_connection_variant='gated_residual'``.
+gated_residual_hybrid_stack_spec = _strip_input_norms(hybrid_stack_spec)
+
+
+def is_gated_residual_norm_free(spec) -> bool:
+    """True for stack specs built by :func:`_strip_input_norms`.
+
+    The hybrid builder warns about explicitly provided specs under the gated-residual
+    variant (fused input layernorms would normalize the residual streams twice); specs that
+    carry the ``gated_residual_norm_free`` metainfo are exempt.
+    """
+    return bool((getattr(spec, "metainfo", None) or {}).get("gated_residual_norm_free", False))

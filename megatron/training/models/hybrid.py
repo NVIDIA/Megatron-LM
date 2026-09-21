@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Literal, override
 
@@ -12,6 +13,8 @@ from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_sta
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
     hybrid_inference_stack_spec,
+    gated_residual_hybrid_stack_spec,
+    is_gated_residual_norm_free,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -163,8 +166,33 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                     local_core_attention=False,
                     remap_te_layernorm=False,
                 )
+            elif (
+                self._model_config.transformer.enable_mhc_connections
+                and self._model_config.transformer.mhc_connection_variant == "gated_residual"
+            ):
+                # Norm-free layer specs: the gated-residual group norm replaces
+                # the per-sublayer input layernorms.
+                hybrid_stack_spec = gated_residual_hybrid_stack_spec
             else:
                 hybrid_stack_spec = default_hybrid_stack_spec
+        elif (
+            self._model_config.transformer.enable_mhc_connections
+            and self._model_config.transformer.mhc_connection_variant == "gated_residual"
+            and not is_gated_residual_norm_free(hybrid_stack_spec)
+        ):
+            # An explicit spec wins by design, but the gated-residual architecture
+            # has no pre-sublayer norms: a spec that keeps them (e.g. the default
+            # hybrid_stack_spec) normalizes the streams twice. Specs built by
+            # gated_residual_hybrid_stack_spec mark themselves norm-free and are exempt.
+            warnings.warn(
+                "mhc_connection_variant='gated_residual' with an explicitly provided "
+                "hybrid_stack_spec: make sure the spec is norm-free (see "
+                "gated_residual_hybrid_stack_spec) — fused input layernorms in the "
+                "layer specs would normalize the residual streams twice on top of the "
+                "gated-residual group norm.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:
