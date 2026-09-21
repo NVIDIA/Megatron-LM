@@ -887,3 +887,31 @@ def test_leaf_outputs_do_not_accumulate_backward_hooks():
         assert wrapped() is parameter
     assert not parameter._backward_hooks
     assert any("persistent leaf" in issue for issue in observed.issues)
+
+
+@pytest.mark.parametrize("passes,exit_code", [(0, 2), (1, 0)])
+def test_replay_launcher_requires_a_passed_case(tmp_path, monkeypatch, passes, exit_code):
+    from tools.determinism import replay_collectives
+
+    capture = tmp_path / "capture"
+    capture.mkdir()
+    policy = ModuleType("megatron.determinism")
+    policy.bootstrap_training_determinism = lambda _: None
+    plugin = ModuleType("tools.determinism.pytest_plugin")
+    monkeypatch.setitem(sys.modules, policy.__name__, policy)
+    monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+
+    def run(args, plugins):
+        for _ in range(passes):
+            plugins[-1].pytest_runtest_logreport(SimpleNamespace(when="call", passed=True))
+        return 0
+
+    monkeypatch.setattr(pytest, "main", run)
+    arguments = ["--capture", str(capture), "--evidence", str(tmp_path / "evidence")]
+    if exit_code:
+        with pytest.raises(SystemExit) as error:
+            replay_collectives.main(arguments)
+        assert error.value.code == exit_code
+    else:
+        assert replay_collectives.main(arguments) == 0

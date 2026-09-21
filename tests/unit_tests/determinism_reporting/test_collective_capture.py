@@ -636,3 +636,20 @@ def test_cli_writes_rank_capture_and_propagates_capture_gaps(tmp_path, max_bytes
     assert len(capture["events"]) == expected_events
     assert report["capture_issues"] == capture["capture_issues"]
     assert bool(report["capture_issues"]) is (max_bytes == 1)
+
+
+@pytest.mark.parametrize("alias_first", [False, True])
+def test_mapping_alias_bindings_are_order_independent(tmp_path, monkeypatch, mappings, alias_first):
+    alias = ModuleType("collective_alias_fixture")
+    alias.reduce = mappings.reduce_from_tensor_model_parallel_region
+    monkeypatch.setitem(sys.modules, alias.__name__, alias)
+    direct = binding("reduce")
+    alternate = {**direct, "target": alias.__name__ + ":reduce"}
+    store = CollectiveCapture(tmp_path / "capture", max_bytes=4096, max_events=8)
+    inventory = Inventory(torch, 8, collectives=store)
+    with install_bindings(inventory, [alternate, direct] if alias_first else [direct, alternate]):
+        value = torch.ones(2)
+        assert torch.equal(alias.reduce(value, group()), value * 2)
+        assert torch.equal(
+            mappings.reduce_from_tensor_model_parallel_region(value, group()), value * 2
+        )
