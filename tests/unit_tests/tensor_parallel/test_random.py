@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
+    HAVE_TE,
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
@@ -294,5 +295,106 @@ def test_checkpoint_without_output_view_sharing_regression():
         output2.backward(grad, retain_graph=True)
         assert torch.allclose(input1.grad, input2.grad)
         assert torch.allclose(weight1.grad, weight2.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _fp8_recipe_or_skip(name=None):
+    """An FP8 recipe the current GPU can run; skips when it is unavailable.
+
+    ``name`` selects ``"mxfp8"`` or ``"delayed"`` scaling; ``None`` prefers MXFP8 and falls back
+    to delayed scaling.
+    """
+    from transformer_engine.common import recipe as te_recipe
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    if not FP8GlobalStateManager.is_fp8_available()[0]:
+        pytest.skip("FP8 is not available on this GPU")
+    mxfp8_available = FP8GlobalStateManager.is_mxfp8_available()[0]
+    if name == "mxfp8" and not mxfp8_available:
+        pytest.skip("MXFP8 is not available on this GPU")
+    if name == "mxfp8" or (name is None and mxfp8_available):
+        return te_recipe.MXFP8BlockScaling()
+    return te_recipe.DelayedScaling()
+
+
+@pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+def test_checkpoint_recompute_reenters_forward_fp8_autocast():
+    """backward() recomputes outside the caller's fp8_autocast; the recompute must see the FP8
+    state the forward ran under (and none when the forward had none)."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    recipe = _fp8_recipe_or_skip()
+    Utils.initialize_model_parallel()
+    model_parallel_cuda_manual_seed(123)
+    try:
+        seen = []
+
+        def record_and_scale(x):
+            enabled = FP8GlobalStateManager.is_fp8_enabled()
+            seen.append(
+                (enabled, type(FP8GlobalStateManager.get_fp8_recipe()) if enabled else None)
+            )
+            return x * 2
+
+        x = torch.ones(8, device="cuda", requires_grad=True)
+        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            y = checkpoint(record_and_scale, False, x)
+        assert not FP8GlobalStateManager.is_fp8_enabled()
+        y.sum().backward()  # the recompute runs here
+        assert seen == [(True, type(recipe)), (True, type(recipe))]
+        assert torch.equal(x.grad, torch.full((8,), 2.0, device="cuda"))
+
+        seen.clear()
+        x = torch.ones(8, device="cuda", requires_grad=True)
+        y = checkpoint(record_and_scale, False, x)
+        y.sum().backward()
+        assert seen == [(False, None), (False, None)]
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+@pytest.mark.parametrize("recipe_name", ["mxfp8", "delayed"])
+def test_checkpoint_recomputes_te_linear_with_fp8_parameters(recipe_name):
+    """A TE Linear with FP8 parameters and fused wgrad accumulation inside a checkpointed region:
+    without the recorded FP8 state the recompute dequantizes the weight into a plain tensor and
+    the backward fails on ``weight.main_grad``; with it the checkpointed pass matches the plain one.
+    """
+    import transformer_engine.pytorch as te
+
+    recipe = _fp8_recipe_or_skip(recipe_name)
+    Utils.initialize_model_parallel()
+    model_parallel_cuda_manual_seed(123)
+    try:
+        inputs = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+
+        def run(use_checkpoint):
+            # A fresh, identically initialised module per pass: FP8 scaling state (amax history
+            # under delayed scaling) evolves with every forward, so the two passes must not share
+            # one module.
+            torch.manual_seed(0)
+            with te.fp8_model_init(enabled=True, recipe=recipe):
+                linear = te.Linear(
+                    256,
+                    256,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    fuse_wgrad_accumulation=True,
+                    device="cuda",
+                )
+            linear.weight.main_grad = torch.zeros(256, 256, dtype=torch.float32, device="cuda")
+            x = inputs.clone().requires_grad_(True)
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                out = checkpoint(linear, False, x) if use_checkpoint else linear(x)
+            out.float().sum().backward()
+            return out.detach().clone(), x.grad.clone(), linear.weight.main_grad.clone()
+
+        ref_out, ref_x_grad, ref_main_grad = run(use_checkpoint=False)
+        out, x_grad, main_grad = run(use_checkpoint=True)
+        torch.testing.assert_close(out, ref_out)
+        torch.testing.assert_close(x_grad, ref_x_grad)
+        torch.testing.assert_close(main_grad, ref_main_grad, rtol=1e-3, atol=1e-2)
     finally:
         Utils.destroy_model_parallel()
