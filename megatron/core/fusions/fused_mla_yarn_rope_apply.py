@@ -255,70 +255,6 @@ def _mla_rope_fwd_inplace_kernel(
         triton.Config({"BLOCK_H": 128}),
     ],
     key=["emb_dim", "head_num"],
-)
-@triton.jit
-def _mla_rope_fwd_out_kernel(
-    Q,
-    O,
-    COS,
-    SIN,
-    nope_dim,
-    emb_dim: tl.constexpr,
-    head_num: tl.constexpr,
-    stride_q_seq,
-    stride_q_nheads,
-    stride_o_seq,
-    stride_o_nheads,
-    stride_cos_seq,
-    stride_sin_seq,
-    BLOCK_NOPE: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    """Copy the non-RoPE dimensions and rotate into a separate output."""
-    pid_m = tl.program_id(axis=0)
-    pid_head = tl.program_id(axis=1)
-    head_offsets = pid_head * BLOCK_H + tl.arange(0, BLOCK_H)
-    head_mask = head_offsets < head_num
-
-    q_head = Q + pid_m * stride_q_seq + head_offsets[:, None] * stride_q_nheads
-    o_head = O + pid_m * stride_o_seq + head_offsets[:, None] * stride_o_nheads
-
-    nope_offsets = tl.arange(0, BLOCK_NOPE)
-    nope_mask = head_mask[:, None] & (nope_offsets[None, :] < nope_dim)
-    nope = tl.load(q_head + nope_offsets[None, :], mask=nope_mask)
-    tl.store(o_head + nope_offsets[None, :], nope, mask=nope_mask)
-
-    rope_offsets = tl.arange(0, emb_dim // 2)
-    cos_left = tl.load(COS + pid_m * stride_cos_seq + rope_offsets)
-    sin_left = tl.load(SIN + pid_m * stride_sin_seq + rope_offsets)
-    cos_right = tl.load(COS + pid_m * stride_cos_seq + emb_dim // 2 + rope_offsets)
-    sin_right = tl.load(SIN + pid_m * stride_sin_seq + emb_dim // 2 + rope_offsets)
-
-    x_1_off = nope_dim + rope_offsets[None, :] * 2
-    x_2_off = x_1_off + 1
-    x_1 = tl.load(q_head + x_1_off, mask=head_mask[:, None])
-    x_2 = tl.load(q_head + x_2_off, mask=head_mask[:, None])
-    x_left = x_1 * cos_left[None, :] - x_2 * sin_left[None, :]
-    x_right = x_2 * cos_right[None, :] + x_1 * sin_right[None, :]
-
-    x_left_off = nope_dim + rope_offsets[None, :]
-    x_right_off = x_left_off + emb_dim // 2
-    tl.store(o_head + x_left_off, x_left, mask=head_mask[:, None])
-    tl.store(o_head + x_right_off, x_right, mask=head_mask[:, None])
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 1}),
-        triton.Config({"BLOCK_H": 2}),
-        triton.Config({"BLOCK_H": 4}),
-        triton.Config({"BLOCK_H": 8}),
-        triton.Config({"BLOCK_H": 16}),
-        triton.Config({"BLOCK_H": 32}),
-        triton.Config({"BLOCK_H": 64}),
-        triton.Config({"BLOCK_H": 128}),
-    ],
-    key=["emb_dim", "head_num"],
     restore_value=["DO"],
 )
 @triton.jit
@@ -691,171 +627,6 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             else:
                 grad = grad_root
         return grad, None, None, None, None, None, None, None, None, None, None, None
-
-
-class _FusedMLARoPEOutVMM(torch.autograd.Function):
-    """SBHD Q RoPE that reads ordinary input and writes a VMM output."""
-
-    @staticmethod
-    def forward(ctx, q, out, cos, sin, nope_dim, emb_dim):
-        if q.ndim != 4 or q.shape[1] != 1:
-            raise ValueError("VMM Q RoPE output currently supports SBHD with batch size 1")
-        if (
-            tuple(out.shape) != tuple(q.shape)
-            or out.dtype != q.dtype
-            or out.device != q.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError("Q RoPE output must match the contiguous input")
-        if out.requires_grad:
-            raise ValueError("Q RoPE output buffer must not require gradients")
-        if not q.is_contiguous() or not cos.is_contiguous() or not sin.is_contiguous():
-            raise ValueError("Q, cos, and sin must be contiguous")
-
-        seqlen, _, nheads, headdim = q.shape
-        if headdim != nope_dim + emb_dim:
-            raise ValueError(f"Expected Q head dimension {nope_dim + emb_dim}, got {headdim}")
-        if emb_dim % 4 != 0:
-            raise ValueError("RoPE dimension must be divisible by 4")
-        if ctx.needs_input_grad[0]:
-            ctx.mark_dirty(out)
-
-        streams = _localization_streams(out)
-        if streams is None:
-            raise ValueError("Q RoPE output must be VMM-localized")
-        q_3d = q.view(seqlen, nheads, headdim)
-        out_3d = out.view(seqlen, nheads, headdim)
-        parent_stream, fork_event, join_events = _fork_localized_streams(streams, out.device)
-        rows_per_domain = seqlen // len(streams)
-        for domain, stream in enumerate(streams):
-            row_start = domain * rows_per_domain
-            row_end = row_start + rows_per_domain
-            local_q = q_3d[row_start:row_end]
-            local_out = out_3d[row_start:row_end]
-            local_cos = cos[row_start:row_end]
-            local_sin = sin[row_start:row_end]
-            grid = lambda META: (
-                rows_per_domain,
-                triton.cdiv(nheads, META["BLOCK_H"]),
-            )
-            with torch.cuda.stream(stream):
-                _mla_rope_fwd_out_kernel[grid](
-                    local_q,
-                    local_out,
-                    local_cos,
-                    local_sin,
-                    nope_dim,
-                    emb_dim,
-                    nheads,
-                    local_q.stride(0),
-                    local_q.stride(1),
-                    local_out.stride(0),
-                    local_out.stride(1),
-                    local_cos.stride(0),
-                    local_sin.stride(0),
-                    BLOCK_NOPE=triton.next_power_of_2(nope_dim),
-                )
-            join_events[domain].record(stream)
-        for event in join_events:
-            parent_stream.wait_event(event)
-
-        ctx.save_for_backward(cos, sin)
-        ctx.nope_dim = nope_dim
-        ctx.emb_dim = emb_dim
-        ctx.localization_events = (fork_event, *join_events)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad):
-        cos, sin = ctx.saved_tensors
-        grad_root = _capture_vmm_output(grad, grad.shape, "q_backward")
-        if grad_root is not None and grad_root.data_ptr() != grad.data_ptr():
-            grad_root.copy_(grad)
-            grad = grad_root
-        else:
-            grad = grad.contiguous()
-
-        seqlen, batch_size, nheads, headdim = grad.shape
-        grad_3d = grad.view(seqlen * batch_size, nheads, headdim)
-        streams = _localization_streams(grad)
-        if streams is None:
-            grid = lambda META: (
-                grad_3d.shape[0],
-                triton.cdiv(nheads, META["BLOCK_H"]),
-            )
-            _mla_rope_bwd_inplace_kernel[grid](
-                grad_3d,
-                cos,
-                sin,
-                ctx.nope_dim,
-                ctx.emb_dim,
-                nheads,
-                batch_size,
-                None,
-                None,
-                None,
-                grad_3d.stride(0),
-                grad_3d.stride(1),
-                cos.stride(0),
-                sin.stride(0),
-                0,
-                1,
-                INVERSE=False,
-                REMOVE_INTERLEAVING=False,
-            )
-        else:
-            parent_stream, fork_event, join_events = _fork_localized_streams(
-                streams, grad.device
-            )
-            rows_per_domain = seqlen // len(streams)
-            for domain, stream in enumerate(streams):
-                row_start = domain * rows_per_domain
-                row_end = row_start + rows_per_domain
-                local_grad = grad_3d[row_start:row_end]
-                local_cos = cos[row_start:row_end]
-                local_sin = sin[row_start:row_end]
-                grid = lambda META: (
-                    rows_per_domain,
-                    triton.cdiv(nheads, META["BLOCK_H"]),
-                )
-                with torch.cuda.stream(stream):
-                    _mla_rope_bwd_inplace_kernel[grid](
-                        local_grad,
-                        local_cos,
-                        local_sin,
-                        ctx.nope_dim,
-                        ctx.emb_dim,
-                        nheads,
-                        1,
-                        None,
-                        None,
-                        None,
-                        local_grad.stride(0),
-                        local_grad.stride(1),
-                        local_cos.stride(0),
-                        local_sin.stride(0),
-                        0,
-                        1,
-                        INVERSE=False,
-                        REMOVE_INTERLEAVING=False,
-                    )
-                join_events[domain].record(stream)
-            for event in join_events:
-                parent_stream.wait_event(event)
-            ctx.localization_bwd_events = (fork_event, *join_events)
-        return grad, None, None, None, None, None
-
-
-def fused_mla_rope_q_out(
-    q: torch.Tensor,
-    out: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    nope_dim: int,
-    emb_dim: int,
-) -> torch.Tensor:
-    """Apply SBHD Q RoPE while copying ordinary input directly into VMM output."""
-    return _FusedMLARoPEOutVMM.apply(q, out, cos, sin, nope_dim, emb_dim)
 
 
 def fused_mla_rope_inplace(
@@ -1665,16 +1436,12 @@ def fused_apply_mla_rope_for_q(
     its original mutation behavior and does not add a clone to the hot path.
     """
     localized_q = _capture_vmm_output(t, t.shape, "q_forward")
-    if localized_q is not None and localized_q.data_ptr() != t.data_ptr():
-        return fused_mla_rope_q_out(
-            t,
-            localized_q,
-            cos,
-            sin,
-            qk_head_dim,
-            emb_dim,
-        )
     if localized_q is not None:
+        # The profiled Q kernel is in-place. Preserve its API while moving the
+        # producer output into VMM; replacing this copy with Q-up GEMM out=
+        # support is the next optimization step.
+        if localized_q.data_ptr() != t.data_ptr():
+            localized_q.copy_(t)
         t = localized_q
     return fused_mla_rope_inplace(
         t,
