@@ -111,11 +111,6 @@ whole-layer training capture when the flag is omitted.
 
 ### mHC Attention Split
 
-Activation recompute inside a chunk capture always goes through Transformer Engine's checkpoint —
-full recompute, the MTP, MoE / shared-expert recompute, `core_attn` and the GDN / KDA core — because
-Megatron's own `tensor_parallel.checkpoint` runs the function without a checkpoint node while a graph
-is warmed up or captured and would silently keep the activations resident.
-
 For mHC selective recompute, `--mhc-recompute-attn-cuda-graph-split` keeps mHC aggregation and
 BDA eager and captures only the input norm and attention. The producer writes directly into
 the graph's single-stream `[s, b, C]` input, including during backward recomputation, instead
@@ -185,8 +180,16 @@ reloads them right before its own backward (no cross-layer prefetch; GPU pages o
 so the captured graphs do not depend on the recorded pipeline order; it needs TE >= 2.19 and
 `--cuda-graph-warmup-steps >= 2`. Full recompute inside the captured block requires
 `hidden_dropout=0`, `attention_dropout=0` and no router input jitter: the recompute runs inside the
-backward graph, where the RNG state cannot be rewound (forced-load-balancing router logits are
-replayed from their recorded seed and are therefore allowed).
+backward graph, where the RNG state cannot be rewound. `--moe-router-force-load-balancing` is not
+rejected but its random router logits are drawn again in the captured recompute, so that combination
+is for throughput measurements only, not for numerical comparisons (the code warns). Re-entrant
+activation checkpoints — the
+`tensor_parallel.checkpoint` / `te_checkpoint` sites: full recompute, the MTP block, `mlp` / `moe` /
+`shared_experts`, `core_attn` and the GDN / KDA core (`gdn`) — always use Transformer Engine's checkpoint
+inside a chunk capture, because Megatron's `tensor_parallel.checkpoint` runs the function without a
+checkpoint node while a graph is warmed up or captured and would silently keep the activations resident.
+Recompute built on `CheckpointWithoutOutput` (`layernorm`, `moe_act`, `mla_up_proj`, `gdn_norm_out`,
+`mhc`) keeps its own hook mechanism, which registers the recompute inside the capture as is.
 
 **DSA compact-indexer workspace.** With CUDA graphs the fused compact DSA indexer (`--dsa-kernel-backend cudnn`,
 `--dsa-indexer-precision mxfp8`) keeps a persistent workspace per static geometry: the MXFP8 q/k quantization
