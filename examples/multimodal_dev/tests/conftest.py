@@ -82,6 +82,26 @@ def cleanup():
         torch.distributed.destroy_process_group()
 
 
+# Tests that must actually execute -- not merely be collected -- whenever the
+# world size allows it.  Keyed by the module basename, valued by the minimum
+# world size the module needs.
+_MUST_RUN_MODULES = {"test_pp_support.py": 2}
+
+_skipped_must_run = []
+
+
+def pytest_runtest_logreport(report):
+    """Record skips from modules that are required to run in this topology."""
+    if report.when != "setup" or not report.skipped:
+        return
+    module = os.path.basename(report.nodeid.split("::")[0])
+    min_world_size = _MUST_RUN_MODULES.get(module)
+    if min_world_size is None:
+        return
+    if int(os.environ.get("WORLD_SIZE", "1")) >= min_world_size:
+        _skipped_must_run.append(report.nodeid)
+
+
 def pytest_sessionfinish(session, exitstatus):
     """Treat "no tests collected" as success for the ``--experimental`` pass only.
 
@@ -99,3 +119,17 @@ def pytest_sessionfinish(session, exitstatus):
     """
     if exitstatus == 5 and session.config.getoption("--experimental"):
         session.exitstatus = 0
+
+    # A skip is invisible in a green run, so a guard that silently stops
+    # matching the CI topology (an "== 2 ranks" check under an 8-rank runner,
+    # say) would take the pipeline-parallel coverage to zero without anything
+    # going red. Fail loudly instead: if the world size was large enough for
+    # these tests to run and they skipped anyway, the bucket is not testing
+    # what it claims to.
+    if _skipped_must_run:
+        print(
+            "\nERROR: tests that must run in this topology were skipped "
+            f"(WORLD_SIZE={os.environ.get('WORLD_SIZE', '1')}):\n  "
+            + "\n  ".join(_skipped_must_run)
+        )
+        session.exitstatus = 1
