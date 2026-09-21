@@ -118,9 +118,11 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
     DSAIndexerLossLoggingHelper,
-    is_dsa_skip_topk_layer,
+    initialize_dsa_metric_tracker,
+    resolve_dsa_metric_pg_collection,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
@@ -260,6 +262,39 @@ stimer = StragglerDetector()
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
+
+# Per-iteration vision-work stats, accumulated from the actual ``grid_thw``
+# tensors consumed by multimodal forward steps:
+#   index 0 -> total input patches, ``sum_i(T_i * H_i * W_i)``
+#   index 1 -> bidirectional attention work, ``sum_i(T_i * (H_i * W_i) ** 2)``
+#   index 2 -> total output tokens after spatial patch merging
+#   index 3 -> "this rank saw runtime grid data" flag (0.0 / 1.0)
+#   index 4 -> count of malformed grid rows seen (see ``update_*``)
+#
+# Slots 3 and 4 ride along in the same tensor so the whole protocol costs one
+# all-reduce and one host sync per iteration. Slot 3 is summed and tested
+# ``> 0``: it distinguishes "some rank reported vision work" from "every
+# microbatch this iteration was text-only" (legitimately all-zero stats) and
+# from "nothing was ever reported".
+#
+# As with language packed-sequence stats, every model-parallel rank sees the
+# same grids while data-parallel ranks see different samples. ``consume_*``
+# therefore all-reduces once and removes TP/CP/PP replication. Unlike the
+# language decoder, the vision encoder itself is NOT partitioned by context
+# parallelism -- it runs before ``_cp_split_for_forward`` and is forced onto a
+# size-1 attention group, so every CP rank redundantly computes the entire
+# vision forward. Dividing by ``cp_size`` here is still correct for a MODEL
+# FLOPs metric (redundant compute is not useful work), it just means vision
+# and language replicate across CP for different reasons -- the vision
+# encoder isn't actually doing 1/cp_size of the work per rank the way the
+# decoder is.
+_VISION_FLOPS_STATS_SLOTS = 5
+_VISION_FLOPS_PATCHES_SLOT = 0
+_VISION_FLOPS_ATTN_SLOT = 1
+_VISION_FLOPS_MERGED_SLOT = 2
+_VISION_FLOPS_REPORTED_SLOT = 3
+_VISION_FLOPS_INVALID_SLOT = 4
+_vision_flops_stats_in_iteration: Optional[torch.Tensor] = None
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -425,7 +460,15 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
 
 
 def _dsa_indexer_flops(
-    *, hidden_size, q_lora_rank, n_heads, head_dim, num_indexer_layers, indexer_loss_coeff
+    *,
+    hidden_size,
+    q_lora_rank,
+    n_heads,
+    head_dim,
+    num_indexer_layers,
+    dsa_indexer_loss_enabled: bool,
+    dsa_indexer_use_sparse_loss=False,
+    sparse_core_scale=1.0,
 ):
     """DSA lightning-indexer FLOPs coefficients, fwd/bwd expansion included.
 
@@ -438,9 +481,10 @@ def _dsa_indexer_flops(
     only the model's defining GEMMs enter the estimate, not auxiliary-loss or
     sorting work.
 
-    Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
-    (``dsa_indexer_topk_freq``) the layers in between reuse the most recent
-    top-k (see ``is_dsa_skip_topk_layer``).
+    Only ``num_indexer_layers`` indexer executions pay: with cross-layer index
+    sharing (``dsa_indexer_topk_freq``) the layers in between reuse the most
+    recent top-k (see ``is_dsa_skip_topk_layer``). Repeated MTP may execute the
+    same physical indexer multiple times.
 
     The indexer does NOT get the global fwd+bwd factor of 3. It is trained
     only by its own KL loss, so ``DSAttention.forward`` runs it under
@@ -452,12 +496,29 @@ def _dsa_indexer_flops(
       * loss on  -> the projections (wq_b / wk / weights_proj) read a detached
         input, so autograd skips their dgrad and they pay fwd + wgrad = 2x.
         The scoring GEMM has two activation operands that both need gradients
-        to reach those weights, so it pays fwd + dq + dk = 3x.
+        to reach those weights, so it pays fwd + dq + dk. Forward scoring is
+        always dense (top-k selection needs every score). How much of the
+        backward is dense depends on the loss variant:
+
+          - dense KL (``dsa_indexer_use_sparse_loss=False``, the default):
+            every causal (query, key) pair carries a gradient, so
+            dq + dk are dense too and the scoring pays 3x.
+          - sparse KL (``dsa_indexer_use_sparse_loss=True``): the KL is
+            taken over the selected top-k keys only, so the score gradient is
+            zero outside them and dq + dk span just the top-k pairs. The
+            scoring pays ``1 + 2 * sparse_core_scale``, with
+            ``sparse_core_scale`` the same top-k / dense pair ratio that
+            ``_dsa_sparse_core_scale`` applies to core attention. The fused
+            cuDNN backend (``_compute_sparse_indexer_loss_and_grads``)
+            executes exactly this sparse backward; the reference PyTorch path
+            multiplies a dense zero-padded gradient instead, which is an
+            implementation detail and, like the dense-masked reference
+            attention, does not enter the model FLOPs count.
 
     Whether the indexer is trained is part of the training procedure rather
-    than the kernel schedule, so it belongs in this model-FLOPs count. (With
-    ``dsa_indexer_use_sparse_loss`` the scoring backward only covers the top-k
-    entries, which the 3x does not model; it defaults to False.)
+    than the kernel schedule, so it belongs in this model-FLOPs count.
+    The caller derives ``dsa_indexer_loss_enabled`` from the configured loss
+    coefficient; its magnitude affects gradients but not the FLOPs count.
 
     Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
     Multiply ``token_linear`` by the real token count and ``core`` by
@@ -477,27 +538,223 @@ def _dsa_indexer_flops(
     # Scoring each query against every past token under a causal mask (/2).
     core = num_indexer_layers * index_dim / 2
     fma_expansion_factor = 2
-    loss_enabled = (indexer_loss_coeff or 0.0) > 0
+    if not dsa_indexer_loss_enabled:
+        token_expansion, core_expansion = 1, 1
+    else:
+        # Projections: fwd + wgrad (input is detached, no dgrad).
+        token_expansion = 2
+        # Scoring: dense fwd + dq + dk, where dq/dk cover only the top-k pairs
+        # under the sparse KL loss (see docstring).
+        core_expansion = 1 + 2 * (sparse_core_scale if dsa_indexer_use_sparse_loss else 1.0)
     return (
-        (2 if loss_enabled else 1) * fma_expansion_factor * token_linear,
-        (3 if loss_enabled else 1) * fma_expansion_factor * core,
+        token_expansion * fma_expansion_factor * token_linear,
+        core_expansion * fma_expansion_factor * core,
     )
 
 
-def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
-    """Count layers that compute their own DSA index (the rest reuse one).
+def _standard_layer_numbers_for_execution(
+    num_decoder_layers, *, mtp_num_layers=0, mtp_use_repeated_layer=False
+):
+    """Return standard-model layer numbers in their runtime execution order.
 
-    On the standard-model path every layer is a DSA attention layer (MTP
-    layers included -- ``DSAttention.__init__`` numbers them
-    ``layer_number + config.num_layers``, which is exactly how the caller
-    extends ``num_layers``), so the predicate runs over the whole
-    ``1..num_layers`` range.
+    Decoder layers use global numbers ``1..N``. Independent MTP layers use
+    ``N+1..N+D``, while repeated MTP builds only layer ``N+1`` and executes it
+    ``D`` times.
     """
+    layer_numbers = list(range(1, num_decoder_layers + 1))
+    mtp_num_layers = mtp_num_layers or 0
+    if mtp_use_repeated_layer and mtp_num_layers > 0:
+        layer_numbers.extend([num_decoder_layers + 1] * mtp_num_layers)
+    else:
+        layer_numbers.extend(range(num_decoder_layers + 1, num_decoder_layers + mtp_num_layers + 1))
+    return layer_numbers
+
+
+def _num_dsa_indexer_layers(
+    num_decoder_layers,
+    skip_topk_offset,
+    topk_freq,
+    *,
+    mtp_num_layers=0,
+    mtp_use_repeated_layer=False,
+):
+    """Count DSA indexer executions on the standard-model path.
+
+    Cross-layer top-k sharing is tied to the physical layer number, so repeated
+    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    """
+
+    def computes_index(layer_number):
+        return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+
     return sum(
-        1
-        for layer_number in range(1, num_layers + 1)
-        if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+        computes_index(layer_number)
+        for layer_number in _standard_layer_numbers_for_execution(
+            num_decoder_layers,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        )
     )
+
+
+def _vision_flops_stats_tensor(reference: torch.Tensor | None = None) -> torch.Tensor:
+    """Return the per-iteration vision stats buffer, allocating it on first use."""
+    global _vision_flops_stats_in_iteration
+    if _vision_flops_stats_in_iteration is None:
+        if torch.cuda.is_available():
+            device = torch.device(f'cuda:{torch.cuda.current_device()}')
+        elif reference is not None:
+            device = reference.device
+        else:
+            device = torch.device("cpu")
+        _vision_flops_stats_in_iteration = torch.zeros(
+            _VISION_FLOPS_STATS_SLOTS, dtype=torch.float64, device=device
+        )
+    return _vision_flops_stats_in_iteration
+
+
+def update_vision_model_flops_stats(grid_thw: torch.Tensor | None, spatial_merge_size: int) -> None:
+    """Accumulate vision-token shape statistics for one microbatch.
+
+    Args:
+        grid_thw: ``[num_images_or_videos, 3]`` tensor containing the
+            post-patch-embedding ``(T, H, W)`` grid for each vision input.
+            ``None`` records an explicit text-only microbatch.
+        spatial_merge_size: Spatial patch-merger factor used by the vision
+            encoder.
+
+    Must be called by every rank on every microbatch whenever
+    ``args.count_vision_model_flops`` is set -- including for text-only or
+    empty microbatches, for which ``grid_thw=None`` records an explicit zero.
+    ``consume_vision_model_flops_stats`` decides whether to enter its
+    collective from that config flag alone, so a rank that silently skipped
+    the update would not desync the job, but it would drop its share of the
+    global batch from the reported FLOPs.
+
+    The update stays on device and records the three sufficient statistics
+    needed by the Qwen3.5-VL FLOPs formula. Each temporal frame is a separate
+    bidirectional-attention sequence, matching the encoder's packed THD
+    ``cu_seqlens`` construction. Malformed grid values are accumulated into a
+    device-side counter rather than checked eagerly, so production CUDA grids
+    are validated with the same strictness as CPU ones at no extra host sync;
+    ``consume_*`` raises on the reduced counter.
+    """
+    if spatial_merge_size is None or spatial_merge_size <= 0:
+        raise ValueError(f"vision spatial_merge_size must be positive, got {spatial_merge_size}")
+    stats = _vision_flops_stats_tensor(grid_thw)
+    if grid_thw is None or grid_thw.numel() == 0:
+        # An explicit text-only (or vision-free) microbatch still counts as a
+        # report: the iteration's vision work is genuinely zero, which is a
+        # different statement from "no runtime grids were ever available".
+        stats[_VISION_FLOPS_REPORTED_SLOT] += 1.0
+        return
+    if grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
+        raise ValueError(
+            "vision grid_thw must have shape [num_images_or_videos, 3], "
+            f"got {tuple(grid_thw.shape)}"
+        )
+
+    grid = grid_thw.to(device=stats.device, dtype=torch.float64)
+    temporal, height, width = grid.unbind(dim=1)
+    # Device-side validation: non-positive extents, or an H/W that the patch
+    # merger's ``view(-1, merge_dim)`` reshape could not consume. Counted, not
+    # raised, to keep this path free of a device-to-host sync.
+    not_positive = (grid <= 0).any(dim=1)
+    not_mergeable = (torch.remainder(grid[:, 1:], spatial_merge_size) != 0).any(dim=1)
+    invalid = not_positive | not_mergeable
+    stats[_VISION_FLOPS_INVALID_SLOT] += invalid.to(torch.float64).sum()
+
+    patches_per_frame = height * width
+    merged_height = torch.div(height, spatial_merge_size, rounding_mode='floor')
+    merged_width = torch.div(width, spatial_merge_size, rounding_mode='floor')
+    stats[_VISION_FLOPS_PATCHES_SLOT] += (temporal * patches_per_frame).sum()
+    stats[_VISION_FLOPS_ATTN_SLOT] += (temporal * patches_per_frame * patches_per_frame).sum()
+    stats[_VISION_FLOPS_MERGED_SLOT] += (temporal * merged_height * merged_width).sum()
+    stats[_VISION_FLOPS_REPORTED_SLOT] += 1.0
+
+
+def consume_vision_model_flops_stats(
+    count_vision_model_flops: bool,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Read, reset, and globally reduce per-iteration vision shape stats.
+
+    Args:
+        count_vision_model_flops: ``args.count_vision_model_flops`` -- a
+            config value identical on every rank. Whether to enter the
+            distributed all-reduce is decided by THIS value alone, never by
+            whether ``update_vision_model_flops_stats`` happened to be called
+            locally this iteration: a rank whose data iterator ran dry (or
+            whose model wrapper lacks a ``.training`` attribute) must still
+            enter the same collective its peers enter, or the job desyncs.
+            Ranks with nothing to report contribute a zero tensor, and the
+            "did anyone report" flag is reduced inside the same collective.
+
+    Returns:
+        ``(total_patches, attention_seqlen_squared_sum, merged_tokens)`` for
+        the global batch. Returns ``(None, None, None)`` when vision FLOPs
+        counting is disabled, or when it is enabled but no rank supplied any
+        runtime grid this iteration.
+
+    Raises:
+        ValueError: if any rank accumulated a malformed ``grid_thw`` row.
+    """
+    if not count_vision_model_flops:
+        return None, None, None
+
+    stats = _vision_flops_stats_tensor()
+    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        # Unconditional when the feature is on, so collective participation is
+        # a global invariant rather than a function of local activity.
+        torch.distributed.all_reduce(stats)
+        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+        cp_size = max(mpu.get_context_parallel_world_size(), 1)
+        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
+        dedup = tp_size * cp_size * pp_size
+    else:
+        # No model-parallel state -> single-rank path (standalone unit tests;
+        # production always initializes mpu).
+        dedup = 1
+
+    # Single host sync drains every slot at once.
+    total_patches, attention_seqlen_squared_sum, merged_tokens, num_reported, num_invalid = (
+        stats.tolist()
+    )
+    # Reset for the next iteration, keeping the tensor allocated.
+    stats.zero_()
+
+    if num_invalid > 0:
+        raise ValueError(
+            f"{int(num_invalid)} vision grid_thw row(s) this iteration had a non-positive "
+            "extent, or a height/width not divisible by vision_spatial_merge_size"
+        )
+    if num_reported == 0:
+        return None, None, None
+    return (total_patches / dedup, attention_seqlen_squared_sum / dedup, merged_tokens / dedup)
+
+
+def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
+    """Count DSA indexer executions at actual main and nested-MTP layer numbers."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+
+    parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+    main_pattern = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
+
+    def is_indexer(layer_type, layer_number):
+        return layer_type == Symbols.DS_ATTENTION and not is_dsa_skip_topk_layer(
+            layer_number, skip_topk_offset or 0, topk_freq or 1
+        )
+
+    count = sum(
+        is_indexer(layer_type, layer_number)
+        for layer_number, layer_type in enumerate(main_pattern, start=1)
+    )
+    if parsed.mtp_pattern is not None:
+        indexers_per_mtp_depth = sum(
+            is_indexer(layer_type, num_layers + inner_layer_number)
+            for inner_layer_number, layer_type in enumerate(parsed.mtp_pattern, start=1)
+        )
+        count += indexers_per_mtp_depth * parsed.mtp_num_depths
+    return count
 
 
 def _dsv4_hybrid_self_attention_flops(
@@ -610,8 +867,221 @@ def _dsv4_hybrid_self_attention_flops(
     return token_linear, core
 
 
+_vision_flops_missing_runtime_stats_warned: bool = False
+
+
+def validate_vision_flops_metadata(args) -> None:
+    """Validate ``count_vision_model_flops`` metadata and precompute derived scalars.
+
+    Call this once, at model-construction time, right after a model
+    registry's ``vision_flops_fn`` sets ``args.count_vision_model_flops`` and
+    the ``vision_*`` fields (see
+    ``examples/multimodal_dev/pretrain_multimodal.py:model_provider``, which
+    calls this centrally right after ``vision_flops_fn`` -- individual
+    ``vision_flops_fn`` implementations, e.g.
+    ``examples/multimodal_dev/models/qwen35_vl/factory.py:set_vision_flops_metadata``,
+    do not need to call it themselves).
+    Doing this eagerly means a misconfigured variant or missing/invalid field
+    raises before the dataloader and optimizer are built, instead of at
+    iteration 1 inside the training loop. It also means
+    ``_num_multimodal_extra_floating_point_operations`` -- which runs every
+    iteration, from both the train loop and ``training_log``'s throughput
+    computation -- only has to do arithmetic on the precomputed scalars set
+    here, not re-validate config that cannot change after model construction.
+    """
+    if not getattr(args, "count_vision_model_flops", False):
+        return
+
+    vision_flops_variant = getattr(args, "vision_flops_variant", None)
+    if vision_flops_variant != "qwen35_vl":
+        raise ValueError(f"Unsupported vision FLOPs variant: {vision_flops_variant!r}")
+
+    required_fields = (
+        "vision_num_layers",
+        "vision_hidden_size",
+        "vision_ffn_hidden_size",
+        "vision_num_attention_heads",
+        "vision_patch_size",
+        "vision_temporal_patch_size",
+        "vision_spatial_merge_size",
+        "vision_in_channels",
+        "vision_out_hidden_size",
+    )
+    missing_fields = [field for field in required_fields if getattr(args, field, None) is None]
+    if missing_fields:
+        raise ValueError("Missing Qwen3.5-VL vision FLOPs metadata: " + ", ".join(missing_fields))
+
+    hidden_size = args.vision_hidden_size
+    num_attention_heads = args.vision_num_attention_heads
+    spatial_merge_size = args.vision_spatial_merge_size
+    positive_fields = {
+        "vision_num_layers": args.vision_num_layers,
+        "vision_hidden_size": hidden_size,
+        "vision_ffn_hidden_size": args.vision_ffn_hidden_size,
+        "vision_num_attention_heads": num_attention_heads,
+        "vision_patch_size": args.vision_patch_size,
+        "vision_temporal_patch_size": args.vision_temporal_patch_size,
+        "vision_spatial_merge_size": spatial_merge_size,
+        "vision_in_channels": args.vision_in_channels,
+        "vision_out_hidden_size": args.vision_out_hidden_size,
+    }
+    invalid_fields = [f"{field}={value}" for field, value in positive_fields.items() if value <= 0]
+    if invalid_fields:
+        raise ValueError(
+            "Qwen3.5-VL vision FLOPs metadata must be positive: " + ", ".join(invalid_fields)
+        )
+
+    kv_channels = getattr(args, "vision_kv_channels", None)
+    if kv_channels is None:
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                "vision_hidden_size must be divisible by vision_num_attention_heads "
+                "when vision_kv_channels is unset"
+            )
+        kv_channels = hidden_size // num_attention_heads
+    elif kv_channels <= 0:
+        raise ValueError(f"vision_kv_channels must be positive, got {kv_channels}")
+
+    # Derived scalars fixed at model-construction time; the per-iteration
+    # path below reads these directly instead of recomputing them.
+    args.vision_projection_size = kv_channels * num_attention_heads
+    args.vision_patch_dim = (
+        args.vision_in_channels
+        * args.vision_temporal_patch_size
+        * args.vision_patch_size
+        * args.vision_patch_size
+    )
+    args.vision_merge_dim = hidden_size * spatial_merge_size**2
+
+
+def _num_multimodal_extra_floating_point_operations(
+    args,
+    vision_total_tokens_in_batch=None,
+    vision_seqlen_squared_sum_in_batch=None,
+    vision_merged_tokens_in_batch=None,
+):
+    """Estimate training FLOPs outside the language decoder stack.
+
+    This follows the existing decoder convention: count the dominant
+    projections and attention matrix multiplications, including forward,
+    weight-gradient, and data-gradient work, while omitting comparatively
+    small elementwise operations such as normalization, GELU, RoPE, and
+    residual additions.
+
+    Metadata validation and derived-scalar precomputation happen once, at
+    model-construction time, in ``validate_vision_flops_metadata`` -- see
+    there. This function assumes that already ran successfully whenever
+    ``count_vision_model_flops`` is set.
+
+    The vision terms are driven exclusively by the runtime ``grid_thw``
+    statistics the forward step reported. When an entry point does not report
+    them, the vision contribution is omitted (and a one-time warning is
+    logged) rather than synthesised from nominal architecture metadata: a
+    fabricated-but-plausible number would silently feed MFU comparisons and
+    perf regression tracking.
+    """
+    if not getattr(args, "count_vision_model_flops", False):
+        return 0
+
+    global _vision_flops_missing_runtime_stats_warned
+
+    projection_size = getattr(args, "vision_projection_size", None)
+    if projection_size is None:
+        # The derived scalars are only ever set by validate_vision_flops_metadata.
+        # An entry point that sets count_vision_model_flops itself, without
+        # routing through that validator, would otherwise fail here with a bare
+        # AttributeError at the first training iteration.
+        raise ValueError(
+            "count_vision_model_flops is set but the vision FLOPs metadata was never "
+            "validated. Call megatron.training.training.validate_vision_flops_metadata(args) "
+            "at model-construction time (see "
+            "examples/multimodal_dev/pretrain_multimodal.py:model_provider)."
+        )
+    hidden_size = args.vision_hidden_size
+    ffn_hidden_size = args.vision_ffn_hidden_size
+    patch_dim = args.vision_patch_dim
+    merge_dim = args.vision_merge_dim
+
+    vision_stats = (
+        vision_total_tokens_in_batch,
+        vision_seqlen_squared_sum_in_batch,
+        vision_merged_tokens_in_batch,
+    )
+    if any(value is not None for value in vision_stats) and not all(
+        value is not None for value in vision_stats
+    ):
+        raise ValueError(
+            "vision_total_tokens_in_batch, vision_seqlen_squared_sum_in_batch, "
+            "and vision_merged_tokens_in_batch must be provided together"
+        )
+    if all(value is not None for value in vision_stats) and any(
+        value < 0 for value in vision_stats
+    ):
+        raise ValueError(
+            "runtime vision FLOPs statistics must be non-negative, " f"got {vision_stats}"
+        )
+
+    if vision_total_tokens_in_batch is None:
+        if not _vision_flops_missing_runtime_stats_warned:
+            print_rank_0(
+                "[vision FLOPs] count_vision_model_flops is enabled but no runtime "
+                "image_grid_thw was reported, so vision-encoder work is EXCLUDED from "
+                "the reported FLOPs/TFLOP-per-s. Entry points must call "
+                "megatron.training.training.update_vision_model_flops_stats() from "
+                "their forward step (see examples/multimodal_dev/forward_step.py). "
+                "Logged once."
+            )
+            _vision_flops_missing_runtime_stats_warned = True
+        return 0
+
+    # Every weight-bearing matmul runs once in forward and twice in backward.
+    forward_backward_expansion_factor = 3
+    fma_expansion_factor = 2
+    training_matmul_factor = forward_backward_expansion_factor * fma_expansion_factor
+
+    # NOTE: uses the same forward+weight-grad+data-grad factor as the other
+    # terms even though pixel_values is a leaf input with no data-gradient
+    # (factor 4 would be exact here, not 6). Deliberate ~0.4% over-count for
+    # formula uniformity across terms; not worth a separate constant.
+    patch_embed_flops = (
+        training_matmul_factor * vision_total_tokens_in_batch * patch_dim * hidden_size
+    )
+
+    # Per layer: dense QKV + output projections, a two-linear GELU MLP, and
+    # bidirectional QK^T / attention-value matmuls over each temporal frame.
+    vision_projection_flops = (
+        training_matmul_factor
+        * vision_total_tokens_in_batch
+        * (
+            hidden_size * (3 * projection_size)
+            + projection_size * hidden_size
+            + hidden_size * ffn_hidden_size
+            + ffn_hidden_size * hidden_size
+        )
+    )
+    vision_core_attention_flops = (
+        forward_backward_expansion_factor * 4 * vision_seqlen_squared_sum_in_batch * projection_size
+    )
+    vision_transformer_flops = args.vision_num_layers * (
+        vision_projection_flops + vision_core_attention_flops
+    )
+
+    patch_merger_flops = (
+        training_matmul_factor
+        * vision_merged_tokens_in_batch
+        * (merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size)
+    )
+    return patch_embed_flops + vision_transformer_flops + patch_merger_flops
+
+
 def num_floating_point_operations(
-    args, batch_size, seqlen_squared_sum_in_batch=None, total_real_tokens_in_batch=None
+    args,
+    batch_size,
+    seqlen_squared_sum_in_batch=None,
+    total_real_tokens_in_batch=None,
+    vision_total_tokens_in_batch=None,
+    vision_seqlen_squared_sum_in_batch=None,
+    vision_merged_tokens_in_batch=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -636,6 +1106,16 @@ def num_floating_point_operations(
             than ``batch_size * args.seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
+        vision_total_tokens_in_batch: Total pre-merger vision patch tokens
+            from the actual ``grid_thw`` values in the global batch.
+        vision_seqlen_squared_sum_in_batch: ``sum_i(T_i * (H_i * W_i)^2)``
+            for bidirectional vision attention, where each temporal frame is
+            one packed attention sequence.
+        vision_merged_tokens_in_batch: Total vision tokens after spatial patch
+            merging. The three vision statistics must be supplied together.
+            When omitted, the vision-encoder contribution is excluded from the
+            result (with a one-time warning) rather than estimated from
+            nominal architecture metadata.
     """
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
     # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
@@ -1293,6 +1773,14 @@ def num_floating_point_operations(
                 f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
                 f"expected num_layers + mtp_num_layers ({num_layers})."
             )
+            compress_ratios = [
+                compress_ratios[layer_number - 1]
+                for layer_number in _standard_layer_numbers_for_execution(
+                    args.num_layers,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                )
+            ]
             # ratio == 0: window-only; ratio == 4: window + topk compressed KV
             # (compressor + indexer); ratio == 128: window + all compressed KV.
             dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
@@ -1341,6 +1829,9 @@ def num_floating_point_operations(
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
+            dsa_sparse_core_scale = _dsa_sparse_core_scale(
+                total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
+            )
             standard_self_attn_core_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -1348,9 +1839,7 @@ def num_floating_point_operations(
                     args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
                     + args.num_attention_heads * args.kv_lora_rank / 2
                 )
-                * _dsa_sparse_core_scale(
-                    total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
-                )
+                * dsa_sparse_core_scale
             )
             dsa_extra_term, dsa_extra_core_term = _dsa_indexer_flops(
                 hidden_size=args.hidden_size,
@@ -1358,9 +1847,15 @@ def num_floating_point_operations(
                 n_heads=args.dsa_indexer_n_heads,
                 head_dim=args.dsa_indexer_head_dim,
                 num_indexer_layers=_num_dsa_indexer_layers(
-                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                    args.num_layers,
+                    args.dsa_indexer_skip_topk_offset,
+                    args.dsa_indexer_topk_freq,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
                 ),
-                indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                sparse_core_scale=dsa_sparse_core_scale,
             )
         else:
             num_linear_attention_layers = 0
@@ -1490,8 +1985,7 @@ def num_floating_point_operations(
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
         assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -1503,7 +1997,8 @@ def num_floating_point_operations(
         if mtp_num_layers is None:
             mtp_num_layers = 0
 
-        return hybrid_flops(
+        # Compute hybrid decoder FLOPs.
+        total_floating_point_operations = hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
@@ -1571,7 +2066,14 @@ def num_floating_point_operations(
         )
     else:
         # Compute standard Transformer model FLOPs.
-        return transformer_flops()
+        total_floating_point_operations = transformer_flops()
+
+    return total_floating_point_operations + _num_multimodal_extra_floating_point_operations(
+        args,
+        vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+        vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+        vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+    )
 
 
 def get_start_time_from_progress_log():
@@ -2982,6 +3484,11 @@ def setup_model_and_optimizer(
         torch.distributed.barrier()
         exit()
 
+    # Match training_log's activation gate so every enabled writer is reduced and cleared once
+    # per step. Establish its PP-agreed capacity before the first forward/capture.
+    if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+        initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
+
     return model, optimizer, opt_param_scheduler
 
 
@@ -3720,7 +4227,11 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    vision_total_tokens_in_batch: float | None = None,
+    vision_seqlen_squared_sum_in_batch: float | None = None,
+    vision_merged_tokens_in_batch: float | None = None,
     num_microbatches: int | None = None,
+    schedule_pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3965,21 +4476,71 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    should_track_dsa, dsa_metric_pg_collection = resolve_dsa_metric_pg_collection(
+        pg_collection, schedule_pg_collection=schedule_pg_collection
+    )
+    if (
+        args.dsa_indexer_loss_coeff is not None
+        and args.dsa_indexer_loss_coeff > 0
+        and should_track_dsa
+    ):
+        # Sequence packing may pass the physical packed microbatch count to training_log, but
+        # Dynamic-CP metric reduction reconstructs equal weighting over the nominal global-batch
+        # samples. Normalize by the calculator's nominal scheduled count deliberately.
         indexer_loss_scale = 1 / get_num_microbatches()
+        pp_group = None
+        dp_group = None
+        dynamic_cp_parent_group = None
+        if dsa_metric_pg_collection is not None:
+            pp_group = dsa_metric_pg_collection.pp
+            dp_group = dsa_metric_pg_collection.dp
+        if args.dynamic_context_parallel:
+            if dsa_metric_pg_collection is not None:
+                dynamic_cp_parent_group = dsa_metric_pg_collection.dp_cp
+            else:
+                # Legacy training entry points without a process-group collection.
+                dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        tracked_layers = args.num_layers + (args.mtp_num_layers or 0)
+        if args.csa_compress_ratios is not None:
+            compress_ratios = args.csa_compress_ratios
+            if not is_hybrid_model(args):
+                compress_ratios = [
+                    compress_ratios[layer_number - 1]
+                    for layer_number in _standard_layer_numbers_for_execution(
+                        args.num_layers,
+                        mtp_num_layers=args.mtp_num_layers,
+                        mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                    )
+                ]
+            num_indexer_layers = sum(ratio == 4 for ratio in compress_ratios)
+        elif is_hybrid_model(args):
+            num_indexer_layers = _num_hybrid_dsa_indexer_layers(
+                args.hybrid_layer_pattern,
+                args.num_layers,
+                args.dsa_indexer_skip_topk_offset,
+                args.dsa_indexer_topk_freq,
+            )
+        else:
+            num_indexer_layers = _num_dsa_indexer_layers(
+                args.num_layers,
+                args.dsa_indexer_skip_topk_offset,
+                args.dsa_indexer_topk_freq,
+                mtp_num_layers=args.mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+            )
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
-            num_layers=args.num_layers + (args.mtp_num_layers or 0),
-            num_indexer_layers=(
-                sum(ratio == 4 for ratio in args.csa_compress_ratios)
-                if args.csa_compress_ratios is not None
-                else None
-            ),
+            num_layers=tracked_layers,
+            num_indexer_layers=num_indexer_layers,
             preserve_groups=args.cuda_graph_impl != "none",
+            dynamic_cp_parent_group=dynamic_cp_parent_group,
+            configured_cp_size=args.context_parallel_size,
+            pp_group=pp_group,
+            dp_group=dp_group,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -4011,6 +4572,9 @@ def training_log(
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
@@ -4878,6 +5442,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
@@ -5148,11 +5713,19 @@ def train(
             total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
                 consume_seqlen_stats_in_iteration()
             )
+        (
+            vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch,
+        ) = consume_vision_model_flops_stats(getattr(args, "count_vision_model_flops", False))
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -5186,7 +5759,11 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
             num_microbatches=num_microbatches,
+            schedule_pg_collection=pg_collection,
         )
         is_first_iteration = False
 
@@ -5443,7 +6020,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5750,7 +6327,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

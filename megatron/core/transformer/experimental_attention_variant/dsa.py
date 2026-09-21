@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fp8_utils import get_fp8_disabled_context
@@ -29,6 +28,15 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_kernels,
     dsa_layout,
     dsa_masking,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_local_positions_from_host as _build_cp_positions_from_host,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_query_positions_and_key_reorder_from_host as _cp_reorder_from_host,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
+    DSAIndexerLossLoggingHelper,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -287,179 +295,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size**-0.5)
-
-
-class DSAIndexerLossLoggingHelper:
-    """Helper class for logging sparse attention indexer losses."""
-
-    tracker = {}
-
-    @staticmethod
-    def save_loss_to_tracker(
-        loss: torch.Tensor,
-        layer_number: int,
-        num_layers: int,
-        reduce_group: torch.distributed.ProcessGroup = None,
-        avg_group: torch.distributed.ProcessGroup = None,
-    ):
-        """Save the indexer loss for logging.
-
-        Args:
-            loss: The loss tensor.
-            layer_number: Layer index of the loss, 1-indexed.
-            num_layers: The number of total layers.
-            reduce_group: The group for reducing the loss.
-            avg_group: The group for averaging the loss.
-        """
-        # Skip indexer loss logging if layer_number is None.
-        if layer_number is None:
-            return
-
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
-        # (whose layer_number can exceed config.num_layers + config.mtp_num_layers when
-        # each MTP depth contains multiple hybrid layers) don't index out of bounds.
-        # Grow lazily; with PP=1 every rank takes the same path, so sizes stay consistent.
-        needed = max(num_layers, layer_number)
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
-        elif tracker["values"].shape[0] < needed:
-            grown = torch.zeros(
-                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
-            )
-            grown[: tracker["values"].shape[0]] = tracker["values"]
-            tracker["values"] = grown
-        tracker["values"][layer_number - 1] += loss.detach()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
-
-    @staticmethod
-    def clean_loss_in_tracker(preserve_groups: bool = False):
-        """Clear the indexer losses."""
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        reduce_group = tracker.get("reduce_group") if preserve_groups else None
-        avg_group = tracker.get("avg_group") if preserve_groups else None
-        if "values" in tracker:
-            tracker["values"].zero_()
-        tracker["reduce_group"] = reduce_group
-        tracker["avg_group"] = avg_group
-
-    @staticmethod
-    def reduce_loss_in_tracker(num_layers: Optional[int] = None):
-        """Collect and reduce the indexer losses across ranks.
-
-        Cross-PP `all_reduce` must be invoked on every rank in the pipeline-parallel group,
-        otherwise ranks without any indexer layer would skip the collective and cause a hang.
-        Pass `num_layers` to lazily initialize the tracker on such ranks so they participate
-        with a zero-filled tensor.
-
-        Args:
-            num_layers: Total number of decoder layers; required to lazily initialize the
-                tracker on ranks where no indexer layer ran.
-        """
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-
-        # Agree on a consistent tracker size across the PP group BEFORE the collective.
-        # Ranks owning indexer layers may have grown the tracker via save_loss_to_tracker
-        # (e.g. an MTP layer whose layer_number exceeds num_layers), while ranks without any
-        # indexer layer have only a num_layers-sized (or absent) tracker. all_reduce requires
-        # identical shapes on every rank, so reduce-MAX the local size first, then pad to it
-        # (otherwise PP>1 hangs / errors on mismatched sizes).
-        # The agreed size (max over the PP group) is constant across iterations (num_layers and
-        # the layer numbering don't change), so compute it once and cache it. This avoids a
-        # per-iteration CPU-GPU sync (.item()); the size-negotiation all_reduce + .item() runs
-        # only on the first call. Every PP rank caches on the same (first) call, so later steps
-        # all skip it consistently.
-        if tracker.get("agreed_size") is not None:
-            size = tracker["agreed_size"]
-        else:
-            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
-            size_t = torch.tensor(
-                [local_size], device=torch.cuda.current_device(), dtype=torch.long
-            )
-            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
-            size = int(size_t.item())
-            tracker["agreed_size"] = size
-        if size == 0:
-            return
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
-        elif tracker["values"].shape[0] < size:
-            grown = torch.zeros(
-                size, device=tracker["values"].device, dtype=tracker["values"].dtype
-            )
-            grown[: tracker["values"].shape[0]] = tracker["values"]
-            tracker["values"] = grown
-        values = tracker["values"]
-
-        torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce indexer losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
-        )
-
-    @staticmethod
-    def track_indexer_metrics(
-        loss_scale: float,
-        iteration: int,
-        writer,
-        wandb_writer=None,
-        total_loss_dict=None,
-        per_layer_logging: bool = False,
-        num_layers: Optional[int] = None,
-        num_indexer_layers: Optional[int] = None,
-        preserve_groups: bool = False,
-    ):
-        """Track the sparse attention indexer metrics for logging.
-
-        Args:
-            loss_scale: Scale factor for the loss.
-            iteration: Current training iteration.
-            writer: TensorBoard writer.
-            wandb_writer: Weights & Biases writer.
-            total_loss_dict: Dictionary to accumulate total losses.
-            per_layer_logging: Whether to log per-layer losses.
-            num_layers: Total decoder layer count used to initialize empty PP ranks.
-            num_indexer_layers: Number of layers that own an indexer. Defaults to
-                the tracker size when every tracked layer owns one.
-            preserve_groups: Keep reduction groups after logging for CUDA Graph runs.
-        """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(num_layers=num_layers)
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
-            return
-
-        indexer_loss_values = tracker["values"] * loss_scale
-        if num_indexer_layers is None:
-            num_indexer_layers = indexer_loss_values.shape[0]
-
-        # Average across layers that actually own an indexer; layers without one
-        # contribute zero in `tracker["values"]` so they must not be in the divisor.
-        avg_indexer_loss = indexer_loss_values.sum() / max(num_indexer_layers, 1)
-
-        # Log average loss
-        if total_loss_dict is not None:
-            if "indexer loss" in total_loss_dict:
-                total_loss_dict["indexer loss"] += avg_indexer_loss
-            else:
-                total_loss_dict["indexer loss"] = avg_indexer_loss
-
-        if writer is not None:
-            writer.add_scalar("indexer loss", avg_indexer_loss, iteration)
-
-        if wandb_writer is not None:
-            wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
-
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
 
 def compute_dsa_indexer_loss(
@@ -1936,8 +1771,10 @@ class DSAttention(MegatronModule):
 
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True
+    logs_dsa_indexer_loss = True
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
     _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
+    _LAYOUT_HOLDER_ATTR = "_dsa_packed_cp_layout_holder"
 
     def __init__(
         self,
@@ -2022,6 +1859,45 @@ class DSAttention(MegatronModule):
             holder = {}
             setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
         return holder
+
+    def _get_packed_cp_layout_cache(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ) -> Optional[dict]:
+        """Return the per-microbatch memo for packed-CP layout metadata, or None.
+
+        The CP query positions and key reorder indices depend only on
+        ``cu_seqlens_q``/``cu_seqlens_kv``, ``cp_size``, ``cp_rank`` and the
+        requested output sizes. All of those are identical for every layer in a
+        microbatch, yet each layer rebuilds them, and each rebuild loops
+        ``cp_size`` times over :func:`build_packed_allgather_cp_local_positions`,
+        whose boolean-mask indexing has data-dependent output shapes and so
+        forces a device-to-host size readback.
+
+        ``PackedSeqParams`` is the only carrier used here. It is constructed per
+        microbatch, so a memo hung on it cannot outlive the layout it describes
+        -- which matters under dynamic CP, where the layout changes between
+        microbatches. The index-share top-k holders fall back to
+        ``attention_mask``/``self.config``, but that is only safe because every
+        computing layer overwrites its slot before any sharing layer reads it. A
+        layout memo has no such write-before-read ordering and ``self.config``
+        outlives the microbatch, so caching there could serve a stale layout.
+        """
+        if packed_seq_params is None:
+            return None
+        cache = getattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, None)
+        if cache is None:
+            cache = {}
+            setattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, cache)
+        return cache
+
+    @staticmethod
+    def _memoized(cache: Optional[dict], key: tuple, build):
+        """Return ``cache[key]``, building it on first use. No-op when cache is None."""
+        if cache is None:
+            return build()
+        if key not in cache:
+            cache[key] = build()
+        return cache[key]
 
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
@@ -2122,27 +1998,61 @@ class DSAttention(MegatronModule):
         nonpacked_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
+        # Layout metadata is identical for every layer in a microbatch; memoize it on
+        # the per-microbatch PackedSeqParams so only the first DSA layer pays for it.
+        layout_cache = self._get_packed_cp_layout_cache(packed_seq_params)
         if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-            single_packed_thd_sequence = (
-                cp_size > 1 and cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
-            )
+            # Host copies of the compacted cu_seqlens, stored by
+            # prebuild_thd_cp_partition_routes at batch-construction time. When
+            # present, the layout builders below run entirely on the host: no
+            # kernels, no device readbacks, one async copy of the finished table.
+            host_cu_q = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+            host_cu_kv = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_kv", None)
+            # Whether the pack holds one sequence is a fact about the pack, not about
+            # context parallelism; which kernels accept that layout is the scoring
+            # plan's decision. Consumers that genuinely need CP already test cp_size.
+            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             packed_query_output_size = (
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
             packed_global_output_size = packed_query_output_size * cp_size
+            query_cu_seqlens_cover_output = (
+                single_packed_thd_sequence
+                and isinstance(packed_seq_params.max_seqlen_q, int)
+                and packed_seq_params.max_seqlen_q == packed_global_output_size
+            )
+            key_cu_seqlens_cover_output = (
+                single_packed_thd_sequence
+                and isinstance(packed_seq_params.max_seqlen_kv, int)
+                and packed_seq_params.max_seqlen_kv == packed_global_output_size
+            )
             if sequence_parallel_query_is_local and cp_size == 1:
                 row_start = sequence_parallel_tp_row_start
                 packed_query_positions = torch.arange(
                     row_start, row_start + sq, dtype=torch.int64, device=query.device
                 )
             elif sequence_parallel_tp and cp_size > 1:
-                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                    cu_seqlens_q,
-                    cp_size,
-                    cp_rank,
-                    query.device,
-                    output_size=packed_query_output_size,
+                packed_query_positions_full = self._memoized(
+                    layout_cache,
+                    ("local_positions", cp_size, cp_rank, packed_query_output_size),
+                    lambda: (
+                        _build_cp_positions_from_host(
+                            host_cu_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                        if host_cu_q is not None
+                        else dsa_layout.build_packed_allgather_cp_local_positions(
+                            cu_seqlens_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                    ),
                 )
                 if sequence_parallel_query_is_local:
                     row_start = sequence_parallel_tp_row_start
@@ -2150,31 +2060,45 @@ class DSAttention(MegatronModule):
                 else:
                     packed_query_positions = packed_query_positions_full
             elif cp_size > 1:
-                # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
-                # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
-                query_cu_seqlens_cover_output = (
-                    single_packed_thd_sequence
-                    and isinstance(packed_seq_params.max_seqlen_q, int)
-                    and packed_seq_params.max_seqlen_q == packed_global_output_size
-                )
-                key_cu_seqlens_cover_output = (
-                    single_packed_thd_sequence
-                    and isinstance(packed_seq_params.max_seqlen_kv, int)
-                    and packed_seq_params.max_seqlen_kv == packed_global_output_size
-                )
-                packed_query_positions, kv_reorder_idx = (
-                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=packed_query_output_size,
-                        key_local_output_size=packed_query_output_size,
-                        global_output_size=packed_global_output_size,
-                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-                    )
+                packed_query_positions, kv_reorder_idx = self._memoized(
+                    layout_cache,
+                    (
+                        "positions_and_reorder",
+                        cp_size,
+                        cp_rank,
+                        packed_query_output_size,
+                        packed_query_output_size,
+                        packed_global_output_size,
+                        query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output,
+                    ),
+                    lambda: (
+                        _cp_reorder_from_host(
+                            host_cu_q,
+                            host_cu_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                        if host_cu_q is not None and host_cu_kv is not None
+                        else dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                    ),
                 )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
@@ -2182,7 +2106,6 @@ class DSAttention(MegatronModule):
             _validate_nonpacked_cp_uniform_length(
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
-
         if sequence_parallel_tp:
             if key.size(0) == local_sequence_rows:
                 key = gather_from_sequence_parallel_region(key, group=tp_group)
@@ -2215,15 +2138,49 @@ class DSAttention(MegatronModule):
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
                 if packed_thd:
-                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=local_len,
-                        key_local_output_size=local_len,
-                        global_output_size=local_len * cp_size,
+                    # Same memo key shape as the branch above, so when the output sizes
+                    # coincide this reuses that result instead of rerunning the cp_size loop.
+                    _, idx = self._memoized(
+                        layout_cache,
+                        (
+                            "positions_and_reorder",
+                            cp_size,
+                            cp_rank,
+                            local_len,
+                            local_len,
+                            local_len * cp_size,
+                            query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output,
+                        ),
+                        lambda: (
+                            _cp_reorder_from_host(
+                                host_cu_q,
+                                host_cu_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                                query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                                key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                            )
+                            if host_cu_q is not None and host_cu_kv is not None
+                            else (
+                                dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder
+                            )(
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_kv=cu_seqlens_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                                query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                                key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                            )
+                        ),
                     )
                     return idx
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
@@ -2328,9 +2285,11 @@ class DSAttention(MegatronModule):
         )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        # Reports a packed causal layout with identity key positions. CP size is an
+        # independent geometry fact; the scoring plan and packed metadata eligibility
+        # decide which executor can safely consume the layout.
         use_local_indexer_varlen = (
             packed_thd
-            and cp_size > 1
             and attn_mask_type == AttnMaskType.causal
             and varlen_starts is not None
             and varlen_ends is not None
@@ -2555,6 +2514,7 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
@@ -2601,6 +2561,7 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk

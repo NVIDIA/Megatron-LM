@@ -24,7 +24,6 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -70,6 +69,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
     get_pipeline_prefetched_tokens,
     is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
 )
 from model_provider import model_provider
 
@@ -168,7 +168,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        prepare_packed_seq_params(packed_seq_params, config)
         return (
             attention_mask,
             None,
@@ -382,7 +382,7 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
 
     timers('batch-generator').stop()
 
