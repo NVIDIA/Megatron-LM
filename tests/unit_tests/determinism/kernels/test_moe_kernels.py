@@ -20,6 +20,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface,
+    PipelineOffloadManager,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import moe_utils
@@ -32,6 +36,7 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     count_differing_replays,
     deterministic_algorithms,
     seeded,
@@ -357,6 +362,96 @@ class TestMoEModules:
             contention=True,
             what="TEGroupedMLP",
         )
+
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    @pytest.mark.parametrize(
+        "offload_modules,offloaded_group",
+        [
+            (["expert_fc1", "moe_act"], "fused_group_mlp"),
+            (["expert_fc1"], "expert_fc1"),
+            (["moe_act"], "moe_act"),
+        ],
+        ids=["fc1+act->one_group", "fc1", "act"],
+    )
+    def test_te_grouped_mlp_replays_under_fine_grained_offloading(
+        self, offload_modules, offloaded_group
+    ):
+        """Unfused ``TEGroupedMLP`` with its activations really offloaded to CPU and reloaded.
+
+        Two experts modules run back to back because the offload manager always keeps the
+        last group of each name resident; the first module's group is the one that travels.
+        With both unfused knobs set, fc1 input and activation input go as ONE group named like
+        the fused path's (``fused_group_mlp``); a single knob keeps its own group.
+        """
+        self._init()
+        seeded()
+        PipelineOffloadManager.reset_instance()
+        config = _moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1024,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+
+        def build():
+            experts = get_submodules(spec.submodules.mlp).experts(
+                num_local_experts=8,
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+            assert isinstance(experts, TEGroupedMLP)
+            assert not experts._with_fused_impl
+            return experts.cuda()
+
+        stack = torch.nn.ModuleList([build(), build()])
+        tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(rows, device="cuda")
+
+        def run():
+            FineGrainedActivationOffloadingInterface.init_chunk_handler(
+                pp_rank=0,
+                vp_size=None,
+                vp_stage=None,
+                min_offloaded_tensor_size=1024,
+                delta_offload_bytes_across_pp_ranks=0,
+                activation_offload_fraction=1.0,
+            )
+            for p in stack.parameters():
+                p.grad = None
+            h = hidden.clone().requires_grad_(True)
+            pr = probs.clone().requires_grad_(True)
+            out, _ = stack[0](h, tokens_per_expert, pr)
+            out, _ = stack[1](out, tokens_per_expert, pr)
+            out.backward(torch.ones_like(out))
+            torch.cuda.synchronize()
+            FineGrainedActivationOffloadingInterface.reset()
+            return [out.detach().clone(), h.grad.clone(), pr.grad.clone()] + [
+                p.grad.detach().clone() for p in stack.parameters()
+            ]
+
+        try:
+            # The warmup iteration records the groups; the extra reset applies the
+            # post-warmup offload decisions.
+            run()
+            FineGrainedActivationOffloadingInterface.reset()
+            offloaded = PipelineOffloadManager.get_instance().offload_summary_bytes
+            assert (
+                offloaded.get(offloaded_group, 0) > 0
+            ), f"nothing offloaded under group {offloaded_group!r}; summary: {dict(offloaded)}"
+            assert set(offloaded) == {offloaded_group}, dict(offloaded)
+            names = ["out", "grad_hidden", "grad_probs"] + [
+                f"grad[{n}]" for n, _ in stack.named_parameters()
+            ]
+            ref = run()
+            for i in range(1, 4):
+                for name, a, b in zip(names, ref, run()):
+                    assert bytes_equal(a, b), f"TEGroupedMLP[offload] replay {i}: {name} differs"
+        finally:
+            PipelineOffloadManager.reset_instance()
 
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
