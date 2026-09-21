@@ -30,15 +30,9 @@ def join_paths(*paths: str) -> str:
 
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
-        path_cls = msc.Path
-    else:
-        path_cls = Path
+        return msc.os.path.join(*paths)
 
-    path = path_cls(paths[0])
-    for part in paths[1:]:
-        path = path / part
-
-    return str(path)
+    return os.path.join(*paths)
 
 
 def get_checkpoint_run_config_filename(checkpoints_path: str) -> str:
