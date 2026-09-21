@@ -6,6 +6,10 @@ real runtime (``MegatronLiteRuntime.forward_backward`` -> Magi dispatch). Accept
 relative |delta| over 100 steps < 1% (plan curve criterion), and the indexer weights are bitwise unchanged after
 training on every configuration (frozen selector; ``kl_loss_coeff=0`` alone would not guarantee this).
 
+``test_magi_deterministic_mode_reproduces_bitwise``: with ``ImplConfig.deterministic=True`` (ordered accumulation in the
+msa_v1 backward, Magi-MSA c829982) two identical runs must give bitwise-identical loss and grad-norm at every step; the
+same pair with ``deterministic=False`` is recorded (first diverging step, step-time ratio) for reference.
+
 Set ``MLITE_MAGI_BENCH=1`` to also record step time / peak memory at 16K and 32K tokens (flex vs magi, cp1/cp2).
 Run: torchrun --nproc-per-node=8 -m pytest -s <file> with MLITE_TEST_HARNESS=1, MAGI_ATTENTION_KERNEL_BACKEND=sdpa_ol.
 """
@@ -88,7 +92,7 @@ def source_weights(tmp_path_factory):
     return SimpleNamespace(cfg=cfg, src=src[0])
 
 
-def _build_handle(cfg, src, parallel, *, load=True):
+def _build_handle(cfg, src, parallel, *, load=True, deterministic=False):
     from megatron.lite.model.minimax_m3.lite import protocol
     from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
     from megatron.lite.runtime.contracts.config import OptimizerConfig
@@ -98,7 +102,7 @@ def _build_handle(cfg, src, parallel, *, load=True):
         parallel=parallel,
         optimizer="dist_opt",
         optimizer_config=OptimizerConfig(optimizer="adam", lr=LR, weight_decay=0.1, clip_grad=1.0),
-        deterministic=False,
+        deterministic=deterministic,
         magi_chunk_size=CHUNK,
     )
     torch.manual_seed(1)
@@ -138,13 +142,13 @@ def _indexer_weights(handle):
     return {n: p.detach().clone() for c in chunks for n, p in unwrap_model(c).named_parameters() if ".indexer." in n}
 
 
-def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, bench=False, load=True):
+def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, bench=False, load=True, deterministic=False):
     from test_minimax_m3_train_curve_smoke import _reset_parallel_state
 
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    handle = _build_handle(cfg, src, parallel, load=load)
+    handle = _build_handle(cfg, src, parallel, load=load, deterministic=deterministic)
     ps = handle._parallel_state
     w0 = _indexer_weights(handle)
     losses, norms, step_times = [], [], []
@@ -239,3 +243,41 @@ def test_magi_bench_step_time_and_memory(source_weights, seq_len, cp, layers):
     )
     if dist.get_rank() == 0:
         print(f"BENCH {layers} S={seq_len} cp{cp} magi: {st.step_ms:.0f} ms/step, peak {st.peak_gib:.2f} GiB", flush=True)
+
+
+def _first_divergence(a, b):
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return -1
+
+
+_DET_CASES = [("cp1", dict(tp=1, ep=1, etp=1, pp=1, cp=1)), ("cp2", dict(tp=1, ep=1, etp=1, pp=1, cp=2)),
+              ("cp2_ep2", dict(tp=1, ep=2, etp=1, pp=1, cp=2))]
+
+
+@pytest.mark.parametrize("name,parallel", _DET_CASES, ids=[c[0] for c in _DET_CASES])
+def test_magi_deterministic_mode_reproduces_bitwise(source_weights, name, parallel):
+    """ImplConfig.deterministic=True -> identical runs reproduce loss and grad-norm bitwise at every step."""
+    import torch.distributed as dist
+
+    from megatron.lite.runtime.contracts.config import ParallelConfig
+
+    steps = int(os.environ.get("MLITE_MAGI_DET_STEPS", STEPS))
+    runs = {}
+    for det in (True, False):
+        pair = [_train(source_weights.cfg, source_weights.src, ParallelConfig(**parallel), steps=steps, deterministic=det)
+                for _ in range(2)]
+        (l0, n0, st0), (l1, n1, st1) = pair
+        same = torch.tensor([int(l0 == l1 and n0 == n1)], device="cuda")
+        dist.all_reduce(same, op=dist.ReduceOp.MIN)
+        runs[det] = SimpleNamespace(same=bool(same.item()), loss_div=_first_divergence(l0, l1),
+                                    norm_div=_first_divergence(n0, n1), step_ms=(st0.step_ms + st1.step_ms) / 2,
+                                    loss_last=(l0[-1], l1[-1]))
+    d, nd = runs[True], runs[False]
+    if dist.get_rank() == 0:
+        print(f"\nmagi deterministic {name} ({steps} steps): det=True bitwise={'yes' if d.same else 'NO'} "
+              f"(first loss/gnorm divergence {d.loss_div}/{d.norm_div}) {d.step_ms:.0f} ms/step | "
+              f"det=False bitwise={'yes' if nd.same else 'no'} (first divergence {nd.loss_div}/{nd.norm_div}) "
+              f"{nd.step_ms:.0f} ms/step, loss[-1] {nd.loss_last} | det/nondet step-time x{d.step_ms / nd.step_ms:.2f}", flush=True)
+    assert d.same, (name, d)

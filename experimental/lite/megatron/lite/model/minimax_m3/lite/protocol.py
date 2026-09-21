@@ -58,7 +58,9 @@ class ImplConfig:
     cross_entropy_fusion: bool = False
     hf_path: str = ""
     router_aux_loss_coef: float | None = None
-    # The production MSA v1 dependency used for MiniMax-M3 rejects deterministic mode.
+    # Forwarded to the primitives and to ``MagiMsaSettings.deterministic``: ordered (writer-rank/semaphore)
+    # accumulation in the msa_v1 backward instead of unordered atomics -> bitwise-reproducible runs (~4x slower
+    # MSA backward).
     deterministic: bool = False
     optimizer_config: OptimizerConfig | None = None
     # Magi CP dispatch chunk (tokens; batch padded to chunk*cp), FP32 dK group-reduce, and the kernel
