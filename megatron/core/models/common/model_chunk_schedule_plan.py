@@ -298,6 +298,7 @@ class TransformerLayerSchedulePlan:
             TransformerLayerNode,
             build_layer_callables,
         )
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
         from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
@@ -307,6 +308,8 @@ class TransformerLayerSchedulePlan:
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
         transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
+        if isinstance(transformer_layer, HyperConnectionHybridLayer):
+            transformer_layer = transformer_layer.inner_layer
         is_moe = isinstance(transformer_layer.mlp, MoELayer)
         num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
@@ -633,6 +636,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     └── post_process: PostProcessNode
     """
 
+    @staticmethod
+    def _get_pre_post_process_nodes():
+        from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
+
+        return PreProcessNode, PostProcessNode
+
     def __init__(
         self,
         model,
@@ -674,7 +683,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
-        from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
+        PreProcessNode, PostProcessNode = self._get_pre_post_process_nodes()
 
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
@@ -707,6 +716,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.mhc_grad_carrier = None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
+        self._model_chunk_state.current_microbatch = getattr(model.decoder, "current_microbatch", 0)
         self._model_chunk_state.padding_mask = padding_mask
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
