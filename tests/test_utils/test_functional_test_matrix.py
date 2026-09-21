@@ -143,6 +143,30 @@ def test_product_edit_adds_only_affected_case(repo: Path):
     assert _matrix(repo, base) == [_entry("edited", "L2", "")]
 
 
+@pytest.mark.parametrize("new_case", [True, False])
+def test_changed_script_only_case_is_added_without_model_config(repo: Path, new_case: bool):
+    _case(repo, "baseline")
+    _recipe(repo, [_product("baseline", "L0")])
+    directory = repo / "tests/functional_tests/test_cases/gpt/direct_script"
+    directory.mkdir(parents=True)
+    script = directory / "test_gradients.py"
+    recipe_name = "recipes/h100/direct_script.yaml"
+    command = "python tests/functional_tests/test_cases/{model}/{test_case}/test_gradients.py"
+    if not new_case:
+        script.write_text("assert 1 + 1 == 2\n")
+        _recipe(repo, [_product("direct_script", "L1")], recipe_name, script=command)
+    base = _commit(repo)
+
+    script.write_text("assert 2 + 2 == 4\n")
+    if new_case:
+        _recipe(repo, [_product("direct_script", "L1")], recipe_name, script=command)
+    _commit(repo)
+
+    assert not (directory / "model_config.yaml").exists()
+    assert _matrix(repo) == [_entry("baseline")]
+    assert _matrix(repo, base) == [_entry("baseline"), _entry("direct_script", "L1", "")]
+
+
 def test_shared_recipe_edit_adds_all_affected_cases(repo: Path):
     products = [_product("nightly", "L2"), _product("weekly", "L3")]
     for name in ("nightly", "weekly", "other_recipe"):
@@ -184,10 +208,14 @@ def test_deleted_cases_are_omitted_and_renamed_cases_use_current_names(repo: Pat
     (root / "old_name").rename(root / "new_name")
     (root / "surviving/golden_values_dev_dgx_h100.json").unlink()
     (root / "deleted_config/model_config.yaml").unlink()
-    _recipe(repo, [_product(name, "L2") for name in ("new_name", "surviving", "deleted_config")])
+    _recipe(
+        repo,
+        [_product(name, "L2") for name in ("deleted", "new_name", "surviving", "deleted_config")],
+    )
     _commit(repo)
 
     assert sorted(_matrix(repo, base), key=lambda row: row["test_case"]) == [
+        _entry("deleted_config", "L2", ""),
         _entry("new_name", "L2", ""),
         _entry("surviving", "L2", ""),
     ]

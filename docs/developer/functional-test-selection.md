@@ -19,7 +19,8 @@ most recent push. It adds tests when:
 
 Additional tests must have an active GitHub tier (`L0`, `L1`, `L2`, or `L3`,
 including legacy aliases), a `dev` recipe for the platform being tested, and an
-existing `model_config.yaml`. They must fit the existing single-node GitHub
+existing test case directory. Recipes may run training configurations or Python
+test scripts directly. They must fit the existing single-node GitHub
 runner (8 GPUs on H100 or 4 GPUs on GB200); multi-node recipes still require
 the existing JET/GitLab infrastructure. Disabled scopes such as `mr-github-broken`,
 GitLab-only scopes, unit-test recipes, and deleted cases are not added. New

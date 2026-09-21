@@ -83,8 +83,9 @@ def _changed_workloads(
             ):
                 continue
             case = (spec["model"], spec["test_case"])
-            if not (repo_root / TEST_CASES / case[0] / case[1] / "model_config.yaml").is_file():
-                # A deleted test has no executable configuration at the tested SHA.
+            if not (repo_root / TEST_CASES / case[0] / case[1]).is_dir():
+                # Exclude deleted cases. Recipes can launch Python tests directly
+                # without using the model_config.yaml training harness.
                 continue
             if case in changed_cases or (previous is not None and workload not in previous):
                 changed.append(workload)
