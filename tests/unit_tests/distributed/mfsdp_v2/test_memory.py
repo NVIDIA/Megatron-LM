@@ -17,7 +17,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
@@ -223,7 +223,7 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     peak_nbytes = torch.cuda.max_memory_allocated(device) - allocated_before_setup
     resting_nbytes = torch.cuda.memory_allocated(device) - allocated_before_setup
     assert parameter_group.model_weight.placements == (Replicate(),)
-    assert parameter_group.post_optimizer_model_weight.placements == (Flat(),)
+    assert parameter_group.post_optimizer_model_weight.placements == (RowAtomic(),)
 
     optimizer_state_nbytes = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes

@@ -1,10 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
-Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
+Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`RowAtomic` layout.
 
 - `ParameterLayout` describes how a single parameter's flat element range is split across the DP
-  group under MFSDP v2's all-`Flat` layout.
+  group under MFSDP v2's all-`RowAtomic` layout.
 - `ParameterLayout.from_group` builds `{tensor_index: layout}` for eligible parameters in an
   `FsdpParameterGroup`, keyed by each parameter's index within the group.
 - `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
@@ -38,7 +38,7 @@ def select_ge_2d_params(param: torch.Tensor) -> bool:
 class ParameterLayout:
     """How a single parameter's flat element range splits across the DP group.
 
-    MFSDP v2's all-`Flat` layout gives each rank one contiguous global element range per parameter,
+    MFSDP v2's all-`RowAtomic` layout gives each rank one contiguous global element range per parameter,
     in rank order, so rank `r` holds `[offset, offset + count)` where `offset` is the sum of the
     previous ranks' counts. A rank with `count == 0` holds no elements of this parameter.
 
