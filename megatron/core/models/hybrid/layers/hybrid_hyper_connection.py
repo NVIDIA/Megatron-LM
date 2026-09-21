@@ -145,11 +145,17 @@ class HyperConnectionHybridLayer(MegatronModule):
             )
             return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
+        mlp_kwargs = (
+            cross_layer_state.mlp_kwargs(layer.layer_number)
+            if cross_layer_state is not None and hasattr(cross_layer_state, "mlp_kwargs")
+            else {}
+        )
         output_with_bias, residual = layer._forward_mlp_output_with_bias(
             hidden_states,
             inference_context=inference_context,
             padding_mask=padding_mask,
             packed_seq_params=packed_seq_params,
+            **({"mlp_kwargs": mlp_kwargs} if mlp_kwargs else {}),
         )
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(

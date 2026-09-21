@@ -15,6 +15,7 @@ from megatron.core.models.deepseek_v41.config import (
     VisionConfig,
 )
 from megatron.core.models.deepseek_v41.engram_hash import EngramLayout
+from megatron.core.models.deepseek_v41.image_processing import ImageInput
 from megatron.core.models.deepseek_v41.model import DeepSeekV41Model
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -55,6 +56,17 @@ def tiny_config(dtype=torch.float32, *, all_components=False, **overrides):
         config.engram_config = replace(
             config.engram_config,
             num_embeddings=[sum((sum(row) for row in layer)) for layer in layout.primes],
+        )
+        config.vision_config = VisionConfig(
+            num_hidden_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            intermediate_size=48,
+            patch_size=2,
+            rope_theta=10000,
+            downsample_ratio=3,
+            max_image_tokens=32,
+            min_pixels=36,
         )
     return config
 
@@ -97,11 +109,20 @@ def test_forward_backward_and_optimizer_step(groups, all_components):
     ids = torch.randint(0, 126, (1, 17), device="cuda")
     positions = torch.arange(17, device="cuda").expand_as(ids)
     kwargs = {}
+    if all_components:
+        image = ImageInput(
+            1,
+            torch.randn(9, 3, 2, 2, device="cuda"),
+            3,
+            3,
+            torch.tensor([0, 1, 2, 3], device="cuda"),
+        )
+        kwargs["images"] = [[image]]
     loss = model(ids, positions, labels=ids.roll(-1, 1), **kwargs).mean()
     loss.backward()
     assert torch.isfinite(loss)
     if all_components:
-        for component in ("engram",):
+        for component in ("engram", "vision", "aligner"):
             gradients = [
                 p.grad
                 for name, p in model.named_parameters()
