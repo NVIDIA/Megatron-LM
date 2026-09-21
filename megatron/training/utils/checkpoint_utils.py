@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import os
+import sys
 from typing import Optional
 
 import torch
@@ -8,8 +9,8 @@ import torch
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megeatron.training.state import TrainState
-from megeatron.training.utils import print_rank_0
+from megatron.training.state import TrainState
+from megatron.training.utils import print_rank_0
 
 
 TRAIN_STATE_FILE = "train_state.pt"

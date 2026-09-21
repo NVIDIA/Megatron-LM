@@ -1123,7 +1123,7 @@ def save_checkpoint(
                 )
 
                 checkpoint_name = get_checkpoint_name(
-                    save_dir, iteration=iteration, return_base_dir=True
+                    save_dir, iteration=iteration, release=release, return_base_dir=True
                 )
                 train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
                 train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=_TRACKER_PREFIX)
@@ -1149,14 +1149,8 @@ def save_checkpoint(
                 if MultiStorageClientFeature.is_enabled():
                     msc = MultiStorageClientFeature.import_package()
                     msc.torch.save(train_state_dict, train_state_global_filename)
-                    # Write Megatron-LM tracker file for compatibility
-                    with msc.open(tracker_filename, "w") as f:
-                        f.write(str(iteration))
                 else:
                     shutil.copy(train_state_local_filename, train_state_global_filename)
-                    # Write Megatron-LM tracker file for compatibility
-                    with open(tracker_filename, "w") as f:
-                        f.write(str(iteration))
 
                 if save_retain_interval is not None:
                     if (
