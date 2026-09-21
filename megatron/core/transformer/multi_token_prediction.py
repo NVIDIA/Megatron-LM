@@ -1538,12 +1538,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
-        if mtp_input_mask is not None:
-            # Keep invalid placeholder values in the forward pass, but prevent
-            # later causal positions from updating their shared embedding rows.
-            valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
-            decoder_input = torch.where(valid_decoder_input, decoder_input, decoder_input.detach())
-
         # Mirror the scatter in the model's own forward (see hybrid_model.py:
         # "the embedding skips SP scatter for models whose outer wrapper
         # scatters instead"). Multimodal LMs build LanguageModelEmbedding with
@@ -1556,6 +1550,24 @@ class MultiTokenPredictionLayer(MegatronModule):
             embedding, "scatter_to_sequence_parallel", True
         ):
             decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
+
+        if mtp_input_mask is not None:
+            # Keep invalid placeholder values in the forward pass, but prevent
+            # later causal positions from updating their shared embedding rows.
+            valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
+            if valid_decoder_input.shape[0] != decoder_input.shape[0]:
+                assert self.config.sequence_parallel, (
+                    "MTP conditioning mask and decoder input sequence lengths differ without "
+                    "sequence parallelism"
+                )
+                valid_decoder_input = scatter_to_sequence_parallel_region(
+                    valid_decoder_input, group=self.tp_group
+                )
+            assert valid_decoder_input.shape[0] == decoder_input.shape[0], (
+                f"MTP conditioning mask sequence length {valid_decoder_input.shape[0]} must match "
+                f"decoder input sequence length {decoder_input.shape[0]}"
+            )
+            decoder_input = torch.where(valid_decoder_input, decoder_input, decoder_input.detach())
 
         if getattr(
             self.config, "mtp_detach_embedding", getattr(self.config, "mtp_detach_heads", False)

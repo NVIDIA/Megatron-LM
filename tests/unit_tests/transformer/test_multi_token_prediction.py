@@ -937,6 +937,46 @@ class TestMultiTokenPredictionLayer:
 
         assert (len(scattered) == 1) is expect_scatter
 
+    def test_get_embeddings_scatters_mtp_mask_to_match_sequence_parallel_embedding(
+        self, monkeypatch
+    ):
+        """A VL MTP mask follows an embedding that was already sequence-parallel sharded."""
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config.sequence_parallel = True
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        position_ids = torch.arange(4, dtype=torch.int64).unsqueeze(0)
+        mtp_input_mask = torch.tensor([[True, False, True, True]])
+        hidden_states = torch.randn(2, 1, config.hidden_size)
+        embedding_weight = torch.nn.Parameter(torch.randn(4, 1, config.hidden_size))
+
+        def embedding(input_ids, position_ids):
+            return embedding_weight[:2]
+
+        def fake_scatter(tensor, group=None):
+            return tensor[:2]
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction."
+            "scatter_to_sequence_parallel_region",
+            fake_scatter,
+        )
+
+        _, _, _, _, decoder_input, _ = mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=embedding,
+            hidden_states=hidden_states,
+            packed_seq_params=None,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        decoder_input.sum().backward()
+        assert torch.count_nonzero(embedding_weight.grad[0]) == 0
+        assert torch.count_nonzero(embedding_weight.grad[1]) > 0
+
     @pytest.mark.parametrize(
         ("detach_heads", "detach_embedding", "detach_backbone"),
         [
