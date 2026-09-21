@@ -1028,7 +1028,7 @@ def initialize_model_parallel(
         # PyTorch is performing lazy initialization of the communicator group.
         # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
         torch.distributed.barrier(
-            group=get_data_parallel_group(with_context_parallel=True),
+            group=get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
             device_ids=[torch.cuda.current_device()],
         )
         torch.cuda.synchronize()
