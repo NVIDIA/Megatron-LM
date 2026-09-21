@@ -705,6 +705,40 @@ def _gtp_reclass_native_fp8_shard(param):
     return param
 
 
+def _move_presharded_weight_to_symm_pool(param, gtp_remat_group):
+    """Swap a pre-sharded weight's storage into the group's registered pool.
+
+    Quantized weights are re-homed whole (data + scale tensors) with the same
+    make_empty/copy_from_storage/data-setter sequence TE uses to re-home grouped
+    weights; plain BF16 weights get an empty_like + copy_. The old storage is freed.
+    """
+    quantizer = getattr(param, "_quantizer", None)
+    with torch.no_grad():
+        if quantizer is not None:
+            # Allocate the full quantized layout (data + scales) in the pool. Match the
+            # source tensor's populated buffers so copy_from_storage copies all of them;
+            # restore the quantizer's usage afterwards (the optimizer's quantize_
+            # updates rely on it).
+            saved_usage = (quantizer.rowwise_usage, quantizer.columnwise_usage)
+            quantizer.set_usage(
+                rowwise=param._rowwise_data is not None,
+                columnwise=param._columnwise_data is not None,
+            )
+            with gtp_symm_pool_ctx(gtp_remat_group):
+                pooled = quantizer.make_empty(param.shape, dtype=param.dtype, device=param.device)
+            quantizer.set_usage(rowwise=saved_usage[0], columnwise=saved_usage[1])
+            pooled.copy_from_storage(param)
+        else:
+            with gtp_symm_pool_ctx(gtp_remat_group):
+                pooled = torch.empty_like(param)
+            pooled.copy_(param)
+        old = param.data
+        param.data = pooled
+        if hasattr(old, "clear"):
+            # Quantized storage: release the non-pooled buffers immediately.
+            old.clear()
+
+
 def attach_gtp_to_presharded_module(
     module, gtp_remat_group, pad_length, is_grouped=False, replica_group=None
 ):
@@ -731,6 +765,11 @@ def attach_gtp_to_presharded_module(
         param = getattr(module, name, None)
         if param is None or is_gtp_param(param):
             continue
+        # Re-home the pre-sharded shard (the all-gather input) into the group's
+        # registered pool; biases and FP8 metadata stay in regular memory. The slice
+        # path does the equivalent clone in _gtp_slice_one_param.
+        if is_gtp_symm_pool_registered(gtp_remat_group, mode="ag"):
+            _move_presharded_weight_to_symm_pool(param, gtp_remat_group)
         if isinstance(param, QuantizedTensor):
             gtp_param = _gtp_reclass_native_fp8_shard(param)
         else:

@@ -752,6 +752,30 @@ def _worker_ag_alloc_routing(rank, world_size, port):
         deregister_and_clear_gtp_symm_pools()
 
 
+class TestTeWeightPoolMove:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
+    def test_weight_moves_to_pool_bias_stays_out(self):
+        group = _StubGroup(name="te_weight_move_group")
+        weight = torch.nn.Parameter(torch.randn(8, 4, device="cuda", dtype=torch.bfloat16))
+        bias = torch.nn.Parameter(torch.zeros(8, device="cuda", dtype=torch.bfloat16))
+        before = weight.detach().clone()
+        try:
+            gtp_module._move_presharded_weight_to_symm_pool(weight, group)
+            pool = gtp_symm._pools[group.group_name]
+            in_pool = lambda t: any(
+                seg["address"] <= t.data_ptr() < seg["address"] + seg["total_size"]
+                for seg in pool.snapshot()
+            )
+            # The weight's storage moved into the pool with values intact; bias did not.
+            assert in_pool(weight)
+            assert not in_pool(bias)
+            assert torch.equal(weight.detach(), before)
+            del weight, before
+            torch.cuda.synchronize()
+        finally:
+            deregister_and_clear_gtp_symm_pools()
+
+
 class TestAgAllocRouting:
     def test_slice_storage_and_cache_routing(self):
         _requires_multi_gpu(4)
