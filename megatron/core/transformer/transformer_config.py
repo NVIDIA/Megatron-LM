@@ -2542,15 +2542,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.enable_mhc_connections:
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
             # the stage holding the final layernorm, so every intermediate pipeline stage
-            # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.
-            # Pipeline support must resize the p2p buffers before this guard can be lifted.
-            if self.pipeline_model_parallel_size > 1:
-                raise NotImplementedError(
-                    "enable_mhc_connections does not support pipeline_model_parallel_size > 1 "
-                    "yet. Inter-stage activations are n-stream ([s, b, n*C]) while pipeline "
-                    "p2p buffers are sized from hidden_size, so the shapes disagree. Use "
-                    "pipeline_model_parallel_size=1 until mHC pipeline support lands."
-                )
+            # exchanges [s, b, n*C]. `get_tensor_shapes` sizes the p2p buffers accordingly
+            # (see `_mhc_p2p_hidden_size` in pipeline_parallel/schedules.py), which is what
+            # lifted the former "mHC does not support pipeline_model_parallel_size > 1" guard.
 
             # The residual carried across an mHC layer is the n-stream tensor consumed by
             # `fused_h_res_h_post_bda` (a bmm against h_res), not the single-stream residual
@@ -2600,26 +2594,6 @@ class TransformerConfig(ModelParallelConfig):
                     "--hybrid-layer-pattern). The GPT decoder path builds its own static "
                     "output contract and per-sublayer norms, which the gated-residual "
                     "variant replaces; wiring it there would silently take the wrong branch."
-                )
-            if (
-                self.virtual_pipeline_model_parallel_size is not None
-                and self.virtual_pipeline_model_parallel_size > 1
-            ):
-                raise ValueError(
-                    "Virtual pipeline parallelism is not supported with "
-                    "mhc_connection_variant='gated_residual': the pipeline schedule still "
-                    "sizes stage-to-stage tensors as [s, b, hidden_size] while the "
-                    "multi-stream hidden state is [s, b, n*hidden_size] (see BLOCKERS.md "
-                    "B1). Use virtual_pipeline_model_parallel_size=None."
-                )
-            if self.pipeline_model_parallel_size > 1:
-                raise ValueError(
-                    "Pipeline parallelism is not supported with "
-                    "mhc_connection_variant='gated_residual' on this base: the pipeline "
-                    "schedule computes stage-to-stage tensor shapes as "
-                    "[s, b, hidden_size], but the multi-stream hidden state is "
-                    "[s, b, n*hidden_size], so the receive buffers are undersized. Use "
-                    "pipeline_model_parallel_size=1."
                 )
             if not isinstance(self.hc_lowrank, int) or isinstance(self.hc_lowrank, bool) or (
                 self.hc_lowrank < 1

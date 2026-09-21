@@ -9,13 +9,14 @@ Measured 2026-09-15 **on the `dev`-based integration branch**. Re-run after any 
 cases are cheap (one node, ~40 min for all of them) and they are the only thing that proves the
 *combination* works.
 
-> ## ⚠️ This branch is based on `main`, and three rows do not carry over
+> ## ⚠️ This branch is based on `main`, and CUDA graphs do not carry over
 >
-> The rows below were measured against `origin/dev`. On the `main` base, pipeline parallelism
-> beyond PP1 and every CUDA-graph scope are **refused at configuration validation** rather than
-> supported. They are marked ⛔ (main) in place and explained in
-> "Not available on the `main` base" at the end of this file. Everything else was re-verified by
-> the parity harness and the single-node proxy on this branch.
+> The rows below were measured against `origin/dev`. On the `main` base every CUDA-graph scope is
+> **refused at configuration validation** rather than supported; the row is marked ⛔ (main) in
+> place and explained in "Not available on the `main` base" at the end of this file.
+>
+> Pipeline and virtual-pipeline parallelism were in that list until the mHC p2p tensor shapes were
+> ported to this base; both rows below were re-measured **on this branch** and pass.
 
 ## Parallelism and data layout
 
@@ -23,8 +24,8 @@ cases are cheap (one node, ~40 min for all of them) and they are the only thing 
 |---|:---:|---|---|
 | **EP** | ✅ | `--expert-model-parallel-size 4` (default of the proxy) | 8 local experts per rank, as at EP64 on the full model |
 | **TP + SP** | ✅ | `--tensor-model-parallel-size 2 --sequence-parallel` | GR warns without SP (replicated compute per TP rank) |
-| **PP** | ⛔ **(main)** | — | **Refused on this base.** `--pipeline-model-parallel-size > 1` with the gated residual raises at config validation. The pipeline schedule computes stage-to-stage tensor shapes as `[s, b, hidden_size]`, but the multi-stream hidden state is `[s, b, n*hidden_size]`, so the receive buffers are undersized. The ~35-line `pipeline_parallel/schedules.py` fix (BLOCKERS.md "B1") exists on `dev` and was **not** ported. On `dev` this row is ✅ |
-| **VPP** | ⛔ **(main)** | — | **Refused on this base**, for the same reason as PP, and additionally because the `dev` implementation of B1 carries a `TODO: flexible VPP layout`. On `dev` this row is ✅ with the `--overlap-param-gather` caveat (`assert self.param_gather_handle is None` in the distributed optimizer) |
+| **PP** | ✅ | pattern `GEGEGEQE\|GEGEGEQE/QE`, `--pipeline-model-parallel-size 2 --expert-model-parallel-size 2` | pipe separators define the stage boundaries. Was ⛔ on this base until `get_tensor_shapes` learned the mHC n-stream boundary width; re-measured on this branch (8 iterations, 59.2 GiB peak allocated) |
+| **VPP** | ✅ **with a caveat** | pattern with 4 `\|` segments, PP2 → 2 virtual stages per rank | **fails with `--overlap-param-gather`** (`assert self.param_gather_handle is None` in the distributed optimizer, no Qwen3.8 code in the traceback) — the same caveat as on `dev`. Works with `--use-distributed-optimizer --overlap-grad-reduce`; re-measured on this branch (8 iterations, 60.2 GiB peak allocated). Note `--num-virtual-stages-per-pipeline-rank` is **rejected** with `--hybrid-layer-pattern`: the virtual stages come from the number of `\|` segments |
 | **CP** (unpacked BSHD) | ✅ | `--context-parallel-size 2 --qsa-use-sparse-attention --cp-comm-type all_gather` | QSA CP **requires the sparse kernel** (the dense-mask bridge is single-rank) and allgather comm; PLE uses its conv halo |
 | **Packed rows (THD)** | ✅ **via `--sft` only** | `--sft --pad-packed-seq-alignment max --max-seqlen-per-dp-cp-rank 4096 --qsa-use-sparse-attention --eval-iters 1` | the **sequence-packing schedulers** selected by `--use-varlen-dataset` are rejected by the memory ("use the `--sft` packed path instead"). The SFT path still builds a validation loader, so `--eval-iters 0` fails with "no sample to consume" |
 | **Packed rows + CP** | ⛔ | — | rejected at startup: upstream `get_thd_batch_on_this_cp_rank` passes `cu_seqlens_padded=None` to `thd_get_partitioned_indices` and fails with or without the memory. The memory's own packed-CP layout is implemented and module-verified |
@@ -95,14 +96,12 @@ numerically equivalent to their single-rank / BF16 counterparts (that is the par
 
 ## Not available on the `main` base
 
-This branch is `origin/main` + the four feature branches. Three capabilities that the
-`dev`-based branch has are **refused at configuration validation** here, with a message naming
-the reason, rather than silently producing wrong shapes or numbers:
+This branch is `origin/main` + the four feature branches. One capability that the `dev`-based
+branch has is **refused at configuration validation** here, with a message naming the reason,
+rather than silently producing wrong shapes or numbers:
 
 | Capability | What happens | Why it is not here |
 |---|---|---|
-| `pipeline_model_parallel_size > 1` | `ValueError` from `TransformerConfig.__post_init__` | `main` has no mHC p2p tensor-shape handling. The fix is ~35 lines in one file, guarded by `enable_mhc_connections`, and is tracked as "B1". Note this gap is **upstream-wide** — it affects every mHC config on `main`, not only the gated-residual variant; the guard here is scoped to `mhc_connection_variant='gated_residual'` so it does not change `main`'s behaviour for other users |
-| `virtual_pipeline_model_parallel_size > 1` | `ValueError` from `TransformerConfig.__post_init__` | same root cause; and the `dev` implementation of B1 explicitly flags its VPP layout handling as unfinished |
 | CUDA graphs, any scope | `ValueError` from `TransformerConfig.__post_init__`, from the gated-residual guard, and again from Engram if it gets that far | the partial-MoE capture path packs the 4-tuple's `h_res` slot as a graph output, which the gated-residual variant returns as `None`; and Engram's hashed lookup and all-to-all have data-dependent shapes. The two commits that make the MoE-scoped capture work on `dev` were deliberately not ported |
 
 Everything else in the matrix above was re-verified on this base: the parity harness passes

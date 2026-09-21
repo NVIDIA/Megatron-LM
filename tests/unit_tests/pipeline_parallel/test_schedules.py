@@ -1270,3 +1270,58 @@ def test_forward_backward_no_pipelining_with_custom_pgs(mocker):
         assert l['loss_reduced'] == expected['loss_reduced']
 
     Utils.destroy_model_parallel()
+
+
+class _FakePPGroup:
+    """Minimal stand-in for a pipeline process group (rank/size are all schedules read)."""
+
+    def __init__(self, rank, size):
+        self._rank, self._size = rank, size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+def _mhc_config(streams=4, hidden=16, enabled=True):
+    return SimpleNamespace(
+        hidden_size=hidden, enable_mhc_connections=enabled, mhc_num_residual_streams=streams
+    )
+
+
+@pytest.mark.parametrize(
+    "pp_rank,pp_size,is_recv,widened",
+    [
+        (0, 2, True, False),  # first stage receives from the embedding, not from a peer
+        (1, 2, True, True),  # every later stage receives the n-stream tensor
+        (0, 2, False, True),  # every stage but the last sends the n-stream tensor
+        (1, 2, False, False),  # last stage has already contracted back to hidden_size
+        (1, 4, True, True),
+        (1, 4, False, True),  # an intermediate stage is n-stream on both sides
+    ],
+)
+def test_mhc_p2p_hidden_size_widens_only_intermediate_boundaries(
+    pp_rank, pp_size, is_recv, widened
+):
+    """mHC exchanges [s, b, n*C] between stages, but not into the first or out of the last."""
+    config = _mhc_config()
+    got = schedule._mhc_p2p_hidden_size(
+        config, pp_group=_FakePPGroup(pp_rank, pp_size), is_recv=is_recv
+    )
+    assert got == (config.hidden_size * 4 if widened else config.hidden_size)
+
+
+def test_mhc_p2p_hidden_size_is_inert_without_mhc():
+    """A model without hyper connections must keep byte-identical p2p shapes."""
+    config = _mhc_config(enabled=False)
+    for is_recv in (True, False):
+        assert (
+            schedule._mhc_p2p_hidden_size(
+                config, pp_group=_FakePPGroup(1, 2), is_recv=is_recv
+            )
+            == config.hidden_size
+        )
+    # No pipeline group (single stage, or a caller that cannot supply one) is also inert.
+    assert schedule._mhc_p2p_hidden_size(_mhc_config(), pp_group=None) == 16
