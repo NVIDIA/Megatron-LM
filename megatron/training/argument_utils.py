@@ -605,7 +605,8 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     from copy import deepcopy
 
     kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
-    kwargs["use_nsys_profiler"] = args.profile
+    if hasattr(args, "profile"):
+        kwargs["use_nsys_profiler"] = args.profile
     return ProfilingConfig(**deepcopy(kwargs))
 
 

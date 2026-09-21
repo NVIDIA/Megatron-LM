@@ -20,7 +20,6 @@ class TrainingProfiler:
     """
 
     def __init__(self, config: ProfilingConfig, *, rank: int, tensorboard_dir: str | None) -> None:
-        config.validate()
         self.config = config
         self.rank = rank
         self.tensorboard_dir = tensorboard_dir
@@ -37,6 +36,7 @@ class TrainingProfiler:
         config = self.config
         if not self._enabled() or not config.use_pytorch_profiler:
             return
+        config.validate()
         if config.pytorch_profiler_collect_chakra:
             trace_dir = Path(f"{self.tensorboard_dir}/../chakra")
             trace_dir.mkdir(parents=True, exist_ok=True)

@@ -41,26 +41,48 @@ def test_cli_and_native_settings_match_without_aliasing(enabled):
 
 @pytest.mark.parametrize("native", [False, True])
 def test_active_pytorch_window_validation(native):
+    if native:
+        config = ProfilingConfig(
+            use_nsys_profiler=True,
+            use_pytorch_profiler=True,
+            profile_step_start=5,
+            profile_step_end=5,
+        )
+    else:
+        _, config = cli_config(
+            "--profile",
+            "--use-pytorch-profiler",
+            "--profile-step-start",
+            "5",
+            "--profile-step-end",
+            "5",
+        )
+    # Construction is valid for non-training consumers; an active selected
+    # profiler checks its requirements immediately before starting.
+    runtime = profiling.TrainingProfiler(config, rank=0, tensorboard_dir=None)
     with pytest.raises(ValueError, match="profile_step_end > profile_step_start"):
-        if native:
-            ProfilingConfig(
-                use_nsys_profiler=True,
-                use_pytorch_profiler=True,
-                profile_step_start=5,
-                profile_step_end=5,
-            )
-        else:
-            cli_config(
-                "--profile",
-                "--use-pytorch-profiler",
-                "--profile-step-start",
-                "5",
-                "--profile-step-end",
-                "5",
-            )
-    # Options belonging to an inactive mode must not enable it or break scripts.
-    ProfilingConfig(use_pytorch_profiler=True, profile_step_start=5, profile_step_end=5)
-    ProfilingConfig(use_nsys_profiler=True, profile_step_start=5, profile_step_end=5)
+        runtime.start()
+    config.profile_ranks = [1]
+    runtime.start()  # Excluded ranks did not validate the window before migration.
+    config.profile_ranks = []
+    config.use_nsys_profiler = False
+    runtime.start()
+    config.use_nsys_profiler = True
+    config.use_pytorch_profiler = False
+    runtime.start()
+
+
+@pytest.mark.parametrize("profile", [None, False, True])
+def test_legacy_namespace_profile_alias_is_optional(profile):
+    args = SimpleNamespace(record_memory_history=True, memory_snapshot_path="legacy.pickle")
+    if profile is not None:
+        args.profile = profile
+    before = vars(args).copy()
+    config = profiling_config_from_args(args)
+    assert config.use_nsys_profiler is (profile is True)
+    assert config.record_memory_history is True
+    assert config.memory_snapshot_path == "legacy.pickle"
+    assert vars(args) == before
 
 
 @pytest.mark.parametrize(
