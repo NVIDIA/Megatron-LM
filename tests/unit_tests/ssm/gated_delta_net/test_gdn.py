@@ -848,7 +848,7 @@ class TestGDNCuSeqlensResolve:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("deterministic_mode", [False, True])
 @pytest.mark.parametrize("use_qk_l2norm", [False, True])
-def test_qk_l2_norm(dtype, deterministic_mode, use_qk_l2norm):
+def test_qk_l2_norm_deterministic_mode(dtype, deterministic_mode, use_qk_l2norm):
     """Check normalization dispatch, additive epsilon, and gradients on CPU."""
     gdn = SimpleNamespace(
         config=SimpleNamespace(deterministic_mode=deterministic_mode),
