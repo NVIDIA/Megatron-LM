@@ -6,6 +6,7 @@ import warnings
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
@@ -233,21 +234,46 @@ def _build_thd_layout_side_route(
     k-th row that peer expects from us. For the zigzag and contiguous layouts every rank's
     local order is already monotonic in global position, so this equals the previous
     target-local ordering and the CP-only routes are unchanged.
+
+    The row order is kept as runs of consecutive local rows, so the host work is
+    proportional to the number of layout segments rather than the number of tokens.
+    Returns ``None`` instead of an index tensor when the order is the identity.
     """
-    row_order: List[int] = []
+    # (first_row, length) runs of consecutive local rows in send order; a run that
+    # continues where the previous one ended is merged into it.
+    runs: List[Tuple[int, int]] = []
     split_sizes: List[int] = []
     for peer_segments in target_segments_by_rank:
         intersections = _intersect_thd_layout_segments(local_segments, peer_segments)
         intersections.sort(key=lambda item: item[3])
         split_size = 0
         for source_row, _, length, _ in intersections:
-            row_order.extend(range(source_row, source_row + length))
+            if runs and runs[-1][0] + runs[-1][1] == source_row:
+                runs[-1] = (runs[-1][0], runs[-1][1] + length)
+            else:
+                runs.append((source_row, length))
             split_size += length
         split_sizes.append(split_size)
 
-    if all(row == index for index, row in enumerate(row_order)):
+    # The order is the identity exactly when the merged runs form one range from row 0.
+    if not runs or (len(runs) == 1 and runs[0][0] == 0):
         return None, split_sizes
-    return torch.tensor(row_order, device=device, dtype=torch.long), split_sizes
+    return _materialize_row_runs(runs).to(device), split_sizes
+
+
+def _materialize_row_runs(runs: List[Tuple[int, int]]) -> torch.Tensor:
+    """Expand (first_row, length) runs into the flat row index they describe.
+
+    Built with NumPy on the host: the vectorized expansion costs O(#runs) Python work
+    and, unlike the multi-threaded CPU kernels of torch, has no per-call thread-pool
+    overhead for these small index tensors.
+    """
+    starts = np.fromiter((start for start, _ in runs), dtype=np.int64, count=len(runs))
+    lengths = np.fromiter((length for _, length in runs), dtype=np.int64, count=len(runs))
+    run_offsets = np.cumsum(lengths) - lengths
+    positions = np.arange(int(lengths.sum()), dtype=np.int64)
+    # Row of output position p inside run k is starts[k] + (p - run_offsets[k]).
+    return torch.from_numpy(np.repeat(starts - run_offsets, lengths) + positions)
 
 
 def _build_thd_cp_partition_route_from_host(

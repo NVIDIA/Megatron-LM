@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import random
 import warnings
 from types import SimpleNamespace
 
@@ -1417,3 +1418,132 @@ def test_sequence_parallel_thd_conversion_matches_unfused_reference(
         assert packed_seq_params.cp_partition_mode == target_layout
     finally:
         Utils.destroy_model_parallel()
+
+
+# -----------------------------------------------------------------------------
+# Run-based side-route construction must match the per-row reference bit for bit
+# -----------------------------------------------------------------------------
+
+
+def _reference_thd_layout_side_route(local_segments, target_segments_by_rank):
+    """Per-row reference for ``_build_thd_layout_side_route`` (the pre-run implementation)."""
+    row_order = []
+    split_sizes = []
+    for peer_segments in target_segments_by_rank:
+        intersections = context_parallel_layout_routes._intersect_thd_layout_segments(
+            local_segments, peer_segments
+        )
+        intersections.sort(key=lambda item: item[3])
+        split_size = 0
+        for source_row, _, length, _ in intersections:
+            row_order.extend(range(source_row, source_row + length))
+            split_size += length
+        split_sizes.append(split_size)
+    if all(row == index for index, row in enumerate(row_order)):
+        return None, split_sizes
+    return torch.tensor(row_order, dtype=torch.long), split_sizes
+
+
+def _random_route_cu_seqlens(rng, cp_size, tp_size, *, padded_tail):
+    """Random packed boundaries valid for zigzag CP and TP x CP shards."""
+    unit = 2 * cp_size * tp_size
+    lengths = [unit * rng.randint(1, 8) for _ in range(rng.randint(1, 6))]
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    if padded_tail:
+        cu.extend([cu[-1]] * rng.randint(1, 2))
+    return cu
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_thd_layout_side_route_runs_match_per_row_reference(cp_size, tp_size):
+    rng = random.Random(1000 * cp_size + tp_size)
+    group_size = cp_size * tp_size
+    for _ in range(10):
+        cu = _random_route_cu_seqlens(rng, cp_size, tp_size, padded_tail=False)
+        zigzag_by_logical, _ = context_parallel_layout_routes._build_thd_tp_cp_layout_segments(
+            cu, cp_size, tp_size, "zigzag"
+        )
+        contiguous_by_logical, _ = context_parallel_layout_routes._build_thd_tp_cp_layout_segments(
+            cu, cp_size, tp_size, "contiguous"
+        )
+        group_rank_by_logical_rank = list(range(group_size))
+        rng.shuffle(group_rank_by_logical_rank)
+        zigzag_by_group = [None] * group_size
+        contiguous_by_group = [None] * group_size
+        for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+            zigzag_by_group[group_rank] = zigzag_by_logical[logical_rank]
+            contiguous_by_group[group_rank] = contiguous_by_logical[logical_rank]
+
+        logical_ranks = list(range(group_size))
+        if group_size > 8:
+            logical_ranks = sorted(rng.sample(logical_ranks, 8))
+        for logical_rank in logical_ranks:
+            for local_segments, peers in (
+                (zigzag_by_logical[logical_rank], contiguous_by_group),
+                (contiguous_by_logical[logical_rank], zigzag_by_group),
+            ):
+                actual_index, actual_splits = (
+                    context_parallel_layout_routes._build_thd_layout_side_route(
+                        local_segments, peers, device=torch.device("cpu")
+                    )
+                )
+                expected_index, expected_splits = _reference_thd_layout_side_route(
+                    local_segments, peers
+                )
+                assert actual_splits == expected_splits, (cu, logical_rank)
+                if expected_index is None:
+                    assert actual_index is None, (cu, logical_rank)
+                else:
+                    assert actual_index is not None, (cu, logical_rank)
+                    assert actual_index.dtype == torch.long
+                    assert torch.equal(actual_index, expected_index), (cu, logical_rank)
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_thd_route_builders_match_per_row_reference(monkeypatch, cp_size, tp_size):
+    """Full CP-only and TP x CP routes are unchanged by the run-based construction."""
+    rng = random.Random(7000 + 10 * cp_size + tp_size)
+    group_size = cp_size * tp_size
+    run_based = context_parallel_layout_routes._build_thd_layout_side_route
+
+    def reference_side_route(local_segments, target_segments_by_rank, *, device):
+        index, split_sizes = _reference_thd_layout_side_route(
+            local_segments, target_segments_by_rank
+        )
+        return (index if index is None else index.to(device)), split_sizes
+
+    for trial in range(6):
+        cu_seqlens = torch.tensor(
+            _random_route_cu_seqlens(rng, cp_size, tp_size, padded_tail=trial % 2 == 1),
+            dtype=torch.int32,
+        )
+        group_rank_by_logical_rank = list(range(group_size))
+        rng.shuffle(group_rank_by_logical_rank)
+        group_rank_by_logical_rank = tuple(group_rank_by_logical_rank)
+        coordinates = [
+            (cp_rank, tp_rank) for cp_rank in range(cp_size) for tp_rank in range(tp_size)
+        ]
+        if len(coordinates) > 6:
+            coordinates = rng.sample(coordinates, 6)
+
+        for cp_rank, tp_rank in coordinates:
+            monkeypatch.setattr(
+                context_parallel_layout_routes, "_build_thd_layout_side_route", reference_side_route
+            )
+            expected_cp = build_thd_cp_partition_route(cu_seqlens, cp_size, cp_rank)
+            expected_tp_cp = build_thd_tp_cp_partition_route(
+                cu_seqlens, cp_size, cp_rank, tp_size, tp_rank, group_rank_by_logical_rank
+            )
+            monkeypatch.setattr(
+                context_parallel_layout_routes, "_build_thd_layout_side_route", run_based
+            )
+            actual_cp = build_thd_cp_partition_route(cu_seqlens, cp_size, cp_rank)
+            actual_tp_cp = build_thd_tp_cp_partition_route(
+                cu_seqlens, cp_size, cp_rank, tp_size, tp_rank, group_rank_by_logical_rank
+            )
+            _assert_thd_routes_equal(actual_cp, expected_cp)
+            _assert_thd_routes_equal(actual_tp_cp, expected_tp_cp)
