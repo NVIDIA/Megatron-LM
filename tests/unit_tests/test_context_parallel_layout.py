@@ -14,6 +14,7 @@ from megatron.core.context_parallel_layout import (
     CpPartitionModeConverter,
     ThdCpRoute,
     convert_module_input_tensors_cp_partition_mode,
+    finalize_packed_seq_params,
     prebuild_thd_cp_partition_routes,
 )
 from megatron.core.context_parallel_layout.routes import (
@@ -1418,6 +1419,92 @@ def test_sequence_parallel_thd_conversion_matches_unfused_reference(
         assert packed_seq_params.cp_partition_mode == target_layout
     finally:
         Utils.destroy_model_parallel()
+
+
+# -----------------------------------------------------------------------------
+# finalize_packed_seq_params prebuilds the fused route only for sequence parallelism
+# -----------------------------------------------------------------------------
+
+
+def _patch_static_parallel_state_groups(monkeypatch, *, cp_group, tp_group, tp_cp_group):
+    monkeypatch.setattr(
+        parallel_state, "get_context_parallel_group", lambda check_initialized=True: cp_group
+    )
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_group", lambda check_initialized=True: tp_group
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tensor_and_context_parallel_group",
+        lambda check_initialized=True: tp_cp_group,
+    )
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_finalize_packed_seq_params_prebuilds_fused_route_only_for_sequence_parallel(
+    monkeypatch, sequence_parallel
+):
+    cp_group = _FakeGroup(size=2, rank=1)
+    tp_group = _FakeGroup(size=2, rank=0)
+    tp_cp_group = _FakeGroup(size=4, rank=2)
+    _patch_static_parallel_state_groups(
+        monkeypatch, cp_group=cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
+    )
+    resolved = []
+
+    def fake_resolve(cp, tp, tp_cp):
+        resolved.append((cp, tp, tp_cp))
+        return (0, 2, 1, 3)
+
+    monkeypatch.setattr(
+        context_parallel_layout_routes, "resolve_tp_cp_group_rank_by_logical_rank", fake_resolve
+    )
+    cu_seqlens = torch.tensor([0, 16, 40], dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens
+    )
+
+    result = finalize_packed_seq_params(packed_seq_params, sequence_parallel=sequence_parallel)
+
+    assert result is packed_seq_params
+    assert packed_seq_params.cp_group is cp_group
+    assert isinstance(packed_seq_params.cp_partition_route, ThdCpRoute)
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
+    if sequence_parallel:
+        assert resolved == [(cp_group, tp_group, tp_cp_group)]
+        assert isinstance(packed_seq_params.tp_cp_partition_route, ThdCpRoute)
+        _assert_thd_routes_equal(
+            packed_seq_params.tp_cp_partition_route,
+            build_thd_tp_cp_partition_route(cu_seqlens, 2, 1, 2, 0, (0, 2, 1, 3)),
+        )
+    else:
+        # TP without sequence parallelism has no SP shards to convert; nothing to prebuild.
+        assert resolved == []
+        assert packed_seq_params.tp_cp_partition_route is None
+
+
+def test_finalize_packed_seq_params_default_matches_no_sequence_parallel(monkeypatch):
+    cp_group = _FakeGroup(size=2, rank=0)
+    _patch_static_parallel_state_groups(
+        monkeypatch,
+        cp_group=cp_group,
+        tp_group=_FakeGroup(size=2, rank=0),
+        tp_cp_group=_FakeGroup(size=4, rank=0),
+    )
+    monkeypatch.setattr(
+        context_parallel_layout_routes,
+        "resolve_tp_cp_group_rank_by_logical_rank",
+        lambda *args: pytest.fail("the fused route must not be prebuilt by default"),
+    )
+    cu_seqlens = torch.tensor([0, 16, 40], dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens
+    )
+
+    finalize_packed_seq_params(packed_seq_params)
+
+    assert packed_seq_params.cp_partition_route is not None
+    assert packed_seq_params.tp_cp_partition_route is None
 
 
 # -----------------------------------------------------------------------------
