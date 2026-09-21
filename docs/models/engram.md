@@ -59,7 +59,8 @@ Startup validates the following before model allocation:
 - context parallelism is not combined with packed rows -- the memory handles that layout, but
   upstream's THD context-parallel partitioning crashes with or without Engram;
 - packed (THD) sequences use the `--sft` family (schedulers including `--use-varlen-dataset`
-  are rejected) and, with PP > 1, `--pad-packed-seq-alignment max`; PP >= 3 is blocked upstream.
+  are rejected); PP >= 3 is blocked upstream. The `--pad-packed-seq-alignment max` that the
+  `dev`-based lineage pairs with PP > 1 has no counterpart on this base.
 
 Activation recomputation and virtual pipeline parallelism are supported. Recompute needs no
 Engram-specific plumbing: `checkpointed_forward` already forwards `input_ids` to the layers it
