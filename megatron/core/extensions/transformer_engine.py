@@ -572,9 +572,6 @@ def _init_gtp_remat_context(
         out_split_size=out_split_size,
     )
     yield out_features
-    # The attach below also re-homes each pre-sharded weight (the GTP all-gather input)
-    # into the group's registered symmetric pool when one is registered for "ag";
-    # biases, high-precision init values, and FP8 metadata stay in regular memory.
     _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, replica_group=replica_group)
 
 
