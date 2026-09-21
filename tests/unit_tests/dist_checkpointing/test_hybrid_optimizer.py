@@ -56,6 +56,10 @@ class HybridOptimizerModel(torch.nn.Module):
         ).reshape(16, 16) * (0.0078125 * step)
         return sum((parameter.float() * gradient).sum() for parameter in self.weights)
 
+    def state_dict_for_save_checkpoint(self, **kwargs) -> dict:
+        """Expose the native checkpoint interface used by production model modules."""
+        return self.state_dict(**kwargs)
+
     def sharded_state_dict(self, prefix: str = '', **kwargs) -> dict:
         """Replicate model tensors across the synthetic TP and DP ranks."""
         return {
