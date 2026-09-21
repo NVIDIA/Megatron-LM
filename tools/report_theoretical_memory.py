@@ -3,6 +3,12 @@
 """Computes theoretical memory footprint for model training without instantiating
 a model and running training iterations on GPU(s)."""
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 from megatron.training import get_args
 from megatron.training.initialize import initialize_megatron
 from megatron.training.theoretical_memory_usage import report_theoretical_memory

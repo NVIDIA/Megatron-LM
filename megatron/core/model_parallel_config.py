@@ -235,7 +235,7 @@ class ModelParallelConfig:
     deterministic_mode: bool = False
     """Select deterministic implementation paths. This flag alone does not configure
        process-wide policy. Library callers must also call
-       ``megatron.core.determinism.configure_determinism`` before CUDA, process groups,
+       ``megatron.determinism.configure_determinism`` before CUDA, process groups,
        or backend first use, and manage RNG seeds and data order. Defaults to False."""
 
     enable_autocast: bool = False

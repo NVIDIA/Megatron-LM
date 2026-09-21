@@ -9,23 +9,28 @@ from typing import Any, Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import datasets
 import torch
 import transformers
+from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import get_context_parallel_group
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
 from megatron.training.utils import print_rank_0
-from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 from model_provider import model_provider
-from megatron.core.parallel_state import get_context_parallel_group
-
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"

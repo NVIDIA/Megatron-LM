@@ -9,27 +9,31 @@ import sys
 from functools import partial
 from typing import Any, Dict, Iterator
 
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.arguments import parse_and_validate_args
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import torch
-from megatron.training import get_args, pretrain, print_rank_0
 
 from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_data_parallel_group,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
-    get_context_parallel_group,
-    get_data_parallel_group,
 )
+from megatron.training import get_args, pretrain, print_rank_0
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
-from data.mock import (
-    train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
-)
+from data.mock import train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider
 from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder

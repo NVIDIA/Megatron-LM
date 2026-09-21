@@ -17,6 +17,13 @@ _EXAMPLES_MULTIMODAL = os.path.join(_REPO_ROOT, "examples", "multimodal")
 if _EXAMPLES_MULTIMODAL not in sys.path:
     sys.path.append(_EXAMPLES_MULTIMODAL)
 
+# Apply requested policy before GPU dependencies can initialize CUDA.
+if __name__ == "__main__":
+    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    from megatron.determinism import bootstrap_training_determinism
+
+    bootstrap_training_determinism()
+
 import torch  # noqa: E402
 
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
