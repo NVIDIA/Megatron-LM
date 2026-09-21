@@ -92,7 +92,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
-    args.async_strategy = "mcore"
+    args.async_strategy = "nvrx"
     args.data_parallel_random_init = False
     args.no_save_optim = False
     args.no_save_rng = False
@@ -109,6 +109,8 @@ def create_args():
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
+    args.ckpt_assume_constant_structure = False
+    args.ckpt_load_validate_sharding_integrity = False
 
     yield args
 
@@ -177,7 +179,7 @@ def _save_a_checkpoint(
     )
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist", "torch_dcp", "fsdp_dtensor"])
 def test_train_state_files_saved_for_different_ckpt_types(
     init_model_parallel, create_args, populated_train_state, tmp_path_dist_ckpt, ckpt_format
 ):
