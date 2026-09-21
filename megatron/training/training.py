@@ -4164,8 +4164,26 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
 
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and active sparse indexer modules for loss logging."""
     tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
+    if (
+        getattr(args, "experimental_attention_variant", None) == "dsa"
+        and not getattr(args, "multi_latent_attention", False)
+        and is_hybrid_model(args)
+    ):
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            get_hybrid_layer_counts,
+            parse_hybrid_pattern,
+        )
+
+        parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+        tracker_layers = args.num_layers + len(parsed_pattern.mtp_pattern or "")
+        indexer_layers = get_hybrid_layer_counts(args.hybrid_layer_pattern)["*"]
+        if args.mtp_use_repeated_layer and parsed_pattern.mtp_pattern:
+            indexer_layers -= parsed_pattern.mtp_pattern.count("*") * (
+                parsed_pattern.mtp_num_depths - 1
+            )
+        return tracker_layers, indexer_layers
     if args.csa_compress_ratios is None:
         return tracker_layers, None
 

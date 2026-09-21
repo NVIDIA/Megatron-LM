@@ -683,6 +683,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
     ),
+    # ---------------------------------------------------------------- Simplified sparse attention (CuTe)
+    KernelEntry(
+        name="simplified_sparse_attention_cute",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_cute_kernels.py",),
+        kind="dispatch",
+        exempt_reason="The optional SM103 CuTe package accumulates sparse-attention K/V gradients "
+        "with floating-point atomics and has no deterministic backward. CuTe selection rejects "
+        "deterministic mode; numerical parity and that rejection are covered by "
+        "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_cute_kernels.py.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_kernels",

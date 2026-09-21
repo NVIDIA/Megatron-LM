@@ -385,15 +385,15 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
-    dsa_min_memory_backend: Literal['reference', 'triton-min-memory', 'torch-min-memory'] = (
-        'reference'
-    )
-    """Which min-memory DSA-over-GQA implementation to use.
+    dsa_gqa_backend: Optional[
+        Literal['reference', 'triton-min-memory', 'torch-min-memory', 'cute']
+    ] = None
+    """DSA-over-GQA implementation. None preserves the legacy selector's value."""
 
-    Distinct from dsa_kernel_backend, which selects the fused kernel backend for
-    DSA over MLA (none/tilelang/cudnn). This selects the streamed min-memory
-    implementation used by the GQA path. Both names existed independently
-    before this branch was rebased onto main."""
+    dsa_min_memory_backend: Literal[
+        'reference', 'triton-min-memory', 'torch-min-memory', 'cute'
+    ] = 'reference'
+    """Compatibility alias for dsa_gqa_backend, normalized during configuration initialization."""
 
     dsa_min_memory_profile: bool = False
     """Whether to print per-layer DSA min-memory forward/backward timing breakdowns."""
@@ -1676,6 +1676,22 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        # Resolve the old selector once, retaining existing launch/checkpoint arguments.
+        if self.dsa_gqa_backend is None:
+            self.dsa_gqa_backend = self.dsa_min_memory_backend
+        elif self.dsa_min_memory_backend not in ('reference', self.dsa_gqa_backend):
+            raise ValueError("dsa_gqa_backend conflicts with the legacy dsa_min_memory_backend.")
+        if self.dsa_gqa_backend not in (
+            'reference',
+            'triton-min-memory',
+            'torch-min-memory',
+            'cute',
+        ):
+            raise ValueError("Unsupported dsa_gqa_backend.")
+        self.dsa_min_memory_backend = self.dsa_gqa_backend
+        if self.dsa_gqa_backend == 'cute' and self.experimental_attention_variant != 'dsa':
+            raise ValueError("The CuTe GQA backend requires experimental_attention_variant='dsa'.")
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -3813,9 +3829,10 @@ class TransformerConfig(ModelParallelConfig):
                 'reference',
                 'triton-min-memory',
                 'torch-min-memory',
+                'cute',
             ), (
-                "dsa_min_memory_backend must be 'reference', 'triton-min-memory', "
-                "or 'torch-min-memory'."
+                "dsa_gqa_backend must be 'reference', 'triton-min-memory', "
+                "'torch-min-memory', or 'cute'."
             )
             assert (
                 self.dsa_min_memory_profile_rank >= -1
@@ -3914,6 +3931,51 @@ class TransformerConfig(ModelParallelConfig):
                 ), (
                     "DSAttention context parallelism currently supports "
                     "cp_comm_type=allgather only."
+                )
+
+        if self.dsa_gqa_backend == 'cute':
+            if self.multi_latent_attention or self.dsa_kernel_backend != 'none':
+                raise ValueError("CuTe selects GQA; leave the separate MLA backend at 'none'.")
+            if self.transformer_impl != 'transformer_engine':
+                raise ValueError("CuTe GQA integration requires Transformer Engine.")
+            if self.dsa_indexer_mode != 'simplified' or not self.dsa_simplified_use_learned_k:
+                raise ValueError("CuTe requires the simplified learned-Q/K indexer.")
+            if self.tensor_model_parallel_size != 1:
+                raise ValueError("CuTe GQA integration currently requires TP1.")
+            if self.num_attention_heads not in (16, 32, 96) or self.kv_channels != 256:
+                raise ValueError("CuTe requires 16, 32 or 96 query heads of dimension 256.")
+            if self.num_query_groups != 1 or self.dsa_indexer_head_dim != 128:
+                raise ValueError("CuTe requires MQA and one 128-dimensional indexer head.")
+            if self.dsa_indexer_topk not in (512, 1024, 2048):
+                raise ValueError("CuTe requires top-k 512, 1024 or 2048.")
+            if self.dsa_indexer_topk_freq != 1 or self.dsa_indexer_skip_topk_offset != 0:
+                raise ValueError("CuTe does not support cross-layer index sharing.")
+            if not self.bf16 or self.params_dtype != torch.bfloat16:
+                raise ValueError("CuTe requires BF16 activations and parameters.")
+            if self.attention_dropout != 0 or self.softmax_type != 'vanilla':
+                raise ValueError("CuTe requires zero attention dropout and vanilla softmax.")
+            if self.window_size is not None or self.attn_logit_softcapping is not None:
+                raise ValueError("CuTe does not support window attention or logit softcapping.")
+            if self.fused_single_qkv_rope or self.attention_output_gate:
+                raise ValueError("CuTe GQA does not support fused QKV RoPE or output gates.")
+            if self.dsa_simplified_indexer_disable_main_input_norm:
+                raise ValueError("CuTe requires normalized indexer inputs.")
+            if self.dsa_train_indexer_only or self.dsa_fwd_use_dense_attn or self.dsa_fwd_skip_dsa:
+                raise ValueError(
+                    "CuTe supports sparse attention, not indexer-only or dense warmup modes."
+                )
+            loss_coeff = self.dsa_indexer_loss_coeff or 0.0
+            if not math.isfinite(loss_coeff) or loss_coeff < 0:
+                raise ValueError("CuTe indexer loss coefficient must be finite and nonnegative.")
+            if loss_coeff > 0 and not self.dsa_indexer_use_sparse_loss:
+                raise ValueError("CuTe requires selected-support sparse indexer loss.")
+            if self.attention_backend in (AttnBackend.unfused, 'unfused'):
+                raise ValueError(
+                    "Explicit CuTe selection does not use the unfused attention backend."
+                )
+            if self.deterministic_mode:
+                raise ValueError(
+                    "CuTe sparse backward uses atomics and is not bit-exact deterministic."
                 )
 
         if self.inference_fuse_tp_communication:

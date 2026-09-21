@@ -44,6 +44,17 @@ def indexer_kl_sum(
     return _indexer_kl_terms(target, predict_log_probs, valid_mask).sum()
 
 
+def get_indexer_loss_denominator(
+    *, num_rows: int, calculate_per_token_loss: bool, valid_row_count: torch.Tensor | None = None
+) -> int | torch.Tensor:
+    """Choose the shared DSA sum-versus-mean denominator without host synchronization."""
+    if calculate_per_token_loss:
+        return 1
+    if valid_row_count is not None:
+        return valid_row_count.to(dtype=torch.float32).clamp_min(1.0)
+    return max(num_rows, 1)
+
+
 def reduce_indexer_kl_sum(
     kl_sum: torch.Tensor,
     *,
@@ -52,11 +63,16 @@ def reduce_indexer_kl_sum(
     valid_row_count: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Reduce an already-summed KL value using DSA token-loss semantics."""
-    if calculate_per_token_loss:
+    denominator = get_indexer_loss_denominator(
+        num_rows=num_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
+        valid_row_count=valid_row_count,
+    )
+    if isinstance(denominator, torch.Tensor):
+        denominator = denominator.to(device=kl_sum.device)
+    elif denominator == 1:
         return kl_sum
-    if valid_row_count is not None:
-        return kl_sum / valid_row_count.to(dtype=torch.float32, device=kl_sum.device).clamp_min(1.0)
-    return kl_sum / max(num_rows, 1)
+    return kl_sum / denominator
 
 
 def indexer_loss_from_target(

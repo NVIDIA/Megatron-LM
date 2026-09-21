@@ -2,6 +2,7 @@
 
 import copy
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -9,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -24,6 +26,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossLoggingHelper,
     fused_qk_topk_chunked,
     fused_qk_topk_naive,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_indexer_loss import (
+    get_indexer_loss_denominator,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
@@ -550,30 +555,42 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                     cp_group=self.pg_collection.cp,
                 )
 
-        self.linear_q = build_module(
-            submodules.linear_q,
-            self.hidden_size,
-            self.index_head_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
-        self.linear_k = None
-        if self.use_learned_k:
-            self.linear_k = build_module(
-                submodules.linear_k,
+        # Keep the small CuTe indexer projections BF16 even when the backbone uses FP8.
+        indexer_config = config
+        if config.dsa_gqa_backend == 'cute':
+            indexer_config = copy.copy(config)
+            indexer_config.fp8 = None
+            indexer_config.fp8_param = False
+            indexer_config.fp4 = None
+        with (
+            get_fp8_disabled_context(config, is_init=True)
+            if config.dsa_gqa_backend == 'cute'
+            else nullcontext()
+        ):
+            self.linear_q = build_module(
+                submodules.linear_q,
                 self.hidden_size,
                 self.index_head_dim,
-                config=config,
+                config=indexer_config,
                 init_method=config.init_method,
                 bias=False,
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
             )
+            self.linear_k = None
+            if self.use_learned_k:
+                self.linear_k = build_module(
+                    submodules.linear_k,
+                    self.hidden_size,
+                    self.index_head_dim,
+                    config=indexer_config,
+                    init_method=config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                    parallel_mode="duplicated",
+                )
         if self.pg_collection.tp.size() > 1:
             for param in self.parameters():
                 setattr(param, "average_gradients_across_tp_domain", True)
@@ -613,7 +630,12 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                 hidden_states, group=self.pg_collection.tp
             )
         seqlen, batch_size, _ = hidden_states.shape
-        q, _ = self.linear_q(hidden_states)
+        with (
+            get_fp8_disabled_context(self.config)
+            if self.config.dsa_gqa_backend == 'cute'
+            else nullcontext()
+        ):
+            q, _ = self.linear_q(hidden_states)
         q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
         return self._apply_rope(q, use_rope=use_rope, packed_seq_params=packed_seq_params)
 
@@ -630,8 +652,13 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                 hidden_states, group=self.pg_collection.tp
             )
         seqlen, batch_size, _ = hidden_states.shape
-        q, _ = self.linear_q(hidden_states)
-        k, _ = self.linear_k(hidden_states)
+        with (
+            get_fp8_disabled_context(self.config)
+            if self.config.dsa_gqa_backend == 'cute'
+            else nullcontext()
+        ):
+            q, _ = self.linear_q(hidden_states)
+            k, _ = self.linear_k(hidden_states)
         q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
         k = k.reshape(seqlen, batch_size, 1, self.index_head_dim)
         return (
@@ -775,6 +802,15 @@ class DSGQACoreAttention(MegatronModule):
                 "DSA-GQA currently supports full-sequence attention only. Decode-time "
                 "indexer caching is not implemented yet."
             )
+
+        if getattr(self.config, 'dsa_gqa_backend', 'reference') == 'cute':
+            if use_indexer_rope:
+                raise NotImplementedError(
+                    "CuTe simplified sparse attention currently supports NoPE only."
+                )
+            if attn_mask_type != AttnMaskType.causal or attention_mask is not None:
+                raise NotImplementedError("CuTe requires causal attention without a custom mask.")
+            return self._forward_cute(query, key, value, hidden_states, indexer_input_norm)
 
         sq, b, _, _ = query.size()
         skv = key.size(0)
@@ -1006,6 +1042,54 @@ class DSGQACoreAttention(MegatronModule):
             query_chunk_size=None,
             use_gather=sparse_attention_use_gather,
         )
+
+    def _forward_cute(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        hidden_states: torch.Tensor,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec],
+    ) -> torch.Tensor:
+        """Run the explicit CuTe backend using the existing GQA indexer and loss attachment."""
+        from megatron.core.transformer.experimental_attention_variant.dsa_cute_kernels import (
+            run_cute_sparse_attention,
+        )
+
+        # The outer attention hook supplies TE's already-normalized activation.
+        # A direct core call can supply the existing norm description instead.
+        indexer_input = _normalized_indexer_input(hidden_states, indexer_input_norm)
+        loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
+        use_indexer_loss = self.training and torch.is_grad_enabled() and loss_coeff > 0
+        with torch.enable_grad() if use_indexer_loss else torch.no_grad():
+            q_indexer, k_indexer = self.indexer.forward_qk(indexer_input, use_rope=False)
+        denominator = get_indexer_loss_denominator(
+            num_rows=query.shape[0] * query.shape[1],
+            calculate_per_token_loss=self.config.calculate_per_token_loss,
+        )
+        output, indexer_loss = run_cute_sparse_attention(
+            query,
+            key,
+            value,
+            q_indexer,
+            k_indexer,
+            topk=self.config.dsa_indexer_topk,
+            softmax_scale=self.softmax_scale,
+            loss_coeff=loss_coeff if use_indexer_loss else 0.0,
+            loss_denominator=denominator,
+        )
+        if use_indexer_loss:
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=indexer_loss,
+                raw_loss=indexer_loss / loss_coeff,
+                layer_number=self.layer_number,
+                num_layers=self.config.num_layers,
+                avg_group=getattr(self.indexer.pg_collection, 'dp_cp', None),
+            )
+            return DSAIndexerLossAutoScaler.apply(output, indexer_loss)
+        if self.training and torch.is_grad_enabled() and not self.config.dsa_train_main_only:
+            return _DSAZeroParamDependency.apply(output, *self.indexer.parameters())
+        return output
 
     def _forward_min_memory(
         self,
@@ -1281,6 +1365,7 @@ class DSGroupedSelfAttention(SelfAttention):
         pp_layer_offset: Optional[int] = None,
         # Upstream's TransformerLayer now passes a module instance name top-down.
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         if config.experimental_attention_variant == "dsa":
             submodules = copy.copy(submodules)
@@ -1308,7 +1393,11 @@ class DSGroupedSelfAttention(SelfAttention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
+
+    def _needs_qkv_layernorm_output(self) -> bool:
+        return self.config.dsa_gqa_backend == 'cute'
 
     def _use_indexer_rope(
         self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
@@ -1350,8 +1439,10 @@ class DSGroupedSelfAttention(SelfAttention):
         normalized_standard_indexer = not simplified_indexer and getattr(
             self.config, "dsa_standard_indexer_use_main_input_norm", False
         )
-        if (normalized_simplified_indexer or normalized_standard_indexer) and not getattr(
-            self.config, "dsa_fwd_skip_dsa", False
+        if (
+            getattr(self.config, 'dsa_gqa_backend', 'reference') != 'cute'
+            and (normalized_simplified_indexer or normalized_standard_indexer)
+            and not getattr(self.config, "dsa_fwd_skip_dsa", False)
         ):
             indexer_input_norm = _indexer_input_norm_spec(self.linear_qkv, self.config)
         return {
