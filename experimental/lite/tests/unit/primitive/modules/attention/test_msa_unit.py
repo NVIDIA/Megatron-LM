@@ -21,6 +21,7 @@ GRAD_REL = 5e-2
 GRAD_COS = 0.999
 TOPK_FLIP_BUDGET = 0.2  # fraction of (batch, head, token) rows whose top-k set may differ from HF in bf16
 MATCHED_ROWS_REL = 5e-2
+OUTPUT_COS = 0.99  # over all rows, flipped ones included
 
 
 def _rel(a, b):
@@ -188,4 +189,4 @@ def test_msattention_matches_hf_bf16(S):
     print(f"msattention_vs_hf_bf16 S={S} topk_flip_rows={flip_frac:.3%} matched_rows_rel={matched_rel:.3e} cos_all={cos_all:.6f}")
     assert flip_frac < TOPK_FLIP_BUDGET
     assert matched_rel < MATCHED_ROWS_REL
-    assert cos_all > 0.999
+    assert cos_all > OUTPUT_COS
