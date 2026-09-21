@@ -9,7 +9,10 @@ import torch
 import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    fused_mla_rope_inplace,
+    fused_mla_rope_out_of_place,
+)
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -28,7 +31,9 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_co
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (  # pylint: disable=line-too-long
     BSHDCompactIndexerWorkspace,
     FusedCSAIndexerSparseAttnFromTopkFunc,
+    OutputRopeParams,
     THDCompactIndexerWorkspace,
+    _compact_flat_topk_idxs,
     batch_of_row,
     bshd_compact_indexer_available,
     build_flat_topk_idxs,
@@ -58,7 +63,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -840,6 +845,7 @@ def _unfused_indexer_sparse_attn_from_topk(
     indexer_layout: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     q_padding_mask: Optional[torch.Tensor] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    out_rope: Optional[OutputRopeParams] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """PyTorch sparse attention plus caller-supplied indexer loss for THD CP.
 
@@ -848,7 +854,15 @@ def _unfused_indexer_sparse_attn_from_topk(
     ``indexer_topk_indices`` indexes compressed K for sparse indexer loss.
     ``_max_seqlen_q`` is unused here; it is retained to match the fused
     callable's signature, with the leading underscore marking it as unused.
+
+    ``out_rope`` is likewise only there for signature parity. There is no output
+    buffer to fuse the rotation into on this path, so the caller applies it.
     """
+    if out_rope is not None:
+        raise ValueError(
+            "The unfused THD CP path cannot fuse the output inverse RoPE; "
+            "the caller must apply it to the returned output."
+        )
     output = unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale)
 
     total_q, np_, hn = query.shape
@@ -1005,6 +1019,31 @@ class CompressorSubmodules:
     linear_wkv: Union[ModuleSpec, type] = None
     linear_wgate: Union[ModuleSpec, type] = None
     norm: Union[ModuleSpec, type] = None
+
+
+def _weight_requires_single_cp_projection(weight: nn.Parameter) -> bool:
+    """True when fused wgrad will overwrite ``main_grad`` for this weight.
+
+    ``overwrite_main_grad`` is the runtime contract, but Megatron FSDP only sets
+    it inside the linear pre-forward unshard hook. ``optim_grads`` and
+    fine-grained param-gather wrapping therefore look unset on the first
+    compressor forward, even though both backward GEMMs will copy into the same
+    buffer. Fall back using FSDP state that exists as soon as the wrapper is
+    constructed. ``is_first_microbatch=None`` cannot override that copy.
+    """
+    if getattr(weight, "overwrite_main_grad", False):
+        return True
+    fsdp = getattr(weight, "_megatron_fsdp_model", None)
+    if fsdp is None:
+        return False
+    strategy = getattr(fsdp, "data_parallel_sharding_strategy", "no_shard")
+    if strategy == "no_shard":
+        return False
+    if getattr(fsdp, "enable_fine_grained_param_gather_hook", False):
+        return True
+    # These strategies do not install TransformerLayer FSDP units, so the
+    # unshard hook (and overwrite_main_grad) runs on the linear itself.
+    return strategy in ("optim", "optim_grads")
 
 
 class Compressor(MegatronModule):
@@ -1201,6 +1240,92 @@ class Compressor(MegatronModule):
             kv = rotate_activation(kv)
         return kv
 
+    def _cp_requires_single_projection(self) -> bool:
+        """Whether wgrad's per-call contract requires the original CP projection.
+
+        FSDP sets ``overwrite_main_grad`` in the linear pre-forward unshard hook.
+        ``_forward_thd_cp`` inspects the flag before that hook runs, so also use
+        wrapping state that exists as soon as FSDP is constructed.
+        """
+        if self.config.delay_wgrad_compute:
+            return True
+        return any(
+            _weight_requires_single_cp_projection(linear.weight)
+            for linear in (self.linear_wkv, self.linear_wgate)
+        )
+
+    def _forward_thd_cp(
+        self,
+        x: torch.Tensor,
+        boundary_hidden: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        layout: thd_layout_kernels.CPCompressorLayout,
+        max_seqlen_q: int,
+        pre_compacted_hidden: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Project original CP inputs before compacting the much narrower KV/gate.
+
+        The linear backward saves the original local hidden storage, which is
+        already retained by attention, instead of a separate hidden-size compact
+        buffer. Only the required compressor halo is projected. Attention and
+        indexer compressors share the integer layout, including its inverse map.
+        ``pre_compacted_hidden`` keeps the fallback's high-dimensional input
+        shared across the two compressors as well.
+        """
+        linears = (self.linear_wkv, self.linear_wgate)
+        # Deferred wgrad stores one GEMM per backward_dw call. FSDP can likewise
+        # request a single overwrite of main_grad. Preserve their single-call
+        # contract instead of splitting a projection into two invocations.
+        projected_kv_score = None
+        if pre_compacted_hidden is not None:
+            x = pre_compacted_hidden
+        elif self._cp_requires_single_projection():
+            x, *_ = cp_utils.prepare_cp_compressor_input(
+                x,
+                boundary_hidden,
+                cu_seqlens,
+                layout.global_start,
+                layout.cp_size,
+                self.compress_ratio,
+            )
+        else:
+            if boundary_hidden.shape[0] < layout.boundary_rows:
+                raise ValueError("CP boundary is shorter than the compressor halo.")
+            boundary = boundary_hidden[-layout.boundary_rows :]
+            projections = []
+            with get_fp8_disabled_context(self.config):
+                for linear in linears:
+                    # BF16 has no quantized weight transpose to cache. Passing
+                    # is_first_microbatch=None via TELinear also makes both GEMMs
+                    # accumulate into the zeroed main_grad: otherwise backward's
+                    # last GEMM can overwrite the other half on microbatch one.
+                    # FSDP's overwrite_main_grad still forces a copy, so this
+                    # path must not run when FSDP wrapping will set that flag.
+                    cache_setting = getattr(linear, "disable_parameter_transpose_cache", None)
+                    if cache_setting is not None:
+                        linear.disable_parameter_transpose_cache = True
+                    try:
+                        local, _ = linear(x)
+                        halo, _ = linear(boundary)
+                    finally:
+                        if cache_setting is not None:
+                            linear.disable_parameter_transpose_cache = cache_setting
+                    projections.append((local, halo))
+            (local_kv, boundary_kv), (local_score, boundary_score) = projections
+            projected_kv_score = thd_layout_kernels.CompressorProjectionCompact.apply(
+                local_kv, local_score, boundary_kv, boundary_score, layout
+            )
+        return self._forward_thd(
+            x,
+            cu_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            compressed_group_ids=layout.group_ids,
+            compressed_position_ids=layout.position_ids,
+            pre_grouped_cu_seqlens=layout.local_cu_seqlens,
+            pre_grouped_cu_seqlens_compressed=layout.local_cu_seqlens_compressed,
+            projected_kv_score=projected_kv_score,
+        )
+
     def _forward_thd(
         self,
         x: torch.Tensor,
@@ -1211,6 +1336,7 @@ class Compressor(MegatronModule):
         compressed_position_ids: Optional[torch.Tensor] = None,
         pre_grouped_cu_seqlens: Optional[torch.Tensor] = None,
         pre_grouped_cu_seqlens_compressed: Optional[torch.Tensor] = None,
+        projected_kv_score: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """THD per-segment compression — fully vectorized.
 
@@ -1238,6 +1364,9 @@ class Compressor(MegatronModule):
             pre_grouped_cu_seqlens/pre_grouped_cu_seqlens_compressed: local
                 token/group prefixes describing the physical pre-grouped buffer.
                 Supplying both enables the regular THD fused compressor for CP.
+            projected_kv_score: pre-grouped CP projections. When supplied, ``x``
+                provides only the device/dtype; its high-dimensional rows have
+                not been compacted.
 
         Returns:
             ``(compressed_thd, cu_seqlens_compressed)`` where
@@ -1252,6 +1381,8 @@ class Compressor(MegatronModule):
         device = x.device
         dtype = x.dtype
         pre_grouped = compressed_group_ids is not None
+        if projected_kv_score is not None and not pre_grouped:
+            raise ValueError("Precomputed compressor projections require pre-grouped metadata.")
         has_pre_grouped_metadata = (
             pre_grouped_cu_seqlens is not None and pre_grouped_cu_seqlens_compressed is not None
         )
@@ -1286,10 +1417,13 @@ class Compressor(MegatronModule):
             return None, cu_seqlens_compressed
 
         # Run the compressor GEMMs in high precision (BF16) even under FP8 training.
-        with get_fp8_disabled_context(self.config):
-            # Token-wise projections on the FULL flat input — no boundary issue.
-            kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
-            score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
+        if projected_kv_score is None:
+            with get_fp8_disabled_context(self.config):
+                # Token-wise projections on the FULL flat input — no boundary issue.
+                kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
+                score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
+        else:
+            kv, score = projected_kv_score
 
         # Additive fused fast path (CuTe DSL, one kernel per direction) for the
         # gather / overlap-window / softmax / weighted-sum region below. Returns None
@@ -1738,6 +1872,135 @@ class CSAIndexer(MegatronModule):
 # ---------------------------------------------------------------------------
 
 
+class _OutputInverseRope:
+    """Undoes the query-side RoPE on the DSv4 attention output.
+
+    Built once per :meth:`CompressedSparseAttention.forward` from the layout
+    metadata, then used one of two ways:
+
+    * :attr:`fused_params` is handed to the sparse-attention ``Function``, which
+      rotates in place on the output it already saves for backward.  Only
+      available when ``config.apply_rope_fusion`` is set.
+    * :meth:`apply` rotates out of place, for every path whose output is still
+      owned by autograd and therefore cannot be mutated.
+
+    ``mscale`` is pinned to 1.0 throughout.  DSv4's reference (DS-Inf) RoPE is a
+    pure rotation and the model relies on Q/KV RMS-norm rather than yarn's
+    concentration factor.  That unit magnitude is also what makes the rotation
+    orthogonal, which is what lets the fused backward invert it.
+    """
+
+    def __init__(
+        self,
+        attn: "CompressedSparseAttention",
+        dtype: torch.dtype,
+        rope_seqlen: int,
+        packed_seq: bool,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        sbhd_batch_size: Optional[int] = None,
+        thd_cp_global_start: Optional[int] = None,
+        thd_cp_rows: Optional[int] = None,
+    ):
+        if attn.rotary_pos_emb is None:
+            raise ValueError(
+                "CompressedSparseAttention needs rotary_pos_emb to undo the "
+                "query-side RoPE on its output."
+            )
+        self.config = attn.config
+        self.cp_group = attn.pg_collection.cp
+        self.pos_dim = attn.qk_pos_emb_head_dim
+        self.nope_dim = attn.v_head_dim - self.pos_dim
+        self.cu_seqlens_q = cu_seqlens_q
+        self.max_seqlen = rope_seqlen if packed_seq else None
+        self.thd_cp_global_start = thd_cp_global_start
+
+        position_ids = None
+        if thd_cp_global_start is not None:
+            position_ids = cp_utils.thd_cp_position_ids(
+                cu_seqlens_q, thd_cp_global_start, thd_cp_rows
+            )
+
+        self.freqs = None
+        self.fused_params = None
+        if self.config.apply_rope_fusion:
+            cos, sin = attn.rotary_pos_emb.get_cached_cos_sin(
+                rope_seqlen, dtype=dtype, packed_seq=packed_seq, mscale=1.0
+            )
+            # position_ids supersedes the kernel's built-in CP row mapping.
+            self.fused_params = OutputRopeParams(
+                cos=cos,
+                sin=sin,
+                nope_dim=self.nope_dim,
+                pos_dim=self.pos_dim,
+                cu_seqlens_q=cu_seqlens_q,
+                cp_rank=0 if position_ids is not None else get_pg_rank(self.cp_group),
+                cp_size=1 if position_ids is not None else get_pg_size(self.cp_group),
+                position_ids=position_ids,
+                sbhd_batch_size=sbhd_batch_size,
+            )
+        else:
+            rope_result = attn.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            self.freqs = rope_result[0] if isinstance(rope_result, tuple) else rope_result
+
+    def apply(self, x: torch.Tensor) -> torch.Tensor:
+        """Inverse-RoPE ``x`` out of place.
+
+        Args:
+            x: ``(sq, b, np, head_dim)`` for sbhd, ``(rows, np, head_dim)`` for thd.
+        """
+        if self.thd_cp_global_start is not None:
+            if self.fused_params is not None:
+                return cp_utils.apply_thd_cp_local_rope_fused(
+                    x,
+                    self.fused_params.cos,
+                    self.fused_params.sin,
+                    self.nope_dim,
+                    self.pos_dim,
+                    self.cu_seqlens_q,
+                    self.thd_cp_global_start,
+                    inverse=True,
+                )
+            return cp_utils.apply_thd_cp_local_rope_unfused(
+                x,
+                self.freqs,
+                self.nope_dim,
+                self.pos_dim,
+                self.cu_seqlens_q,
+                self.thd_cp_global_start,
+                self.config,
+                inverse=True,
+            )
+
+        if self.fused_params is not None:
+            return fused_mla_rope_out_of_place(
+                x,
+                self.fused_params.cos,
+                self.fused_params.sin,
+                self.nope_dim,
+                self.pos_dim,
+                cu_seqlens_q=self.cu_seqlens_q,
+                cp_rank=self.fused_params.cp_rank,
+                cp_size=self.fused_params.cp_size,
+                inverse=True,
+                remove_interleaving=True,
+            )
+
+        content_part, rot_part = torch.split(x, [x.size(-1) - self.pos_dim, self.pos_dim], dim=-1)
+        rot_part = apply_rotary_pos_emb(
+            rot_part,
+            self.freqs,
+            self.config,
+            cu_seqlens=self.cu_seqlens_q,
+            mscale=1.0,
+            cp_group=self.cp_group,
+            mla_rotary_interleaved=True,
+            inverse=True,
+            mla_output_remove_interleaving=True,
+            max_seqlen=self.max_seqlen,
+        )
+        return torch.cat([content_part, rot_part], dim=-1)
+
+
 @dataclass
 class CompressedSparseAttentionSubmodules:
     """Submodule specs for CompressedSparseAttention."""
@@ -1757,6 +2020,8 @@ class CompressedSparseAttention(MegatronModule):
     * ``ratio == 4``:  window + 4x compressed + learned Indexer (both built)
     * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
     """
+
+    logs_dsa_indexer_loss = True
 
     def __init__(
         self,
@@ -1792,6 +2057,11 @@ class CompressedSparseAttention(MegatronModule):
         self.compress_ratio = compress_ratio
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
+        # Owned here rather than by the parent attention module: the inverse RoPE
+        # on the attention output is applied by this module (fused into the
+        # sparse-attention Function where possible), so it needs the cos/sin.
+        self.rotary_pos_emb = rotary_pos_emb
+        self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
 
         self.n_local_heads = config.num_attention_heads
 
@@ -2182,6 +2452,7 @@ class CompressedSparseAttention(MegatronModule):
         n_compressed: int,
         offset: int,
         window_idxs: torch.Tensor,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Path A: fused sparse attn with window or deterministic compressed indices."""
         sq, b, np, hn = query.size()
@@ -2198,7 +2469,7 @@ class CompressedSparseAttention(MegatronModule):
 
         nvtx_range_push("sparse_attn_kernel")
         output = csa_sparse_attn(
-            query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale
+            query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale, out_rope=out_rope
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2213,6 +2484,7 @@ class CompressedSparseAttention(MegatronModule):
         offset: int,
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Path C: separate indexer forward (no loss) + fused sparse attn (compact)."""
         b = query.size(1)
@@ -2238,8 +2510,13 @@ class CompressedSparseAttention(MegatronModule):
             deterministic=self.config.deterministic_mode,
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + offset, -1)
+        # Same lowering as ``FusedCSAIndexerSparseAttnFunc.forward`` (the
+        # grad-enabled path): compressed ids, then window ids, globalized and
+        # compacted. FlashMLA's online softmax accumulates in key order, so a
+        # forward-only pass reproduces the training forward only if it hands
+        # the kernel the same id sequence.
         flat_idxs, flat_tlen = build_flat_topk_idxs(
-            window_idxs, compress_topk_idxs, batch_size=b, compact=True
+            compress_topk_idxs, window_idxs, batch_size=b, compact=True
         )
         nvtx_range_pop("compressed_indices")
 
@@ -2251,6 +2528,7 @@ class CompressedSparseAttention(MegatronModule):
             flat_idxs,
             self.softmax_scale,
             topk_length=flat_tlen,
+            out_rope=out_rope,
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2265,8 +2543,12 @@ class CompressedSparseAttention(MegatronModule):
         offset: int,
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Path B: fused indexer (with loss) + fused sparse attn.
+
+        ``out_rope`` is applied to the attention output inside the Function, so
+        the returned output is already inverse-RoPE'd.
 
         Returns ``(output, indexer_loss)``.
         """
@@ -2308,6 +2590,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            out_rope=out_rope,
         )
         nvtx_range_pop("sparse_attn_kernel")
 
@@ -2348,7 +2631,8 @@ class CompressedSparseAttention(MegatronModule):
             qr:     [sq, b, q_lora_rank]  compressed query representation.
 
         Returns:
-            output: [sq, b, np * v_head_dim]
+            output: [sq, b, np * v_head_dim], with DSv4's inverse RoPE already
+                applied to the trailing ``qk_pos_emb_head_dim`` of each head.
         """
         nvtx_range_push("compressed_sparse_attn")
 
@@ -2390,6 +2674,14 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         indexer_loss = None
+        out_rope = _OutputInverseRope(
+            self, x.dtype, rope_seqlen=sq, packed_seq=False, sbhd_batch_size=b
+        )
+        # Every fused path rotates in place inside its Function, which owns the
+        # output buffer and un-rotates what it needs in its own backward. Only
+        # the unfused reference path leaves its output owned by autograd, so
+        # that one rotates out of place below.
+        fused_out_rope = out_rope.fused_params if self.use_fused_kernels else None
 
         if not self.use_fused_kernels:
             output, indexer_loss = self._forward_unfused_csa(
@@ -2405,16 +2697,36 @@ class CompressedSparseAttention(MegatronModule):
             )
         elif has_indexer_compressed and self.training and torch.is_grad_enabled():
             output, indexer_loss = self._forward_fused_indexer_training(
-                query, x, qr, kv_full, n_compressed, offset, window_idxs, packed_seq_params
+                query,
+                x,
+                qr,
+                kv_full,
+                n_compressed,
+                offset,
+                window_idxs,
+                packed_seq_params,
+                out_rope=fused_out_rope,
             )
         elif has_indexer_compressed:
             output = self._forward_fused_indexer_inference(
-                query, x, qr, kv_full, n_compressed, offset, window_idxs, packed_seq_params
+                query,
+                x,
+                qr,
+                kv_full,
+                n_compressed,
+                offset,
+                window_idxs,
+                packed_seq_params,
+                out_rope=fused_out_rope,
             )
         else:
             output = self._forward_fused_no_indexer(
-                query, kv_full, n_compressed, offset, window_idxs
+                query, kv_full, n_compressed, offset, window_idxs, out_rope=fused_out_rope
             )
+
+        if fused_out_rope is None:
+            flat_shape = output.shape
+            output = out_rope.apply(output.reshape(sq, b, np, -1)).reshape(flat_shape)
 
         if indexer_loss is not None:
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
@@ -2590,6 +2902,7 @@ class CompressedSparseAttention(MegatronModule):
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_compressed: torch.Tensor,
         max_seqlen_compressed_idx: int = 0,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Path A (THD): fused sparse attn with window or deterministic
         compressed indices.
@@ -2622,6 +2935,7 @@ class CompressedSparseAttention(MegatronModule):
             self.softmax_scale,
             topk_length=flat_tlen,
             is_thd=True,
+            out_rope=out_rope,
         )
         return output.unsqueeze(1)
 
@@ -2639,6 +2953,7 @@ class CompressedSparseAttention(MegatronModule):
         cu_seqlens_compressed: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_compressed_idx: int,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Path C (THD): separate indexer forward (no loss) + fused sparse attn (compact).
 
@@ -2692,6 +3007,17 @@ class CompressedSparseAttention(MegatronModule):
                 deterministic=self.config.deterministic_mode,
             )
 
+        # ``build_attention_indices`` has two output layouts. Its default puts
+        # window ids first and returns the list already compacted with a
+        # ``topk_length``. Its indexer-loss layout puts the compressed ids
+        # first at fixed positions (so the grad-enabled path can slice the
+        # window segment for the dense teacher) and leaves compaction to the
+        # caller, returning ``None`` for the length. The grad-enabled path in
+        # ``FusedCSAIndexerSparseAttnFunc.forward`` uses the latter; take the
+        # same layout here and compact it ourselves so both forwards hand
+        # FlashMLA an identical id sequence. With no compressed ids the two
+        # layouts coincide, so keep the default and its precomputed length.
+        compressed_first = topk_indices_cmp.shape[-1] > 0
         flat_idxs, flat_tlen, _, _ = thd_layout_kernels.build_attention_indices(
             cu_seqlens_q,
             0,
@@ -2702,11 +3028,14 @@ class CompressedSparseAttention(MegatronModule):
             topk_indices_cmp.shape[-1],
             topk_indices_cmp,
             cu_seqlens_compressed=cu_seqlens_compressed,
+            for_indexer_loss=compressed_first,
             compressed_base=compressed_base,
             compressed_rows=compressed_rows,
             compressed_is_sequence_major=True,
             output_alignment=get_flash_mla_topk_alignment(),
         )
+        if compressed_first:
+            flat_idxs, flat_tlen = _compact_flat_topk_idxs(flat_idxs)
         output = csa_sparse_attn(
             query,
             kv_full_thd,
@@ -2715,6 +3044,7 @@ class CompressedSparseAttention(MegatronModule):
             self.softmax_scale,
             topk_length=flat_tlen,
             is_thd=True,
+            out_rope=out_rope,
         )
         return output.unsqueeze(1)
 
@@ -2731,8 +3061,12 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_compressed_idx: int,
         compressed_kv: torch.Tensor,
         kv_full_thd: torch.Tensor,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Path B (THD): fused indexer (with loss) + fused sparse attn.
+
+        ``out_rope`` is applied to the attention output inside the Function, so
+        the returned output is already inverse-RoPE'd.
 
         Returns ``(output, indexer_loss)`` where *output* is
         ``(total_q, 1, np * hn)``.
@@ -2821,6 +3155,7 @@ class CompressedSparseAttention(MegatronModule):
             deterministic=self.config.deterministic_mode,
             thd_window_size=self.window_size,
             thd_compressed_is_sequence_major=True,
+            out_rope=out_rope,
         )
 
         if indexer_loss_coeff > 0:
@@ -2852,7 +3187,7 @@ class CompressedSparseAttention(MegatronModule):
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
 
-        l_local = query.shape[0]
+        l_local, np_local = query.shape[0], query.shape[1]
         if l_local != key.shape[0]:
             raise RuntimeError("DSv4 THD CP path currently supports self-attention only.")
         cu_seqlens = (
@@ -2864,6 +3199,17 @@ class CompressedSparseAttention(MegatronModule):
 
         # ---- Step 2: local CP rows, local KV, and boundary tensors ------------
         global_start = cp_rank * l_local
+        # Self-attention only on this path, so the q cu_seqlens double as the kv
+        # ones and keep the CP row-to-position mapping self-consistent.
+        out_rope = _OutputInverseRope(
+            self,
+            x.dtype,
+            rope_seqlen=max_seqlen_q,
+            packed_seq=True,
+            cu_seqlens_q=cu_seqlens,
+            thd_cp_global_start=global_start,
+            thd_cp_rows=l_local,
+        )
         kv_local = key.squeeze(-2).squeeze(1)
         if boundary_hidden is None or boundary_kv is None:
             raise RuntimeError(
@@ -2897,23 +3243,22 @@ class CompressedSparseAttention(MegatronModule):
         local_compressed_kv_grad_edge = None
         compressed_kv_rs_state = None
         if self.compressor is not None and ratio > 1:
-            # ---- Step 3: build fixed-capacity compressor input ----------------
-
-            # ``hidden_compact`` packs the local and boundary tokens needed by the
-            # Compressor. The same two CuTe launches also emit local prefixes for
-            # the fused pooling kernel, RoPE positions, global compressed prefixes,
-            # and the sequence-major -> rank-major gather map.
-            (
-                hidden_compact,
-                compressed_group_ids,
-                compressed_position_ids,
-                local_cu_seqlens,
-                local_cu_seqlens_compressed,
-                cu_seqlens_compressed,
-                seq_to_rank_row,
-            ) = cp_utils.prepare_cp_compressor_input(
-                x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
+            # ---- Step 3: build shared fixed-capacity compressor row maps ------
+            # Keep high-dimensional hidden states in their original storage.
+            # Both compressors project first, then compact their narrow KV/gate
+            # with these maps. Pooling, RoPE and gathered row ownership are unchanged.
+            compressor_layout = thd_layout_kernels.build_cp_compressor_layout(
+                cu_seqlens, global_start, l_local, cp_size, ratio
             )
+            cu_seqlens_compressed = compressor_layout.cu_seqlens_compressed
+            seq_to_rank_row = compressor_layout.seq_to_rank_row
+            hidden_compact = None
+            if self.compressor._cp_requires_single_projection() or (
+                indexer is not None and indexer.compressor._cp_requires_single_projection()
+            ):
+                hidden_compact, *_ = cp_utils.prepare_cp_compressor_input(
+                    x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
+                )
 
             if indexer is not None:
                 # ---- Step 4: optional indexer compressed path -----------------
@@ -2951,14 +3296,15 @@ class CompressedSparseAttention(MegatronModule):
                 # PackedSeqParams.cp_partition_mode is not "contiguous".
 
                 nvtx_range_push("dsv4_cp_indexer_k_compressor")
-                indexer_compressed_local, _ = indexer.compressor._forward_thd(
-                    hidden_compact.detach(),
+                indexer_compressed_local, _ = indexer.compressor._forward_thd_cp(
+                    indexer_x,
+                    boundary_hidden.detach(),
                     cu_seqlens,
+                    compressor_layout,
                     max_seqlen_q=max_seqlen_q,
-                    compressed_group_ids=compressed_group_ids,
-                    compressed_position_ids=compressed_position_ids,
-                    pre_grouped_cu_seqlens=local_cu_seqlens,
-                    pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
+                    pre_compacted_hidden=(
+                        hidden_compact.detach() if hidden_compact is not None else None
+                    ),
                 )
                 nvtx_range_pop("dsv4_cp_indexer_k_compressor")
                 # Build this edge before the independent attention
@@ -2979,14 +3325,13 @@ class CompressedSparseAttention(MegatronModule):
 
             # ---- Step 5: attention compressed KV path -------------------------
             nvtx_range_push("dsv4_cp_attention_kv_compressor")
-            compressed_kv_local, _ = self.compressor._forward_thd(
-                hidden_compact,
+            compressed_kv_local, _ = self.compressor._forward_thd_cp(
+                x,
+                boundary_hidden,
                 cu_seqlens,
+                compressor_layout,
                 max_seqlen_q=max_seqlen_q,
-                compressed_group_ids=compressed_group_ids,
-                compressed_position_ids=compressed_position_ids,
-                pre_grouped_cu_seqlens=local_cu_seqlens,
-                pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
+                pre_compacted_hidden=hidden_compact,
             )
             nvtx_range_pop("dsv4_cp_attention_kv_compressor")
             if indexer is not None:
@@ -3304,6 +3649,9 @@ class CompressedSparseAttention(MegatronModule):
                 output_alignment=(get_flash_mla_topk_alignment() if self.use_fused_kernels else 1),
             )
         )
+        # Only the fused Functions can rotate in place; see :meth:`forward`.
+        fused_out_rope = out_rope.fused_params if self.use_fused_kernels else None
+
         if use_indexer_loss:
             # ---- Step 7a: indexer-loss path ----------------------------------
             k_indexer_for_loss = k_indexer_rank_major
@@ -3358,11 +3706,15 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_kv_rs_state,
                     self.window_size,
                     kv_reconstruction_parts,
+                    fused_out_rope,
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
-                    *indexer_loss_args, tp_group=indexer.pg_collection.tp
+                    *indexer_loss_args, out_rope=fused_out_rope, tp_group=indexer.pg_collection.tp
                 )
+            if fused_out_rope is None:
+                flat_shape = output.shape
+                output = out_rope.apply(output.reshape(l_local, np_local, -1)).reshape(flat_shape)
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
@@ -3384,11 +3736,15 @@ class CompressedSparseAttention(MegatronModule):
                 topk_length=topk_length,
                 is_thd=True,
                 kv_reconstruction_parts=kv_reconstruction_parts,
+                out_rope=fused_out_rope,
             )
         else:
             output = unfused_compressed_sparse_attn(
                 query, kv_full_thd, self.attn_sink.float(), topk_idxs, self.softmax_scale
             )
+        if fused_out_rope is None:
+            flat_shape = output.shape
+            output = out_rope.apply(output.reshape(l_local, np_local, -1)).reshape(flat_shape)
         return output.unsqueeze(1)
 
     def _forward_thd(
@@ -3433,6 +3789,9 @@ class CompressedSparseAttention(MegatronModule):
             else packed_seq_params.cu_seqlens_kv
         )
         max_seqlen_q = int(packed_seq_params.max_seqlen_q)
+        # The output inverse-RoPE rotates against the KV segmentation, so its
+        # cos/sin cache is sized by the KV max rather than the Q max.
+        max_seqlen_kv = int(packed_seq_params.max_seqlen_kv)
 
         # Squeeze the dummy b=1 and MQA head-dim to get the KV-flat layout.
         # (key arrives as (total_kv, 1, 1, hn) for MQA.)
@@ -3468,6 +3827,12 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         indexer_loss = None
+        out_rope = _OutputInverseRope(
+            self, x.dtype, rope_seqlen=max_seqlen_kv, packed_seq=True, cu_seqlens_q=cu_seqlens_kv
+        )
+        # See :meth:`forward`: every fused path rotates in place inside its
+        # Function, only the unfused reference path rotates out of place.
+        fused_out_rope = out_rope.fused_params if self.use_fused_kernels else None
 
         if not self.use_fused_kernels:
             # The reference path retains the per-segment physical layout and
@@ -3518,6 +3883,7 @@ class CompressedSparseAttention(MegatronModule):
                     max_seqlen_compressed_idx,
                     compressed_kv,
                     kv_full_thd,
+                    out_rope=fused_out_rope,
                 )
             elif has_indexer:
                 output = self._forward_fused_indexer_inference_thd(
@@ -3533,6 +3899,7 @@ class CompressedSparseAttention(MegatronModule):
                     cu_seqlens_compressed,
                     max_seqlen_q,
                     max_seqlen_compressed_idx,
+                    out_rope=fused_out_rope,
                 )
             else:
                 output = self._forward_fused_no_indexer_thd(
@@ -3544,7 +3911,12 @@ class CompressedSparseAttention(MegatronModule):
                     cu_seqlens_q,
                     cu_seqlens_compressed,
                     max_seqlen_compressed_idx=max_seqlen_compressed_idx,
+                    out_rope=fused_out_rope,
                 )
+
+        if fused_out_rope is None:
+            flat_shape = output.shape
+            output = out_rope.apply(output.reshape(total_q, _np, -1)).reshape(flat_shape)
 
         if indexer_loss is not None:
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)

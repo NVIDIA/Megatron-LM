@@ -371,7 +371,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         attention_optional_kwargs = {}
-        if config.context_parallel_size > 1 and config.cp_comm_type is not None:
+        if (
+            config.context_parallel_size > 1 or config.dynamic_context_parallel
+        ) and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
                 # layer_number is 1-indexed, so we need to subtract 1 to get the correct index
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[
@@ -1281,6 +1283,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
         )
+        # Linear-attention variants (e.g. GatedDeltaNet) sit in the self_attention slot but
+        # accept `attention_mask` only for signature compatibility and never read it, and
+        # they have no `attn_mask_type`. Building a mask for them costs a persistent
+        # [mbs, 1, slen, seq] buffer that is discarded, and probing attn_mask_type raises
+        # AttributeError. Note this must not fold into attn_in_graph: those layers still
+        # need the THD cu_seqlens static inputs below. Defaults to True so third-party
+        # attention modules keep the softmax-attention behaviour.
+        attn_uses_mask = getattr(self.self_attention, "uses_attention_mask", True)
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
@@ -1313,7 +1323,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             static_inputs["padding_mask"] = torch.zeros(
                 1, slen_for_mask, dtype=torch.bool, device=device
             )
-        elif attn_in_graph:
+        elif attn_in_graph and attn_uses_mask:
             if not self.config.create_attention_mask_in_dataloader:
                 if self.self_attention.attn_mask_type not in (
                     AttnMaskType.causal,
@@ -1822,7 +1832,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # If the dataloader never creates masks, the TE CUDA graph was captured without
                 # this kwarg. Preserve that signature instead of allocating a synthetic
                 # [local_seq, global_seq] zero mask.
-                if not self.config.create_attention_mask_in_dataloader:
+                if self._is_thd_cuda_graph() or not self.config.create_attention_mask_in_dataloader:
+                    # THD captures sequence boundaries instead of a dense mask, regardless
+                    # of the dataloader setting. Do not allocate an unused quadratic mask.
                     cudagraph_kwargs.pop("attention_mask")
                 else:
                     # The graph was captured with an attention_mask tensor, so replay needs a
@@ -2265,16 +2277,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
-        # Backstop for packed inputs the config gate cannot see (the gate keys
-        # on sequence_packing_scheduler): fail with a clear message instead of
-        # the TE TypeError a replay with missing captured kwargs would raise.
-        if kwargs.get("packed_seq_params") is not None:
-            raise NotImplementedError(
-                "mhc_recompute_attn_cuda_graph_split does not support packed "
-                "(THD) sequences: the split's replay does not forward the THD "
-                "captured kwargs (cu_seqlens_*, padding_mask). Disable the "
-                "switch to capture the whole attention range instead."
-            )
         return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
 
     def _forward_mhc_attention_post_cuda_graph(
@@ -2623,6 +2625,27 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return output
 
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """Keep packed metadata intact for the split's eager continuation.
+
+        The parent decomposes PackedSeqParams before dispatching replay. The split instead
+        decomposes a separate copy for the attention graph, retaining the original object
+        (including CP route metadata) for the eager MLP. Preserve the parent's offload lifecycle.
+        """
+        if not self._uses_mhc_recompute_attn_cuda_graph_split():
+            return super()._te_cuda_graph_replay(*args, **kwargs)
+        assert (
+            kwargs.get("inference_context") is None
+        ), "mHC attention-only TE CUDA Graphs do not support inference_context"
+        if self.config.delay_offload_until_cuda_graph:
+            self.off_interface.enter_replay()
+        try:
+            return self._te_cuda_graph_replay_impl(args, kwargs, None)
+        finally:
+            self._te_cuda_graph_route_replay_state = None
+            if self.config.delay_offload_until_cuda_graph:
+                self.off_interface.exit_replay()
+
     def _replay_mhc_attention_consumer(self, args, kwargs, context):
         """Eager mHC aggregate -> captured attention replay -> eager post-BDA.
 
@@ -2646,6 +2669,34 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         else:
             hidden_states = kwargs.pop("hidden_states")
 
+        # Forward only the tensor arguments consumed by the captured attention
+        # callable. Include unused static kwargs such as padding_mask: TE requires
+        # every captured kwarg on replay. Keep the originals for the eager continuation.
+        graph_kwargs = {}
+        graph_tensor_kwargs = (
+            "rotary_pos_emb",
+            "rotary_pos_cos",
+            "rotary_pos_sin",
+            "rotary_pos_cos_sin",
+            "attention_bias",
+            "sequence_len_offset",
+            "padding_mask",
+            "input_ids",
+        )
+        if "attention_mask" in kwargs:
+            # TransformerLayer's replay-argument helper turns a None mask into
+            # the capture-compatible representation when necessary.
+            graph_kwargs["attention_mask"] = kwargs["attention_mask"]
+        for name in graph_tensor_kwargs:
+            value = kwargs.get(name)
+            if value is not None:
+                graph_kwargs[name] = value
+        if kwargs.get("packed_seq_params") is not None:
+            graph_kwargs["packed_seq_params"] = kwargs["packed_seq_params"]
+            self._decompose_packed_seq_params_to_kwargs(graph_kwargs)
+
+        # Decomposition also pins graph-dynamic CP route replay to its retained slot.
+        # Select the mHC direct-write buffer only after that slot has been resolved.
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
         output_slot = None
         if mhc_recompute_manager is not None:
@@ -2661,29 +2712,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
-
-        # Forward only the tensor arguments consumed by the captured attention
-        # callable.  Keep the original kwargs intact for the eager continuation.
-        graph_kwargs = {}
-        graph_tensor_kwargs = (
-            "rotary_pos_emb",
-            "rotary_pos_cos",
-            "rotary_pos_sin",
-            "rotary_pos_cos_sin",
-            "attention_bias",
-            "sequence_len_offset",
-        )
-        if "attention_mask" in kwargs:
-            # TransformerLayer's replay-argument helper turns a None mask into
-            # the capture-compatible representation when necessary.
-            graph_kwargs["attention_mask"] = kwargs["attention_mask"]
-        for name in graph_tensor_kwargs:
-            value = kwargs.get(name)
-            if value is not None:
-                graph_kwargs[name] = value
-        if kwargs.get("packed_seq_params") is not None:
-            graph_kwargs["packed_seq_params"] = kwargs["packed_seq_params"]
-            self._decompose_packed_seq_params_to_kwargs(graph_kwargs)
 
         cuda_graph_output = GraphableMegatronModule._te_cuda_graph_replay(
             self, aggregated, **graph_kwargs
@@ -2806,9 +2834,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay with hyper connection support.
 
-        Overrides the parent's _te_cuda_graph_replay_impl so that the
-        delay_offload_until_cuda_graph lifecycle (enter_replay/exit_replay) in
-        the parent's _te_cuda_graph_replay is preserved.
+        The caller owns the delay_offload_until_cuda_graph lifecycle
+        (enter_replay/exit_replay), including on the attention-only split path.
 
         During MoE partial CUDA graph capture, the graph outputs include HC state
         (mlp_hc_h_post, mlp_h_res) in addition to the base class outputs. This method
