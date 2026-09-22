@@ -450,6 +450,10 @@ def create_ckpt_load_args(create_args):
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
+    # Guard against leaked state: a prior test's teardown may have raised before
+    # reaching `unset_num_microbatches_calculator()`, leaving the calculator
+    # initialized for this test's setup.
+    unset_num_microbatches_calculator()
     init_num_microbatches_calculator(
         rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
     )
