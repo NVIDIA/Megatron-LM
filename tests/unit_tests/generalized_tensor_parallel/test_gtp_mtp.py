@@ -243,8 +243,8 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
 
             del model
             ps.destroy_model_parallel()
-            GTPShardedParam._chain_state = {}
-            GTPShardedParam._recompute_chain_state = {}
+            GTPShardedParam._chain_state.clear()
+            GTPShardedParam._recompute_chain_state.clear()
             GTPShardedParam._link_tables_flushed = False
     finally:
         GTP_CONFIG.async_reduction = saved_async
@@ -319,8 +319,8 @@ def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=Fa
 
         del model
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
-        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._chain_state.clear()
+        GTPShardedParam._recompute_chain_state.clear()
         GTPShardedParam._link_tables_flushed = False
     finally:
         GTP_CONFIG.pad_for_alignment = saved_pad
@@ -401,8 +401,8 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
         P._all_gather_weight_on_demand = o_ondemand
         GTP_CONFIG.pad_for_alignment = saved_pad
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
-        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._chain_state.clear()
+        GTPShardedParam._recompute_chain_state.clear()
         GTPShardedParam._link_tables_flushed = False
 
     # Every rank asserts: the tallies are rank-local, so rank 0 alone could miss a violation.
@@ -489,8 +489,8 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
 
         del model, ddp
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
-        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._chain_state.clear()
+        GTPShardedParam._recompute_chain_state.clear()
         GTPShardedParam._link_tables_flushed = False
     finally:
         pgb._ParamAndGradBucketGroup.register_grad_ready = orig_register
