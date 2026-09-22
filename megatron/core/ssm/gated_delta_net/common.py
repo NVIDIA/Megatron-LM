@@ -8,6 +8,7 @@
 # pylint: disable=unused-import
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Protocol, Union
@@ -15,7 +16,7 @@ from typing import Optional, Protocol, Union
 import torch
 import torch.nn as nn
 
-from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -55,6 +56,17 @@ except ImportError:
     HAVE_FLA = False
 
 logger = logging.getLogger(__name__)
+
+
+def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
+    """Build a KDA projection without quantized parameter initialization when requested."""
+    init_context = (
+        get_fp8_disabled_context(fp8_config, is_init=True)
+        if getattr(fp8_config, "kda_disable_fp8", False)
+        else nullcontext()
+    )
+    with init_context:
+        return build_module(module_spec, *args, **kwargs)
 
 
 @dataclass
@@ -216,7 +228,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 "For FP8, the innermost dimension of the GDN layer "
                 "input projection output tensor must be a multiple of 16."
             )
-        self.in_proj = build_module(
+        self.in_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,
@@ -285,7 +298,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
             self.recompute_gdn = "gdn" in self.config.recompute_modules
 
-        self.out_proj = build_module(
+        self.out_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.out_proj,
             self.v_dim,
             self.hidden_size,
