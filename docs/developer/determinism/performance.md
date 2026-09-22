@@ -386,3 +386,65 @@ inconclusive. Local-activation leaderboard and calibration reports retain their
 own format. Use the explicit collective publication and artifact-consumer paths
 below for this report kind. Reviewed baseline promotion and production-recipe
 performance acceptance remain separate work.
+
+### Publish and transport captured collective evidence
+
+Publish a complete capture, its matching replay/accuracy report and timing tree:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/baseline.py publish-collectives \
+  --capture /results/recipe/capture \
+  --coverage /results/recipe/coverage.json \
+  --benchmark /results/recipe/timing/benchmark.json \
+  --revision <measured-head-revision> --origin <original-run-reference> \
+  --store /store/collectives
+
+python tests/performance_tests/shell_test_utils/determinism/baseline.py verify \
+  /downloaded/collective-bundle --expected-id <published-baseline-id>
+```
+
+The distinct `determinism_collective_baseline` format retains original capture
+manifests and tensor blobs, coverage evidence, per-rank samples, worker requests,
+logs and timing reports. It checks every captured event, its all-rank replay,
+reference and sensitivity evidence, source/runtime and NCCL options; a selection
+of favorable events cannot form a complete baseline. It recomputes aligned group
+maxima, medians and paired comparisons from the separate rank files. Missing,
+changed or undeclared files, duplicate attempts, diagnostic records, failed
+budgets and inconclusive measurements are rejected. Unbudgeted results stay
+`not_gated`.
+
+Publication is immutable and verifies the copied bundle before exposing its
+content identifier. Repeated publication of identical content reuses the same
+identifier. Verification works on CPU without Torch, GPUs or the original
+checkout paths; recorded commands are data and are never executed. Supply the
+original identifier after transport to bind verification to the intended bundle.
+The verifier checks recorded numerical evidence and captured-byte integrity; it
+does not rerun GPU numerical references or establish model/restart equality.
+Tensor blobs and logs may contain recipe data, so select their destination and
+access policy explicitly.
+
+The CPU CI consumer supports a separate `determinism_collective_perf` producer.
+Its uploaded tree must contain exactly one dataset with sibling `capture/`,
+`coverage.json` and `timing/benchmark.json` paths. Stamp its actual outcome using
+`ci_artifacts.py stamp --test-case determinism_collective_perf` and the same
+repository, checked-out revision, run, attempt and platform arguments used below.
+After downloading separately named artifacts, select collective platforms
+explicitly:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/ci_artifacts.py collect \
+  --artifacts /downloaded/logs --output /reports/collective-candidates \
+  --repository NVIDIA/Megatron-LM --revision <measured-head-revision> \
+  --run-id <run-id> --attempt <run-attempt> \
+  --collective-platform dgx_h100 --collective-platform dgx_gb200
+```
+
+Each selected platform requires one successful collective artifact containing
+matching capture/replay/timing evidence from its original allocation. Activation
+artifacts cannot substitute for it. `--platform` continues to select the existing
+activation producers; both kinds can be requested together and are reported
+separately. A missing, failed, stale, wrong-platform or ambiguous selected producer
+fails verification. The derived bundles retain the source records and unbudgeted
+status. The nightly producer recipes and workflow selection described above
+provide the automatic path. Protected CI acceptance, reviewed performance limits
+and durable baseline promotion remain separate rollout requirements.

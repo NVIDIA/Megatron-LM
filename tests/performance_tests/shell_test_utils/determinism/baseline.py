@@ -169,6 +169,10 @@ def verified_contents(directory: Path, expected_id: str | None = None) -> tuple[
 
 def verify(directory: Path, expected_id: str | None = None) -> dict:
     """Rehash the complete bundle and independently recompute its evidence join."""
+    if _json(_bytes(directory / MANIFEST)).get("kind") == "determinism_collective_baseline":
+        import collective_baseline
+
+        return collective_baseline.verify(directory, expected_id)
     manifest, identity, count = verified_contents(directory, expected_id)
     if (
         manifest.get("schema_version") != 1
@@ -244,6 +248,13 @@ def main(argv: list[str] | None = None) -> int:
     create.add_argument(
         "--origin", required=True, help="Caller-supplied CI run or execution reference"
     )
+    collective = commands.add_parser("publish-collectives")
+    collective.add_argument("--capture", type=Path, required=True)
+    collective.add_argument("--coverage", type=Path, required=True)
+    collective.add_argument("--benchmark", type=Path, required=True)
+    collective.add_argument("--store", type=Path, required=True)
+    collective.add_argument("--revision", required=True)
+    collective.add_argument("--origin", required=True)
     check = commands.add_parser("verify")
     check.add_argument("directory", type=Path)
     check.add_argument("--expected-id")
@@ -252,6 +263,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "publish":
             result = publish(
                 args.coverage, args.leaderboard, args.store, args.revision, args.origin
+            )
+        elif args.command == "publish-collectives":
+            import collective_baseline
+
+            result = collective_baseline.publish(
+                args.capture, args.coverage, args.benchmark, args.store, args.revision, args.origin
             )
         else:
             result = verify(args.directory, args.expected_id)
