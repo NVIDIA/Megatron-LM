@@ -18,7 +18,9 @@ from vllm.transformers_utils.config import get_config
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import _rope_and_qnorm
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
+    _rope_and_qnorm,
+)
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.host_geometry import (
     compressed_sequence_boundaries,
     padded_sequence_boundaries,
@@ -458,7 +460,9 @@ def _packed_cache(
 def _dequantize_packed_cache(
     cache: torch.Tensor, rows: int, *, block_size: int = 64
 ) -> torch.Tensor:
-    from vllm.models.deepseek_v4.common.ops.cache_utils import dequantize_and_gather_k_cache_triton
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        dequantize_and_gather_k_cache_triton,
+    )
 
     output = torch.empty((1, rows, 512), dtype=torch.bfloat16, device=cache.device)
     if rows:
@@ -476,7 +480,9 @@ def _dequantize_packed_cache(
 
 
 def quantized_main_k_visible(functional_k: torch.Tensor) -> torch.Tensor:
-    from vllm.models.deepseek_v4.common.ops.cache_utils import quantize_and_insert_k_cache
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        quantize_and_insert_k_cache,
+    )
 
     rows = functional_k.shape[0]
     if rows == 0:
@@ -555,7 +561,9 @@ def official_compact_compressed_visible(
     functional_k = functional_k[:groups]
     compressed_group_ids = compressed_group_ids[:groups]
     # Each packed request needs an independent compressor state reset.
-    from vllm.models.deepseek_v4.common.ops.cache_utils import dequantize_and_gather_k_cache_triton
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        dequantize_and_gather_k_cache_triton,
+    )
 
     block_size = runtime_metadata.k_cache.shape[1]
     visible_parts = []
@@ -678,8 +686,12 @@ def official_indexer_topk(
     ratio: int,
     topk: int,
 ) -> torch.Tensor:
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
-    from vllm.models.deepseek_v4.common.ops.fused_indexer_q import fused_indexer_q_rope_quant
+    from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
+        fused_indexer_q_rope_quant,
+    )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
     rows = index_q.shape[0]
