@@ -1435,13 +1435,18 @@ class RequestPayloadStager(Protocol):
         ...
 
 
-# Request-metadata keys written by the chat endpoint when it defers the prompt
-# prefix replacement to a RequestPromptPreparer: the chat-template render of the
-# conversation through its last assistant message, and the EOS token id. The
-# consumer is out-of-tree (NeMo RL's ``TQMegatronPromptPreparer``), which passes
-# them straight to its ``replace_prefix_tokens``; the names mirror its arguments.
+# Request-metadata keys written by the chat endpoint when it defers prompt-prefix
+# replacement. A RequestPromptPreparer may consume them before admission; the
+# multimodal path also uses them to locate the splice after media expansion.
 PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
 PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
+
+# Engine-private fields used to defer multimodal prefix stitching until after
+# media-token expansion. The HTTP endpoint validates client offload metadata
+# before adding these reserved keys, so clients cannot forge them.
+PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD = "_prefix_model_prompt_token_ids"
+PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD = "_prefix_model_generation_token_ids"
+PREFIX_MEDIA_COUNT_FIELD = "_prefix_media_count"
 
 
 @dataclass(frozen=True)

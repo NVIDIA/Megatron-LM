@@ -9,11 +9,16 @@ import pytest
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
+    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD,
+    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     compute_media_cache_key,
     serialize_multimodal_data,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+    _compact_tokens_after_prefix,
+    _expanded_prefix_stitching_metadata,
     _extract_media_url_bytes,
     _has_previous_turn_tokens,
     _last_assistant_message,
@@ -53,13 +58,34 @@ def test_replace_prefix_tokens_metadata_ships_the_rendered_prefix_and_eos():
     assert offload_params == {"ng_capture": {"staging_chain": ["k1"]}}  # input not mutated
 
 
+def test_expanded_prefix_stitching_metadata_uses_model_input_tokens():
+    assistant = {
+        "prompt_token_ids": [10, 99, 99, 20],
+        "generation_token_ids": [7, 8],
+    }
+
+    out = _expanded_prefix_stitching_metadata(2, 1, assistant)
+
+    assert out[PREFIX_EOS_TOKEN_ID_FIELD] == 2
+    assert out[PREFIX_MEDIA_COUNT_FIELD] == 1
+    assert out[PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD] == [10, 99, 99, 20]
+    assert out[PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD] == [7, 8]
+
+
+def test_compact_tokens_after_prefix_keeps_only_new_turn_suffix():
+    assert _compact_tokens_after_prefix(
+        2,
+        [1, 10, 42, 11, 500, 2],
+        [1, 10, 42, 11, 500, 2, 12, 13],
+    ) == [2, 12, 13]
+
+
 _USER = {"role": "user", "content": "hi"}
 _ASSISTANT_TEXT = {"role": "assistant", "content": "hello"}
 _ASSISTANT_WITH_TOKENS = {
     "role": "assistant",
     "content": "hello",
     "prompt_token_ids": [1, 2],
-    "compact_prompt_token_ids": [1, 2],
     "generation_token_ids": [3, 99],
 }
 _ENGINE_METADATA = {"ng_capture": {"staging_chain": ["k1"]}}

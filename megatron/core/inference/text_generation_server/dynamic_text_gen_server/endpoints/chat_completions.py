@@ -23,6 +23,9 @@ _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
+    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD,
+    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     prepare_multimodal_data,
     unwrap_serialized_tensors,
@@ -60,6 +63,8 @@ _TOKEN_ID_FIELDS_TO_REDACT = {
     "generated_tokens",
     "prompt_token_ids",
     "generation_token_ids",
+    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD,
+    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD,
 }
 
 _INDEX_FIELDS_TO_REDACT = {"routing_indices", "moe_topk_indices", "prompt_moe_topk_indices"}
@@ -630,6 +635,41 @@ def _replace_prefix_tokens_metadata(eos_token_id, template_prefix_token_ids, off
     }
 
 
+def _expanded_prefix_stitching_metadata(
+    eos_token_id, prefix_media_count, last_assistant_message, offload_params=None
+):
+    """Carry an exact expanded prefix while the wire prompt contains only the compact suffix."""
+    return {
+        **(offload_params or {}),
+        PREFIX_EOS_TOKEN_ID_FIELD: eos_token_id,
+        PREFIX_MEDIA_COUNT_FIELD: prefix_media_count,
+        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: list(
+            last_assistant_message["prompt_token_ids"]
+        ),
+        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: list(
+            last_assistant_message["generation_token_ids"]
+        ),
+    }
+
+
+def _compact_tokens_after_prefix(eos_token_id, template_prefix_token_ids, current_tokens):
+    """Return the current-turn compact suffix, beginning at the prefix's final EOS."""
+    eos_count = template_prefix_token_ids.count(eos_token_id)
+    if eos_count <= 0:
+        raise ValueError("Could not locate an EOS-delimited previous turn.")
+
+    seen_eos = 0
+    for position, token_id in enumerate(current_tokens):
+        if token_id == eos_token_id:
+            seen_eos += 1
+            if seen_eos == eos_count:
+                return current_tokens[position:]
+    raise ValueError(
+        f"Expected {eos_count} EOS token(s) before the new turn, "
+        f"but found only {seen_eos}."
+    )
+
+
 def _apply_chat_template_sync(
     tokenizer, messages, tools, chat_template_kwargs, add_generation_prompt=True
 ):
@@ -952,17 +992,6 @@ try:
                     previous_media_slots = [
                         slot for slot in media_slots if slot[2] <= last_assistant_message_idx
                     ]
-                    if replace_prefix_tokens_here:
-                        previous_prompt_token_ids = last_assistant_message.get(
-                            "compact_prompt_token_ids"
-                        )
-                        if not isinstance(previous_prompt_token_ids, list):
-                            if previous_media_slots:
-                                raise ValueError(
-                                    "Prefix stitching requires compact_prompt_token_ids "
-                                    "from the previous Megatron-Inference response."
-                                )
-                            previous_prompt_token_ids = last_assistant_message["prompt_token_ids"]
                     eos_token_id = tokenizer.eos_id
                     assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
@@ -1005,12 +1034,36 @@ try:
                         )
 
                     if replace_prefix_tokens_in_engine:
+                        # Offloaded tokens are stitched in engine via RequestPromptPreparer.
                         offload_params = _replace_prefix_tokens_metadata(
                             eos_token_id, retokenized_previous_turn_token_ids, offload_params
                         )
+                        if previous_media_slots:
+                            # Multimodal post-expansion stitching requires an expanded prefix
+                            # and compact / pre-expanded suffix from RequestPromptPreparer.
+                            # PREFIX_MEDIA_COUNT_FIELD signals multimodal expansion and is
+                            # used to figure out how many subsequent media tokens to expand.
+                            offload_params[PREFIX_MEDIA_COUNT_FIELD] = len(
+                                previous_media_slots
+                            )
+                    elif previous_media_slots:
+                        # Multi-modal post-expansion stitching passes the pre-expanded prefix
+                        # and non-expanded suffix to the engine for stitching after expanding
+                        # the multimodal tokens in the suffix only.
+                        prompt_tokens = _compact_tokens_after_prefix(
+                            eos_token_id,
+                            retokenized_previous_turn_token_ids,
+                            prompt_tokens,
+                        )
+                        offload_params = _expanded_prefix_stitching_metadata(
+                            eos_token_id,
+                            len(previous_media_slots),
+                            last_assistant_message,
+                        )
                     else:
+                        # Neither offload nor multimodal. Just stitch here.
                         previous_turn_token_ids = (
-                            previous_prompt_token_ids
+                            last_assistant_message["prompt_token_ids"]
                             + last_assistant_message["generation_token_ids"]
                         )
                         prompt_tokens = _replace_prefix_tokens(
@@ -1400,12 +1453,8 @@ try:
 
             if return_tokenized_data and not payload_offloaded:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
-                # (post vision/video expansion). Preserve the exact compact form
-                # separately for lossless multi-turn prefix stitching.
+                # (post vision/video expansion).
                 message["prompt_token_ids"] = result["prompt_tokens"]
-                message["compact_prompt_token_ids"] = (
-                    result.get("compact_prompt_tokens") or result["prompt_tokens"]
-                )
                 message["generation_token_ids"] = result["generated_tokens"]
             if return_raw_text and not payload_offloaded:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
