@@ -431,6 +431,98 @@ def test_hybrid_stack_rejects_same_named_config_type():
         )
 
 
+@pytest.mark.parametrize("qk_layernorm", [False, True])
+def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch, qk_layernorm):
+    """C/H/W select a static spec and preserve per-layer ratios and mHC context."""
+
+    class DummyLayer(torch.nn.Module):
+
+        def __init__(self, layer_number):
+            super().__init__()
+            self.layer_number = layer_number
+
+    csa_layer_spec = object()
+    csa_qk_layernorm_spec = object()
+    submodules = HybridStackSubmodules(
+        csa_layer=csa_layer_spec, csa_qk_layernorm_layer=csa_qk_layernorm_spec
+    )
+    build_calls = []
+    built_layers = []
+    wrapped_layers = []
+
+    def fake_build(spec, **kwargs):
+        build_calls.append((spec, kwargs))
+        layer = DummyLayer(kwargs["layer_number"])
+        built_layers.append(layer)
+        return layer
+
+    def fake_wrap(*, config, layer):
+        wrapped_layers.append((config, layer))
+        return layer
+
+    monkeypatch.setattr("megatron.core.models.hybrid.hybrid_block.build_module", fake_build)
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_block.HyperConnectionHybridLayer", fake_wrap
+    )
+
+    transformer_config = TransformerConfig(
+        hidden_size=256,
+        num_layers=3,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        enable_mhc_connections=True,
+        qk_layernorm=qk_layernorm,
+    )
+    pg_collection = _make_pg_collection()
+    block = HybridStack(
+        transformer_config,
+        submodules,
+        layer_type_list=[Symbols.CSA, Symbols.HCA, Symbols.WINDOW],
+        pp_layer_offset=7,
+        post_layer_norm=False,
+        post_process=False,
+        pg_collection=pg_collection,
+        is_mtp_layer=True,
+        name="decoder",
+    )
+
+    expected_spec = csa_qk_layernorm_spec if qk_layernorm else csa_layer_spec
+    assert [spec for spec, _ in build_calls] == [expected_spec] * 3
+    built_configs = []
+    for index, (_, kwargs) in enumerate(build_calls):
+        layer_symbol = (Symbols.CSA, Symbols.HCA, Symbols.WINDOW)[index]
+        layer_config = kwargs.pop("config")
+        built_configs.append(layer_config)
+        assert type(layer_config) is Symbols.LAYER_CONFIG_MAP[layer_symbol]
+        assert layer_config.compress_ratio == Symbols.DSV4_COMPRESS_RATIO_MAP[layer_symbol]
+        assert layer_config is not transformer_config
+        assert layer_config.hidden_size == transformer_config.hidden_size
+        assert kwargs == {
+            "layer_number": 8 + index,
+            "pg_collection": pg_collection,
+            "is_mtp_layer": True,
+            "add_layer_offset": False,
+            "pp_layer_offset": 7,
+            "name": f"decoder.layers.{index}",
+        }
+    assert all(
+        wrapped_config is built_config
+        for (wrapped_config, _), built_config in zip(wrapped_layers, built_configs, strict=True)
+    )
+    assert [layer for _, layer in wrapped_layers] == built_layers
+    assert list(block.layers) == built_layers
+
+    with pytest.raises(ValueError, match="C/H/W layers require.*csa_layer"):
+        HybridStack(
+            transformer_config,
+            HybridStackSubmodules(),
+            layer_type_list=[Symbols.CSA, Symbols.HCA, Symbols.WINDOW],
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=pg_collection,
+        )
+
+
 _BF16 = {"bf16": True, "params_dtype": torch.bfloat16}
 # Current scaling, not delayed: delayed scaling opens one outer fp8 context for the whole stack
 # and the per-layer factory degenerates to nullcontext, so the block's interleaving of the two

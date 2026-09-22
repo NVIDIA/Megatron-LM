@@ -774,7 +774,10 @@ class InferenceStateHandoffMixin:
         ssm_meta = handoff.kv_meta.get("ssm") if isinstance(handoff.kv_meta, dict) else None
         continuation_block_count = (
             additional_decode_blocks(
-                len(handoff.prompt), len(resume_tokens), self.context.block_size_tokens
+                len(handoff.prompt),
+                len(resume_tokens),
+                self.context.block_size_tokens,
+                mtp_kv_cache=getattr(self.context, "enable_mtp_kv_cache", False),
             )
             if resume_tokens
             else 0
