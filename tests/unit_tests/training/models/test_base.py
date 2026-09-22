@@ -8,6 +8,16 @@ import pytest
 
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
+
+@pytest.fixture(autouse=True)
+def _disable_allowlist():
+    """Allow local test-module targets when from_dict resolves encoded callables."""
+    from megatron.training.config.instantiate_utils import target_allowlist
+
+    target_allowlist.disable()
+    yield
+    target_allowlist.enable()
+
 # ---------------------------------------------------------------------------
 # Dummy concrete implementations
 # ---------------------------------------------------------------------------
@@ -148,8 +158,18 @@ class TestModelConfigToDict:
         assert "pre_wrap_hooks" not in result
         assert "post_wrap_hooks" not in result
 
-    def test_callable_field_excluded(self):
+    def test_callable_field_encoded(self):
+        """Module-level callables serialize as _target_/_call_ dicts (they used to be dropped)."""
         cfg = DummyNestedModelConfig()
+        result = cfg.as_dict()
+        assert result["fn_field"] == {
+            "_target_": f"{_dummy_callable.__module__}.{_dummy_callable.__qualname__}",
+            "_call_": False,
+        }
+
+    def test_unencodable_callable_skipped(self):
+        """Lambdas cannot be re-imported and are still dropped from the dict."""
+        cfg = DummyNestedModelConfig(fn_field=lambda: None)
         result = cfg.as_dict()
         assert "fn_field" not in result
 
@@ -221,6 +241,8 @@ class TestModelConfigFromDict:
         assert isinstance(cfg.sub, DummySubConfig)
         assert cfg.sub.x == 7
         assert cfg.sub.y == "nested"
+        # Encoded callable fields resolve back to the original function.
+        assert cfg.fn_field is _dummy_callable
 
 
 # =============================================================================
