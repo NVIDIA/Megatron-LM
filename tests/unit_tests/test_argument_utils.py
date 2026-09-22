@@ -168,13 +168,14 @@ def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, exp
     )
     language_model.params_dtype = torch.float32
     language_model.activation_func = "gelu"
-    language_model.init_method = "xavier_uniform"
     language_model.embedding_init_method = "xavier_uniform"
 
+    # ``core_transformer_config_from_yaml`` merges the ``language_model`` and
+    # ``model_parallel`` sections, and this fixture already carries every
+    # TransformerConfig field in ``language_model``; repeating one here raises
+    # ``TypeError: got multiple values for keyword argument``.
     args = SimpleNamespace(
-        language_model=language_model,
-        model_parallel=SimpleNamespace(overlap_p2p_comm=False),
-        **fsdp_kwargs,
+        language_model=language_model, model_parallel=SimpleNamespace(), **fsdp_kwargs
     )
 
     config = core_transformer_config_from_yaml(args)
