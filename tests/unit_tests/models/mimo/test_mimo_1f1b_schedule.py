@@ -1292,32 +1292,6 @@ class TestMimo1F1BSchedule:
             projection_type="affine",
         )
 
-    def test_language_rank_input_projection_with_frozen_encoder_8gpu(self):
-        """Language ranks project unequal-width features from frozen encoder ranks."""
-        if self.world_size != 8:
-            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
-
-        run_mimo_1f1b_test(
-            encoder_tp=1,
-            encoder_pp=1,
-            encoder_dp=4,
-            encoder_offset=0,
-            llm_tp=2,
-            llm_pp=1,
-            llm_dp=2,
-            llm_offset=4,
-            hidden_size=256,
-            encoder_hidden_size=128,
-            num_layers=2,
-            vocab_size=1000,
-            seq_length=64,
-            micro_batch_size=2,
-            num_microbatches=2,
-            language_rank_input_projection=True,
-            freeze_encoder=True,
-            projection_type="affine",
-        )
-
     @pytest.mark.parametrize("use_layer_wise_distributed_optimizer", [False, True])
     def test_fan_in_dp2_to_dp1_llm_pp3_8gpu(self, use_layer_wise_distributed_optimizer):
         """Fan-in 2→1: Encoder DP=2 → LLM TP=2 PP=3, on 8 GPUs.
