@@ -436,6 +436,33 @@ def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=3, what="torch_chunk_gated_delta_rule")
 
 
+def test_kda_gate_jit_path_replays_fwd_bwd():
+    """KDA's jit-fused gate reshaping and beta activation replay bit-exactly."""
+    from types import SimpleNamespace
+
+    from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
+
+    seeded()
+    batch, seq_len, heads, head_dim = 2, 256, 4, 32
+    dummy = SimpleNamespace(key_head_dim=head_dim)
+    A_log = torch.randn(heads, device="cuda")
+    dt_bias = torch.randn(heads, device="cuda")
+    raw_g = torch.randn(
+        batch * seq_len * heads * head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    beta = torch.randn(
+        batch * seq_len * heads, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+
+    def fn(raw_g, beta):
+        raw_g, gates = KimiDeltaAttention._compute_gates(
+            dummy, A_log, dt_bias, batch, seq_len, raw_g, beta
+        )
+        return raw_g, gates["beta"]
+
+    assert_replays_bit_exact(fn, (raw_g, beta), replays=3, what="KDA gate JIT path")
+
+
 @pytest.mark.xfail(
     strict=False, reason="FLA chunk_gated_delta_rule is documented non-deterministic; recorded"
 )
