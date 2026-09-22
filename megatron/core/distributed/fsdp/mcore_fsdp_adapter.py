@@ -805,11 +805,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
         if config.fp4 or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")
-        if config.fp8 or config.fp8_param or ddp_config.fp8_param_gather:
-            if not config.fp8 or config.fp8_recipe != "mxfp8":
-                raise ValueError("MFSDP v2 only supports FP8 with the MXFP8 recipe.")
-            if config.fp8_param != ddp_config.fp8_param_gather:
-                raise ValueError("MFSDP v2 requires fp8_param and fp8_param_gather to match.")
+        if config.fp8 and config.fp8_recipe != "mxfp8":
+            raise ValueError("MFSDP v2 only supports FP8 with the MXFP8 recipe.")
+        if config.fp8_param != ddp_config.fp8_param_gather:
+            raise ValueError("MFSDP v2 requires fp8_param and fp8_param_gather to match.")
 
         if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
             raise ValueError(

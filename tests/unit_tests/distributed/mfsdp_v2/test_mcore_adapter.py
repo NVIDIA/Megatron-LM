@@ -88,7 +88,11 @@ class TestMcoreAdapterDense:
             ({"fp8": "hybrid", "fp8_recipe": "tensorwise"}, {}, "MXFP8 recipe"),
             ({"fp4": "e2m1"}, {}, "does not currently support FP4"),
             ({}, {"fp4_param_gather": True}, "does not currently support FP4"),
-            ({}, {"fp8_param_gather": True}, "MXFP8 recipe"),
+            (
+                {},
+                {"fp8_param_gather": True},
+                "fp8_param and fp8_param_gather to match",
+            ),
             (
                 {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
                 {"fp8_param_gather": True},
