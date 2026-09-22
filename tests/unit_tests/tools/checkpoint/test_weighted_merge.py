@@ -16,7 +16,6 @@ from megatron.core import dist_checkpointing
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import ShardedObject, ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
-from megatron.core.dist_checkpointing.strategies import filesystem_async
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer import TransformerConfig
@@ -90,11 +89,10 @@ def cpu_only_dcp_save(monkeypatch):
         monkeypatch.delenv(_var, raising=False)
     if torch.cuda.is_available():
         return
-    # DCP's mcore async writer synchronizes CUDA even for these CPU-only fixtures.
+    # dist_checkpointing synchronizes CUDA (e.g. fully_parallel.py) even for
+    # these CPU-only fixtures.
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
-    if not filesystem_async.HAVE_PSUTIL:
-        monkeypatch.setattr(filesystem_async, "_process_memory", lambda: 0)
 
 
 def _rank():
