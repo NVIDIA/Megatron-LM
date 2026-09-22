@@ -476,12 +476,9 @@ def tag_gtp_params_with_names(model):
         if is_gtp_param(param):
             param._debug_name = name
 
-    # A fused gate|up fc1 under GTP stores each shard as a CONTIGUOUS row slice of the
-    # logical [gate | up] weight (mapping pinned by the checkpoint wiring in
-    # transformer/mlp.py), so the gathered weight is already in logical order. Grouped
-    # (routed-expert) gated fc1 under EGTP has no such wiring yet: its checkpoint factory
-    # still splits per shard, which no runtime path reconciles. Refuse rather than train
-    # on scrambled experts.
+    # GTP stores contiguous rows of the logical [gate | up] weight. Unlike ordinary
+    # MLPs, grouped gated fc1 has no checkpoint wiring to gather before splitting
+    # gate/up, so reject EGTP for these modules.
     for mod_name, mod in model.named_modules():
         if not mod_name.endswith("linear_fc1"):
             continue
@@ -490,16 +487,14 @@ def tag_gtp_params_with_names(model):
             continue
         if getattr(mod, "weight", None) is not None:
             continue
-        grouped = [
-            gw
-            for gw in (getattr(mod, f"weight{i}", None) for i in range(64))
-            if gw is not None and is_gtp_param(gw)
-        ]
-        if grouped:
+        if any(
+            name.startswith("weight") and name[6:].isdigit() and is_gtp_param(param)
+            for name, param in mod.named_parameters(recurse=False)
+        ):
             raise NotImplementedError(
                 f"{mod_name}: gated_linear_unit with EGTP-sharded grouped weights is not "
                 "supported: the logical-layout checkpoint wiring (transformer/mlp.py) only "
-                "covers non-grouped fc1. Disable EGTP for gated experts or port the wiring."
+                "covers non-grouped fc1. Disable EGTP for grouped gated fc1 or port the wiring."
             )
 
 

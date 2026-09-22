@@ -8,9 +8,9 @@ the LOGICAL layout (gather to TP-local for the section split on save, slice this
 contiguous rows back out on load). These two helpers implement that round trip; every
 fused-projection module wires them around its own section-split factory.
 
-The same pair also pins the storage mapping: a GTP shard holds a CONTIGUOUS row slice of
-the logical TP-local tensor. The all-gathered weight is therefore already in logical
-order and needs no runtime permutation at the consume sites.
+These helpers preserve GTP's existing storage mapping: each shard holds a contiguous row
+slice of the logical TP-local tensor. Runtime all-gather therefore reconstructs the logical
+order without a permutation.
 """
 
 from dataclasses import replace
@@ -90,8 +90,8 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         full = original_merge_fn(sub_state_dict)
         if full.dim() != 2:
             # Fail loudly instead of padding/slicing a flattened buffer: only the
-            # unflattened 2-D model-weight factory is supported (optimizer state resolves
-            # through the per-shard rebuild, never through this merge).
+            # unflattened 2-D model-weight factory is supported. Optimizer checkpoint
+            # formats require their own mapping; this wrapper does not handle them.
             raise NotImplementedError(
                 "GTP fused-projection merge expects the unflattened 2-D projection; got "
                 f"a {full.dim()}-D tensor (flattened factories are unsupported)"

@@ -1429,6 +1429,7 @@ def _worker_fused_projection_checkpoint(world_size, *, kind, native_fp8=False):
             hidden_size=256,
             num_attention_heads=8,
             normalization='RMSNorm',
+            layernorm_zero_centered_gamma=False,
             activation_func=F.silu,
             bf16=True,
             params_dtype=torch.bfloat16,
@@ -1488,6 +1489,19 @@ def _worker_fused_projection_checkpoint(world_size, *, kind, native_fp8=False):
             expected_parts = [
                 (f'{kind}.{key}', 388, 1552, rank * 388) for rank in (tp_rank, tp_rank + 2)
             ]
+            # Seed TP-local logical rows independently of the checkpoint factories.
+            logical_weight = (
+                torch.randn(
+                    776,
+                    config.hidden_size,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                    generator=torch.Generator(device=weight.device).manual_seed(1234 + tp_rank),
+                )
+                * 0.02
+            )
+            with torch.no_grad():
+                weight.copy_(F.pad(logical_weight, (0, 0, 0, 24)).chunk(2)[gtp_rank])
         assert is_gtp_param(weight)
         assert is_float8tensor(weight) == native_fp8
         expected_weight = dequantize_gtp_native_fp8(weight) if native_fp8 else weight.detach()
@@ -1528,6 +1542,23 @@ def _worker_fused_projection_checkpoint(world_size, *, kind, native_fp8=False):
             restored = dequantize_gtp_native_fp8(weight)
             error = (restored - merged).abs().max() / merged.abs().max().clamp_min(1e-6)
             assert error < 0.2  # MXFP8 requantization is lossy.
+        elif kind == 'swiglu':
+            # One real forward checks that restored gate/up rows need no runtime permutation.
+            with torch.no_grad():
+                weight.zero_()
+                model.load_state_dict({key: merged}, strict=False)
+                inputs = torch.randn(
+                    8, 2, config.hidden_size, device=weight.device, dtype=weight.dtype
+                )
+                actual, _ = model.linear_fc1(inputs)
+                normalized = F.rms_norm(
+                    inputs.float(),
+                    (config.hidden_size,),
+                    model.linear_fc1.layer_norm_weight.float(),
+                    config.layernorm_epsilon,
+                ).to(inputs.dtype)
+                expected = F.linear(normalized, logical_weight)
+                torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
     finally:
         update_gtp_config(pad_for_alignment=original_pad)
         ps.destroy_model_parallel()
