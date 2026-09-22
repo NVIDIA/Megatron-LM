@@ -387,6 +387,24 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Compressed sparse attention
     ####################
+    dsv4_version: Literal["v4", "v4.1"] = "v4"
+    """Attention architecture. V4.1 uses CSA2 with explicit cross-layer sharing."""
+
+    csa2_kv_source_layers: list[int] | None = None
+    """Zero-based stack layer indices producing global KV and indexer K."""
+
+    csa2_index_source_layers: list[int] | None = None
+    """Zero-based stack layer indices computing new sparse indices."""
+
+    csa2_candidate_source_layer: int | None = None
+    """Full layer producing the hierarchical candidate pool; None disables it."""
+
+    csa2_candidate_topk_blocks: int = 0
+    """Maximum candidate blocks selected by the first decoder indexer."""
+
+    csa2_candidate_block_size: int = 0
+    """Number of global positions in a candidate block."""
+
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
@@ -1239,6 +1257,12 @@ class TransformerConfig(ModelParallelConfig):
     enable_mhc_connections: bool = False
     """Enable mHC residual connections."""
 
+    mhc_single_pass: bool = False
+    """Use the preceding sublayer's input mix and the final mix for output contraction."""
+
+    mhc_epsilon: float = 1e-6
+    """Positive stabilizer for single-pass mHC input and Sinkhorn coefficients."""
+
     mhc_num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
@@ -1586,6 +1610,11 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         self._validate_cp_layouts()
 
+        if self.dsv4_version not in ("v4", "v4.1"):
+            raise ValueError(f"Unsupported dsv4_version: {self.dsv4_version}")
+        if self.dsv4_version == "v4.1" and self.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError("V4.1 requires experimental_attention_variant='dsv4_hybrid'")
+
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
         ):
@@ -1740,6 +1769,13 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+        elif self.experimental_attention_variant == "dsv4_hybrid" and self.dsv4_version == "v4.1":
+            from megatron.core.transformer.experimental_attention_variant.csa2_config import (
+                validate_csa2_config,
+            )
+
+            validate_csa2_config(self)
+            self.hetereogenous_dist_checkpoint = True
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -2401,6 +2437,24 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
                 "recompute_modules with selective recompute to reduce activation memory."
             )
+
+        if self.mhc_single_pass:
+            if self.moe_shortcut_connection:
+                raise NotImplementedError("Single-pass mHC does not yet support shortcut MoE")
+            if self.tensor_model_parallel_size != 1 or self.context_parallel_size != 1:
+                raise NotImplementedError("Single-pass mHC currently requires TP=CP=1")
+            if not self.enable_mhc_connections:
+                raise ValueError("mhc_single_pass requires enable_mhc_connections=True")
+            if type(self.mhc_num_residual_streams) is not int or self.mhc_num_residual_streams < 1:
+                raise ValueError("mhc_num_residual_streams must be a positive integer")
+            if not math.isfinite(self.mhc_epsilon) or self.mhc_epsilon <= 0:
+                raise ValueError("mhc_epsilon must be positive and finite")
+            if self.cuda_graph_impl != "none" or self.mtp_num_layers:
+                raise NotImplementedError("Single-pass mHC does not yet support CUDA graphs or MTP")
+            if self.virtual_pipeline_model_parallel_size or self.sequence_parallel:
+                raise NotImplementedError(
+                    "Single-pass mHC does not yet support VPP or sequence parallelism"
+                )
 
         if self.use_fused_mhc and not self.enable_mhc_connections:
             raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")

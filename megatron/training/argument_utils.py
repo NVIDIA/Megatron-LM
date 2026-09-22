@@ -348,13 +348,13 @@ def core_transformer_config_from_args(args, config_class=None):
 
         pattern = args.hybrid_layer_pattern
         has_dsv4_attention = any(
-            symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
+            symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.CSA2, Symbols.HCA)
         )
         variant = getattr(args, 'experimental_attention_variant', None)
         if has_dsv4_attention:
             if variant not in (None, 'dsv4_hybrid'):
                 raise ValueError(
-                    "Hybrid C/H/W attention requires experimental_attention_variant='dsv4_hybrid', "
+                    "Hybrid C/H/V/W attention requires experimental_attention_variant='dsv4_hybrid', "
                     f"got {variant!r} for pattern {pattern!r}."
                 )
             kw_args['experimental_attention_variant'] = 'dsv4_hybrid'

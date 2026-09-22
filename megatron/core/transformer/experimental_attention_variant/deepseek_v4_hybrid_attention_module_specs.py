@@ -37,6 +37,12 @@ def get_dsv4_hybrid_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider
 ) -> ModuleSpec:
     """Build the native SBHD DSv4 HybridModel attention spec."""
+    if config.dsv4_version == "v4.1":
+        from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
+            get_csa2_module_spec_for_backend,
+        )
+
+        return get_csa2_module_spec_for_backend(cast(_DSv4BackendSpecProvider, backend))
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
 
