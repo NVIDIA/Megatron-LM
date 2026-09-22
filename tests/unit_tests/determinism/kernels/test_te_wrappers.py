@@ -15,8 +15,16 @@ import os
 import pytest
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    set_batch_invariant_mode,
+    te_supports_batch_invariant_grouped_gemm,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal
@@ -39,9 +47,11 @@ if HAVE_TE:
         TELayerNormColumnParallelLinear,
         TENorm,
         TERowParallelLinear,
+        te_cross_entropy,
     )
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
+_IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 
 def _config(**overrides):
@@ -89,6 +99,127 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what="TEColumnParallelLinear"
         )
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])
+    @pytest.mark.parametrize(
+        "k,n", [(256, 512), (2048, 1536), (768, 2048), (2688, 1856), (1856, 2688)]
+    )
+    def test_device_metadata_batch_invariant_training(self, monkeypatch, quantized, k, n):
+        """Exercise actual grouped TN/NN/NT dispatch, co-batches, and graph replay."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+        from transformer_engine.pytorch.module import grouped_linear
+
+        from megatron.core.extensions.transformer_engine import (
+            _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+        )
+
+        if (
+            not _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
+            or not te_supports_batch_invariant_grouped_gemm()
+        ):
+            pytest.skip("Requires TE grouped-tensor API, SM100, and cuBLASLt 13.5.1")
+        monkeypatch.delenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", raising=False)
+        calls = set()
+        original_mm = grouped_linear.general_grouped_gemm_for_grouped_tensor
+
+        def counted_mm(*args, **kwargs):
+            calls.add(kwargs.get("layout", "TN"))
+            return original_mm(*args, **kwargs)
+
+        monkeypatch.setattr(grouped_linear, "general_grouped_gemm_for_grouped_tensor", counted_mm)
+        seeded()
+        config = _config(
+            moe_use_grouped_tensor=True,
+            moe_grouped_gemm=True,
+            num_moe_experts=4,
+            fp8="hybrid" if quantized else None,
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_param=quantized,
+        )
+        with get_fp8_context(config, 0, is_init=True):
+            module = (
+                TEGroupedLinear(
+                    4,
+                    k,
+                    n,
+                    parallel_mode=None,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=True,
+                )
+                .cuda()
+                .train()
+            )
+        target = torch.randn(k, device="cuda", dtype=torch.bfloat16)
+        baseline = None
+
+        def check(fn, sizes, row, *, single_token=False):
+            nonlocal baseline
+            x = torch.randn(sum(sizes), k, device="cuda", dtype=torch.bfloat16)
+            if single_token:
+                x.zero_()
+            offset = 0
+            for size in sizes:
+                if size:
+                    x[offset + size - 32 : offset + size].zero_()
+                offset += size
+            x[row] = target
+            x.requires_grad_(True)
+            splits = torch.tensor(sizes, device="cuda", dtype=torch.int64)
+            with get_fp8_context(config, 0):
+                output, _ = fn(x, splits)
+                actual = output[row].detach().clone()
+                output[row].float().sum().backward()
+            if baseline is None:
+                baseline = actual
+            torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+            assert torch.isfinite(x.grad).all()
+            assert all(
+                p.grad is not None and torch.isfinite(p.grad).all() for p in module.parameters()
+            )
+            module.zero_grad(set_to_none=True)
+            return actual
+
+        with set_batch_invariant_mode(True, backend="te_native"):
+            check(module, [256, 256, 256, 256], 0, single_token=True)
+            check(module, [512, 256, 0, 768], 73)
+            check(module, [1024, 2048, 256, 0], 17)
+            sample = torch.randn(2048, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            splits = torch.tensor([512, 512, 512, 512], device="cuda", dtype=torch.int64)
+            with get_fp8_context(config, 0):
+                assert_module_replays_bit_exact(
+                    module,
+                    (sample, splits),
+                    replays=3,
+                    contention=True,
+                    what="TE device-metadata fixed-batch forward/backward",
+                )
+            graphed = te.make_graphed_callables(
+                module,
+                (sample, splits),
+                num_warmup_iters=3,
+                enabled=quantized,
+                recipe=MXFP8BlockScaling(),
+            )
+            for sizes, row in (
+                ([512, 512, 512, 512], 0),
+                ([256, 1024, 768, 0], 73),
+                ([1024, 256, 0, 768], 17),
+            ):
+                assert_replays_bit_exact(
+                    lambda: check(graphed, sizes, row),
+                    (),
+                    replays=3,
+                    backward=False,
+                    contention=True,
+                    what="TE device-metadata co-batch",
+                )
+        assert calls == {"TN", "NN", "NT"}
 
     def test_te_row_parallel_linear_replays(self):
         seeded()
@@ -164,6 +295,138 @@ class TestTEWrappers:
         )
         assert_module_replays_bit_exact(
             module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
+    @pytest.mark.parametrize(
+        ("recipe_storage", "global_recipe", "transformer_impl", "middle_uses_mxfp8"),
+        [
+            ({}, Fp8Recipe.mxfp8, "inference_optimized", True),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "inference_optimized", True),
+            ({"fp8_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({"inherit_model_init_context": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({"fp4_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({}, Fp8Recipe.tensorwise, "inference_optimized", False),
+            ({}, Fp8Recipe.mxfp8, "transformer_engine", False),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "transformer_engine", True),
+        ],
+        ids=[
+            "automatic-inheritance",
+            "explicit-inheritance",
+            "explicit-bf16-override",
+            "explicit-no-inheritance",
+            "explicit-fp4-storage-option",
+            "mismatched-global-recipe",
+            "training-default-unchanged",
+            "training-explicit-inheritance",
+        ],
+    )
+    def test_per_module_mxfp8_recipe_model_init_policy(
+        self, recipe_storage, global_recipe, transformer_impl, middle_uses_mxfp8
+    ):
+        """Only inference inherits MXFP8 storage automatically; explicit choices win."""
+        training_recipe = {"fp8_quantization_recipe": "mxfp8", "override_quantized_autocast": True}
+        training_recipe.update(recipe_storage)
+        recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": training_recipe,
+                    },
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {},
+                    },
+                },
+                "matchers": {
+                    "routed_expert_fc1": {
+                        "config": "mxfp8",
+                        "type": "glob",
+                        "pattern": "*mlp.experts.linear_fc1",
+                        "enabled": True,
+                    },
+                    "all_other_modules": {
+                        "config": "bf16",
+                        "type": "glob",
+                        "pattern": "*",
+                        "enabled": True,
+                    },
+                },
+            }
+        )
+        config = _config(
+            num_layers=3,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            num_query_groups=4,
+            kv_channels=32,
+            num_moe_experts=2,
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            add_bias_linear=False,
+            fp8="hybrid",
+            fp8_recipe=global_recipe,
+            fp8_param=True,
+            transformer_impl=transformer_impl,
+            normalization="RMSNorm",
+            moe_router_dtype="fp32",
+            quant_recipe=recipe,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=1,
+            num_layers_at_end_in_bf16=1,
+        )
+
+        def build(layer_number, module_path="mlp.experts.linear_fc1"):
+            name = f"decoder.layers.{layer_number}.{module_path}"
+            with get_fp8_context(config, layer_number, is_init=True):
+                return TEGroupedLinear(
+                    2,
+                    128,
+                    256,
+                    parallel_mode=None,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=True,
+                    name=name,
+                )
+
+        edge = build(0)
+        middle = build(1)
+        assert not is_mxfp8tensor(edge.weight0)
+        assert is_mxfp8tensor(middle.weight0) is middle_uses_mxfp8
+
+        # The catch-all recipe allocates BF16 directly even inside an MXFP8 layer.
+        # Checkpoint loading must preserve the parameter object and its exact BF16 values.
+        other = build(1, "mlp.shared_experts.linear_fc1")
+        for module in (edge, build(2), other):
+            parameter = module.weight0
+            assert not is_mxfp8tensor(parameter)
+            checkpoint = module.state_dict()
+            expected = torch.randn_like(parameter)
+            checkpoint["weight0"] = expected
+            module.load_state_dict(checkpoint)
+            assert module.weight0 is parameter
+            assert torch.equal(module.weight0, expected)
+
+    def test_te_fused_cross_entropy_replays(self):
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(
+            tokens, 1, 32768, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        assert_replays_bit_exact(
+            lambda l, t: te_cross_entropy(l, t, tp_group),
+            (logits, target),
+            replays=4,
+            what="te_fused_cross_entropy",
         )
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
