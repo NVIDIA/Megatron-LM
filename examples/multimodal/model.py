@@ -4,7 +4,12 @@ import warnings
 from copy import deepcopy
 
 import torch
-from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
+from config import (
+    get_language_model_config,
+    get_vision_model_config,
+    get_vision_projection_config,
+    is_hybrid_language_model_type,
+)
 from layer_specs import (
     get_hybrid_layer_spec_te,
     get_layer_spec,
@@ -132,9 +137,8 @@ def model_provider(
         padding = args.context_parallel_size > 1 and args.sequence_parallel
         if args.spec is not None:
             language_transformer_layer_spec = import_module(args.spec)
-        elif args.language_model_type.startswith(
-            ('nemotron5-hybrid', 'nemotron6-moe', 'nemotron6-super')
-        ):
+        # Resolve the same model-name aliases used by the configuration builders.
+        elif is_hybrid_language_model_type(args.language_model_type):
             language_transformer_layer_spec = get_hybrid_layer_spec_te(
                 config=language_config, padding=padding
             )

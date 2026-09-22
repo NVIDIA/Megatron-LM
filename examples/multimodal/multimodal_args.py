@@ -10,7 +10,16 @@ def add_multimodal_extra_args(parser):
     group.add_argument('--freeze-LM', action='store_true', default=False)
     group.add_argument('--freeze-ViT', action='store_true', default=False)
     group.add_argument('--freeze-sound-model', action='store_true', default=False)
-    group.add_argument('--language-model-type', type=str, required=True)
+    group.add_argument(
+        '--language-model-type',
+        type=str,
+        required=True,
+        help=(
+            "Language model configuration. Prefer nemotron2-* and nemotron3-* names; "
+            "legacy nemotron5-* and nemotron6-* names remain compatibility aliases. "
+            "This does not change --tokenizer-prompt-format names."
+        ),
+    )
     group.add_argument('--vision-model-type', type=str, default="clip")
     group.add_argument('--sound-model-type', type=str, default=None)
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)

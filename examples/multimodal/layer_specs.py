@@ -137,7 +137,7 @@ def get_hybrid_layer_spec_te(config=None, padding=False) -> ModuleSpec:
 
     Args:
         config: language-model ``TransformerConfig``. Required for MoE hybrids
-            (e.g. nemotron6-moe): the moe_layer branch reads
+            (e.g. nemotron3-moe, formerly nemotron6-moe): the moe_layer branch reads
             ``num_moe_experts`` / ``moe_grouped_gemm`` off it to match the
             checkpoint's architecture. Non-MoE hybrids may pass ``None``;
             they never traverse the moe_layer branch.
