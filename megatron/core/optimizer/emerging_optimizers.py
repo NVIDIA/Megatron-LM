@@ -805,7 +805,24 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         local_split_shapes = getattr(p, "qkv_split_shapes", None)
         heads_are_complete = getattr(p, "qkv_split_heads_are_complete", None)
         has_gtp_padding = int(getattr(p, "qkv_gtp_pad_length", 0)) > 0
-        use_local_layout = not has_gtp_padding and (
+        gtp_remat_group = self._get_gtp_remat_group(p)
+        gtp_rows_are_sharded = (
+            getattr(p, "is_gtp_weight_remat", False)
+            and gtp_remat_group is not None
+            and get_pg_size(gtp_remat_group) > 1
+        )
+        tp_rows_are_sharded = (
+            getattr(p, "partition_dim", None) == 0
+            and tp_group is not None
+            and get_pg_size(tp_group) > 1
+        )
+        # ``heads_are_complete`` is rank-local and may differ across a row-sharding
+        # group when head sizes are unequal. Never use it to decide collective
+        # participation: every rank in an active GTP/TP row-sharding group reconstructs
+        # the global layout, even ranks whose local shard happens to contain full heads.
+        use_local_layout = not (
+            has_gtp_padding or gtp_rows_are_sharded or tp_rows_are_sharded
+        ) and (
             heads_are_complete is True
             or (
                 heads_are_complete is None
