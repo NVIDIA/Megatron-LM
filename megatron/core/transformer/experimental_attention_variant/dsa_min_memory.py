@@ -45,14 +45,26 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_tri
     triton_teacher_scores_tile,
     triton_topk_index_block,
 )
+from megatron.core.utils import ensure_params_ready
 
 _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE = 64
 
 
 def _module_weight(module) -> torch.Tensor:
+    """Return a module's weight, ready to read.
+
+    These kernels consume the weight directly instead of calling the module, so the forward
+    pre-hook that publishes it never runs. Under a sharding backend that gathers parameters
+    asynchronously -- DDP with overlap_param_gather, FSDP -- ``weight.data`` would still be the
+    unpublished shard here, and reading it would be wrong and silent. The wait belongs on this
+    accessor rather than on its callers: a new call site would otherwise have to remember it, which
+    is the failure this guards against. Unmarked parameters carry no callback and no-op, and a
+    bucket that is already published returns on its own hot path, so repeat calls are cheap.
+    """
     weight = getattr(module, "weight", None)
     if weight is None:
         raise RuntimeError(f"{module.__class__.__name__} does not expose a weight tensor.")
+    ensure_params_ready([weight])
     return weight
 
 
