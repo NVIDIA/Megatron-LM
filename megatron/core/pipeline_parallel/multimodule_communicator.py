@@ -363,12 +363,17 @@ class MultiModulePipelineCommunicator:
                 self.rank_module_map[module_name] = rank_module_info
 
     def recv_forward(
-        self, tensor_shape: Optional[Shape] = None, is_first_stage: bool = False
+        self,
+        tensor_shape: Optional[Shape] = None,
+        is_first_stage: bool = False,
+        *,
+        microbatch_id: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive forward activation tensor.
 
         Args:
             tensor_shape: Expected activation tensor shape
+            microbatch_id: Optional telemetry ID for bridge communication.
 
         Returns:
             A dictionary mapping module names to tensors.
@@ -388,9 +393,13 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    received_tensor = bridge_comm.recv_forward(
-                        recv_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None)
-                    )
+                    recv_shape = self._next_bridge_recv_shapes.pop(bridge_comm, None)
+                    if microbatch_id is None:
+                        received_tensor = bridge_comm.recv_forward(recv_shape=recv_shape)
+                    else:
+                        received_tensor = bridge_comm.recv_forward(
+                            recv_shape=recv_shape, microbatch_id=microbatch_id
+                        )
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
@@ -436,20 +445,35 @@ class MultiModulePipelineCommunicator:
                     )
                 self._next_bridge_recv_shapes[bridge_comm] = shape
 
-    def send_forward(self, output_dict: Dict[str, torch.Tensor], is_last_stage: bool = False):
+    def send_forward(
+        self,
+        output_dict: Dict[str, torch.Tensor],
+        is_last_stage: bool = False,
+        *,
+        microbatch_id: Optional[int] = None,
+    ):
         """Send forward activation tensor.
 
         Args:
             output_dict: A dictionary mapping module names to tensors.
+            microbatch_id: Optional telemetry ID for bridge communication.
         """
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    bridge_comm.send_forward(
-                        output_dict[module_name], expect_backward=not self._schedule_forward_only
-                    )
+                    if microbatch_id is None:
+                        bridge_comm.send_forward(
+                            output_dict[module_name],
+                            expect_backward=not self._schedule_forward_only,
+                        )
+                    else:
+                        bridge_comm.send_forward(
+                            output_dict[module_name],
+                            expect_backward=not self._schedule_forward_only,
+                            microbatch_id=microbatch_id,
+                        )
             else:
                 # If not last stage, send forward activation by using P2P communicator.
                 tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name])
@@ -460,12 +484,17 @@ class MultiModulePipelineCommunicator:
         output_dict: Dict[str, torch.Tensor],
         tensor_shape: Optional[Shape] = None,
         is_last_stage: bool = False,
+        *,
+        forward_microbatch_id: Optional[int] = None,
+        backward_microbatch_id: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Send forward activation tensor and receive backward activation tensor.
 
         Args:
             output_dict: A dictionary mapping module names to tensors.
             tensor_shape: Expected gradient tensor shape
+            forward_microbatch_id: Optional telemetry ID for the forward bridge operation.
+            backward_microbatch_id: Optional telemetry ID for the backward bridge operation.
 
         Returns:
             A dictionary mapping module names to tensors.
@@ -476,7 +505,14 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad = bridge_comm.send_forward_recv_backward(output_dict[module_name])
+                    if forward_microbatch_id is None and backward_microbatch_id is None:
+                        grad = bridge_comm.send_forward_recv_backward(output_dict[module_name])
+                    else:
+                        grad = bridge_comm.send_forward_recv_backward(
+                            output_dict[module_name],
+                            forward_microbatch_id=forward_microbatch_id,
+                            backward_microbatch_id=backward_microbatch_id,
+                        )
                     grad_dict[bridge_comm.src_module_name] = grad
             else:
                 # If not last stage, send forward activation and receive backward gradient
@@ -493,12 +529,17 @@ class MultiModulePipelineCommunicator:
         grad_dict: Dict[str, torch.Tensor],
         tensor_shape: Optional[Shape] = None,
         is_first_stage: bool = False,
+        *,
+        forward_microbatch_id: Optional[int] = None,
+        backward_microbatch_id: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Send backward activation tensor and receive forward activation tensor.
 
         Args:
             grad_dict: A dictionary mapping module names to tensors.
             tensor_shape: Expected gradient tensor shape
+            forward_microbatch_id: Optional telemetry ID for the forward bridge operation.
+            backward_microbatch_id: Optional telemetry ID for the backward bridge operation.
 
         Returns:
             A dictionary mapping module names to tensors.
@@ -509,10 +550,18 @@ class MultiModulePipelineCommunicator:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
-                    received_tensor = bridge_comm.send_backward_recv_forward(
-                        grad_dict[bridge_comm.src_module_name],
-                        forward_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None),
-                    )
+                    forward_shape = self._next_bridge_recv_shapes.pop(bridge_comm, None)
+                    if forward_microbatch_id is None and backward_microbatch_id is None:
+                        received_tensor = bridge_comm.send_backward_recv_forward(
+                            grad_dict[bridge_comm.src_module_name], forward_shape=forward_shape
+                        )
+                    else:
+                        received_tensor = bridge_comm.send_backward_recv_forward(
+                            grad_dict[bridge_comm.src_module_name],
+                            forward_shape=forward_shape,
+                            forward_microbatch_id=forward_microbatch_id,
+                            backward_microbatch_id=backward_microbatch_id,
+                        )
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:
                 # If not first stage, send backward gradient and receive forward activation
@@ -525,12 +574,17 @@ class MultiModulePipelineCommunicator:
         return input_dict
 
     def recv_backward(
-        self, tensor_shape: Optional[Shape] = None, is_last_stage: bool = False
+        self,
+        tensor_shape: Optional[Shape] = None,
+        is_last_stage: bool = False,
+        *,
+        microbatch_id: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive backward activation tensor.
 
         Args:
             tensor_shape: Expected gradient tensor shape
+            microbatch_id: Optional telemetry ID for bridge communication.
 
         Returns:
             A dictionary mapping module names to tensors.
@@ -549,7 +603,10 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad = bridge_comm.recv_backward()
+                    if microbatch_id is None:
+                        grad = bridge_comm.recv_backward()
+                    else:
+                        grad = bridge_comm.recv_backward(microbatch_id=microbatch_id)
                     grad_dict[bridge_comm.src_module_name] = grad
             else:
                 # If not last stage, receive backward gradient by using P2P communicator.
@@ -559,18 +616,30 @@ class MultiModulePipelineCommunicator:
                 grad_dict[module_name] = _restore_tensor_from_comm(grad)
         return grad_dict
 
-    def send_backward(self, grad_dict: Dict[str, torch.Tensor], is_first_stage: bool = False):
+    def send_backward(
+        self,
+        grad_dict: Dict[str, torch.Tensor],
+        is_first_stage: bool = False,
+        *,
+        microbatch_id: Optional[int] = None,
+    ):
         """Send backward activation tensor.
 
         Args:
             grad_dict: A dictionary mapping module names to tensors.
+            microbatch_id: Optional telemetry ID for bridge communication.
         """
         for module_name, rank_module_info in self.rank_module_map.items():
             if rank_module_info.pp_rank == 0:
                 # If first stage, and has incoming modules, send backward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
+                    if microbatch_id is None:
+                        bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
+                    else:
+                        bridge_comm.send_backward(
+                            grad_dict[bridge_comm.src_module_name], microbatch_id=microbatch_id
+                        )
             else:
                 # If not first stage, send backward activation by using P2P communicator.
                 grad_to_send = _prepare_tensor_for_comm(grad_dict[module_name])

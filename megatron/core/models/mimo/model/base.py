@@ -2,9 +2,19 @@
 
 import logging
 from contextlib import ExitStack, contextmanager
+from functools import wraps
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+    from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+    from megatron.core.telemetry.fallbacks import safe_set_span_attributes as _otel_safe_set_attrs
+    from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
 
 from megatron.core._rank_utils import warn_single_rank
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -24,6 +34,32 @@ from megatron.core.utils import make_viewless_tensor, unwrap_model
 logger = logging.getLogger(__name__)
 
 _LANGUAGE_INPUT_PROJECTIONS_ATTR = "mimo_input_projections"
+
+
+def _trace_mimo_tensor_operation(name):
+    """Trace a tensor-returning MIMO operation and attach output metadata."""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _otel_sg_enabled('microbatch'):
+                return func(*args, **kwargs)
+
+            with _otel_managed_span('microbatch', name) as span:
+                output = func(*args, **kwargs)
+                if torch.is_tensor(output):
+                    _otel_safe_set_attrs(
+                        span,
+                        {
+                            'megatron.mimo.output.shape': list(output.shape),
+                            'megatron.mimo.output.dtype': str(output.dtype),
+                        },
+                    )
+                return output
+
+        return wrapped
+
+    return decorator
 
 
 class MimoModel(MegatronModule):
@@ -212,6 +248,7 @@ class MimoModel(MegatronModule):
                 f"got {total_indices}"
             )
 
+    @_trace_mimo_tensor_operation('megatron.mimo.embedding.fuse')
     def align_embeddings_by_token_positions(
         self,
         modality_embeddings: Dict[str, torch.Tensor],  # [num_embeddings, hidden_dim]
@@ -484,6 +521,7 @@ class MimoModel(MegatronModule):
         for module in self._active_submodules():
             module.zero_grad_buffer()
 
+    @_trace_mimo_tensor_operation('megatron.mimo.embedding.text')
     def get_text_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -783,12 +821,48 @@ class MimoModel(MegatronModule):
         if self.partition_adapter is None:
             return embeddings, labels, loss_mask, packed_seq_params
 
-        return self.partition_adapter.shard(
-            embeddings=embeddings,
-            labels=labels,
-            loss_mask=loss_mask,
-            packed_seq_params=packed_seq_params,
-        )
+        if not _otel_sg_enabled('microbatch'):
+            return self.partition_adapter.shard(
+                embeddings=embeddings,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+
+        cfg = self.partition_adapter.cfg
+        does_partition_work = (
+            cfg.use_cp and any(value is not None for value in (embeddings, labels, loss_mask))
+        ) or (cfg.seq_parallel and embeddings is not None)
+        if not does_partition_work:
+            return self.partition_adapter.shard(
+                embeddings=embeddings,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+
+        attributes = {'megatron.mimo.input.packed': packed_seq_params is not None}
+        if embeddings is not None:
+            attributes['megatron.mimo.input.shape'] = list(embeddings.shape)
+        with _otel_managed_span(
+            'microbatch', 'megatron.mimo.input.partition', **attributes
+        ) as span:
+            outputs = self.partition_adapter.shard(
+                embeddings=embeddings,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+            sharded_embeddings = outputs[0]
+            if torch.is_tensor(sharded_embeddings):
+                _otel_safe_set_attrs(
+                    span,
+                    {
+                        'megatron.mimo.output.shape': list(sharded_embeddings.shape),
+                        'megatron.mimo.output.dtype': str(sharded_embeddings.dtype),
+                    },
+                )
+            return outputs
 
     def _language_model_owns_mtp(self) -> bool:
         """Return whether this rank executes the language model's MTP block."""
@@ -876,6 +950,58 @@ class MimoModel(MegatronModule):
 
         return mtp_input_ids, local_position_ids, mtp_input_mask
 
+    def _run_language_projection(
+        self, name: str, tensor: torch.Tensor, input_projections: torch.nn.ModuleDict
+    ) -> torch.Tensor:
+        """Run a language-owned modality projection with optional tracing."""
+        if not _otel_sg_enabled('microbatch'):
+            return input_projections[name](tensor)
+
+        with _otel_managed_span(
+            'microbatch',
+            'megatron.mimo.projection.forward',
+            **{
+                'megatron.mimo.module.name': name,
+                'megatron.mimo.projection.placement': 'language',
+                'megatron.mimo.projection.direction': 'input',
+                'megatron.mimo.input.shape': list(tensor.shape),
+                'megatron.mimo.input.dtype': str(tensor.dtype),
+            },
+        ) as span:
+            output = input_projections[name](tensor)
+            _otel_safe_set_attrs(
+                span,
+                {
+                    'megatron.mimo.output.shape': list(output.shape),
+                    'megatron.mimo.output.dtype': str(output.dtype),
+                },
+            )
+            return output
+
+    def _run_language_model(self, *, first_stage: bool, last_stage: bool, **kwargs):
+        """Run language-model compute with pipeline-stage metadata."""
+        if not _otel_sg_enabled('microbatch'):
+            return self.language_model(**kwargs)
+
+        with _otel_managed_span(
+            'microbatch',
+            'megatron.mimo.language.forward',
+            **{
+                'megatron.mimo.language.first_pipeline_stage': first_stage,
+                'megatron.mimo.language.last_pipeline_stage': last_stage,
+            },
+        ) as span:
+            output = self.language_model(**kwargs)
+            if torch.is_tensor(output):
+                _otel_safe_set_attrs(
+                    span,
+                    {
+                        'megatron.mimo.output.shape': list(output.shape),
+                        'megatron.mimo.output.dtype': str(output.dtype),
+                    },
+                )
+            return output
+
     def _forward_language_module(
         self,
         input_ids: torch.Tensor,
@@ -937,7 +1063,7 @@ class MimoModel(MegatronModule):
                 for name, tensor in input_tensors.items():
                     if name != lang_name:
                         if name in input_projections:
-                            tensor = input_projections[name](tensor)
+                            tensor = self._run_language_projection(name, tensor, input_projections)
                         modality_embeddings[name] = tensor
 
             # Get text embeddings
@@ -972,7 +1098,9 @@ class MimoModel(MegatronModule):
                 text_token_indices=(modality_token_indices or {}).get("text"),
             )
 
-            lm_output = self.language_model(
+            lm_output = self._run_language_model(
+                first_stage=True,
+                last_stage=self.role.is_last_stage(lang_name),
                 # decoder_input replaces the main embedding lookup, but MTP still
                 # needs token IDs to construct its shifted-token embeddings.
                 input_ids=mtp_input_ids,
@@ -1010,7 +1138,9 @@ class MimoModel(MegatronModule):
                 if hasattr(underlying_lm, 'set_input_tensor'):
                     underlying_lm.set_input_tensor(hidden_states)
 
-            lm_output = self.language_model(
+            lm_output = self._run_language_model(
+                first_stage=False,
+                last_stage=self.role.is_last_stage(lang_name),
                 # Hidden states arrive via set_input_tensor; position_ids is
                 # still consumed by mRoPE on non-first PP stages.
                 input_ids=mtp_input_ids,
@@ -1147,7 +1277,9 @@ class MimoModel(MegatronModule):
         )
 
         # 5. Forward pass through language model
-        lm_output = self.language_model(
+        lm_output = self._run_language_model(
+            first_stage=self.role.is_first_stage(MIMO_LANGUAGE_MODULE_KEY),
+            last_stage=self.role.is_last_stage(MIMO_LANGUAGE_MODULE_KEY),
             # decoder_input replaces the main embedding lookup, but MTP still
             # needs token IDs to construct its shifted-token embeddings.
             input_ids=mtp_input_ids,

@@ -7,6 +7,15 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+    from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+    from megatron.core.telemetry.fallbacks import safe_set_span_attributes as _otel_safe_set_attrs
+    from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
+
 from megatron.core._rank_utils import warn_single_rank
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -212,6 +221,17 @@ class ModalitySubmodules(ABC, nn.Module):
         logger.debug(f"Combined embeddings shape after concatenation: {combined.shape}")
         return combined
 
+    @staticmethod
+    def _primary_encoder_output(encoder_outputs):
+        """Return the primary tensor from an encoder result."""
+        if (
+            isinstance(encoder_outputs, tuple)
+            and encoder_outputs
+            and torch.is_tensor(encoder_outputs[0])
+        ):
+            return encoder_outputs[0]
+        return encoder_outputs
+
     def encode(self, encoders_data_batch: Dict) -> List[torch.Tensor]:
         """Encode data batch into a list of tensors.
 
@@ -233,16 +253,39 @@ class ModalitySubmodules(ABC, nn.Module):
                 raise ValueError(f"No inputs found for encoder '{name}'")
 
             encoder_inputs = encoders_data_batch[name]
-            encoder_outputs = encoder(**encoder_inputs)
-            # Some encoders return (embeddings, aux_state). MIMO consumes the
-            # primary embedding tensor here; model-specific aux handling should
-            # live in a modality-specific submodule.
-            if (
-                isinstance(encoder_outputs, tuple)
-                and encoder_outputs
-                and torch.is_tensor(encoder_outputs[0])
-            ):
-                encoder_outputs = encoder_outputs[0]
+            if not _otel_sg_enabled('microbatch'):
+                encoder_outputs = self._primary_encoder_output(encoder(**encoder_inputs))
+            else:
+                frozen_cache = self.__dict__.setdefault('_telemetry_encoder_frozen', {})
+                if name not in frozen_cache:
+                    frozen_cache[name] = not any(
+                        parameter.requires_grad for parameter in encoder.parameters()
+                    )
+                primary_input = next(
+                    (value for value in encoder_inputs.values() if torch.is_tensor(value)), None
+                )
+                attributes = {
+                    'megatron.mimo.encoder.name': name,
+                    'megatron.mimo.encoder.frozen': frozen_cache[name],
+                }
+                if primary_input is not None:
+                    attributes.update(
+                        {
+                            'megatron.mimo.input.shape': list(primary_input.shape),
+                            'megatron.mimo.input.dtype': str(primary_input.dtype),
+                        }
+                    )
+                with _otel_managed_span(
+                    'microbatch', 'megatron.mimo.encoder.forward', **attributes
+                ) as span:
+                    encoder_outputs = self._primary_encoder_output(encoder(**encoder_inputs))
+                    _otel_safe_set_attrs(
+                        span,
+                        {
+                            'megatron.mimo.output.shape': list(encoder_outputs.shape),
+                            'megatron.mimo.output.dtype': str(encoder_outputs.dtype),
+                        },
+                    )
             logger.debug(f"Encoder '{name}' output shape: {encoder_outputs.shape}")
 
             if encoder_outputs.ndim == 3:
@@ -292,7 +335,27 @@ class ModalitySubmodules(ABC, nn.Module):
 
         if projections:
             projection = projections[0]
-            projected = projection(combined)
+            if not _otel_sg_enabled('microbatch'):
+                projected = projection(combined)
+            else:
+                with _otel_managed_span(
+                    'microbatch',
+                    'megatron.mimo.projection.forward',
+                    **{
+                        'megatron.mimo.projection.placement': 'encoder',
+                        'megatron.mimo.projection.direction': 'input' if is_input else 'output',
+                        'megatron.mimo.input.shape': list(combined.shape),
+                        'megatron.mimo.input.dtype': str(combined.dtype),
+                    },
+                ) as span:
+                    projected = projection(combined)
+                    _otel_safe_set_attrs(
+                        span,
+                        {
+                            'megatron.mimo.output.shape': list(projected.shape),
+                            'megatron.mimo.output.dtype': str(projected.dtype),
+                        },
+                    )
             logger.debug(f"Post-projection embeddings shape: {projected.shape}")
             return projected
 

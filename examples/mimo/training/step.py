@@ -7,12 +7,18 @@ from __future__ import annotations
 from contextlib import nullcontext
 from functools import partial
 
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
 import torch
 
 from examples.mimo.training.batch import move_batch_to_cuda
 from examples.mimo.training.encoder_prefetch import PREFETCHED_FEATURES_KEY, PROJECTION_TIMER_KEY
 
 
+@_otel_trace_fn('microbatch', 'megatron.mimo.loss')
 def loss_func(output_tensor: torch.Tensor, *, loss_mask: torch.Tensor):
     """Return summed per-token loss, integer local token count, and logging tensors."""
     if not isinstance(output_tensor, torch.Tensor):
