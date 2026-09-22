@@ -65,6 +65,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     output of the same size.
     """
 
+    #: Whether this layer class owns a wide-residual connection around its mixer.
+    supports_wide_residual_connections: bool = False
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -80,6 +83,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config)
+        if config.wide_residual is not None and not self.supports_wide_residual_connections:
+            raise ValueError(
+                f"{type(self).__name__} does not implement wide-residual streams. Build the "
+                "hybrid stack with WideResidualMambaLayer when wide_residual is configured."
+            )
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
         self.tp_group = pg_collection.tp
 
@@ -195,6 +203,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
         return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
+    def _get_residual_connection(self):
+        """Return an optional architecture-owned connection around the Mamba mixer."""
+
+        return None
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -235,10 +248,29 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
+            residual_connection = self._get_residual_connection()
+            connection_state = None
+            if residual_connection is not None:
+                hidden_states, connection_state = apply_module(residual_connection)(
+                    hidden_states,
+                    operation="read",
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                )
+                residual = residual_connection.residual_stream(connection_state)
+            else:
+                residual = hidden_states
+
+            if residual_connection is None:
+                hidden_states, residual = self._prepare_mixer_input(hidden_states)
+            else:
+                # Wide connections may carry an FP32 stream, while mixer computation remains in
+                # parameter precision.
+                hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+                hidden_states = apply_module(self.norm)(hidden_states)
+
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
-            hidden_states, residual = self._prepare_mixer_input(hidden_states)
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
                 if packed_sequence_cp_metadata is None:
                     mixer_out_with_bias = self.mixer(
@@ -253,7 +285,22 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                         packed_seq_params=packed_seq_params,
                         packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                     )
-            return self._apply_mixer_bda(mixer_out_with_bias, residual)
+
+            if residual_connection is not None:
+                if connection_state is None:
+                    raise RuntimeError("Missing state for the Mamba residual connection.")
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = apply_module(residual_connection)(
+                        mixer_out_with_bias,
+                        operation="write",
+                        state=connection_state,
+                        dropout_probability=self.hidden_dropout,
+                        training=self.training,
+                    )
+            else:
+                hidden_states = self._apply_mixer_bda(mixer_out_with_bias, residual)
+
+            return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
