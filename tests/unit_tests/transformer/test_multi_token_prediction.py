@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import sys
@@ -28,6 +28,7 @@ from megatron.core.transformer.multi_token_prediction import (
     ContiguousPackedCPRollContext,
     ContiguousPackedCPRollHalos,
     ContiguousPackedSeqRollPlan,
+    MTPLossAutoScaler,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     MultiTokenPredictionLayer,
@@ -506,6 +507,101 @@ class TestMultiTokenPredictionLayer:
             assert weight_to_check.grad is None
         else:
             assert weight_to_check.grad is not None
+
+    @pytest.mark.parametrize("cp", [1, 2])
+    @pytest.mark.parametrize("empty_mask", [False, True])
+    def test_process_mtp_loss_per_token_gradient(self, monkeypatch, cp, empty_mask):
+        """DP/CP shards must match the unpartitioned microbatch MTP objective."""
+        Utils.initialize_model_parallel(context_parallel_size=cp)
+        groups = ProcessGroupCollection.use_mpu_process_groups(["cp", "dp", "dp_cp"])
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=4,
+            num_attention_heads=2,
+            mtp_num_layers=2,
+            calculate_per_token_loss=True,
+            context_parallel_size=cp,
+        )
+        monkeypatch.setattr(
+            MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0, device="cuda")
+        )
+        torch.manual_seed(_SEED)
+        seq_length, vocab_size = 8, 3
+        # Keep the same logical microbatch when changing CP: each DP rank owns
+        # cp samples, and CP partitions each sample in the usual zigzag layout.
+        num_samples = groups.dp_cp.size()
+        samples = slice(groups.dp.rank() * cp, (groups.dp.rank() + 1) * cp)
+        indices = torch.arange(seq_length, device="cuda").reshape(2 * cp, -1)
+        indices = indices[[groups.cp.rank(), 2 * cp - groups.cp.rank() - 1]].flatten()
+        weight = torch.randn(vocab_size, config.hidden_size, device="cuda", dtype=torch.float64)
+        weight.requires_grad_()
+        reference_weight = weight.detach().clone().requires_grad_()
+        total_main_tokens = torch.zeros((), device="cuda", dtype=torch.float64)
+        reference_loss = 0.0
+
+        def output_layer(hidden, weight, runtime_gather_output):
+            return hidden @ weight.t(), None
+
+        def loss_func(labels, logits):
+            return torch.nn.functional.cross_entropy(
+                logits.transpose(0, 1).reshape(-1, vocab_size), labels.reshape(-1), reduction="none"
+            ).view_as(labels)
+
+        for microbatch in range(2):
+            features = torch.randn(
+                config.mtp_num_layers,
+                seq_length,
+                num_samples,
+                config.hidden_size,
+                device="cuda",
+                dtype=torch.float64,
+            )
+            labels = torch.arange(num_samples * seq_length, device="cuda")
+            labels = labels.reshape(num_samples, seq_length) % vocab_size
+            valid_lengths = (torch.arange(num_samples, device="cuda") * 3 + 2 * microbatch) % 8
+            mask = (torch.arange(seq_length, device="cuda") < valid_lengths[:, None]).double()
+            if empty_mask:
+                mask.zero_()
+            main_tokens = mask.sum()
+            total_main_tokens += main_tokens
+            local_features = features[:, indices, samples, :]
+            hidden_states = torch.cat(
+                [torch.zeros_like(local_features[0]), *local_features], dim=0
+            ).requires_grad_()
+            output = process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels[samples][:, indices],
+                loss_mask=mask[samples][:, indices],
+                output_layer=output_layer,
+                output_weight=weight,
+                runtime_gather_output=None,
+                is_training=False,
+                compute_language_model_loss=loss_func,
+                config=config,
+                cp_group=groups.cp,
+                # Exercise both explicit groups and the standalone compatibility path.
+                dp_cp_group=groups.dp_cp if cp > 1 else None,
+            )
+            output.sum().backward()
+
+            for depth in range(config.mtp_num_layers):
+                shift = depth + 1
+                shifted_labels = torch.nn.functional.pad(labels[:, shift:], (0, shift))
+                shifted_mask = torch.nn.functional.pad(mask[:, shift:], (0, shift))
+                loss = loss_func(shifted_labels, features[depth] @ reference_weight.t())
+                reference_loss = reference_loss + (
+                    config.mtp_loss_scaling_factor
+                    / config.mtp_num_layers
+                    * (loss * shifted_mask).sum()
+                    * main_tokens
+                    / shifted_mask.sum().clamp(min=1)
+                )
+
+        # Match DDP SUM followed by finalize_model_grads' accumulated main count.
+        torch.distributed.all_reduce(weight.grad, group=groups.dp_cp)
+        weight.grad.div_(total_main_tokens.clamp(min=1))
+        (reference_loss / total_main_tokens.clamp(min=1)).backward()
+        torch.testing.assert_close(weight.grad, reference_weight.grad, rtol=1e-10, atol=1e-10)
 
 
 class TestMultiTokenPrediction:
