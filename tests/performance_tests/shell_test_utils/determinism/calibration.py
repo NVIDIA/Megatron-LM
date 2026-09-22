@@ -216,8 +216,10 @@ def markdown_report(report: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     """Compare explicitly pinned bundles and retain JSON plus a reviewable table."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--baseline", nargs=2, action="append", required=True, metavar=("PATH", "SHA256")
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--baseline", nargs=2, action="append", metavar=("PATH", "SHA256"))
+    selection.add_argument(
+        "--collective-baseline", nargs=2, action="append", metavar=("PATH", "SHA256")
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -233,17 +235,28 @@ def main(argv: list[str] | None = None) -> int:
             or args.output.with_suffix(".md").exists()
         ):
             raise ValueError("Use a new .json output path and preserve earlier reports")
-        report = compare(
-            [(Path(path), identity) for path, identity in args.baseline],
+        compare_runs, render = compare, markdown_report
+        if args.collective_baseline:
+            import collective_calibration
+
+            compare_runs, render = (
+                collective_calibration.compare,
+                collective_calibration.markdown_report,
+            )
+        report = compare_runs(
+            [
+                (Path(path), identity)
+                for path, identity in (args.collective_baseline or args.baseline)
+            ],
             compare_cache_locations=args.compare_cache_locations,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-        args.output.with_suffix(".md").write_text(markdown_report(report))
+        args.output.with_suffix(".md").write_text(render(report))
     except (OSError, AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
         print(json.dumps({"status": "invalid", "error": str(error)}))
         return 1
-    print(markdown_report(report))
+    print(render(report))
     return 0
 
 
