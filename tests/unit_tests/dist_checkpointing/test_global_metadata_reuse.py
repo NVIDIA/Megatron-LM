@@ -7,7 +7,6 @@ import pytest
 
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config import ProfilingConfig
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -59,7 +58,6 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     save_ckpt_context,
-                    profiling=ProfilingConfig(),
                 )
 
                 assert reduce_scatter_mock.call_count == 0
@@ -88,7 +86,6 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     resume_ckpt_context,
-                    profiling=ProfilingConfig(),
                 )
                 assert reduce_scatter_mock.call_count == 0
 
@@ -139,7 +136,6 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     save_ckpt_context,
-                    profiling=ProfilingConfig(),
                 )
 
                 assert reduce_scatter_mock.call_count == 0
@@ -176,7 +172,6 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     resume_ckpt_context,
-                    profiling=ProfilingConfig(),
                 )
                 assert reduce_scatter_mock.call_count == 0
 

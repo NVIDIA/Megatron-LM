@@ -137,18 +137,18 @@ class MegatronCheckpointSaverBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
-            from megatron.training.global_vars import set_global_variables, get_args
+            from megatron.training.global_vars import set_global_variables, get_args, set_run_config
+            from megatron.training.argument_utils import inference_cfg_container_from_args
             from megatron.core import mpu
-            from megatron.training.argument_utils import profiling_config_from_args
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        set_run_config(inference_cfg_container_from_args(self.margs, build_model_config=False))
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
-        self.profiling = profiling_config_from_args(self.margs)
 
         if hasattr(self.md, 'consumed_train_samples'):
             self.margs.consumed_train_samples = self.md.consumed_train_samples
@@ -360,7 +360,7 @@ class MegatronCheckpointSaverBase:
                     save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
-                        tensor_rank=tp_rank, profiling=self.profiling)
+                        tensor_rank=tp_rank)
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 

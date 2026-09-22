@@ -22,12 +22,13 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config import ProfilingConfig
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
     set_args,
     set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import (
     force_param_sync,
@@ -170,6 +171,7 @@ class TestFP8Param:
 
         validate_args(args)
         set_global_variables(args, False)
+        set_run_config(pretrain_cfg_container_from_args(args))
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -294,7 +296,6 @@ class TestFP8Param:
                 self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
-                profiling=cfg_container.profiling,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
@@ -737,7 +738,6 @@ class TestFP8Param:
             self.model_provider,
             cfg_container=cfg_container,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-            profiling=cfg_container.profiling,
         )
         assert len(model) == 1
         return args, model, optimizer, opt_param_scheduler
@@ -840,9 +840,7 @@ class TestFP8Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
-            save_checkpoint(
-                3, model, optimizer, opt_param_scheduler, 0, profiling=ProfilingConfig()
-            )
+            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
             self.cleanup_between_runs()

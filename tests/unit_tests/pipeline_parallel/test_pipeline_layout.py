@@ -24,13 +24,14 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
 )
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 
 def initialize_gpt_model(
@@ -290,12 +291,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         args.save = ckpt_dir
         args.load = ckpt_dir
         save_checkpoint(
-            iteration,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            profiling=ProfilingConfig(),
+            iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
         print(f"save checkpoint done")
 

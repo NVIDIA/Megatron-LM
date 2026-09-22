@@ -20,7 +20,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.models.common import (
@@ -364,7 +363,6 @@ def test_save_and_load_checkpoint_vpp(
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
-                profiling=ProfilingConfig(),
             )
 
             expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
@@ -393,7 +391,6 @@ def test_save_and_load_checkpoint_vpp(
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
-                profiling=ProfilingConfig(),
             )
 
             set_tp_pp_vpp(1, 1)

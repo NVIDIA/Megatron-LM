@@ -61,8 +61,8 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training.argument_utils import _default_config_from_args
-from megatron.training.config import ProfilingConfig, TokenizerConfig
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.config import TokenizerConfig
+from megatron.training.global_vars import get_run_config, get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -653,8 +653,6 @@ def save_checkpoint(
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    *,
-    profiling: ProfilingConfig,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -834,7 +832,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                checkpoint_args_snapshot(args, profiling=profiling),
+                checkpoint_args_snapshot(args),
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1638,13 +1636,14 @@ def maybe_save_dataloader_state(
     torch.save(dataloader_save_dict, data_state_save_path)
 
 
-def checkpoint_args_snapshot(args: Namespace, *, profiling: ProfilingConfig) -> Namespace:
+def checkpoint_args_snapshot(args: Namespace) -> Namespace:
     """Project config-owned settings into a separate legacy checkpoint snapshot.
 
     Profiling settings describe the saving run, but are not restored by
     load_args_from_checkpoint: the resumed run keeps its own profiling policy.
     Never update live args or retain mutable config fields in an async save.
     """
+    profiling = get_run_config().profiling
     snapshot = copy.copy(args)
     for config_field in dataclasses.fields(profiling):
         name = "profile" if config_field.name == "use_nsys_profiler" else config_field.name

@@ -585,6 +585,6 @@ if __name__ == "__main__":
         train_valid_test_sft_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, modelopt_gpt_hybrid_builder, profiling=full_config.profiling),
+        partial(model_provider, modelopt_gpt_hybrid_builder),
         non_loss_data_func=non_loss_data_func,
     )

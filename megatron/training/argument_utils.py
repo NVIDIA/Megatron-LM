@@ -670,7 +670,7 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
 
 
 def inference_cfg_container_from_args(
-    args: Namespace, model_cfg=None
+    args: Namespace, model_cfg=None, *, build_model_config: bool = True
 ) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
@@ -683,8 +683,10 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
+        build_model_config: If False, retain model_cfg (including None) for legacy callers
+            that still construct the model through a model provider.
     """
-    if model_cfg is None:
+    if model_cfg is None and build_model_config:
         if getattr(args, "hybrid_layer_pattern", None) is not None:
             model_cfg = hybrid_config_from_args(args)
         else:

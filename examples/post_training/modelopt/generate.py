@@ -19,10 +19,10 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args, get_model, initialize_megatron
-from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -81,7 +81,7 @@ if __name__ == "__main__":
             'no_load_rng': True,
             'no_load_optim': True,
         })
-    profiling = profiling_config_from_args(args)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()
 
@@ -103,10 +103,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder, profiling=profiling),
-        wrap_with_ddp=False,
-    )
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]

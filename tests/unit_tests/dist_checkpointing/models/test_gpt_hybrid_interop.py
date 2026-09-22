@@ -54,7 +54,6 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     save_checkpoint,
 )
-from megatron.training.config import ProfilingConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
@@ -688,7 +687,7 @@ def _run_gpt_to_hybrid_optimizer_load(
             _seed_optimizer_moments(gpt_optimizer, seed=3)
             _configure_checkpoint_args(mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp)
             mock_args.num_layers = num_gpt_layers
-            save_checkpoint(10, gpt_model, gpt_optimizer, None, 0, profiling=ProfilingConfig())
+            save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
             Utils.destroy_model_parallel()
 
             # Build a hybrid model + optimizer (independently seeded moments) and

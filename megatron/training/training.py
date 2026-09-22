@@ -22,6 +22,7 @@ import sys
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 # Third-party.
@@ -130,6 +131,7 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
+    configure_nvtx_profiling,
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -151,7 +153,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import FaultInjectorConfig, ProfilingConfig
+from megatron.training.config import FaultInjectorConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -165,7 +167,6 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
-from megatron.training.profiling import TrainingProfiler
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -190,6 +191,8 @@ from .global_vars import (
     get_tensorboard_writer,
     get_timers,
     get_wandb_writer,
+    get_run_config,
+    set_run_config,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1644,6 +1647,7 @@ def pretrain(
     timestamp_after_initialize_megatron = time.time()
 
     args = get_args()
+    set_run_config(cfg_container)
     timers = get_timers()
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
@@ -1919,7 +1923,6 @@ def pretrain(
                 if pg_collection is not None
                 else ProcessGroupCollection.use_mpu_process_groups()
             ),
-            profiling=cfg_container.profiling,
         )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -2136,7 +2139,6 @@ def pretrain(
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
                     callback_manager=callback_manager,
-                    profiling=cfg_container.profiling,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2160,8 +2162,7 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
-                profiling=cfg_container.profiling,
+                train_data_iterator=train_data_iterator
             )
 
         one_logger and one_logger.log_metrics(
@@ -2843,7 +2844,6 @@ def setup_model_and_optimizer(
     *,
     cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
-    profiling: ProfilingConfig,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2864,7 +2864,7 @@ def setup_model_and_optimizer(
         if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
             from megatron.training.utils import start_memory_history_recording
 
-            start_memory_history_recording(profiling)
+            start_memory_history_recording(cfg_container.profiling)
 
             cfg = cfg_container
             model_config = cfg.model
@@ -3025,12 +3025,7 @@ def setup_model_and_optimizer(
         )
         args.iteration = 1
         save_checkpoint(
-            args.iteration,
-            model,
-            None,
-            None,
-            args.num_floating_point_operations_so_far,
-            profiling=profiling,
+            args.iteration, model, None, None, args.num_floating_point_operations_so_far
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -3134,7 +3129,6 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             args.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
-            profiling=profiling,
         )
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
@@ -3618,12 +3612,11 @@ def training_log(
     model=None,
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
-    *,
-    profiling: ProfilingConfig,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    profiling = get_run_config().profiling
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -3907,12 +3900,8 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        should_prof_rank = (
-            profiling.profile_ranks == [] or safe_get_rank() in profiling.profile_ranks
-        )  # [] is all ranks
-        if profiling.record_memory_history and (
-            should_prof_rank or torch.distributed.get_backend() == 'fake'
-        ):
+        should_prof_rank = (profiling.profile_ranks == [] or safe_get_rank() in profiling.profile_ranks)  # [] is all ranks
+        if profiling.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
             rank = safe_get_rank()
             base, ext = os.path.splitext(profiling.memory_snapshot_path)
             snapshot_filename = f"{base}_{rank}{ext}"
@@ -4205,8 +4194,6 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
-    *,
-    profiling: ProfilingConfig,
 ):
     args = get_args()
     timers = get_timers()
@@ -4294,7 +4281,6 @@ def save_checkpoint_and_time(
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
                 cp_group=cp_group,
-                profiling=profiling,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -4372,11 +4358,13 @@ def post_training_step_callbacks(
     optimizer,
     opt_param_scheduler,
     iteration,
-    profiler: TrainingProfiler,
+    prof,
     num_floating_point_operations_since_last_log_event,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
+    profiling = get_run_config().profiling
 
     # Bring CPU and GPU back in sync if on right iteration.
     if args.train_sync_interval and iteration % args.train_sync_interval == 0:
@@ -4405,11 +4393,27 @@ def post_training_step_callbacks(
 
     # Autoresume.
     if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
-        check_adlr_autoresume_termination(
-            iteration, model, optimizer, opt_param_scheduler, profiling=profiler.config
-        )
+        check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
 
-    profiler.stop(iteration)
+    # Profiling.
+    if (
+        profiling.use_nsys_profiler
+        and iteration == profiling.profile_step_end
+        and (len(profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in profiling.profile_ranks)
+    ):
+        # Disable NVTX range when profiling ends.
+        if profiling.nvtx_ranges:
+            configure_nvtx_profiling(False)
+        if profiling.use_pytorch_profiler:
+            assert prof is not None
+            prof.stop()
+            if prof.execution_trace_observer is not None:
+                prof.execution_trace_observer.unregister_callback()
+        else:
+            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            if nsys_nvtx_context is not None:
+                nsys_nvtx_context.__exit__(None, None, None)
 
     # GPU sniff test.
     if (
@@ -4438,8 +4442,6 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
-    *,
-    profiling: ProfilingConfig,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -4461,7 +4463,6 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
-                    profiling=profiling,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -4477,7 +4478,6 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
-            profiling=profiling,
         )
         saved_checkpoint = True
 
@@ -4495,7 +4495,6 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
-            profiling=profiling,
         )
         saved_checkpoint = True
 
@@ -4521,7 +4520,6 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
-                    profiling=profiling,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -4544,7 +4542,6 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
-                profiling=profiling,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -4568,8 +4565,6 @@ def train(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     callback_manager: CallbackManager | None = None,
-    *,
-    profiling: ProfilingConfig,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4580,6 +4575,7 @@ def train(
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    profiling = get_run_config().profiling
     timers = get_timers()
 
     fault_injector_kwargs = {}
@@ -4886,10 +4882,38 @@ def train(
         with one_logger.get_context_manager():
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
-    profiler = TrainingProfiler(
-        profiling, rank=torch.distributed.get_rank(), tensorboard_dir=args.tensorboard_dir
-    )
-    profiler.start()
+    prof = None
+    nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
+    if (
+        profiling.use_nsys_profiler
+        and (len(profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in profiling.profile_ranks)
+        and profiling.use_pytorch_profiler
+    ):
+        profiling.validate()
+        if profiling.pytorch_profiler_collect_chakra:
+            et_dir = Path(f"{args.tensorboard_dir}/../chakra")
+            et_dir.mkdir(parents=True, exist_ok=True)
+            et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+        else:
+            et = None
+        def trace_handler(p):
+            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+        prof = torch.profiler.profile(
+            schedule=torch.profiler.schedule(
+                wait=max(profiling.profile_step_start - 1, 0),
+                warmup=1 if profiling.profile_step_start > 0 else 0,
+                active=profiling.profile_step_end - profiling.profile_step_start,
+                repeat=1,
+            ),
+            on_trace_ready=trace_handler,
+            record_shapes=profiling.pytorch_profiler_collect_shapes,
+            with_stack=profiling.pytorch_profiler_collect_callstack,
+            execution_trace_observer=et,
+        )
+        prof.start()
 
     start_iteration = iteration
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
@@ -4948,7 +4972,19 @@ def train(
         # trace instead of accreting into a run-long one. Must be the first thing in
         # the pass so everything below nests under the current interval root.
         _maybe_reroot_otel_interval()
-        profiler.step(iteration)
+        if (profiling.use_nsys_profiler
+            and (len(profiling.profile_ranks) == 0 or
+                 torch.distributed.get_rank() in profiling.profile_ranks)):
+            # Enable NVTX range when profiling starts and nvtx_ranges is set.
+            if iteration == profiling.profile_step_start and profiling.nvtx_ranges:
+                configure_nvtx_profiling(True)
+            if profiling.use_pytorch_profiler:
+                prof.step()
+            elif iteration == profiling.profile_step_start:
+                torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
+                if profiling.record_shapes:
+                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=profiling.record_shapes)
+                    nsys_nvtx_context.__enter__()
 
         # Fault-tolerance heartbeat at the top of the loop -- uninstrumented
         # main-thread work that sits in the post-checkpoint gap alongside the
@@ -5003,7 +5039,6 @@ def train(
                         num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
-                        profiling=profiling,
                     )
                     print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
                                  "exiting so the run can be relaunched at the new batch size.")
@@ -5153,7 +5188,6 @@ def train(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
-                profiling=profiling,
             )
         if should_exit:
             break
@@ -5317,7 +5351,6 @@ def train(
                     model=model,
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
-                    profiling=profiling,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5403,8 +5436,9 @@ def train(
             optimizer,
             opt_param_scheduler,
             iteration,
-            profiler,
+            prof,
             num_floating_point_operations_since_last_log_event,
+            nsys_nvtx_context,
         )
 
         # Checkpoint and decide whether to exit.
@@ -5416,7 +5450,6 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
-            profiling=profiling,
         )
         if should_exit:
             break

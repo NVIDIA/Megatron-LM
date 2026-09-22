@@ -23,12 +23,13 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config import ProfilingConfig
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
     set_args,
     set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
@@ -228,6 +229,7 @@ class TestMoESingleGroupedWeightNumerics:
 
         validate_args(args)
         set_global_variables(args, False)
+        set_run_config(pretrain_cfg_container_from_args(args))
         return args
 
     def get_batch(self):
@@ -355,9 +357,7 @@ class TestMoESingleGroupedWeightNumerics:
 
         batch = self.get_batch()
         model, optimizer, _ = setup_model_and_optimizer(
-            model_type=ModelType.encoder_or_decoder,
-            model_provider_func=self.model_provider,
-            profiling=ProfilingConfig(),
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(
@@ -468,9 +468,7 @@ class TestMoESingleGroupedWeightNumerics:
         )
 
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_type=ModelType.encoder_or_decoder,
-            model_provider_func=self.model_provider,
-            profiling=ProfilingConfig(),
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(model[0], "mxfp8", True, single_weight)
@@ -502,9 +500,7 @@ class TestMoESingleGroupedWeightNumerics:
         for step in range(4):
             if checkpoint_before_step is not None and step == checkpoint_before_step:
                 force_param_sync(model, optimizer=optimizer)
-                save_checkpoint(
-                    step, model, optimizer, opt_param_scheduler, 0, profiling=ProfilingConfig()
-                )
+                save_checkpoint(step, model, optimizer, opt_param_scheduler, 0)
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
             losses.append(self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch))
@@ -520,7 +516,7 @@ class TestMoESingleGroupedWeightNumerics:
         for _ in range(2):
             self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
         force_param_sync(model, optimizer=optimizer)
-        save_checkpoint(2, model, optimizer, opt_param_scheduler, 0, profiling=ProfilingConfig())
+        save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -613,9 +609,7 @@ class TestMoESingleGroupedWeightNumerics:
             )
 
             model, optimizer, _ = setup_model_and_optimizer(
-                model_type=ModelType.encoder_or_decoder,
-                model_provider_func=self.model_provider,
-                profiling=ProfilingConfig(),
+                model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
             )
             assert len(model) == 1
             self.assert_storage_path_is_exercised(

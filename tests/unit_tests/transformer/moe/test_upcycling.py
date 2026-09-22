@@ -27,12 +27,13 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import gpt_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-from megatron.training.config import ProfilingConfig
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
     set_args,
     set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
@@ -135,6 +136,7 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
 
     validate_args(args)
     set_global_variables(args, False)
+    set_run_config(pretrain_cfg_container_from_args(args))
     return args
 
 
@@ -197,7 +199,6 @@ class TestGPTModel:
             model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
-            profiling=cfg_container.profiling,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -268,7 +269,7 @@ class TestGPTModel:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, model_provider, profiling=ProfilingConfig()
+            ModelType.encoder_or_decoder, model_provider
         )
         dense_model = unwrap_model(dense_model)
         set_bias_value(dense_model)
@@ -341,7 +342,6 @@ class TestGPTModel:
             model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
-            profiling=cfg_container.profiling,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()

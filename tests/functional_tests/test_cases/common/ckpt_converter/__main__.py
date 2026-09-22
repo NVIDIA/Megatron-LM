@@ -26,8 +26,8 @@ from megatron.training import get_args, get_tokenizer
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
-from megatron.training.config import ProfilingConfig
-from megatron.training.global_vars import set_global_variables, unset_global_variables
+from megatron.training.global_vars import set_global_variables, unset_global_variables, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.training import get_model
 from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
@@ -210,6 +210,7 @@ class Pipeline:
 
         # Set global args, build tokenizer.
         unset_global_variables()
+        set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
         set_global_variables(args)
 
         # Random seed.
@@ -223,7 +224,7 @@ class Pipeline:
 
     @staticmethod
     def build_model():
-        model_provider_func = partial(model_provider, gpt_builder, profiling=ProfilingConfig())
+        model_provider_func = partial(model_provider, gpt_builder)
         models = get_model(
             model_provider_func=model_provider_func, model_type=ModelType.encoder_or_decoder
         )
@@ -416,7 +417,6 @@ class Pipeline:
             optimizer=None,
             opt_param_scheduler=None,
             num_floating_point_operations_so_far=None,
-            profiling=ProfilingConfig(),
         )
 
         return output_tensor, orig_input_ids
@@ -815,6 +815,7 @@ class LLaVAPipeline(Pipeline):
 
         # Set global args, build tokenizer.
         unset_global_variables()
+        set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
         set_global_variables(args)
 
         # Random seed.

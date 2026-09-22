@@ -8,7 +8,6 @@ import torch
 
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.config import ProfilingConfig
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_checkpointing_mock_args,
@@ -97,7 +96,6 @@ class TestLayerWiseOptimizerCommonStateDict:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                    profiling=ProfilingConfig(),
                 )
 
                 # Get optimizer A param state
@@ -185,7 +183,6 @@ class TestLayerWiseOptimizerCommonStateDict:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                    profiling=ProfilingConfig(),
                 )
 
                 optim_param_state_A = optimizer_A.state_dict()

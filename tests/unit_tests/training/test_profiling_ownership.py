@@ -3,13 +3,14 @@
 """Behavioral ownership checks without starting an actual profiler."""
 
 from argparse import ArgumentParser
+from contextlib import nullcontext
 from dataclasses import asdict, fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from megatron.training import arguments, checkpointing, profiling
+from megatron.training import argument_utils, arguments, checkpointing, global_vars, training
 from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.config import ProfilingConfig
 from megatron.training.utils import start_memory_history_recording
@@ -28,6 +29,83 @@ def remove_profiling_args(args):
         delattr(args, name)
 
 
+@pytest.mark.parametrize("cleanup", ["unset_global_variables", "destroy_global_vars"])
+def test_run_config_lifecycle(monkeypatch, cleanup):
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    with pytest.raises(AssertionError, match="run config is not initialized"):
+        global_vars.get_run_config()
+    config = SimpleNamespace(profiling=ProfilingConfig())
+    global_vars.set_run_config(config)
+    assert global_vars.get_run_config() is config
+    with pytest.raises(AssertionError, match="run config is already initialized"):
+        global_vars.set_run_config(SimpleNamespace(profiling=ProfilingConfig()))
+    # Both cleanup paths clear the owner before a subsequent run.
+    getattr(global_vars, cleanup)()
+    with pytest.raises(AssertionError, match="run config is not initialized"):
+        global_vars.get_run_config()
+    global_vars.set_run_config(config)
+    assert global_vars.get_run_config() is config
+
+
+@pytest.fixture
+def inline_profiler(monkeypatch, run_config):
+    """Exercise the real train preamble/loop, stopping before the first train step."""
+    args, _ = cli_config("--micro-batch-size", "1")
+    remove_profiling_args(args)
+    args.iteration = args.consumed_train_samples = args.num_floating_point_operations_so_far = 0
+    args.train_iters = 10
+    args.train_sync_interval = 0
+    args.gpu_sniff_test_interval = args.check_weight_hash_across_dp_replicas_interval = None
+    args.log_straggler = args.manual_gc = False
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock(return_value=Mock()))
+    monkeypatch.setattr(training, "get_energy_monitor", lambda: None)
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "get_attr_wrapped_model", Mock(return_value=Mock()))
+    monkeypatch.setattr(training, "get_rerun_state_machine", Mock(return_value=Mock()))
+    monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(training, "get_forward_backward_func", Mock())
+    monkeypatch.setattr(training, "one_logger_utils", Mock())
+    monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda _: False)
+    monkeypatch.setattr(training, "_otel_managed_span", lambda *a, **kw: nullcontext())
+    for name in (
+        "write_args_to_tensorboard",
+        "print_datetime",
+        "_end_otel_startup_span",
+        "_start_otel_train_span",
+        "_maybe_reroot_otel_interval",
+    ):
+        monkeypatch.setattr(training, name, Mock())
+
+    class BeforeTrainStep(Exception):
+        pass
+
+    monkeypatch.setattr(
+        training.ft_integration, "on_checkpointing_start", Mock(side_effect=BeforeTrainStep)
+    )
+
+    def start(config, *, iteration=0, rank=0, tensorboard_dir=None):
+        run_config.profiling = config
+        args.iteration = iteration
+        args.tensorboard_dir = tensorboard_dir
+        monkeypatch.setattr(training.torch.distributed, "get_rank", lambda: rank)
+        with pytest.raises(BeforeTrainStep):
+            training.train(
+                forward_step_func=Mock(),
+                model=[Mock()],
+                optimizer=None,
+                opt_param_scheduler=None,
+                train_data_iterator=None,
+                valid_data_iterator=None,
+                process_non_loss_data_func=None,
+                config=SimpleNamespace(finalize_model_grads_func=Mock()),
+                checkpointing_context={},
+                non_loss_data_func=None,
+            )
+
+    return start
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_cli_and_native_settings_match_without_aliasing(enabled):
     args, config = cli_config(*(["--profile"] if enabled else []), "--profile-ranks", "1", "3")
@@ -39,8 +117,29 @@ def test_cli_and_native_settings_match_without_aliasing(enabled):
     assert config.use_nsys_profiler is enabled
 
 
+def test_legacy_inference_owner_does_not_construct_unused_training_configs():
+    args, profiling = cli_config(
+        "--profile", "--optimizer", "sgd", "--use-precision-aware-optimizer"
+    )
+    config = argument_utils.inference_cfg_container_from_args(args, build_model_config=False)
+    assert config.model is None
+    assert asdict(config.profiling) == asdict(profiling)
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_inference_factory_keeps_automatic_model_construction(monkeypatch, explicit_none):
+    args, _ = cli_config()
+    model = object()
+    build = Mock(return_value=model)
+    monkeypatch.setattr(argument_utils, "gpt_config_from_args", build)
+    kwargs = {"model_cfg": None} if explicit_none else {}
+    config = argument_utils.inference_cfg_container_from_args(args, **kwargs)
+    assert config.model is model
+    build.assert_called_once_with(args)
+
+
 @pytest.mark.parametrize("native", [False, True])
-def test_active_pytorch_window_validation(native):
+def test_active_pytorch_window_validation(native, inline_profiler):
     if native:
         config = ProfilingConfig(
             use_nsys_profiler=True,
@@ -59,17 +158,16 @@ def test_active_pytorch_window_validation(native):
         )
     # Construction is valid for non-training consumers; an active selected
     # profiler checks its requirements immediately before starting.
-    runtime = profiling.TrainingProfiler(config, rank=0, tensorboard_dir=None)
     with pytest.raises(ValueError, match="profile_step_end > profile_step_start"):
-        runtime.start()
+        inline_profiler(config)
     config.profile_ranks = [1]
-    runtime.start()  # Excluded ranks did not validate the window before migration.
+    inline_profiler(config)  # Excluded ranks do not validate the window.
     config.profile_ranks = []
     config.use_nsys_profiler = False
-    runtime.start()
+    inline_profiler(config)
     config.use_nsys_profiler = True
     config.use_pytorch_profiler = False
-    runtime.start()
+    inline_profiler(config)
 
 
 @pytest.mark.parametrize("profile", [None, False, True])
@@ -89,7 +187,9 @@ def test_legacy_namespace_profile_alias_is_optional(profile):
     "enabled,ranks,rank,expected",
     [(False, [], 0, False), (True, [1], 0, False), (True, [], 0, True), (True, [1], 1, True)],
 )
-def test_nsys_windows_and_nvtx_use_config(monkeypatch, enabled, ranks, rank, expected):
+def test_nsys_windows_and_nvtx_use_config(
+    monkeypatch, inline_profiler, enabled, ranks, rank, expected
+):
     args, config = cli_config(
         "--profile",
         "--profile-step-start",
@@ -105,16 +205,14 @@ def test_nsys_windows_and_nvtx_use_config(monkeypatch, enabled, ranks, rank, exp
     cudart = Mock()
     context = MagicMock()
     nvtx = Mock()
-    monkeypatch.setattr(profiling.torch.cuda, "cudart", Mock(return_value=cudart))
-    monkeypatch.setattr(profiling.torch.cuda, "check_error", Mock())
+    monkeypatch.setattr(training.torch.cuda, "cudart", Mock(return_value=cudart))
+    monkeypatch.setattr(training.torch.cuda, "check_error", Mock())
     emit = Mock(return_value=context)
-    monkeypatch.setattr(profiling.torch.autograd.profiler, "emit_nvtx", emit)
-    monkeypatch.setattr(profiling, "configure_nvtx_profiling", nvtx)
-    runtime = profiling.TrainingProfiler(config, rank=rank, tensorboard_dir=None)
-    runtime.start()
-    for iteration in range(6):
-        runtime.step(iteration)
-        runtime.stop(iteration + 1)
+    monkeypatch.setattr(training.torch.autograd.profiler, "emit_nvtx", emit)
+    monkeypatch.setattr(training, "configure_nvtx_profiling", nvtx)
+    inline_profiler(config, iteration=2, rank=rank)
+    for iteration in range(1, 7):
+        training.post_training_step_callbacks([], None, None, iteration, None, 0, context)
     assert cudart.cudaProfilerStart.call_count == int(expected)
     assert cudart.cudaProfilerStop.call_count == int(expected)
     assert emit.call_count == int(expected)
@@ -129,7 +227,9 @@ def test_nsys_windows_and_nvtx_use_config(monkeypatch, enabled, ranks, rank, exp
 
 @pytest.mark.parametrize("start", [0, 2])
 @pytest.mark.parametrize("chakra", [False, True])
-def test_pytorch_consumer_inputs_and_resume_progress(monkeypatch, tmp_path, start, chakra):
+def test_pytorch_consumer_inputs_and_resume_progress(
+    monkeypatch, inline_profiler, tmp_path, start, chakra
+):
     config = ProfilingConfig(
         use_nsys_profiler=True,
         use_pytorch_profiler=True,
@@ -145,13 +245,12 @@ def test_pytorch_consumer_inputs_and_resume_progress(monkeypatch, tmp_path, star
     backend.execution_trace_observer = observer if chakra else None
     factory = Mock(return_value=backend)
     schedule = Mock()
-    monkeypatch.setattr(profiling.torch.profiler, "profile", factory)
-    monkeypatch.setattr(profiling.torch.profiler, "schedule", schedule)
+    monkeypatch.setattr(training.torch.profiler, "profile", factory)
+    monkeypatch.setattr(training.torch.profiler, "schedule", schedule)
     monkeypatch.setattr(
-        profiling.torch.profiler, "ExecutionTraceObserver", Mock(return_value=observer)
+        training.torch.profiler, "ExecutionTraceObserver", Mock(return_value=observer)
     )
-    runtime = profiling.TrainingProfiler(config, rank=0, tensorboard_dir=str(tmp_path / "tb"))
-    runtime.start()
+    inline_profiler(config, iteration=4, tensorboard_dir=str(tmp_path / "tb"))
     schedule.assert_called_once_with(
         wait=max(start - 1, 0), warmup=int(start > 0), active=5 - start, repeat=1
     )
@@ -164,28 +263,28 @@ def test_pytorch_consumer_inputs_and_resume_progress(monkeypatch, tmp_path, star
     )
     # Existing semantics: PyTorch scheduling starts at loop entry on resume;
     # global progress is supplied explicitly for the stop boundary.
-    runtime.step(4)
-    runtime.stop(4)
+    training.post_training_step_callbacks([], None, None, 4, backend, 0)
     backend.stop.assert_not_called()
-    runtime.stop(5)
+    training.post_training_step_callbacks([], None, None, 5, backend, 0)
     backend.start.assert_called_once()
     backend.step.assert_called_once()
     backend.stop.assert_called_once()
     assert observer.unregister_callback.call_count == int(chakra)
 
 
-def test_checkpoint_snapshot_uses_config_not_live_args():
+def test_checkpoint_snapshot_uses_config_not_live_args(run_config):
     args, config = cli_config("--profile", "--profile-ranks", "1", "3", "--record-memory-history")
+    run_config.profiling = config
     args.profile = False
     args.profile_ranks = [99]
-    snapshot = checkpointing.checkpoint_args_snapshot(args, profiling=config)
+    snapshot = checkpointing.checkpoint_args_snapshot(args)
     assert snapshot is not args
     assert snapshot.profile is True and snapshot.profile_ranks == [1, 3]
     assert args.profile is False and args.profile_ranks == [99]
     config.profile_ranks.append(5)
     assert snapshot.profile_ranks == [1, 3]  # Async-save snapshot is detached.
     remove_profiling_args(args)
-    snapshot = checkpointing.checkpoint_args_snapshot(args, profiling=config)
+    snapshot = checkpointing.checkpoint_args_snapshot(args)
     for field in fields(config):
         name = "profile" if field.name == "use_nsys_profiler" else field.name
         assert getattr(snapshot, name) == getattr(config, field.name)
@@ -244,11 +343,12 @@ def test_memory_history_uses_config(monkeypatch, enabled, ranks, rank, expected)
     ],
 )
 def test_training_log_memory_snapshot_without_profiling_args(
-    monkeypatch, enabled, ranks, rank, backend, expected
+    monkeypatch, run_config, enabled, ranks, rank, backend, expected
 ):
     from megatron.training import training
 
     args, config = cli_config("--log-interval", "1", "--micro-batch-size", "1")
+    run_config.profiling = config
     config.record_memory_history = enabled
     config.profile_ranks = ranks
     config.memory_snapshot_path = "owned.pickle"
@@ -277,7 +377,7 @@ def test_training_log_memory_snapshot_without_profiling_args(
     monkeypatch.setattr(training.torch.distributed, "get_backend", lambda: backend)
     dump = Mock()
     monkeypatch.setattr(training.torch.cuda.memory, "_dump_snapshot", dump)
-    training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, None, profiling=config)
+    training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, None)
     if expected:
         dump.assert_called_once_with(f"owned_{rank}.pickle")
     else:

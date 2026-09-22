@@ -36,6 +36,8 @@ from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.usefixtures("run_config")
+
 
 class MockModel(MegatronModule):
     """Dummy megatron model."""
@@ -502,13 +504,16 @@ def test_load_base_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
-def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format):
+def test_save_checkpoint(
+    init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format, run_config
+):
     """Test save_checkpoint."""
     args = create_args
     args.ckpt_format = ckpt_format
     profiling = ProfilingConfig(
         use_nsys_profiler=True, profile_ranks=[0], memory_snapshot_path="owned.pickle"
     )
+    run_config.profiling = profiling
     # Runtime config owns these fields, even if the legacy namespace disagrees.
     args.profile = False
     args.profile_ranks = [99]
@@ -554,7 +559,6 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 cp_group=cp_group,
-                profiling=profiling,
             )
         assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
 
@@ -607,12 +611,7 @@ def test_load_checkpoint(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration,
-            [model],
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            profiling=ProfilingConfig(),
+            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
@@ -675,12 +674,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration,
-            [model],
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            profiling=ProfilingConfig(),
+            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
@@ -743,14 +737,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
-            save_checkpoint(
-                iteration,
-                [model],
-                optimizer,
-                opt_param_scheduler,
-                num_fp_ops,
-                profiling=ProfilingConfig(),
-            )
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
 
         second_job_mock_metadata = {
             **base_metadata,
@@ -766,14 +753,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             assert optimizer._called_metadata[-1] == first_job_mock_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
-            save_checkpoint(
-                iteration,
-                [model],
-                optimizer,
-                opt_param_scheduler,
-                num_fp_ops,
-                profiling=ProfilingConfig(),
-            )
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
         assert optimizer._called_metadata == model._called_metadata

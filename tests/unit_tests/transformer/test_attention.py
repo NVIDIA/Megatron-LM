@@ -25,7 +25,6 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
 from tests.unit_tests.dist_checkpointing import (
@@ -35,6 +34,8 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -532,7 +533,7 @@ def _test_parallel_attention_correctness(
         mock_args.no_save_rng = True
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0, profiling=ProfilingConfig())
+        save_checkpoint(10, gpt_model, None, None, 0)
 
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention

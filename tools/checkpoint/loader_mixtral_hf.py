@@ -133,16 +133,13 @@ def load_checkpoint_to_model(args):
     from model_provider import model_provider
     from gpt_builders import gpt_builder
     from transformers import MixtralForCausalLM, MixtralConfig
-    from megatron.training.argument_utils import profiling_config_from_args
 
     # Load Huggingface model.
 
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(
-        gpt_builder, pre_process=True, post_process=True, profiling=profiling_config_from_args(args)
-    ).to(args.params_dtype)
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -167,7 +164,8 @@ def _load_checkpoint(queue, args):
 
     try:
         from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
+        from megatron.training.global_vars import set_args, set_global_variables, set_run_config
+        from megatron.training.argument_utils import inference_cfg_container_from_args
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -237,6 +235,7 @@ def _load_checkpoint(queue, args):
     # Suppress warning about torch.distributed not being initialized.
     LanguageModule.embedding_warning_printed = True 
 
+    set_run_config(inference_cfg_container_from_args(margs, build_model_config=False))
     set_global_variables(margs, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)

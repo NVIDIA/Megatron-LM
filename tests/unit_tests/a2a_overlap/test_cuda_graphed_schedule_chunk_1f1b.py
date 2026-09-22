@@ -19,7 +19,6 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
-from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
@@ -267,7 +266,7 @@ class TestPartialCudaGraphedA2AOverlap:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider, profiling=ProfilingConfig()
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 

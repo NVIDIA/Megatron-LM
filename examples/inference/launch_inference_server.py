@@ -29,9 +29,9 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, initialize_megatron
-from megatron.training.argument_utils import profiling_config_from_args
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
 
 
 def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
@@ -105,13 +105,14 @@ def main():
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()
 
     # Match the legacy tool's NVTX gating.
-    profiling = profiling_config_from_args(args)
+    profiling = get_run_config().profiling
     if profiling.use_nsys_profiler and profiling.nvtx_ranges:
         configure_nvtx_profiling(True)
 

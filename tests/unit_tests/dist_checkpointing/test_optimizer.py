@@ -32,7 +32,6 @@ from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.utils import is_torch_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.config import ProfilingConfig
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -553,7 +552,6 @@ class TestDistributedOptimizer:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                    profiling=ProfilingConfig(),
                 )
 
                 # Get optimizer A param state
@@ -611,7 +609,7 @@ class TestDistributedOptimizer:
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
 
-                save_checkpoint(10, model, optimizer, None, 0, profiling=ProfilingConfig())
+                save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(*dest_tp_pp)

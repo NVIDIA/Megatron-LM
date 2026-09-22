@@ -57,10 +57,7 @@ class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
         if self.args.model_type == 'GPT':
             from model_provider import model_provider
             from gpt_builders import gpt_builder
-            from megatron.training.argument_utils import profiling_config_from_args
-            self.model_provider = partial(
-                model_provider, gpt_builder, profiling=profiling_config_from_args(self.margs)
-            )
+            self.model_provider = partial(model_provider, gpt_builder)
             return model_provider
         elif self.args.model_type == 'BERT':
             from pretrain_bert import model_provider

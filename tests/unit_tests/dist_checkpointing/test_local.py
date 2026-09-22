@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from megatron.training.arguments import parse_args
-from megatron.training.config import ProfilingConfig
 
 nvidia_resiliency_ext = pytest.importorskip(
     "nvidia_resiliency_ext",
@@ -200,7 +199,6 @@ class TestLocalCheckpointing:
                 num_floating_point_operations_so_far,
                 checkpointing_context=checkpointing_context,
                 non_persistent_ckpt=True,
-                profiling=ProfilingConfig(),
             )
             if async_save:
                 maybe_finalize_async_save(True)
@@ -233,7 +231,6 @@ class TestLocalCheckpointing:
                 num_floating_point_operations_so_far,
                 checkpointing_context=checkpointing_context,
                 non_persistent_ckpt=True,
-                profiling=ProfilingConfig(),
             )
             if async_save:
                 maybe_finalize_async_save(True)
@@ -247,7 +244,6 @@ class TestLocalCheckpointing:
                 num_floating_point_operations_so_far,
                 checkpointing_context=checkpointing_context,
                 non_persistent_ckpt=True,
-                profiling=ProfilingConfig(),
             )
             if async_save:
                 maybe_finalize_async_save(True)
@@ -311,7 +307,6 @@ class TestLocalCheckpointing:
                         num_floating_point_operations_so_far,
                         checkpointing_context=checkpointing_context,
                         non_persistent_ckpt=True,
-                        profiling=ProfilingConfig(),
                     )
                     if async_save:
                         maybe_finalize_async_save(True)

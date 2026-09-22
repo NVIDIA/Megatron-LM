@@ -9,7 +9,7 @@ import torch
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.training import get_args, print_rank_0
-from megatron.training.config import ProfilingConfig
+from megatron.training.global_vars import get_run_config
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -20,8 +20,6 @@ except ImportError:
 
 def model_provider(
     model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
-    *,
-    profiling: ProfilingConfig,
 ) -> Union[GPTModel, HybridModel]:
     """Builds the model.
 
@@ -36,6 +34,7 @@ def model_provider(
         Union[GPTModel, HybridModel]: The returned model
     """
     args = get_args()
+    profiling = get_run_config().profiling
 
     if profiling.record_memory_history:
         torch.cuda.memory._record_memory_history(
