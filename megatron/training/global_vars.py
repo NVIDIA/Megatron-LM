@@ -43,7 +43,6 @@ def get_args():
 def get_run_config():
     """Return the full pretrain config container. It can be None so no need
     to check if it is initialized."""
-    _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
     return _GLOBAL_RUN_CONFIG
 
 
