@@ -1,11 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax Sparse Attention primitive (flex backend), bf16 on one GPU.
-
-References are pure-torch masked dense attention on the same block selection (softmax in
-fp32) and, for the full ``MSAttention`` module, HF ``MiniMaxM3VLAttention`` with identical
-weights. bf16 flips a few percent of the indexer's top-k rows whenever the GEMM order
-changes, so selections are compared as sets with a flip budget and outputs are compared
-on the rows whose selection agrees; per-case numbers are printed as evidence.
+"""MiniMax Sparse Attention primitive (flex backend), bf16 on one GPU, vs fp32 masked dense attention on the same block
+selection and vs HF ``MiniMaxM3VLAttention`` with identical weights. Selections are compared as sets under a flip budget
+(bf16 top-k flips; see ``skills/primitive/module/msa.md``).
 """
 
 from __future__ import annotations

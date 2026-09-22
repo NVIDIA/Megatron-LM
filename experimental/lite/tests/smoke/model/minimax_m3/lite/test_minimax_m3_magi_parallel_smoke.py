@@ -1,14 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax-M3 lite with the production ``magi`` MSA backend (MagiAttention MSA extension + msa_v1), bf16, 2 GPUs.
-
-* magi CP1 vs flex CP1 on the same weights: kernel-level agreement of the two backends, on a single
-  4096-token document and on a packed 3-document batch.
-* magi CP2 / EP2 / PP2 vs magi CP1: the Magi dispatch and required-K communication path, including a
-  packed batch whose total is not a multiple of ``chunk * cp`` (trailing pad document).
-* the indexer weights are bitwise unchanged and carry no gradient after forward/backward (frozen selector).
-
-Gates (bf16 kernels): loss rel < 1e-2 (backend) / 5e-3 (layout), per-layer cosine >= 0.999, gradient
-cosines >= 0.99 (routing-independent) / 0.95 (router gate, per-layer experts). Numbers are printed as evidence.
+"""MiniMax-M3 lite with the production ``magi`` MSA backend, bf16, 2 GPUs: magi CP1 vs flex CP1, and magi CP2 / EP2 / PP2
+vs magi CP1, on a single document and on a packed batch with a trailing pad document. The indexer stays frozen throughout.
 """
 
 from __future__ import annotations
@@ -46,63 +38,6 @@ def _rel(a, b):
 
 def _cos(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
-
-
-def _is_routed_expert(name):
-    return ".experts." in name and ".shared_experts." not in name
-
-
-def _is_routing_coupled(name):
-    return _is_routed_expert(name) or name.endswith("block_sparse_moe.gate.weight")
-
-
-def _grads_by_hf_name(model, cfg, ps):
-    from megatron.lite.model.minimax_m3.lite.checkpoint import export_hf_weights
-
-    params = list(model.named_parameters())
-    saved = [p.data for _, p in params]
-    for _, p in params:
-        p.data = p.grad if p.grad is not None else torch.zeros_like(p.data)
-    try:
-        grads = {n: t.detach().clone() for n, t in export_hf_weights(model, cfg, ps)}
-    finally:
-        for (_, p), data in zip(params, saved):
-            p.data = data
-    return {n: g for n, g in grads.items() if "e_score_correction_bias" not in n and "index_" not in n}
-
-
-def _grad_cosines(got, want):
-    """Routed experts are compared per MoE layer on the concatenation of all their gradients."""
-    out, groups = {}, {}
-    for n, g in got.items():
-        w = want[n]
-        if _is_routed_expert(n):
-            a, b = groups.setdefault(n.split(".experts.")[0] + ".experts.all", ([], []))
-            a.append(g.float().flatten())
-            b.append(w.float().flatten())
-        elif w.norm() > 0:
-            out[n] = _cos(g, w)
-    for n, (a, b) in groups.items():
-        out[n] = _cos(torch.cat(a), torch.cat(b))
-    return out
-
-
-def _worst(grad_cos):
-    dense = {n: c for n, c in grad_cos.items() if not _is_routing_coupled(n)}
-    experts = {n: c for n, c in grad_cos.items() if _is_routing_coupled(n)}
-    return min(dense.items(), key=lambda kv: kv[1]), min(experts.items(), key=lambda kv: kv[1])
-
-
-def _indexer_weights(model):
-    return {n: p.detach().clone() for n, p in model.named_parameters() if ".indexer." in n}
-
-
-def _assert_indexer_frozen(model, before):
-    for n, w in _indexer_weights(model).items():
-        assert torch.equal(w, before[n]), f"indexer weight {n} changed"
-    for n, p in model.named_parameters():
-        if ".indexer." in n:
-            assert p.grad is None and not p.requires_grad, n
 
 
 class _LayerDump:
@@ -200,7 +135,7 @@ def _run_magi(model, ps, ctx, ids, labels, dist):
 
 
 @pytest.fixture(scope="module")
-def magi_cp1(magi_cfg, magi_source, dist):
+def magi_cp1(magi_cfg, magi_source, dist, grad_tools):
     """magi CP1 forward/backward on both batches: the reference for the parallel layouts."""
     from megatron.lite.primitive.parallel import ParallelState
 
@@ -209,29 +144,29 @@ def magi_cp1(magi_cfg, magi_source, dist):
     results = {}
     for tag, seq_lens in (("single", SINGLE), ("packed", PACKED)):
         model = _build(magi_cfg, ps0, magi_source, "magi")
-        w0 = _indexer_weights(model)
+        w0 = grad_tools.indexer_weights(model)
         ids, labels = _make_batch(magi_cfg, seq_lens)
         loss, layer_out = _run_magi(model, ps0, _magi_ctx(ps0, magi_cfg, seq_lens), ids, labels, dist)
-        _assert_indexer_frozen(model, w0)
+        grad_tools.assert_indexer_frozen(model, w0)
         results[tag] = dict(seq_lens=seq_lens, ids=ids, labels=labels, loss=loss.detach(), layer_out=layer_out,
-                            grads=_grads_by_hf_name(model, magi_cfg, ps0))
+                            grads=grad_tools.grads_by_hf_name(model, magi_cfg, ps0))
         del model
         torch.cuda.empty_cache()
     return results
 
 
 @pytest.mark.parametrize("tag", ["single", "packed"])
-def test_magi_cp1_matches_flex_cp1(magi_cfg, magi_source, magi_cp1, dist, tag):
+def test_magi_cp1_matches_flex_cp1(magi_cfg, magi_source, magi_cp1, dist, grad_tools, tag):
     from megatron.lite.primitive.parallel import ParallelState
 
     ps0 = ParallelState()
     ref_model = _build(magi_cfg, ps0, magi_source, "flex")
     m = magi_cp1[tag]
     ref_loss, ref_layers = _flex_reference(ref_model, m["seq_lens"], m["ids"], m["labels"])
-    ref_grads = _grads_by_hf_name(ref_model, magi_cfg, ps0)
+    ref_grads = grad_tools.grads_by_hf_name(ref_model, magi_cfg, ps0)
     loss_rel = abs(m["loss"].item() - ref_loss) / abs(ref_loss)
     layer_cos = {gi: _cos(m["layer_out"][gi], ref_layers[gi]) for gi in ref_layers}
-    (dense_name, dense_cos), (expert_name, expert_cos) = _worst(_grad_cosines(m["grads"], ref_grads))
+    (dense_name, dense_cos), (expert_name, expert_cos) = grad_tools.worst(grad_tools.grad_cosines(m["grads"], ref_grads))
     if dist.get_rank() == 0:
         print(f"\nmagi_vs_flex {tag}: loss {m['loss'].item():.5f} vs {ref_loss:.5f} (rel {loss_rel:.2e}) | layer cos min "
               f"{min(layer_cos.values()):.6f} | worst dense grad cos {dense_cos:.5f} ({dense_name.split('layers.')[-1]}), "
@@ -244,7 +179,7 @@ def test_magi_cp1_matches_flex_cp1(magi_cfg, magi_source, magi_cp1, dist, tag):
     torch.cuda.empty_cache()
 
 
-def _check_layout(magi_cfg, magi_source, magi_cp1, dist, *, cp=1, ep=1, pp=1, tag="single"):
+def _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, *, cp=1, ep=1, pp=1, tag="single"):
     from megatron.lite.primitive.parallel import init_parallel
     from megatron.lite.runtime.contracts import ParallelConfig
 
@@ -254,23 +189,23 @@ def _check_layout(magi_cfg, magi_source, magi_cp1, dist, *, cp=1, ep=1, pp=1, ta
     ps = init_parallel(ParallelConfig(tp=1, ep=ep, pp=pp, cp=cp))
     ref = magi_cp1[tag]
     model = _build(magi_cfg, ps, magi_source, "magi")
-    w0 = _indexer_weights(model)
+    w0 = grad_tools.indexer_weights(model)
     ctx = _magi_ctx(ps, magi_cfg, ref["seq_lens"])
     loss, layer_out = _run_magi(model, ps, ctx, ref["ids"], ref["labels"], dist)
-    _assert_indexer_frozen(model, w0)
+    grad_tools.assert_indexer_frozen(model, w0)
     case = f"cp{cp}_ep{ep}_pp{pp}_{tag}"
     loss_rel = _rel(loss, ref["loss"]) if loss is not None else 0.0
     layer_cos = {gi: _cos(h, ref["layer_out"][gi]) for gi, h in layer_out.items()}
-    grads = _grads_by_hf_name(model, magi_cfg, ps)
+    grads = grad_tools.grads_by_hf_name(model, magi_cfg, ps)
     for name, g in grads.items():  # reduce to the CP1 convention before comparing
-        if _is_routed_expert(name):
+        if grad_tools.is_routed_expert(name):
             if ps.expert_dp_size > 1:
                 dist.all_reduce(g, group=ps.ep_dp_group)
             g.div_(ps.cp_size * ps.dp_size)
         elif ps.cp_size > 1:
             dist.all_reduce(g, group=ps.cp_group)
             g.div_(ps.cp_size)
-    (dense_name, dense_cos), (expert_name, expert_cos) = _worst(_grad_cosines(grads, ref["grads"]))
+    (dense_name, dense_cos), (expert_name, expert_cos) = grad_tools.worst(grad_tools.grad_cosines(grads, ref["grads"]))
     stats = torch.tensor([loss_rel, 1.0 - min(layer_cos.values()), 1.0 - dense_cos, 1.0 - expert_cos], device="cuda")
     dist.all_reduce(stats, op=dist.ReduceOp.MAX)
     loss_rel, layer_gap, dense_gap, expert_gap = stats.tolist()
@@ -286,17 +221,17 @@ def _check_layout(magi_cfg, magi_source, magi_cp1, dist, *, cp=1, ep=1, pp=1, ta
     torch.cuda.empty_cache()
 
 
-def test_magi_cp2_matches_cp1_single(magi_cfg, magi_source, magi_cp1, dist):
-    _check_layout(magi_cfg, magi_source, magi_cp1, dist, cp=2, tag="single")
+def test_magi_cp2_matches_cp1_single(magi_cfg, magi_source, magi_cp1, dist, grad_tools):
+    _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, cp=2, tag="single")
 
 
-def test_magi_cp2_matches_cp1_packed_with_pad(magi_cfg, magi_source, magi_cp1, dist):
-    _check_layout(magi_cfg, magi_source, magi_cp1, dist, cp=2, tag="packed")
+def test_magi_cp2_matches_cp1_packed_with_pad(magi_cfg, magi_source, magi_cp1, dist, grad_tools):
+    _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, cp=2, tag="packed")
 
 
-def test_magi_ep2_matches_cp1_packed(magi_cfg, magi_source, magi_cp1, dist):
-    _check_layout(magi_cfg, magi_source, magi_cp1, dist, ep=2, tag="packed")
+def test_magi_ep2_matches_cp1_packed(magi_cfg, magi_source, magi_cp1, dist, grad_tools):
+    _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, ep=2, tag="packed")
 
 
-def test_magi_pp2_matches_cp1_single(magi_cfg, magi_source, magi_cp1, dist):
-    _check_layout(magi_cfg, magi_source, magi_cp1, dist, pp=2, tag="single")
+def test_magi_pp2_matches_cp1_single(magi_cfg, magi_source, magi_cp1, dist, grad_tools):
+    _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, pp=2, tag="single")

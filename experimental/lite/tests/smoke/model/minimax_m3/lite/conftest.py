@@ -1,15 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Fixtures shared by the MiniMax-M3 smoke tests.
-
-Tiny configurations use the on-disk HF ``config.json`` spelling so ``MiniMaxM3Config._from_hf_dict``
-is exercised. Layers 0-1 are dense attention + dense MLP, layers 2-3 are MSA + MoE (the real model's
-L0-2 / L3-59 split). ``flex_cfg`` uses small heads (8/2, top-4; sparse past 512 tokens); ``magi_cfg``
-uses the msa_v1 kernel shapes (64/4 heads, 4x128 index heads, top-16; sparse past 2048 tokens).
-
-``*_source`` fixtures save one randomly initialised bf16 model in HF format (rank 0 writes, everyone
-reads) so every parallel configuration in a module starts from identical weights through the real
-``load_hf_weights`` sharding path.
-"""
+"""Fixtures shared by the MiniMax-M3 smoke tests: tiny HF-spelled configs (layers 0-1 dense, layers 2-3 MSA + MoE),
+the torchrun process group, one random bf16 HF-format source per config, and gradient comparison by HF disk name."""
 
 from __future__ import annotations
 
@@ -18,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 _NUM_LAYERS = 4
 _LAYER_IS_MOE = [0, 0, 1, 1]
@@ -117,7 +109,10 @@ def dist():
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     if not dist.is_initialized():
         dist.init_process_group("nccl")
-    return dist
+    yield dist
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def save_random_source(cfg, dist, tmp_path_factory, tag: str, *, seed: int) -> str:
@@ -152,3 +147,87 @@ def flex_source(flex_cfg, dist, tmp_path_factory) -> str:
 @pytest.fixture(scope="module")
 def magi_source(magi_cfg, dist, tmp_path_factory) -> str:
     return save_random_source(magi_cfg, dist, tmp_path_factory, "magi", seed=20260914)
+
+
+def _cos(a, b):
+    return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def _is_routed_expert(name):
+    return ".experts." in name and ".shared_experts." not in name
+
+
+def _is_routing_coupled(name):
+    return _is_routed_expert(name) or name.endswith("block_sparse_moe.gate.weight")
+
+
+def _grads_by_hf_name(model, cfg, ps, dist=None):
+    """Parameter gradients gathered across TP/EP/PP through the weight-export path, keyed by HF disk name."""
+    from megatron.lite.model.minimax_m3.lite.checkpoint import export_hf_weights
+
+    params = list(model.named_parameters())
+    saved = [p.data for _, p in params]
+    sp_ids = {id(p) for p in getattr(model, "sp_params", [])}
+    for _, p in params:
+        g = p.grad if p.grad is not None else torch.zeros_like(p.data)
+        if dist is not None and id(p) in sp_ids and ps.tp_size > 1:  # SP-sharded input: DDP sums these grads over TP
+            g = g.clone()
+            dist.all_reduce(g, group=ps.tp_group)
+        p.data = g
+    try:
+        grads = {n: t.detach().clone() for n, t in export_hf_weights(model, cfg, ps)}
+    finally:
+        for (_, p), data in zip(params, saved):
+            p.data = data
+    return {n: g for n, g in grads.items() if "e_score_correction_bias" not in n and "index_" not in n}
+
+
+def _weights_by_hf_name(model, cfg, ps):
+    from megatron.lite.model.minimax_m3.lite.checkpoint import export_hf_weights
+
+    return {n: t.detach().clone() for n, t in export_hf_weights(model, cfg, ps) if "e_score_correction_bias" not in n}
+
+
+def _grad_cosines(got, want):
+    """Routed experts are compared per MoE layer on the concatenation of all their gradients."""
+    out, groups = {}, {}
+    for n, g in got.items():
+        w = want[n]
+        if _is_routed_expert(n):
+            a, b = groups.setdefault(n.split(".experts.")[0] + ".experts.all", ([], []))
+            a.append(g.float().flatten())
+            b.append(w.float().flatten())
+        elif w.norm() > 0:
+            out[n] = _cos(g, w)
+    for n, (a, b) in groups.items():
+        out[n] = _cos(torch.cat(a), torch.cat(b))
+    return out
+
+
+def _worst(grad_cos):
+    """(worst routing-independent, worst routing-coupled) as (name, cosine)."""
+    dense = {n: c for n, c in grad_cos.items() if not _is_routing_coupled(n)}
+    experts = {n: c for n, c in grad_cos.items() if _is_routing_coupled(n)}
+    return min(dense.items(), key=lambda kv: kv[1]), min(experts.items(), key=lambda kv: kv[1])
+
+
+def _indexer_weights(model):
+    return {n: p.detach().clone() for n, p in model.named_parameters() if ".indexer." in n}
+
+
+def _assert_indexer_frozen(model, before):
+    for n, w in _indexer_weights(model).items():
+        assert torch.equal(w, before[n]), f"indexer weight {n} changed"
+    for n, p in model.named_parameters():
+        if ".indexer." in n:
+            assert p.grad is None and not p.requires_grad, n
+
+
+@pytest.fixture(scope="module")
+def grad_tools():
+    """Gradient / weight comparison helpers shared by the parity smokes."""
+    return SimpleNamespace(
+        grads_by_hf_name=_grads_by_hf_name, weights_by_hf_name=_weights_by_hf_name, grad_cosines=_grad_cosines,
+        worst=_worst, is_routed_expert=_is_routed_expert, is_routing_coupled=_is_routing_coupled,
+        indexer_weights=_indexer_weights, assert_indexer_frozen=_assert_indexer_frozen,
+    )

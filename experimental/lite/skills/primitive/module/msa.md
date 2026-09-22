@@ -59,6 +59,10 @@ def msa(task, implementation, config, reference, budget):
     validation = primitive.validate(task, primitive=implementation.msa, implementation=implementation, budget=budget)
     risks = ["top-k ties flip under kernel/dtype changes (compare sets; bf16 flips 5-17% of rows, so gates are loose and "
              "flip rates are printed as evidence)",
+             "bf16 parity gates are cosine-based (per-layer 0.995, logits 0.995 + KL 5e-2, dense grads 0.99, routing-coupled 0.95): "
+             "flipped top-k rows dominate any max-abs metric; routed-expert grads are compared per MoE layer on the concatenation "
+             "(one under-populated expert swings its own tiny grad under routing flips) and the embedding grad is evidence only "
+             "(same-token rows cancel ~200x on a random-init proxy, below bf16 resolution)",
              "flex BlockMask rebuilt per call (perf)",
              "CP (flex) all-gathers full K/V per layer (memory O(S_full) per rank, not overlapped)",
              "indexer scores are pooled chunk-wise and the BlockMask is built from kv blocks (no S_q x S_k tensors)",

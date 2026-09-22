@@ -1,14 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax-M3 lite vs Hugging Face ``MiniMaxM3VLForCausalLM`` on identical random weights, bf16, one GPU.
+"""MiniMax-M3 lite vs HF ``MiniMaxM3VLForCausalLM`` on identical random weights (bf16, one GPU), flex and magi backends.
 
-The HF model is saved with ``save_pretrained`` and loaded into lite through the real ``load_hf_weights``
-path, so structure, config mapping and weight mapping are all under test. Both MSA backends are
-checked: ``flex`` (pure torch, Hopper) and the production ``magi`` protocol (msa_v1 kernels, Blackwell).
-
-bf16 is the only precision the msa_v1 kernels support, and bf16 flips a few percent of the
-indexer's top-k rows whenever the GEMM order changes; the flipped rows dominate any max-abs metric,
-so hidden states are gated on cosine (0.995), logits on cosine (0.995) + KL and gradients on cosine (0.99 / 0.95), while
-per-layer rel-to-max, KL and top-1 agreement are printed as evidence.
+Gates are cosine-based (per-layer, logits + KL, gradients) because bf16 flips some indexer top-k rows; see
+``skills/primitive/module/msa.md``.
 """
 
 from __future__ import annotations
@@ -46,13 +40,6 @@ def _rel(a, b):
 
 def _cos(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
-
-
-def _dist():
-    from megatron.lite.primitive.kernels import magi_msa
-
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    magi_msa.ensure_single_process_group()
 
 
 def _train_config(ps):
@@ -124,29 +111,14 @@ def _hf_grad_lookup(hf_grads: dict, mod: str) -> torch.Tensor:
     return gate if fm.group(2) == "gate" else up
 
 
-def _lite_grads_by_hf_name(model, cfg, ps) -> dict[str, torch.Tensor]:
-    """Lite parameter gradients keyed by the HF *module* name (export path re-used on ``.grad``)."""
-    from megatron.lite.model.minimax_m3.lite.checkpoint import (
-        disk_to_module_name,
-        export_hf_weights,
-    )
+def _lite_grads_by_hf_module_name(model, cfg, ps, grad_tools) -> dict[str, torch.Tensor]:
+    from megatron.lite.model.minimax_m3.lite.checkpoint import disk_to_module_name
 
-    params = list(model.named_parameters())
-    saved = [p.data for _, p in params]
-    for _, p in params:
-        p.data = p.grad if p.grad is not None else torch.zeros_like(p.data)
-    try:
-        grads = {disk_to_module_name(n): t.detach().clone() for n, t in export_hf_weights(model, cfg, ps)}
-    finally:
-        for (_, p), data in zip(params, saved):
-            p.data = data
-    return {n: g for n, g in grads.items() if "e_score_correction_bias" not in n and ".indexer." not in n}
+    return {disk_to_module_name(n): g for n, g in grad_tools.grads_by_hf_name(model, cfg, ps).items()}
 
 
 def _compare_grads(lite_grads: dict[str, torch.Tensor], hf, tag: str):
-    """Per-parameter gradient cosines; routed experts are compared per MoE layer on the concatenation of
-    all their gradients (a single under-populated expert of a random-init model can swing its own tiny
-    gradient under routing flips while the layer-level expert gradient is stable)."""
+    """Per-parameter gradient cosines; routed experts are compared per MoE layer on all their gradients concatenated."""
     hf_grads = {n: p.grad for n, p in hf.named_parameters() if p.grad is not None}
     dense, experts = {}, {}
     groups: dict[str, tuple[list, list]] = {}
@@ -154,10 +126,7 @@ def _compare_grads(lite_grads: dict[str, torch.Tensor], hf, tag: str):
         want = _hf_grad_lookup(hf_grads, mod).to(DEV)
         if want.shape != g.shape:  # vocab padding
             g = g[: want.shape[0]]
-        if mod.endswith("embed_tokens.weight"):
-            # The embedding gradient sums the input-gradient rows of every position holding the same token. For a
-            # random-init proxy those rows cancel ~200x (the first RMSNorm amplifies the tiny embeddings), so the
-            # sum sits below bf16 resolution on both sides; the input gradient itself agrees to cosine 0.9996.
+        if mod.endswith("embed_tokens.weight"):  # below bf16 resolution on a random-init proxy: evidence only
             print(f"{tag} embed_tokens grad cos {_cos(g, want):.5f} (evidence only: below bf16 resolution)")
             continue
         if ".experts." in mod:
@@ -195,12 +164,11 @@ def _compare_layers_and_logits(tag, lite_layers, hf_layers, lite_logits, hf_logi
 # ----------------------------------------------------------------------------------------- flex
 @pytest.mark.gpus(1)
 @pytest.mark.skipif(not _hf_available(), reason="transformers without minimax_m3_vl")
-def test_flex_matches_hf_forward_backward(tmp_path, flex_hf_kwargs):
+def test_flex_matches_hf_forward_backward(tmp_path, flex_hf_kwargs, dist, grad_tools):
     from megatron.lite.model.minimax_m3.lite import protocol as P
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
     from megatron.lite.primitive.parallel import ParallelState
 
-    _dist()
     hf, hf_cfg, src = _build_hf(flex_hf_kwargs, tmp_path, seed=0)
     cfg = P.build_model_config(hf_cfg.to_dict())
     ps = ParallelState()
@@ -238,12 +206,12 @@ def test_flex_matches_hf_forward_backward(tmp_path, flex_hf_kwargs):
     assert loss_rel < LOSS_REL
     lite_out["loss"].backward()
     hf_loss.backward()
-    _compare_grads(_lite_grads_by_hf_name(lite, cfg, ps), hf, "flex_vs_hf")
+    _compare_grads(_lite_grads_by_hf_module_name(lite, cfg, ps, grad_tools), hf, "flex_vs_hf")
 
 
 @pytest.mark.gpus(1)
 @pytest.mark.skipif(not _hf_available(), reason="transformers without minimax_m3_vl")
-def test_weight_round_trip_is_bitwise(tmp_path, flex_hf_kwargs):
+def test_weight_round_trip_is_bitwise(tmp_path, flex_hf_kwargs, dist):
     from safetensors.torch import load_file
 
     from megatron.lite.model.minimax_m3.lite import protocol as P
@@ -251,7 +219,6 @@ def test_weight_round_trip_is_bitwise(tmp_path, flex_hf_kwargs):
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
     from megatron.lite.primitive.parallel import ParallelState
 
-    _dist()
     _, hf_cfg, src = _build_hf(flex_hf_kwargs, tmp_path, seed=0)
     cfg = P.build_model_config(hf_cfg.to_dict())
     ps = ParallelState()
@@ -303,7 +270,7 @@ def test_weight_round_trip_is_bitwise(tmp_path, flex_hf_kwargs):
 # ----------------------------------------------------------------------------------------- magi
 @pytest.mark.gpus(1, min_architecture="blackwell")
 @pytest.mark.skipif(not _hf_available(), reason="transformers without minimax_m3_vl")
-def test_magi_matches_hf_forward_backward(tmp_path, magi_hf_kwargs):
+def test_magi_matches_hf_forward_backward(tmp_path, magi_hf_kwargs, dist, grad_tools):
     pytest.importorskip("magi_attn_extensions.MSA")
     pytest.importorskip("msa_v1")
     from megatron.lite.model.minimax_m3.lite import protocol as P
@@ -311,7 +278,6 @@ def test_magi_matches_hf_forward_backward(tmp_path, magi_hf_kwargs):
     from megatron.lite.runtime.contracts import ParallelConfig
     from megatron.lite.runtime.contracts.data import PackedBatch
 
-    _dist()
     hf, hf_cfg, src = _build_hf(magi_hf_kwargs, tmp_path, seed=0)
     cfg = P.build_model_config(hf_cfg.to_dict())
     bundle = P.build_model(cfg, impl_cfg=P.ImplConfig(parallel=ParallelConfig(), optimizer=None, magi_chunk_size=MAGI_CHUNK))
@@ -351,4 +317,4 @@ def test_magi_matches_hf_forward_backward(tmp_path, magi_hf_kwargs):
     for name, p in lite.named_parameters():  # frozen selector
         if ".indexer." in name:
             assert p.grad is None and not p.requires_grad, name
-    _compare_grads(_lite_grads_by_hf_name(lite, cfg, ps), hf, "magi_vs_hf")
+    _compare_grads(_lite_grads_by_hf_module_name(lite, cfg, ps, grad_tools), hf, "magi_vs_hf")

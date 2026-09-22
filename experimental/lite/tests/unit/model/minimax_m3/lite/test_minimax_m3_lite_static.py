@@ -14,7 +14,29 @@ import torch
 _LITE = Path(__file__).resolve().parents[5]
 
 
-def test_registry_resolves_lite():
+def _tiny_hf_kwargs() -> dict:
+    """HF config.json spelling; layers 0-1 dense attention + dense MLP, layers 2-3 MSA + MoE."""
+    return dict(
+        model_type="minimax_m3_vl_text", vocab_size=256, hidden_size=256, num_hidden_layers=4,
+        num_attention_heads=8, num_key_value_heads=2, head_dim=128,
+        dense_intermediate_size=512, intermediate_size=128, shared_intermediate_size=128, n_shared_experts=1,
+        num_local_experts=4, num_experts_per_tok=2, moe_layer_freq=[0, 0, 1, 1],
+        scoring_func="sigmoid", use_routing_bias=True, routed_scaling_factor=2.0,
+        hidden_act="swigluoai", swiglu_alpha=1.702, swiglu_limit=7.0,
+        rms_norm_eps=1e-6, use_gemma_norm=True, use_qk_norm=True, qk_norm_type="per_head",
+        rope_theta=5_000_000, rotary_dim=64, partial_rotary_factor=0.5, max_position_embeddings=65536,
+        tie_word_embeddings=False, attention_output_gate=False,
+        sparse_attention_config=dict(
+            use_sparse_attention=True, sparse_index_dim=128, sparse_num_index_heads=2, sparse_topk_blocks=4,
+            sparse_block_size=128, sparse_score_type="max", sparse_init_block=0, sparse_local_block=1,
+            sparse_disable_index_value=[0, 0, 1, 1], sparse_attention_freq=[0, 0, 1, 1],
+        ),
+        output_router_logits=False, router_aux_loss_coef=0.001, attention_dropout=0.0,
+        bos_token_id=1, eos_token_id=2, pad_token_id=0,
+    )
+
+
+def test_minimax_m3_registry_resolves_lite():
     from megatron.lite.model.registry import (
         get_train_runtime_module,
         resolve_model_type_from_hf,
@@ -28,7 +50,7 @@ def test_registry_resolves_lite():
         assert resolve_model_type_from_hf({"model_type": model_type}) == "minimax_m3"
 
 
-def test_lite_does_not_import_sibling_models_or_megatron_core():
+def test_minimax_m3_lite_does_not_import_sibling_models_or_megatron_core():
     root = _LITE / "megatron" / "lite" / "model" / "minimax_m3"
     for path in root.rglob("*.py"):
         text = path.read_text()
@@ -37,7 +59,8 @@ def test_lite_does_not_import_sibling_models_or_megatron_core():
             assert forbidden not in text, (path, forbidden)
 
 
-def test_config_maps_hf_text_config_strictly(tiny_hf_kwargs):
+def test_minimax_m3_config_maps_hf_text_config_strictly():
+    tiny_hf_kwargs = _tiny_hf_kwargs()
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
 
     cfg = MiniMaxM3Config._from_hf_dict(tiny_hf_kwargs)  # strict: raises on unmapped fields
@@ -55,7 +78,8 @@ def test_config_maps_hf_text_config_strictly(tiny_hf_kwargs):
 
 
 @pytest.mark.optional
-def test_config_from_hf_object_matches_dict_mapping(tiny_hf_kwargs):
+def test_minimax_m3_config_from_hf_object_matches_dict_mapping():
+    tiny_hf_kwargs = _tiny_hf_kwargs()
     pytest.importorskip("transformers.models.minimax_m3_vl")
     from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
 
@@ -69,7 +93,7 @@ def test_config_from_hf_object_matches_dict_mapping(tiny_hf_kwargs):
     assert from_obj.index_topk_blocks == from_dict.index_topk_blocks
 
 
-def test_impl_config_defaults_to_the_magi_production_path():
+def test_minimax_m3_impl_config_defaults_to_the_magi_production_path():
     from megatron.lite.model.minimax_m3.lite import protocol as P
 
     cfg = P.ImplConfig()
@@ -80,7 +104,7 @@ def test_impl_config_defaults_to_the_magi_production_path():
     assert cfg.optimizer == "dist_opt"
 
 
-def test_protocol_rejects_tensor_parallel_thd_and_vpp():
+def test_minimax_m3_protocol_rejects_tensor_parallel_thd_and_vpp():
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
     from megatron.lite.model.minimax_m3.lite import protocol as P
     from megatron.lite.runtime.contracts import ParallelConfig
@@ -93,7 +117,7 @@ def test_protocol_rejects_tensor_parallel_thd_and_vpp():
         P.build_model(MiniMaxM3Config(), impl_cfg=P.ImplConfig(parallel=ParallelConfig(pp=2, vpp=2), optimizer=None))
 
 
-def test_protocol_builds_the_magi_backend(monkeypatch):
+def test_minimax_m3_protocol_builds_the_magi_backend(monkeypatch):
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
     from megatron.lite.model.minimax_m3.lite import protocol as P
 
@@ -127,7 +151,7 @@ def test_protocol_builds_the_magi_backend(monkeypatch):
     assert bundle.chunks[0].magi_settings.deterministic is False
 
 
-def test_forward_step_pads_and_dispatches_the_packed_batch(monkeypatch):
+def test_minimax_m3_forward_step_pads_and_dispatches_the_packed_batch(monkeypatch):
     from megatron.lite.model.minimax_m3.lite import protocol as P
     from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -161,7 +185,7 @@ def test_forward_step_pads_and_dispatches_the_packed_batch(monkeypatch):
     assert [d.squeeze(-1).tolist() for d in unpacked.unbind()] == [[10, 11], [20, 21, 22]]
 
 
-def test_forward_step_rejects_inconsistent_packed_batches():
+def test_minimax_m3_forward_step_rejects_inconsistent_packed_batches():
     from megatron.lite.model.minimax_m3.lite import protocol as P
     from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -178,7 +202,8 @@ def test_forward_step_rejects_inconsistent_packed_batches():
     )
 
 
-def test_weight_spec_maps_native_names_to_hf_disk_names(tiny_hf_kwargs):
+def test_minimax_m3_weight_spec_maps_native_names_to_hf_disk_names():
+    tiny_hf_kwargs = _tiny_hf_kwargs()
     from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
     from megatron.lite.model.minimax_m3.lite.checkpoint import (
         MiniMaxM3WeightSpec,

@@ -1,15 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MiniMax-M3 lite (flex MSA backend) under TP / EP / PP / CP vs the single-rank model, bf16, 2 GPUs.
+"""MiniMax-M3 lite (flex MSA backend) under TP / EP / PP / CP vs the single-rank model on the same HF-format weights, bf16, 2 GPUs.
 
-Every rank runs the same batch. The reference is the un-parallelised model (``ParallelState()``)
-loaded from the same HF-format weights as the parallel model, so the comparison isolates the parallel
-code paths: TP shards + SP (index heads sharded like KV heads), EP dispatch, PP p2p, and the
-all-gather CP of K/V + index-K on zigzag shards.
-
-Gates (bf16; reduction order differs between layouts, so a few indexer top-k rows may flip):
-per-layer hidden states rel-to-max < 1e-1 on this rank's shard, loss rel < 1e-2, top-k flips < 20% of
-rows, gradient cosines >= 0.99 (routing-independent) / 0.95 (router gate, per-layer experts), and the
-weights exported back through the TP/EP/PP merge bitwise equal to the source.
+Gates: per-layer rel-to-max, loss rel, top-k flip rate, gradient cosines, bitwise weight export round-trip.
 """
 
 from __future__ import annotations
@@ -40,63 +32,6 @@ def _rel(a, b):
 
 def _cos(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
-
-
-def _is_routed_expert(name):
-    return ".experts." in name and ".shared_experts." not in name
-
-
-def _is_routing_coupled(name):
-    return _is_routed_expert(name) or name.endswith("block_sparse_moe.gate.weight")
-
-
-def _grads_by_hf_name(model, cfg, ps, dist):
-    """Parameter gradients gathered across TP/EP/PP through the weight-export path (HF disk names)."""
-    from megatron.lite.model.minimax_m3.lite.checkpoint import export_hf_weights
-
-    params = list(model.named_parameters())
-    saved = [p.data for _, p in params]
-    sp_ids = {id(p) for p in getattr(model, "sp_params", [])}
-    for _, p in params:
-        g = p.grad if p.grad is not None else torch.zeros_like(p.data)
-        if id(p) in sp_ids and ps.tp_size > 1:  # TP-replicated params with SP-sharded input: DDP sums their grads over TP
-            g = g.clone()
-            dist.all_reduce(g, group=ps.tp_group)
-        p.data = g
-    try:
-        grads = {n: t.detach().clone() for n, t in export_hf_weights(model, cfg, ps)}
-    finally:
-        for (_, p), data in zip(params, saved):
-            p.data = data
-    return {n: g for n, g in grads.items() if "e_score_correction_bias" not in n and "index_" not in n}
-
-
-def _weights_by_hf_name(model, cfg, ps):
-    from megatron.lite.model.minimax_m3.lite.checkpoint import export_hf_weights
-
-    return {n: t.detach().clone() for n, t in export_hf_weights(model, cfg, ps) if "e_score_correction_bias" not in n}
-
-
-def _grad_cosines(got, want):
-    """Routed experts are compared per MoE layer on the concatenation of all their gradients."""
-    out, groups = {}, {}
-    for n, g in got.items():
-        w = want[n]
-        if _is_routed_expert(n):
-            a, b = groups.setdefault(n.split(".experts.")[0] + ".experts.all", ([], []))
-            a.append(g.float().flatten())
-            b.append(w.float().flatten())
-        elif w.norm() > 0:
-            out[n] = _cos(g, w)
-    for n, (a, b) in groups.items():
-        out[n] = _cos(torch.cat(a), torch.cat(b))
-    return out
-
-
-def _worst(grad_cos):
-    dense = {n: c for n, c in grad_cos.items() if not _is_routing_coupled(n)}
-    experts = {n: c for n, c in grad_cos.items() if _is_routing_coupled(n)}
-    return min(dense.items(), key=lambda kv: kv[1]), min(experts.items(), key=lambda kv: kv[1])
 
 
 class _LayerDump:
@@ -156,7 +91,7 @@ def _run_pipeline_fwd_bwd(model, ps, cfg, ids, labels, dist):
 
 
 @pytest.fixture(scope="module")
-def reference(flex_cfg, flex_source, dist):
+def reference(flex_cfg, flex_source, dist, grad_tools):
     """Single-rank bf16 forward/backward: layer outputs, top-k selections, loss, gradients, exported weights."""
     from megatron.lite.model.minimax_m3.lite.checkpoint import load_hf_weights
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
@@ -175,14 +110,14 @@ def reference(flex_cfg, flex_source, dist):
     out["loss"].backward()
     result = dict(
         ids=ids, labels=labels, loss=out["loss"].detach(), layer_out=dump.out, topk=dump.topk,
-        grads=_grads_by_hf_name(ref, flex_cfg, ps0, dist), weights=_weights_by_hf_name(ref, flex_cfg, ps0),
+        grads=grad_tools.grads_by_hf_name(ref, flex_cfg, ps0, dist), weights=grad_tools.weights_by_hf_name(ref, flex_cfg, ps0),
     )
     del ref
     torch.cuda.empty_cache()
     return result
 
 
-def _check_case(flex_cfg, flex_source, reference, dist, *, tp=1, ep=1, pp=1, cp=1):
+def _check_case(flex_cfg, flex_source, reference, dist, grad_tools, *, tp=1, ep=1, pp=1, cp=1):
     from megatron.lite.model.minimax_m3.lite.checkpoint import load_hf_weights
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
     from megatron.lite.primitive.parallel import init_parallel, zigzag_slice_for_cp
@@ -219,11 +154,11 @@ def _check_case(flex_cfg, flex_source, reference, dist, *, tp=1, ep=1, pp=1, cp=
             want = local(_reference_topk_slice(reference["topk"][gi], layer.attn), 2).sort(-1).values
             assert got.shape == want.shape, (got.shape, want.shape)
             flips[gi] = (got != want).any(-1).float().mean().item()
-    weights = _weights_by_hf_name(model, flex_cfg, ps)
+    weights = grad_tools.weights_by_hf_name(model, flex_cfg, ps)
     w_worst = max(_rel(w, reference["weights"][n]) for n, w in weights.items())
-    grads = _grads_by_hf_name(model, flex_cfg, ps, dist)
+    grads = grad_tools.grads_by_hf_name(model, flex_cfg, ps, dist)
     for name, g in grads.items():  # reduce to the single-rank convention
-        if _is_routed_expert(name):
+        if grad_tools.is_routed_expert(name):
             # Routed experts see the SP/CP token shards of every rank in their EP group: sum over the expert-DP group
             # (what DDP does), then undo the dp/cp duplication; with tp>1, ep==1 the Experts module already
             # all-reduces its grads over TP.
@@ -235,8 +170,8 @@ def _check_case(flex_cfg, flex_source, reference, dist, *, tp=1, ep=1, pp=1, cp=
             dist.all_reduce(g, group=ps.cp_group)
             g.div_(ps.cp_size)
     assert set(grads) == set(reference["grads"]), (case, set(grads) ^ set(reference["grads"]))
-    grad_cos = _grad_cosines(grads, reference["grads"])
-    (dense_name, dense_cos), (expert_name, expert_cos) = _worst(grad_cos)
+    grad_cos = grad_tools.grad_cosines(grads, reference["grads"])
+    (dense_name, dense_cos), (expert_name, expert_cos) = grad_tools.worst(grad_cos)
 
     # reduce across ranks first so every rank asserts on the same numbers (no collective deadlock)
     stats = torch.tensor([loss_rel, max(layer_rel.values()), max(flips.values()) if flips else 0.0,
@@ -258,18 +193,18 @@ def _check_case(flex_cfg, flex_source, reference, dist, *, tp=1, ep=1, pp=1, cp=
     torch.cuda.empty_cache()
 
 
-def test_tp2_matches_single_rank(flex_cfg, flex_source, reference, dist):
-    _check_case(flex_cfg, flex_source, reference, dist, tp=2)
+def test_tp2_matches_single_rank(flex_cfg, flex_source, reference, dist, grad_tools):
+    _check_case(flex_cfg, flex_source, reference, dist, grad_tools, tp=2)
 
 
-def test_ep2_matches_single_rank(flex_cfg, flex_source, reference, dist):
-    _check_case(flex_cfg, flex_source, reference, dist, ep=2)
+def test_ep2_matches_single_rank(flex_cfg, flex_source, reference, dist, grad_tools):
+    _check_case(flex_cfg, flex_source, reference, dist, grad_tools, ep=2)
 
 
-def test_pp2_matches_single_rank(flex_cfg, flex_source, reference, dist):
-    _check_case(flex_cfg, flex_source, reference, dist, pp=2)
+def test_pp2_matches_single_rank(flex_cfg, flex_source, reference, dist, grad_tools):
+    _check_case(flex_cfg, flex_source, reference, dist, grad_tools, pp=2)
 
 
-def test_cp2_matches_single_rank(flex_cfg, flex_source, reference, dist):
+def test_cp2_matches_single_rank(flex_cfg, flex_source, reference, dist, grad_tools):
     # zigzag chunk of 256 tokens: KV blocks straddle rank boundaries, the global-order gather must fix it up
-    _check_case(flex_cfg, flex_source, reference, dist, cp=2)
+    _check_case(flex_cfg, flex_source, reference, dist, grad_tools, cp=2)
