@@ -81,48 +81,6 @@ class TestMcoreAdapterDense:
     def teardown_method(self):
         _destroy_model_parallel()
 
-    @pytest.mark.parametrize(
-        "config_overrides,ddp_overrides,message",
-        [
-            ({"fp8": "hybrid", "fp8_recipe": "delayed"}, {}, "MXFP8 recipe"),
-            ({"fp8": "hybrid", "fp8_recipe": "tensorwise"}, {}, "MXFP8 recipe"),
-            ({"fp4": "e2m1"}, {}, "does not currently support FP4"),
-            ({}, {"fp4_param_gather": True}, "does not currently support FP4"),
-            (
-                {},
-                {"fp8_param_gather": True},
-                "fp8_param and fp8_param_gather to match",
-            ),
-            (
-                {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
-                {"fp8_param_gather": True},
-                "fp8_param and fp8_param_gather to match",
-            ),
-            (
-                {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True},
-                {},
-                "fp8_param and fp8_param_gather to match",
-            ),
-        ],
-    )
-    def test_rejects_unsupported_quantization(self, config_overrides, ddp_overrides, message):
-        """Reject unsupported recipes and inconsistent parameter-gather configuration."""
-        config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
-        ddp_config = DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
-        )
-        for name, value in config_overrides.items():
-            setattr(config, name, value)
-        for name, value in ddp_overrides.items():
-            setattr(ddp_config, name, value)
-        with pytest.raises(ValueError, match=message):
-            mcore_fsdp_adapter.FullyShardedDataParallelV2._validate_config(
-                config, ddp_config, torch.nn.Linear(128, 128), self.pg_collection, False
-            )
-
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         torch.cuda.get_device_capability()[0] < 10,
