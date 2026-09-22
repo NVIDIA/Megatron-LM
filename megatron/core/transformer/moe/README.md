@@ -498,6 +498,29 @@ FP8 training provides benefits across all three performance walls:
 > **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
 
 
+### GLU Checkpoint Layout
+
+`--moe-mlp-glu-interleave-size 32` makes routed expert activations interpret FC1
+channels as alternating blocks of 32 gate and 32 up channels. Native Megatron-LM
+converts contiguous checkpoint FC1 weights and biases into that runtime layout
+before loading the model and initializing FP32 master weights. Both indexed
+per-expert weights and single grouped weights are supported. Shared experts use
+their separate `--moe-shared-expert-glu-interleave-size` setting when
+`--use-grouped-gemm-for-shared-expert` is enabled.
+
+For `torch` and `torch_dist` checkpoints, model weights are saved in contiguous
+`[all gate | all up]` layout. Optimizer master weights and moments retain their
+runtime layout, recorded in `glu_checkpoint_layout`. Full optimizer resume
+requires the same interleave sizes and the same ETP size for routed experts
+(TP size for shared experts). To change those settings, load model weights with
+`--finetune` or `--no-load-optim` and initialize a new optimizer. This also applies
+when enabling interleaving on a checkpoint saved with a contiguous optimizer.
+
+Legacy native checkpoints without layout metadata use the layout in their saved
+arguments; re-save an interleaved legacy checkpoint with its original TP/ETP
+configuration before resharding its model weights. In-place FSDP loading and
+`torch_dcp` / `fsdp_dtensor` formats are not supported by this conversion.
+
 ### CUDA Graph
 CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:
 
