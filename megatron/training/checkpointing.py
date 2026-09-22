@@ -1121,9 +1121,6 @@ def save_checkpoint(
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
-                with maybe_msc.open(tracker_filename, 'w') as f:
-                    f.write('release' if release else str(iteration))
-
                 # Save run_config.yaml
                 checkpoint_name = get_checkpoint_name(
                     save_dir,
@@ -1151,6 +1148,9 @@ def save_checkpoint(
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
+
+                with maybe_msc.open(tracker_filename, 'w') as f:
+                    f.write('release' if release else str(iteration))
 
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
