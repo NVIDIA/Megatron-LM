@@ -1916,10 +1916,7 @@ def get_dynamic_data_context_parallel_groups(
     """Get the dynamic CP group of ``group_size`` containing the caller rank."""
     # Runtime DCP subdivides the replicate DPxCP domain, not the independent
     # GTP-remat data-distribution axis.
-    if (
-        get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False)
-        == group_size
-    ):
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP

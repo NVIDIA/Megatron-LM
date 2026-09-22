@@ -142,12 +142,21 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/activations.py",
             "megatron/core/transformer/utils.py",
             "megatron/core/transformer/torch_norm.py",
-            "megatron/core/transformer/attention.py",
         ),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
-        "L2Norm._norm (row reduction) and Attention._apply_output_gate.",
+        "L2Norm._norm (row reduction).",
+    ),
+    KernelEntry(
+        name="attention_kernels_and_dispatch",
+        sources=("megatron/core/transformer/attention.py",),
+        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        kind="dispatch",
+        notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
+        "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
+        "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
+        "test_runtime_cp_attention.py.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -251,10 +260,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="transformer_engine_wrappers",
         sources=("megatron/core/extensions/transformer_engine.py",),
-        tests=(K + "test_te_wrappers.py", C + "test_fp8_determinism.py"),
+        tests=(
+            K + "test_te_wrappers.py",
+            C + "test_fp8_determinism.py",
+            K + "test_runtime_cp_attention.py",
+        ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
-        "FP8/FP4 recipes in the model-level suite.",
+        "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
+        "replayed through packed SelfAttention in test_runtime_cp_attention.py.",
     ),
     KernelEntry(
         name="kitchen_extension",
