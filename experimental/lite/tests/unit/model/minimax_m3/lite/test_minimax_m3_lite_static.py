@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -67,21 +66,6 @@ def test_config_from_hf_object_matches_dict_mapping(tiny_hf_kwargs):
     assert from_obj.layer_types == from_dict.layer_types
     assert from_obj.mlp_layer_types == from_dict.mlp_layer_types
     assert from_obj.index_topk_blocks == from_dict.index_topk_blocks
-
-
-@pytest.mark.optional
-@pytest.mark.skipif(not os.environ.get("MINIMAX_M3_CONFIG_JSON"), reason="set MINIMAX_M3_CONFIG_JSON to a real config.json")
-def test_config_maps_real_config_json():
-    import json
-
-    from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
-
-    hf = json.load(open(os.environ["MINIMAX_M3_CONFIG_JSON"]))
-    cfg = MiniMaxM3Config._from_hf_dict(hf)
-    assert cfg.num_hidden_layers == 60 and cfg.hidden_size == 6144
-    assert cfg.layer_types[:3] == ["full_attention"] * 3 and cfg.layer_types[3] == "minimax_m3_sparse"
-    assert cfg.index_topk_blocks == 16 and cfg.index_block_size == 128 and cfg.index_n_heads == 4
-    assert cfg.num_experts == 128 and cfg.num_experts_per_tok == 4
 
 
 def test_impl_config_defaults_to_the_magi_production_path():

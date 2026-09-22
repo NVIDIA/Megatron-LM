@@ -30,8 +30,7 @@ def msa(task, implementation, config, reference, budget):
             "indexer is a pure selector: no gradient path, no auxiliary loss (frozen, requires_grad=False)",
             "index-Q sharded like KV heads, index-K single head replicated on every TP rank",
         ],
-        "reference": reference or "HF MiniMaxM3VLAttention (bf16, same weights) and the pure-torch masked-attention "
-                                  "reference inside tests/unit/primitive/modules/attention/test_msa_reference_unit.py",
+        "reference": reference or "HF MiniMaxM3VLAttention (bf16, same weights) and the fp32 masked-dense attention on the same block selection",
     }
     implementation_contract = {
         "details": ["MSAIndexer (Gemma-norm + partial RoPE + fp32 block max-pool + top-k); MSAIndexer.index_qk = projections only",

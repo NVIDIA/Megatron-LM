@@ -7,12 +7,7 @@ mean relative |delta| over the steps and over the last 10 steps both < 1%. The i
 bitwise unchanged after training on every layout (frozen selector; ``kl_loss_coeff=0`` alone would not
 guarantee this).
 
-Optional (explicit selection only):
-* ``test_bench_step_time_and_memory`` records step time / peak memory at 16K tokens; the ``all_msa`` variant
-  routes every layer through MSA to attribute the cost to the MSA path alone.
-* ``test_deterministic_mode_reproduces_bitwise``: ``ImplConfig.deterministic=True`` (ordered msa_v1
-  backward) must reproduce loss and grad-norm bitwise across two identical runs; ``deterministic=False``
-  is recorded for reference. Runs on the all-MSA model because the dense layers' fa4 backward is unordered.
+Optional: ``ImplConfig.deterministic=True`` must reproduce loss and grad-norm bitwise across two runs (all-MSA model).
 """
 
 from __future__ import annotations
@@ -192,21 +187,6 @@ def test_train_curve_tracks_dp_baseline(magi_cfg, magi_source, baseline, dist, n
     assert tail_rel < CURVE_REL, (name, tail_rel)
 
 
-@pytest.mark.optional
-@pytest.mark.parametrize("layers", ["full", "all_msa"])
-@pytest.mark.parametrize("cp", [1, 2])
-def test_bench_step_time_and_memory(magi_cfg, magi_hf_kwargs, magi_source, dist, layers, cp):
-    from megatron.lite.runtime.contracts.config import ParallelConfig
-
-    _deps(dist)
-    seq_len = 16384
-    cfg = magi_cfg if layers == "full" else _all_msa_config(magi_hf_kwargs)
-    _, _, st = _train(cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), steps=6, seq_len=seq_len,
-                      load=layers == "full")
-    if dist.get_rank() == 0:
-        print(f"BENCH {layers} S={seq_len} cp{cp}: {st.step_ms:.0f} ms/step, peak {st.peak_gib:.2f} GiB", flush=True)
-
-
 def _first_divergence(a, b):
     for i, (x, y) in enumerate(zip(a, b)):
         if x != y:
@@ -221,20 +201,14 @@ def test_deterministic_mode_reproduces_bitwise(magi_hf_kwargs, magi_source, dist
 
     _deps(dist)
     steps, cfg = 20, _all_msa_config(magi_hf_kwargs)
-    runs = {}
-    for det in (True, False):
-        (l0, n0, st0), (l1, n1, st1) = [
-            _train(cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), steps=steps, load=False, deterministic=det)
-            for _ in range(2)
-        ]
-        same = torch.tensor([int(l0 == l1 and n0 == n1)], device="cuda")
-        dist.all_reduce(same, op=dist.ReduceOp.MIN)
-        runs[det] = SimpleNamespace(same=bool(same.item()), loss_div=_first_divergence(l0, l1),
-                                    norm_div=_first_divergence(n0, n1), step_ms=(st0.step_ms + st1.step_ms) / 2)
-    d, nd = runs[True], runs[False]
+    (l0, n0, st0), (l1, n1, st1) = [
+        _train(cfg, magi_source, ParallelConfig(tp=1, ep=1, etp=1, pp=1, cp=cp), steps=steps, load=False, deterministic=True)
+        for _ in range(2)
+    ]
+    same = torch.tensor([int(l0 == l1 and n0 == n1)], device="cuda")
+    dist.all_reduce(same, op=dist.ReduceOp.MIN)
     if dist.get_rank() == 0:
-        print(f"\ndeterministic all_msa cp{cp} ({steps} steps): det=True bitwise={'yes' if d.same else 'NO'} "
-              f"(first divergence {d.loss_div}/{d.norm_div}) {d.step_ms:.0f} ms/step | det=False bitwise="
-              f"{'yes' if nd.same else 'no'} (first divergence {nd.loss_div}/{nd.norm_div}) {nd.step_ms:.0f} ms/step | "
-              f"det/nondet step-time x{d.step_ms / nd.step_ms:.2f}", flush=True)
-    assert d.same, (cp, d)
+        print(f"\ndeterministic all_msa cp{cp} ({steps} steps): bitwise={'yes' if same.item() else 'NO'} "
+              f"(first divergence loss {_first_divergence(l0, l1)} / gnorm {_first_divergence(n0, n1)}) "
+              f"{(st0.step_ms + st1.step_ms) / 2:.0f} ms/step", flush=True)
+    assert same.item(), cp
