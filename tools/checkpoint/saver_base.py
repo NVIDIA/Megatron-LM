@@ -8,7 +8,6 @@ import torch
 from packaging.version import Version as PkgVersion
 from utils import chunk_bias, chunk_weight, initialize_checkpoint_converter_fake_process_groups
 
-
 class MegatronCheckpointSaverBase:
     """Orchestrates saving a Megatron checkpoint using parameters received on a multiprocessing queue.
 
@@ -66,6 +65,10 @@ class MegatronCheckpointSaverBase:
                 'tensor_model_parallel_size',
                 'pipeline_model_parallel_size',
                 'expert_model_parallel_size',
+                'tensor_parallel_num_weight_shards',
+                'gtp_weight_remat_size',
+                'expert_tensor_parallel_num_weight_shards',
+                'expert_gtp_weight_remat_size',
                 'world_size',
                 'params_dtype',
                 'num_layers_per_virtual_pipeline_stage',
@@ -201,14 +204,14 @@ class MegatronCheckpointSaverBase:
         mpu.set_tensor_model_parallel_rank(0)
         mpu.set_pipeline_model_parallel_rank(0)
         mpu.set_expert_model_parallel_rank(0)
-        
+
         initialize_checkpoint_converter_fake_process_groups(
             mpu,
             self.args.target_tensor_parallel_size,
             self.args.target_pipeline_parallel_size,
             self.args.target_expert_parallel_size,
         )
-        
+
         try:
             import torch_llm_debug_tools
 
