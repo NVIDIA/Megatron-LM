@@ -369,6 +369,37 @@ def test_load_args_restores_gdp_num_householder_from_checkpoint(
     assert restored_args.gdp_num_householder == expected_num_householder
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_args", "configured_scale", "expected_scale"),
+    [
+        (SimpleNamespace(activation_func_tanh_clamp_scale=16.0), None, 16.0),
+        (SimpleNamespace(activation_func_tanh_clamp_scale=16.0), 1.0, 16.0),
+        (SimpleNamespace(), 4.0, 4.0),
+    ],
+    ids=["restored", "overrides-command-line", "absent-keeps-command-line"],
+)
+def test_load_args_restores_activation_func_tanh_clamp_scale_from_checkpoint(
+    checkpoint_args, configured_scale, expected_scale
+):
+    """The checkpoint's clamp scale overrides the command line (force=True), like squared_relu."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        activation_func_tanh_clamp_scale=configured_scale,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.activation_func_tanh_clamp_scale == expected_scale
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
@@ -398,7 +429,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
-    args.async_strategy = "mcore"
+    args.async_strategy = "nvrx"
     args.data_parallel_random_init = False
     args.no_save_optim = False
     args.no_save_rng = False

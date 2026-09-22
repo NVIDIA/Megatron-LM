@@ -1,10 +1,10 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Inspect sample keys and time the Energon multimodal data pipeline without training a model."""
+
 import faulthandler
 import os
-import sys
 import time
-from collections import defaultdict
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -12,14 +12,13 @@ import tqdm
 from data_loading.task_encoder import MultiModalTaskEncoder
 from multimodal_args import add_multimodal_extra_args
 
-from megatron.core import parallel_state
 from megatron.energon import FileStoreCachePool, WorkerConfig, get_savable_loader, get_train_dataset
-from megatron.training import get_args, get_tokenizer
+from megatron.training import get_args
 from megatron.training.initialize import initialize_megatron
 
 
 def main():
-    # Initalize and get arguments, timers, and Tensorboard writer.
+    """Initialize CPU-side data loading and report sample keys and iteration timings."""
     faulthandler.enable()
     print(f"PID: {os.getpid()}")
 
@@ -32,20 +31,10 @@ def main():
         skip_mpu_initialization=True,
     )
 
-    # This requires not to skip mpu initialization.
-    # rank = parallel_state.get_data_parallel_rank()
-    # world_size = parallel_state.get_data_parallel_world_size()
-    # try:
-    #     data_parallel_group = parallel_state.get_data_parallel_group()
-    # except Exception as e:
-    #     print(f"Error getting data parallel group: {e}")
-    #     data_parallel_group = None
+    # No model-parallel groups are initialized; shard data across all launched ranks.
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     data_parallel_group = torch.distributed.group.WORLD
-    # rank = 0
-    # world_size = 1
-    # data_parallel_group = None
 
     args = get_args()
 
@@ -56,8 +45,6 @@ def main():
         world_size=world_size,
         num_workers=args.num_workers,
         data_parallel_group=data_parallel_group,
-        # worker_debug_path=str(Path('tmpdata/energon-dbg-{worker_id:02}-{pid}.jsonl').absolute()),
-        # worker_log_level=2,
     )
 
     print(f"worker_config: {worker_config}")
@@ -85,7 +72,6 @@ def main():
 
     total_samples = 0
 
-    # gc.freeze()
     step = -1
     start = time.time()
     try:
@@ -98,15 +84,9 @@ def main():
                 pbar.update(batch['samples_seen'].item())
                 total_samples += batch['samples_seen'].item()
 
-                # tokenizer = get_tokenizer()
-                # print("-" * 20)
-                # print(f"Sample {batch['__key__']} Images {batch['num_tiles']}:")
-                # print(tokenizer.detokenize(batch['tokens'][0]))
-                # print("-" * 20)
                 print(f"Step {step} {batch['__key__']}")
 
                 start = time.time()
-                # gc.collect()
                 if total_samples >= len(train_dataloader):
                     break
     finally:

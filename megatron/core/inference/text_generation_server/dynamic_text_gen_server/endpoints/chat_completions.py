@@ -426,7 +426,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
     return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
-def _sanitize_messages_for_template(messages):
+def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
     This only normalizes tool-call argument payloads inside each message:
@@ -444,7 +444,11 @@ def _sanitize_messages_for_template(messages):
     if not isinstance(messages, list):
         return messages
     sanitized = []
-    for message in messages:
+    media_modalities_by_message = {}
+    for _sentinel, modality, message_index in media_slots:
+        media_modalities_by_message.setdefault(message_index, set()).add(modality)
+
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             sanitized.append(message)
             continue
@@ -462,7 +466,21 @@ def _sanitize_messages_for_template(messages):
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
-            msg_copy["content"] = "".join(text_chunks)
+            separator = ""
+            message_modalities = media_modalities_by_message.get(message_index, set())
+            if message_modalities:
+                if prompt_config is None:
+                    raise ValueError("Media content normalization requires a prompt config.")
+                separators = {
+                    prompt_config.get_spec(modality).content_part_separator
+                    for modality in message_modalities
+                }
+                if len(separators) != 1:
+                    raise ValueError(
+                        "Media types in one message must use the same content-part separator."
+                    )
+                separator = separators.pop()
+            msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:
@@ -740,7 +758,7 @@ try:
     bp = Blueprint('chat_completions_api', __name__)
 
     def apply_parsers(
-        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
+        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None, finished=True
     ):
         """Runs CPU-intensive text parsing."""
         for parser in parsers_list:
@@ -767,6 +785,7 @@ try:
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
                 implicit_reasoning_end_markers=implicit_reasoning_end_markers,
+                finished=finished,
             )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
@@ -826,7 +845,7 @@ try:
             multi_modal_data = {"image": image_bytes_list}
         elif video_bytes_list:
             multi_modal_data = {"video": video_bytes_list}
-        template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
         template_tools = _sanitize_tools_for_template(tools)
 
         # The exact tokens of the previous turn can come from one of two places, never both:
@@ -1124,13 +1143,14 @@ try:
                     else ()
                 )
 
-                def parse_streaming_text(text):
+                def parse_streaming_text(text, finished=False):
                     parsed_text, metadata = apply_parsers(
                         text,
                         tools,
                         parsers,
                         tools_requested,
                         chat_template_kwargs=chat_template_kwargs,
+                        finished=finished,
                     )
                     metadata["tool_calls"] = _maybe_filter_parallel_tool_calls(
                         metadata.get("tool_calls", []), parallel_tool_calls

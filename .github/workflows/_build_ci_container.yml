@@ -107,6 +107,9 @@ jobs:
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      # GitHub dev CI runs on Hopper and Blackwell; other callers retain the Dockerfile default.
+      NVTE_CUDA_ARCHS: "90;100"
     permissions:
       contents: read
       id-token: write
@@ -266,6 +269,9 @@ jobs:
                 "build-arg:FROM_IMAGE_NAME=$FROM_IMAGE_NAME" \
                 "build-arg:IMAGE_TYPE=$IMAGE_TYPE" \
                 "automatic-build-arg:TARGETARCH=$TARGET_ARCH"
+              if [ "$CACHE_VARIANT" != "lts" ]; then
+                printf '%s\n' "build-arg:NVTE_CUDA_ARCHS=$NVTE_CUDA_ARCHS"
+              fi
               sha256sum "${BUILD_INPUTS[@]}"
             } | sha256sum | cut -c1-32
           )
@@ -331,6 +337,7 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
+            ${{ !inputs.lts && format('NVTE_CUDA_ARCHS={0}', env.NVTE_CUDA_ARCHS) || '' }}
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
