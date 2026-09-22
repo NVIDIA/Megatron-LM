@@ -74,6 +74,7 @@ def _make_gpt_args(
     args.moe_shared_expert_intermediate_size = None
     args.mtp_num_layers = None
     args.mtp_use_repeated_layer = False
+    args.mtp_repeated_layer_shared_components = None
     # Linear attention disabled.
     args.experimental_attention_variant = None
     args.linear_attention_freq = None
@@ -353,6 +354,26 @@ class TestQwen35VisionFlops:
         args.count_vision_model_flops = False
         args.vision_flops_variant = "unknown"
         assert num_floating_point_operations(args, batch_size=2) == decoder_flops
+
+
+class TestMTPE2ETVFlops:
+    """E2E TV adds one frozen target-output projection to the FLOPs count."""
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_counts_one_forward_only_target_projection(self, hybrid):
+        args = _make_hybrid_args() if hybrid else _make_gpt_args()
+        args.mtp_num_layers = 3
+        args.mtp_loss_type = "cross_entropy"
+        batch_size = 2
+        cross_entropy_flops = num_floating_point_operations(args, batch_size)
+
+        args.mtp_loss_type = "e2e_tv"
+        e2e_tv_flops = num_floating_point_operations(args, batch_size)
+
+        expected_extra = (
+            2 * batch_size * args.seq_length * args.hidden_size * args.padded_vocab_size
+        )
+        assert e2e_tv_flops - cross_entropy_flops == expected_extra
 
 
 class TestTHDScaling:
@@ -1920,6 +1941,75 @@ class TestDSA:
         num_floating_point_operations(args, batch_size=2)
 
         assert observed_indexer_executions == [expected_indexer_executions]
+
+    def test_repeated_mtp_component_sharing(self):
+        """Each selected component removes only its own later-depth work."""
+        args = _make_dsa_args()
+        args.mtp_num_layers = 3
+        args.mtp_use_repeated_layer = True
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        args.mtp_repeated_layer_shared_components = []
+        unshared = num_floating_point_operations(args, batch_size)
+
+        args.mtp_repeated_layer_shared_components = ["latent_kv"]
+        latent_shared = num_floating_point_operations(args, batch_size)
+
+        args.mtp_repeated_layer_shared_components = ["sparse_attention_index"]
+        index_shared = num_floating_point_operations(args, batch_size)
+
+        args.mtp_repeated_layer_shared_components = ["latent_kv", "sparse_attention_index"]
+        both_shared = num_floating_point_operations(args, batch_size)
+
+        num_consumer_depths = args.mtp_num_layers - 1
+        expected_latent_savings = (
+            total_tokens
+            * 3
+            * 2
+            * num_consumer_depths
+            * (
+                args.hidden_size * (args.kv_lora_rank + args.qk_pos_emb_head_dim)
+                + args.kv_lora_rank
+            )
+        )
+        index_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+        index_token_term = (
+            2
+            * 2
+            * (
+                args.q_lora_rank * index_dim
+                + args.hidden_size * args.dsa_indexer_head_dim
+                + args.hidden_size * args.dsa_indexer_n_heads
+            )
+        )
+        index_core_term = 3 * 2 * index_dim / 2
+        expected_index_savings = num_consumer_depths * (
+            total_tokens * index_token_term + sum_sq * index_core_term
+        )
+
+        assert unshared - latent_shared == expected_latent_savings
+        assert unshared - index_shared == expected_index_savings
+        assert unshared - both_shared == expected_latent_savings + expected_index_savings
+
+    def test_repeated_mtp_uses_one_global_layer_number_for_index_schedule(self):
+        """A repeated skip layer must not be counted as fictitious later MTP layers."""
+        from megatron.training.training import _num_dsa_indexer_layers
+
+        # Decoder layers 1..3 compute. Repeated MTP layer 4 is a skip layer at
+        # every depth; fictitious global layers 5..8 must not enter the count.
+        assert (
+            _num_dsa_indexer_layers(
+                3,
+                skip_topk_offset=3,
+                topk_freq=4,
+                mtp_num_layers=5,
+                mtp_use_repeated_layer=True,
+                mtp_shares_sparse_attention_index=False,
+            )
+            == 3
+        )
 
     def test_topk_caps_long_context_growth(self):
         """Pin the bug: a long sequence must not be charged dense ``L^2 / 2``.

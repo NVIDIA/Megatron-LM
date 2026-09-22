@@ -164,6 +164,155 @@ def test_layerwise_param_sync_subset_excludes_distopt_buckets():
     assert calls == [(layerwise_group, True)]
 
 
+def test_layerwise_step_uses_synchronous_grad_buffer_param_sync(monkeypatch):
+    """Compact MXFP8 sync must avoid the allocating legacy all-gather path."""
+
+    events = []
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.overlap_param_gather = False
+    optimizer.use_buffer_param_sync = False
+    optimizer.use_grad_buffer_param_sync = True
+    optimizer.start_param_sync_for_bucket_group_subset = lambda force_sync=False: events.append(
+        ("grad-buffer", force_sync)
+    )
+    optimizer.allgather_params = lambda: events.append(("legacy", False))
+    monkeypatch.setattr(ChainedOptimizer, "step_with_ready_grads", lambda _self: True)
+
+    assert LayerWiseDistributedOptimizer.step_with_ready_grads(optimizer)
+    assert events == [("grad-buffer", True)]
+
+
+def test_synchronous_layerwise_param_sync_reuses_grad_storage(monkeypatch):
+    """The no-overlap path receives every owner directly into the existing grad buffer."""
+
+    import megatron.core.distributed.param_and_grad_buffer as param_and_grad_buffer
+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
+
+    local_param = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.bfloat16))
+    local_param.main_param = torch.tensor([1.5, 2.5], dtype=torch.float32)
+    remote_param = nn.Parameter(torch.tensor([3.0, 4.0], dtype=torch.bfloat16))
+    grad_data = torch.full((4,), 9.0, dtype=torch.bfloat16)
+    bucket = SimpleNamespace(
+        params_list=[local_param, remote_param],
+        layerwise_params_list=[[local_param], [remote_param]],
+        layerwise_param_flat_sizes=[2, 2],
+        layerwise_gather_list=None,
+        grad_data=grad_data,
+    )
+    bucket_group = object.__new__(_ParamAndGradBucketGroup)
+    bucket_group.buckets = [bucket]
+    bucket_group.ddp_config = SimpleNamespace(
+        use_distributed_optimizer=False,
+        overlap_param_gather=False,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        use_layer_wise_param_layout=False,
+    )
+    bucket_group.intra_distributed_optimizer_instance_rank = 0
+    bucket_group.intra_distributed_optimizer_instance_size = 2
+    bucket_group.intra_distributed_optimizer_instance_group = object()
+    bucket_group.param_gather_handle = None
+    bucket_group.param_gather_dispatched = False
+
+    # Exercise the actual compact-MXFP8 branch without requiring Transformer Engine
+    # quantized tensors in this CPU storage/lifecycle test.
+    monkeypatch.setattr(param_and_grad_buffer, "is_float8tensor", lambda _param: True)
+    monkeypatch.setattr(
+        param_and_grad_buffer,
+        "copy_back_gathered_bf16_into_fp8_param",
+        lambda model_param, gathered: model_param.data.copy_(gathered),
+    )
+
+    def fake_all_gather_into_tensor(output, src, *, group, async_op):
+        assert group is bucket_group.intra_distributed_optimizer_instance_group
+        assert async_op is False
+        assert src.data_ptr() == grad_data.data_ptr()
+        assert output.data_ptr() == grad_data.data_ptr()
+        output[:2].copy_(src)
+        output[2:].fill_(7.0)
+
+    monkeypatch.setattr(param_and_grad_buffer, "dist_all_gather_func", fake_all_gather_into_tensor)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather",
+        lambda *_args, **_kwargs: pytest.fail("equal-size path must not use list all_gather"),
+    )
+
+    bucket_group.start_param_sync(force_sync=True)
+
+    torch.testing.assert_close(local_param, torch.tensor([1.5, 2.5], dtype=torch.bfloat16))
+    torch.testing.assert_close(remote_param, torch.tensor([7.0, 7.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(grad_data, torch.zeros_like(grad_data))
+    assert bucket.layerwise_gather_list is None
+    assert bucket_group.param_gather_dispatched is True
+
+
+def test_synchronous_layerwise_param_sync_preserves_uneven_owner_sizes(monkeypatch):
+    """Uneven owners use the list collective with receive views in the same grad arena."""
+
+    import megatron.core.distributed.param_and_grad_buffer as param_and_grad_buffer
+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
+
+    local_param = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.bfloat16))
+    remote_param = nn.Parameter(torch.tensor([3.0], dtype=torch.bfloat16))
+    grad_data = torch.full((3,), 9.0, dtype=torch.bfloat16)
+    bucket = SimpleNamespace(
+        params_list=[local_param, remote_param],
+        layerwise_params_list=[[local_param], [remote_param]],
+        layerwise_param_flat_sizes=[2, 1],
+        layerwise_gather_list=None,
+        grad_data=grad_data,
+    )
+    bucket_group = object.__new__(_ParamAndGradBucketGroup)
+    bucket_group.buckets = [bucket]
+    bucket_group.ddp_config = SimpleNamespace(
+        use_distributed_optimizer=False,
+        overlap_param_gather=False,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        use_layer_wise_param_layout=False,
+    )
+    bucket_group.intra_distributed_optimizer_instance_rank = 0
+    bucket_group.intra_distributed_optimizer_instance_size = 2
+    bucket_group.intra_distributed_optimizer_instance_group = object()
+    bucket_group.param_gather_handle = None
+    bucket_group.param_gather_dispatched = False
+
+    monkeypatch.setattr(param_and_grad_buffer, "is_float8tensor", lambda _param: True)
+    monkeypatch.setattr(
+        param_and_grad_buffer,
+        "copy_back_gathered_bf16_into_fp8_param",
+        lambda model_param, gathered: model_param.data.copy_(gathered),
+    )
+
+    def fake_all_gather(gather_list, src, *, group, async_op):
+        assert group is bucket_group.intra_distributed_optimizer_instance_group
+        assert async_op is False
+        assert src.data_ptr() == grad_data.data_ptr()
+        assert [view.numel() for view in gather_list] == [2, 1]
+        assert all(
+            view.untyped_storage().data_ptr() == grad_data.untyped_storage().data_ptr()
+            for view in gather_list
+        )
+        gather_list[0].copy_(src)
+        gather_list[1].fill_(7.0)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        param_and_grad_buffer,
+        "dist_all_gather_func",
+        lambda *_args, **_kwargs: pytest.fail(
+            "uneven-size path must not use all_gather_into_tensor"
+        ),
+    )
+
+    bucket_group.start_param_sync(force_sync=True)
+
+    torch.testing.assert_close(local_param, torch.tensor([1.0, 2.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(remote_param, torch.tensor([7.0], dtype=torch.bfloat16))
+    torch.testing.assert_close(grad_data, torch.zeros_like(grad_data))
+    assert bucket.layerwise_gather_list is None
+    assert bucket_group.param_gather_dispatched is True
+
+
 def test_outer_chain_only_syncs_children_requiring_master_before_offload():
     calls = []
 

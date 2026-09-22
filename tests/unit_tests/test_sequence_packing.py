@@ -18,6 +18,7 @@ from megatron.core.datasets.data_schedule import (
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    build_packed_microbatches,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
@@ -52,6 +53,38 @@ def test_scheduler_max_real_num_seqs_rejects_dummy_without_capacity():
 
     with pytest.raises(ValueError, match="includes that dummy sequence"):
         _get_scheduler_max_real_num_seqs(config)
+
+
+@pytest.mark.parametrize("dynamic_cp", [False, True])
+@pytest.mark.parametrize(("padded_lengths", "expected_min_chunk"), [((8, 12), 2), ((8, 10), 0)])
+def test_build_packed_microbatches_certifies_zigzag_chunk_size(
+    dynamic_cp, padded_lengths, expected_min_chunk
+):
+    """The host schedule emits one conservative certificate for each packed batch."""
+    samples = {
+        sample_id: {
+            "original_seq_len": torch.tensor([padded_length - 1], dtype=torch.int32),
+            "padded_seq_len": torch.tensor([padded_length], dtype=torch.int32),
+        }
+        for sample_id, padded_length in enumerate(padded_lengths)
+    }
+    sample_id_groups = [[[0, 1], [0, 1]]]
+
+    packed = build_packed_microbatches(
+        samples,
+        sample_id_groups,
+        dcp_rank=0,
+        dev=torch.device("cpu"),
+        is_dynamic_cp=dynamic_cp,
+        global_id_seqlens=list(enumerate(padded_lengths)),
+    )
+
+    assert len(packed) == 1
+    assert packed[0]["zigzag_cp_min_chunk_size"].item() == expected_min_chunk
+    if dynamic_cp:
+        assert packed[0]["local_cp_size"].item() == 2
+    else:
+        assert "local_cp_size" not in packed[0]
 
 
 def test_scheduler_thd_padding_mask_from_cu_seqlens():

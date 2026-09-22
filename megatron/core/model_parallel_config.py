@@ -394,8 +394,9 @@ class ModelParallelConfig:
 
     This preserves variable-sequence-length semantics for sequence packing while using
     ``max_seqlen_per_dp_cp_rank`` to determine the pipeline receive-buffer shape. It requires a
-    sequence-packing scheduler, maximum-size packed-sequence padding, and static context
-    parallelism.
+    sequence-packing scheduler and maximum-size packed-sequence padding. Dynamic context
+    parallelism is rejected unless the transformer full-iteration CUDA-graph path performs its
+    stricter per-slot topology certification.
 
     Supported only by ``forward_backward_pipelining_without_interleaving``, the sole caller of
     ``get_tensor_shapes()`` where the fixed packed shape is derived. The interleaved (VPP)
@@ -595,9 +596,12 @@ class ModelParallelConfig:
         if self.pipeline_p2p_fixed_shape:
             if self.sequence_packing_scheduler is None:
                 raise ValueError("pipeline_p2p_fixed_shape requires a sequence_packing_scheduler.")
-            if self.dynamic_context_parallel:
+            if self.dynamic_context_parallel and getattr(self, "cuda_graph_impl", None) != (
+                "full_iteration"
+            ):
                 raise ValueError(
-                    "pipeline_p2p_fixed_shape is not supported with dynamic_context_parallel."
+                    "pipeline_p2p_fixed_shape with dynamic_context_parallel is only supported "
+                    "by the full-iteration CUDA-graph static-certificate path."
                 )
             # Must precede the alignment comparison below: when both fields are unset that
             # comparison is `None not in ("max", None)` -> False, so validation would pass and

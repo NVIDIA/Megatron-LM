@@ -29,6 +29,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
@@ -56,6 +57,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_logging import
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -581,6 +583,20 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=warmup_steps
             )
 
+    def test_full_iteration_paged_stash_requires_two_warmup_steps(self):
+        kwargs = dict(
+            cuda_graph_impl="full_iteration",
+            cuda_graph_modules=[],
+            moe_expert_capacity_factor=1.0,
+            moe_pad_expert_input_to_capacity=True,
+        )
+        for warmup_steps in (0, 1):
+            with pytest.raises(AssertionError, match="at least two eager warmup steps"):
+                _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=warmup_steps, **kwargs)
+
+        config = _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=2, **kwargs)
+        assert config.cuda_graph_warmup_steps == 2
+
     @pytest.mark.parametrize(
         "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
     )
@@ -629,6 +645,142 @@ class TestCudaGraphConfigAndArguments:
             _base_cuda_graph_config(
                 cuda_graph_impl='full_iteration', cuda_graph_modules=[CudaGraphModule.attn]
             )
+
+    def test_thd_full_iteration_cp_requires_eager_warmup(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "THD full-iteration CUDA graph with context parallelism requires "
+                "cuda_graph_warmup_steps > 0"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=0,
+                context_parallel_size=2,
+                sequence_packing_scheduler='dp_balanced',
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_thd_full_iteration_cp1_allows_zero_warmup(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='full_iteration',
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=0,
+            context_parallel_size=1,
+            sequence_packing_scheduler='dp_balanced',
+            pad_packed_seq_alignment='max',
+            max_seqlen_per_dp_cp_rank=64,
+            thd_max_packed_sequences=8,
+        )
+
+        assert cfg.pipeline_p2p_fixed_shape
+
+    def test_thd_full_iteration_dynamic_cp_requires_static_certificate_opt_in(self):
+        with pytest.raises(AssertionError, match="requires --cuda-graph-static-dynamic-cp"):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=1,
+                context_parallel_size=2,
+                dynamic_context_parallel=True,
+                sequence_packing_scheduler='default_dynamic_cp',
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_thd_full_iteration_dynamic_cp_allows_static_certificate_path(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='full_iteration',
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=1,
+            context_parallel_size=2,
+            dynamic_context_parallel=True,
+            sequence_packing_scheduler='default_dynamic_cp',
+            cuda_graph_static_dynamic_cp=True,
+            pad_packed_seq_alignment='max',
+            max_seqlen_per_dp_cp_rank=64,
+            thd_max_packed_sequences=8,
+        )
+
+        assert cfg.dynamic_context_parallel
+        assert cfg.cuda_graph_static_dynamic_cp
+        assert cfg.pipeline_p2p_fixed_shape
+
+    def test_thd_full_iteration_dynamic_cp_defaults_scheduler_before_fixed_shape(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='full_iteration',
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=1,
+            context_parallel_size=2,
+            dynamic_context_parallel=True,
+            cuda_graph_static_dynamic_cp=True,
+            pad_packed_seq_alignment='max',
+            max_seqlen_per_dp_cp_rank=64,
+            thd_max_packed_sequences=8,
+        )
+
+        assert cfg.sequence_packing_scheduler == 'default_dynamic_cp'
+        assert cfg.pipeline_p2p_fixed_shape
+
+    def test_thd_full_iteration_static_dynamic_cp_flag_requires_dynamic_cp(self):
+        with pytest.raises(AssertionError, match="requires --dynamic-context-parallel"):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=1,
+                sequence_packing_scheduler='dp_balanced',
+                cuda_graph_static_dynamic_cp=True,
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_static_dynamic_cp_flag_requires_default_dynamic_cp_scheduler(self):
+        # ModelParallelConfig owns the dynamic-CP scheduler contract and runs
+        # before the full-iteration-specific validation below.
+        with pytest.raises(
+            ValueError,
+            match="Dynamic context parallelism requires sequence_packing_scheduler=default_dynamic_cp",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=1,
+                context_parallel_size=2,
+                dynamic_context_parallel=True,
+                sequence_packing_scheduler='dp_balanced',
+                cuda_graph_static_dynamic_cp=True,
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    @pytest.mark.parametrize('cuda_graph_impl', ['none', 'local'])
+    def test_static_dynamic_cp_flag_rejects_non_full_iteration_impl(self, cuda_graph_impl):
+        with pytest.raises(
+            AssertionError, match="only valid with cuda_graph_impl='full_iteration'"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_modules=[],
+                context_parallel_size=2,
+                dynamic_context_parallel=True,
+                sequence_packing_scheduler='default_dynamic_cp',
+                cuda_graph_static_dynamic_cp=True,
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_static_dynamic_cp_cli_is_explicit_opt_in(self, monkeypatch):
+        monkeypatch.setattr(sys, 'argv', ['test_cuda_graphs.py', '--cuda-graph-static-dynamic-cp'])
+        args = parse_args()
+        assert args.cuda_graph_static_dynamic_cp
 
     def test_full_iteration_scope_string_in_config_migrated(self):
         with pytest.warns(DeprecationWarning, match="deprecated"):
@@ -2602,6 +2754,145 @@ class TestPartialCudaGraph:
             self.cuda_graph_helper = None
 
         return torch.tensor(loss_list)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_mtp_thd_partial_cudagraph_replay_changed_boundaries(self):
+        """TE partial replay refreshes same-shape THD boundaries for prepared MTP rows."""
+        self.seq_length = 32
+        self.micro_batch_size = 1
+        self.tp_size = 1
+        self.cp_size = 1
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, context_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        boundaries_per_step = ([0, 8, 16, 32], [0, 4, 16, 32], [0, 8, 16, 32])
+
+        def position_ids_for(boundaries):
+            position_ids = torch.empty(self.seq_length, dtype=torch.int64, device="cuda")
+            for start, end in zip(boundaries, boundaries[1:]):
+                position_ids[start:end] = torch.arange(end - start, device="cuda")
+            return position_ids.unsqueeze(0)
+
+        def run(cuda_graph_impl):
+            args = self.create_test_args(
+                cuda_graph_impl,
+                [CudaGraphModule.attn] if cuda_graph_impl == "transformer_engine" else None,
+                0,
+                1,
+                global_batch_size=torch.distributed.get_world_size(),
+                max_position_embeddings=32,
+                max_seqlen_per_dp_cp_rank=32,
+                mtp_num_layers=3,
+                fp8=None,
+                first_last_layers_bf16=False,
+                create_attention_mask_in_dataloader=False,
+                sequence_packing_scheduler="dp_balanced",
+                moe_token_dispatcher_type="alltoall",
+                pad_packed_seq_alignment="max",
+                thd_max_packed_sequences=3,
+                transformer_impl="transformer_engine",
+            )
+            set_args(args)
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(123)
+            input_ids = torch.arange(self.seq_length, dtype=torch.int64, device="cuda").unsqueeze(0)
+            labels = (input_ids + 1).clone()
+            loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+            padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            gpt_model, optimizer, _ = setup_model_and_optimizer(
+                ModelType.encoder_or_decoder, self.model_provider
+            )
+            assert len(gpt_model) == 1
+            MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+
+            if cuda_graph_impl == "transformer_engine":
+                self.cuda_graph_helper = TECudaGraphHelper(
+                    model=gpt_model,
+                    config=gpt_model[0].config,
+                    seq_length=self.seq_length,
+                    micro_batch_size=self.micro_batch_size,
+                    optimizers=[optimizer],
+                )
+                self.cuda_graph_helper.create_cudagraphs()
+                assert self.cuda_graph_helper.graphs_created()
+
+            named_parameters = tuple(gpt_model[0].named_parameters())
+            mtp_grad_parameters = [
+                next(
+                    param
+                    for name, param in named_parameters
+                    if f"mtp.layers.{depth}." in name and param.requires_grad
+                )
+                for depth in range(3)
+            ]
+            results = []
+            for boundaries in boundaries_per_step:
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
+                set_current_microbatch(gpt_model[0], 0)
+                gpt_model[0].set_is_first_microbatch()
+                cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+                packed_seq_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens.clone(),
+                    cu_seqlens_kv=cu_seqlens.clone(),
+                    cu_seqlens_q_padded=cu_seqlens.clone(),
+                    cu_seqlens_kv_padded=cu_seqlens.clone(),
+                    max_seqlen_q=32,
+                    max_seqlen_kv=32,
+                    pad_between_seqs=True,
+                )
+                output = gpt_model[0].forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids_for(boundaries),
+                    attention_mask=None,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    padding_mask=padding_mask,
+                    packed_seq_params=packed_seq_params,
+                )
+                loss = output.mean()
+                loss.backward()
+                assert all(param.main_grad is not None for param in mtp_grad_parameters)
+                results.append(
+                    (
+                        output.detach().cpu().clone(),
+                        loss.detach().cpu().clone(),
+                        tuple(
+                            param.main_grad.detach().cpu().clone() for param in mtp_grad_parameters
+                        ),
+                    )
+                )
+
+            if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+                self.cuda_graph_helper.delete_cuda_graphs()
+                self.cuda_graph_helper = None
+            return results
+
+        try:
+            eager_results = run("none")
+            graph_results = run("transformer_engine")
+            for eager, graph in zip(eager_results, graph_results):
+                for eager_value, graph_value in zip(eager[:2], graph[:2]):
+                    assert torch.equal(graph_value, eager_value)
+                for eager_grad, graph_grad in zip(eager[2], graph[2], strict=True):
+                    assert torch.equal(graph_grad, eager_grad)
+            for results in (eager_results, graph_results):
+                assert torch.equal(results[0][0], results[2][0])
+                assert not torch.equal(results[0][0], results[1][0])
+                for depth in range(3):
+                    assert torch.equal(results[0][2][depth], results[2][2][depth])
+                    assert not torch.equal(results[0][2][depth], results[1][2][depth])
+                    assert results[0][2][depth].ne(0).any()
+        finally:
+            if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+                self.cuda_graph_helper.delete_cuda_graphs()
+                self.cuda_graph_helper = None
+            Utils.destroy_model_parallel()
 
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev

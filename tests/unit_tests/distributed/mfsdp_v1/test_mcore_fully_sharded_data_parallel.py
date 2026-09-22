@@ -16,7 +16,7 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.fp8_utils import HAVE_TE
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.optimizer import OptimizerConfig
@@ -1007,13 +1007,8 @@ class TestMegatronFSDPE2E:
 
     @staticmethod
     def _reset_full_cuda_graph_static_state():
-        """Reset class-level state on FullCudaGraphWrapper / StaticBufferLoader
-        so a test that uses the wrapper does not see leftovers from a previous
-        test in this process."""
-        FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-        FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
-        FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+        """Reset full-iteration graph state so it cannot leak across tests."""
+        FullCudaGraphWrapper.reset_cuda_graph()
 
     @staticmethod
     def _reset_cuda_rng_tracker():
@@ -1057,8 +1052,8 @@ class TestMegatronFSDPE2E:
             outer-DP sharding strategy ``optim``.
 
         Asserts:
-          1. ``FullCudaGraphWrapper.cuda_graph['training']`` is populated by
-             the end of training (i.e. capture happened).
+          1. ``FullCudaGraphWrapper.cuda_graph['training']`` is observed before
+             the optimizer step and before pretrain teardown destroys it.
           2. Decoupled gradients are globally present before every
              ``optimizer.step``.
           3. Loss decreases across the run.
@@ -1119,6 +1114,7 @@ class TestMegatronFSDPE2E:
         # Test loss and gradients when using full-iter CG with FSDP.
         losses: list[torch.Tensor] = []
         grads_present_steps: list[bool] = []
+        cuda_graph_was_captured = False
 
         orig_forward_step = _pretrain_gpt.forward_step
 
@@ -1150,6 +1146,8 @@ class TestMegatronFSDPE2E:
         # precision-aware optimizer the FusedAdam reads from
         # ``param.decoupled_grad``.
         def pre_step_hook(optimizer, args_, kwargs_):
+            nonlocal cuda_graph_was_captured
+            cuda_graph_was_captured |= FullCudaGraphWrapper.cuda_graph.get("training") is not None
             local_present = any(
                 getattr(p, "decoupled_grad", None) is not None
                 and (
@@ -1168,7 +1166,6 @@ class TestMegatronFSDPE2E:
             grads_present_steps.append(any(gathered))
 
         hook_handle = register_optimizer_step_pre_hook(pre_step_hook)
-        cuda_graph_was_captured = False
 
         try:
             # Setup argument overrides for FSDP <> CG test.
@@ -1194,8 +1191,6 @@ class TestMegatronFSDPE2E:
                 wrapped_forward_step,
                 get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
             )
-            # Validate CUDA graph was captured and thus replayed.
-            cuda_graph_was_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
         finally:
             hook_handle.remove()
             TestMegatronFSDPE2E._reset_full_cuda_graph_static_state()
