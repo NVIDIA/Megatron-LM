@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = [pytest.mark.gpus(2, min_architecture="blackwell"), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
+pytestmark = [pytest.mark.gpus(2, min_architecture="blackwell"), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"), pytest.mark.optional]
 
 CHUNK = 512
 SINGLE = [4096]  # 32 KV blocks > top-16

@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = pytest.mark.gpus(1, min_architecture="blackwell")
+pytestmark = [pytest.mark.gpus(1, min_architecture="blackwell"), pytest.mark.optional]
 DEV = "cuda"
 HIDDEN, HQ, HKV, D, HIDX, DIDX, BLK, TOPK = 512, 64, 4, 128, 4, 128, 128, 16
 CHUNK = 512

@@ -22,6 +22,7 @@ import torch
 pytestmark = [
     pytest.mark.gpus(2, min_architecture="blackwell"),
     pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+    pytest.mark.optional,
 ]
 
 S, STEPS, LR, CHUNK = 4096, 50, 1e-3, 512

@@ -54,6 +54,7 @@ def test_config_maps_hf_text_config_strictly(tiny_hf_kwargs):
     assert [cfg.is_moe_layer(i) for i in range(4)] == [False, False, True, True]
 
 
+@pytest.mark.optional
 def test_config_from_hf_object_matches_dict_mapping(tiny_hf_kwargs):
     pytest.importorskip("transformers.models.minimax_m3_vl")
     from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig

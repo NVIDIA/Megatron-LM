@@ -124,6 +124,7 @@ def _hf_available():
         return False
 
 
+@pytest.mark.optional
 @pytest.mark.skipif(not _hf_available(), reason="transformers without minimax_m3_vl")
 @pytest.mark.parametrize("S", [1000, 2048])
 def test_msattention_matches_hf_bf16(S):

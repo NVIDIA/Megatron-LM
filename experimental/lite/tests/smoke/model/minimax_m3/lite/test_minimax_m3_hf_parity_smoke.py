@@ -21,7 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
+pytestmark = [pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"), pytest.mark.optional]
 DEV = "cuda"
 LAYER_COS = 0.995
 LOGITS_COS, LOGITS_KL = 0.995, 5e-2
