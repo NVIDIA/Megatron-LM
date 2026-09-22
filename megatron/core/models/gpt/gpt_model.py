@@ -307,8 +307,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
+                skip_weight_param_allocation=self.share_embeddings_and_output_weights
+                and (self.pre_process or self.mtp_process),
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,

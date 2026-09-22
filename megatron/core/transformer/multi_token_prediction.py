@@ -185,6 +185,15 @@ def tie_output_layer_state_dict(
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 
+    On stages where the output projection borrows the shared embedding/output weight
+    (``share_embeddings_and_output_weights`` with ``pre_process`` or ``mtp_process``),
+    ``output_layer`` owns no weight and the state dict contains no
+    ``output_layer.weight`` key to replace. In that case this is a no-op: the shared
+    weight is already tied through the embedding, and inventing an
+    ``output_layer.weight`` entry here would be an orphan tensor (see
+    ``LanguageModule.tie_embeddings_and_output_weights_state_dict``, which asserts
+    that key is absent on tied MTP stages).
+
     Args:
         sharded_state_dict (ShardedStateDict): state dict with the weight to tie.
         output_layer_weight (Tensor): weight of the output layer.
@@ -194,6 +203,9 @@ def tie_output_layer_state_dict(
 
     Returns: None, acts in-place
     """
+    if output_layer_weight_key not in sharded_state_dict:
+        # No own output weight to tie: the projection borrows the shared weight.
+        return
     mtp_output_layer_replica_id = (
         1,  # copy of output layer in post processing stage
         0,
