@@ -19,6 +19,7 @@ from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron
 from model_provider import model_provider
 
@@ -44,13 +45,20 @@ def add_modelopt_export_args(parser):
         default=False,
         help="Export the model for vLLM fakequant reload.",
     )
+    group.add_argument(
+        "--no-clamp-kv-scales",
+        action="store_false",
+        dest="clamp_kv_scales",
+        default=True,
+        help="Preserve FP8 KV-cache scales learned during QAT instead of clamping them to 1.0.",
+    )
     group.add_argument("--export-dir", type=str, help="The target export path.")
     add_modelopt_args(parser)
     return parser
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_modelopt_export_args,
         args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
@@ -58,6 +66,7 @@ if __name__ == "__main__":
             'no_load_optim': True,
         },
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()
@@ -108,5 +117,13 @@ if __name__ == "__main__":
 
     if "trust_remote_code" in inspect.signature(export_fn).parameters:
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})
+
+    if "clamp_kv_cache_scales" in inspect.signature(export_fn).parameters:
+        export_kwargs["clamp_kv_cache_scales"] = args.clamp_kv_scales
+    elif not args.clamp_kv_scales:
+        raise RuntimeError(
+            "--no-clamp-kv-scales requires a ModelOpt version that supports "
+            "export_mcore_gpt_to_hf(..., clamp_kv_cache_scales=False)."
+        )
 
     export_fn(unwrapped_model, args.pretrained_model_name, **export_kwargs)

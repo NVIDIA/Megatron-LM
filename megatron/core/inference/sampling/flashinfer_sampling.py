@@ -11,15 +11,20 @@ except ImportError:
     flashinfer = None
 
 from megatron.core.inference.sampling.base import Sampling
+from megatron.core.inference.sampling_params import (
+    MIN_SAMPLING_TEMPERATURE,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 
 
 class FlashInferSampling(Sampling):
-    """FlashInfer sampling with per-step top-p-only / top-k-only / joint dispatch.
+    """FlashInfer sampling with per-step unfiltered / top-p-only / top-k-only / joint dispatch.
 
-    Each step selects a kernel from the batch's active filters: the dedicated exact
-    top-p or top-k kernel when only one filter is in use, and the joint kernel only
-    for genuinely mixed batches. The dispatch flags are read from the pinned CPU
-    sampling metadata, so evaluating them costs no GPU sync.
+    Each step selects a kernel from the batch's active filters: the logits kernel
+    when nothing filters, the dedicated exact top-p or top-k kernel when only one filter is in use,
+    and the joint kernel only for genuinely mixed batches.
+    The dispatch flags are read from the pinned CPU sampling metadata.
 
     The sampler runs eagerly. Its kernel choice is data-dependent (it varies with
     which filters the batch uses), so it cannot be captured in a CUDA graph; running
@@ -61,8 +66,8 @@ class FlashInferSampling(Sampling):
             context: The active DynamicInferenceContext.
             no_top_k, no_top_p: Required batch-level dispatch flags (whether NO active
                 request uses top-k / top-p). The caller computes them once from the
-                pinned CPU sampling metadata (the controller's
-                `_active_requests_sampling_filter_flags`).
+                pinned CPU sampling metadata (the context's
+                `active_sampling_filter_flags`).
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, sampling parameters are gathered
                 per-token rather than per-request (speculative decoding path).
@@ -90,7 +95,7 @@ class FlashInferSampling(Sampling):
         # temperature` promotes `scaled` to fp32 -- the softmax / nucleus math must
         # run in fp32 (a bf16 softmax over the vocab loses precision in exactly the
         # tail region top-p depends on). The assert pins that guarantee.
-        temperature = temperature.clamp(min=1e-6)
+        temperature = temperature.clamp(min=MIN_SAMPLING_TEMPERATURE)
         if gather_indices is None:
             scaled = logits[:n] / temperature.unsqueeze(1)
         else:
@@ -103,33 +108,29 @@ class FlashInferSampling(Sampling):
         # the full mass). Every kernel gets `self._rng` so sampling is seeded and its
         # philox offset advances per launch.
         if no_top_k and no_top_p:
-            # No nucleus / top-k filtering: sample the full temperature-scaled
-            # distribution. Use FlashInfer's kernel rather than torch.multinomial:
-            # multinomial forces a device-to-host sync, whereas sampling_from_probs
-            # stays on-device and keeps the RNG's philox offset advancing per launch.
-            probs = torch.softmax(scaled, dim=-1)
-            sampled_tokens = flashinfer.sampling.sampling_from_probs(
-                probs, deterministic=True, generator=self._rng
+            # No filtering: sample the temperature-scaled dist with the Gumbel-race logits kernel.
+            sampled_tokens = flashinfer.sampling.sampling_from_logits(
+                scaled, deterministic=True, generator=self._rng
             ).long()
         elif no_top_k:
             # Top-p only -> dedicated exact nucleus kernel.
             probs = torch.softmax(scaled, dim=-1)
-            top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+            top_p_safe = top_p.masked_fill(is_no_op_top_p(top_p), 1.0)
             sampled_tokens = flashinfer.sampling.top_p_sampling_from_probs(
                 probs, top_p_safe, deterministic=True, generator=self._rng
             ).long()
         elif no_top_p:
             # Top-k only -> dedicated exact top-k kernel.
             probs = torch.softmax(scaled, dim=-1)
-            top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
+            top_k_safe = top_k.masked_fill(is_no_op_top_k(top_k), self._vocab_size)
             sampled_tokens = flashinfer.sampling.top_k_sampling_from_probs(
                 probs, top_k_safe, deterministic=True, generator=self._rng
             ).long()
         else:
             # Mixed batch (some top-k, some top-p, or requests using both) -> joint
             # kernel, fed the temperature-scaled logits.
-            top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
-            top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+            top_k_safe = top_k.masked_fill(is_no_op_top_k(top_k), self._vocab_size)
+            top_p_safe = top_p.masked_fill(is_no_op_top_p(top_p), 1.0)
             sampled_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                 scaled, top_k_safe, top_p_safe, deterministic=True, generator=self._rng
             ).long()
@@ -165,15 +166,28 @@ class FlashInferSampling(Sampling):
             top_k = gpu_view.top_k[token_to_request_index]
             top_p = gpu_view.top_p[token_to_request_index]
 
-        temperature = temperature.clamp(min=1e-6)
-        probs = torch.softmax(logits / temperature.unsqueeze(1), dim=-1)
+        temperature = temperature.clamp(min=MIN_SAMPLING_TEMPERATURE)
+        scaled = logits / temperature.unsqueeze(1)
 
-        # Sentinel values disable filtering:
+        # Batch-level no-op check.
+        no_top_k_batch, no_top_p_batch = context.active_sampling_filter_flags()
+        if no_top_k_batch and no_top_p_batch:
+            return torch.log_softmax(scaled, dim=-1)
+
+        # Sentinel / no-op values disable filtering:
         # top_k=vocab_size keeps all tokens, top_p=1.0 keeps the full probability mass.
-        top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
-        top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+        no_top_k = is_no_op_top_k(top_k) | (top_k >= self._vocab_size)
+        no_top_p = is_no_op_top_p(top_p)
+        top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
+        top_p_safe = top_p.masked_fill(no_top_p, 1.0)
 
+        probs = torch.softmax(scaled, dim=-1)
         # Renormalize to the kept set (top-k first, then top-p) to match
         renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
         renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
-        return torch.log(renormed)
+        # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
+        return torch.where(
+            (no_top_k & no_top_p).unsqueeze(1),
+            torch.log_softmax(scaled, dim=-1),
+            torch.log(renormed),
+        )

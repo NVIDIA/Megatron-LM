@@ -36,7 +36,7 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         "--mimo-llm-cp",
         type=int,
         default=1,
-        help="Language context-parallel size (CP=1 only for now).",
+        help="Language context-parallel size; encoder CP remains 1.",
     )
     grid.add_argument(
         "--mimo-llm-pp", type=int, default=1, help="Language pipeline-model-parallel size."
@@ -77,19 +77,40 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
             "Requires every encoder DP rank to execute encoder backward on every microbatch."
         ),
     )
+    grid.add_argument(
+        "--mimo-run-input-projections-on-llm-ranks",
+        action="store_true",
+        help=(
+            "Build modality input projections on LLM ranks. Use --no-load-optim "
+            "when loading a checkpoint saved with the other placement."
+        ),
+    )
+    grid.add_argument(
+        "--mimo-bridge-skip-shape-exchange",
+        action="store_true",
+        help=(
+            "Derive MIMO fan-out receive shapes from language-batch metadata and skip "
+            "bridge shape exchange."
+        ),
+    )
     return parser
 
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
     gtp_weight_remat_size, _ = resolve_hetero_gtp_degrees(args)
-    if args.mimo_llm_cp != 1:
-        raise ValueError("hetero MIMO training currently supports CP=1 only")
+    if args.mimo_llm_cp < 1:
+        raise ValueError("--mimo-llm-cp must be positive")
 
     if getattr(args, "mimo_encoder_ddp_overlap", False) and not getattr(
         args, "overlap_grad_reduce", False
     ):
         raise ValueError("--mimo-encoder-ddp-overlap requires --overlap-grad-reduce")
+
+    if args.mimo_run_input_projections_on_llm_ranks and args.mimo_llm_only:
+        raise ValueError(
+            "--mimo-run-input-projections-on-llm-ranks cannot be used with --mimo-llm-only"
+        )
 
     # MoE expert count must divide evenly across the language grid's expert parallelism.
     num_experts = _num_experts(args)

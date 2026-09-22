@@ -16,6 +16,10 @@ name: ~Build CI containers
 
 on:
   workflow_call:
+    outputs:
+      build-matrix:
+        description: Platforms, registries, and runners used for this build
+        value: ${{ jobs.cicd-compute-build-matrix.outputs.matrix }}
     inputs:
       is-maintainer:
         description: Whether the workflow is running with maintainer resources
@@ -61,6 +65,11 @@ on:
         required: false
         default: false
         type: boolean
+      publish-target-cache:
+        description: Publish the target branch build-hash cache
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   cicd-compute-build-matrix:
@@ -98,6 +107,9 @@ jobs:
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
+    env:
+      # GitHub dev CI runs on Hopper and Blackwell; other callers retain the Dockerfile default.
+      NVTE_CUDA_ARCHS: "90;100"
     permissions:
       contents: read
       id-token: write
@@ -142,11 +154,9 @@ jobs:
         id: cache_keys
         shell: bash
         env:
-          BASE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha || '' }}
           BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref || github.ref_name }}
           CACHE_VARIANT: ${{ inputs.lts && 'lts' || 'dev' }}
           EVENT_NAME: ${{ github.event_name }}
-          GH_TOKEN: ${{ github.token }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
           PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
@@ -173,41 +183,17 @@ jobs:
             KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${BRANCH_NAMESPACE}"
           fi
 
-          BASE_PR_KEY=""
-          if [ -n "$BASE_SHA" ]; then
-            # PR caches are keyed by PR number, so recover the PR associated with the base commit.
-            if BASE_PRS=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BASE_SHA}/pulls"); then
-              BASE_PR=$(printf '%s' "$BASE_PRS" | jq -c --arg sha "$BASE_SHA" '
-                (
-                  [.[] | select(.state == "open" and .head.sha == $sha)]
-                  + [.[] | select(.merge_commit_sha == $sha)]
-                  + [.[] | select(.head.sha == $sha)]
-                ) | first // empty
-              ')
-              if [ -n "$BASE_PR" ]; then
-                BASE_PR_NUMBER=$(printf '%s' "$BASE_PR" | jq -r '.number')
-                BASE_PR_REF=$(printf '%s' "$BASE_PR" | jq -r '.base.ref')
-                BASE_PR_NAMESPACE=$(printf '%s' "$BASE_PR_REF" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
-                BASE_PR_KEY="${BASE_PR_NAMESPACE}-${CACHE_VARIANT}-${BASE_PR_NUMBER}"
-              fi
-            else
-              echo "::warning::Unable to resolve a PR cache key for base commit $BASE_SHA"
-            fi
-          fi
-
           if [ "${#KEY}" -gt 100 ]; then
             KEY="${KEY:0:83}-$(printf '%s' "$KEY" | sha256sum | cut -c1-16)"
           fi
           if [ "${#BASELINE_KEY}" -gt 100 ]; then
             BASELINE_KEY="${BASELINE_KEY:0:83}-$(printf '%s' "$BASELINE_KEY" | sha256sum | cut -c1-16)"
           fi
-          if [ "${#BASE_PR_KEY}" -gt 100 ]; then
-            BASE_PR_KEY="${BASE_PR_KEY:0:83}-$(printf '%s' "$BASE_PR_KEY" | sha256sum | cut -c1-16)"
-          fi
 
           echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "namespace=$CACHE_NAMESPACE" | tee -a "$GITHUB_OUTPUT"
           echo "baseline=$BASELINE_KEY" | tee -a "$GITHUB_OUTPUT"
-          echo "base-pr=$BASE_PR_KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "pr-number=$PR_NUMBER" | tee -a "$GITHUB_OUTPUT"
 
       - name: Parse base image
         id: base-image
@@ -227,6 +213,90 @@ jobs:
             echo "dockerfile=./docker/Dockerfile.ci.dev" | tee -a "$GITHUB_OUTPUT"
           fi
 
+      - name: Compute build cache key
+        id: build_cache
+        shell: bash
+        env:
+          CACHE_NAMESPACE: ${{ steps.cache_keys.outputs.namespace }}
+          CACHE_VARIANT: ${{ inputs.lts && 'lts' || 'dev' }}
+          DOCKERFILE: ${{ steps.base-image.outputs.dockerfile }}
+          FROM_IMAGE_NAME: ${{ steps.base-image.outputs.version }}
+          IMAGE_TYPE: ${{ steps.base-image.outputs.image_type }}
+          PR_NUMBER: ${{ steps.cache_keys.outputs.pr-number }}
+          DEFAULT_CACHE_KEY: ${{ steps.cache_keys.outputs.key }}
+          PUBLISH_TARGET_CACHE: ${{ inputs.publish-target-cache }}
+        run: |
+          # These inputs can invalidate the expensive dependency and native-extension layers.
+          # README and downloaded assets remain BuildKit-validated late layers, but do not
+          # create a new dependency-cache namespace.
+          if [ "$CACHE_VARIANT" = "lts" ]; then
+            BUILD_INPUTS=(
+              docker/Dockerfile.ci.lts
+              docker/.ngc_version.lts
+              docker/lts/requirements.txt
+              docker/patches/deepep.patch
+              megatron/core/__init__.py
+              megatron/core/package_info.py
+              pyproject.toml
+              uv.lock
+            )
+          else
+            BUILD_INPUTS=(
+              docker/Dockerfile.ci.dev
+              docker/.ngc_version.dev
+              docker/common/install_nccl.sh
+              docker/common/install_nccl_m2n.sh
+              docker/patches/deepep.patch
+              docker/patches/deepep-nvshmem.patch
+              megatron/core/__init__.py
+              megatron/core/package_info.py
+              pyproject.toml
+              uv.lock
+            )
+          fi
+
+          case "$(uname -m)" in
+            x86_64) TARGET_ARCH=amd64 ;;
+            aarch64 | arm64) TARGET_ARCH=arm64 ;;
+            *) echo "Unsupported build architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          BUILD_HASH=$(
+            {
+              printf '%s\n' \
+                "dockerfile=$DOCKERFILE" \
+                "target=main" \
+                "build-arg:FROM_IMAGE_NAME=$FROM_IMAGE_NAME" \
+                "build-arg:IMAGE_TYPE=$IMAGE_TYPE" \
+                "automatic-build-arg:TARGETARCH=$TARGET_ARCH"
+              if [ "$CACHE_VARIANT" != "lts" ]; then
+                printf '%s\n' "build-arg:NVTE_CUDA_ARCHS=$NVTE_CUDA_ARCHS"
+              fi
+              sha256sum "${BUILD_INPUTS[@]}"
+            } | sha256sum | cut -c1-32
+          )
+          TARGET_BUILD_HASH_KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-build-${BUILD_HASH}"
+          PR_BUILD_HASH_KEY=""
+          CACHE_KEY="$TARGET_BUILD_HASH_KEY"
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "0" ]; then
+            PR_BUILD_HASH_KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-pr-${PR_NUMBER}-build-${BUILD_HASH}"
+            CACHE_KEY="$PR_BUILD_HASH_KEY"
+          elif [ "$PUBLISH_TARGET_CACHE" != "true" ]; then
+            # Only the explicit population build publishes the shared target-branch hash cache.
+            CACHE_KEY="$DEFAULT_CACHE_KEY"
+          fi
+
+          for key_name in TARGET_BUILD_HASH_KEY PR_BUILD_HASH_KEY CACHE_KEY; do
+            key="${!key_name}"
+            if [ "${#key}" -gt 100 ]; then
+              printf -v "$key_name" '%s' "${key:0:83}-$(printf '%s' "$key" | sha256sum | cut -c1-16)"
+            fi
+          done
+
+          echo "key=$CACHE_KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "target-build-hash=$TARGET_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "pr-build-hash=$PR_BUILD_HASH_KEY" | tee -a "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
@@ -234,19 +304,16 @@ jobs:
         id: cache_from
         shell: bash
         env:
-          BASE_PR_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.base-pr }}-buildcache-${{ matrix.cloud }}
-          BASE_PR_KEY: ${{ steps.cache_keys.outputs.base-pr }}
           BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
-          EVENT_NAME: ${{ github.event_name }}
           LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
-          RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+          PR_BUILD_HASH_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.pr-build-hash }}-buildcache-${{ matrix.cloud }}
+          PR_BUILD_HASH_KEY: ${{ steps.build_cache.outputs.pr-build-hash }}
+          TARGET_BUILD_HASH_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.target-build-hash }}-buildcache-${{ matrix.cloud }}
         run: |
-          if [ "$EVENT_NAME" = "merge_group" ]; then
-            CANDIDATES=("$BASELINE_CACHE" "$RUN_CACHE" "$LEGACY_CACHE")
-          elif [ -n "$BASE_PR_KEY" ]; then
-            CANDIDATES=("$RUN_CACHE" "$BASE_PR_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
+          if [ -n "$PR_BUILD_HASH_KEY" ]; then
+            CANDIDATES=("$PR_BUILD_HASH_CACHE" "$TARGET_BUILD_HASH_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
           else
-            CANDIDATES=("$RUN_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
+            CANDIDATES=("$TARGET_BUILD_HASH_CACHE" "$BASELINE_CACHE" "$LEGACY_CACHE")
           fi
 
           DONOR_CACHE="$LEGACY_CACHE"
@@ -270,8 +337,9 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
+            ${{ !inputs.lts && format('NVTE_CUDA_ARCHS={0}', env.NVTE_CUDA_ARCHS) || '' }}
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
-          cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
+          cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
           tags: |
             ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
@@ -281,7 +349,7 @@ jobs:
         if: inputs.verify-cache
         shell: bash
         env:
-          CACHE_IMAGE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+          CACHE_IMAGE: ${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.key }}-buildcache-${{ matrix.cloud }}
         run: |
           docker buildx imagetools inspect "$CACHE_IMAGE"
           {
