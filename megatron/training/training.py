@@ -3814,6 +3814,8 @@ def training_log(
             main_pattern = parsed_pattern.main_pattern or ""
             mtp_pattern = parsed_pattern.mtp_pattern or ""
             main_moe_layers = main_pattern.count(Symbols.MOE)
+            # Hybrid hash counts select leading MoE positions, excluding MTP.
+            num_hash_layers = min(main_moe_layers, max(args.moe_num_hash_layers, 0))
             mtp_moe_layers_per_depth = mtp_pattern.count(Symbols.MOE)
             if parsed_pattern.mtp_num_depths > 0 and mtp_moe_layers_per_depth > 0:
                 mtp_moe_layers = (
@@ -3836,6 +3838,8 @@ def training_log(
             else:
                 raise ValueError(f"Invalid moe_layer_freq: {args.moe_layer_freq}")
             main_moe_layers = sum(moe_layer_pattern)
+            # Other stacks select hash routing by transformer-layer number.
+            num_hash_layers = sum(moe_layer_pattern[: max(args.moe_num_hash_layers, 0)])
             mtp_moe_layers = 0
             if args.mtp_num_layers and moe_layer_pattern[-1]:
                 mtp_moe_layers = 1 if args.mtp_use_repeated_layer else args.mtp_num_layers
@@ -3854,6 +3858,7 @@ def training_log(
             num_layers=layers,
             num_moe_layers=num_moe_layers,
             moe_layer_freq=args.moe_layer_freq,
+            num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
