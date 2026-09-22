@@ -578,24 +578,30 @@ def _num_dsa_indexer_layers(
     *,
     mtp_num_layers=0,
     mtp_use_repeated_layer=False,
+    mtp_shares_sparse_attention_index=False,
 ):
     """Count DSA indexer executions on the standard-model path.
 
     Cross-layer top-k sharing is tied to the physical layer number, so repeated
-    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    MTP normally executes its one indexer ``D`` times. When repeated MTP shares
+    its sparse-attention index, only depth 0 executes the indexer.
     """
 
     def computes_index(layer_number):
         return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
 
-    return sum(
-        computes_index(layer_number)
-        for layer_number in _standard_layer_numbers_for_execution(
-            num_decoder_layers,
-            mtp_num_layers=mtp_num_layers,
-            mtp_use_repeated_layer=mtp_use_repeated_layer,
-        )
+    layer_numbers = _standard_layer_numbers_for_execution(
+        num_decoder_layers,
+        mtp_num_layers=mtp_num_layers,
+        mtp_use_repeated_layer=mtp_use_repeated_layer,
     )
+    if (
+        mtp_use_repeated_layer
+        and mtp_num_layers > 0
+        and mtp_shares_sparse_attention_index
+    ):
+        layer_numbers = layer_numbers[: num_decoder_layers + 1]
+    return sum(computes_index(layer_number) for layer_number in layer_numbers)
 
 
 def _vision_flops_stats_tensor(reference: torch.Tensor | None = None) -> torch.Tensor:
@@ -1545,6 +1551,11 @@ def num_floating_point_operations(
             mtp_num_layers = 0
             num_layers = args.num_layers
 
+        mtp_use_repeated_layer = getattr(args, "mtp_use_repeated_layer", False)
+        mtp_shared_components = frozenset(
+            getattr(args, "mtp_repeated_layer_shared_components", None) or ()
+        )
+
         moe_ffn_hidden_size = (
             args.moe_ffn_hidden_size
             if args.moe_ffn_hidden_size is not None
@@ -1692,6 +1703,7 @@ def num_floating_point_operations(
         dsv4_hybrid_extra_core_term = 0
         dsa_extra_term = 0
         dsa_extra_core_term = 0
+        dsa_repeated_mtp_saved_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -1852,12 +1864,30 @@ def num_floating_point_operations(
                     args.dsa_indexer_skip_topk_offset,
                     args.dsa_indexer_topk_freq,
                     mtp_num_layers=mtp_num_layers,
-                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                    mtp_use_repeated_layer=mtp_use_repeated_layer,
+                    mtp_shares_sparse_attention_index=(
+                        "sparse_attention_index" in mtp_shared_components
+                    ),
                 ),
                 dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
                 sparse_core_scale=dsa_sparse_core_scale,
             )
+            if mtp_use_repeated_layer and "latent_kv" in mtp_shared_components:
+                # Later depths reuse the normalized, post-RoPE latent KV from depth 0.
+                # They still execute the absorbed K/V up-projection work on their query
+                # and attention output. Runtime also skips key RoPE and communication,
+                # which this FLOPs model does not count; only the KV down projection and
+                # norm disappear from the modeled standard MLA token-linear term.
+                dsa_repeated_mtp_saved_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * max(mtp_num_layers - 1, 0)
+                    * (
+                        args.hidden_size * (args.kv_lora_rank + args.qk_pos_emb_head_dim)
+                        + args.kv_lora_rank
+                    )
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -1870,6 +1900,7 @@ def num_floating_point_operations(
             + standard_self_attn_term * num_standard_attention_layers
             + dsv4_hybrid_extra_term
             + dsa_extra_term
+            - dsa_repeated_mtp_saved_term
         )
         # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
         # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.
@@ -2168,6 +2199,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -2175,6 +2207,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -4245,6 +4278,10 @@ def training_log(
                 args.dsa_indexer_topk_freq,
                 mtp_num_layers=args.mtp_num_layers,
                 mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                mtp_shares_sparse_attention_index=(
+                    "sparse_attention_index"
+                    in (getattr(args, "mtp_repeated_layer_shared_components", None) or ())
+                ),
             )
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
