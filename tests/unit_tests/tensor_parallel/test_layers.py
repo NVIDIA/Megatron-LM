@@ -258,6 +258,7 @@ def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
     output = linear_with_grad_accumulation_and_async_allreduce(
         input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
     )
+    assert output._base is None
     output.sum().backward()
 
     reference_output = torch.nn.functional.linear(reference_input, reference_weight)
@@ -274,6 +275,73 @@ def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
     assert torch.allclose(weight.grad, reference_weight.grad)
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+@pytest.mark.parametrize("frozen_weight", [False, True])
+@pytest.mark.parametrize("cross_entropy_fusion", [False, True])
+def test_fp32_linear_output_is_an_inplace_safe_ce_workspace(frozen_weight, cross_entropy_fusion):
+    """FP32 output logits should be one owning allocation reusable by cross entropy."""
+    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core.parallel_state import get_tensor_model_parallel_group
+    from megatron.core.tensor_parallel.cross_entropy import (
+        VocabParallelCrossEntropy,
+        vocab_parallel_cross_entropy,
+    )
+
+    Utils.initialize_model_parallel(1, 1)
+
+    try:
+        input_data = torch.randn(4, 3, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(
+            32, 16, device="cuda", dtype=torch.bfloat16, requires_grad=not frozen_weight
+        )
+        if frozen_weight:
+            output = linear_with_frozen_weight(
+                input_data,
+                weight,
+                None,
+                False,
+                False,
+                False,
+                tp_group=None,
+                output_dtype=torch.float32,
+            )
+        else:
+            output = linear_with_grad_accumulation_and_async_allreduce(
+                input_data,
+                weight,
+                None,
+                False,
+                False,
+                False,
+                tp_group=None,
+                output_dtype=torch.float32,
+            )
+
+        output_data_ptr = output.data_ptr()
+        assert output.dtype is torch.float32
+        assert output._base is None
+        workspace, _ = VocabParallelCrossEntropy.calculate_logits_max(output)
+        assert workspace.data_ptr() == output_data_ptr
+
+        target = torch.randint(0, weight.size(0), input_data.shape[:-1], device="cuda")
+        if cross_entropy_fusion:
+            loss = fused_vocab_parallel_cross_entropy(
+                output, target, get_tensor_model_parallel_group()
+            )
+        else:
+            loss = vocab_parallel_cross_entropy(output, target)
+        loss.sum().backward()
+
+        assert output.data_ptr() == output_data_ptr
+        assert input_data.grad is not None
+        assert input_data.grad.dtype is torch.bfloat16
+        assert (weight.grad is None) is frozen_weight
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(

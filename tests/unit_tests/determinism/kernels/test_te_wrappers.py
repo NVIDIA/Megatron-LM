@@ -16,11 +16,16 @@ import pytest
 import torch
 
 import megatron.core.extensions.transformer_engine as te_ext
+from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, mark_grouped_tensor
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    set_batch_invariant_mode,
+    te_supports_batch_invariant_grouped_gemm,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal
@@ -43,6 +48,7 @@ if HAVE_TE:
         TELayerNormColumnParallelLinear,
         TENorm,
         TERowParallelLinear,
+        te_cross_entropy,
     )
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
@@ -109,6 +115,127 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what="TEColumnParallelLinear"
         )
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])
+    @pytest.mark.parametrize(
+        "k,n", [(256, 512), (2048, 1536), (768, 2048), (2688, 1856), (1856, 2688)]
+    )
+    def test_device_metadata_batch_invariant_training(self, monkeypatch, quantized, k, n):
+        """Exercise actual grouped TN/NN/NT dispatch, co-batches, and graph replay."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+        from transformer_engine.pytorch.module import grouped_linear
+
+        from megatron.core.extensions.transformer_engine import (
+            _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+        )
+
+        if (
+            not _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
+            or not te_supports_batch_invariant_grouped_gemm()
+        ):
+            pytest.skip("Requires TE grouped-tensor API, SM100, and cuBLASLt 13.5.1")
+        monkeypatch.delenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", raising=False)
+        calls = set()
+        original_mm = grouped_linear.general_grouped_gemm_for_grouped_tensor
+
+        def counted_mm(*args, **kwargs):
+            calls.add(kwargs.get("layout", "TN"))
+            return original_mm(*args, **kwargs)
+
+        monkeypatch.setattr(grouped_linear, "general_grouped_gemm_for_grouped_tensor", counted_mm)
+        seeded()
+        config = _config(
+            moe_use_grouped_tensor=True,
+            moe_grouped_gemm=True,
+            num_moe_experts=4,
+            fp8="hybrid" if quantized else None,
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_param=quantized,
+        )
+        with get_fp8_context(config, 0, is_init=True):
+            module = (
+                TEGroupedLinear(
+                    4,
+                    k,
+                    n,
+                    parallel_mode=None,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=True,
+                )
+                .cuda()
+                .train()
+            )
+        target = torch.randn(k, device="cuda", dtype=torch.bfloat16)
+        baseline = None
+
+        def check(fn, sizes, row, *, single_token=False):
+            nonlocal baseline
+            x = torch.randn(sum(sizes), k, device="cuda", dtype=torch.bfloat16)
+            if single_token:
+                x.zero_()
+            offset = 0
+            for size in sizes:
+                if size:
+                    x[offset + size - 32 : offset + size].zero_()
+                offset += size
+            x[row] = target
+            x.requires_grad_(True)
+            splits = torch.tensor(sizes, device="cuda", dtype=torch.int64)
+            with get_fp8_context(config, 0):
+                output, _ = fn(x, splits)
+                actual = output[row].detach().clone()
+                output[row].float().sum().backward()
+            if baseline is None:
+                baseline = actual
+            torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+            assert torch.isfinite(x.grad).all()
+            assert all(
+                p.grad is not None and torch.isfinite(p.grad).all() for p in module.parameters()
+            )
+            module.zero_grad(set_to_none=True)
+            return actual
+
+        with set_batch_invariant_mode(True, backend="te_native"):
+            check(module, [256, 256, 256, 256], 0, single_token=True)
+            check(module, [512, 256, 0, 768], 73)
+            check(module, [1024, 2048, 256, 0], 17)
+            sample = torch.randn(2048, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            splits = torch.tensor([512, 512, 512, 512], device="cuda", dtype=torch.int64)
+            with get_fp8_context(config, 0):
+                assert_module_replays_bit_exact(
+                    module,
+                    (sample, splits),
+                    replays=3,
+                    contention=True,
+                    what="TE device-metadata fixed-batch forward/backward",
+                )
+            graphed = te.make_graphed_callables(
+                module,
+                (sample, splits),
+                num_warmup_iters=3,
+                enabled=quantized,
+                recipe=MXFP8BlockScaling(),
+            )
+            for sizes, row in (
+                ([512, 512, 512, 512], 0),
+                ([256, 1024, 768, 0], 73),
+                ([1024, 256, 0, 768], 17),
+            ):
+                assert_replays_bit_exact(
+                    lambda: check(graphed, sizes, row),
+                    (),
+                    replays=3,
+                    backward=False,
+                    contention=True,
+                    what="TE device-metadata co-batch",
+                )
+        assert calls == {"TN", "NN", "NT"}
 
     def test_te_row_parallel_linear_replays(self):
         seeded()
@@ -302,6 +429,21 @@ class TestTEWrappers:
             module.load_state_dict(checkpoint)
             assert module.weight0 is parameter
             assert torch.equal(module.weight0, expected)
+
+    def test_te_fused_cross_entropy_replays(self):
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(
+            tokens, 1, 32768, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        assert_replays_bit_exact(
+            lambda l, t: te_cross_entropy(l, t, tp_group),
+            (logits, target),
+            replays=4,
+            what="te_fused_cross_entropy",
+        )
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):

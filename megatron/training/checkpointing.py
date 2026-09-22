@@ -33,15 +33,14 @@ from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
-from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
-    get_async_strategy,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
@@ -96,6 +95,17 @@ try:
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
+
+
+if has_nvrx_async_support():
+    from nvidia_resiliency_ext.checkpointing.utils import _disable_gc
+else:
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _disable_gc():
+        """No-op fallback when nvidia-resiliency-ext is unavailable."""
+        yield
 
 
 _CHECKPOINT_VERSION = None
@@ -640,6 +650,7 @@ def save_checkpoint(
     dp_gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -662,6 +673,8 @@ def save_checkpoint(
         dp_gtp_remat_group: Full data-distribution group (dp x gtp_remat), for indexing the
             per-rank dataloader state (default: None, falls back to mpu API)
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
+        cp_group: Context-parallel group for dataloader saving. Falls back to the MPU group
+            when available. Callers using CP without global MPU initialization must pass it.
     """
     start_ckpt = time()
     args = get_args()
@@ -910,7 +923,6 @@ def save_checkpoint(
                     validate_access_integrity=validate_sharding_integrity,
                     preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                     content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                    async_strategy=args.async_strategy,
                     verify_integrity=args.verify_integrity,
                 )
             # [ModelOpt]: save sharded modelopt_state
@@ -925,11 +937,15 @@ def save_checkpoint(
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
             if args.async_save:
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+                    FileSystemWriterAsync,
+                )
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+                    save_state_dict_async_plan,
+                )
+
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
-                _, async_modules = get_async_strategy(args.async_strategy)
-                FileSystemWriterAsync = async_modules['FileSystemWriterAsync']
-                save_state_dict_async_plan = async_modules['save_state_dict_async_plan']
                 _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
                 _writer_kwargs = {}
                 if _cpu_shm:
@@ -960,7 +976,7 @@ def save_checkpoint(
                     enable_cache=args.ckpt_assume_constant_structure,
                 )
                 async_save_request = get_save_and_finalize_callbacks(
-                    fs_storage_writer, save_state_dict_ret, args.async_strategy
+                    fs_storage_writer, save_state_dict_ret
                 )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
@@ -1038,6 +1054,7 @@ def save_checkpoint(
         tp_group=tp_group,
         pp_group=pp_group,
         dp_group=dp_gtp_remat_group,
+        cp_group=cp_group,
     )
 
     start_misc = time()
@@ -1219,6 +1236,8 @@ def save_checkpoint(
         # "success" callbacks only fire after both writes are confirmed.
         from megatron.training.distillation import get_logits_saver
 
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+
         logits_saver = get_logits_saver()
         if logits_saver is not None:
             # In frozen-dump mode there is no checkpoint request (async_save_request is None); the
@@ -1244,8 +1263,7 @@ def save_checkpoint(
                                     f"{iteration} to {tracker_filename}")
 
                 logits_finalize_fns.append(progress_finalize_fn)
-            async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
-            async_logits_request = async_request_cls(
+            async_logits_request = AsyncRequest(
                 async_fn=logits_saver._write_batched_tar,
                 async_fn_args=logits_saver.take_pending_data(),
                 finalize_fns=logits_finalize_fns,
@@ -1451,7 +1469,7 @@ def _async_delete_checkpoint_impl(
         io_priority (int): I/O class when lower_priority is True (from args.async_ckpt_io_priority).
     """
     if lower_priority:
-        from megatron.core.dist_checkpointing.strategies.async_utils import _set_process_qos
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import _set_process_qos
 
         _set_process_qos(cpu_priority=cpu_priority, io_priority=io_priority)
 
@@ -1505,7 +1523,14 @@ def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=F
 
 
 def maybe_save_dataloader_state(
-    train_iterator, iteration, dataloader_save_path, *, tp_group=None, pp_group=None, dp_group=None
+    train_iterator,
+    iteration,
+    dataloader_save_path,
+    *,
+    tp_group=None,
+    pp_group=None,
+    dp_group=None,
+    cp_group=None,
 ):
     """Saves dataloader state if the dataloader supports it.
 
@@ -1530,6 +1555,8 @@ def maybe_save_dataloader_state(
         dp_group (ProcessGroup): Full data-distribution group (dp x gtp_remat), matching the
             axis the dataloader shards on, or MPU fallback when unset. Passing the replicate
             data-parallel group instead makes gtp_remat peers write the same file.
+        cp_group (ProcessGroup): Context-parallel group, or the MPU group when available.
+            No group preserves the TP0/PP0 writer behavior without requiring MPU initialization.
     """
     # If no dataloader or saving path is provided, exit early, otherwise, raise an error.
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
@@ -1541,6 +1568,12 @@ def maybe_save_dataloader_state(
             f'Could not find a save_state for the train_iterator of type {type(train_iterator)}'
         )
 
+    # Compatibility fallback for callers that still use the global MPU groups.
+    # Explicit-group callers need not initialize MPU, including when CP is unused.
+    if cp_group is None:
+        cp_group = mpu.get_context_parallel_group(check_initialized=False)
+    is_first_cp_rank = cp_group is None or get_pg_rank(cp_group) == 0
+
     # Save dataloader state for each data parallel rank only once.
     first_rank = (
         get_pg_rank(pp_group) == 0
@@ -1550,7 +1583,7 @@ def maybe_save_dataloader_state(
         get_pg_rank(tp_group) == 0
         if tp_group is not None
         else mpu.get_tensor_model_parallel_rank() == 0
-    )
+    ) and is_first_cp_rank
     if not first_rank:
         return
 
@@ -2551,6 +2584,7 @@ def load_checkpoint(
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
+    loading_pretrained_checkpoint = False
 
     # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
     # and auto-resume the data position by feeding this run's own progress tracker -- written to
@@ -2578,6 +2612,7 @@ def load_checkpoint(
         if not checkpoint_exists(load_dir):
             raise FileNotFoundError('No checkpoint found in load directory or pretrained directory')
         args.finetune = True
+        loading_pretrained_checkpoint = True
 
     model = unwrap_model(ddp_model)
 
@@ -2758,6 +2793,8 @@ def load_checkpoint(
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
         sharded_sd_metadata['dp_cp_group'] = dp_cp_group
+        if loading_pretrained_checkpoint and getattr(args, 'allow_llm_only_checkpoint', False):
+            sharded_sd_metadata['load_from_llm_only_checkpoint'] = True
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)

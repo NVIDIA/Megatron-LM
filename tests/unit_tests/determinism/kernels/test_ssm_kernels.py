@@ -7,8 +7,10 @@ The Mamba training mixer is covered by ``correctness/test_ssm_conv1d.py``; this 
 the kernels Megatron ships itself: the Mamba2 varlen chunked scan (``ssd_*`` kernels behind
 ``mamba_chunk_scan_combined_varlen``), the decode-time ``selective_state_update`` and
 ``causal_conv1d_update``, the varlen causal conv, the Gated Delta Product varlen chunk scan
-(``gdp/*`` kernels) and its decode kernels, and the torch gated-delta-rule path that
-``--deterministic-mode`` selects instead of FLA.
+(``gdp/*`` kernels) and its decode kernels -- single-token and speculative, where a step
+carries several draft tokens and the kernels snapshot the conv and recurrent state after
+each of them -- and the torch gated-delta-rule path that ``--deterministic-mode`` selects
+instead of FLA.
 
 Autotuning is the mechanism that can break replay here: ``ops/common/determinism.py`` pins a
 single config and a zero-initialised, ordered-sum workspace when ``MAMBA_DETERMINISTIC`` (or
@@ -152,6 +154,52 @@ def test_causal_conv1d_update_replays():
     )
 
 
+def test_causal_conv1d_update_spec_decode_replays():
+    """Speculative decode: several tokens per request, with the rollback snapshots.
+
+    ``intermediate_conv_states`` receives the conv state after each draft token so
+    that verification can roll a request back to its accepted prefix. GDP caches
+    ``d_conv`` positions per request (``state_len == width``), the branch that
+    writes the snapshot from the shifted registers rather than re-reading HBM --
+    the single-token test above covers the ``state_len > width`` branch.
+    """
+    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+
+    seeded()
+    batch, seq_len, dim, width = 256, 4, 4096, 4
+    slots = batch + 8
+    x = torch.randn(batch, seq_len, dim, device="cuda", dtype=torch.bfloat16)
+    conv_state = torch.randn(slots, dim, width, device="cuda", dtype=torch.bfloat16)
+    intermediate = torch.zeros(slots, seq_len, dim, width, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    # Dynamic batching hands out shuffled slots; -1 marks a padding request, whose
+    # output is zeroed and whose state and snapshots are left untouched.
+    state_indices = torch.randperm(slots, device="cuda")[:batch].to(torch.int32)
+    state_indices[::16] = -1
+
+    def fn(x, conv_state, intermediate, weight, bias, state_indices):
+        out = causal_conv1d_update(
+            x,
+            conv_state,
+            weight,
+            bias,
+            "silu",
+            state_indices,
+            intermediate_conv_states=intermediate,
+        )
+        return out, conv_state, intermediate
+
+    assert_replays_bit_exact(
+        fn,
+        (x, conv_state, intermediate, weight, bias, state_indices),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="causal_conv1d_update (speculative decode)",
+    )
+
+
 def test_causal_conv1d_varlen_replays():
     from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
@@ -265,13 +313,68 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
     )
 
 
-def test_gdp_decode_prepare_replays():
+def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
+    """Speculative decode: ``S`` draft tokens of ``M`` Householder steps each.
+
+    Exercises the slot-indexed state cache and ``intermediate_states``, which the
+    kernel writes on the last step of every draft token so that verification can
+    roll the recurrence back to an accepted prefix. The snapshot buffer is an
+    output here, so its contents are compared across replays like any other.
+    """
+    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+
+    seeded()
+    B, S, M, H, K, V = 64, 4, 2, 8, 128, 128
+    T = S * M
+    slots = B + 8
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16)
+    g = -torch.rand(B, T, H, device="cuda") * 0.1
+    beta = torch.rand(B, T, H, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(slots, H, K, V, device="cuda")
+    intermediate = torch.zeros(slots, S, H, K, V, device="cuda")
+    # Dynamic batching hands out shuffled slots; -1 marks a padding request, whose
+    # output is zeroed and whose state and snapshots are left untouched.
+    state_indices = torch.randperm(slots, device="cuda")[:B].to(torch.int32)
+    state_indices[::16] = -1
+
+    def fn(q, k, v, g, beta, state, intermediate, state_indices):
+        o, final_state = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            use_qk_l2norm_in_kernel=True,
+            state=state,
+            state_indices=state_indices,
+            intermediate_states=intermediate,
+            steps_per_token=M,
+        )
+        return o, final_state, intermediate
+
+    assert_replays_bit_exact(
+        fn,
+        (q, k, v, g, beta, state, intermediate, state_indices),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="fused_recurrent_gated_delta_rule_update (speculative decode)",
+    )
+
+
+@pytest.mark.parametrize("S", [1, 4])
+def test_gdp_decode_prepare_replays(S):
+    """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
     from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
 
     seeded()
     n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
-    x = torch.randn(n, 1, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
-    ba = torch.randn(n, 1, M * H + H, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(n, S, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
+    # `ba` reaches the kernel as a slice of the input projection, so only its last
+    # dimension is contiguous and the token stride comes from the view, not the width.
+    ba = torch.randn(n, S, 2 * (M * H + H), device="cuda", dtype=torch.bfloat16)[..., : M * H + H]
     A_log = torch.randn(H, device="cuda")
     dt_bias = torch.randn(H, device="cuda")
     assert_replays_bit_exact(
@@ -279,7 +382,7 @@ def test_gdp_decode_prepare_replays():
         (x, ba, A_log, dt_bias),
         replays=4,
         backward=False,
-        what="gdp_decode_prepare",
+        what=f"gdp_decode_prepare (S={S})",
     )
 
 

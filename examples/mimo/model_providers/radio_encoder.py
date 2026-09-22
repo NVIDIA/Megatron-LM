@@ -74,6 +74,10 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     """Strip language-only MoE/Mamba/hybrid and activation-clamp settings from the base config."""
     config.activation_func_tanh_clamp_scale = None
     config.activation_func_tanh_clamp_scale_linear = None
+    # FP32 residual accumulation is a language-model policy. Preserve the pretrained
+    # modality math and restore the communication dtype promoted by TransformerConfig.
+    config.fp32_residual_connection = False
+    config.pipeline_dtype = config.params_dtype
     config.num_moe_experts = None
     config.moe_ffn_hidden_size = None
     config.moe_shared_expert_intermediate_size = None
@@ -138,6 +142,7 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.bf16 = bf16
     config.tensor_model_parallel_size = tp_size
     config.pipeline_model_parallel_size = pp_size
+    config.context_parallel_size = 1
     _disable_gtp(config)
     config.sequence_parallel = False
     return config

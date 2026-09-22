@@ -27,6 +27,7 @@ from megatron.training.global_vars import (
 from tests.unit_tests.test_utilities import Utils
 
 GOLDEN_CONFIG: Dict[str, Any] = {
+    "keep_mtp_in_bf16": False,
     "_cpu_offloading_context": None,
     "account_for_embedding_in_pipeline_split": False,
     "account_for_loss_in_pipeline_split": False,
@@ -180,6 +181,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,
     "linear_num_value_heads": 32,
+    "gdn_pre_gated_delta_rule_fusion": False,
+    "gdn_gated_output_norm_fusion": False,
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,

@@ -157,6 +157,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
     ),
     KernelEntry(
+        name="te_fused_cross_entropy",
+        sources=("megatron/core/extensions/transformer_engine.py",),
+        tests=(K + "test_te_wrappers.py",),
+        kind="external-lib",
+        notes="Replays TE's overwrite_input path when supported.",
+    ),
+    KernelEntry(
         name="jit_fuser",
         sources=("megatron/core/jit.py",),
         kind="torch.compile",
@@ -393,7 +400,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
         notes="Gated Delta Product varlen chunk scan (drives cumsum/l2norm/kkt/solve_tril/wy_fast/chunk_h/chunk_o), "
-        "fused recurrent decode and decode-prepare kernels.",
+        "fused recurrent decode and decode-prepare kernels. The decode kernels are replayed both "
+        "for one token per request and for a speculative step of several draft tokens, where the "
+        "recurrence also writes per-draft-token state snapshots for rollback.",
     ),
     KernelEntry(
         name="gated_delta_net",
@@ -402,9 +411,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", C + "test_hybrid_model.py"),
+        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
+    ),
+    KernelEntry(
+        name="gdn_pre_gated_delta_rule_fusion",
+        sources=("megatron/core/fusions/fused_pre_gated_delta_rule.py",),
+        kind="triton",
+        exempt_reason="Pre-GDR fusion is explicitly rejected with deterministic_mode=True. "
+        "Its backward uses atomic parameter-gradient reductions and timing-based autotuning; "
+        "numerical parity and the rejection guard are covered by the GDN fusion unit tests.",
+    ),
+    KernelEntry(
+        name="gdn_gated_output_norm_fusion",
+        sources=("megatron/core/fusions/fused_gated_norm.py",),
+        tests=(K + "test_gated_norm.py",),
+        kind="triton",
+        notes="GatedDeltaNet._apply_gated_norm dispatches fused RMSNorm/SiLU forward/backward "
+        "with fixed launch configurations and ordered weight-gradient reduction; first-order replay.",
     ),
     KernelEntry(
         name="ssm_triton_cache_manager",
@@ -426,6 +451,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
         "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+    ),
+    KernelEntry(
+        name="tensor_metric_l2",
+        sources=("megatron/training/tensor_metrics/definitions.py",),
+        tests=(K + "test_optimizer_kernels.py",),
+        kind="dispatch",
+        notes="L2NormMetric dispatches TE multi_tensor_l2norm with per-tensor output enabled, "
+        "then squares each norm. Replayed for FP16, BF16 and FP32 batches under side-stream "
+        "contention, with the per-tensor fallback forbidden so the fused path is exercised.",
     ),
     KernelEntry(
         name="ddp_grad_buffer_reductions",
@@ -479,6 +513,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/custom_layers/batch_invariant_kernels.py",),
         tests=(
             K + "test_inference_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
         ),
         kind="triton",
@@ -554,7 +589,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
         "GDP forks (chunk_gated_delta_product_varlen, fused_recurrent_gated_delta_rule_update), all "
-        "replayed in test_ssm_kernels.py. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
+        "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
+        "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
+        "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
+        "as outputs. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
     ),
     KernelEntry(
         name="rope_dispatch",

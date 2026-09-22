@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 
+from megatron.core.config import set_experimental_flag
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
@@ -30,11 +31,11 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training import global_vars
 from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
     ArgumentGroupFactory,
     core_transformer_config_from_args,
 )
-from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -86,6 +87,11 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     return parser
 
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
+    """Prepare and register CLI inputs without constructing runtime services.
+
+    Checkpoint overrides and validation precede config construction. Callers
+    initialize runtime services explicitly after preparing their configuration.
+    """
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
@@ -107,9 +113,12 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
     else:
         validate_args(args, args_defaults)
 
-    # set global args, build tokenizer, and set adlr-autoresume,
-    # tensorboard-writer, and timers.
-    set_global_variables(args)
+    global_vars._ensure_var_is_not_initialized(global_vars._GLOBAL_ARGS, 'args')
+    global_vars.set_args(args)
+    # Model config construction can use experimental features. Enabling the
+    # feature gate does not construct any runtime services.
+    if args.enable_experimental:
+        set_experimental_flag(True)
 
     return args
 
@@ -1895,9 +1904,6 @@ def validate_args(args, defaults={}):
             )
             args.async_save = False
 
-    if not args.async_save:
-        args.async_strategy = "mcore"
-
     if args.logits_save_dir is not None:
         assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
         assert args.async_save, (
@@ -2991,7 +2997,9 @@ def _add_rl_args(parser):
                         help='Directory to write RL profiling data. Defaults to {save}/profiles.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
-                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
+                            '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool). '
+                            'qwen3-coder-tool-combined additionally treats <tool_call> as the end of '
+                            'an unterminated reasoning block, like vLLM\'s combined qwen3 parser.')
     return parser
 
 def _add_training_args(parser):
@@ -3003,6 +3011,13 @@ def _add_training_args(parser):
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")
 
+    # Keep this CLI-only until dataset options have their own config dataclass.
+    group.add_argument(
+        "--train-full-dataset",
+        action="store_true",
+        default=False,
+        help="Train for one complete pass over an externally provided dataset.",
+    )
     group.add_argument('--batch-size', type=int, default=None,
                        help='Old batch size parameter, do not use. '
                        'Use --micro-batch-size instead')
@@ -3907,6 +3922,16 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument(
+        '--sft-loss-log-mode',
+        type=str,
+        default='token-weighted',
+        choices=['token-weighted', 'microbatch'],
+        help=(
+            'SFT loss logging reduction: average over all trainable tokens or over valid '
+            'microbatch losses.'
+        ),
+    )
     group.add_argument('--sft-mock-dataset-config-json', type=str, default=None,
                        help='This config provides the necessary information for the mock '
                        'dataset. Accepts either an inline JSON literal or a path to a JSON '
