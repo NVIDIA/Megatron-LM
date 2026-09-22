@@ -175,6 +175,8 @@ def test_cross_depth_sharing_accepts_moe_only_graph(shared_components):
         mtp_repeated_layer_shared_components=shared_components,
         cuda_graph_impl="transformer_engine",
         cuda_graph_modules=["moe"],
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
     )
 
     assert config.mtp_repeated_layer_shared_components == shared_components
