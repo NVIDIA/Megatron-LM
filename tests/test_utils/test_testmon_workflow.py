@@ -160,31 +160,145 @@ def test_producer_requires_the_main_branch(tmp_path: Path, source_ref: str) -> N
     assert (result.returncode == 0) == (source_ref == "refs/heads/main")
 
 
-@pytest.mark.parametrize("force_label", [False, True])
-def test_synthetic_pr_force_label_overrides_selective_testing(
-    tmp_path: Path, shell_environment: dict[str, str], force_label: bool
-) -> None:
+@pytest.fixture
+def configure_environment(
+    tmp_path: Path, shell_environment: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> dict[str, str]:
+    monkeypatch.delenv("ENABLE_SELECTIVE_UNIT_TESTS", raising=False)
     gh = tmp_path / "bin/gh"
-    gh.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_PR_LABELS"\n')
+    gh.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$TEST_PR_LABELS"\n' 'exit "$TEST_PR_LABEL_LOOKUP_EXIT"\n'
+    )
     gh.chmod(0o755)
-    labels = ["Run selective unit tests"] + (["force-run-all"] if force_label else [])
+    return {
+        **shell_environment,
+        "IS_CI_WORKLOAD": "false",
+        "IS_MERGE_GROUP": "false",
+        "EVENT_NAME": "push",
+        "REF": "refs/heads/pull-request/6934",
+        "FORCE_RUN_ALL": "false",
+        "TEST_PR_LABEL_LOOKUP_EXIT": "0",
+    }
+
+
+def _run_configure(
+    tmp_path: Path, environment: dict[str, str], labels: list[str]
+) -> tuple[subprocess.CompletedProcess, dict]:
     script = _step("cicd-main.yml", "configure", "configure")["run"]
     script = script.replace(
         "${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}", "6934"
     )
     script = script.replace("${{ github.repository }}", "NVIDIA/Megatron-LM")
-    result, outputs = _run(
-        script,
-        tmp_path,
-        {
-            **shell_environment,
-            "TEST_PR_LABELS": json.dumps(labels),
-            "IS_CI_WORKLOAD": "false",
-            "IS_MERGE_GROUP": "false",
-            "EVENT_NAME": "push",
-            "REF": "refs/heads/pull-request/6934",
-            "FORCE_RUN_ALL": "false",
-        },
-    )
+    return _run(script, tmp_path, {**environment, "TEST_PR_LABELS": json.dumps(labels)})
+
+
+def test_selective_default_uses_the_repository_variable() -> None:
+    step = _step("cicd-main.yml", "configure", "configure")
+    assert step["env"]["ENABLE_SELECTIVE_UNIT_TESTS"] == "${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}"
+
+
+@pytest.mark.parametrize(
+    ("default_value", "labels", "expected_default", "expected_requested"),
+    [
+        pytest.param(None, [], False, False, id="unset"),
+        pytest.param("", [], False, False, id="empty"),
+        pytest.param("false", [], False, False, id="disabled"),
+        pytest.param("true", [], True, True, id="enabled"),
+        pytest.param("TRUE", [], False, False, id="uppercase-is-not-enabled"),
+        pytest.param("true ", [], False, False, id="whitespace-is-not-enabled"),
+        pytest.param("1", [], False, False, id="numeric-is-not-enabled"),
+        pytest.param(None, ["Run selective unit tests"], False, True, id="label-without-default"),
+        pytest.param("false", ["Run selective unit tests"], False, True, id="label-enables"),
+        pytest.param("invalid", ["Run selective unit tests"], False, True, id="label-with-invalid"),
+        pytest.param("true", ["Run selective unit tests"], True, True, id="both-enable"),
+        pytest.param("true", ["Disable selective unit tests"], True, False, id="label-disables"),
+        pytest.param(
+            "false", ["Disable selective unit tests"], False, False, id="already-disabled"
+        ),
+        pytest.param(
+            "true",
+            ["Run selective unit tests", "Disable selective unit tests"],
+            True,
+            False,
+            id="disable-wins-over-default-and-enable-label",
+        ),
+        pytest.param(
+            None,
+            ["Run selective unit tests", "Disable selective unit tests"],
+            False,
+            False,
+            id="disable-wins-over-enable-label",
+        ),
+    ],
+)
+def test_selective_variable_and_label_precedence(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    default_value: str | None,
+    labels: list[str],
+    expected_default: bool,
+    expected_requested: bool,
+) -> None:
+    if default_value is not None:
+        configure_environment["ENABLE_SELECTIVE_UNIT_TESTS"] = default_value
+    result, outputs = _run_configure(tmp_path, configure_environment, labels)
     assert result.returncode == 0, result.stderr
-    assert outputs["unit_testmon_eligible"] == ("false" if force_label else "true")
+    assert outputs["unit_testmon_eligible"] == str(expected_requested).lower()
+    summary = (tmp_path / "summary").read_text()
+    for name, expected in {
+        "unit_testmon_default_enabled": expected_default,
+        "unit_testmon_enable_label": "Run selective unit tests" in labels,
+        "unit_testmon_disable_label": "Disable selective unit tests" in labels,
+        "unit_testmon_requested": expected_requested,
+        "unit_testmon_eligible": expected_requested,
+    }.items():
+        assert f"| `{name}` | `{str(expected).lower()}` |" in summary
+
+
+@pytest.mark.parametrize("request_source", ["default", "label"])
+@pytest.mark.parametrize(
+    ("labels", "environment"),
+    [
+        pytest.param(["Run tests"], {}, id="run-tests-label"),
+        pytest.param(["Run functional tests"], {}, id="run-functional-tests-label"),
+        pytest.param(["force-run-all"], {}, id="force-run-all-label"),
+        pytest.param(["container::lts"], {}, id="lts-label"),
+        pytest.param([], {"FORCE_RUN_ALL": "true"}, id="preflight-forces-full"),
+        pytest.param([], {"TEST_PR_LABEL_LOOKUP_EXIT": "1"}, id="label-lookup-fails"),
+        pytest.param([], {"REF": "refs/heads/main"}, id="main-push"),
+        pytest.param([], {"REF": "refs/heads/pull-request/not-a-number"}, id="non-pr-branch"),
+        pytest.param([], {"REF": "refs/heads/deploy-release/1.0"}, id="release-push"),
+        pytest.param([], {"EVENT_NAME": "workflow_dispatch"}, id="manual-dispatch"),
+        pytest.param([], {"EVENT_NAME": "schedule", "IS_CI_WORKLOAD": "true"}, id="schedule"),
+        pytest.param([], {"IS_MERGE_GROUP": "true"}, id="preflight-merge-group"),
+        pytest.param(
+            [],
+            {
+                "EVENT_NAME": "merge_group",
+                "IS_MERGE_GROUP": "true",
+                "REF": "refs/heads/gh-readonly-queue/main/pr-6934-abc",
+            },
+            id="merge-queue",
+        ),
+    ],
+)
+def test_full_test_guards_override_selective_requests(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    request_source: str,
+    labels: list[str],
+    environment: dict[str, str],
+) -> None:
+    if request_source == "default":
+        configure_environment["ENABLE_SELECTIVE_UNIT_TESTS"] = "true"
+    else:
+        labels = [*labels, "Run selective unit tests"]
+    result, outputs = _run_configure(tmp_path, {**configure_environment, **environment}, labels)
+    assert result.returncode == 0, result.stderr
+    assert outputs["unit_testmon_eligible"] == "false"
+    # Eligibility guards must not obscure a requested selection in the summary.
+    # If label lookup failed, only the repository default can establish a request.
+    requested = request_source == "default" or environment.get("TEST_PR_LABEL_LOOKUP_EXIT") != "1"
+    summary = (tmp_path / "summary").read_text()
+    assert f"| `unit_testmon_requested` | `{str(requested).lower()}` |" in summary
+    assert "| `unit_testmon_eligible` | `false` |" in summary
