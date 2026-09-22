@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 import re
 
-from data_loading.conversation_sample import ConversationSample, Message
 from PIL import Image
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.energon import CachePool, FileStore, MockLazy, basic_sample_keys, cooker, stateless
 from megatron.training import get_args
+
+from ..conversation_sample import ConversationSample, Message
 
 
 @stateless

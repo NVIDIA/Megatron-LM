@@ -6,17 +6,17 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import albumentations as A
 import einops
 import numpy as np
 import torch
-from data_loading.conversation_sample import ImageMedia, VideoFrameMedia
 from PIL import Image
 from torchvision import transforms as T
 from torchvision.transforms import Compose
 from torchvision.transforms.functional import InterpolationMode
 
 from megatron.core.models.multimodal.utils import patchify_image
+
+from .conversation_sample import ImageMedia, VideoFrameMedia
 
 IMAGENET_PIXEL_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_PIXEL_STD = [0.229, 0.224, 0.225]
@@ -338,6 +338,17 @@ class ImageTilingStrategyV1(_FixedSizeStrategy):
         embeddings_per_tile: int,
         find_closest_aspect_ratio_fn=find_closest_aspect_ratio,
     ):
+        # Only V1 tiling uses Albumentations; other strategies do not require it.
+        try:
+            import albumentations as A
+        except ModuleNotFoundError as exc:
+            if exc.name != "albumentations":
+                raise
+            raise ImportError(
+                "ImageTilingStrategyV1 requires albumentations. "
+                "Install it with `pip install albumentations` to use this strategy."
+            ) from exc
+
         super().__init__(
             vision_model_type=vision_model_type,
             target_width=tile_size,
