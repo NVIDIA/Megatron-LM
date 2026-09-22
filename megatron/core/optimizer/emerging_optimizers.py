@@ -32,7 +32,13 @@ try:
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
-    from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+
+    try:
+        from emerging_optimizers.legacy_soap import SOAP  # pylint: disable=unused-import
+    except ModuleNotFoundError as exc:
+        if exc.name != "emerging_optimizers.legacy_soap":
+            raise
+        from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:

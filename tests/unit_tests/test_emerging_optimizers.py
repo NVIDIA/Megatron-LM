@@ -39,8 +39,10 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
+    from emerging_optimizers import utils as emerging_optimizer_utils
     from emerging_optimizers.scalar_optimizers import Lion
-    from emerging_optimizers.soap import SOAP
+
+    from megatron.core.optimizer.emerging_optimizers import SOAP
 else:
     SOAP = None
     Lion = None
@@ -1222,13 +1224,14 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
         pg_collection=None,
     )
 
-    actual = optimizer.orthogonalize(param, grad)
-    expected = torch.cat(
-        [
-            optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
-            for head in torch.split(grad, [2] * 4)
-        ]
-    )
+    with emerging_optimizer_utils.fp32_matmul_precision(optimizer.fp32_matmul_prec):
+        actual = optimizer.orthogonalize(param, grad)
+        expected = torch.cat(
+            [
+                optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
+                for head in torch.split(grad, [2] * 4)
+            ]
+        )
     torch.testing.assert_close(actual, expected)
 
 
