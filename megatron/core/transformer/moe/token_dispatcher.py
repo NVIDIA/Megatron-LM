@@ -1631,10 +1631,16 @@ class _NCCLEPManager(_DispatchManager):
         # (nccl_ep device/hybridep_adapter.cu).
         _HT_TOKENS_PER_CHUNK = 64
         # TODO: support THD/Dynamic CP when different ranks might have different number of tokens
+        size_basis = self.config.moe_ncclep_max_tokens_per_rank
+        if size_basis is None:
+            size_basis = self.num_local_tokens
+        elif self.num_local_tokens > size_basis:
+            raise ValueError(
+                f"NCCL EP dispatch with {self.num_local_tokens} local tokens exceeds "
+                f"moe_ncclep_max_tokens_per_rank={size_basis}"
+            )
         self._max_tokens_per_rank = (
-            (self.num_local_tokens + _HT_TOKENS_PER_CHUNK - 1)
-            // _HT_TOKENS_PER_CHUNK
-            * _HT_TOKENS_PER_CHUNK
+            (size_basis + _HT_TOKENS_PER_CHUNK - 1) // _HT_TOKENS_PER_CHUNK * _HT_TOKENS_PER_CHUNK
         )
         if self.eager:
             self._recv_capacity = None
@@ -1701,6 +1707,14 @@ class _NCCLEPManager(_DispatchManager):
         # Note: this needs to stay out of the torch.compile region because TE's ep_bootstrap does
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_bootstrap()
+        if self.num_local_tokens > self._max_tokens_per_rank:
+            raise ValueError(
+                f"NCCL EP dispatch with {self.num_local_tokens} local tokens exceeds the "
+                f"bootstrapped max_tokens_per_rank={self._max_tokens_per_rank}; set "
+                "moe_ncclep_max_tokens_per_rank to the workload's static bound (by default the "
+                "buffers are sized at bootstrap from that dispatch's token count, which a "
+                "variable-length workload can exceed)"
+            )
         # Fresh buffer per dispatch; held until the matching combine consumes it.
         self._buffer = new_nccl_ep_buffer(
             top_k=self.router_topk,

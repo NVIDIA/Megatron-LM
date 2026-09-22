@@ -108,6 +108,7 @@ class MoEModelTestContainer:
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
+            moe_ncclep_max_tokens_per_rank=kwargs.get("moe_ncclep_max_tokens_per_rank", None),
             moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
             moe_combine_bwd_dtype=kwargs.get("moe_combine_bwd_dtype", 'bf16'),
             use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
@@ -653,3 +654,82 @@ class TestFlexDispatcher:
             test_dtype=torch.bfloat16,
         )
         container.moe_layer_variant_parity_test(variant)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    def test_ncclep_max_tokens_per_rank(self):
+        """Variable-length microbatches under a static moe_ncclep_max_tokens_per_rank bound.
+
+        Bootstrap with a small microbatch, then dispatch a larger one that still fits the
+        bound: without the knob the EP group is sized from whichever dispatch triggers the
+        bootstrap, and the larger microbatch overruns its buffers (a hard trap inside
+        nccl_ep). A microbatch above the bound must raise a ValueError on every rank --
+        both at bootstrap sizing and on a later dispatch -- instead of corrupting device
+        state.
+        """
+        if not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+
+        import gc
+
+        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+
+        seql = 8
+        bound = 512  # tokens per rank; a multiple of the HT chunk size (64)
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=8,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            moe_ncclep_max_tokens_per_rank=bound,
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+        )
+        small_layer = None
+        # The EP context is process-wide; re-bootstrap so this test's bound sizes it.
+        nccl_ep_release_context()
+        try:
+
+            def roundtrip(moe_layer, bs):
+                hidden_states = torch.randn(
+                    (bs, seql, moe_layer.config.hidden_size), dtype=container.test_dtype
+                ).cuda()
+                hidden_states.requires_grad = True
+                probs, indices = apply_module(moe_layer.router)(hidden_states)
+                probs = torch.ones_like(probs) / moe_layer.router.topk
+                permuted, _, permuted_probs = token_permutation(
+                    moe_layer.token_dispatcher, hidden_states, probs, indices
+                )
+                permuted = (permuted * permuted_probs.unsqueeze(-1)).to(container.test_dtype)
+                restored, _ = token_unpermutation(moe_layer.token_dispatcher, permuted)
+                torch.testing.assert_close(restored, hidden_states)
+
+            moe_layer = container.moe_layer
+            # 1. Bootstrap with a small microbatch; the group is sized by the bound, not by
+            #    the bootstrapping dispatch's 32 tokens.
+            roundtrip(moe_layer, bs=4)  # 32 tokens/rank
+            assert moe_layer.token_dispatcher._comm_manager._max_tokens_per_rank == bound
+            # 2. A later, larger microbatch (== bound) must fit. Under first-dispatch sizing
+            #    this overruns the 32-token buffers and hard-traps inside nccl_ep.
+            roundtrip(moe_layer, bs=64)  # 512 tokens/rank
+            # 3. Exceeding the bound after bootstrap raises instead of corrupting device
+            #    state (raised before any collective, so every rank raises symmetrically).
+            with pytest.raises(ValueError, match="exceeds"):
+                roundtrip(moe_layer, bs=96)  # 768 tokens/rank
+            # 4. Exceeding the bound on the bootstrapping dispatch itself also raises.
+            small_layer = container.new_moe_layer(moe_ncclep_max_tokens_per_rank=64)
+            nccl_ep_release_context()
+            with pytest.raises(ValueError, match="exceeds moe_ncclep_max_tokens_per_rank"):
+                roundtrip(small_layer, bs=64)  # 512 tokens/rank > 64
+        finally:
+            # Leave a clean slate: the EP context is process-wide, and this test's EpBuffers
+            # must be freed before a later test re-bootstraps (same pattern as
+            # test_paged_stashing).
+            del small_layer, container
+            gc.collect()
+            nccl_ep_release_context()

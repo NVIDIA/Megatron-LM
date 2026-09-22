@@ -1092,6 +1092,16 @@ class TransformerConfig(ModelParallelConfig):
     symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
     fused op (use_transformer_engine_op_fuser). Defaults to False."""
 
+    moe_ncclep_max_tokens_per_rank: Optional[int] = None
+    """For the 'ncclep' flex dispatcher: static upper bound on the per-rank dispatch token count,
+    used to size the NCCL EP group and its persistent buffers. The default (None) sizes them at
+    bootstrap from that dispatch's token count, which is only correct when every microbatch
+    carries the same per-rank token count; with variable-length workloads (e.g. packed sequences
+    of varying total length) a later, larger microbatch overruns the buffers and hard-traps
+    inside nccl_ep. Set this to the largest per-rank token count any microbatch can reach
+    (sequence parallelism divides the packed sequence length by the tensor-parallel size) to
+    size the buffers once, up front, and keep the group shape stable across re-bootstraps."""
+
     moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
     """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
