@@ -135,3 +135,48 @@ acceptance uses unprofiled event or training-step samples. An integrated
 telemetry sampler, compiler-cache inventory and post-timing Torch profiler are
 outside this benchmark's scope. Reports marked diagnostic-only remain ineligible
 for author performance evidence or baseline publication.
+
+## Join author checks and phase timings
+
+Run the coverage producer and performance driver from the **same clean source
+revision**, containing both features. Reports from separate PR heads cannot be
+joined. The shared adapter records its own source hash, input fingerprints,
+strict Torch policy (including warn-only and memory-fill settings), autocast/TF32/
+cuDNN settings, CUDA/driver/GPU details, package versions and environment overrides.
+Default and deterministic timing arms must differ only in the declared policy;
+old reports lacking this contract remain ineligible for author evidence.
+
+After collecting the coverage report and the twelve-row leaderboard:
+
+```bash
+uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/author_evidence.py \
+  --coverage /tmp/replay/coverage.json \
+  --performance /tmp/kernel-leaderboard/leaderboard.json \
+  --revision "$(git rev-parse HEAD)" \
+  --output /tmp/author-evidence.json
+```
+
+Repeat `--performance` to supply separate `benchmark.json` files. Use one attempt
+and one hardware/configuration context per bundle. The join retains every
+manifest-required case, requires passing reference/sensitivity/replay evidence
+on every replay rank, and requires one matching forward and one backward report.
+It rejects duplicates instead of selecting a favorable retry. Raw samples,
+medians and paired comparisons are checked again, and every arm of a phase must
+use the same GPU UUID. Local activation replay may be replicated across multiple
+ranks while timing uses one GPU; this adapter contains no collectives and makes
+no inference about distributed performance. Other operators need explicit adapters.
+
+`evidence_complete` and performance status answer different questions. Complete
+head-only or unbudgeted timings are `not_gated`, even if det/default overhead met
+a configured limit. A performance pass also requires a common base revision for
+both phases, complete base/head arms, and passing explicit overhead and revision
+limits. This catches slowdowns shared by default and deterministic modes. The
+limits still need independently reviewed calibration; their presence is not proof
+that the budgets were calibrated.
+
+The CLI writes JSON and Markdown plus hashes of its input artifacts before
+returning. Exit 0 means complete, nonfailing evidence; exit 1 means a numerical or
+performance failure; exit 2 means missing/incompatible/uncertain evidence. Add
+`--require-performance-pass` to also return 2 for an unbudgeted bundle. Existing
+reports are not overwritten. Combining compatible coverage/performance CI jobs
+and calibrated PR-wide enforcement still needs the combined GPU workflow.
