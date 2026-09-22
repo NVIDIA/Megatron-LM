@@ -255,6 +255,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                     hidden_states,
                     operation="read",
                     fp32_residual_connection=self.config.fp32_residual_connection,
+                    branch_input_dtype=self.config.params_dtype,
                 )
                 residual = residual_connection.residual_stream(connection_state)
             else:
@@ -263,8 +264,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             if residual_connection is None:
                 hidden_states, residual = self._prepare_mixer_input(hidden_states)
             else:
-                # Wide connections may carry an FP32 stream, while mixer computation remains in
-                # parameter precision.
+                # The residual connection requests this dtype from its read kernel, so this is
+                # normally an alias. Keep the guard for hooks and custom connection subclasses.
                 hidden_states = hidden_states.to(dtype=self.config.params_dtype)
                 hidden_states = apply_module(self.norm)(hidden_states)
 
