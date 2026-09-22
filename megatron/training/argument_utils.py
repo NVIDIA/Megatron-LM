@@ -275,6 +275,7 @@ class ArgumentGroupFactory:
 
 
 def core_transformer_config_from_args(args, config_class=None):
+    """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
     from megatron.core.quantization.utils import (
@@ -306,6 +307,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    if kw_args.get('hash_moe_vocab_size') is None:
+        kw_args['hash_moe_vocab_size'] = args.vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
