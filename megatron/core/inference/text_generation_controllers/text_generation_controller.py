@@ -1733,9 +1733,18 @@ class TextGenerationController(MTPControllerMixin):
             finished_idxs = finished_idxs[finished_idxs != chunked_prefill_idx]
         finished_request_ids = context.request_ids[finished_idxs]
 
-        # Save block IDs for finished requests before update_requests releases them.
-        # Needed for per-block routing reconstruction in the engine.
+        # Save block IDs *and* a snapshot of their routing arrays for finished
+        # requests before update_requests releases them. Saving only the block
+        # ids is not enough: update_requests() releases a finished request's
+        # blocks back to the free pool and can, within that same call,
+        # immediately hand one of them to a different, still-active request
+        # that needs a new block (resume_paused_requests) -- which pops the
+        # block's routing data on reuse, before the engine's later, separate
+        # reconstruct_routing_from_blocks() call ever runs for this request.
+        # Snapshotting the arrays here, while they are still guaranteed
+        # intact, closes that race.
         finished_routing_block_ids = {}
+        finished_routing_block_snapshots = {}
         if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
@@ -1745,6 +1754,11 @@ class TextGenerationController(MTPControllerMixin):
                 valid = blocks[blocks >= 0].tolist()
                 if valid:
                     finished_routing_block_ids[req_id] = valid
+                    for bid in valid:
+                        if bid not in finished_routing_block_snapshots:
+                            routing = context.kv_block_allocator.get_block_routing(bid)
+                            if routing is not None:
+                                finished_routing_block_snapshots[bid] = routing
 
         # Retain finished prefill blocks before request cleanup releases them;
         # the handoff path owns this reference until the decode transfer completes.
@@ -1774,6 +1788,7 @@ class TextGenerationController(MTPControllerMixin):
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
+            "finished_routing_block_snapshots": finished_routing_block_snapshots,
             "finished_handoff_block_ids": finished_handoff_block_ids,
             "finished_handoff_ssm_slots": finished_handoff_ssm_slots,
             "finished_handoff_decode_tokens": finished_handoff_decode_tokens,
@@ -2965,7 +2980,7 @@ class TextGenerationController(MTPControllerMixin):
             if tracer is not None and routing_indices is not None:
                 layer_ids = [
                     r.layer_number
-                    for r in RouterReplay.global_router_replay_instances
+                    for r in RouterReplay.replay_instances()
                     if r.layer_number is not None
                 ] or None
                 tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)

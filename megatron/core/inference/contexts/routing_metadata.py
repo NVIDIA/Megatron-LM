@@ -41,7 +41,7 @@ class RoutingMetadata:
         if self.routing_indices_buffer is not None:
             return
 
-        self.num_moe_layers = len(RouterReplay.global_router_replay_instances)
+        self.num_moe_layers = len(RouterReplay.replay_instances())
 
         if self.num_moe_layers == 0:
             return
@@ -75,7 +75,14 @@ class RoutingMetadata:
             recorded_data = RouterReplay.get_recorded_data()
             if recorded_data is None or len(recorded_data) == 0:
                 return None
-            if recorded_data[0] is None:
+            # Not every MoE layer necessarily records on the same step (e.g. a
+            # layer whose forward hasn't run yet this async step) -- checking
+            # only recorded_data[0] let a partially-populated list (real
+            # tensor at 0, None at some later layer) reach torch.stack below
+            # and crash with "expected Tensor as element N in argument 0, but
+            # got NoneType". Any layer still None means this step's routing
+            # isn't fully recorded yet; treat it the same as "not available".
+            if any(layer_indices is None for layer_indices in recorded_data):
                 return None
             # Stack: list of [num_tokens, topk] -> [num_tokens, num_layers, topk]
             return torch.stack(recorded_data, dim=1)

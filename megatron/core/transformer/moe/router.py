@@ -267,7 +267,7 @@ class TopKRouter(Router):
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
-            self.router_replay = RouterReplay()
+            self.router_replay = RouterReplay(is_mtp_layer=self.is_mtp_layer)
 
     def _maintain_float32_expert_bias(self):
         """
@@ -1006,7 +1006,7 @@ class InferenceTopKRouter(TopKRouter):
             f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
         )
 
-        super().__init__(config=config, pg_collection=pg_collection)
+        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
 
     @staticmethod
     @torch.compile
