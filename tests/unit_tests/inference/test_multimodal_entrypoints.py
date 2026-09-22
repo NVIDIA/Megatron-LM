@@ -20,6 +20,7 @@ from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
+    compute_media_cache_key,
     resolve_multimodal_data_for_engine,
     serialize_multimodal_data,
 )
@@ -51,6 +52,16 @@ class _ToyTokenizer:
     def detokenize(self, token_ids):
         return " ".join(str(token_id) for token_id in token_ids)
 
+    def tokenize(self, text):
+        parts = text.split("<image>")
+        tokens = []
+        for index, part in enumerate(parts):
+            if part:
+                tokens.append(42)
+            if index < len(parts) - 1:
+                tokens.append(_MEDIA_TOKEN_ID)
+        return tokens
+
 
 class _InlineLoopManager:
     async def run_async(self, awaitable):
@@ -77,6 +88,8 @@ def _toy_preprocessed_media(modality):
             "imgs": torch.ones(2, 3, 4, 4),
             "imgs_sizes": torch.tensor([[4, 4], [4, 4]], dtype=torch.int32),
             "num_frames": torch.tensor([2], dtype=torch.int32),
+            "video_frame_indices": [[0, 1]],
+            "video_fps": [1.0],
         }
     return {"imgs": torch.ones(1, 3, 4, 4), "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32)}
 
@@ -182,12 +195,17 @@ class _ToyInferenceService:
         assert torch.all(decoder_output[image_positions] == 1)
         assert torch.all(decoder_output[~image_positions] == 0)
 
-    def add_request(self, prompt, sampling_params, *, multi_modal_data=None):
-        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
-            1
-        ]
+    def add_request(self, prompt, sampling_params, *, multi_modal_data=None, offload_params=None):
+        return self.add_request_with_id(
+            prompt,
+            sampling_params,
+            multi_modal_data=multi_modal_data,
+            offload_params=offload_params,
+        )[1]
 
-    def add_request_with_id(self, prompt, sampling_params, *, multi_modal_data=None):
+    def add_request_with_id(
+        self, prompt, sampling_params, *, multi_modal_data=None, offload_params=None
+    ):
         """Mirror InferenceClient: the endpoints submit through the id-returning form."""
         future = asyncio.get_running_loop().create_future()
         # Claimed before the work, as the real client claims next_request_id
@@ -226,7 +244,7 @@ class _ToyInferenceService:
                 **engine_kwargs,
             )
             request.generated_text = "toy output"
-            request.generated_tokens = [7]
+            request.generated_tokens = [7] if self.deserialize else [7, 8]
             self._run_toy_decoder(request)
             self.last_request = request
             if self.deserialize:
@@ -238,7 +256,7 @@ class _ToyInferenceService:
                     "generated_text": request.generated_text,
                     "generated_tokens": request.generated_tokens,
                     "prompt_tokens": request.prompt_tokens.tolist(),
-                    "sampling_params": {"num_tokens_to_generate": 1},
+                    "sampling_params": {"num_tokens_to_generate": 2},
                     "routing_indices": None,
                 }
             future.set_result(result)
@@ -305,6 +323,9 @@ async def test_generate_multimodal_entrypoint_with_toy_model(
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1
     assert int((result.image_token_mask >= 0).sum()) == result.image_embeddings.shape[0]
+    if modality == "video":
+        assert result.video_frame_indices == [[0, 1]]
+        assert result.video_fps == [1.0]
 
 
 @pytest.mark.internal
@@ -348,18 +369,24 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
     if modality == "video":
         encoded_media = f"data:video/mp4;base64,{encoded_media}"
 
-    response = await app.test_client().post(
-        "/v1/completions",
-        json={
-            "prompt": _PROMPT_TOKENS,
-            "max_tokens": 1,
-            "multi_modal_data": {modality: encoded_media},
-        },
-    )
+    with mock.patch(
+        "megatron.core.inference.inference_request.compute_media_cache_key",
+        wraps=compute_media_cache_key,
+    ) as compute_key:
+        response = await app.test_client().post(
+            "/v1/completions",
+            json={
+                "prompt": [_PROMPT_TOKENS, _PROMPT_TOKENS],
+                "max_tokens": 2,
+                "multi_modal_data": {modality: encoded_media},
+            },
+        )
 
     assert response.status_code == 200
     payload = await response.get_json()
-    assert payload["choices"][0]["text"] == "toy output"
+    assert len(payload["choices"]) == 2
+    assert payload["choices"][0]["text"] == "7 8"
+    assert compute_key.call_count == 1
     assert service.last_request.compact_prompt_tokens.tolist() == _PROMPT_TOKENS
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1

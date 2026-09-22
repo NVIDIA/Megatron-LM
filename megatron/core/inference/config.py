@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
 
@@ -143,6 +143,24 @@ class MambaInferenceStateConfig:
         return None
 
 
+def mtp_layer_types_from_model(model: MegatronModule) -> Optional[List[str]]:
+    """Layer types of one MTP draft-head depth, or None for a non-hybrid model.
+
+    The MTP head's layer types come from the unified hybrid pattern ("<main>/<mtp>/..."), which
+    only HybridModel parses. Independent of whether the MAIN decoder has recurrent layers, so it
+    cannot be derived from `MambaInferenceStateConfig`.
+
+    Callers that never enable speculative decoding do not need this: the draft-KV gate requires
+    `num_speculative_tokens > 0` first, so leaving `InferenceConfig.mtp_layer_type_list` at None
+    is correct for them.
+    """
+    try:
+        mtp_pattern = get_attr_wrapped_model(model, "mtp_pattern")
+    except RuntimeError:
+        return None
+    return list(mtp_pattern) if mtp_pattern else None
+
+
 class PrefixCachingEvictionPolicy(str, Enum):
     """Eviction policy for prefix caching blocks.
 
@@ -264,6 +282,31 @@ class ImageProcessingConfig:
     max_num_tiles: int = 1
     use_thumbnail: bool = False
     num_img_embeddings_per_tile: int = 0
+    dynamic_resolution_model_length: Optional[int] = None
+    """Model-length budget used by processors that divide capacity across images."""
+    dynamic_resolution_rounding_mode: Literal["ceil", "round_plus_half"] = "ceil"
+    """Patch-grid rounding contract: ``ceil`` or ``round_plus_half``."""
+    dynamic_resolution_resize_mode: Literal["pil", "torch_bicubic_antialias"] = "pil"
+    """Resize contract: ``pil`` or ``torch_bicubic_antialias``."""
+
+    def __post_init__(self):
+        if self.dynamic_resolution_rounding_mode not in ("ceil", "round_plus_half"):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_rounding_mode must be "
+                "'ceil' or 'round_plus_half'."
+            )
+        if self.dynamic_resolution_resize_mode not in ("pil", "torch_bicubic_antialias"):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_resize_mode must be "
+                "'pil' or 'torch_bicubic_antialias'."
+            )
+        if (
+            self.dynamic_resolution_model_length is not None
+            and self.dynamic_resolution_model_length <= 4
+        ):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_model_length must be " "greater than 4."
+            )
 
 
 @dataclass
@@ -286,6 +329,24 @@ class MediaPromptSpec:
     prefix: str = ""
     suffix: str = ""
     input_marker: Optional[str] = None
+    content_part_separator: str = ""
+    expansion_mode: Literal["single", "temporal_patch"] = "single"
+    include_frame_timestamps_for_nemotron_vl: bool = False
+
+    def __post_init__(self):
+        if self.expansion_mode not in ("single", "temporal_patch"):
+            raise ValueError(
+                "MediaPromptSpec.expansion_mode must be 'single' or "
+                f"'temporal_patch', got {self.expansion_mode!r}."
+            )
+        if (
+            self.include_frame_timestamps_for_nemotron_vl
+            and self.expansion_mode != "temporal_patch"
+        ):
+            raise ValueError(
+                "MediaPromptSpec.include_frame_timestamps_for_nemotron_vl requires "
+                "expansion_mode='temporal_patch'."
+            )
 
 
 @dataclass(frozen=True)
@@ -304,13 +365,14 @@ class MultimodalPromptConfig:
         raise ValueError(f"Unsupported media modality: {modality!r}")
 
     @classmethod
-    def from_dict(cls, value):
-        """Build from image and video specs."""
+    def from_dict(cls, value, defaults=None):
+        """Build from image and video overrides, preserving optional defaults."""
         if not value:
-            return cls()
+            return defaults or cls()
+        defaults = defaults or cls()
         return cls(
-            image_spec=MediaPromptSpec(**value.get("image_spec", {})),
-            video_spec=MediaPromptSpec(**value.get("video_spec", {})),
+            image_spec=replace(defaults.image_spec, **dict(value.get("image_spec", {}))),
+            video_spec=replace(defaults.video_spec, **dict(value.get("video_spec", {}))),
         )
 
 
@@ -348,6 +410,12 @@ class InferenceConfig:
 
     mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
     """The Mamba inference state config if the model is a hybrid model."""
+
+    mtp_layer_type_list: Optional[List[str]] = None
+    """Layer types of one MTP draft-head depth, one symbol per layer, or None for a non-hybrid
+    model, whose head is a single attention layer by construction. Read by
+    `DynamicInferenceContext` to decide whether the MTP draft attention can be given its own KV
+    plane."""
 
     mamba_memory_ratio: Optional[float] = None
     """
@@ -453,6 +521,9 @@ class InferenceConfig:
 
     video_preprocessing_config: Optional[VideoProcessingConfig] = None
     """Configuration for decoding and preprocessing raw video payloads."""
+
+    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None
+    """Optional per-engine overrides for the inference wrapper's media prompt contract."""
 
     use_flashinfer_fused_rope: Optional[bool] = False
     """

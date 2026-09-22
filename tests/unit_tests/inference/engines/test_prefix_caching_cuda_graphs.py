@@ -237,9 +237,8 @@ class TestPrefixCachingCudaGraphs:
                     ctx.using_cuda_graph_this_step(),
                 )
             )
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
 
         if batch_structure in ("prefill", "decode"):
             # Add all 4 requests before first step.
@@ -483,9 +482,8 @@ class TestHybridChunkedPrefillIntermediateState:
         baseline_outputs = {}
         while baseline_engine.has_unfinished_requests():
             result = baseline_engine.step_modern()
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                baseline_outputs[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                baseline_outputs[request.request_id] = list(request.generated_tokens)
 
         # Test: prefix caching + chunked prefill, max_tokens=400.
         test_engine = self._build_engine(
@@ -500,9 +498,8 @@ class TestHybridChunkedPrefillIntermediateState:
         test_outputs = {}
 
         def collect_finished(result):
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                test_outputs[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                test_outputs[request.request_id] = list(request.generated_tokens)
 
         # Phase 1: run req0 to completion (seeds cache).
         req0 = self._make_request(0, prompt0, enable_pc=True)
@@ -581,9 +578,8 @@ class TestHybridChunkedPrefillIntermediateState:
         outputs = {}
         while engine.has_unfinished_requests():
             result = engine.step_modern()
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                outputs[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                outputs[request.request_id] = list(request.generated_tokens)
 
         # Generation completes and produces the requested number of tokens.
         assert len(outputs[0]) == NUM_TOKENS_TO_GENERATE
