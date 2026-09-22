@@ -3962,10 +3962,15 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
-        if self.mtp_repeated_layer_shared_components and cuda_graph_captures_attention:
+        if (
+            self.mtp_repeated_layer_shared_components
+            and cuda_graph_captures_attention
+            and self.cuda_graph_impl != "full_iteration"
+        ):
             raise ValueError(
-                "mtp_repeated_layer_shared_components does not support CUDA graph capture that "
-                "includes attention. Use a MoE-only scope or disable CUDA graphs."
+                "mtp_repeated_layer_shared_components does not support per-layer CUDA graph "
+                "scopes that capture attention. Use a MoE-only scope or a full-iteration graph "
+                "that contains the complete MTP producer-consumer chain."
             )
 
         if self.pipeline_model_parallel_prewarm:

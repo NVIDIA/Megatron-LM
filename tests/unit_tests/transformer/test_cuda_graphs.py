@@ -709,7 +709,7 @@ class TestCudaGraphConfigAndArguments:
 
         assert cfg.dynamic_context_parallel
         assert cfg.cuda_graph_static_dynamic_cp
-        assert cfg.thd_static_pp_communication
+        assert cfg.pipeline_p2p_fixed_shape
 
     def test_thd_full_iteration_static_dynamic_cp_flag_requires_dynamic_cp(self):
         with pytest.raises(AssertionError, match="requires --dynamic-context-parallel"):

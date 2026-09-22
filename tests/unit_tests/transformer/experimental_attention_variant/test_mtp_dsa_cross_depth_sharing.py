@@ -139,21 +139,31 @@ def test_cross_depth_shared_components_reject_invalid_lists(shared_components, m
         ({"mtp_num_layers": 1}, "requires mtp_num_layers > 1"),
         (
             {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": ["attn"]},
-            "does not support CUDA graph capture that includes attention",
+            "does not support per-layer CUDA graph",
         ),
         (
             {"cuda_graph_impl": "local", "cuda_graph_modules": []},
-            "does not support CUDA graph capture that includes attention",
-        ),
-        (
-            {"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []},
-            "does not support CUDA graph capture that includes attention",
+            "does not support per-layer CUDA graph",
         ),
     ],
 )
 def test_cross_depth_sharing_rejects_incompatible_config(overrides, message):
     with pytest.raises(ValueError, match=message):
         _make_config(**overrides)
+
+
+@pytest.mark.parametrize(
+    "shared_components",
+    [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS],
+)
+def test_cross_depth_sharing_accepts_full_iteration_graph(shared_components):
+    config = _make_config(
+        mtp_repeated_layer_shared_components=shared_components,
+        cuda_graph_impl="full_iteration",
+        cuda_graph_modules=[],
+    )
+
+    assert config.mtp_repeated_layer_shared_components == shared_components
 
 
 @pytest.mark.parametrize(
