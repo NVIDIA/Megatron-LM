@@ -3860,6 +3860,7 @@ try:
         out: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         grad: bool = False,
+        accumulate: bool = False,
     ) -> List[torch.Tensor]:
         """
         Wrapper for TE's general_gemm function.
@@ -3867,13 +3868,17 @@ try:
         The output dtype can be specified by `out_dtype`.
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
+
+        ``accumulate=True`` makes the epilogue add into ``out`` instead of overwriting it, so a
+        caller that drives the same output buffer through several GEMMs gets the sum without a
+        separate accumulator. ``out`` must then already hold the running value.
         """
         kwargs = dict(
             out_dtype=out_dtype,
             quantization_params=None,
             gelu=None,
             gelu_in=None,
-            accumulate=False,
+            accumulate=accumulate,
             layout=layout,
             out=out,
             bias=bias,
