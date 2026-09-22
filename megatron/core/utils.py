@@ -2545,6 +2545,10 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
         'max_seqlen',
         'local_cp_size',
         'hybrid_cp_group',
+        # BlendedDataset tags each sample with a scalar dataset_id (blended_dataset.py:109). It
+        # has no sequence dimension, so sharding it along one raises IndexError; only blended
+        # real datasets produce it, which is why mock-data CP runs never hit this.
+        'dataset_id',
     )
 
     if cp_size > 1:
