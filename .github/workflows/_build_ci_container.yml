@@ -106,8 +106,8 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: >-
-      ${{ inputs.is-maintainer && matrix.cloud == 'aws-h100' && 'nemo-ci-aws-cpu'
-          || inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nemo-ci-aws-cpu-arm64'
+      ${{ inputs.is-maintainer && matrix.cloud == 'aws-h100' && 'nvidia-ci-aws-cpu'
+          || inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
           || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     permissions:
