@@ -213,7 +213,7 @@ class RecipeConfig:
 
         matchers_dict = {}
         for i, m in enumerate(self.matchers):
-            if isinstance(m, GlobMatcher):
+            if type(m) is GlobMatcher:
                 m_dict = {
                     "enabled": True,
                     "type": "glob",
