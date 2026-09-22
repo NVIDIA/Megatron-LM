@@ -5,7 +5,10 @@ import base64
 import logging
 import time
 
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.inference_request import (
+    prepare_multimodal_data,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
@@ -192,6 +195,9 @@ try:
         # through openai_stream's finally, which never runs because the
         # generator is never started.
         try:
+            # Hash and serialize shared media once before fanning it out across
+            # the prompts in this batch, the same way chat completions does.
+            prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
             for prompt_tokens in prompts_as_tokens:
                 per_req_params = SamplingParams(
                     temperature=sampling_params.temperature,
@@ -216,7 +222,7 @@ try:
                         client.add_request_streaming(
                             prompt_tokens,
                             per_req_params,
-                            multi_modal_data=multi_modal_data,
+                            multi_modal_data=prepared_multimodal_data,
                             offload_params=offload_params,
                         )
                     )
@@ -227,7 +233,7 @@ try:
                     request_id, future = client.add_request_with_id(
                         prompt_tokens,
                         per_req_params,
-                        multi_modal_data=multi_modal_data,
+                        multi_modal_data=prepared_multimodal_data,
                         offload_params=offload_params,
                     )
                     request_ids.append(request_id)
