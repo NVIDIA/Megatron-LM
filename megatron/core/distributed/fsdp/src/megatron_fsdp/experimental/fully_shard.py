@@ -92,8 +92,7 @@ def fully_shard_context(
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
     """
-    existing = _FSDP_CONTEXT.get()
-    if existing is not None:
+    if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
 
     device = device or torch.device("cuda", torch.cuda.current_device())
