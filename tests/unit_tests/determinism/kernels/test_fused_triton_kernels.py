@@ -5,11 +5,16 @@
 * ``fused_pad_routing_map`` / ``fused_indices_to_multihot``: integer routing bookkeeping with
   unique stores -- replay and agree with the torch reference.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
-  ``triton.autotune``; forward and backward replay in sbhd and thd layouts.
+  ``triton.autotune``; forward and backward replay in sbhd and thd layouts, at a head count the
+  autotuned ``BLOCK_H`` divides and at one it does not, plus a check that the result does not
+  depend on ``BLOCK_H`` at all -- a replay cannot see that, because Triton caches the config the
+  first call chose.
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
   contain real ``tl.sum`` reductions under autotune, on the Triton, native (``torch.compile``)
   and, when available, cuTile backends.
 """
+
+import contextlib
 
 import pytest
 import torch
@@ -159,12 +164,53 @@ def _yarn_cos_sin(emb_dim, seqlen, dtype):
     return (torch.cos(freqs) * mscale).to(dtype), (torch.sin(freqs) * mscale).to(dtype)
 
 
+# Every MLA RoPE kernel is launched over ``cdiv(head_num, BLOCK_H)`` head programs, so a head count
+# that ``BLOCK_H`` does not divide leaves the final program covering head rows that do not exist.
+# 32 -- the only count these tests used -- is divisible by every ``BLOCK_H`` in the autotune list
+# that does not collapse the grid to a single program, so the partial final block was never built
+# here at all. 12 builds it.
+PARTIAL_BLOCK_HEADS = 12
+
+# The two tilings compared below: 12 % 8 leaves a partial final block, 12 % 4 does not.
+_BLOCK_H_PAIR = (8, 4)
+
+
+@contextlib.contextmanager
+def _pinned_block_h(block_h):
+    """Leave every autotuned MLA RoPE kernel one ``BLOCK_H`` to choose from.
+
+    ``BLOCK_H`` is chosen by timing, so it is not an input the caller controls. The replay tests
+    above cannot vary it -- Triton caches the tuned config, so every replay reuses whatever the
+    first call picked -- which is exactly why a result that moves with the tiling can look stable
+    under replay and still move from run to run in a real job.
+    """
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as mla
+
+    kernels = [
+        mla._mla_rope_fwd_inplace_kernel,
+        mla._mla_rope_bwd_inplace_kernel,
+        mla._mla_rope_fwd_kv_split_kernel,
+        mla._mla_rope_bwd_kv_split_kernel,
+    ]
+    saved = [(k, k.configs, k.cache) for k in kernels]
+    try:
+        for kernel in kernels:
+            kernel.configs = [triton.Config({"BLOCK_H": block_h})]
+            kernel.cache = {}
+        yield
+    finally:
+        for kernel, configs, cache in saved:
+            kernel.configs = configs
+            kernel.cache = cache
+
+
 @pytest.mark.skipif(fused_mla_rope_out_of_place is None, reason="fused MLA RoPE unavailable")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("variant", ["out_of_place", "inplace"])
-def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant):
+@pytest.mark.parametrize("heads", [32, PARTIAL_BLOCK_HEADS])
+def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
     seeded()
-    heads, nope_dim, emb_dim = 32, 128, 64
+    nope_dim, emb_dim = 128, 64
     dtype = torch.bfloat16
     if layout == "sbhd":
         seqlen, batch = 2048, 2
@@ -187,9 +233,10 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant):
 
 @pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
-def test_fused_mla_rope_kv_split_replays_fwd_bwd(layout):
+@pytest.mark.parametrize("heads", [32, PARTIAL_BLOCK_HEADS])
+def test_fused_mla_rope_kv_split_replays_fwd_bwd(layout, heads):
     seeded()
-    heads, k_dim, v_dim, emb_dim = 32, 128, 128, 64
+    k_dim, v_dim, emb_dim = 128, 128, 64
     dtype = torch.bfloat16
     if layout == "sbhd":
         seqlen, batch = 2048, 2
@@ -214,6 +261,71 @@ def test_fused_mla_rope_kv_split_replays_fwd_bwd(layout):
     assert_replays_bit_exact(
         run, (kv, k_pos_emb), replays=3, what=f"fused_mla_rope_kv_split[{layout}]"
     )
+
+
+@pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
+@pytest.mark.parametrize("path", ["q", "kv_split"])
+def test_fused_mla_rope_is_independent_of_block_h(path):
+    """One fixed input must give the same bits at both tilings.
+
+    ``BLOCK_H`` is a tiling choice the autotuner makes on timing, so a result that depends on it is
+    a result that depends on which config happened to win -- non-determinism reached through the
+    tuner rather than through a reduction order, and invisible to a replay that reuses one config.
+    """
+    seeded()
+    heads, nope_dim, k_dim, v_dim, emb_dim = PARTIAL_BLOCK_HEADS, 128, 128, 128, 64
+    dtype = torch.bfloat16
+    bounds = [0, 1000, 1500, 2048, 4096]
+    seqlen = max(b - a for a, b in zip(bounds, bounds[1:]))
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    cos, sin = _yarn_cos_sin(emb_dim, seqlen, dtype)
+
+    if path == "q":
+        base = torch.randn(bounds[-1], heads, nope_dim + emb_dim, device="cuda", dtype=dtype)
+        grad = torch.randn_like(base)
+
+        def run():
+            t = base.detach().clone().requires_grad_(True)
+            out = fused_mla_rope_out_of_place(
+                t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens
+            )
+            out.backward(grad.clone())
+            return [out.detach(), t.grad]
+
+    else:
+        base_kv = torch.randn(bounds[-1], heads, k_dim + v_dim, device="cuda", dtype=dtype)
+        base_emb = torch.randn(bounds[-1], 1, emb_dim, device="cuda", dtype=dtype)
+        grad_k = torch.randn(bounds[-1], heads, k_dim + emb_dim, device="cuda", dtype=dtype)
+        grad_v = torch.randn(bounds[-1], heads, v_dim, device="cuda", dtype=dtype)
+
+        def run():
+            kv = base_kv.detach().clone().requires_grad_(True)
+            k_pos_emb = base_emb.detach().clone().requires_grad_(True)
+            k_out, v_out = fused_mla_rope_kv_split(
+                kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim, cu_seqlens_kv=cu_seqlens
+            )
+            torch.autograd.backward((k_out, v_out), (grad_k.clone(), grad_v.clone()))
+            # k_pos_emb.grad is the dEMB reduction -- the one output here built by summing over
+            # head rows, so the only one a head row the mask should have dropped can reach.
+            return [k_out.detach(), v_out.detach(), kv.grad, k_pos_emb.grad]
+
+    results = []
+    for block_h in _BLOCK_H_PAIR:
+        with _pinned_block_h(block_h):
+            results.append(run())
+
+    first, second = results
+    for i, (a, b) in enumerate(zip(first, second)):
+        torch.testing.assert_close(
+            a,
+            b,
+            rtol=0,
+            atol=0,
+            msg=lambda m, i=i: (
+                f"fused_mla_rope_{path} output {i} differs between "
+                f"BLOCK_H={_BLOCK_H_PAIR[0]} and BLOCK_H={_BLOCK_H_PAIR[1]}: {m}"
+            ),
+        )
 
 
 # --- mHC (hyper-connection) kernels -------------------------------------------------------
