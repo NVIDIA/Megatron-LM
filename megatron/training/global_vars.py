@@ -209,7 +209,7 @@ def unset_global_variables():
     """
 
     global _GLOBAL_ARGS
-    global _GLOBAL_FULL_CONFIG
+    global _GLOBAL_RUN_CONFIG
     global _GLOBAL_TRAIN_STATE
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
@@ -223,7 +223,7 @@ def unset_global_variables():
     global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
-    _GLOBAL_FULL_CONFIG = None
+    _GLOBAL_RUN_CONFIG = None
     _GLOBAL_TRAIN_STATE = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
@@ -575,8 +575,8 @@ def destroy_global_vars():
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
 
-    global _GLOBAL_FULL_CONFIG
-    _GLOBAL_FULL_CONFIG = None
+    global _GLOBAL_RUN_CONFIG
+    _GLOBAL_RUN_CONFIG = None
 
     global _GLOBAL_TRAIN_STATE
     _GLOBAL_TRAIN_STATE = None
