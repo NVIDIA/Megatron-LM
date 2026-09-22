@@ -30,7 +30,6 @@ from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_train_state_filename,
     read_train_state,
 )
-
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
