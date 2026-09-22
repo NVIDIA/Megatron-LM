@@ -1,7 +1,6 @@
 # DeepSeek-style proxy: 8 layers — 3 dense, Rest MoE with expert parallelism 2.
 # MXFP8 compute and parameter gather on one node (4 GPUs).
 # Compare the loss curve with the recorded BF16 MFSDP v2 proxy baseline.
-# See README.md for baseline provenance and comparison tolerance.
 ENV_VARS:
   # run_ci_test.sh always exports this (yq prints "null" for a missing key,
   # which fails determinism.py's validator), so it must be set explicitly.
