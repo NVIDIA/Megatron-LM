@@ -58,6 +58,7 @@ class Router(ABC, MegatronModule):
         self.moe_aux_loss_func = None
         self.layer_number = None
         self.is_mtp_layer = is_mtp_layer
+        self.mtp_layer_number = None
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -147,6 +148,14 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
         if getattr(self, "router_replay", None) is not None:
             self.router_replay.layer_number = layer_number
+
+    def set_mtp_layer_number(self, layer_number: int) -> None:
+        """Set the owning MTP head's 1-based index for loss logging.
+
+        All routers within a hybrid MTP head share its metric slot. Their physical
+        layer numbers remain unchanged for routing and router replay.
+        """
+        self.mtp_layer_number = layer_number
 
 
 class TopKRouter(Router):
@@ -593,16 +602,13 @@ class TopKRouter(Router):
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
 
-        # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
-        # add the aux loss logging value to other layer's since it is difficult to get the
-        # correct layer_number for MTP. It does not affect the correctness of the calculation
-        # results and the reduced load_balancing_loss logging value.
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
 
         if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
+            mtp_layer_number = self.mtp_layer_number or self.layer_number
+            layer_number = mtp_layer_number + self.config.num_layers
         else:
             layer_number = self.layer_number
 
@@ -705,7 +711,8 @@ class TopKRouter(Router):
                 num_layers += self.config.mtp_num_layers
 
             if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
+                mtp_layer_number = self.mtp_layer_number or self.layer_number
+                layer_number = mtp_layer_number + self.config.num_layers
             else:
                 layer_number = self.layer_number
 

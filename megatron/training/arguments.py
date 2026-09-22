@@ -978,24 +978,9 @@ def validate_args(args, defaults={}):
         if args.virtual_pipeline_model_parallel_size == 1:
             args.virtual_pipeline_model_parallel_size = None
     else:
-        # Only set VPP to None if it wasn't already derived from --hybrid-layer-pattern
-        if args.hybrid_layer_pattern is None:
+        # CLI patterns and Python configs may already provide the VPP topology.
+        if not hasattr(args, 'virtual_pipeline_model_parallel_size'):
             args.virtual_pipeline_model_parallel_size = None
-
-        if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
-            # Divisibility check not applicable for T5 models which specify encoder_num_layers
-            # and decoder_num_layers, or for hybrid models using --hybrid-layer-pattern.
-            if args.num_layers is not None and args.hybrid_layer_pattern is None:
-                num_layers = args.num_layers
-
-                if args.account_for_embedding_in_pipeline_split:
-                    num_layers += 1
-
-                if args.account_for_loss_in_pipeline_split:
-                    num_layers += 1
-
-                assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                    'Number of layers should be divisible by the pipeline-model-parallel size'
 
     if args.virtual_pipeline_model_parallel_size is not None:
         if args.overlap_p2p_comm:
