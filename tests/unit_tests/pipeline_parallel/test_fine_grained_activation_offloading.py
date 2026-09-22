@@ -33,125 +33,139 @@ EPSILON_A2A = 0.30
 DELTA = 20  # MiB
 
 
-class _FakeCudaStream:
-    def wait_stream(self, stream):
-        pass
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatch):
+    """Actual H2D reloads must stay one group ahead of a sequential backward pass.
 
+    A chain of sin operations saves one equally sized activation per group. Warmup
+    reserves the final group, and fraction=0.5 keeps the latter half of the remaining
+    groups on GPU. Reloading at every resident group's backward boundary would pull
+    all earlier offloaded groups back to GPU before any of them are consumed.
 
-class _FakeOffloadGroup:
-    def __init__(self, name, *, offloaded):
-        self._name = name
-        self._tensors = {"tensor": (object(),) if offloaded else torch.empty(0)}
-        self.recorded_reload = False
+    Observe real reload events and saved-tensor consumption without changing stream
+    ordering or calling the scheduler ourselves. Use interfaces shared with the
+    unfixed implementation so the same test can demonstrate the original regression.
+    """
+    num_groups = 9
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    input_tensor = torch.full((512, 512), 0.1, device="cuda", requires_grad=True)
+    group_bytes = input_tensor.numel() * input_tensor.element_size()
+    backward_order = []
+    reload_events = []
+    samples = []
+    current_backward_group = None
+    offloaded_groups = {}
 
-    def push_tensor(self, tag, tensor):
-        self._tensors[tag] = tensor
+    def sample(event):
+        # Count only initially offloaded groups. A CUDA tensor here was allocated
+        # by reload but has not yet been retrieved through saved_tensors_hooks.
+        # No synchronize is inserted: allocation/retention already occurs when the
+        # asynchronous H2D copy is enqueued, even if the copy has not completed.
+        pending = {
+            index: sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in group._tensors.values()
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+            )
+            for group, index in offloaded_groups.items()
+        }
+        pending = {index: size for index, size in pending.items() if size}
+        samples.append((event, current_backward_group, tuple(pending), sum(pending.values())))
 
-    def wait_offload_event(self, stream):
-        pass
+    def record_backward(grad, index):
+        nonlocal current_backward_group
+        current_backward_group = index
+        backward_order.append(index)
+        sample("backward")
+        return grad
 
-    def record_reload_event(self, stream):
-        self.recorded_reload = True
+    def forward(record=False):
+        off_interface.init_chunk_handler(
+            pp_rank=0,
+            vp_size=None,
+            vp_stage=None,
+            min_offloaded_tensor_size=1,
+            delta_offload_bytes_across_pp_ranks=0,
+            activation_offload_fraction=0.5,
+        )
+        output = input_tensor
+        for index in range(num_groups):
+            scope = off_interface(True, output, "core_attn")
+            with scope as activation:
+                output = activation.sin()
+            output = scope.group_offload(output)
+            if record:
+                output.register_hook(lambda grad, index=index: record_backward(grad, index))
+        return output
 
+    original_reload_event = OffloadTensorGroup.record_reload_event
+    original_pop = OffloadTensorGroup.pop_tensor
 
-def test_group_start_backward_consumes_current_noop_slot_before_reloading_next(monkeypatch):
-    """No-op reload slots should preserve cadence without delaying the next reload."""
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _FakeCudaStream())
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    def record_reload_event(group, stream):
+        original_reload_event(group, stream)
+        if group in offloaded_groups:
+            reload_events.append((current_backward_group, offloaded_groups[group]))
+            sample("reload")
 
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    handler.do_offload = True
-    handler.h2d_stream = _FakeCudaStream()
-    handler._reloading_group = []
-    handler.reload = lambda state: torch.empty(0)
+    def pop_tensor(group, tag):
+        tensor = original_pop(group, tag)
+        if group in offloaded_groups:
+            sample("consume")
+        return tensor
 
-    next_group = _FakeOffloadGroup("next", offloaded=True)
-    current_group = _FakeOffloadGroup("current", offloaded=False)
-    handler._groups_to_reload = [next_group, current_group]
+    try:
+        # Discover the groups and let the production warmup policy apply the
+        # fraction; do not manually construct or edit either scheduling queue.
+        output = forward()
+        torch.cuda.synchronize()
+        output.sum().backward()
+        torch.cuda.synchronize()
+        del output
+        input_tensor.grad = None
+        off_interface.reset()
 
-    handler.on_group_start_backward(current_group)
+        output = forward(record=True)
+        chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
+        assert len(chunk.offload_groups) == num_groups
+        offloaded_groups = {
+            group: index
+            for index, group in enumerate(chunk.offload_groups)
+            if any(isinstance(state, tuple) for state in group._tensors.values())
+        }
+        num_offloaded = (num_groups - 1) // 2
+        assert list(offloaded_groups.values()) == list(range(num_offloaded))
+        assert all(len(group._tensors) == 1 for group in chunk.offload_groups)
 
-    assert current_group not in handler._groups_to_reload
-    assert next_group not in handler._groups_to_reload
-    assert handler._reloading_group == [next_group]
-    assert next_group.recorded_reload
+        monkeypatch.setattr(OffloadTensorGroup, "record_reload_event", record_reload_event)
+        monkeypatch.setattr(OffloadTensorGroup, "pop_tensor", pop_tensor)
+        torch.cuda.synchronize()
+        output.sum().backward()
+        torch.cuda.synchronize()
 
-
-@pytest.mark.parametrize("offload", [False, True])
-def test_bulk_offload_preserves_reload_slots_and_matches_pending_group(offload):
-    """A commit must keep its slot even when policy skips the D2H transfer."""
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    group = _FakeOffloadGroup("current", offloaded=False)
-    other = _FakeOffloadGroup("other", offloaded=False)
-    handler._groups_to_offload = [group, other]
-    handler._groups_to_reload = []
-    handler.should_bulk_offload = lambda pending: pending is group and offload
-    offloaded_groups = []
-    handler.bulk_offload_group = offloaded_groups.append
-
-    handler.bulk_offload("current", forced_released_tensors=[])
-
-    assert handler._groups_to_offload == [other]
-    assert handler._groups_to_reload == [group]
-    assert offloaded_groups == ([group] if offload else [])
-
-
-@pytest.mark.parametrize("empty", [False, True])
-def test_bulk_reload_consumes_one_noop_slot_without_reloading_earlier_groups(empty):
-    """Skipped and already-consumed groups must not trigger an early H2D copy."""
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    earlier = _FakeOffloadGroup("earlier", offloaded=True)
-    noop = _FakeOffloadGroup("noop", offloaded=False)
-    if empty:
-        noop._tensors.clear()
-    handler._groups_to_reload = [earlier, noop]
-    handler._reloading_group = []
-
-    handler.bulk_reload_group()
-
-    assert handler._groups_to_reload == [earlier]
-    assert handler._reloading_group == []
-    assert not noop.recorded_reload
-    assert not earlier.recorded_reload
-
-
-def test_group_start_backward_preserves_consecutive_noop_slots(monkeypatch):
-    """Only the current and next slots are consumed at a backward boundary."""
-    monkeypatch.setattr(torch.cuda, "current_stream", _FakeCudaStream)
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    handler.do_offload = True
-    handler.h2d_stream = _FakeCudaStream()
-    handler._reloading_group = []
-    earlier = _FakeOffloadGroup("same_name", offloaded=True)
-    next_group = _FakeOffloadGroup("same_name", offloaded=False)
-    current = _FakeOffloadGroup("same_name", offloaded=False)
-    handler._groups_to_reload = [earlier, next_group, current]
-
-    handler.on_group_start_backward(current)
-
-    assert handler._groups_to_reload == [earlier]
-    assert handler._reloading_group == []
-    assert not earlier.recorded_reload
-
-
-def test_group_start_marker_retains_forward_group_for_backward(monkeypatch):
-    """The real autograd marker passes its exact forward group to backward."""
-    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-        FineGrainedOffloadingGroupStartFunction,
-    )
-
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    group = object()
-    backward_groups = []
-    monkeypatch.setattr(handler, "on_group_start_forward", lambda name: group)
-    monkeypatch.setattr(handler, "on_group_start_backward", backward_groups.append)
-    tensor = torch.ones(2, requires_grad=True)
-
-    output = FineGrainedOffloadingGroupStartFunction.apply(tensor, handler, "current")
-    output.sum().backward()
-
-    assert backward_groups == [group]
-    assert torch.equal(tensor.grad, torch.ones_like(tensor))
+        assert backward_order == list(reversed(range(num_groups)))
+        assert [index for _, index in reload_events] == list(reversed(range(num_offloaded)))
+        assert all(not group._tensors for group in chunk.offload_groups)
+        peak_pending = max(len(pending) for _, _, pending, _ in samples)
+        peak_pending_bytes = max(size for _, _, _, size in samples)
+        print(
+            f"Partial offload cadence: groups={num_groups}, offloaded={num_offloaded}, "
+            f"peak_pending_groups={peak_pending}, peak_pending_bytes={peak_pending_bytes}, "
+            f"reloads=(backward_group, reload_group) "
+            f"{reload_events}"
+        )
+        assert peak_pending <= 1 and peak_pending_bytes <= group_bytes, (
+            "Backward reload accumulation: expected at most one prefetched activation "
+            f"({group_bytes} bytes), got {peak_pending} groups / {peak_pending_bytes} bytes; "
+            f"samples={samples}"
+        )
+        assert all(
+            target == current - 1 for current, target in reload_events
+        ), f"Reload exceeded the next-group prefetch window: {reload_events}"
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
 
 
 def _reset_cuda_memory() -> None:
@@ -637,21 +651,23 @@ def _run_one_iter_and_capture(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules",
+    "is_moe, is_mla, offload_modules, activation_offload_fraction",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"]),
-        (True, False, ["qkv_linear"]),
-        (True, False, ["core_attn"]),
+        (False, True, ["attn_norm"], 1.0),
+        (True, False, ["qkv_linear"], 1.0),
+        (True, False, ["core_attn"], 1.0),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"]),
-        (True, False, ["mlp_norm"]),
-        (True, False, ["expert_fc1"]),
-        (True, False, ["moe_act"]),
+        (True, True, ["core_attn", "attn_proj"], 1.0),
+        (True, False, ["mlp_norm"], 1.0),
+        (True, False, ["expert_fc1"], 1.0),
+        (True, False, ["moe_act"], 1.0),
+        # One eager partial-offload case across attention and MoE groups.
+        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 0.5),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
-    is_moe: bool, is_mla: bool, offload_modules: List[str]
+    is_moe: bool, is_mla: bool, offload_modules: List[str], activation_offload_fraction: float
 ):
     """
     Initialize a GPTModel and verify:
@@ -737,6 +753,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
+            activation_offload_fraction=activation_offload_fraction,
         ).cuda()
         _restore_params(off_model, base_params)
         off_model.train()
@@ -804,155 +821,6 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             print(
                 f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
             )
-    finally:
-        Utils.destroy_model_parallel()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
-def test_gpt_fine_grained_activation_offload_fraction_correctness_and_memory():
-    """
-    Verify activation_offload_fraction preserves numerics and still saves memory.
-
-    The fraction path leaves some groups on GPU but keeps no-op reload slots in
-    the backward cadence, so this test compares it against both a no-offload
-    baseline and full fine-grained activation offload.
-    """
-    os.environ.pop("NVTE_FUSED_ATTN", None)
-    os.environ.pop("NVTE_FLASH_ATTN", None)
-    os.environ.pop("NVTE_UNFUSED_ATTN", None)
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-
-    seed = 123
-    num_layers = 8
-    hidden_size = 1024
-    num_attention_heads = 8
-    vocab_size = 1024
-    seq_length = 1024
-    micro_batch_size = 2
-    num_experts = 4
-    offload_modules = ["core_attn", "attn_proj", "expert_fc1"]
-    device = torch.device("cuda")
-
-    input_ids, position_ids, attention_mask = _make_gpt_inputs(
-        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
-    )
-
-    def _build_case(enable_offload: bool, activation_offload_fraction: float = 1.0) -> GPTModel:
-        return _build_gpt_model(
-            seed=seed,
-            num_layers=num_layers,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            vocab_size=vocab_size,
-            seq_length=seq_length,
-            num_experts=num_experts,
-            fine_grained_activation_offloading=enable_offload,
-            offload_modules=offload_modules if enable_offload else None,
-            min_offloaded_tensor_size=1024,
-            is_mla=False,
-            activation_offload_fraction=activation_offload_fraction,
-        ).cuda()
-
-    def _run_baseline():
-        off_interface.reset_instance()
-        model = _build_case(enable_offload=False)
-        model.train()
-        params = _capture_params(model)
-        _run_one_iter_and_capture(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            enable_offload_reset=False,
-        )
-        _reset_cuda_memory()
-        logits, grads, peak = _run_one_iter_and_capture(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            enable_offload_reset=False,
-        )
-        del model
-        _reset_cuda_memory()
-        return logits, grads, peak, params
-
-    def _run_offload_case(activation_offload_fraction: float, params: Dict[str, torch.Tensor]):
-        off_interface.reset_instance()
-        model = _build_case(
-            enable_offload=True, activation_offload_fraction=activation_offload_fraction
-        )
-        _restore_params(model, params)
-        model.train()
-        _run_one_iter_and_capture(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            enable_offload_reset=True,
-        )
-        off_interface.reset()
-
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            PipelineOffloadManager,
-        )
-
-        expected_bytes = PipelineOffloadManager.get_instance().offload_summary_total_bytes
-        _reset_cuda_memory()
-        logits, grads, peak = _run_one_iter_and_capture(
-            model,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            enable_offload_reset=True,
-        )
-        del model
-        _reset_cuda_memory()
-        return logits, grads, peak, expected_bytes
-
-    def _assert_matches_base(label, logits, grads, base_logits, base_grads):
-        assert torch.allclose(
-            logits, base_logits, rtol=1e-3, atol=1e-3
-        ), f"{label} logits mismatch: max_diff={torch.max(torch.abs(logits - base_logits))}"
-        assert set(grads.keys()) == set(base_grads.keys())
-        for name, gb in base_grads.items():
-            go = grads[name]
-            if gb is None or go is None:
-                assert gb is None and go is None, f"{label} grad None mismatch for {name}"
-                continue
-            assert torch.allclose(
-                go, gb, rtol=1e-3, atol=1e-3
-            ), f"{label} grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
-
-    try:
-        base_logits, base_grads, base_peak, params = _run_baseline()
-        half_logits, half_grads, half_peak, half_expected_bytes = _run_offload_case(0.5, params)
-        full_logits, full_grads, full_peak, full_expected_bytes = _run_offload_case(1.0, params)
-
-        _assert_matches_base("fraction=0.5", half_logits, half_grads, base_logits, base_grads)
-        _assert_matches_base("fraction=1.0", full_logits, full_grads, base_logits, base_grads)
-
-        assert 0 < half_expected_bytes < full_expected_bytes, (
-            f"Expected fraction=0.5 to offload a nonzero subset of the full case, "
-            f"but got half={half_expected_bytes} bytes, full={full_expected_bytes} bytes"
-        )
-
-        half_saved_mib = (base_peak - half_peak) / (1024**2)
-        full_saved_mib = (base_peak - full_peak) / (1024**2)
-        assert half_saved_mib > 0.0, (
-            f"Expected activation_offload_fraction=0.5 to reduce peak memory, "
-            f"but got saved={half_saved_mib:.2f}MiB "
-            f"(base={base_peak/(1024**2):.2f}MiB, half={half_peak/(1024**2):.2f}MiB)"
-        )
-        assert full_saved_mib + DELTA >= half_saved_mib, (
-            f"Expected full offload to save at least as much memory as fraction=0.5, "
-            f"but got full_saved={full_saved_mib:.2f}MiB, half_saved={half_saved_mib:.2f}MiB"
-        )
-        print(
-            f"Offload fraction memory: base={base_peak/(1024**2):.2f}MiB, "
-            f"half={half_peak/(1024**2):.2f}MiB, full={full_peak/(1024**2):.2f}MiB, "
-            f"half_saved={half_saved_mib:.2f}MiB, full_saved={full_saved_mib:.2f}MiB"
-        )
     finally:
         Utils.destroy_model_parallel()
 
