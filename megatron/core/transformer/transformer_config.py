@@ -1373,8 +1373,8 @@ class TransformerConfig(ModelParallelConfig):
     dynamic scheduler still runs eagerly before every iteration, while each realized
     microbatch slot must retain the captured microbatch count, effective CP size, process-group
     identity and rank membership, partition mode, and (for CP>1) exact packed boundaries and
-    route-defining geometry. Any mismatch is rejected before replay. This option is only valid for the
-    full-iteration CUDA Graph implementation; layer/chunk implementations reject it.
+    route-defining geometry. Any mismatch is rejected before replay. This option is only valid
+    for the full-iteration CUDA Graph implementation; layer/chunk implementations reject it.
     """
 
     ####################
@@ -3976,9 +3976,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.pipeline_model_parallel_prewarm:
-            assert self.pipeline_model_parallel_size > 1, (
-                "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
-            )
+            assert (
+                self.pipeline_model_parallel_size > 1
+            ), "pipeline_model_parallel_prewarm requires pipeline_model_parallel_size > 1."
 
         if self.cuda_graph_impl != "none":
 

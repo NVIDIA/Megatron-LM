@@ -186,7 +186,6 @@ def test_synchronous_layerwise_param_sync_reuses_grad_storage(monkeypatch):
     """The no-overlap path receives every owner directly into the existing grad buffer."""
 
     import megatron.core.distributed.param_and_grad_buffer as param_and_grad_buffer
-
     from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 
     local_param = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.bfloat16))
@@ -251,7 +250,6 @@ def test_synchronous_layerwise_param_sync_preserves_uneven_owner_sizes(monkeypat
     """Uneven owners use the list collective with receive views in the same grad arena."""
 
     import megatron.core.distributed.param_and_grad_buffer as param_and_grad_buffer
-
     from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBucketGroup
 
     local_param = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.bfloat16))

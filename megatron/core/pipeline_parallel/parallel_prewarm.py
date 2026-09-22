@@ -120,9 +120,7 @@ def _build_layer_inputs(
         )
 
     static_inputs = layer.get_layer_static_inputs(
-        seq_length,
-        micro_batch_size,
-        for_pipeline_prewarm=True,
+        seq_length, micro_batch_size, for_pipeline_prewarm=True
     )
     hidden_states = static_inputs.pop('hidden_states')
     kwargs = static_inputs
@@ -159,12 +157,7 @@ def _reset_temporary_state(model, config, optimizers):
 
 
 def prewarm_pipeline_model_parallel(
-    model,
-    config,
-    seq_length,
-    micro_batch_size,
-    optimizers=(),
-    pg_collection=None,
+    model, config, seq_length, micro_batch_size, optimizers=(), pg_collection=None
 ):
     """Initialize local lazy kernels concurrently on all pipeline stages.
 
@@ -175,9 +168,9 @@ def prewarm_pipeline_model_parallel(
     if getattr(config, 'moe_paged_stash', False):
         from megatron.core.transformer.moe.paged_stash import PagedStashManager
 
-        assert not PagedStashManager.get_instance().enabled, (
-            "Pipeline prewarm must run before the first Paged Stash schedule."
-        )
+        assert (
+            not PagedStashManager.get_instance().enabled
+        ), "Pipeline prewarm must run before the first Paged Stash schedule."
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -310,9 +303,9 @@ def prewarm_pipeline_model_parallel(
                             source_by_layer[repeated_layer_number] = True
                         outputs = layer.forward(*args, **kwargs)
                     differentiable_outputs = _collect_differentiable_tensors(outputs)
-                    assert differentiable_outputs, (
-                        "Pipeline prewarm must produce at least one differentiable tensor."
-                    )
+                    assert (
+                        differentiable_outputs
+                    ), "Pipeline prewarm must produce at least one differentiable tensor."
                     torch.autograd.backward(
                         differentiable_outputs,
                         grad_tensors=[

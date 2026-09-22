@@ -153,8 +153,7 @@ def test_cross_depth_sharing_rejects_incompatible_config(overrides, message):
 
 
 @pytest.mark.parametrize(
-    "shared_components",
-    [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS],
+    "shared_components", [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS]
 )
 def test_cross_depth_sharing_accepts_full_iteration_graph(shared_components):
     config = _make_config(
@@ -167,8 +166,7 @@ def test_cross_depth_sharing_accepts_full_iteration_graph(shared_components):
 
 
 @pytest.mark.parametrize(
-    "shared_components",
-    [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS],
+    "shared_components", [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS]
 )
 def test_cross_depth_sharing_accepts_moe_router_graph(shared_components):
     config = _make_config(
