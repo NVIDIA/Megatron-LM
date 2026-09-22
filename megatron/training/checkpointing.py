@@ -1643,11 +1643,11 @@ def checkpoint_args_snapshot(args: Namespace) -> Namespace:
     load_args_from_checkpoint: the resumed run keeps its own profiling policy.
     Never update live args or retain mutable config fields in an async save.
     """
-    profiling = get_run_config().profiling
+    cfg = get_run_config()
     snapshot = copy.copy(args)
-    for config_field in dataclasses.fields(profiling):
+    for config_field in dataclasses.fields(cfg.profiling):
         name = "profile" if config_field.name == "use_nsys_profiler" else config_field.name
-        setattr(snapshot, name, copy.deepcopy(getattr(profiling, config_field.name)))
+        setattr(snapshot, name, copy.deepcopy(getattr(cfg.profiling, config_field.name)))
     return snapshot
 
 

@@ -34,9 +34,9 @@ def model_provider(
         Union[GPTModel, HybridModel]: The returned model
     """
     args = get_args()
-    profiling = get_run_config().profiling
+    cfg = get_run_config()
 
-    if profiling.record_memory_history:
+    if cfg.profiling.record_memory_history:
         torch.cuda.memory._record_memory_history(
             True,
             # keep 100,000 alloc/free events from before the snapshot
@@ -49,7 +49,7 @@ def model_provider(
             # snapshot right after an OOM happened
             print('saving allocated state during OOM')
 
-            filename = f"oom_rank-{torch.distributed.get_rank()}_{profiling.memory_snapshot_path}"
+            filename = f"oom_rank-{torch.distributed.get_rank()}_{cfg.profiling.memory_snapshot_path}"
             torch.cuda.memory._dump_snapshot(filename)
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)

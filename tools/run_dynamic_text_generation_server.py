@@ -442,8 +442,8 @@ if __name__ == "__main__":
         # --profile and --nvtx-ranges are set). Otherwise the engine-side
         # nvtx_range_push labels (bookkeeping, Decode, _ep_establish_consensus,
         # etc.) are no-ops and the inter-step gap is unattributable in nsys.
-        profiling = get_run_config().profiling
-        if profiling.use_nsys_profiler and profiling.nvtx_ranges:
+        cfg = get_run_config()
+        if cfg.profiling.use_nsys_profiler and cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(True)
 
         # Already requested via --return-log-probs default above; keep this

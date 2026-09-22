@@ -112,8 +112,8 @@ def main():
     args = get_args()
 
     # Match the legacy tool's NVTX gating.
-    profiling = get_run_config().profiling
-    if profiling.use_nsys_profiler and profiling.nvtx_ranges:
+    cfg = get_run_config()
+    if cfg.profiling.use_nsys_profiler and cfg.profiling.nvtx_ranges:
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)

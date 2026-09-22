@@ -3616,7 +3616,7 @@ def training_log(
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
-    profiling = get_run_config().profiling
+    cfg = get_run_config()
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -3900,10 +3900,10 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        should_prof_rank = (profiling.profile_ranks == [] or safe_get_rank() in profiling.profile_ranks)  # [] is all ranks
-        if profiling.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
+        should_prof_rank = (cfg.profiling.profile_ranks == [] or safe_get_rank() in cfg.profiling.profile_ranks)  # [] is all ranks
+        if cfg.profiling.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
             rank = safe_get_rank()
-            base, ext = os.path.splitext(profiling.memory_snapshot_path)
+            base, ext = os.path.splitext(cfg.profiling.memory_snapshot_path)
             snapshot_filename = f"{base}_{rank}{ext}"
             torch.cuda.memory._dump_snapshot(snapshot_filename)
 
@@ -4364,7 +4364,7 @@ def post_training_step_callbacks(
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
-    profiling = get_run_config().profiling
+    cfg = get_run_config()
 
     # Bring CPU and GPU back in sync if on right iteration.
     if args.train_sync_interval and iteration % args.train_sync_interval == 0:
@@ -4397,15 +4397,15 @@ def post_training_step_callbacks(
 
     # Profiling.
     if (
-        profiling.use_nsys_profiler
-        and iteration == profiling.profile_step_end
-        and (len(profiling.profile_ranks) == 0 or
-             torch.distributed.get_rank() in profiling.profile_ranks)
+        cfg.profiling.use_nsys_profiler
+        and iteration == cfg.profiling.profile_step_end
+        and (len(cfg.profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in cfg.profiling.profile_ranks)
     ):
         # Disable NVTX range when profiling ends.
-        if profiling.nvtx_ranges:
+        if cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(False)
-        if profiling.use_pytorch_profiler:
+        if cfg.profiling.use_pytorch_profiler:
             assert prof is not None
             prof.stop()
             if prof.execution_trace_observer is not None:
@@ -4575,7 +4575,7 @@ def train(
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
-    profiling = get_run_config().profiling
+    cfg = get_run_config()
     timers = get_timers()
 
     fault_injector_kwargs = {}
@@ -4885,13 +4885,13 @@ def train(
     prof = None
     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
-        profiling.use_nsys_profiler
-        and (len(profiling.profile_ranks) == 0 or
-             torch.distributed.get_rank() in profiling.profile_ranks)
-        and profiling.use_pytorch_profiler
+        cfg.profiling.use_nsys_profiler
+        and (len(cfg.profiling.profile_ranks) == 0 or
+             torch.distributed.get_rank() in cfg.profiling.profile_ranks)
+        and cfg.profiling.use_pytorch_profiler
     ):
-        profiling.validate()
-        if profiling.pytorch_profiler_collect_chakra:
+        cfg.profiling.validate()
+        if cfg.profiling.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{args.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
             et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
@@ -4903,14 +4903,14 @@ def train(
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
-                wait=max(profiling.profile_step_start - 1, 0),
-                warmup=1 if profiling.profile_step_start > 0 else 0,
-                active=profiling.profile_step_end - profiling.profile_step_start,
+                wait=max(cfg.profiling.profile_step_start - 1, 0),
+                warmup=1 if cfg.profiling.profile_step_start > 0 else 0,
+                active=cfg.profiling.profile_step_end - cfg.profiling.profile_step_start,
                 repeat=1,
             ),
             on_trace_ready=trace_handler,
-            record_shapes=profiling.pytorch_profiler_collect_shapes,
-            with_stack=profiling.pytorch_profiler_collect_callstack,
+            record_shapes=cfg.profiling.pytorch_profiler_collect_shapes,
+            with_stack=cfg.profiling.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
         )
         prof.start()
@@ -4972,18 +4972,18 @@ def train(
         # trace instead of accreting into a run-long one. Must be the first thing in
         # the pass so everything below nests under the current interval root.
         _maybe_reroot_otel_interval()
-        if (profiling.use_nsys_profiler
-            and (len(profiling.profile_ranks) == 0 or
-                 torch.distributed.get_rank() in profiling.profile_ranks)):
+        if (cfg.profiling.use_nsys_profiler
+            and (len(cfg.profiling.profile_ranks) == 0 or
+                 torch.distributed.get_rank() in cfg.profiling.profile_ranks)):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.
-            if iteration == profiling.profile_step_start and profiling.nvtx_ranges:
+            if iteration == cfg.profiling.profile_step_start and cfg.profiling.nvtx_ranges:
                 configure_nvtx_profiling(True)
-            if profiling.use_pytorch_profiler:
+            if cfg.profiling.use_pytorch_profiler:
                 prof.step()
-            elif iteration == profiling.profile_step_start:
+            elif iteration == cfg.profiling.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
-                if profiling.record_shapes:
-                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=profiling.record_shapes)
+                if cfg.profiling.record_shapes:
+                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=cfg.profiling.record_shapes)
                     nsys_nvtx_context.__enter__()
 
         # Fault-tolerance heartbeat at the top of the loop -- uninstrumented
