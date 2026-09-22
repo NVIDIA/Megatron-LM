@@ -1049,7 +1049,7 @@ jobs:
           echo "integration-tests-h100=$(cat integration-tests-h100.json)" | tee -a "$GITHUB_OUTPUT"
 
   cicd-integration-tests-latest-h100:
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.test_case == 'determinism_kernel_perf' && 180 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1082,7 +1082,7 @@ jobs:
           test_case: ${{ matrix.test_case }}
           model: ${{ matrix.model }}
           tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
+          timeout: ${{ matrix.test_case == 'determinism_kernel_perf' && 150 || matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           scope: ${{ needs.configure.outputs.scope }}
@@ -1147,7 +1147,7 @@ jobs:
           echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
 
   cicd-integration-tests-latest-gb200:
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.test_case == 'determinism_kernel_perf' && 180 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1182,7 +1182,7 @@ jobs:
           test_case: ${{ matrix.test_case }}
           model: ${{ matrix.model }}
           tag: latest
-          timeout: ${{ matrix.timeout || 30 }}
+          timeout: ${{ matrix.test_case == 'determinism_kernel_perf' && 150 || matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           scope: ${{ needs.configure.outputs.scope }}
@@ -1192,6 +1192,74 @@ jobs:
           cadence: ${{ needs.configure.outputs.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
+  cicd-determinism-baselines:
+    # Consume existing logs only when an activation or collective timing recipe was selected.
+    # Missing/failed producers cannot yield a verified baseline candidate.
+    needs:
+      - configure
+      - cicd-parse-integration-tests-h100
+      - cicd-parse-integration-tests-gb200
+      - cicd-unit-tests-latest
+      - cicd-unit-tests-latest-gb200
+      - cicd-integration-tests-latest-h100
+      - cicd-integration-tests-latest-gb200
+    if: >-
+      always() && !cancelled() &&
+      (contains(fromJSON(needs.cicd-parse-integration-tests-h100.outputs.integration-tests-h100 || '[]').*.test_case, 'determinism_kernel_perf') ||
+       contains(fromJSON(needs.cicd-parse-integration-tests-gb200.outputs.integration-tests-gb200 || '[]').*.test_case, 'determinism_kernel_perf') ||
+       contains(fromJSON(needs.cicd-parse-integration-tests-h100.outputs.integration-tests-h100 || '[]').*.test_case, 'determinism_collective_perf') ||
+       contains(fromJSON(needs.cicd-parse-integration-tests-gb200.outputs.integration-tests-gb200 || '[]').*.test_case, 'determinism_collective_perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout matching verifier
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+          persist-credentials: false
+      - name: Download current-attempt determinism logs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: logs-determinism-${{ github.run_id }}-a${{ github.run_attempt }}-*
+          path: determinism-inputs
+          merge-multiple: false
+      - name: Verify replay and timing artifacts
+        if: ${{ always() && !cancelled() }}
+        env:
+          REVISION: ${{ needs.configure.outputs.sha }}
+          H100_SELECTED: ${{ contains(fromJSON(needs.cicd-parse-integration-tests-h100.outputs.integration-tests-h100 || '[]').*.test_case, 'determinism_kernel_perf') }}
+          GB200_SELECTED: ${{ contains(fromJSON(needs.cicd-parse-integration-tests-gb200.outputs.integration-tests-gb200 || '[]').*.test_case, 'determinism_kernel_perf') }}
+          H100_COLLECTIVE_SELECTED: ${{ contains(fromJSON(needs.cicd-parse-integration-tests-h100.outputs.integration-tests-h100 || '[]').*.test_case, 'determinism_collective_perf') }}
+          GB200_COLLECTIVE_SELECTED: ${{ contains(fromJSON(needs.cicd-parse-integration-tests-gb200.outputs.integration-tests-gb200 || '[]').*.test_case, 'determinism_collective_perf') }}
+        run: |
+          PLATFORMS=()
+          if [[ "$H100_SELECTED" == true ]]; then PLATFORMS+=(--platform dgx_h100); fi
+          if [[ "$GB200_SELECTED" == true ]]; then PLATFORMS+=(--platform dgx_gb200); fi
+          if [[ "$H100_COLLECTIVE_SELECTED" == true ]]; then PLATFORMS+=(--collective-platform dgx_h100); fi
+          if [[ "$GB200_COLLECTIVE_SELECTED" == true ]]; then PLATFORMS+=(--collective-platform dgx_gb200); fi
+          python3 tests/performance_tests/shell_test_utils/determinism/ci_artifacts.py collect \
+            --artifacts determinism-inputs --output determinism-baselines \
+            --repository "$GITHUB_REPOSITORY" --revision "$REVISION" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            "${PLATFORMS[@]}"
+      - name: Summarize baseline candidates
+        if: ${{ always() && !cancelled() }}
+        run: |
+          if [[ -f determinism-baselines/report.md ]]; then
+            cat determinism-baselines/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Retain verification report and baseline candidates
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: determinism-baselines-${{ github.run_id }}-a${{ github.run_attempt }}
+          path: determinism-baselines
+          if-no-files-found: error
+          include-hidden-files: true
+
   Nemo_CICD_Test:
     needs:
       - pre-flight
@@ -1200,6 +1268,7 @@ jobs:
       - cicd-unit-tests-latest-gb200
       - cicd-integration-tests-latest-h100
       - cicd-integration-tests-latest-gb200
+      - cicd-determinism-baselines
     if: |
       (
         needs.pre-flight.outputs.docs_only == 'true'
@@ -1232,6 +1301,7 @@ jobs:
           UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
+          DETERMINISM_ARTIFACT_RESULT: ${{ needs.cicd-determinism-baselines.result }}
         run: |
           # Docs-only and deployment workflows intentionally skip all tests
           if [ "$DOCS_ONLY" == "true" ] || [ "$IS_DEPLOYMENT" == "true" ]; then
@@ -1240,6 +1310,12 @@ jobs:
           fi
 
           FAILED=false
+
+          # Skipped means no kernel timing recipe was selected for this run.
+          if [ "$DETERMINISM_ARTIFACT_RESULT" != "success" ] && [ "$DETERMINISM_ARTIFACT_RESULT" != "skipped" ]; then
+            echo "❌ cicd-determinism-baselines: $DETERMINISM_ARTIFACT_RESULT"
+            FAILED=true
+          fi
 
           # Unit tests are required on PR-push and merge_group, but scheduled
           # / force-run workflows still want integration to run (and be
