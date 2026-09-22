@@ -308,6 +308,7 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 |------------|-------------|----------|--------|
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
+| **FlexDispatcher with [DeepEP v2](https://github.com/deepseek-ai/DeepEP) backend** | Uses the NCCL Gin-based `ElasticBuffer` dispatch/combine API | Expert parallelism with a DeepEP v2 container | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepepv2` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 

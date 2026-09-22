@@ -1510,8 +1510,11 @@ class _DeepepV2Manager(_DeepepManager):
 
         if deepepv2_dispatch is None:
             raise ImportError(
-                "DeepEP v2 is not installed. Please install a DeepEP package that provides "
-                "ElasticBuffer."
+                "DeepEP v2 (deep_ep.ElasticBuffer) is unavailable. Install or upgrade DeepEP "
+                "in your container following https://github.com/deepseek-ai/DeepEP#installation "
+                "and ensure its CUDA, PyTorch, and NCCL requirements are met. "
+                "HybridEP also uses the deep_ep Python module and may need to be uninstalled "
+                "first; replacing it with DeepEP v2 can make the hybridep backend unavailable."
             )
 
     def _get_buffer(self, hidden_states: torch.Tensor):
