@@ -1424,7 +1424,51 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 .reshape(1, 1, slen_per_cp, seq_length)
                 .tile(micro_batch_size, 1, 1, 1)
             )
+
+        # Reserve a padding_mask graph input when eager routing (the warmup steps before capture)
+        # received one, so the graphed router/z-loss/expert-bias see the same mask as eager mode.
+        # TE fixes the kwarg set at capture, so replays must then always pass a mask; see
+        # _te_cuda_graph_replay for the all-False default.
+        self._cuda_graph_padding_mask_shape = None
+        if self._moe_router_in_cuda_graph():
+            mask_shape = getattr(self.mlp, "padding_mask_shape_seen", None)
+            if mask_shape is not None:
+                self._cuda_graph_padding_mask_shape = tuple(mask_shape)
+                static_inputs["padding_mask"] = torch.zeros(
+                    mask_shape, dtype=torch.bool, device=torch.cuda.current_device()
+                )
         return static_inputs
+
+    def _moe_router_in_cuda_graph(self) -> bool:
+        """Return True when this layer's MoE router runs inside the TE CUDA graph."""
+        return self.is_moe_layer and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.moe in self.config.cuda_graph_modules
+            or CudaGraphModule.moe_router in self.config.cuda_graph_modules
+        )
+
+    def _te_cuda_graph_padding_mask(self, kwargs, reference: Tensor):
+        """Reconcile the replay padding_mask with the graph's captured input set.
+
+        Returns the mask to pass to the graph: the caller's mask, an all-False mask when the graph
+        was captured with a padding_mask input but this batch has none, or None when the graph has
+        no such input. Raises when a mask is passed to a graph captured without one, since the
+        graph would silently ignore it and diverge from eager execution.
+        """
+        padding_mask = kwargs.get("padding_mask")
+        graph_mask_shape = getattr(self, "_cuda_graph_padding_mask_shape", None)
+        if graph_mask_shape is None:
+            if padding_mask is not None and self._moe_router_in_cuda_graph():
+                raise RuntimeError(
+                    "padding_mask was passed to a TE CUDA graph that was captured without a "
+                    "padding_mask input: no mask reached the MoE router during "
+                    "cuda_graph_warmup_steps (is it 0?). The graphed router would silently ignore "
+                    "the mask. Run at least one eager warmup step with masked batches."
+                )
+            return None
+        if padding_mask is None:
+            padding_mask = torch.zeros(graph_mask_shape, dtype=torch.bool, device=reference.device)
+        return padding_mask
 
     def _get_submodules_under_cudagraphs(self):
         """
@@ -1497,7 +1541,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 )
             )
         ):
-            hidden_states = self._forward_mlp(hidden_states)
+            # padding_mask is a graph input only when get_layer_static_inputs reserved it.
+            hidden_states = self._forward_mlp(
+                hidden_states, padding_mask=kwargs.get("padding_mask")
+            )
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
         else:
@@ -1525,7 +1572,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
-            kwargs = {}
+            # Attention consumed the other kwargs eagerly; the MoE padding mask is still needed
+            # by the graphed router and by the eager MoE steps after the graph.
+            kwargs = {"padding_mask": kwargs.get("padding_mask")}
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
@@ -1546,7 +1595,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
-        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+        # The graph only takes padding_mask when it was captured with that input; the eager MoE
+        # steps after the graph keep using the caller's mask from `kwargs`.
+        graph_kwargs = {k: v for k, v in kwargs.items() if k != "padding_mask"}
+        graph_padding_mask = self._te_cuda_graph_padding_mask(
+            kwargs, args[0] if args else kwargs["hidden_states"]
+        )
+        if graph_padding_mask is not None:
+            graph_kwargs["padding_mask"] = graph_padding_mask
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **graph_kwargs))
 
         # Flush delayed offload groups from previous layers after graph replay.
         # The CPU is idle during the sync between graph replay and a2a comm,
@@ -1645,7 +1702,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 return residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
-            output = self._forward_mlp(*cuda_graph_output)
+            output = self._forward_mlp(*cuda_graph_output, padding_mask=kwargs.get("padding_mask"))
         return output, context
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):

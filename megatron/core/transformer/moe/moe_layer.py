@@ -406,6 +406,10 @@ class MoELayer(BaseMoELayer):
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+        # Batch-first shape of the padding mask seen by route() during eager execution (the
+        # cuda_graph_warmup_steps). TE CUDA graph capture uses it to reserve a padding_mask
+        # graph input, so graphed routing sees the same mask as eager routing.
+        self.padding_mask_shape_seen: Optional[tuple[int, ...]] = None
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
@@ -471,6 +475,8 @@ class MoELayer(BaseMoELayer):
         routing consumes it sequence-first to align with ``hidden_states``.
         """
         if padding_mask is not None:
+            if self.padding_mask_shape_seen is None:
+                self.padding_mask_shape_seen = tuple(padding_mask.shape)
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
         return probs, routing_map
