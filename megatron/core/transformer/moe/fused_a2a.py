@@ -367,14 +367,17 @@ class DeepepV2Dispatch(torch.autograd.Function):
         ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
     ):
         """Backward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # Queue input conversions before recording the event that DeepEP waits on.
+        grad_output = grad_output.contiguous()
+        grad_token_probs = grad_token_probs.float()
         # The backward pass of dispatch is a combine over the dispatch handle.
         previous_event = (
             ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
         )
         grad_x, grad_token_probs, event = ctx.buffer.combine(
-            grad_output.contiguous(),
+            grad_output,
             handle=ctx.handle,
-            topk_weights=grad_token_probs.float(),
+            topk_weights=grad_token_probs,
             num_sms=ctx.num_sms,
             previous_event=previous_event,
             async_with_compute_stream=ctx.async_finish,
@@ -413,11 +416,13 @@ class DeepepV2Combine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, grad_combined_token_probs):
         """Backward pass of DeepEP v2 elastic combine."""
+        # The communication stream must wait for the contiguous copy as well.
+        grad_output = grad_output.contiguous()
         previous_event = (
             ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
         )
         grad_x, _, _, _, event = ctx.buffer.dispatch(
-            grad_output.contiguous(),
+            grad_output,
             handle=ctx.handle,
             num_sms=ctx.num_sms,
             previous_event=previous_event,
