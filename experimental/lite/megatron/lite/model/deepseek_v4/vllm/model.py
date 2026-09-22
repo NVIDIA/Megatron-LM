@@ -7,33 +7,26 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.deepseek_v4.lite.model import (
-    DeepseekV4Layer as LiteDeepseekV4Layer,
-    DeepseekV4Model as LiteDeepseekV4Model,
-)
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import (
-    VLLMAttention,
-)
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
-    AttentionKernelMetadata,
-)
-from megatron.lite.model.deepseek_v4.vllm.primitive.logprob import (
-    aligned_selected_log_probs,
-)
+from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer as LiteDeepseekV4Layer
+from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model as LiteDeepseekV4Model
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.module import VLLMAttention
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import AttentionKernelMetadata
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
-    mhc_kernel,
     mhc_head,
+    mhc_kernel,
     mhc_post,
     mhc_pre_broadcast,
+    rms_norm,
 )
+from megatron.lite.model.deepseek_v4.vllm.primitive.logprob import aligned_selected_log_probs
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.module import DeepseekV4MoE
-from megatron.lite.model.deepseek_v4.vllm.primitive.dense import rms_norm
 from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.parallel.mhc import (
     fold_mhc_hidden_for_pipeline,
     unfold_mhc_hidden_from_pipeline,
 )
+
 
 class DeepseekV4Layer(LiteDeepseekV4Layer):
     def __init__(
@@ -315,9 +308,7 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             self.hc_head.hc_base.float().contiguous(),
             eps=self.config.hc_eps,
         )
-        from vllm.model_executor.layers.batch_invariant import (
-            rms_norm_batch_invariant,
-        )
+        from vllm.model_executor.determinism.batch_invariant import rms_norm_batch_invariant
 
         hidden_states = rms_norm(
             rms_norm_batch_invariant,
