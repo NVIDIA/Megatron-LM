@@ -180,6 +180,12 @@ Forward pass (Layer N):                    Backward pass (Layer N):
 3. **`group_offload`**: Triggers asynchronous D2H copy on a dedicated CUDA stream (`d2h_stream`), optionally releases GPU storage of input tensors.
 4. **Backward**: Before the group's backward, tensors are reloaded from CPU to GPU on `h2d_stream`, and the compute stream waits for the transfer to complete.
 
+Every committed forward group occupies a slot in the backward reload queue, including groups
+kept on GPU by the offload policy. GPU-resident groups are consumed as no-op slots without
+recording a reload event. The group-start autograd marker retains the corresponding forward
+group so backward can consume its current no-op slot before preloading the next group. This
+preserves the reload cadence for partial offloading without reloading earlier groups too soon.
+
 ### Warmup and Adaptive Offloading
 
 The first training iteration serves as a **warmup phase** where the manager records tensor groups, their sizes, and the execution order. After warmup, a `post_warmup_callback` runs to:
