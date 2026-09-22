@@ -257,7 +257,8 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_tanh_clamp_scale: Optional[float] = None
     """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s`
-    is this value. For a gated activation (silu only) this instead selects SiTU-GLU."""
+    is this value. For a gated activation (silu only) this instead selects SiTU-GLU. The fused MoE
+    path (use_transformer_engine_op_fuser) requires a Transformer Engine with ScaledTanhSReLU."""
 
     activation_func_tanh_clamp_scale_linear: Optional[float] = None
     """Soft clamp scale for the linear (up) half of a gated activation, decoupled from the gate
