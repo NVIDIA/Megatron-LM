@@ -2,10 +2,16 @@
 """Full-width streamwise residual operations.
 
 The pure PyTorch functions are the numerical reference and CPU fallback. CUDA
-training can use dedicated Triton kernels that consume the padded controller
-logits directly. Those kernels form sigmoid factors in registers and compute
-controller gradients from per-program partials, avoiding both dense slot maps
-and a second activation-reading GEMM/BMM in backward.
+training and inference can use dedicated Triton kernels that consume the padded
+controller logits directly. Those kernels form sigmoid factors in registers and
+compute controller gradients from per-program partials, avoiding both dense slot
+maps and a second activation-reading GEMM/BMM in backward.
+
+``BATCH`` is a runtime kernel argument rather than a ``tl.constexpr``: it is only
+compared against to mask the tail, so specializing on it buys nothing and would
+force a separate JIT compile per token count. Dynamic-batching inference captures
+one CUDA graph per token bucket, and a compile that misses graph warmup would
+land inside stream capture.
 """
 
 from __future__ import annotations
@@ -14,6 +20,8 @@ import math
 
 import torch
 from torch import Tensor
+
+from megatron.core.inference.utils import InferenceMode
 
 try:
     import triton
@@ -108,21 +116,38 @@ def _validate_raw_write_inputs(
 
 
 def _can_use_streamwise_triton(
-    tensor: Tensor, logits: Tensor, num_streams: int, stream_width: int
+    tensor: Tensor,
+    logits: Tensor,
+    num_streams: int,
+    stream_width: int,
+    *,
+    enforce_training_limits: bool = True,
 ) -> bool:
-    """Return whether a direct raw-logit streamwise Triton kernel is supported."""
+    """Return whether a direct raw-logit streamwise Triton kernel is supported.
+
+    ``enforce_training_limits=False`` drops two training-path constraints.
+    The minimum batch is a performance floor for amortizing fused forward and
+    backward overhead, while the reduction-block cap bounds the controller-gradient
+    partial reduction. A forward-only inference call allocates no gradient
+    partials and runs no backward reduction, so neither limit needs to apply.
+
+    Training keeps the limits even when grad is disabled. Residual-stream
+    recompute replays the forward under ``torch.no_grad()`` during backward, and
+    that replay has to reproduce the original forward's arithmetic exactly, so
+    the kernel choice must not depend on whether grad happens to be enabled.
+    """
 
     if not HAVE_STREAMWISE_TRITON or tensor.ndim < 2:
         return False
     batch = math.prod(tensor.shape[:-1])
-    if (
-        batch < _STREAMWISE_MIN_BATCH
-        or not 1 <= num_streams <= _STREAMWISE_MAX_STREAMS
-        or stream_width < 64
-    ):
+    if not 1 <= num_streams <= _STREAMWISE_MAX_STREAMS or stream_width < 64:
         return False
-    partials = _num_gradient_partials(batch, stream_width)
-    reduction_block = triton.next_power_of_2(partials)
+    if enforce_training_limits:
+        if batch < _STREAMWISE_MIN_BATCH:
+            return False
+        partials = _num_gradient_partials(batch, stream_width)
+        if triton.next_power_of_2(partials) > _STREAMWISE_MAX_REDUCTION_BLOCK:
+            return False
     return (
         tensor.is_cuda
         and logits.is_cuda
@@ -133,7 +158,6 @@ def _can_use_streamwise_triton(
         and logits.ndim == 1
         and logits.numel() >= num_streams
         and tensor.shape[-1] == num_streams * stream_width
-        and reduction_block <= _STREAMWISE_MAX_REDUCTION_BLOCK
     )
 
 
@@ -147,7 +171,7 @@ if HAVE_STREAMWISE_TRITON:
         X,  # noqa: ANN001
         READ_LOGITS,  # noqa: ANN001
         OUT,  # noqa: ANN001
-        BATCH: tl.constexpr,
+        BATCH,  # noqa: ANN001
         STREAM_WIDTH: tl.constexpr,
         NUM_STREAMS: tl.constexpr,
         BLOCK_BATCH: tl.constexpr,
@@ -184,7 +208,7 @@ if HAVE_STREAMWISE_TRITON:
         READ_LOGITS,  # noqa: ANN001
         GRAD_X,  # noqa: ANN001
         GRAD_LOGIT_PARTIALS,  # noqa: ANN001
-        BATCH: tl.constexpr,
+        BATCH,  # noqa: ANN001
         STREAM_WIDTH: tl.constexpr,
         NUM_STREAMS: tl.constexpr,
         NUM_WIDTH_BLOCKS: tl.constexpr,
@@ -230,7 +254,7 @@ if HAVE_STREAMWISE_TRITON:
         RETENTION_LOGITS,  # noqa: ANN001
         OUT,  # noqa: ANN001
         MAX_FORGET: tl.constexpr,
-        BATCH: tl.constexpr,
+        BATCH,  # noqa: ANN001
         STREAM_WIDTH: tl.constexpr,
         NUM_STREAMS: tl.constexpr,
         BLOCK_BATCH: tl.constexpr,
@@ -281,7 +305,7 @@ if HAVE_STREAMWISE_TRITON:
         GRAD_WRITE_PARTIALS,  # noqa: ANN001
         GRAD_RETENTION_PARTIALS,  # noqa: ANN001
         MAX_FORGET: tl.constexpr,
-        BATCH: tl.constexpr,
+        BATCH,  # noqa: ANN001
         STREAM_WIDTH: tl.constexpr,
         NUM_STREAMS: tl.constexpr,
         NUM_WIDTH_BLOCKS: tl.constexpr,
@@ -737,12 +761,32 @@ def _streamwise_autograd_needed(*tensors: Tensor | None) -> bool:
     )
 
 
+def _streamwise_inference_forward(*tensors: Tensor | None) -> bool:
+    """Return whether an inference engine is driving a forward-only call.
+
+    Gating on the engine flag rather than on grad state alone keeps training
+    self-consistent: residual-stream recompute replays the forward under
+    ``torch.no_grad()``, and it must select the same kernel as the original
+    grad-enabled forward.
+    """
+
+    return InferenceMode.is_active() and not _streamwise_autograd_needed(*tensors)
+
+
 def streamwise_sigmoid_read(hidden_states: Tensor, read_logits: Tensor, num_streams: int) -> Tensor:
     """Read full-width streams from raw padded logits with fused CUDA dispatch."""
 
     stream_width = _validate_raw_read_inputs(hidden_states, read_logits, num_streams)
-    if _can_use_streamwise_triton(hidden_states, read_logits, num_streams, stream_width):
-        if _streamwise_autograd_needed(hidden_states, read_logits):
+    needs_backward = _streamwise_autograd_needed(hidden_states, read_logits)
+    inference_forward = _streamwise_inference_forward(hidden_states, read_logits)
+    if _can_use_streamwise_triton(
+        hidden_states,
+        read_logits,
+        num_streams,
+        stream_width,
+        enforce_training_limits=not inference_forward,
+    ):
+        if needs_backward:
             return _StreamwiseSigmoidRead.apply(hidden_states, read_logits, num_streams)
         return _streamwise_sigmoid_read_triton(hidden_states, read_logits, num_streams)
 
@@ -769,18 +813,27 @@ def streamwise_sigmoid_writeback(
             "retention_max_forget must be in (0, 1] when retention is enabled, got "
             f"{retention_max_forget}."
         )
+    needs_backward = _streamwise_autograd_needed(
+        residual_stream, branch_update, write_logits, retention_logits
+    )
+    inference_forward = _streamwise_inference_forward(
+        residual_stream, branch_update, write_logits, retention_logits
+    )
     supports_triton = _can_use_streamwise_triton(
-        residual_stream, write_logits, num_streams, stream_width
+        residual_stream,
+        write_logits,
+        num_streams,
+        stream_width,
+        enforce_training_limits=not inference_forward,
     ) and _can_use_streamwise_triton(
         residual_stream,
         write_logits if retention_logits is None else retention_logits,
         num_streams,
         stream_width,
+        enforce_training_limits=not inference_forward,
     )
     if supports_triton and branch_update.is_contiguous():
-        if _streamwise_autograd_needed(
-            residual_stream, branch_update, write_logits, retention_logits
-        ):
+        if needs_backward:
             return _StreamwiseSigmoidWriteback.apply(
                 residual_stream,
                 branch_update,

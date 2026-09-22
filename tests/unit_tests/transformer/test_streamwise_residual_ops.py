@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.streamwise_residual_ops import (
     HAVE_STREAMWISE_TRITON,
     _can_use_streamwise_triton,
@@ -599,3 +600,165 @@ def test_fused_cuda_profile_has_no_map_construction_or_map_gradient_gemm(activat
         "aten::sigmoid",
     }
     assert event_names.isdisjoint(forbidden), sorted(event_names & forbidden)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
+def test_streamwise_triton_selector_allows_small_forward_only_batches():
+    """Decode-sized batches are eligible when the training-only limits are lifted."""
+
+    num_streams = 3
+    stream_width = 64
+    logits = torch.zeros(128, device="cuda", dtype=torch.float32)
+    decode_sized = torch.empty(128, num_streams * stream_width, device="cuda", dtype=torch.float32)
+
+    # The minimum batch bounds the backward pass's gradient partials only.
+    assert not _can_use_streamwise_triton(decode_sized, logits, num_streams, stream_width)
+    assert _can_use_streamwise_triton(
+        decode_sized, logits, num_streams, stream_width, enforce_training_limits=False
+    )
+
+    # Geometry and layout constraints still apply for an inference forward.
+    narrow = torch.empty(128, num_streams * 32, device="cuda", dtype=torch.float32)
+    assert not _can_use_streamwise_triton(
+        narrow, logits, num_streams, 32, enforce_training_limits=False
+    )
+
+    noncontiguous = torch.empty(
+        128, num_streams * stream_width * 2, device="cuda", dtype=torch.float32
+    )[:, ::2]
+    assert not _can_use_streamwise_triton(
+        noncontiguous, logits, num_streams, stream_width, enforce_training_limits=False
+    )
+
+    fp64 = decode_sized.to(dtype=torch.float64)
+    assert not _can_use_streamwise_triton(
+        fp64, logits, num_streams, stream_width, enforce_training_limits=False
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
+@pytest.mark.parametrize(
+    "context_factory", [torch.no_grad, torch.inference_mode], ids=("no_grad", "inference")
+)
+@pytest.mark.parametrize("batch", [96, 128, 130], ids=("block_aligned", "pow2", "ragged_tail"))
+def test_decode_sized_forward_only_fuses_and_matches_reference(context_factory, batch):
+    """A decode-sized forward must take the fused path, not the eager factor kernels.
+
+    The batch sizes cover a block-aligned count, a power of two, and a count whose
+    tail partially fills the final BLOCK_BATCH tile, which is what the runtime
+    ``BATCH`` kernel argument masks off.
+    """
+
+    torch.manual_seed(2718)
+    num_streams = 3
+    stream_width = 64
+    max_forget = 0.2
+    # All are below _STREAMWISE_MIN_BATCH: realistic decode steps.
+    residual_source = torch.randn(
+        batch, num_streams * stream_width, device="cuda", dtype=torch.bfloat16
+    )
+    update_source = torch.randn(batch, stream_width, device="cuda", dtype=torch.bfloat16)
+    read_logits = _padded_logits(torch.tensor([-0.8, -0.7, -0.6], device="cuda"))
+    write_logits = _padded_logits(torch.tensor([-0.01, 0.0, 0.01], device="cuda"))
+    retention_logits = _padded_logits(torch.tensor([4.8, 4.9, 5.0], device="cuda"))
+
+    def run(residual, update):
+        read = streamwise_sigmoid_read(residual, read_logits, num_streams)
+        output = streamwise_sigmoid_writeback(
+            residual,
+            update + 0.125 * read,
+            write_logits,
+            num_streams,
+            retention_logits=retention_logits,
+            retention_max_forget=max_forget,
+        )
+        return read, output
+
+    with InferenceMode.active(), context_factory():
+        residual = residual_source.clone()
+        update = update_source.clone()
+        run(residual, update)  # Warm up the Triton JIT outside the profiled region.
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as profile:
+            read, output = run(residual, update)
+        torch.cuda.synchronize()
+        read_value = read.clone()
+        output_value = output.clone()
+
+    # The eager fallback materializes the factors with these ops; the fused
+    # kernels form them in registers from the raw logits.
+    event_names = {event.key for event in profile.key_averages()}
+    forbidden = {"aten::sigmoid", "aten::matmul", "aten::mm", "aten::addcmul_", "aten::neg"}
+    assert event_names.isdisjoint(forbidden), sorted(event_names & forbidden)
+
+    reference_read = _reference_read(
+        residual_source, torch.sigmoid(read_logits[:num_streams].float()).to(torch.bfloat16)
+    )
+    reference_output = _reference_writeback(
+        residual_source,
+        update_source + 0.125 * reference_read,
+        (2.0 * torch.sigmoid(write_logits[:num_streams].float())).to(torch.bfloat16),
+        (1.0 - max_forget * torch.sigmoid(-retention_logits[:num_streams].float())).to(
+            torch.bfloat16
+        ),
+    )
+    assert _relative_l2(read_value, reference_read) <= 0.02
+    assert _relative_l2(output_value, reference_output) <= 0.02
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
+def test_small_batch_training_forward_stays_eager_without_inference_mode():
+    """Grad state must not change which kernel a training forward selects.
+
+    Residual-stream recompute replays the forward under torch.no_grad() during
+    backward. If the replay fused while the original grad-enabled forward did
+    not, the recomputed activations would disagree with the ones backward was
+    built on -- which is what broke the hybrid-block wide-residual replay test.
+    """
+
+    torch.manual_seed(31415)
+    num_streams = 3
+    stream_width = 64
+    batch = 32  # Below _STREAMWISE_MIN_BATCH, as in the hybrid-block recompute test.
+    residual = torch.randn(batch, num_streams * stream_width, device="cuda", dtype=torch.float32)
+    read_logits = _padded_logits(torch.tensor([-0.8, -0.7, -0.6], device="cuda"))
+
+    # Be explicit rather than relying on ambient state: StaticInferenceEngine sets
+    # this flag without clearing it, and conftest's autouse fixture only clears it
+    # after each test.
+    InferenceMode.unset_active()
+
+    # The training limits hold regardless of grad state.
+    for grad_enabled in (True, False):
+        with torch.set_grad_enabled(grad_enabled):
+            assert not _can_use_streamwise_triton(
+                residual, read_logits, num_streams, stream_width, enforce_training_limits=True
+            )
+
+    original = streamwise_sigmoid_read(residual, read_logits, num_streams)
+    with torch.no_grad():
+        streamwise_sigmoid_read(residual, read_logits, num_streams)  # warm up
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as profile:
+            replayed = streamwise_sigmoid_read(residual, read_logits, num_streams)
+        torch.cuda.synchronize()
+
+    # The eager fallback materializes the factors with aten ops; the fused kernel
+    # forms them in registers. Seeing the aten ops proves the replay did not fuse.
+    event_names = {event.key for event in profile.key_averages()}
+    assert "aten::sigmoid" in event_names, sorted(event_names)
+
+    torch.testing.assert_close(replayed, original.detach())
