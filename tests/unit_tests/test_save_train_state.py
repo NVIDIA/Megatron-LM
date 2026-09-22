@@ -2,6 +2,7 @@
 """Unit tests for saving/loading ``train_state.pt`` (see megatron/training/state.py,
 megatron/training/utils/checkpoint_utils.py and the train-state block in
 megatron.training.checkpointing.save_checkpoint)."""
+
 from types import SimpleNamespace
 from typing import Optional
 
