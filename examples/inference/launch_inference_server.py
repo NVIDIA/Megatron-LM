@@ -30,6 +30,7 @@ from megatron.inference.utils import (
 )
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 
 
 def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
@@ -99,10 +100,11 @@ async def _serve(args, model, tokenizer, inference_config):
 
 
 def main():
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()

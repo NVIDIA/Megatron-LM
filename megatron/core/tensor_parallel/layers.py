@@ -536,8 +536,20 @@ def _linear_forward(
 
     input_shape = input.shape
     input_2d = input.reshape(-1, input_shape[-1])
-    output = te_general_gemm(weight, input_2d, out_dtype=output_dtype, layout="TN", bias=bias)[0]
-    return output.reshape(*input_shape[:-1], weight.size(0))
+    output = torch.empty(
+        (*input_shape[:-1], weight.size(0)), dtype=output_dtype, device=input.device
+    )
+    # Cross entropy transforms FP32 logits in place. Have TE write through a 2-D view of
+    # the final-shaped allocation, then return the owning tensor rather than that view.
+    te_general_gemm(
+        weight,
+        input_2d,
+        out_dtype=output_dtype,
+        layout="TN",
+        out=output.view(-1, weight.size(0)),
+        bias=bias,
+    )
+    return output
 
 
 def linear_with_frozen_weight(
@@ -1271,7 +1283,11 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             # Check the weight passed in is the correct shape
             expected_shape = (self.output_size_per_partition, self.input_size)
-            if weight.shape != expected_shape:
+            # Deferred to break the tensor_parallel package import cycle (gtp_api ->
+            # generalized_tensor_parallelism -> tensor_parallel/__init__ -> layers).
+            from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+            if weight.shape != expected_shape and not is_gtp_param(weight):
                 raise RuntimeError(
                     f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"

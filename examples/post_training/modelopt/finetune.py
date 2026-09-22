@@ -22,6 +22,8 @@ from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
 from megatron.training.utils import print_rank_0
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+from megatron.training.global_vars import initialize_runtime_services
 from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 from model_provider import model_provider
 from megatron.core.parallel_state import get_context_parallel_group
@@ -157,16 +159,10 @@ class SFTDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _load_dataset_synchronized(load_dataset_func):
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return load_dataset_func()
-
-        if torch.distributed.get_rank() == 0:
-            raw_samples = load_dataset_func()
-        torch.distributed.barrier()
-        if torch.distributed.get_rank() != 0:
-            raw_samples = load_dataset_func()
-        torch.distributed.barrier()
-        return raw_samples
+        # Megatron only builds datasets on tensor-parallel rank zero, so a global
+        # barrier here deadlocks whenever tensor parallelism is greater than one.
+        # Hugging Face Hub serializes concurrent cache writes with file locks.
+        return load_dataset_func()
 
     @staticmethod
     def _normalize_input_ids(input_ids) -> List[int]:
@@ -581,8 +577,11 @@ if __name__ == "__main__":
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
     )
+    full_config = pretrain_cfg_container_from_args(args)
+    initialize_runtime_services(args)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
-        pretrain_cfg_container_from_args(args),
+        full_config,
         train_valid_test_sft_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,

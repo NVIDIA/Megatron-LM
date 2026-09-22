@@ -49,7 +49,7 @@ from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     is_gtp_symm_pool_registered,
     symmetric_wgrad_pool,
 )
-from megatron.core.utils import ensure_params_ready, log_single_rank
+from megatron.core.utils import ensure_params_ready, log_single_rank, resolve_gtp_pad_for_alignment
 
 logger = logging.getLogger(__name__)
 
@@ -517,17 +517,8 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+        pad_for_alignment=resolve_gtp_pad_for_alignment(fp4=fp4, fp8_recipe=fp8_recipe, fp8=fp8),
     )
-    if fp4:
-        update_gtp_config(pad_for_alignment=16)
-    elif fp8_recipe == "mxfp8":
-        update_gtp_config(pad_for_alignment=32)
-    elif fp8:
-        update_gtp_config(pad_for_alignment=16)
-    else:
-        # No MXFP8/NVFP4 tile-size requirement in this recipe -- pad only to the minimum
-        # gtp_remat_size needed for even AG/RS sharding, not a fixed quantization tile size.
-        update_gtp_config(pad_for_alignment=1)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)

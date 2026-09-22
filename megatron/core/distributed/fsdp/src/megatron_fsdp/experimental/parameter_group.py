@@ -14,6 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+import math
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -28,7 +29,8 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .module_utils import get_parameter_owner
+from .module_utils import copy_parameter_attributes, get_parameter_owner
+from .placement import BlockAtomic
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -191,11 +193,17 @@ class FsdpParameterGroup:
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         tensor_shapes = tuple(parameter.shape for parameter in parameters)
+        block_size = 1
+        for placements in (model_weight_placements, main_grad_placements, main_weight_placements):
+            for placement in placements:
+                if isinstance(placement, BlockAtomic):
+                    block_size = math.lcm(block_size, placement.block_size)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameters),
             mesh=self.mesh,
             placements=main_weight_placements,
+            block_size=block_size,
         )
 
         if use_symmetric_memory:
@@ -213,12 +221,13 @@ class FsdpParameterGroup:
             # into its local storage, so the first ZeRO-1 unshard can all-gather
             # directly into this allocation.
             with self._symmetric_memory_context():
-                self.model_weight = DBuffer(
+                self.model_weight = DBuffer.empty(
                     mesh=self.mesh,
                     placements=model_weight_placements,
                     tensor_shapes=tensor_shapes,
                     dtype=self.dtype,
                     device=self.main_weight.device,
+                    block_size=block_size,
                 )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         # Cast into the preallocated optimizer-layout view on the current stream.
@@ -228,12 +237,13 @@ class FsdpParameterGroup:
         )
 
         with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
+            self._unsharded_model_weight = DBuffer.empty(
                 mesh=self.mesh,
                 placements=[Replicate()] * self.mesh.ndim,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
+                block_size=block_size,
             )
 
         self.main_grad = None
@@ -248,12 +258,13 @@ class FsdpParameterGroup:
         # eagerly deallocated right after optimizer.step(), avoiding main_grad
         # storage during forward. That requires a separate lifetime contract with
         # the optimizer, so this version keeps the simpler persistent buffer.
-        self.main_grad = DBuffer(
+        self.main_grad = DBuffer.empty(
             mesh=self.mesh,
             placements=main_grad_placements,
             tensor_shapes=self.main_weight.layout.tensor_shapes,
             dtype=grad_dtype,
             device=self.main_weight.device,
+            block_size=block_size,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
         assert self.main_grad.layout == self.main_weight.layout, (
@@ -268,15 +279,15 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            unsharded_tensor = self._unsharded_model_weight.get_tensor_view(index)
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
+                # Copy model metadata first since swap_tensors() also swaps attributes.
                 materialized_parameter = nn.Parameter(
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
+                copy_parameter_attributes(parameter, materialized_parameter)
                 torch.utils.swap_tensors(parameter, materialized_parameter)
             else:
                 parameter.data = unsharded_tensor
@@ -287,6 +298,7 @@ class FsdpParameterGroup:
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            copy_parameter_attributes(parameter, sharded_parameter)
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
@@ -348,7 +360,7 @@ class FsdpParameterGroup:
                 )
             unsharded_model_weight = self._unsharded_model_weight
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
+            fsdp_parameter.unsharded.data = unsharded_model_weight.get_tensor_view(index)
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
@@ -377,19 +389,20 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
-            return DBuffer(
+            return DBuffer.empty(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
+                block_size=self.main_weight.layout.block_size,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
+            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
@@ -404,9 +417,7 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def reduce_partial_gradients(
-        self, partial_grad: DBuffer, is_last_microbatch: bool = True
-    ) -> None:
+    def reduce_partial_gradients(self, partial_grad: DBuffer, *, is_last_microbatch: bool) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
         For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,

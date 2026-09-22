@@ -32,11 +32,12 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 )
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+from megatron.core.ssm.packed_seq_helpers import build_packed_seq_idx
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_in_proj_factory, _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -133,7 +134,7 @@ class MambaMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
+class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
     """
     Args:
         config: The config of the model.
@@ -469,47 +470,20 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
         self.tp_group = pg_collection.tp
 
-    def forward(
+    def _mamba_chunk(
         self,
         hidden_states,
-        inference_context=None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        conv_state=None,
+        ssm_state=None,
+        packed_seq_params=None,
+        inference_mode=False,
     ):
-        """
-        hidden_states: (nL, B, D) / (L B D)
-        Returns: same shape as hidden_states
-        """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        in_inference_mode = InferenceMode.is_active()
-
-        _, batch, dim = hidden_states.shape
-        conv_state, ssm_state = None, None
-
-        if in_inference_mode and inference_context is not None:
-            if inference_context.is_dynamic_batching():
-                return self.ssm_dynamic_inference(hidden_states, inference_context)
-            else:
-                assert inference_context.is_static_batching()
-                assert not self.config.batch_invariant_mode, (
-                    "batch_invariant_mode for Mamba inference is only supported with "
-                    "DynamicInferenceContext."
-                )
-                assert not self.config.sequence_parallel
-                conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-                if inference_context.seqlen_offset > 0:
-                    # The states are updated inplace
-                    out, out_bias = self._static_decode(hidden_states, conv_state, ssm_state)
-                    return out, out_bias
-
+        """Run Mamba through its normalized SSM output, before output projection."""
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
-        if in_inference_mode or not self.use_mem_eff_path:
+        if inference_mode or not self.use_mem_eff_path:
             # TODO(ksanthanam): Consider deprecating this path for training
             assert packed_seq_params is None, (
                 "Training with packed sequences is not supported "
@@ -520,9 +494,65 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
-        out, out_bias = self.out_proj(y)
+        return y
 
-        return out, out_bias
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states,
+        *,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_cp_metadata=None,
+    ):
+        """Run the training pre-attention and core-attention stage."""
+        assert (
+            packed_sequence_cp_metadata is None
+        ), "MambaMixer does not support packed-sequence chunkwise CP metadata."
+        assert (
+            not InferenceMode.is_active()
+        ), "Two-stage mixer execution does not support inference."
+        return self._mamba_chunk(hidden_states, packed_seq_params=packed_seq_params)
+
+    def forward_post_core_attn(self, y):
+        """Apply the Mamba output projection to an SSM output tensor."""
+        return self.out_proj(y)
+
+    def forward(
+        self,
+        hidden_states,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Run the input projection/SSM phase followed by the output projection."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        in_inference_mode = InferenceMode.is_active()
+
+        _, batch, _ = hidden_states.shape
+        conv_state, ssm_state = None, None
+        if in_inference_mode and inference_context is not None:
+            if inference_context.is_dynamic_batching():
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
+
+            assert inference_context.is_static_batching()
+            assert not self.config.batch_invariant_mode, (
+                "batch_invariant_mode for Mamba inference is only supported with "
+                "DynamicInferenceContext."
+            )
+            assert not self.config.sequence_parallel
+            conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
+            if inference_context.seqlen_offset > 0:
+                # The states are updated in place.
+                return self._static_decode(hidden_states, conv_state, ssm_state)
+
+        y = self._mamba_chunk(
+            hidden_states,
+            conv_state=conv_state,
+            ssm_state=ssm_state,
+            packed_seq_params=packed_seq_params,
+            inference_mode=in_inference_mode,
+        )
+        return self.out_proj(y)
 
     # ==================================================================
     # Static / eager inference
@@ -698,6 +728,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
+            if seq_idx is None:
+                seq_idx = build_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
 
         state_dtype_kwarg = (
             {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}

@@ -63,6 +63,13 @@ jobs:
             Read `skills/pr-review/SKILL.md` with the Read tool and follow it exactly.
             It is checked out at the PR head alongside this workflow.
 
+            If the PR adds or changes a GPU kernel (Triton kernel, `jit_fuser`/`torch.compile`
+            function, CUDA extension, Transformer Engine or external-library dispatch, or a
+            scatter/index accumulation), check that a bit-exact determinism test under
+            `tests/unit_tests/determinism/kernels/` is added or updated and that the kernel is
+            registered in `tests/unit_tests/determinism/kernels/manifest.py`
+            (see docs/developer/determinism/testing.md).
+
   # ──────────────────────────────────────────────────────────────────
   # Strict review: comprehensive Megatron-LM focused analysis
   # covering precision, parallelism correctness, performance,

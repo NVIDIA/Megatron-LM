@@ -27,6 +27,7 @@ from megatron.training.global_vars import (
 from tests.unit_tests.test_utilities import Utils
 
 GOLDEN_CONFIG: Dict[str, Any] = {
+    "keep_mtp_in_bf16": False,
     "_cpu_offloading_context": None,
     "account_for_embedding_in_pipeline_split": False,
     "account_for_loss_in_pipeline_split": False,
@@ -50,6 +51,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "attention_dropout": 0.0,
     "attention_output_gate": False,
     "attention_softmax_in_fp32": False,
+    "attn_logit_softcapping": None,
     "autocast_dtype": "torch.bfloat16",
     "barrier_with_L1_time": True,
     "batch_invariant_backend": "te_native",
@@ -179,6 +181,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,
     "linear_num_value_heads": 32,
+    "gdn_pre_gated_delta_rule_fusion": False,
+    "gdn_gated_output_norm_fusion": False,
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
@@ -228,6 +232,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
     "moe_permute_fusion_into_hybridep": False,
+    "moe_router_aux_loss_fusion": False,
     "moe_router_bias_update_rate": 0.001,
     "moe_router_dtype": "fp64",
     "moe_router_enable_expert_bias": True,
@@ -245,6 +250,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
+    "moe_shortcut_connection": False,
+    "moe_shortcut_parallel": False,
+    "moe_shortcut_post_norm": False,
     "moe_shared_expert_gate": False,
     "use_grouped_gemm_for_shared_expert": False,
     "moe_shared_expert_intermediate_size": 3712,
