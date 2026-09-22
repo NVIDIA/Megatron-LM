@@ -617,11 +617,10 @@ def test_load_checkpoint(
                 num_floating_point_operations_so_far,
                 rng_config=rng_config,
             )
-        # Legacy torch checkpoints serialize on the DP writer only.
-        if serialized.called:
+        # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
+        # torch.save internally while serializing RNG tensors for all_gather_object.
+        if torch.distributed.get_rank() == 0:
             assert rng_config_from_args(serialized.call_args.args[0]["args"]) == rng_config
-        else:
-            assert torch.distributed.get_rank() != 0
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
