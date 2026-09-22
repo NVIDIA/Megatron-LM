@@ -167,6 +167,20 @@ def test_cross_depth_sharing_accepts_full_iteration_graph(shared_components):
 
 
 @pytest.mark.parametrize(
+    "shared_components",
+    [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS],
+)
+def test_cross_depth_sharing_accepts_moe_only_graph(shared_components):
+    config = _make_config(
+        mtp_repeated_layer_shared_components=shared_components,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["moe"],
+    )
+
+    assert config.mtp_repeated_layer_shared_components == shared_components
+
+
+@pytest.mark.parametrize(
     "modules",
     [
         [],

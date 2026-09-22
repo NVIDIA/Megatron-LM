@@ -3966,7 +3966,7 @@ class TransformerConfig(ModelParallelConfig):
             )
         if (
             self.mtp_repeated_layer_shared_components
-            and cuda_graph_captures_attention
+            and graph_captures_attention
             and self.cuda_graph_impl != "full_iteration"
         ):
             raise ValueError(
