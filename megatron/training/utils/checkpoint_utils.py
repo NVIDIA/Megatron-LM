@@ -6,12 +6,16 @@ import sys
 from typing import Any
 
 import torch
-import yaml
 
-from megatron.core._rank_utils import (
-    safe_get_rank as get_rank_safe,
-    safe_get_world_size as get_world_size_safe,
-)
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe
+from megatron.core._rank_utils import safe_get_world_size as get_world_size_safe
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.utils.common_utils import print_rank_0
@@ -59,8 +63,15 @@ def read_run_config(run_config_filename: str) -> dict[str, Any]:
         A dictionary containing the run configuration.
 
     Raises:
+        ImportError: If PyYAML is not installed.
         RuntimeError: If reading the config file fails on rank 0.
     """
+    if not HAVE_YAML:
+        raise ImportError(
+            "PyYAML is required to read YAML configuration files from the checkpoint. "
+            "Install via `pip install pyyaml`."
+        )
+
     if torch.distributed.is_initialized():
         config_obj = [None]
 
