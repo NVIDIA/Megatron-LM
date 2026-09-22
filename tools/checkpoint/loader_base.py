@@ -5,8 +5,7 @@ import sys
 import types
 
 import torch
-from utils import _ConverterFakeProcessGroup, print_memory_usage
-
+from utils import initialize_checkpoint_converter_fake_process_groups, print_memory_usage
 
 class MegatronCheckpointLoaderBase:
     """Orchestrates loading a Megatron checkpoint and sending
@@ -149,11 +148,12 @@ class MegatronCheckpointLoaderBase:
         )
         mpu.set_expert_model_parallel_world_size(self.margs.expert_model_parallel_size)
 
-        # For backward compatibility during local parallel states refactoring
-        fake_tp_group = _ConverterFakeProcessGroup(size=self.margs.tensor_model_parallel_size)
-        fake_ep_group = _ConverterFakeProcessGroup(size=self.margs.expert_model_parallel_size)
-        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+        initialize_checkpoint_converter_fake_process_groups(
+            mpu,
+            self.margs.tensor_model_parallel_size,
+            self.margs.pipeline_model_parallel_size,
+            self.margs.expert_model_parallel_size,
+        )
 
     def compute_true_vocab_size(self):
         """Determine the 'true' (non-padded) vocab size."""
