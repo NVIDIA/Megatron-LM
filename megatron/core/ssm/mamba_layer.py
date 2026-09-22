@@ -275,6 +275,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                         hidden_states,
                         recompute_context,
                         fp32_residual_connection=self.config.fp32_residual_connection,
+                        branch_input_dtype=self.config.params_dtype,
                     )
                 residual = residual_connection.residual_stream(connection_state)
             else:
