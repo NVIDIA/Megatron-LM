@@ -314,3 +314,75 @@ attempts alongside them when reviewing calibration and unexplained variation.
 
 CPU contract tests use explicitly synthetic GPU metadata and timings. They do
 not establish hardware latency, correctness, replay coverage or usable budgets.
+
+## Time actual captured collectives
+
+`benchmark_collectives.py` measures the six direct TP/SP mappings supported by
+the [recipe capture adapter](recipe-coverage.md), using its actual rank-local
+input and upstream-gradient bytes. This optional adapter needs the capture and
+replay producer (#7260/#7317) and the early startup API (#7419). It runs on the
+capture's original single-node allocation; a capture from a different physical
+GPU assignment cannot supply these measurements.
+
+After capture and replay have completed at the clean head revision, run the
+parent outside `torchrun`, from that head checkout:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/benchmark_collectives.py \
+  --capture /results/recipe/capture \
+  --evidence /results/recipe/coverage.json \
+  --base-checkout /checkouts/base \
+  --output /results/recipe/collective-timing \
+  --pairs 3 --warmup 20 --steps 50
+```
+
+The capture must have matching passing replay, reference and sensitivity
+observations on every rank for each selected event. `--event-indices 0 1`
+selects explicit entries from the manifests; omission measures every event.
+A `forward` event measures forward, and its `forward_backward` event measures
+backward with the captured upstream gradient. The latter's forward graph setup
+is outside timing. Both phases restore the input and gradient before every
+sample, including their original strides and storage offsets.
+
+Each source/policy arm starts fresh processes and process groups; pair order
+alternates. Explicit group membership, stream priority, NCCL options, input
+hashes, UUIDs and non-policy settings stay fixed. The deterministic arm retains
+the captured policy. The default arm disables Torch/cuDNN deterministic
+selection, removes NCCL_ALGO/CUBLAS_WORKSPACE_CONFIG and enables the existing
+default TE/Mamba/causal-convolution settings. Memory fill, TF32, Triton caching
+and other NCCL overrides stay fixed and are recorded. Autocast and cuDNN
+benchmark captures currently require a different adapter. The head's timing
+helpers run both sources; production mapping imports are checked against the
+selected checkout. Matching correctness evidence applies to deterministic head
+execution, not to default or baseline accuracy.
+
+Each communicator is initialized with a group barrier before operator warmup.
+The report retains requested options and the actual settings before and after
+initialization. PyTorch resolves NCCL's undefined `blocking` field to `0` or `1`
+according to the explicit configuration/environment; only that declared
+resolution is accepted. Stream priority, CTA limits and every other option stay
+exact. Measured signatures record the resolved settings alongside the original
+capture signature. See [ProcessGroupNCCL initialization](https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/ProcessGroupNCCL.cpp).
+
+Rank alignment barriers, input restoration, graph setup and warmup are excluded
+from CUDA-event intervals. These direct synchronous c10d mappings join NCCL
+completion to the calling stream, so its end event includes completion; see
+[PyTorch's collective stream semantics](https://docs.pytorch.org/docs/2.14/distributed.html#synchronous-and-asynchronous-collective-operations).
+Intervals include host launch gaps and arrival skew. They measure isolated
+operator phases, including identity phases, not pure NCCL kernel durations,
+overlap or whole-model throughput.
+
+Every arm retains raw per-rank JSON and a log. For each event and captured
+group, the report takes the maximum rank latency at each aligned sample index,
+then its median. Paired bootstrap intervals use these independent process-pair
+ratios; ranks and samples are never pooled as independent repetitions. JSON and
+Markdown retain each group's result, head overhead and optional base/head
+regressions. Incomplete ranks, changed source/runtime, modified captures or
+missing accuracy evidence fail and leave the partial attempt for diagnosis.
+
+Ratios are report-only unless explicit reviewed `--max-overhead-ratio` and/or
+`--max-regression-ratio` limits are supplied; fewer than three pairs remain
+inconclusive. Local-activation leaderboard and calibration reports retain their
+own format. Use the explicit collective publication and artifact-consumer paths
+below for this report kind. Reviewed baseline promotion and production-recipe
+performance acceptance remain separate work.
