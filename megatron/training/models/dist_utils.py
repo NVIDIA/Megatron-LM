@@ -31,7 +31,7 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, get_pg_rank
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -217,7 +217,7 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
     """Print the number of parameters in the model on rank 0.
 
     Only prints on data parallel rank 0 to avoid duplicate output.
-    Shows parameter count per (tensor parallel, pipeline parallel) rank.
+    Shows parameter count per (tensor parallel, gtp_remat, pipeline parallel) rank.
 
     Args:
         model: List of model modules to count parameters from
@@ -225,8 +225,9 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
     """
     if (pg_collection.dp.rank() == 0) and (pg_collection.cp.rank() == 0):
         print(
-            " > number of parameters on (tensor, pipeline) model parallel rank ({}, {}): {}".format(
+            " > number of parameters on (tensor, gtp_remat, pipeline) model parallel rank ({}, {}, {}): {}".format(
                 pg_collection.tp.rank(),
+                get_pg_rank(pg_collection.gtp_remat),
                 pg_collection.pp.rank(),
                 sum(
                     [
@@ -354,12 +355,24 @@ def _ddp_wrap(
                 effective_bucket_size = (
                     None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
                 )
+                # Size the layout by the group the optimizer actually shards over, which is
+                # the intra-instance group when there are several optimizer instances. Using
+                # the full dp_cp would report more shards than the reduce-scatter uses and
+                # leave the trailing shard of every bucket owned by no rank.
+                intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
+                intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
                 chunk_kwargs["full_param_layout"] = compute_layout(
                     all_params,
                     effective_bucket_size,
-                    pg_collection.dp_cp.size(),
+                    (
+                        intra_dp_cp_group if intra_dp_cp_group is not None else pg_collection.dp_cp
+                    ).size(),
                     ddp_config,
-                    expert_data_parallel_world_size=pg_collection.expt_dp.size(),
+                    expert_data_parallel_world_size=(
+                        intra_expt_dp_group
+                        if intra_expt_dp_group is not None
+                        else pg_collection.expt_dp
+                    ).size(),
                 )
 
             wrapped_chunk = DP(

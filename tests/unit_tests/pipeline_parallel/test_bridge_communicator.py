@@ -112,7 +112,7 @@ def _shard_and_copy_(
 _active_grids: list = []
 
 
-def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
+def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, gtp_remat=1):
     """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""
     # Set up environment for world size 8 if not already set
     if not dist.is_initialized():
@@ -123,12 +123,13 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
         os.environ["WORLD_SIZE"] = "8"
 
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp],
-        dim_names=["tp", "cp", "pp", "dp"],
+        shape=[tp, cp, gtp_remat, pp, dp],
+        dim_names=["tp", "cp", "gtp_remat", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )
     _ = grid.create_pg(["tp"])
+    _ = grid.create_pg(["gtp_remat"])
     _ = grid.create_pg(["cp"])
     _ = grid.create_pg(["pp"])
     _ = grid.create_pg(["dp"])
@@ -325,6 +326,17 @@ class TestBridgeCommunicator:
             rank for rank, info in bridge.comm_map.items() if info.role == CommRole.MEMBER
         ]
         assert all(rank not in expected for rank in member_ranks)
+
+    def test_gtp_is_an_independent_bridge_data_lane(self):
+        src_grid = create_hypercomm_grid(offset=0, tp=2, dp=2)
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, dp=1, gtp_remat=2)
+        bridge = BridgeCommunicator(src_grid, dest_grid)
+
+        assert len(bridge.src_tp_leaders) == 2
+        assert len(bridge.dest_tp_leaders) == 2
+        assert sorted(set(bridge.src_tp_leaders) | set(bridge.dest_tp_leaders)) == list(
+            dist.get_process_group_ranks(bridge.bridge_pg)
+        )
 
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""

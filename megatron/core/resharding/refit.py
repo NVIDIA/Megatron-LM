@@ -9,7 +9,7 @@ High-level refit/reshard orchestration:
 """
 
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, Literal, NamedTuple, Optional, Union
 
 import torch
 
@@ -17,6 +17,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
     _should_quantize_param,
     quantize_params_to_mxfp8,
+    resolve_mxfp8_backend,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.utils import unwrap_model
@@ -33,6 +34,18 @@ from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
 
 
+class _ParallelConfig(NamedTuple):
+    """Parallel group sizes that determine a refit plan."""
+
+    tp_size: int
+    pp_size: int
+    ep_size: int
+    dp_size: int
+    expert_tp_size: int
+    gtp_remat_size: int
+    expert_gtp_remat_size: int
+
+
 @dataclass(frozen=True)
 class _PlanCacheKey:
     """
@@ -40,9 +53,8 @@ class _PlanCacheKey:
     """
 
     rank: int
-    # Parallelism configuration: (TP, PP, EP, DP, expt_tp) or None for non-collocated ranks
-    src_config: Optional[Tuple[int, int, int, int, int]]
-    dst_config: Optional[Tuple[int, int, int, int, int]]
+    src_config: Optional[_ParallelConfig]
+    dst_config: Optional[_ParallelConfig]
     num_experts: Optional[int]
     # Rank offsets distinguish non-collocated configurations that would otherwise
     # share the same (rank, sizes, num_experts) tuple but route to different
@@ -51,8 +63,8 @@ class _PlanCacheKey:
     dst_rank_offset: int = 0
 
 
-def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
-    """Extract (TP, PP, EP, DP, expt_tp) sizes from a model core, memoized on the core.
+def _get_parallel_config(core) -> Optional[_ParallelConfig]:
+    """Extract TP/PP/EP/DP/expert-TP/GTP-remat sizes, memoized on the core.
 
     Process-group sizes don't change after init, so the result is cached on the
     core object itself to avoid repeated ``get_process_group_ranks`` calls on
@@ -60,19 +72,23 @@ def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
     """
     if core is None:
         return None
-    cached = getattr(core, '_refit_config_tuple', None)
+    cached = getattr(core, '_refit_parallel_config', None)
     if cached is not None:
         return cached
     pg = core.pg_collection
     expt_tp = getattr(pg, 'expt_tp', None)
-    result = (
-        pg.tp.size() if pg.tp else 1,
-        pg.pp.size() if pg.pp else 1,
-        pg.ep.size() if pg.ep else 1,
-        pg.dp.size() if pg.dp else 1,
-        expt_tp.size() if expt_tp else 1,
+    gtp_remat = getattr(pg, 'gtp_remat', None)
+    expt_gtp_remat = getattr(pg, 'expt_gtp_remat', None)
+    result = _ParallelConfig(
+        tp_size=pg.tp.size() if pg.tp else 1,
+        pp_size=pg.pp.size() if pg.pp else 1,
+        ep_size=pg.ep.size() if pg.ep else 1,
+        dp_size=pg.dp.size() if pg.dp else 1,
+        expert_tp_size=expt_tp.size() if expt_tp else 1,
+        gtp_remat_size=gtp_remat.size() if gtp_remat else 1,
+        expert_gtp_remat_size=expt_gtp_remat.size() if expt_gtp_remat else 1,
     )
-    core._refit_config_tuple = result
+    core._refit_parallel_config = result
     return result
 
 
@@ -89,8 +105,8 @@ def _build_plan_cache_key(
     rank = group.rank() if group is not None else torch.distributed.get_rank()
     return _PlanCacheKey(
         rank=rank,
-        src_config=_get_config_tuple(src_core),
-        dst_config=_get_config_tuple(tgt_core),
+        src_config=_get_parallel_config(src_core),
+        dst_config=_get_parallel_config(tgt_core),
         num_experts=num_experts,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
@@ -178,7 +194,7 @@ def _unwrap_model_cores(src_model, target_model):
             raise RuntimeError("Source model missing pg_collection required for reshard")
         # Fill missing DP group on the source using Megatron's parallel state if not provided
         if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
+            src_core.pg_collection.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
@@ -219,7 +235,7 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
 
 
 def _needs_mxfp8_conversion(model) -> bool:
-    """Check if a model uses FlashInfer MXFP8 inference and needs weight conversion."""
+    """Check if a model uses optimized MXFP8 inference and needs weight conversion."""
     if model is None:
         return False
     lm = model[0] if isinstance(model, (list, tuple)) else model
@@ -236,7 +252,7 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     If the *target_model* uses an inference-optimized layer spec with MXFP8,
     this function:
       1. Computes which params are eligible for MXFP8 conversion.
-      2. Quantizes the target model's decoder weights to FlashInfer MXFP8Tensor
+      2. Quantizes the target model's decoder weights to MXFP8Tensor
          (creating persistent buffers whose addresses are later captured by
          CUDA graphs).
       3. Builds an ``MXFP8ReshardTransform`` and attaches it to ``plan.transform``.
@@ -261,13 +277,15 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
             convertible.add(f"decoder.{name}")
 
     # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
-    persistent_buffers = quantize_params_to_mxfp8(decoder)
+    backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
+    persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
     # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(
         convertible_params=convertible,
         persistent_buffers=persistent_buffers,
         buffer_key_prefix="decoder.",
+        backend=backend,
     )
 
 
@@ -289,8 +307,8 @@ def prepare_swap_model_weights(
     (``config.transformer_impl == 'inference_optimized'`` and
     ``config.fp8_recipe == 'mxfp8'``), this function also:
       - computes which parameters are eligible for MXFP8 conversion,
-      - quantizes the target decoder weights to persistent FlashInfer
-        MXFP8Tensor buffers (whose addresses are later baked into CUDA graphs),
+      - quantizes the target decoder weights to persistent MXFP8Tensor buffers
+        (whose addresses are later baked into CUDA graphs),
       - creates an ``MXFP8ReshardTransform`` that subsequent
         ``swap_model_weights`` calls use automatically.
 
