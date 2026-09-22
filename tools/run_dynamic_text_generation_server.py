@@ -58,6 +58,7 @@ from megatron.inference.utils import (  # noqa: E402
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -159,7 +160,8 @@ def parse_args_and_detect_vlm(
         _defaults += ["--tokenizer-prompt-format", "mistral"]
     sys.argv[1:1] = _defaults
 
-    parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    initialize_runtime_services(args)
     initialize_megatron()
     args = get_args()
 

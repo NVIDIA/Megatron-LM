@@ -447,14 +447,45 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
+def resolve_tokenizer_vocab_size(cfg: PretrainConfigContainer, padded_vocab_size: int | None) -> None:
+    """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+
+    Args:
+        cfg: Previously constructed training configuration. Explicit model
+            vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
+        padded_vocab_size: Final size resolved by tokenizer initialization,
+            including any CLI/checkpoint override. None is valid only when the
+            model does not require a tokenizer-derived size.
+
+    Raises:
+        ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
+    """
+    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
+        if padded_vocab_size is None:
+            raise ValueError('Model vocabulary must be resolved before model construction')
+        cfg.model.vocab_size = padded_vocab_size
+        cfg.model.should_pad_vocab = False
+
+
 def gpt_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = GPTModelConfig
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type = GPTModelConfig,
+    *,
+    vocab_size_from_tokenizer: bool = True,
 ) -> Any:
     """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
 
     `model_config_cls` lets callers reuse this same arg-derivation logic for
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptModelConfig`.
+
+    ``vocab_size_from_tokenizer`` uses the tokenizer-derived padded vocabulary
+    when padding is enabled. A size already resolved by CLI/checkpoint arguments
+    takes precedence. Otherwise the vocabulary is bound during runtime setup.
+    Set this to False to explicitly convert a raw ``args.vocab_size`` without
+    waiting for tokenizer initialization.
     """
     assert issubclass(model_config_cls, GPTModelConfig)
 
@@ -489,25 +520,38 @@ def gpt_config_from_args(
     # GPTModelConfig supports either automatically padding vocab size or using exact provided
     # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
     # that is just mapped to settings in args appropriately.
-    if args.padded_vocab_size is not None:
-        kwargs["vocab_size"] = args.padded_vocab_size
+    padded_vocab_size = getattr(args, "padded_vocab_size", None)
+    if padded_vocab_size is not None:
+        kwargs["vocab_size"] = padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
-        kwargs["vocab_size"] = args.vocab_size
+        if not (vocab_size_from_tokenizer and args.pad_vocab_size):
+            assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        # With padding enabled, legacy tokenizer setup derives the model's
+        # vocabulary from the tokenizer, even if --vocab-size was supplied.
+        kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
     return model_config_cls(**kwargs)
 
 
 def hybrid_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = HybridModelConfig
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type = HybridModelConfig,
+    *,
+    vocab_size_from_tokenizer: bool = True,
 ) -> Any:
     """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
 
     `model_config_cls` lets callers reuse this same arg-derivation logic for
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptHybridModelConfig`.
+
+    Vocabulary resolution follows ``gpt_config_from_args``: tokenizer-derived
+    vocabulary is the default when padding is enabled, and an already resolved
+    padded size takes precedence. Set ``vocab_size_from_tokenizer=False`` for
+    explicit raw-vocabulary conversion without tokenizer initialization.
     """
     assert issubclass(model_config_cls, HybridModelConfig)
 
@@ -543,12 +587,14 @@ def hybrid_config_from_args(
     # HybridModelConfig supports either automatically padding vocab size or using exact provided
     # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
     # that is just mapped to settings in args appropriately.
-    if args.padded_vocab_size is not None:
-        kwargs["vocab_size"] = args.padded_vocab_size
+    padded_vocab_size = getattr(args, "padded_vocab_size", None)
+    if padded_vocab_size is not None:
+        kwargs["vocab_size"] = padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
-        kwargs["vocab_size"] = args.vocab_size
+        if not (vocab_size_from_tokenizer and args.pad_vocab_size):
+            assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
     return model_config_cls(**kwargs)
