@@ -35,6 +35,8 @@ except ImportError:
 _STREAMWISE_MIN_BATCH = 256
 _STREAMWISE_MAX_STREAMS = 16
 _STREAMWISE_MAX_REDUCTION_BLOCK = 16_384
+_STREAMWISE_TRITON_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_STREAMWISE_OUTPUT_DTYPES = (*_STREAMWISE_TRITON_DTYPES, torch.float64)
 
 
 def _flatten_leading(tensor: Tensor) -> tuple[Tensor, torch.Size]:
@@ -106,8 +108,15 @@ def _validate_raw_write_inputs(
         )
     if branch_update.device != residual_stream.device:
         raise ValueError("branch_update and residual_stream must be on the same device.")
-    if branch_update.dtype != residual_stream.dtype:
-        raise ValueError("branch_update and residual_stream must have the same dtype.")
+    mixed_fp32_residual = residual_stream.dtype == torch.float32 and branch_update.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    )
+    if branch_update.dtype != residual_stream.dtype and not mixed_fp32_residual:
+        raise ValueError(
+            "branch_update must either match residual_stream dtype or use bfloat16/float16 "
+            "with a float32 residual stream."
+        )
     if retention_logits is not None:
         _validate_logits(retention_logits, num_streams, tensor_name="retention_logits")
         if retention_logits.device != residual_stream.device:
@@ -121,6 +130,7 @@ def _can_use_streamwise_triton(
     num_streams: int,
     stream_width: int,
     *,
+    output_dtype: torch.dtype | None = None,
     enforce_training_limits: bool = True,
 ) -> bool:
     """Return whether a direct raw-logit streamwise Triton kernel is supported.
@@ -148,13 +158,15 @@ def _can_use_streamwise_triton(
         partials = _num_gradient_partials(batch, stream_width)
         if triton.next_power_of_2(partials) > _STREAMWISE_MAX_REDUCTION_BLOCK:
             return False
+    resolved_output_dtype = tensor.dtype if output_dtype is None else output_dtype
     return (
         tensor.is_cuda
         and logits.is_cuda
         and tensor.is_contiguous()
         and logits.is_contiguous()
-        and tensor.dtype in (torch.bfloat16, torch.float16, torch.float32)
-        and logits.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and tensor.dtype in _STREAMWISE_TRITON_DTYPES
+        and logits.dtype in _STREAMWISE_TRITON_DTYPES
+        and resolved_output_dtype in _STREAMWISE_TRITON_DTYPES
         and logits.ndim == 1
         and logits.numel() >= num_streams
         and tensor.shape[-1] == num_streams * stream_width
@@ -197,6 +209,10 @@ if HAVE_STREAMWISE_TRITON:
             factor = tl.sigmoid(tl.load(READ_LOGITS + stream).to(tl.float32))
             factor = factor.to(value.dtype).to(tl.float32)
             output += factor * value.to(tl.float32)
+        # Preserve the original read's terminal rounding before converting to an independently
+        # requested output dtype. For an FP32 residual stream this rounds in FP32 before the
+        # branch-width result is stored in BF16 or FP16.
+        output = output.to(X.dtype.element_ty)
         tl.store(
             OUT + offsets_batch[:, None] * STREAM_WIDTH + offsets_width[None, :], output, mask=mask
         )
@@ -229,7 +245,9 @@ if HAVE_STREAMWISE_TRITON:
             mask=mask,
             other=0.0,
         )
-        grad_output_fp32 = grad_output.to(tl.float32)
+        # Match the backward of an explicit cast after a same-dtype read: first convert the
+        # incoming gradient to the read input dtype, then accumulate in FP32.
+        grad_output_fp32 = grad_output.to(X.dtype.element_ty).to(tl.float32)
 
         for stream in tl.static_range(0, NUM_STREAMS):
             offset = (
@@ -273,7 +291,7 @@ if HAVE_STREAMWISE_TRITON:
             mask=mask,
             other=0.0,
         )
-        update_fp32 = update.to(tl.float32)
+        update_fp32 = update.to(RESIDUAL.dtype.element_ty).to(tl.float32)
 
         for stream in tl.static_range(0, NUM_STREAMS):
             offset = (
@@ -283,7 +301,7 @@ if HAVE_STREAMWISE_TRITON:
             )
             residual = tl.load(RESIDUAL + offset, mask=mask, other=0.0)
             write = 2.0 * tl.sigmoid(tl.load(WRITE_LOGITS + stream).to(tl.float32))
-            write = write.to(update.dtype).to(tl.float32)
+            write = write.to(RESIDUAL.dtype.element_ty).to(tl.float32)
             output = write * update_fp32
             if HAS_RETENTION:
                 forget = tl.sigmoid(-tl.load(RETENTION_LOGITS + stream).to(tl.float32))
@@ -327,7 +345,7 @@ if HAVE_STREAMWISE_TRITON:
             mask=mask,
             other=0.0,
         )
-        update_fp32 = update.to(tl.float32)
+        update_fp32 = update.to(GRAD_OUT.dtype.element_ty).to(tl.float32)
         grad_update = tl.zeros((BLOCK_BATCH, BLOCK_WIDTH), tl.float32)
 
         for stream in tl.static_range(0, NUM_STREAMS):
@@ -339,7 +357,7 @@ if HAVE_STREAMWISE_TRITON:
             grad_output = tl.load(GRAD_OUT + offset, mask=mask, other=0.0)
             grad_output_fp32 = grad_output.to(tl.float32)
             write_sigmoid = tl.sigmoid(tl.load(WRITE_LOGITS + stream).to(tl.float32))
-            write = (2.0 * write_sigmoid).to(update.dtype).to(tl.float32)
+            write = (2.0 * write_sigmoid).to(GRAD_OUT.dtype.element_ty).to(tl.float32)
             grad_update += write * grad_output_fp32
 
             write_derivative = 2.0 * write_sigmoid * (1.0 - write_sigmoid)
@@ -512,12 +530,12 @@ def _reduce_streamwise_partials(
 
 
 def _streamwise_sigmoid_read_triton(
-    hidden_states: Tensor, read_logits: Tensor, num_streams: int
+    hidden_states: Tensor, read_logits: Tensor, num_streams: int, output_dtype: torch.dtype
 ) -> Tensor:
     hidden_flat, leading = _flatten_leading(hidden_states)
     batch = hidden_flat.shape[0]
     stream_width = hidden_flat.shape[1] // num_streams
-    output = torch.empty((batch, stream_width), device=hidden_flat.device, dtype=hidden_flat.dtype)
+    output = torch.empty((batch, stream_width), device=hidden_flat.device, dtype=output_dtype)
     block_batch, block_width, num_warps = _streamwise_block_config(batch, stream_width)
     grid = (math.ceil(batch / block_batch), math.ceil(stream_width / block_width))
     _streamwise_read_fwd_kernel[grid](
@@ -678,13 +696,15 @@ class _StreamwiseSigmoidRead(torch.autograd.Function):
 
     @staticmethod
     def forward(  # type: ignore[override]
-        ctx, hidden_states: Tensor, read_logits: Tensor, num_streams: int
+        ctx, hidden_states: Tensor, read_logits: Tensor, num_streams: int, output_dtype: torch.dtype
     ) -> Tensor:
         """Run the fused streamwise read and save tensors for backward."""
 
         ctx.save_for_backward(hidden_states, read_logits)
         ctx.num_streams = num_streams
-        return _streamwise_sigmoid_read_triton(hidden_states, read_logits, num_streams)
+        return _streamwise_sigmoid_read_triton(
+            hidden_states, read_logits, num_streams, output_dtype
+        )
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, ...]:  # type: ignore[override]
@@ -694,7 +714,7 @@ class _StreamwiseSigmoidRead(torch.autograd.Function):
         grad_hidden, grad_logits = _streamwise_sigmoid_read_backward_triton(
             hidden_states, grad_output.contiguous(), read_logits, ctx.num_streams
         )
-        return grad_hidden, grad_logits, None
+        return grad_hidden, grad_logits, None, None
 
 
 class _StreamwiseSigmoidWriteback(torch.autograd.Function):
@@ -773,10 +793,30 @@ def _streamwise_inference_forward(*tensors: Tensor | None) -> bool:
     return InferenceMode.is_active() and not _streamwise_autograd_needed(*tensors)
 
 
-def streamwise_sigmoid_read(hidden_states: Tensor, read_logits: Tensor, num_streams: int) -> Tensor:
-    """Read full-width streams from raw padded logits with fused CUDA dispatch."""
+def streamwise_sigmoid_read(
+    hidden_states: Tensor,
+    read_logits: Tensor,
+    num_streams: int,
+    *,
+    output_dtype: torch.dtype | None = None,
+) -> Tensor:
+    """Read full-width streams from raw padded logits with fused CUDA dispatch.
+
+    Args:
+        hidden_states: Full-width residual stream to read.
+        read_logits: Padded vector containing the active stream-controller logits.
+        num_streams: Number of contiguous residual streams.
+        output_dtype: Optional dtype for the branch-width result. The default preserves the
+            input dtype. Eligible Triton reads perform this terminal conversion in their store.
+    """
 
     stream_width = _validate_raw_read_inputs(hidden_states, read_logits, num_streams)
+    resolved_output_dtype = hidden_states.dtype if output_dtype is None else output_dtype
+    if resolved_output_dtype not in _STREAMWISE_OUTPUT_DTYPES:
+        raise TypeError(
+            "output_dtype must be a floating-point activation dtype, got "
+            f"{resolved_output_dtype}."
+        )
     needs_backward = _streamwise_autograd_needed(hidden_states, read_logits)
     inference_forward = _streamwise_inference_forward(hidden_states, read_logits)
     if _can_use_streamwise_triton(
@@ -784,14 +824,19 @@ def streamwise_sigmoid_read(hidden_states: Tensor, read_logits: Tensor, num_stre
         read_logits,
         num_streams,
         stream_width,
+        output_dtype=resolved_output_dtype,
         enforce_training_limits=not inference_forward,
     ):
         if needs_backward:
-            return _StreamwiseSigmoidRead.apply(hidden_states, read_logits, num_streams)
-        return _streamwise_sigmoid_read_triton(hidden_states, read_logits, num_streams)
+            return _StreamwiseSigmoidRead.apply(
+                hidden_states, read_logits, num_streams, resolved_output_dtype
+            )
+        return _streamwise_sigmoid_read_triton(
+            hidden_states, read_logits, num_streams, resolved_output_dtype
+        )
 
     read_factors = torch.sigmoid(read_logits[:num_streams].float())
-    return streamwise_read(hidden_states, read_factors)
+    return streamwise_read(hidden_states, read_factors).to(dtype=resolved_output_dtype)
 
 
 def streamwise_sigmoid_writeback(
@@ -832,7 +877,12 @@ def streamwise_sigmoid_writeback(
         stream_width,
         enforce_training_limits=not inference_forward,
     )
-    if supports_triton and branch_update.is_contiguous():
+    update_supports_triton = (
+        branch_update.is_cuda
+        and branch_update.is_contiguous()
+        and branch_update.dtype in _STREAMWISE_TRITON_DTYPES
+    )
+    if supports_triton and update_supports_triton:
         if needs_backward:
             return _StreamwiseSigmoidWriteback.apply(
                 residual_stream,
@@ -857,5 +907,8 @@ def streamwise_sigmoid_writeback(
         active_retention_logits = retention_logits[:num_streams].float()
         retention_factors = 1.0 - retention_max_forget * torch.sigmoid(-active_retention_logits)
     return streamwise_writeback(
-        residual_stream, branch_update, write_factors, retention_factors=retention_factors
+        residual_stream,
+        branch_update.to(dtype=residual_stream.dtype),
+        write_factors,
+        retention_factors=retention_factors,
     )
