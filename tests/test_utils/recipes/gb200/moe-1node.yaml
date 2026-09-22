@@ -153,5 +153,5 @@ products:
   - test_case: [deepseek_proxy_mfsdp_v2_ep2_mxfp8_1node]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr]
         platforms: [dgx_gb200]
