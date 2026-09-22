@@ -672,7 +672,14 @@ alignment (MXFP8: 32; other quantized recipes: 16; BF16: 1).
 >
 > **Distributed optimizer formats.** Distributed Adam's `fully_reshardable` and legacy `fully_sharded_model_space` formats resolve gathered projection factories through their `optimizer_factory` companions and dequantized or padding-trimmed entries through their source parameter identities. GTP parameters without either mapping are rejected before optimizer state is read or buffers are exchanged. `dp_reshardable` keeps its existing buffer-based layout and only supports DP resharding.
 >
-> **Grouped gated experts.** EGTP-sharded grouped gated `fc1` is rejected because its checkpoint factory does not gather before splitting gate/up. This guard does not reject ordinary `.weight` modules, including those inside `SequentialMLP`; their EGTP checkpoint behavior is not covered by the fused-projection tests.
+**Grouped gated experts.** EGTP-sharded grouped `linear_fc1` gathers and splits
+`gate|up` with the same logical factory used by dense MLPs. It uses the checkpoint
+key carried by TEGroupedLinear, preserves the prepended expert axis, and elects
+writers over expert DP. Distributed Adam obtains its physical companion through
+`for_optimizer()`. Muon retains its unsplit physical schema: the grouped factory
+keeps its original `ShardedTensor`, and its mapper reuses that metadata with the
+current checkpoint prefix. A raw gathered factory cannot describe the smaller
+Muon state tensor.
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
