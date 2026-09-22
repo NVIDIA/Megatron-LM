@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -23,6 +24,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -282,6 +284,8 @@ class MLP(MegatronModule):
                         per_token_scale.unsqueeze(-1),
                         self.config.activation_func_fp8_input_store,
                         self.config.activation_func_clamp_value,
+                        gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                        linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -314,26 +318,52 @@ class MLP(MegatronModule):
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
                         self.config.activation_func_clamp_value,
+                        gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                        linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
+            tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
             if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                    if (val := self.config.activation_func_clamp_value) is not None:
-                        x_glu = x_glu.clamp(min=None, max=val)
-                        x_linear = x_linear.clamp(min=-val, max=val)
-                    return self.config.activation_func(x_glu) * (
-                        x_linear + self.config.glu_linear_offset
+                if tanh_clamp_scale is not None:
+                    intermediate_parallel = situ_glu(
+                        intermediate_parallel,
+                        tanh_clamp_scale,
+                        self.config.activation_func_tanh_clamp_scale_linear,
+                        self.config.glu_linear_offset,
                     )
+                else:
 
-                intermediate_parallel = glu(intermediate_parallel)
+                    def glu(x):
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
+
+                    intermediate_parallel = glu(intermediate_parallel)
             else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if (
+                    tanh_clamp_scale is not None
+                    and self.activation_func == squared_relu
+                    and self.config.use_fused_weighted_squared_relu
+                ):
+                    # Fused clamp + squared-ReLU saves only the FC1 output for backward
+                    # instead of both the FC1 output and the clamped intermediate.
+                    intermediate_parallel = weighted_squared_relu_impl(
+                        intermediate_parallel, None, tanh_clamp_scale
+                    )
+                else:
+                    if tanh_clamp_scale is not None:
+                        intermediate_parallel = tanh_soft_clamp(
+                            intermediate_parallel, tanh_clamp_scale
+                        )
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
 
             if per_token_scale is not None:
                 original_dtype = intermediate_parallel.dtype
@@ -397,9 +427,12 @@ class MLP(MegatronModule):
         input_size: int | None = None,
         ffn_hidden_size: int | None = None,
         name: str | None = None,
+        hash_moe_layer_threshold: int | None = None,
     ) -> MLP:
         """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
         del is_mtp_layer
+        if hash_moe_layer_threshold is not None and hash_moe_layer_threshold > 0:
+            raise ValueError("Dense MLP does not support hash MoE routing.")
         assert hasattr(
             pg_collection, 'tp'
         ), 'TP process group is required for MLP in TransformerLayer'

@@ -153,6 +153,12 @@ class DistributedDataParallel(_BaseDataParallel):
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
 
+        # GTP weight-shard axes, None when GTP-remat is inactive. The buffers use these to
+        # elect one rank per module for layout logging; every peer on these axes holds a
+        # replica of the same buffer and would otherwise repeat the whole dump.
+        self.gtp_remat_group = process_group_dict.get('gtp_remat_group')
+        self.expt_gtp_remat_group = process_group_dict.get('expt_gtp_remat_group')
+
         # Set inter_dist_opt_group if multiple optimizer instances
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_dist_opt_group = process_group_dict['inter_dist_opt_group']
@@ -248,6 +254,10 @@ class DistributedDataParallel(_BaseDataParallel):
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
         else:
+            expert_gtp_correction = (
+                config.expert_gtp_weight_remat_size / config.gtp_weight_remat_size
+            )
+
             # The goal is to scale reduced gradients by 1/dp_size.
             # This can be achieved in two ways:
             #
@@ -268,6 +278,12 @@ class DistributedDataParallel(_BaseDataParallel):
             #   1. Scale gradients by 1/dp_size before reduction
             #   2. Do sum reduction across data parallel ranks
             #   3. Final result is scaled by 1/dp_size as desired
+            #
+            #   GTP_remat correction (expert params only): dp_cp_group.size() is shrunk by
+            #   gtp_weight_remat_size. Dense params recover that via the later gtp_remat-AVG;
+            #   expert params instead go through the EGTP-remat-AVG (gtp_remat peers hold
+            #   different experts, so can't share that AVG), recovering only
+            #   expert_gtp_weight_remat_size of it -- the egtp/gtp ratio below makes up the rest.
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
@@ -275,12 +291,19 @@ class DistributedDataParallel(_BaseDataParallel):
                 data_parallel_world_size = self.dp_cp_group.size()
 
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
-                expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
+                expert_gradient_scaling_factor = (
+                    1.0 / data_parallel_world_size
+                ) * expert_gtp_correction
 
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []
-        pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
+        pg_collection = ProcessGroupCollection(
+            tp=self.tp_group,
+            dp_cp=self.dp_cp_group,
+            gtp_remat=self.gtp_remat_group,
+            expt_gtp_remat=self.expt_gtp_remat_group,
+        )
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
@@ -305,6 +328,11 @@ class DistributedDataParallel(_BaseDataParallel):
                             scaling_factor == (self.expt_dp_group.size() / self.dp_cp_group.size())
                         )
                 else:
+                    # Expert params carry the extra egtp/gtp correction folded into
+                    # expert_gradient_scaling_factor above (1.0 when GTP_remat is inactive,
+                    # matching non-expert params).
+                    if buffer_key.is_expert_parallel:
+                        target_gradient_scaling_factor *= expert_gtp_correction
                     assert scaling_factor == target_gradient_scaling_factor
 
             param_layout = (

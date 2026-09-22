@@ -67,10 +67,10 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_1node]
+  - test_case: [deepseek_proxy_mfsdp_v1_ep2_1node]
     products:
       - environment: [dev]
-        scope: [mr-github, mr-github-slim]
+        scope: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon_1node]
     products:
@@ -138,4 +138,13 @@ products:
     products:
       - environment: [dev]
         scope: [mr-github-temp-disabled]
+        platforms: [dgx_gb200]
+
+  #######################################################################
+  # MFSDP v2 + EP2 bf16, full-iteration CUDA graph incl. optimizer.step #
+  #######################################################################
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_bf16_cg_optim_1node]
+    products:
+      - environment: [dev]
+        scope: [mr]
         platforms: [dgx_gb200]

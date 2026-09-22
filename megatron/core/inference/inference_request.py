@@ -2,51 +2,83 @@
 
 import copy
 import hashlib
+import math
 import time
 import uuid
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import torch
 
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.inference.utils import detokenize_tokens
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 
 
-def serialize_tensor(tensor: torch.Tensor) -> List:
-    """Serialize tensor to bytes.
+def serialize_tensor(tensor: torch.Tensor) -> Dict[str, Any]:
+    """Serialize a tensor as contiguous binary data.
 
     Args:
         tensor (Tensor): Tensor.
 
     Returns:
-        (List) Tensor as a list
+        Dictionary containing dtype, shape, and raw bytes.
     """
-    nvtx_range_push("serialize_tensor")
-
-    # simply convert tensor into a list
-    tensor = tensor.cpu().tolist()
-
-    nvtx_range_pop("serialize_tensor")
-    return tensor
+    tensor_cpu = tensor.detach().contiguous().cpu()
+    tensor_bytes = tensor_cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
+    return {"dtype": str(tensor_cpu.dtype), "shape": list(tensor_cpu.shape), "data": tensor_bytes}
 
 
-def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
-    """Deserialize tensor from bytes.
+def deserialize_tensor(tensor_data: Any) -> torch.Tensor:
+    """Deserialize binary tensor data or the legacy nested-list representation.
 
     Args:
-        tensor_as_list (List): List representation of tensor.
+        tensor_data: Binary tensor dictionary or legacy nested list.
 
     Returns:
         (Tensor) Tensor.
     """
-    tensor = torch.tensor(tensor_as_list)
-    return tensor
+    if not isinstance(tensor_data, dict):
+        return torch.tensor(tensor_data)
+
+    required_fields = {"dtype", "shape", "data"}
+    if set(tensor_data) != required_fields:
+        raise ValueError(
+            "Serialized tensor must contain exactly dtype, shape, and data; "
+            f"got {sorted(tensor_data)}."
+        )
+    dtype_name = tensor_data["dtype"]
+    if not isinstance(dtype_name, str):
+        raise TypeError("Serialized tensor dtype must be a string.")
+    dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported serialized tensor dtype {dtype_name!r}.")
+
+    serialized_shape = tensor_data["shape"]
+    if not isinstance(serialized_shape, (list, tuple)):
+        raise TypeError("Serialized tensor shape must be a list or tuple of integers.")
+    if any(not isinstance(dim, int) or isinstance(dim, bool) for dim in serialized_shape):
+        raise TypeError("Serialized tensor shape must contain only integers.")
+    shape = tuple(serialized_shape)
+    if any(dim < 0 for dim in shape):
+        raise ValueError(f"Serialized tensor shape must be non-negative, got {shape}.")
+    raw_data = tensor_data["data"]
+    if not isinstance(raw_data, (bytes, bytearray)):
+        raise TypeError("Serialized tensor data must be bytes.")
+
+    expected_bytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if len(raw_data) != expected_bytes:
+        raise ValueError(
+            f"Serialized tensor has {len(raw_data)} bytes, expected {expected_bytes} "
+            f"for shape {shape} and dtype {dtype}."
+        )
+    if expected_bytes == 0:
+        return torch.empty(shape, dtype=dtype)
+    return torch.frombuffer(bytearray(raw_data), dtype=dtype).reshape(shape).clone()
 
 
 def _normalize_raw_media_items(modality_data: Any) -> Optional[List[bytes]]:
@@ -104,7 +136,8 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
                 digest.update(b"\0")
                 # Viewing a flattened tensor as uint8 works for dtypes such as
                 # bfloat16 that NumPy cannot represent directly.
-                digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+                tensor_bytes = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+                digest.update(tensor_bytes)
             elif name == "num_img_embeddings_per_tile":
                 digest.update(str(int(value)).encode())
             else:
@@ -116,6 +149,19 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
         return digest.hexdigest()
 
     raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
+
+
+@dataclass(frozen=True)
+class _PreparedMultimodalData:
+    """Multimodal wire data whose content identity has already been computed."""
+
+    serialized: Dict[str, Any]
+
+
+def prepare_multimodal_data(multi_modal_data: Any) -> Optional[_PreparedMultimodalData]:
+    """Serialize and hash media once for reuse across equivalent submissions."""
+    serialized = serialize_multimodal_data(multi_modal_data)
+    return _PreparedMultimodalData(serialized) if serialized is not None else None
 
 
 def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]:
@@ -130,13 +176,19 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     Video:
         ``"video"`` accepts raw video bytes, a list of raw video bytes, or a
         preprocessed tensor dictionary containing ``imgs``, ``imgs_sizes``,
-        and ``num_frames``.
+        and ``num_frames``. Preprocessed video dictionaries may also include
+        ``video_frame_indices`` and ``video_fps`` timing metadata.
     Audio:
         Audio does not yet have any supported data preprocessing or modeling
         formats.
     """
     if multi_modal_data is None:
         return None
+    if isinstance(multi_modal_data, _PreparedMultimodalData):
+        # If choices n > 1, reuse the serialized payload without re-hashing or
+        # converting tensors. Return an isolated structure so callers cannot
+        # mutate the prepared payload or its cache identity.
+        return copy.deepcopy(multi_modal_data.serialized)
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
@@ -185,12 +237,67 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             wire[key] = serialize_tensor(value)
         if "num_img_embeddings_per_tile" in modality_data:
             wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
+        if modality == "video":
+            for key in ("video_frame_indices", "video_fps"):
+                if key in modality_data:
+                    wire[key] = copy.deepcopy(modality_data[key])
         return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
     else:
         raise TypeError(
             f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
             f"preprocessed tensor dict; got {type(modality_data)}."
         )
+
+
+def split_multimodal_data(
+    serialized: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Any]:
+    """Split serialized media into a bounded descriptor and its payload.
+
+    The descriptor rides in the metadata frame, which the coordinator decodes and
+    repacks for every request; the payload rides in a body frame it forwards
+    untouched. Keeping them apart is what bounds that per-request cost: the
+    descriptor is a 64-character key plus two small flags, while the payload is
+    raw image or video bytes, or serialized preprocessed tensors.
+
+    Args:
+        serialized: The output of :func:`serialize_multimodal_data`, or None.
+
+    Returns:
+        ``(media_meta, payload)``, both None for a text-only request.
+    """
+    if serialized is None:
+        return None, None
+    modality = "video" if "video" in serialized else "image"
+    if modality not in serialized:
+        raise ValueError(f"Serialized multimodal data has no media payload: {sorted(serialized)}.")
+    media_meta = {key: value for key, value in serialized.items() if key != modality}
+    media_meta["modality"] = modality
+    return media_meta, serialized[modality]
+
+
+def merge_multimodal_data(
+    media_meta: Optional[Dict[str, Any]], payload: Any
+) -> Optional[Dict[str, Any]]:
+    """Rebuild serialized media from its descriptor and payload frames.
+
+    Inverse of :func:`split_multimodal_data`, returning the shape
+    :func:`resolve_multimodal_data_for_engine` consumes.
+
+    Args:
+        media_meta: The bounded descriptor from the metadata frame, or None.
+        payload: The media payload from its own body frame.
+
+    Returns:
+        The serialized multimodal dictionary, or None for a text-only request.
+    """
+    if media_meta is None:
+        return None
+    media_meta = dict(media_meta)
+    modality = media_meta.pop("modality", None)
+    if modality not in ("image", "video"):
+        raise ValueError(f"Media metadata carries an unsupported modality: {modality!r}.")
+    return {modality: payload, **media_meta}
 
 
 def resolve_multimodal_data_for_engine(
@@ -245,6 +352,11 @@ def resolve_multimodal_data_for_engine(
             f"got {type(media_tokens_preexpanded)}."
         )
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
+    media_cache_key = multi_modal_data.get("media_cache_key")
+    if media_cache_key is not None:
+        if not isinstance(media_cache_key, str) or not media_cache_key:
+            raise ValueError("Internal media_cache_key must be a non-empty string.")
+        metadata["media_cache_key"] = media_cache_key
     if isinstance(modality_data, list):
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
             image_preprocessing,
@@ -296,6 +408,10 @@ def resolve_multimodal_data_for_engine(
             kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
     if "num_img_embeddings_per_tile" in modality_data:
         kwargs["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
+    if modality == "video":
+        for key in ("video_frame_indices", "video_fps"):
+            if key in modality_data:
+                kwargs[key] = copy.deepcopy(modality_data[key])
 
     if modality == "image":
         # Reject incomplete static-tiling payloads. Static tiling (imgs +
@@ -331,16 +447,20 @@ def deserialize_ndarray(obj: dict) -> np.ndarray:
 
 
 def unwrap_serialized_tensors(serialized_request: dict) -> dict:
-    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+    """Unwrap serialized tensor tuples produced by serialize() into plain lists.
 
     Args:
         serialized_request (dict): A dict produced by `serialize()`.
 
     Returns:
-        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+        dict: A shallow copy with tensor wrapper tuples replaced by plain lists.
     """
     return {
-        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        k: (
+            deserialize_tensor(v[1]).tolist()
+            if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor"
+            else v
+        )
         for k, v in serialized_request.items()
     }
 
@@ -655,6 +775,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     compact_prompt_tokens: Optional[torch.Tensor] = None
+    # Opaque JSON/msgpack-compatible metadata owned by an external payload stager.
+    offload_params: Optional[Dict[str, Any]] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     policy_epoch: Optional[list[tuple[int, int]]] = None
@@ -671,11 +793,16 @@ class DynamicInferenceRequest(InferenceRequest):
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
-    num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
+    # Prompt tokens whose prefill was skipped via prefix caching; accumulated across chunks.
+    num_cached_tokens: int = 0
     # Length of the leading run of this request's blocks that was obtained by hash
     # match rather than computed. Accumulated across prefill chunks by the context,
     # which uses it to avoid rewriting KV into blocks that already hold it.
     num_matched_prefix_blocks: int = 0
+    # First block kept private after MTP declines a cached prefix block. Neither it nor
+    # its descendants may be registered or inherited by a later chunk: the request does
+    # not own the canonical ancestor. Persists across prefill chunks.
+    mtp_private_suffix_start: Optional[int] = None
     block_hash_salt: Optional[str] = None  # Media identity for multimodal KV safety.
 
     # Computed field - not passed by caller
@@ -686,6 +813,15 @@ class DynamicInferenceRequest(InferenceRequest):
     # Shape: {"request_id", "block_ids", "kv_meta"}.
     # Hybrid models may add kv_meta["ssm"] for recurrent state.
     disaggregated_params: Optional[dict] = None
+
+    # Wire-only keys. Nothing reads or sets these instance attributes: serialize() writes
+    # the wire keys from its own arguments (payload_offloaded=True after dropping the
+    # per-token payload and prompt tensors the RequestPayloadStager took custody of;
+    # payload_stage_metadata from the stager's response metadata) and the REST endpoints
+    # read them off the wire dict. The fields exist only so deserialize()'s cls(**obj)
+    # accepts a reply that carries them.
+    payload_offloaded: bool = False
+    payload_stage_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -723,6 +859,33 @@ class DynamicInferenceRequest(InferenceRequest):
     events: List[DynamicInferenceEvent] = field(default_factory=list)
     event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
     generated_tokens: List[int] = field(default_factory=list)
+    # Speculative decoding (e.g. MTP): tokens emitted for this request on each engine step --
+    # accepted drafts + 1 for a decode step, 1 for the prefill step. Sums to `generated_length`,
+    # so a client can reconstruct per-step acceptance lengths. Empty when spec decoding is off.
+    acceptance_step_lengths: List[int] = field(default_factory=list)
+
+    def finalize_text(self, tokenizer: Any) -> "DynamicInferenceRequest":
+        """Populate generated text by decoding the complete generated token stream.
+
+        Args:
+            tokenizer: Tokenizer used to decode ``generated_tokens``.
+
+        Returns:
+            This request, with ``generated_text`` populated.
+
+        Raises:
+            ValueError: If ``tokenizer`` is ``None``.
+        """
+        if tokenizer is None:
+            raise ValueError("tokenizer must not be None")
+        if self.generated_text is not None:
+            return self
+
+        detokenize_stop_sequence = getattr(self.sampling_params, "detokenize_stop_sequence", False)
+        self.generated_text = detokenize_tokens(
+            tokenizer, self.generated_tokens, remove_EOD=not detokenize_stop_sequence
+        )
+        return self
 
     def __str__(self):
         return ", ".join(
@@ -735,8 +898,18 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self):
+    def serialize(
+        self,
+        payload_offloaded: bool = False,
+        payload_stage_metadata: Optional[Dict[str, Any]] = None,
+    ):
         """Converts the instance into a serializable dictionary.
+
+        Args:
+            payload_offloaded (bool): Drop the per-token payload (log probs, MoE routing
+                indices) from the wire; the engine's RequestPayloadStager has custody of it.
+            payload_stage_metadata: Opaque metadata returned by the stager for the
+                REST endpoint to attach to its response.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
@@ -745,25 +918,10 @@ class DynamicInferenceRequest(InferenceRequest):
         nvtx_range_push("DynamicInferenceRequest.serialize")
 
         # The prompt length is always reported (needed for usage.prompt_tokens),
-        # but the prompt_tokens tensor is dropped from the wire payload unless the
-        # client asked for it back (return_prompt_tokens). This keeps the large
-        # prompt tensor off the engine->coordinator->API path. Null it around
-        # super() so the tensor is never serialized, then restore local state.
+        # but the prompt tensor views are dropped from the wire payload unless the
+        # client asked for them back (return_prompt_tokens). Null all prompt tensor
+        # views around super(), then restore the request's local state.
         prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
-        drop_prompt = (
-            self.prompt_tokens is not None
-            and self.sampling_params is not None
-            and not getattr(self.sampling_params, "return_prompt_tokens", False)
-        )
-        saved_prompt_tokens = None
-        if drop_prompt:
-            saved_prompt_tokens = self.prompt_tokens
-            self.prompt_tokens = None
-
-        obj = super().serialize()
-        obj["events"] = [e.serialize() for e in self.events]
-        obj.pop("event_add_engine", None)
-        obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
@@ -775,10 +933,44 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        if drop_prompt:
-            self.prompt_tokens = saved_prompt_tokens
+        # An offloaded reply never carries the prompt tensors: the stager already holds
+        # the prompt ids in OffloadedRequestPayload.prompt_token_ids, and for long
+        # conversations they dominate the reply size that offload exists to remove.
+        # Otherwise they are opt-in via SamplingParams.return_prompt_tokens (and dropped
+        # when sampling_params is None).
+        should_drop_prompt_tokens = payload_offloaded or not getattr(
+            self.sampling_params, "return_prompt_tokens", False
+        )
+        dropped_fields = {}
+        if should_drop_prompt_tokens:
+            for field_name in ("prompt_tokens", "compact_prompt_tokens", "remaining_prompt_tokens"):
+                if getattr(self, field_name) is not None:
+                    dropped_fields[field_name] = getattr(self, field_name)
+        if payload_offloaded:
+            dropped_fields["generated_log_probs"] = self.generated_log_probs
+            dropped_fields["prompt_log_probs"] = self.prompt_log_probs
+            dropped_fields["routing_indices"] = self.routing_indices
 
-        nvtx_range_pop("DynamicInferenceRequest.serialize")
+        # Dropped fields are nulled only for the duration of super().serialize();
+        # this mutate-and-restore makes serialize() non-reentrant on one request object.
+        try:
+            for field_name in dropped_fields:
+                setattr(self, field_name, None)
+            obj = super().serialize()
+        finally:
+            for field_name, value in dropped_fields.items():
+                setattr(self, field_name, value)
+            nvtx_range_pop("DynamicInferenceRequest.serialize")
+
+        obj["events"] = [e.serialize() for e in self.events]
+        obj.pop("event_add_engine", None)
+        # Request metadata is input-only. Only the stager's response metadata
+        # crosses back to the REST endpoint.
+        obj.pop("offload_params", None)
+        obj["prompt_length"] = prompt_len
+        obj["payload_offloaded"] = payload_offloaded
+        obj["payload_stage_metadata"] = dict(payload_stage_metadata or {})
+
         return obj
 
     def _post_deserialize(self, obj):
@@ -912,8 +1104,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
 @dataclass(kw_only=True)
 class DynamicInferenceRequestRecord:
-    """History of DynamicInferenceRequest objects over multiple request
-    checkpoints."""
+    """Internal engine history across request checkpoints."""
 
     requests: list[DynamicInferenceRequest] = field(default_factory=list)
     latency: Optional[float] = None
@@ -952,18 +1143,20 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
-    def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
+    def checkpoint(self) -> None:
         """Maintain reference to previous request, and then append a new request
-        that concatenates the previous prompt and generations.
-
-        Args:
-            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
-        """
+        that concatenates the previous prompt and generations."""
 
         old_request = self[-1]
 
-        # Carry forward policy_epoch as-is.
-        policy_epoch = old_request.policy_epoch
+        # Engine-created epoch entries are immutable (token index, epoch) tuples, and
+        # the engine only appends to the outer list, so list.copy() provides isolation
+        # without the recursive cost of deepcopy. MessagePack can deserialize tuples
+        # as mutable lists, which would require a deep copy if entries were mutated in
+        # place, but current engine paths never perform such mutations.
+        policy_epoch = (
+            old_request.policy_epoch.copy() if old_request.policy_epoch is not None else None
+        )
 
         # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
         # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
@@ -982,26 +1175,21 @@ class DynamicInferenceRequestRecord:
             dim=0,
         )
 
-        # New sampling params.
-        new_sampling_params = SamplingParams(
-            **{
-                **asdict(old_request.sampling_params),
-                "num_tokens_to_generate": (
-                    old_request.sampling_params.num_tokens_to_generate
-                    - len(old_request.generated_tokens)
-                ),
-            }
-        )
-
         # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
         # expanded prompt. The previous hash list may not include newly completed blocks.
+        # DynamicInferenceRequest.__post_init__ deep-copies sampling_params, including
+        # dynamically added fields, so the new request owns the copy adjusted below.
         common_kwargs = dict(
             request_id=old_request.request_id,
+            uid=old_request.uid,
             prompt_tokens=new_prompt_tokens,
             compact_prompt_tokens=old_request.compact_prompt_tokens,
-            sampling_params=new_sampling_params,
+            sampling_params=old_request.sampling_params,
+            offload_params=old_request.offload_params,
+            status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            stop_word_ids=copy.deepcopy(old_request.stop_word_ids),
             block_size_tokens=old_request.block_size_tokens,
             enable_prefix_caching=old_request.enable_prefix_caching,
             block_hash_salt=old_request.block_hash_salt,
@@ -1018,35 +1206,54 @@ class DynamicInferenceRequestRecord:
                 imgs_sizes=old_request.imgs_sizes,
                 num_frames=old_request.num_frames,
                 media_tokens_preexpanded=old_request.media_tokens_preexpanded,
+                media_cache_key=old_request.media_cache_key,
                 decoder_seq_length=old_request.decoder_seq_length,
                 image_embeddings=old_request.image_embeddings,
                 image_token_mask=old_request.image_token_mask,
             )
         else:
             new_request = DynamicInferenceRequest(**common_kwargs)
+        if old_request.sampling_params.num_tokens_to_generate is not None:
+            new_request.sampling_params.num_tokens_to_generate = (
+                old_request.sampling_params.num_tokens_to_generate
+                - len(old_request.generated_tokens)
+            )
+        # num_tokens_total is converted to a generation budget on first
+        # admission and must not be applied again to the expanded prompt.
+        new_request.sampling_params.num_tokens_total = None
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
         if old_request.event_add_engine is not None:
             new_request.event_add_engine = old_request.event_add_engine
         else:
             new_request.add_event_add_engine()
+
+        # The first segment supplies the original prompt to merge(), and the
+        # newest segment must remain on the active device for re-admission. A
+        # superseded intermediate segment only serves as history, so keeping
+        # its cumulative prompt on CUDA causes repeated checkpoints to retain
+        # overlapping, steadily growing GPU allocations.
+        if len(self.requests) > 1:
+            old_prompt_tokens = old_request.prompt_tokens
+            old_request.prompt_tokens = old_prompt_tokens.cpu()
+            if old_request.remaining_prompt_tokens is old_prompt_tokens:
+                old_request.remaining_prompt_tokens = old_request.prompt_tokens
+            elif old_request.remaining_prompt_tokens is not None:
+                old_request.remaining_prompt_tokens = old_request.remaining_prompt_tokens.cpu()
         self.requests.append(new_request)
 
-    def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
+    def merge(self) -> DynamicInferenceRequest:
         """Merge requests into a single checkpoint-agnostic request object.
-
-        Args:
-            tokenizer (MegatronTokenizer | None): (Deprecated) Tokenizer.
 
         Returns:
             (DynamicInferenceRequest) Merged request.
         """
 
         def merge_lists(key):
-            if getattr(self.requests[0], key) is None:
+            values = [getattr(request, key) for request in self.requests]
+            if all(value is None for value in values):
                 return None
-            else:
-                return [v for r in self.requests for v in getattr(r, key)]
+            return [item for value in values if value is not None for item in value]
 
         first_request = self.requests[0]
         prompt_tokens = first_request.prompt_tokens
@@ -1056,13 +1263,19 @@ class DynamicInferenceRequestRecord:
         if routing_parts:
             routing_indices = np.concatenate(routing_parts)
         generated_tokens = merge_lists("generated_tokens")
-        try:
-            generated_text = "".join(r.generated_text for r in self.requests)
-        except TypeError as e:  # generally means r.generated_text is None
-            generated_text = None
 
-        policy_epoch = self.requests[-1].policy_epoch
-        kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        # Detach the merged result's outer epoch lists under the engine's append-only
+        # mutation pattern described in checkpoint().
+        latest_request = self.requests[-1]
+        policy_epoch = (
+            latest_request.policy_epoch.copy() if latest_request.policy_epoch is not None else None
+        )
+        kv_cache_epoch = (
+            latest_request.kv_cache_epoch.copy()
+            if latest_request.kv_cache_epoch is not None
+            else None
+        )
+        ttft = next((request.ttft for request in self.requests if request.ttft is not None), None)
         # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
 
@@ -1073,17 +1286,19 @@ class DynamicInferenceRequestRecord:
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             compact_prompt_tokens=first_request.compact_prompt_tokens,
+            offload_params=first_request.offload_params,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
-            generated_text=generated_text,
+            generated_text=None,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
+            acceptance_step_lengths=merge_lists("acceptance_step_lengths"),
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
-            ttft=self.requests[0].ttft,
+            ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
@@ -1097,33 +1312,6 @@ class DynamicInferenceRequestRecord:
             disaggregated_params=disaggregated_params,
         )
 
-        return request
-
-    def serialize(self) -> dict:
-        """Converts the instance into a serializable dictionary.
-
-        Returns:
-            (dict) A dictionary representation of the instance suitable for
-                serialization.
-        """
-        nvtx_range_push("DynamicInferenceRequestRecord.serialize")
-        obj = self.__dict__.copy()  # shallow dict copy
-        obj["requests"] = [r.serialize() for r in obj["requests"]]
-        nvtx_range_pop("DynamicInferenceRequestRecord.serialize")
-        return obj
-
-    @classmethod
-    def deserialize(cls, obj: dict) -> "DynamicInferenceRequestRecord":
-        """Deserialize record.
-
-        Args:
-            obj (dict): Serialized record data.
-
-        Returns:
-            (DynamicInferenceRequestRecord) Deserialized record.
-        """
-        request = cls(**obj)
-        request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
         return request
 
 
@@ -1155,6 +1343,100 @@ class FinishedRequestRecord:
         return record
 
 
+@dataclass
+class OffloadedRequestPayload:
+    """A finished request's per-token payload, kept off the RESTful reply by payload offload.
+
+    Self-contained: a consumer can rebuild the served sequence from it alone,
+    keyed by the request uid (the OpenAI response id).
+    """
+
+    prompt_token_ids: Optional[list[int]]
+    generated_token_ids: list[int]
+    generated_log_probs: Optional[list[float]]
+    prompt_log_probs: Optional[list[float]]
+    routing_indices: Optional[np.ndarray]
+
+    @classmethod
+    def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
+        """Copy the payload off a finished (merged) request as plain host-side values.
+
+        Side effect: replaces ``request.prompt_tokens`` with its host copy when it is a
+        tensor, so one device-to-host copy serves both this payload and every later
+        host-side read of the finished request (its reply and the caller's result).
+        """
+
+        def to_plain_list(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.cpu().tolist()
+            return list(value)
+
+        if isinstance(request.prompt_tokens, torch.Tensor):
+            # One device-to-host copy serves both the payload and the wire reply.
+            request.prompt_tokens = request.prompt_tokens.cpu()
+        return cls(
+            prompt_token_ids=to_plain_list(request.prompt_tokens),
+            generated_token_ids=list(request.generated_tokens),
+            generated_log_probs=to_plain_list(request.generated_log_probs),
+            prompt_log_probs=to_plain_list(request.prompt_log_probs),
+            routing_indices=request.routing_indices,
+        )
+
+
+@dataclass(frozen=True)
+class RequestPayloadStageResult:
+    """A custody acknowledgement and opaque metadata for the served response."""
+
+    response_metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class RequestPayloadStager(Protocol):
+    """Protocol to handle offloading of request payloads to a storage backend."""
+
+    def stage(
+        self,
+        uid: str,
+        payload: OffloadedRequestPayload,
+        *,
+        finished_metadata: FinishedRequestRecord,
+        offload_params: Optional[Dict[str, Any]] = None,
+    ) -> Optional[RequestPayloadStageResult]:
+        """Stage a payload, or return ``None`` to keep it on the normal reply path."""
+        ...
+
+
+# Request-metadata keys written by the chat endpoint when it defers the prompt
+# prefix replacement to a RequestPromptPreparer: the chat-template render of the
+# conversation through its last assistant message, and the EOS token id. The
+# consumer is out-of-tree (NeMo RL's ``TQMegatronPromptPreparer``), which passes
+# them straight to its ``replace_prefix_tokens``; the names mirror its arguments.
+PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
+PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
+
+
+@dataclass(frozen=True)
+class RequestPromptPreparationResult:
+    """The resolved engine prompt and opaque parameters that describe it."""
+
+    prompt: Union[str, List[int], torch.Tensor]
+    offload_params: Optional[Dict[str, Any]] = None
+
+
+class RequestPromptPreparer(Protocol):
+    """Protocol for resolving an exact prompt before engine admission."""
+
+    def prepare_prompt(
+        self,
+        prompt: Union[str, List[int], torch.Tensor],
+        *,
+        offload_params: Optional[Dict[str, Any]] = None,
+    ) -> RequestPromptPreparationResult:
+        """Return the engine prompt and metadata that describe that prompt."""
+        ...
+
+
 @dataclass(kw_only=True)
 class VLMInferenceRequest(InferenceRequest):
     """Class for a VLM inference request"""
@@ -1178,4 +1460,7 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     image_token_mask: Optional[torch.Tensor] = None  # 1D, -1=text, >=0=image index
     imgs_sizes: Optional[torch.Tensor] = None
     num_frames: Optional[torch.Tensor] = None
+    video_frame_indices: Optional[List[List[int]]] = None
+    video_fps: Optional[List[float]] = None
     media_tokens_preexpanded: bool = False
+    media_cache_key: Optional[str] = None

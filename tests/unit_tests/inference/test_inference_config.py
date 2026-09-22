@@ -29,6 +29,18 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize("backend", list(InferenceGroupedGemmBackend))
+    def test_grouped_gemm_backend_parses_config_value(self, backend):
+        assert InferenceGroupedGemmBackend.from_config(backend.value) is backend
+        assert InferenceGroupedGemmBackend.from_config(backend) is backend
+
+    def test_grouped_gemm_backend_reports_supported_config_values(self):
+        with pytest.raises(
+            ValueError,
+            match="inference_grouped_gemm_backend must be one of.*'flashinfer'.*'torch'.*'vllm'",
+        ):
+            InferenceGroupedGemmBackend.from_config("unknown")
+
     @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),
         [
@@ -36,15 +48,16 @@ class TestInferenceConfig:
             (InferenceGroupedGemmBackend.TORCH, "triton"),
             ("flashinfer", "triton"),
             (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
+            ("vllm", "triton"),
+            (InferenceGroupedGemmBackend.VLLM, "triton"),
         ],
     )
     def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
         assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
 
-    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
-    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
-            resolve_mxfp8_backend(grouped_gemm_backend)
+            resolve_mxfp8_backend("unknown")
 
     @staticmethod
     def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):
@@ -101,6 +114,20 @@ class TestInferenceConfig:
         with pytest.raises(ValueError):
             InferenceConfig(async_sched_mode=invalid_mode)
 
+    def test_routing_alpha_accepts_values_above_one(self):
+        """Alpha is a load coefficient, not a blend weight, so 1 is not a ceiling.
+
+        The routing tests reach the scorer through a hand-built coordinator, so
+        they never exercise this validation; a value they rely on would have been
+        rejected on the real config path.
+        """
+        assert InferenceConfig(prefix_caching_routing_alpha=5.0).prefix_caching_routing_alpha == 5.0
+
+    def test_routing_alpha_must_be_non_negative(self):
+        """A negative alpha would reward load instead of penalising it."""
+        with pytest.raises(ValueError, match="prefix_caching_routing_alpha"):
+            InferenceConfig(prefix_caching_routing_alpha=-0.1)
+
     def test_media_cache_routing_weight_must_be_non_negative(self):
         with pytest.raises(ValueError, match="media_cache_routing_weight"):
             InferenceConfig(media_cache_routing_weight=-1.0)
@@ -114,14 +141,65 @@ class TestInferenceConfig:
         config = MultimodalPromptConfig.from_dict(
             {
                 "image_spec": {"model_token": "<image>", "prefix": "<img>"},
-                "video_spec": {"model_token": "<video>", "suffix": "</video>"},
+                "video_spec": {
+                    "model_token": "<video>",
+                    "suffix": "</video>",
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                },
             }
         )
 
         assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
-        assert config.get_spec("video") == MediaPromptSpec(model_token="<video>", suffix="</video>")
+        assert config.get_spec("video") == MediaPromptSpec(
+            model_token="<video>",
+            suffix="</video>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
         with pytest.raises(ValueError, match="Unsupported media modality"):
             config.get_spec("audio")
+
+    def test_multimodal_prompt_config_partial_override_preserves_wrapper_defaults(self):
+        defaults = MultimodalPromptConfig(
+            video_spec=MediaPromptSpec(model_token="<image>", prefix="<img>", suffix="</img>")
+        )
+
+        config = MultimodalPromptConfig.from_dict(
+            {
+                "video_spec": {
+                    "expansion_mode": "temporal_patch",
+                    "include_frame_timestamps_for_nemotron_vl": True,
+                }
+            },
+            defaults=defaults,
+        )
+
+        assert config.video_spec == MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+
+    def test_media_prompt_timestamps_require_temporal_expansion(self):
+        with pytest.raises(ValueError, match="requires"):
+            MediaPromptSpec(include_frame_timestamps_for_nemotron_vl=True)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "error"),
+        [
+            ({"dynamic_resolution_rounding_mode": "floor"}, "rounding_mode"),
+            ({"dynamic_resolution_resize_mode": "nearest"}, "resize_mode"),
+            ({"dynamic_resolution_model_length": 4}, "greater than 4"),
+        ],
+    )
+    def test_image_processing_config_rejects_invalid_dynamic_resolution_options(
+        self, kwargs, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            ImageProcessingConfig(patch_dim=14, **kwargs)
 
     def test_video_processing_config_preserves_image_contract_and_defaults(self):
         image_config = ImageProcessingConfig(
