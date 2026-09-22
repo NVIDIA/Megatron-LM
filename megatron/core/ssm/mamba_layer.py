@@ -26,6 +26,11 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.residual_recompute import (
+    ResidualStreamRecomputeContext,
+    checkpoint_residual_read,
+    checkpoint_residual_write,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -215,6 +220,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
@@ -235,6 +241,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
                 packed-sequence metadata for chunkwise CP.
+            residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
+                Call-local ordered replay state for a configured residual connection.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -250,18 +258,33 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
             residual_connection = self._get_residual_connection()
+            recompute_context = (
+                residual_stream_recompute_context if residual_connection is not None else None
+            )
             connection_state = None
             if residual_connection is not None:
-                hidden_states, connection_state = apply_module(residual_connection)(
-                    hidden_states,
-                    operation="read",
-                    fp32_residual_connection=self.config.fp32_residual_connection,
-                    branch_input_dtype=self.config.params_dtype,
-                )
+                if recompute_context is None:
+                    hidden_states, connection_state = apply_module(residual_connection)(
+                        hidden_states,
+                        operation="read",
+                        fp32_residual_connection=self.config.fp32_residual_connection,
+                        branch_input_dtype=self.config.params_dtype,
+                    )
+                else:
+                    hidden_states, connection_state = checkpoint_residual_read(
+                        residual_connection,
+                        hidden_states,
+                        recompute_context,
+                        fp32_residual_connection=self.config.fp32_residual_connection,
+                    )
             else:
                 residual = self._prepare_residual(hidden_states)
 
-            hidden_states = self._prepare_mixer_input(hidden_states)
+            if recompute_context is not None and not isinstance(self.norm, IdentityOp):
+                hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+                hidden_states = recompute_context.checkpoint(apply_module(self.norm), hidden_states)
+            else:
+                hidden_states = self._prepare_mixer_input(hidden_states)
 
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
@@ -284,14 +307,24 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             if residual_connection is not None:
                 if connection_state is None:
                     raise RuntimeError("Missing state for the Mamba residual connection.")
-                with self.bias_dropout_add_exec_handler():
-                    hidden_states = apply_module(residual_connection)(
+                if recompute_context is not None and not recompute_context.is_block_end:
+                    hidden_states = checkpoint_residual_write(
+                        residual_connection,
                         mixer_out_with_bias,
-                        operation="write",
-                        state=connection_state,
+                        connection_state,
+                        recompute_context,
                         dropout_probability=self.hidden_dropout,
                         training=self.training,
                     )
+                else:
+                    with self.bias_dropout_add_exec_handler():
+                        hidden_states = apply_module(residual_connection)(
+                            mixer_out_with_bias,
+                            operation="write",
+                            state=connection_state,
+                            dropout_probability=self.hidden_dropout,
+                            training=self.training,
+                        )
             else:
                 hidden_states = self._apply_mixer_bda(mixer_out_with_bias, residual)
 
