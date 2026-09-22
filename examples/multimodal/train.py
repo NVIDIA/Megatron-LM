@@ -328,7 +328,7 @@ def llava_position_embedding_ranks(pp_ranks):
         return [pp_ranks[0]]
 
 
-def run_online_eval(model):
+def run_online_eval(model, *, random_seed: int):
     """Run an evaluation benchmark during training."""
     args = get_args()
 
@@ -350,7 +350,13 @@ def run_online_eval(model):
     os.makedirs(output_dir, exist_ok=True)
     
     # Use the common evaluation loop
-    scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
+    scores = run_evaluation_loop(
+        model[0].module,
+        configs,
+        output_dir_override=output_dir,
+        print_output=False,
+        random_seed=random_seed,
+    )
 
     return [scores]
 
@@ -391,15 +397,15 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, rng_config=full_config.rng)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         train_valid_test_dataloaders_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        model_provider,
+        partial(model_provider, rng_config=full_config.rng),
         process_non_loss_data_func=write_online_eval_to_tensorboard,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
-        non_loss_data_func=run_online_eval,
+        non_loss_data_func=partial(run_online_eval, random_seed=full_config.rng.seed),
     )

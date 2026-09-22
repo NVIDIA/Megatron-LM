@@ -3,6 +3,7 @@
 """Unit tests for model_provider integration with ModelOpt model_builder."""
 
 from argparse import Namespace
+from megatron.training.config.common_config import RNGConfig
 
 import model_provider as mp
 
@@ -10,7 +11,9 @@ import model_provider as mp
 def _sentinel_builder(return_value, calls):
     """Create a builder stub that records invocation."""
 
-    def _builder(args, pre_process, post_process, vp_stage, config=None, pg_collection=None):
+    def _builder(
+        args, pre_process, post_process, vp_stage, config=None, pg_collection=None, *, random_seed
+    ):
         calls.append(
             {
                 "args": args,
@@ -19,6 +22,7 @@ def _sentinel_builder(return_value, calls):
                 "vp_stage": vp_stage,
                 "config": config,
                 "pg_collection": pg_collection,
+                "random_seed": random_seed,
             }
         )
         return return_value
@@ -52,6 +56,7 @@ def test_model_provider_switches_to_modelopt_builder(monkeypatch):
         vp_stage=1,
         config="cfg",
         pg_collection="pg",
+        rng_config=RNGConfig(seed=987),
     )
 
     assert returned is modelopt_result
@@ -63,6 +68,7 @@ def test_model_provider_switches_to_modelopt_builder(monkeypatch):
             "vp_stage": 1,
             "config": "cfg",
             "pg_collection": "pg",
+            "random_seed": 987,
         }
     ]
     assert len(original_calls) == 0

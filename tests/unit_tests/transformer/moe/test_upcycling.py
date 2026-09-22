@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+from megatron.training.argument_utils import rng_config_from_args
 import os
 import sys
 
@@ -196,6 +197,7 @@ class TestGPTModel:
             model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
+            rng_config=rng_config_from_args(args),
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -224,9 +226,7 @@ class TestGPTModel:
         builder_cls = model_cfg.get_builder_cls()
         builder = builder_cls(model_cfg)
         moe_model = builder.build_distributed_models(
-            pg_collection=pg_collection,
-            ddp_config=cfg_container.ddp,
-            data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
+            pg_collection=pg_collection, ddp_config=cfg_container.ddp, rng_config=cfg_container.rng
         )
 
         # Upcycle the dense model to the MoE model
@@ -266,7 +266,7 @@ class TestGPTModel:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, model_provider
+            ModelType.encoder_or_decoder, model_provider, rng_config=rng_config_from_args(args)
         )
         dense_model = unwrap_model(dense_model)
         set_bias_value(dense_model)
@@ -276,7 +276,11 @@ class TestGPTModel:
             tensor_model_parallel_size=tp, expert_model_parallel_size=ep
         )
         set_upcycling_args(ep, granularity, num_experts=2)
-        moe_model = unwrap_model(get_model(model_provider, ModelType.encoder_or_decoder))
+        moe_model = unwrap_model(
+            get_model(
+                model_provider, ModelType.encoder_or_decoder, rng_config=rng_config_from_args(args)
+            )
+        )
 
         # Emulate multiple model chunks by repeating the single chunk; this drives the
         # ``len(moe_model) > 1`` branch, which previously crashed with an ``AttributeError``
@@ -339,6 +343,7 @@ class TestGPTModel:
             model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
+            rng_config=rng_config_from_args(args),
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -367,9 +372,7 @@ class TestGPTModel:
         builder_cls = model_cfg.get_builder_cls()
         builder = builder_cls(model_cfg)
         moe_model = builder.build_distributed_models(
-            pg_collection=pg_collection,
-            ddp_config=cfg_container.ddp,
-            data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
+            pg_collection=pg_collection, ddp_config=cfg_container.ddp, rng_config=cfg_container.rng
         )
 
         # Upcycle the dense model to the MoE model

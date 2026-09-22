@@ -82,7 +82,7 @@ def test_dynamic_radio_loader_emits_patchified_cpu_metadata(adapter):
     args.img_w = 224
     args.num_image_tiles = 3
     loader = adapter.build_train_valid_test_data_loaders(
-        args, _topology(encoder_rank=True, language_rank=False)
+        args, _topology(encoder_rank=True, language_rank=False), random_seed=123
     )[0]
 
     inputs = next(iter(loader))["modality_inputs"][RADIO_ENCODER_MODULE_NAME][
@@ -107,7 +107,7 @@ def test_dynamic_radio_loader_emits_patchified_cpu_metadata(adapter):
 
 def test_data_adapter_builds_independent_role_specific_loaders(adapter):
     language_loaders = adapter.build_train_valid_test_data_loaders(
-        _args(), _topology(language_rank=True)
+        _args(), _topology(language_rank=True), random_seed=123
     )
     assert all(loader.batch_size == 2 for loader in language_loaders)
     assert all(loader.pin_memory for loader in language_loaders)
@@ -118,7 +118,7 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
     assert language_batch["modality_inputs"] == {}
 
     encoder_loaders = adapter.build_train_valid_test_data_loaders(
-        _args(), _topology(encoder_rank=True, language_rank=False)
+        _args(), _topology(encoder_rank=True, language_rank=False), random_seed=123
     )
     assert all(loader.batch_size == 4 for loader in encoder_loaders)
     assert all(loader.pin_memory for loader in encoder_loaders)
@@ -145,7 +145,7 @@ def test_cp_replicas_share_batches_without_merging_data_lanes(adapter, cp_size, 
             pg.dp_cp_gtp_remat = _group(
                 rank=lane * cp_size + cp_rank, size=args.mimo_llm_dp * gtp_size * cp_size
             )
-            loaders = adapter.build_train_valid_test_data_loaders(args, topology)
+            loaders = adapter.build_train_valid_test_data_loaders(args, topology, random_seed=123)
             assert all(loader.batch_size == args.micro_batch_size for loader in loaders)
             replicas.append(loaders)
         lane_seeds.append(replicas[0][0].dataset.seed)

@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.training import checkpointing
+from megatron.training.argument_utils import rng_config_from_args
 from copy import deepcopy
 from unittest import mock
 
@@ -116,7 +118,9 @@ def initialize_real_model(
 def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
         with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-            return load_checkpoint(*args, **kwargs)
+            return load_checkpoint(
+                *args, **kwargs, rng_config=rng_config_from_args(checkpointing.get_args())
+            )
 
 
 class TestLayerWiseOptimizer:

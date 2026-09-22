@@ -17,6 +17,7 @@ from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from examples.mimo.training.grad_sync import configure_grad_sync
+from megatron.training.config.common_config import RNGConfig
 from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -575,9 +576,23 @@ def get_mimo_model(
         vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
 
     if is_rank_in_grid(encoder_grid):
-        configure_module_rng(SimpleNamespace(seed=123), vision_pg, 10_000)
+        configure_module_rng(
+            RNGConfig(seed=123),
+            vision_pg,
+            10_000,
+            transformer_impl="local",
+            cuda_graph_impl="none",
+            rank=0,
+        )
     if is_rank_in_grid(llm_grid):
-        configure_module_rng(SimpleNamespace(seed=123), language_pg, 0)
+        configure_module_rng(
+            RNGConfig(seed=123),
+            language_pg,
+            0,
+            transformer_impl="local",
+            cuda_graph_impl="none",
+            rank=0,
+        )
 
     language_model_spec = get_language_model_spec(
         num_layers=num_layers,

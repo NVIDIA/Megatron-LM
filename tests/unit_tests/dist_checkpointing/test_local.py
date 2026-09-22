@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from megatron.training.argument_utils import rng_config_from_args
 import filecmp
 import logging
 import shutil
@@ -199,11 +200,16 @@ class TestLocalCheckpointing:
                 num_floating_point_operations_so_far,
                 checkpointing_context=checkpointing_context,
                 non_persistent_ckpt=True,
+                rng_config=rng_config_from_args(mock_args),
             )
             if async_save:
                 maybe_finalize_async_save(True)
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                rng_config=rng_config_from_args(mock_args),
             )
             assert iteration == 1
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(iteration)
@@ -213,14 +219,22 @@ class TestLocalCheckpointing:
             backup_path = ckpt_path.with_name('backup_' + ckpt_path.name)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                rng_config=rng_config_from_args(mock_args),
             )
             assert iteration == 1
             shutil.move(ckpt_path, backup_path)
             checkpointing_context['local_checkpoint_manager'].latest_iteration = -1
             torch.distributed.barrier()
             iteration, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                rng_config=rng_config_from_args(mock_args),
             )
             assert iteration == 0
             save_checkpoint(
@@ -231,6 +245,7 @@ class TestLocalCheckpointing:
                 num_floating_point_operations_so_far,
                 checkpointing_context=checkpointing_context,
                 non_persistent_ckpt=True,
+                rng_config=rng_config_from_args(mock_args),
             )
             if async_save:
                 maybe_finalize_async_save(True)
@@ -244,6 +259,7 @@ class TestLocalCheckpointing:
                 num_floating_point_operations_so_far,
                 checkpointing_context=checkpointing_context,
                 non_persistent_ckpt=True,
+                rng_config=rng_config_from_args(mock_args),
             )
             if async_save:
                 maybe_finalize_async_save(True)
@@ -307,6 +323,7 @@ class TestLocalCheckpointing:
                         num_floating_point_operations_so_far,
                         checkpointing_context=checkpointing_context,
                         non_persistent_ckpt=True,
+                        rng_config=rng_config_from_args(mock_args),
                     )
                     if async_save:
                         maybe_finalize_async_save(True)
@@ -315,6 +332,7 @@ class TestLocalCheckpointing:
                     optimizer,
                     opt_param_scheduler,
                     checkpointing_context=checkpointing_context,
+                    rng_config=rng_config_from_args(mock_args),
                 )
                 assert iteration == 0
                 assert not any((local_ckpt_dir / str(Utils.rank)).iterdir())

@@ -104,8 +104,10 @@ def main():
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     args = get_args()
 
@@ -114,7 +116,7 @@ def main():
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)
-    model = get_model_for_inference()
+    model = get_model_for_inference(rng_config=rng_config)
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     try:

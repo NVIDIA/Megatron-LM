@@ -30,10 +30,13 @@ class _EncoderFloat16Module(Float16Module):
 
 
 def configure_module_rng(
-    args: argparse.Namespace,
+    rng_config,
     pg_collection: ProcessGroupCollection,
     role_seed_offset: int,
-    data_parallel_random_init: bool = False,
+    *,
+    transformer_impl: str,
+    cuda_graph_impl: str,
+    rank: int,
 ) -> None:
     """Seed one active module role through the stock explicit-process-group path.
 
@@ -45,12 +48,15 @@ def configure_module_rng(
         assert (
             getattr(pg_collection, _required, None) is not None
         ), f"pg_collection passed to configure_module_rng must define {_required}"
+    rng_config.resolve_cuda_graphs(
+        transformer_impl=transformer_impl, cuda_graph_impl=cuda_graph_impl, rank=rank
+    )
     _set_random_seed(
-        args.seed + role_seed_offset,
-        data_parallel_random_init,
-        te_rng_tracker=getattr(args, "te_rng_tracker", False),
-        inference_rng_tracker=getattr(args, "inference_rng_tracker", False),
-        use_cudagraphable_rng=getattr(args, "cuda_graph_impl", "none") != "none",
+        rng_config.seed + role_seed_offset,
+        rng_config.data_parallel_random_init,
+        te_rng_tracker=rng_config.te_rng_tracker,
+        inference_rng_tracker=rng_config.inference_rng_tracker,
+        use_cudagraphable_rng=cuda_graph_impl != "none",
         pp_group=pg_collection.pp,
         dp_group=pg_collection.dp,
         tp_group=pg_collection.tp,

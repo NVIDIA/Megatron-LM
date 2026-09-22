@@ -58,7 +58,7 @@ from megatron.core.utils import (
     resolve_gtp_pad_for_alignment,
     unwrap_model,
 )
-from megatron.training.argument_utils import _default_config_from_args
+from megatron.training.argument_utils import _default_config_from_args, rng_args_snapshot
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
 
@@ -192,10 +192,10 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
-def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
+def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None, *, rng_config):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
-    args = get_args()
+    args = rng_args_snapshot(get_args(), rng_config)
     skip_args = skip_args or set()
 
     def _compare(arg_name, old_arg_name=None, default=None):
@@ -229,7 +229,7 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
         if not args.use_dist_ckpt:
             _compare('padded_vocab_size')
         _compare('tokenizer_type')
-    if args.data_parallel_random_init:
+    if rng_config.data_parallel_random_init:
         _compare('data_parallel_random_init')
     if args.phase_transition_iterations:
         _compare('global_batch_size')
@@ -474,6 +474,8 @@ def get_rng_state(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     key_prefix: str = '',
+    *,
+    data_parallel_random_init,
 ) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks.
 
@@ -481,7 +483,6 @@ def get_rng_state(
     dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
-    args = get_args()
     rng_state = {
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
@@ -494,7 +495,7 @@ def get_rng_state(
         get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
     )
     rng_state_list = None
-    if args.data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
+    if data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
         rng_state_list = [None for i in range(dp_world_size)]
         torch.distributed.all_gather_object(
             rng_state_list,
@@ -651,6 +652,8 @@ def save_checkpoint(
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    rng_config,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -738,6 +741,7 @@ def save_checkpoint(
         dp_cp_group=dp_cp_group,
         dp_group=dp_group,
         key_prefix=rng_state_key_prefix,
+        data_parallel_random_init=rng_config.data_parallel_random_init,
     )
 
     # Collect rerun state across all ranks
@@ -830,7 +834,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                args,
+                rng_args_snapshot(args, rng_config),
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -2571,6 +2575,8 @@ def load_checkpoint(
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
+    *,
+    rng_config,
 ):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -2701,6 +2707,7 @@ def load_checkpoint(
                 dp_cp_group=dp_cp_group,
                 dp_group=dp_group,
                 key_prefix=rng_state_key_prefix,
+                data_parallel_random_init=rng_config.data_parallel_random_init,
             )  # we can load the rng state
         else:
             ignore_rng_state = True
@@ -2829,7 +2836,7 @@ def load_checkpoint(
                 for m in model:
                     stack.enter_context(m.hide_loss_modules())
             load_kwargs['sharded_state_dict'] = generate_state_dict(
-                args,
+                rng_args_snapshot(args, rng_config),
                 model,
                 gen_sd_optim,
                 gen_sd_opt_param_scheduler,
@@ -2866,7 +2873,12 @@ def load_checkpoint(
             'args': None,
             'iteration': 1,
             'rng_state': get_rng_state(
-                args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+                args.ckpt_format,
+                tp_group,
+                pp_group,
+                dp_cp_group=dp_cp_group,
+                dp_group=dp_group,
+                data_parallel_random_init=rng_config.data_parallel_random_init,
             ),
             'checkpoint_version': None,
             'opt_param_scheduler': opt_param_scheduler.state_dict(),
@@ -2891,7 +2903,12 @@ def load_checkpoint(
                 )
             if not args.no_load_rng:
                 gen_sd_rng_state = get_rng_state(
-                    args.ckpt_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+                    args.ckpt_format,
+                    tp_group,
+                    pp_group,
+                    dp_cp_group=dp_cp_group,
+                    dp_group=dp_group,
+                    data_parallel_random_init=rng_config.data_parallel_random_init,
                 )
         if (not args.finetune or gpt_compat_load_optim) and not args.no_load_optim:
             gen_sd_optim = optimizer
@@ -2926,7 +2943,7 @@ def load_checkpoint(
 
         try:
             state_dict = generate_state_dict(
-                args,
+                rng_args_snapshot(args, rng_config),
                 model=model,
                 optimizer=gen_sd_optim,
                 opt_param_scheduler=gen_sd_opt_param_scheduler,
@@ -2991,7 +3008,7 @@ def load_checkpoint(
         # architecture-preserving load. Keep every other resume-time argument
         # compatibility check.
         skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        check_checkpoint_args(checkpoint_args, skip_args=skip_args)
+        check_checkpoint_args(checkpoint_args, skip_args=skip_args, rng_config=rng_config)
         args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
         args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
@@ -3237,7 +3254,7 @@ def load_checkpoint(
                     rng_state = state_dict['rng_state']
 
                 # access rng_state for data parallel rank
-                if args.data_parallel_random_init:
+                if rng_config.data_parallel_random_init:
                     dp_rank = (
                         get_pg_rank(dp_group)
                         if dp_group is not None

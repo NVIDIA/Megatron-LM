@@ -2,6 +2,7 @@
 
 """Tests for MIMO per-rank runtime setup (RNG seeding, DDP wrapping)."""
 
+from megatron.training.config.common_config import RNGConfig
 import argparse
 from dataclasses import fields
 from types import SimpleNamespace
@@ -54,6 +55,8 @@ def _args(**overrides):
         ddp_average_in_collective=ddp_defaults["average_in_collective"],
         use_precision_aware_optimizer=ddp_defaults["megatron_fsdp_use_decoupled_grad"],
         cuda_graph_impl="none",
+        transformer_impl="local",
+        rank=0,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -221,13 +224,20 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     assert builder.build_distributed_models(
         mocker.Mock(),
         ddp_config=ddp_config,
-        data_parallel_random_init=True,
+        rng_config=RNGConfig(data_parallel_random_init=True),
         use_layer_wise_distributed_optimizer=True,
         use_layer_wise_param_layout=False,
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
-    seed.assert_called_once_with(args, groups, _LANGUAGE_SEED_OFFSET, True)
+    seed.assert_called_once_with(
+        RNGConfig(data_parallel_random_init=True),
+        groups,
+        _LANGUAGE_SEED_OFFSET,
+        transformer_impl=args.transformer_impl,
+        cuda_graph_impl=args.cuda_graph_impl,
+        rank=args.rank,
+    )
     wrap.assert_called_once_with(
         args,
         model,
@@ -264,9 +274,20 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     mocker.patch("examples.mimo.training.builder.configure_grad_sync")
     seed = mocker.patch("examples.mimo.training.builder.configure_module_rng")
 
-    builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+    builder.build_distributed_models(
+        mocker.Mock(),
+        ddp_config=DistributedDataParallelConfig(),
+        rng_config=RNGConfig(data_parallel_random_init=False),
+    )
 
-    seed.assert_called_once_with(args, encoder_pg, _ENCODER_SEED_OFFSET, False)
+    seed.assert_called_once_with(
+        RNGConfig(),
+        encoder_pg,
+        _ENCODER_SEED_OFFSET,
+        transformer_impl=args.transformer_impl,
+        cuda_graph_impl=args.cuda_graph_impl,
+        rank=args.rank,
+    )
     assert model.pg_collection is encoder_pg
     assert model.rng_state_key_prefix == "encoder."
 
@@ -279,7 +300,10 @@ def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
 
     with pytest.raises(NotImplementedError, match="has not been tested yet"):
         builder.build_distributed_models(
-            mocker.Mock(), ddp_config=DistributedDataParallelConfig(), **{fsdp_kwarg: True}
+            mocker.Mock(),
+            ddp_config=DistributedDataParallelConfig(),
+            **{fsdp_kwarg: True},
+            rng_config=RNGConfig(data_parallel_random_init=False),
         )
 
 
@@ -346,7 +370,9 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
     )
 
     result = builder.build_distributed_models(
-        mocker.Mock(), ddp_config=DistributedDataParallelConfig()
+        mocker.Mock(),
+        ddp_config=DistributedDataParallelConfig(),
+        rng_config=RNGConfig(data_parallel_random_init=False),
     )
 
     assert events == ["pre", "wrap", "configure", "post"]
@@ -381,7 +407,11 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
         ValueError,
         match=f"MIMO {hook_stage}-wrap hooks must return exactly one outer model; got {model_count}",
     ):
-        builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+        builder.build_distributed_models(
+            mocker.Mock(),
+            ddp_config=DistributedDataParallelConfig(),
+            rng_config=RNGConfig(data_parallel_random_init=False),
+        )
 
 
 def test_configure_module_rng_forwards_rng_tracker_options(mocker):
@@ -397,10 +427,12 @@ def test_configure_module_rng_forwards_rng_tracker_options(mocker):
     set_random_seed = mocker.patch("examples.mimo.training.runtime._set_random_seed")
 
     configure_module_rng(
-        _args(te_rng_tracker=True, inference_rng_tracker=True, cuda_graph_impl="local"),
+        RNGConfig(te_rng_tracker=True, inference_rng_tracker=True, data_parallel_random_init=True),
         pg_collection,
         role_seed_offset=10,
-        data_parallel_random_init=True,
+        transformer_impl="local",
+        cuda_graph_impl="local",
+        rank=0,
     )
 
     assert set_random_seed.call_args.args == (1244, True)
@@ -440,9 +472,23 @@ class TestRuntimeDistributed:
         try:
             module = MIMO_LANGUAGE_MODULE_KEY if torch.distributed.get_rank() >= 4 else ENCODER
             pgc = topo.module_pgs[module]
-            configure_module_rng(_args(), pgc, role_seed_offset=10, data_parallel_random_init=True)
+            configure_module_rng(
+                RNGConfig(data_parallel_random_init=True),
+                pgc,
+                role_seed_offset=10,
+                transformer_impl="local",
+                cuda_graph_impl="none",
+                rank=0,
+            )
             states_a = get_cuda_rng_tracker().get_states()
-            configure_module_rng(_args(), pgc, role_seed_offset=20, data_parallel_random_init=True)
+            configure_module_rng(
+                RNGConfig(data_parallel_random_init=True),
+                pgc,
+                role_seed_offset=20,
+                transformer_impl="local",
+                cuda_graph_impl="none",
+                rank=0,
+            )
             states_b = get_cuda_rng_tracker().get_states()
             assert set(states_a) == set(states_b)
             for name in states_a:

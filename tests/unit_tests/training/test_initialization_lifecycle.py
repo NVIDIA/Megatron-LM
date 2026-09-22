@@ -2,6 +2,7 @@
 
 """Tests for config construction before training runtime initialization."""
 
+from megatron.training.argument_utils import rng_config_from_args
 from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 from types import SimpleNamespace
@@ -30,6 +31,8 @@ def isolated_globals(monkeypatch):
 def _runtime_args():
     return Namespace(
         rank=0,
+        transformer_impl="local",
+        cuda_graph_impl="none",
         global_batch_size=8,
         micro_batch_size=2,
         data_parallel_size=2,
@@ -78,7 +81,9 @@ def test_args_only_bootstrap_registers_args_and_constructs_services(monkeypatch,
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     global_vars.set_global_variables(args)
     assert global_vars.get_args() is args
-    initialize.assert_called_once_with(args, build_tokenizer=True)
+    initialize.assert_called_once_with(
+        args, build_tokenizer=True, rng_config=rng_config_from_args(args)
+    )
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args)
 
@@ -138,7 +143,7 @@ def test_vocabulary_resolves_after_config_construction(
     cfg = SimpleNamespace(model=model_cfg, tokenizer=TokenizerConfig())
     global_vars.set_args(args)
 
-    def initialize_services(received_args):
+    def initialize_services(received_args, *, rng_config):
         # Config construction has finished without creating a tokenizer.
         assert cfg.model.vocab_size == checkpoint_vocab
         assert received_args is args
@@ -147,13 +152,13 @@ def test_vocabulary_resolves_after_config_construction(
 
     initialize = Mock(side_effect=initialize_services)
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
-    global_vars.initialize_runtime_services(args)
+    global_vars.initialize_runtime_services(args, rng_config=rng_config_from_args(args))
     resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
 
     assert model_cfg.vocab_size == (128 if checkpoint_vocab is None else checkpoint_vocab)
     assert model_cfg.should_pad_vocab is False
     assert cfg.tokenizer.padded_vocab_size == model_cfg.vocab_size
-    initialize.assert_called_once_with(args)
+    initialize.assert_called_once_with(args, rng_config=rng_config_from_args(args))
 
 
 @pytest.mark.parametrize("args_only", [False, True])
@@ -176,7 +181,7 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
         "_set_telemetry",
     ):
 
-        def record(received_args, service=name):
+        def record(received_args, service=name, **kwargs):
             assert received_args is args
             calls.append(service)
 
@@ -194,7 +199,7 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
     if args_only:
         global_vars.set_global_variables(args)
     else:
-        global_vars.initialize_runtime_services(args)
+        global_vars.initialize_runtime_services(args, rng_config=rng_config_from_args(args))
     assert isinstance(global_vars.get_train_state(), global_vars.TrainState)
     assert calls == [
         "microbatches",
@@ -251,11 +256,11 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
     cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
     global_vars.set_args(args)
 
-    def initialize(received_args):
+    def initialize(received_args, *, rng_config):
         global_vars._build_tokenizer(received_args)
 
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
-    global_vars.initialize_runtime_services(args)
+    global_vars.initialize_runtime_services(args, rng_config=rng_config_from_args(args))
     resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     assert model.as_dict() == legacy_model.as_dict()
     assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
@@ -329,9 +334,13 @@ def test_tokenizer_vocabulary_is_authoritative_when_padding(
     factory.assert_not_called()
     cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
     global_vars.set_args(args)
-    monkeypatch.setattr(global_vars, "initialize_runtime_services", global_vars._build_tokenizer)
+    monkeypatch.setattr(
+        global_vars,
+        "initialize_runtime_services",
+        lambda received_args, *, rng_config: global_vars._build_tokenizer(received_args),
+    )
 
-    global_vars.initialize_runtime_services(args)
+    global_vars.initialize_runtime_services(args, rng_config=rng_config_from_args(args))
     resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     assert model.vocab_size == cfg.tokenizer.padded_vocab_size == 512
     assert model.should_pad_vocab is False
@@ -372,8 +381,12 @@ def test_checkpoint_vocabulary_precedence_survives_runtime_setup(
     assert model.vocab_size == expected
     cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig())
     global_vars.set_args(args)
-    monkeypatch.setattr(global_vars, "initialize_runtime_services", global_vars._build_tokenizer)
-    global_vars.initialize_runtime_services(args)
+    monkeypatch.setattr(
+        global_vars,
+        "initialize_runtime_services",
+        lambda received_args, *, rng_config: global_vars._build_tokenizer(received_args),
+    )
+    global_vars.initialize_runtime_services(args, rng_config=rng_config_from_args(args))
     resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
 
     assert model.vocab_size == cfg.tokenizer.padded_vocab_size == expected

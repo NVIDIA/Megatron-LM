@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from megatron.training.argument_utils import rng_config_from_args
 import contextlib
 import gc
 import os
@@ -283,7 +284,9 @@ class TestFP8Param:
             builder_cls = model_cfg.get_builder_cls()
             builder = builder_cls(model_cfg)
             gpt_model = builder.build_distributed_models(
-                pg_collection=pg_collection, wrap_with_ddp=False
+                pg_collection=pg_collection,
+                wrap_with_ddp=False,
+                rng_config=rng_config_from_args(args),
             )
             gpt_model[0].eval()
             optimizer = None
@@ -293,6 +296,7 @@ class TestFP8Param:
                 self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
+                rng_config=rng_config_from_args(args),
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
@@ -735,6 +739,7 @@ class TestFP8Param:
             self.model_provider,
             cfg_container=cfg_container,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            rng_config=rng_config_from_args(args),
         )
         assert len(model) == 1
         return args, model, optimizer, opt_param_scheduler
@@ -837,7 +842,9 @@ class TestFP8Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
-            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
+            save_checkpoint(
+                3, model, optimizer, opt_param_scheduler, 0, rng_config=rng_config_from_args(args)
+            )
             torch.distributed.barrier()
 
             self.cleanup_between_runs()
@@ -845,7 +852,13 @@ class TestFP8Param:
             args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
                 tp_size, recipe, str(ckpt_dir), **kwargs
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+            iteration, _ = load_checkpoint(
+                model,
+                optimizer,
+                opt_param_scheduler,
+                strict=True,
+                rng_config=rng_config_from_args(args),
+            )
             assert iteration == 3
             loaded_state = self.quantized_param_state(model[0])
 

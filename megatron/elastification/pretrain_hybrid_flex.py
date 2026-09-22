@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
 
+from functools import update_wrapper
 import os
 from functools import partial
 from typing import List, Optional, Tuple, Union
@@ -40,6 +41,7 @@ from megatron.core.utils import (
     get_batch_on_this_tp_rank,
 )
 from megatron.elastification.arguments import add_flextron_args
+from megatron.core.utils import get_model_config
 from megatron.training import (
     get_args,
     get_timers,
@@ -83,7 +85,15 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
-def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:
+def model_provider(
+    pre_process=True,
+    post_process=True,
+    vp_stage: Optional[int] = None,
+    config=None,
+    pg_collection=None,
+    *,
+    rng_config,
+) -> HybridModel:
     """Builds the model.
 
     Args:
@@ -94,10 +104,19 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     Returns:
         HybridModel: The returned model
     """
+    from megatron.training.argument_utils import rng_args_snapshot
     args = get_args()
     if has_nvidia_modelopt:
 
-        model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection)
+        model = model_provider_modelopt(
+            args,
+            pre_process,
+            post_process,
+            vp_stage=vp_stage,
+            config=config,
+            pg_collection=pg_collection,
+            random_seed=rng_config.seed,
+        )
         from megatron.elastification.flextron_utils import (
             inject_flextron_forward_logic,
             setup_flextron_model,
@@ -118,7 +137,9 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         return model
 
     print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(args, TransformerConfig)
+    config = core_transformer_config_from_args(
+        rng_args_snapshot(args, rng_config), TransformerConfig
+    )
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 
@@ -172,11 +193,10 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, *, config):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -409,15 +429,9 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            cu_seqlens,
-            max_seqlen,
-        ) = get_batch(data_iterator)
+        tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(
+            data_iterator, config=get_model_config(model)
+        )
     timers('batch-generator').stop()
 
     if get_grad_acc_based_random_choice(args=args) < args.original_model_sample_prob:
@@ -457,7 +471,7 @@ def is_dataset_built_on_rank(vp_stage=None):
     ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
-def core_gpt_dataset_config_from_args(args):
+def core_gpt_dataset_config_from_args(args, *, random_seed: int):
     tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -466,7 +480,7 @@ def core_gpt_dataset_config_from_args(args):
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
     return GPTDatasetConfig(
-        random_seed=args.seed,
+        random_seed=random_seed,
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,
@@ -485,7 +499,9 @@ def core_gpt_dataset_config_from_args(args):
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, *, random_seed: int
+):
     """Build the train test and validation datasets.
 
     Args:
@@ -493,7 +509,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     """
     args = get_args()
 
-    config = core_gpt_dataset_config_from_args(args)
+    config = core_gpt_dataset_config_from_args(args, random_seed=random_seed)
 
     if args.sft:
         dataset_type = SFTDataset
@@ -570,12 +586,16 @@ if __name__ == "__main__":
     )
 
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, rng_config=full_config.rng)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
-    pretrain(full_config,
-             train_valid_test_datasets_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             model_provider,
-             store=store,
-             )
+    pretrain(
+        full_config,
+        update_wrapper(
+            partial(train_valid_test_datasets_provider, random_seed=full_config.rng.seed),
+            train_valid_test_datasets_provider,
+        ),
+        ModelType.encoder_or_decoder,
+        forward_step,
+        partial(model_provider, rng_config=full_config.rng),
+        store=store,
+    )

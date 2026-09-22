@@ -61,6 +61,8 @@ def initialize_megatron(
     seed_etp_group=None,
     skip_random_seed=False,
     skip_dependency_compilation=False,
+    *,
+    rng_config,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -134,12 +136,17 @@ def initialize_megatron(
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
-            print_rank_0("> setting random seeds to {} ...".format(args.seed))
+            rng_config.resolve_cuda_graphs(
+                transformer_impl=args.transformer_impl,
+                cuda_graph_impl=args.cuda_graph_impl,
+                rank=args.rank,
+            )
+            print_rank_0("> setting random seeds to {} ...".format(rng_config.seed))
             _set_random_seed(
-                args.seed,
-                args.data_parallel_random_init,
-                args.te_rng_tracker,
-                args.inference_rng_tracker,
+                rng_config.seed,
+                rng_config.data_parallel_random_init,
+                rng_config.te_rng_tracker,
+                rng_config.inference_rng_tracker,
                 use_cudagraphable_rng=args.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,
@@ -502,9 +509,10 @@ def _set_random_seed(
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
-def write_args_to_tensorboard():
+def write_args_to_tensorboard(*, rng_config):
     """Write arguments to tensorboard."""
-    args = get_args()
+    from megatron.training.argument_utils import rng_args_snapshot
+    args = rng_args_snapshot(get_args(), rng_config)
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):

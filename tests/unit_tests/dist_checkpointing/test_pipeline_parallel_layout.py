@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.training.argument_utils import rng_config_from_args
 import os
 from types import SimpleNamespace
 
@@ -363,6 +364,7 @@ def test_save_and_load_checkpoint_vpp(
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
+                rng_config=rng_config_from_args(args),
             )
 
             expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
@@ -383,7 +385,13 @@ def test_save_and_load_checkpoint_vpp(
             )
             new_model = new_model if isinstance(new_model, list) else [new_model]
 
-            load_checkpoint(new_model, optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                new_model,
+                optimizer,
+                opt_param_scheduler,
+                strict=False,
+                rng_config=rng_config_from_args(args),
+            )
             set_ckpt_path(ckpt_dir_B)
             save_checkpoint(
                 iteration,
@@ -391,6 +399,7 @@ def test_save_and_load_checkpoint_vpp(
                 optimizer,
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
+                rng_config=rng_config_from_args(args),
             )
 
             set_tp_pp_vpp(1, 1)
@@ -407,7 +416,13 @@ def test_save_and_load_checkpoint_vpp(
                 pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
                 is_moe=is_moe,
             )
-            load_checkpoint([model_A], optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                [model_A],
+                optimizer,
+                opt_param_scheduler,
+                strict=False,
+                rng_config=rng_config_from_args(args),
+            )
 
             set_ckpt_path(ckpt_dir_B)
             model_B = initialize_gpt_model(
@@ -422,7 +437,13 @@ def test_save_and_load_checkpoint_vpp(
                 pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
                 is_moe=is_moe,
             )
-            load_checkpoint([model_B], optimizer, opt_param_scheduler, strict=False)
+            load_checkpoint(
+                [model_B],
+                optimizer,
+                opt_param_scheduler,
+                strict=False,
+                rng_config=rng_config_from_args(args),
+            )
 
             for k in model_A.state_dict():
                 if "_extra_state" in k:  # Ignore extra states

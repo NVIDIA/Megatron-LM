@@ -58,6 +58,7 @@ class TestRNGStateCheckpoint:
                 mpu.get_pipeline_model_parallel_group(),
                 dp_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
                 dp_group=mpu.get_data_parallel_group(),
+                data_parallel_random_init=False,
             )
 
         # get_states() copies the dict but not the tensors, so clone to survive re-seeding.

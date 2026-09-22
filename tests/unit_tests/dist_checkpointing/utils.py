@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from megatron.training.argument_utils import rng_config_from_args
 from functools import partial
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
@@ -257,7 +258,8 @@ def setup_model_and_optimizer(
                 expert_model_parallel_size=ep,
                 expert_tensor_parallel_size=etp,
                 bf16=bf16,
-            )
+            ),
+            rng_config=rng_config_from_args(mock_args),
         )
 
     config = OptimizerConfig(
@@ -394,7 +396,8 @@ def setup_moe_model_and_optimizer(
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
                 bf16=bf16,
-            )
+            ),
+            rng_config=rng_config_from_args(mock_args),
         )
 
     config = OptimizerConfig(

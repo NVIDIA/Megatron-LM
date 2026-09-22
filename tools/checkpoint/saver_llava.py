@@ -161,6 +161,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
         return margs
 
     def import_model_provider(self):
+        from functools import partial
         try:
             from megatron.core.enums import ModelType
         except ModuleNotFoundError as e:
@@ -171,12 +172,12 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             sys.path.insert(0, './examples/multimodal')
             from examples.multimodal.model import model_provider
             from examples.multimodal.config import get_vision_model_config, get_vision_projection_config
-            self.model_provider = model_provider
+            self.model_provider = partial(model_provider, rng_config=self.rng_config)
             self.margs.model_type = ModelType.encoder_or_decoder
         elif self.md.model_type == 'BERT':
             from pretrain_bert import model_provider
             self.margs.model_type = ModelType.encoder_or_decoder
-            self.model_provider = model_provider
+            self.model_provider = partial(model_provider, rng_config=self.rng_config)
         else:
             raise Exception(f'unrecognized model type: {self.args.model_type}')
 

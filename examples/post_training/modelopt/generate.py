@@ -80,8 +80,10 @@ if __name__ == "__main__":
             'no_load_rng': True,
             'no_load_optim': True,
         })
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     check_arguments()
 
@@ -101,7 +103,11 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=rng_config),
+        wrap_with_ddp=False,
+        rng_config=rng_config,
+    )
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
@@ -127,7 +133,13 @@ if __name__ == "__main__":
 
 
     if args.load is not None:
-        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(
+            model,
+            None,
+            None,
+            strict=not args.untie_embeddings_and_output_weights,
+            rng_config=rng_config,
+        )
         print_rank_0("Done loading checkpoint")
 
     unwrapped_model = unwrap_model(model)[0]

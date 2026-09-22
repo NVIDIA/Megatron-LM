@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.training.config.common_config import RNGConfig
 import inspect
 import sys
 from unittest.mock import Mock, call, patch
@@ -738,7 +739,9 @@ class TestGPTModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = [Mock()]
         mock_compose.return_value = Mock(return_value=None)
 
-        self.builder.build_distributed_models(self.pg)
+        self.builder.build_distributed_models(
+            self.pg, rng_config=RNGConfig(data_parallel_random_init=True)
+        )
 
         assert mock_unimodal.called
 
@@ -750,7 +753,9 @@ class TestGPTModelBuilderBuildDistributedModels:
         # post_wrap hook returns None → original list kept
         mock_compose.return_value = Mock(return_value=None)
 
-        result = self.builder.build_distributed_models(self.pg)
+        result = self.builder.build_distributed_models(
+            self.pg, rng_config=RNGConfig(data_parallel_random_init=True)
+        )
 
         assert result is model_list
 
@@ -764,7 +769,9 @@ class TestGPTModelBuilderBuildDistributedModels:
 
         hook1 = Mock()
         self.config.pre_wrap_hooks = [hook1]
-        self.builder.build_distributed_models(self.pg)
+        self.builder.build_distributed_models(
+            self.pg, rng_config=RNGConfig(data_parallel_random_init=True)
+        )
 
         # First compose_hooks call must be with the pre_wrap_hooks list
         assert mock_compose.call_args_list[0] == call([hook1])
@@ -782,7 +789,9 @@ class TestGPTModelBuilderBuildDistributedModels:
         composed_post = Mock(return_value=wrapped_list)
         mock_compose.side_effect = [composed_pre, composed_post]
 
-        result = self.builder.build_distributed_models(self.pg)
+        result = self.builder.build_distributed_models(
+            self.pg, rng_config=RNGConfig(data_parallel_random_init=True)
+        )
 
         composed_post.assert_called_once_with(model_list)
         assert result is wrapped_list
@@ -794,7 +803,9 @@ class TestGPTModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = model_list
         mock_compose.return_value = Mock(return_value=None)
 
-        result = self.builder.build_distributed_models(self.pg)
+        result = self.builder.build_distributed_models(
+            self.pg, rng_config=RNGConfig(data_parallel_random_init=True)
+        )
 
         assert result is model_list
 
@@ -807,7 +818,9 @@ class TestGPTModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = [Mock()]
         mock_compose.return_value = Mock(return_value=None)
 
-        self.builder.build_distributed_models(self.pg)
+        self.builder.build_distributed_models(
+            self.pg, rng_config=RNGConfig(data_parallel_random_init=True)
+        )
 
         args = mock_unimodal.call_args.args
         assert args[0] == self.builder.build_model

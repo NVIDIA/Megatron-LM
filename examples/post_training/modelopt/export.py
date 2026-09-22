@@ -66,8 +66,10 @@ if __name__ == "__main__":
             'no_load_optim': True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     args = get_args()
 
@@ -85,7 +87,9 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=rng_config),
+        wrap_with_ddp=False,
+        rng_config=rng_config,
     )
 
     # Materialize the model from meta device to cpu before loading the checkpoint.
@@ -93,7 +97,7 @@ if __name__ == "__main__":
     unwrapped_model.to_empty(device="cpu")
 
     if args.load is not None and Path(args.load).is_dir():
-        load_checkpoint(model, None, None)
+        load_checkpoint(model, None, None, rng_config=rng_config)
     else:
         raise ValueError(f"Invalid load checkpoint directory: {args.load}")
 

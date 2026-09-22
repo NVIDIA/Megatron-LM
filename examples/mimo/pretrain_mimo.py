@@ -123,7 +123,7 @@ def main() -> None:
 
     def train_valid_test_data_provider(_train_val_test_num_samples):
         nonlocal prefetch_loader
-        loaders = build_train_valid_test_data_loaders(args, topology)
+        loaders = build_train_valid_test_data_loaders(args, topology, random_seed=cfg.rng.seed)
         iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
         if not args.mimo_encoder_prefetch or loaders[0] is None:
             return iterators

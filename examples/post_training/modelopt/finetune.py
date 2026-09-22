@@ -578,13 +578,13 @@ if __name__ == "__main__":
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
     )
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, rng_config=full_config.rng)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_sft_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, modelopt_gpt_hybrid_builder),
+        partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=full_config.rng),
         non_loss_data_func=non_loss_data_func,
     )

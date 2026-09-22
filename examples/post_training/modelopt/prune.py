@@ -177,8 +177,10 @@ if __name__ == "__main__":
             "no_load_optim": True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     args = get_args()
     check_arguments(args)
@@ -192,8 +194,9 @@ if __name__ == "__main__":
         modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
     )
     model = get_model(
-        functools.partial(model_provider, prune_builder),
+        functools.partial(model_provider, prune_builder, rng_config=rng_config),
         wrap_with_ddp=False,
+        rng_config=rng_config,
     )
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")
@@ -201,7 +204,13 @@ if __name__ == "__main__":
     report_current_memory_info()
 
     if args.load is not None:
-        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(
+            model,
+            None,
+            None,
+            strict=not args.untie_embeddings_and_output_weights,
+            rng_config=rng_config,
+        )
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:
@@ -291,7 +300,7 @@ if __name__ == "__main__":
     print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model) / 1e9:.2f}B")
 
     if args.save is not None:
-        save_checkpoint(1, model, None, None, 0)
+        save_checkpoint(1, model, None, None, 0, rng_config=rng_config)
 
     # Free pruning-side memory before the sanity-check generation (do this after saving in case it causes issues)
     gc.collect()

@@ -132,10 +132,12 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(rng_config=rng_config)
 
     inference_engine = get_inference_engine(args, model)
 
@@ -151,7 +153,7 @@ def main():
     # Build tokenizer
     tokenizer = build_tokenizer(args)
 
-    requests = build_requests(args, tokenizer)
+    requests = build_requests(args, tokenizer, random_seed=rng_config.seed)
     prompts = [r.prompt_text for r in requests]
 
     if args.cuda_graph_impl == "local":

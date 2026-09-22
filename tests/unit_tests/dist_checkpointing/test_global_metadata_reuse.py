@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 
+from megatron.training.argument_utils import rng_config_from_args
 from unittest import mock
 
 import pytest
@@ -58,6 +59,7 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     save_ckpt_context,
+                    rng_config=rng_config_from_args(mock_args),
                 )
 
                 assert reduce_scatter_mock.call_count == 0
@@ -66,7 +68,11 @@ class TestGlobalMetadataReuse:
 
             resume_ckpt_context = {}
             _, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=resume_ckpt_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=resume_ckpt_context,
+                rng_config=rng_config_from_args(mock_args),
             )
 
             load_strategy_cached_metadata = resume_ckpt_context[
@@ -86,6 +92,7 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     resume_ckpt_context,
+                    rng_config=rng_config_from_args(mock_args),
                 )
                 assert reduce_scatter_mock.call_count == 0
 
@@ -136,6 +143,7 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     save_ckpt_context,
+                    rng_config=rng_config_from_args(mock_args),
                 )
 
                 assert reduce_scatter_mock.call_count == 0
@@ -151,7 +159,11 @@ class TestGlobalMetadataReuse:
 
             resume_ckpt_context = {}
             _, _ = load_checkpoint(
-                model, optimizer, opt_param_scheduler, checkpointing_context=resume_ckpt_context
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=resume_ckpt_context,
+                rng_config=rng_config_from_args(mock_args),
             )
 
             load_strategy_cached_metadata = resume_ckpt_context[
@@ -172,6 +184,7 @@ class TestGlobalMetadataReuse:
                     opt_param_scheduler,
                     num_floating_point_operations_so_far,
                     resume_ckpt_context,
+                    rng_config=rng_config_from_args(mock_args),
                 )
                 assert reduce_scatter_mock.call_count == 0
 

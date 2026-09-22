@@ -135,6 +135,8 @@ class MegatronCheckpointSaverBase:
             margs.no_persist_layer_norm = True
 
         self.margs = margs
+        from megatron.training.argument_utils import rng_config_from_args
+        self.rng_config = rng_config_from_args(margs)
 
     def initialize_megatron_env(self):
         """
@@ -352,10 +354,19 @@ class MegatronCheckpointSaverBase:
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
-                    save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
-                        pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
-                        expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
-                        tensor_rank=tp_rank)
+                    save_checkpoint(
+                        self.md.iteration,
+                        [self.get_local_model(pp_rank, ep_rank, tp_rank)],
+                        None,
+                        None,
+                        num_floating_point_operations_so_far=0,
+                        pipeline_rank=pp_rank,
+                        pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
+                        expert_rank=ep_rank,
+                        expert_parallel=self.args.target_expert_parallel_size > 1,
+                        tensor_rank=tp_rank,
+                        rng_config=self.rng_config,
+                    )
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 

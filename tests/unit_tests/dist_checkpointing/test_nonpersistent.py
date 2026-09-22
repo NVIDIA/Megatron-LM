@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.training.argument_utils import rng_config_from_args
 import filecmp
 import os
 from unittest import mock
@@ -63,9 +64,16 @@ class TestNonPersistentSaveAndLoad:
                 num_floating_point_operations_so_far,
                 {},
                 non_persistent_ckpt=True,
+                rng_config=rng_config_from_args(mock_args),
             )
             save_checkpoint(
-                3, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                3,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                {},
+                rng_config=rng_config_from_args(mock_args),
             )
             save_checkpoint(
                 4,
@@ -75,13 +83,24 @@ class TestNonPersistentSaveAndLoad:
                 num_floating_point_operations_so_far,
                 {},
                 non_persistent_ckpt=True,
+                rng_config=rng_config_from_args(mock_args),
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, rng_config=rng_config_from_args(mock_args)
+            )
             assert iteration == 4
             save_checkpoint(
-                6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                6,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                {},
+                rng_config=rng_config_from_args(mock_args),
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, rng_config=rng_config_from_args(mock_args)
+            )
             assert iteration == 6
             save_checkpoint(
                 8,
@@ -91,8 +110,11 @@ class TestNonPersistentSaveAndLoad:
                 num_floating_point_operations_so_far,
                 {},
                 non_persistent_ckpt=True,
+                rng_config=rng_config_from_args(mock_args),
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, rng_config=rng_config_from_args(mock_args)
+            )
             assert iteration == 8
             assert "iter_0000003" in os.listdir(non_persistent_ckpt_dir)
             assert "iter_0000006" in os.listdir(non_persistent_ckpt_dir)
@@ -142,9 +164,17 @@ class TestLegacySaveAndLoad:
             init_checkpointing_mock_args(mock_args, legacy_ckpt_dir)
 
             save_checkpoint(
-                2, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                2,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                {},
+                rng_config=rng_config_from_args(mock_args),
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, rng_config=rng_config_from_args(mock_args)
+            )
             assert iteration == 2
             assert "iter_0000002" in os.listdir(legacy_ckpt_dir)
 

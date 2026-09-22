@@ -186,7 +186,7 @@ def _blend_identifiers(args: Any) -> Dict[str, Any]:
     return {"kind": "mock", "mock": True}
 
 
-def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
+def compute_dataset_hash(*, random_seed: int) -> Tuple[str, Dict[str, Any]]:
     """Compute the dataset-identity hash for the current training run.
 
     The fields included are exactly those that determine the global sample
@@ -202,7 +202,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
             train_samples = int(train_iters) * int(global_batch_size)
 
     identifiers = OrderedDict()
-    identifiers["seed"] = getattr(args, 'seed', None)
+    identifiers["seed"] = random_seed
     identifiers["sequence_length"] = getattr(args, 'seq_length', None)
     identifiers["train_samples"] = train_samples
     identifiers["blend"] = _blend_identifiers(args)

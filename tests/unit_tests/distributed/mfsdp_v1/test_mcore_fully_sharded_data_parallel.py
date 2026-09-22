@@ -1065,7 +1065,7 @@ class TestMegatronFSDPE2E:
         """
         import argparse
         import os
-        from functools import partial
+        from functools import partial, update_wrapper
 
         from torch.optim.optimizer import register_optimizer_step_pre_hook
 
@@ -1123,7 +1123,9 @@ class TestMegatronFSDPE2E:
         orig_forward_step = _pretrain_gpt.forward_step
 
         def wrapped_forward_step(*args, **kwargs):
-            output_tensor, loss_func_partial = orig_forward_step(*args, **kwargs)
+            output_tensor, loss_func_partial = orig_forward_step(
+                *args, **kwargs, random_seed=cfg.rng.seed
+            )
 
             def wrapped_loss(*la, **lk):
                 ret = loss_func_partial(*la, **lk)
@@ -1189,10 +1191,17 @@ class TestMegatronFSDPE2E:
 
             pretrain(
                 cfg,
-                _pretrain_gpt.train_valid_test_datasets_provider,
+                update_wrapper(
+                    partial(
+                        _pretrain_gpt.train_valid_test_datasets_provider, random_seed=cfg.rng.seed
+                    ),
+                    _pretrain_gpt.train_valid_test_datasets_provider,
+                ),
                 ModelType.encoder_or_decoder,
                 wrapped_forward_step,
-                get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
+                get_embedding_ranks=partial(
+                    _pretrain_gpt.get_embedding_ranks, random_seed=cfg.rng.seed
+                ),
             )
             # Validate CUDA graph was captured and thus replayed.
             cuda_graph_was_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
