@@ -332,7 +332,7 @@ class FsdpModule:
             module = module_ref()
             if module is None:
                 return
-            if module._trainable_parameter_countdown.decrement():
+            if module._trainable_parameter_countdown.decrement() is True:
                 post_backward_hook(module)
 
         for group in self._parameter_groups:
