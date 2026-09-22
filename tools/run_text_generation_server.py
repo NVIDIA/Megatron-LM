@@ -128,8 +128,10 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -149,16 +151,23 @@ def main(model_type: str = "gpt"):
             # modelopt hooks have not been ported to the new ``ModelBuilder``
             # API yet. ``get_model`` also handles the modelopt-checkpoint
             # auto-detection side effect.
-            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+            from functools import partial
+            from model_provider import model_provider
+            model = get_model(
+                partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=rng_config),
+                wrap_with_ddp=False,
+                rng_config=rng_config,
+            )
         else:
-            builder = get_model_builder(args, provider=model_type)
+            from megatron.training.argument_utils import rng_args_snapshot
+            builder = get_model_builder(rng_args_snapshot(args, rng_config), provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             model = builder.build_distributed_models(
-                pg_collection=pg_collection, wrap_with_ddp=False
+                pg_collection=pg_collection, wrap_with_ddp=False, rng_config=rng_config
             )
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None, strict=False)
+        _ = load_checkpoint(model, None, None, strict=False, rng_config=rng_config)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]

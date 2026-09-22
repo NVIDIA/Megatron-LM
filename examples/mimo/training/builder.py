@@ -73,11 +73,14 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         pre_process: bool | None = None,
         post_process: bool | None = None,
         vp_stage: int | None = None,
+        *,
+        rng_config,
     ) -> MimoModel:
         """Build the bare rank-local MIMO model; the shared lifecycle places it later."""
         del pg_collection, pre_process, post_process, vp_stage
         topology = self._topology
-        args = get_args()
+        from megatron.training.argument_utils import rng_args_snapshot
+        args = rng_args_snapshot(get_args(), rng_config)
         provider = resolve_provider(args)
         active_name, is_language, active_pg = _resolve_role(topology)
 
@@ -130,13 +133,14 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         use_megatron_fsdp: bool = False,
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
-        data_parallel_random_init: bool = False,
         mixed_precision_wrapper: (
             Callable[[Any, MegatronModule], MegatronModule] | None
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        *,
+        rng_config,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if use_megatron_fsdp or use_torch_fsdp2:
@@ -154,14 +158,21 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         else:
             rng_state_key_prefix = "encoder."
             role_seed_offset = _ENCODER_SEED_OFFSET
-        configure_module_rng(args, active_pg, role_seed_offset, data_parallel_random_init)
+        configure_module_rng(
+            rng_config,
+            active_pg,
+            role_seed_offset,
+            transformer_impl=args.transformer_impl,
+            cuda_graph_impl=args.cuda_graph_impl,
+            rank=args.rank,
+        )
 
         built_with_meta_device = getattr(args, "init_model_with_meta_device", False)
         if built_with_meta_device:
             with torch.device("meta"):
-                mimo_model = self.build_model(pg_collection)
+                mimo_model = self.build_model(pg_collection, rng_config=rng_config)
         else:
-            mimo_model = self.build_model(pg_collection)
+            mimo_model = self.build_model(pg_collection, rng_config=rng_config)
 
         mimo_model.model_type = model_type
         model_list = compose_hooks(self._model_config.pre_wrap_hooks)([mimo_model])
@@ -176,7 +187,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             mimo_model,
             topology,
             ddp_config=ddp_config,
-            data_parallel_random_init=data_parallel_random_init,
+            data_parallel_random_init=rng_config.data_parallel_random_init,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
         )

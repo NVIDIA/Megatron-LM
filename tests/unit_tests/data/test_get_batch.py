@@ -23,6 +23,8 @@ from megatron.core.utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from megatron.training import get_args
+from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
 
@@ -187,7 +189,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
     if mpu.get_tensor_model_parallel_rank() == 0:
         data_iterator, num_real_tokens = create_sft_data_iterator(seq_length)
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = get_batch(data_iterator, config=core_transformer_config_from_args(get_args()))
     assert set(cp_batch.batches_by_layout) == {args.linear_cp_layout}
     batch = cp_batch.get_batch()
     (
@@ -556,7 +558,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
     if mpu.get_tensor_model_parallel_rank() == 0:
         data_iterator, _ = create_sft_data_iterator(seq_length)
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = get_batch(data_iterator, config=core_transformer_config_from_args(get_args()))
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -907,7 +909,7 @@ def test_get_batch_builds_required_cp_layouts():
     }
     data_iterator = iter([batch]) if mpu.get_tensor_model_parallel_rank() == 0 else None
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = get_batch(data_iterator, config=core_transformer_config_from_args(get_args()))
     local_tokens = cp_batch.get_batch()["tokens"]
 
     cp_rank = mpu.get_context_parallel_rank()
@@ -1024,7 +1026,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
             return_value=scheduler_batch,
         ),
     ):
-        cp_batch = get_batch(None)
+        cp_batch = get_batch(None, config=config)
 
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
@@ -1070,7 +1072,7 @@ def test_pretrain_batch(
             create_attention_mask=create_attention_mask,
         )
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = get_batch(data_iterator, config=core_transformer_config_from_args(get_args()))
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -1301,7 +1303,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     if mpu.get_tensor_model_parallel_rank() == 0:
         data_iterator = create_hybrid_cp_data_iterator(seq_length, cp_size=cp_size)
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = get_batch(data_iterator, config=core_transformer_config_from_args(get_args()))
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -1474,7 +1476,7 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
             seq_length, micro_batch_size=micro_batch_size
         )
 
-    cp_batch = get_batch(data_iterator)
+    cp_batch = get_batch(data_iterator, config=core_transformer_config_from_args(get_args()))
     batch = cp_batch.get_batch()
     (
         attention_mask,

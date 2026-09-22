@@ -202,15 +202,19 @@ def main():
     logging.getLogger(__name__).warning("Models using pipeline parallelism are not supported yet.")
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     # Set up model and load checkpoint.
-    model = get_model(model_provider, wrap_with_ddp=False)
+    model = get_model(
+        partial(model_provider, rng_config=rng_config), wrap_with_ddp=False, rng_config=rng_config
+    )
 
     args = get_args()
     if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, rng_config=rng_config)
 
     model = model[0]
     model.eval()

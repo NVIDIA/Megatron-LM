@@ -83,6 +83,7 @@ class _ModelOptBuilderMixin:
             post_process,
             vp_stage,
             pg_collection=pg_collection,
+            random_seed=self._model_config.transformer.inference_sampling_seed,
         )
 
 
@@ -114,7 +115,7 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
         model._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
 
 
-def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
+def _load_teacher_model_config(checkpoint_path: str, *, seed: int) -> Namespace:
     """Reads teacher config from a file.
 
     The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
@@ -137,6 +138,7 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
             config_path = None
 
     args_dict = vars(args).copy()
+    args_dict["seed"] = seed
 
     if config_path is not None:
         with open(config_path) as f:
@@ -265,6 +267,7 @@ def modelopt_gpt_hybrid_builder(
     config=None,
     pg_collection=None,
     *,
+    random_seed: int,
     disable_moe_grouped_gemm: bool = False,
 ) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
@@ -292,7 +295,8 @@ def modelopt_gpt_hybrid_builder(
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    config = core_transformer_config_from_args(args)
+    from megatron.training.argument_utils import model_seed_args
+    config = core_transformer_config_from_args(model_seed_args(args, random_seed))
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
@@ -495,7 +499,9 @@ def modelopt_gpt_hybrid_builder(
                 args.virtual_pipeline_model_parallel_size is None
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
-        teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
+        teacher_config_raw = _load_teacher_model_config(
+            args.export_kd_teacher_load, seed=random_seed
+        )
         teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
 
         distill_cfg = mtd_mcore.setup_distillation_config(

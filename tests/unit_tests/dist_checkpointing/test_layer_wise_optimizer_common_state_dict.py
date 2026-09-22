@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.training.argument_utils import rng_config_from_args
 from functools import partial
 from unittest import mock
 
@@ -96,6 +97,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                    rng_config=rng_config_from_args(mock_args),
                 )
 
                 # Get optimizer A param state
@@ -183,6 +185,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                    rng_config=rng_config_from_args(mock_args),
                 )
 
                 optim_param_state_A = optimizer_A.state_dict()

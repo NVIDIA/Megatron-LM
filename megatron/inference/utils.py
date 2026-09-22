@@ -76,9 +76,10 @@ def get_model_builder(
     raise ValueError(f"Invalid model provider {provider}")
 
 
-def get_model_for_inference() -> MegatronModule:
+def get_model_for_inference(*, rng_config) -> MegatronModule:
     """Initialize model and load checkpoint for inference."""
 
+    from megatron.training.argument_utils import rng_args_snapshot
     args = get_args()
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
@@ -86,12 +87,18 @@ def get_model_for_inference() -> MegatronModule:
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
         # care of running the modelopt-checkpoint auto-detection side effect.
-        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        from functools import partial
+        from model_provider import model_provider
+        model = _get_model(
+            partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=rng_config),
+            wrap_with_ddp=False,
+            rng_config=rng_config,
+        )
     else:
-        builder = get_model_builder(args)
+        builder = get_model_builder(rng_args_snapshot(args, rng_config))
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = builder.build_distributed_models(
-            pg_collection=pg_collection, wrap_with_ddp=False
+            pg_collection=pg_collection, wrap_with_ddp=False, rng_config=rng_config
         )
 
     # Load checkpoint.
@@ -102,6 +109,7 @@ def get_model_for_inference() -> MegatronModule:
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
+        rng_config=rng_config,
     )
 
     # No virtual PP.
@@ -359,11 +367,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     )
 
 
-def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
+def get_dynamic_inference_engine(model: MegatronModule) -> DynamicInferenceEngine:
     """Builds a `DynamicInferenceEngine`."""
     args = get_args()
-    if model is None:
-        model = get_model_for_inference()
     tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)

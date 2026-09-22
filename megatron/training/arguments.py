@@ -2033,13 +2033,15 @@ def validate_args(args, defaults={}):
         args.cpu_offloading = True
 
     # CUDA Graphs
+    from megatron.training.argument_utils import rng_config_from_args
+
+    rng_config = rng_config_from_args(args)
+    rng_config.resolve_cuda_graphs(
+        transformer_impl=args.transformer_impl, cuda_graph_impl=args.cuda_graph_impl, rank=args.rank
+    )
+    # Preserve normalized CLI output; runtime consumers use the subsequently built RNGConfig.
+    args.te_rng_tracker = rng_config.te_rng_tracker
     if args.cuda_graph_impl != "none":
-        if (
-            "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
-            and not args.te_rng_tracker
-        ):
-            args.te_rng_tracker = True
-            warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
         if args.cuda_graph_impl == "transformer_engine":
             assert (
                 "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")

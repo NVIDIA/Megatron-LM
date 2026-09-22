@@ -26,7 +26,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import initialize_runtime_services
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 
-def model_provider(pre_process=True, post_process=True) -> GPTModel:
+def model_provider(pre_process=True, post_process=True, *, rng_config) -> GPTModel:
     """Builds the model.
 
     Args:
@@ -40,7 +40,8 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(args)
+    from megatron.training.argument_utils import rng_args_snapshot
+    config = core_transformer_config_from_args(rng_args_snapshot(args, rng_config))
 
     if args.spec is None:
         if args.transformer_impl == 'local':
@@ -227,16 +228,22 @@ def main():
                                            'no_load_rng': True,
                                            'no_load_optim': True,
                                            'seq_length': 2048})
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     # Set up model and load checkpoint
-    model = get_model(model_provider, wrap_with_ddp=False)
+    from functools import partial
+
+    model = get_model(
+        partial(model_provider, rng_config=rng_config), wrap_with_ddp=False, rng_config=rng_config
+    )
 
     args = get_args()
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, rng_config=rng_config)
     model = model[0]
 
     # Generate samples.

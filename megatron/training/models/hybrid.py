@@ -124,7 +124,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         >>> model = HybridModelBuilder(model_cfg).build_model(pg_collection)
         >>>
         >>> # Distributed training
-        >>> models = HybridModelBuilder(model_cfg).build_distributed_models(pg_collection)
+        >>> models = HybridModelBuilder(model_cfg).build_distributed_models(
+        ...     pg_collection, rng_config=cfg.rng
+        ... )
     """
 
     def __init__(self, model_config: HybridModelConfig):
@@ -203,11 +205,12 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         use_megatron_fsdp: bool = False,
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
-        data_parallel_random_init: bool = False,
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        *,
+        rng_config,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -219,7 +222,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             use_megatron_fsdp: Whether to use Megatron FSDP
             use_torch_fsdp2: Whether to use Torch FSDP 2.0
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
-            data_parallel_random_init: Whether to use data parallel random initialization
+            rng_config: Authoritative RNG settings for construction and parameter synchronization.
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -240,7 +243,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             use_megatron_fsdp,
             use_torch_fsdp2,
             wrap_with_ddp,
-            data_parallel_random_init,
+            rng_config.data_parallel_random_init,
             mixed_precision_wrapper,
             composed_pre_wrap_hook,
             model_type,

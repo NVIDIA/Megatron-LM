@@ -139,7 +139,11 @@ def load_checkpoint_to_model(args):
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
+    from megatron.training.argument_utils import rng_config_from_args
+
+    model = model_provider(
+        gpt_builder, pre_process=True, post_process=True, rng_config=rng_config_from_args(args)
+    ).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)

@@ -155,7 +155,7 @@ def get_evaluation_dataloader(
     return dataloader
 
 
-def generate_samples(model, config: EvaluationConfig, print_output):
+def generate_samples(model, config: EvaluationConfig, print_output, *, random_seed: int):
     """Text generation using a trained vision language model."""
     args = get_args()
 
@@ -204,7 +204,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed, legacy=True
+            controller, max_batch_size=1, random_seed=random_seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -254,7 +254,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     top_p_sampling=config.top_p,
                     add_BOS=False,
                     temperature=config.temperature,
-                    random_seed=args.seed,
+                    random_seed=random_seed,
                     detokenize_segments=False,
                     data_parallel=True,
             )
@@ -438,7 +438,7 @@ def get_output_path(config, dp_rank):
         return f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
 
 
-def generate_and_write_samples(model, config, print_output=True):
+def generate_and_write_samples(model, config, print_output=True, *, random_seed: int):
     """Generate text and write to an output file."""
     dp_rank = parallel_state.get_data_parallel_rank()
 
@@ -448,7 +448,7 @@ def generate_and_write_samples(model, config, print_output=True):
         print(f"output path: {output_file.name}")
 
     with torch.no_grad():
-        for output in generate_samples(model, config, print_output):
+        for output in generate_samples(model, config, print_output, random_seed=random_seed):
             if is_first_rank():
                 output_file.write(json.dumps(output) + "\n")
                 output_file.flush()
@@ -803,7 +803,9 @@ def run_eval(config, iteration=None):
     return score
 
 
-def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None, print_output=True):
+def run_evaluation_loop(
+    model, configs, output_dir_override=None, iteration=None, print_output=True, *, random_seed: int
+):
     """
     Common evaluation loop used by both online evaluation during training and standalone evaluation.
 
@@ -826,7 +828,9 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
             config.output_path = os.path.join(output_dir_override, args.language_model_type)
 
         # Generate samples and write to file
-        generate_and_write_samples(model, config, print_output=print_output)
+        generate_and_write_samples(
+            model, config, print_output=print_output, random_seed=random_seed
+        )
 
         # Synchronize before evaluation
         torch.distributed.barrier()
@@ -845,20 +849,33 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     args = get_args()
 
     def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
-        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
-                              parallel_output=False)
+        return model_provider(
+            pre_process,
+            post_process,
+            add_encoder=add_encoder,
+            add_decoder=add_decoder,
+            parallel_output=False,
+            rng_config=rng_config,
+        )
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    model = get_model(
+        wrapped_model_provider,
+        model_type=ModelType.encoder_or_decoder,
+        wrap_with_ddp=False,
+        rng_config=rng_config,
+    )
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, rng_config=rng_config)
 
     model = model[0]
     model.eval()
@@ -866,7 +883,7 @@ def eval_tasks():
     configs = get_evaluation_configs()
 
     # Use the common evaluation loop
-    run_evaluation_loop(model, configs, iteration=args.ckpt_step)
+    run_evaluation_loop(model, configs, iteration=args.ckpt_step, random_seed=rng_config.seed)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ Covers the load-time sharded state dict retargeting in
   counterpart keep their fresh initialization.
 """
 
+from megatron.training.argument_utils import rng_config_from_args
 from functools import partial
 from types import SimpleNamespace
 from unittest import mock
@@ -687,7 +688,9 @@ def _run_gpt_to_hybrid_optimizer_load(
             _seed_optimizer_moments(gpt_optimizer, seed=3)
             _configure_checkpoint_args(mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp)
             mock_args.num_layers = num_gpt_layers
-            save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
+            save_checkpoint(
+                10, gpt_model, gpt_optimizer, None, 0, rng_config=rng_config_from_args(mock_args)
+            )
             Utils.destroy_model_parallel()
 
             # Build a hybrid model + optimizer (independently seeded moments) and
@@ -729,7 +732,9 @@ def _run_gpt_to_hybrid_optimizer_load(
                     data_parallel_size=data_parallel_size,
                 )
             try:
-                iteration, _ = load_checkpoint(hybrid_model, hybrid_optimizer, None)
+                iteration, _ = load_checkpoint(
+                    hybrid_model, hybrid_optimizer, None, rng_config=rng_config_from_args(mock_args)
+                )
             finally:
                 if not finetune:
                     destroy_num_microbatches_calculator()

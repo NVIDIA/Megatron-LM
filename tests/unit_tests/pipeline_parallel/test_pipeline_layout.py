@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from megatron.training.argument_utils import rng_config_from_args
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -289,7 +290,12 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         args.save = ckpt_dir
         args.load = ckpt_dir
         save_checkpoint(
-            iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            rng_config=rng_config_from_args(args),
         )
         print(f"save checkpoint done")
 
@@ -307,7 +313,13 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
             is_moe=is_moe,
             with_mtp=with_mtp,
         )
-        load_checkpoint([model_baseline], optimizer, opt_param_scheduler, strict=False)
+        load_checkpoint(
+            [model_baseline],
+            optimizer,
+            opt_param_scheduler,
+            strict=False,
+            rng_config=rng_config_from_args(args),
+        )
 
         forward_backward_func = get_forward_backward_func()
         losses_reduced_baseline = forward_backward_func(

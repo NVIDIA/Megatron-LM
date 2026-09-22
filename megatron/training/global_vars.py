@@ -148,17 +148,26 @@ def _graceful_shutdown(signum, frame):
 
 def set_global_variables(args, build_tokenizer=True):
     """Register args and construct runtime services for args-only callers."""
+    from megatron.training.argument_utils import rng_config_from_args
 
     assert args is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer)
+    initialize_runtime_services(
+        args, build_tokenizer=build_tokenizer, rng_config=rng_config_from_args(args)
+    )
 
 
-def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
+def initialize_runtime_services(
+    args: Namespace, *, build_tokenizer: bool = True, rng_config
+) -> None:
     """Construct services independently of CLI parsing and config construction."""
+
+    rng_config.resolve_cuda_graphs(
+        transformer_impl=args.transformer_impl, cuda_graph_impl=args.cuda_graph_impl, rank=args.rank
+    )
 
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
@@ -179,7 +188,7 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
     if build_tokenizer:
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
+    _set_wandb_writer(args, rng_config=rng_config)
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
@@ -282,7 +291,7 @@ def _set_tensorboard_writer(args):
                   'no TensorBoard logs will be written.', flush=True)
 
 
-def _set_wandb_writer(args):
+def _set_wandb_writer(args, *, rng_config):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
@@ -296,7 +305,8 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        wandb_config = vars(args)
+        from megatron.training.argument_utils import rng_args_snapshot
+        wandb_config = vars(rng_args_snapshot(args, rng_config))
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.

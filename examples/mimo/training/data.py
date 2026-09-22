@@ -284,7 +284,7 @@ def _collate_mock_batch(batch: list[dict[str, object]]) -> dict[str, object]:
 
 
 def build_train_valid_test_data_loaders(
-    args: argparse.Namespace, topology: HeteroTopology
+    args: argparse.Namespace, topology: HeteroTopology, *, random_seed: int
 ) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """Build independent mock DataLoaders for the data-consuming rank role."""
     if getattr(args, "dataset_provider", "mock") != "mock":
@@ -321,6 +321,7 @@ def build_train_valid_test_data_loaders(
         encoder_mbs = args.micro_batch_size * llm_data_parallel_size // args.mimo_encoder_dp
         return _build_split_loaders(
             args,
+            random_seed=random_seed,
             batch_size=encoder_mbs,
             pg_collection=encoder_pgc,
             module_seed_offset=_ENCODER_SEED_OFFSET,
@@ -329,6 +330,7 @@ def build_train_valid_test_data_loaders(
     if language_needs_data:
         return _build_split_loaders(
             args,
+            random_seed=random_seed,
             batch_size=args.micro_batch_size,
             pg_collection=language_pgc,
             module_seed_offset=_LANGUAGE_SEED_OFFSET,
@@ -344,6 +346,7 @@ def _build_split_loaders(
     pg_collection,
     module_seed_offset: int,
     encoder_name: Optional[str],
+    random_seed: int,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
     data_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp
@@ -353,7 +356,7 @@ def _build_split_loaders(
         # CP replicas consume the same full batch before the model shards it;
         # GTP and DP remain distinct data lanes, matching the bridge topology.
         lane_rank //= pg_collection.cp.size()
-    base_seed = args.seed + module_seed_offset + lane_rank
+    base_seed = random_seed + module_seed_offset + lane_rank
     common = _mock_loader_kwargs(args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(

@@ -2,6 +2,7 @@
 
 """Pretrain T5"""
 
+from functools import update_wrapper
 from copy import deepcopy
 from functools import partial
 from typing import Union
@@ -74,6 +75,8 @@ def model_provider(
     add_decoder=True,
     config=None,
     pg_collection=None,
+    *,
+    rng_config,
 ) -> T5Model:
     """Builds the model.
 
@@ -88,10 +91,11 @@ def model_provider(
         T5Model: The returned T5 model
     """
 
+    from megatron.training.argument_utils import rng_args_snapshot
     args = get_args()
     
     if config is None:
-        config = core_transformer_config_from_args(args)
+        config = core_transformer_config_from_args(rng_args_snapshot(args, rng_config))
 
     encoder_config = deepcopy(config)
     encoder_config.num_layers = args.encoder_num_layers
@@ -169,7 +173,7 @@ def get_batch(data_iterator, use_local):
     return tokens_enc, tokens_dec, loss_mask, labels, enc_mask, dec_mask, enc_dec_mask
 
 
-def forward_step(data_iterator, model: T5Model):
+def forward_step(data_iterator, model: T5Model, *, random_seed: int):
     """Forward training step.
 
     Args:
@@ -193,10 +197,10 @@ def forward_step(data_iterator, model: T5Model):
         tokens_enc, tokens_dec, enc_mask, dec_mask, enc_dec_mask, lm_labels=lm_labels
     )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask, random_seed=random_seed)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples: int):
+def train_valid_test_datasets_provider(train_val_test_num_samples: int, *, random_seed: int):
     """Build the train test and validation datasets.
 
     Args:
@@ -208,7 +212,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     tokenizer = build_tokenizer(args)
 
     config = T5MaskedWordPieceDatasetConfig(
-        random_seed=args.seed,
+        random_seed=random_seed,
         sequence_length=args.encoder_seq_length,
         sequence_length_decoder=args.decoder_seq_length,
         blend=get_blend_from_list(args.data_path),
@@ -274,14 +278,17 @@ if __name__ == "__main__":
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, rng_config=full_config.rng)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
-        train_valid_test_datasets_provider,
+        update_wrapper(
+            partial(train_valid_test_datasets_provider, random_seed=full_config.rng.seed),
+            train_valid_test_datasets_provider,
+        ),
         ModelType.encoder_or_decoder,
-        forward_step,
-        model_provider,
+        partial(forward_step, random_seed=full_config.rng.seed),
+        partial(model_provider, rng_config=full_config.rng),
         get_embedding_ranks=t5_embedding_ranks,
         get_position_embedding_ranks=t5_position_embedding_ranks,
     )

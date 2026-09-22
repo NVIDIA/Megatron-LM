@@ -2,6 +2,7 @@
 
 """Pretrain BERT"""
 
+from functools import update_wrapper
 from functools import partial
 
 import torch
@@ -28,14 +29,23 @@ from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
 
 
-def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
+def model_provider(
+    pre_process=True,
+    post_process=True,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    *,
+    rng_config
+):
     """Build the model."""
 
     print_rank_0('building BERT model ...')
 
+    from megatron.training.argument_utils import rng_args_snapshot
     args = get_args()
     if config is None:
-        config = core_transformer_config_from_args(args)
+        config = core_transformer_config_from_args(rng_args_snapshot(args, rng_config))
     num_tokentypes = 2 if args.bert_binary_head else 0
 
     if args.spec is None:
@@ -134,14 +144,16 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, *, random_seed: int
+):
     """Build train, valid, and test datasets."""
     args = get_args()
 
     tokenizer = build_tokenizer(args)
 
     config = BERTMaskedWordPieceDatasetConfig(
-        random_seed=args.seed,
+        random_seed=random_seed,
         sequence_length=args.seq_length,
         blend=get_blend_from_list(args.data_path),
         blend_per_split=[
@@ -186,8 +198,15 @@ if __name__ == "__main__":
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, rng_config=full_config.rng)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
-    pretrain(full_config, train_valid_test_datasets_provider,
-             ModelType.encoder_or_decoder,
-             forward_step, model_provider)
+    pretrain(
+        full_config,
+        update_wrapper(
+            partial(train_valid_test_datasets_provider, random_seed=full_config.rng.seed),
+            train_valid_test_datasets_provider,
+        ),
+        ModelType.encoder_or_decoder,
+        forward_step,
+        partial(model_provider, rng_config=full_config.rng),
+    )

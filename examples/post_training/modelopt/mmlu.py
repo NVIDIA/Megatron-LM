@@ -82,8 +82,10 @@ if __name__ == "__main__":
             "no_load_optim": True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import rng_config_from_args
+    rng_config = rng_config_from_args(args)
+    initialize_runtime_services(args, rng_config=rng_config)
+    initialize_megatron(rng_config=rng_config)
 
     args = get_args()
 
@@ -102,8 +104,9 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=rng_config),
         wrap_with_ddp=False,
+        rng_config=rng_config,
     )
     report_current_memory_info()
 
@@ -116,7 +119,13 @@ if __name__ == "__main__":
     tokenizer = get_hf_tokenizer()
 
     if args.load is not None:
-        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(
+            model,
+            None,
+            None,
+            strict=not args.untie_embeddings_and_output_weights,
+            rng_config=rng_config,
+        )
         print_rank_0("Done loading checkpoint")
 
     # Fold the scalars into weight for speedup.

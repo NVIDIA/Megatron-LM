@@ -600,6 +600,30 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def rng_config_from_args(args: Namespace) -> RNGConfig:
+    """Copy RNG policy at a legacy CLI/YAML boundary."""
+    return _default_config_from_args(RNGConfig, args)
+
+
+def model_seed_args(args: Namespace, random_seed: int) -> Namespace:
+    """Supply the owned seed to legacy model-config factories without mutating args."""
+    from copy import copy
+
+    snapshot = copy(args)
+    snapshot.seed = random_seed
+    return snapshot
+
+
+def rng_args_snapshot(args: Namespace, rng_config: RNGConfig) -> Namespace:
+    """Project owned RNG settings into detached legacy construction/metadata input."""
+    from copy import copy
+
+    snapshot = copy(args)
+    for config_field in fields(rng_config):
+        setattr(snapshot, config_field.name, getattr(rng_config, config_field.name))
+    return snapshot
+
+
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
@@ -636,7 +660,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         scheduler=_default_config_from_args(SchedulerConfig, args),
         ddp=ddp_config,
         dist=_default_config_from_args(DistributedInitConfig, args),
-        rng=_default_config_from_args(RNGConfig, args),
+        rng=rng_config_from_args(args),
         logger=_default_config_from_args(LoggerConfig, args),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=ProfilingConfig(**prof_kwargs),
@@ -699,7 +723,7 @@ def inference_cfg_container_from_args(
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         inference=inference_cfg_from_args(args),
         dist=_default_config_from_args(DistributedInitConfig, args),
-        rng=_default_config_from_args(RNGConfig, args),
+        rng=rng_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
         logger=_default_config_from_args(LoggerConfig, args),
         profiling=ProfilingConfig(**prof_kwargs),

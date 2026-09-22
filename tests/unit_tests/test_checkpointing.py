@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
+from megatron.training.argument_utils import rng_config_from_args
 import os
 from types import SimpleNamespace
 from typing import Optional
@@ -545,6 +546,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 cp_group=cp_group,
+                rng_config=rng_config_from_args(args),
             )
         assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
 
@@ -563,14 +565,27 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize("owned_rng", [False, True])
 def test_load_checkpoint(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, owned_rng
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
+    rng_config = rng_config_from_args(args)
+    if owned_rng:
+        rng_config.seed = 987
+        rng_config.data_parallel_random_init = True
+        for name in (
+            "seed",
+            "te_rng_tracker",
+            "inference_rng_tracker",
+            "data_parallel_random_init",
+        ):
+            if hasattr(args, name):
+                delattr(args, name)
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -590,9 +605,21 @@ def test_load_checkpoint(
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
         num_floating_point_operations_so_far = 456
 
-        save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
-        )
+        expected_cpu_rng = torch.get_rng_state().clone()
+        with mock.patch("torch.save", wraps=torch.save) as serialized:
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                rng_config=rng_config,
+            )
+        # Legacy torch checkpoints serialize on the DP writer only.
+        if serialized.called:
+            assert rng_config_from_args(serialized.call_args.args[0]["args"]) == rng_config
+        else:
+            assert torch.distributed.get_rank() != 0
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
@@ -601,9 +628,13 @@ def test_load_checkpoint(
 
         # Load checkpoint
         loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            [new_model], new_optimizer, new_opt_param_scheduler, strict=True, rng_config=rng_config
         )
 
+        assert torch.equal(torch.get_rng_state(), expected_cpu_rng)
+        if owned_rng:
+            assert not hasattr(args, "seed")
+            assert not hasattr(args, "data_parallel_random_init")
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
 
@@ -654,7 +685,12 @@ def test_load_checkpoint_override_opt_param_scheduler(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
+            iteration,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            rng_config=rng_config_from_args(args),
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
@@ -670,7 +706,11 @@ def test_load_checkpoint_override_opt_param_scheduler(
 
         # Load checkpoint and verify runtime overrides are restored.
         loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
+            [new_model],
+            new_optimizer,
+            new_opt_param_scheduler,
+            strict=True,
+            rng_config=rng_config_from_args(args),
         )
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
@@ -682,7 +722,9 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
-        loaded_iter_none, loaded_flops_none = load_checkpoint([new_model], None, None, strict=True)
+        loaded_iter_none, loaded_flops_none = load_checkpoint(
+            [new_model], None, None, strict=True, rng_config=rng_config_from_args(args)
+        )
         assert loaded_iter_none == iteration
         assert loaded_flops_none == num_floating_point_operations_so_far
 
@@ -717,7 +759,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
-            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_fp_ops,
+                rng_config=rng_config_from_args(args),
+            )
 
         second_job_mock_metadata = {
             **base_metadata,
@@ -729,11 +778,24 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=second_job_mock_metadata,
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
-            load_checkpoint([model], optimizer, opt_param_scheduler, strict=True)
+            load_checkpoint(
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                strict=True,
+                rng_config=rng_config_from_args(args),
+            )
             assert optimizer._called_metadata[-1] == first_job_mock_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
-            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_fp_ops,
+                rng_config=rng_config_from_args(args),
+            )
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
         assert optimizer._called_metadata == model._called_metadata

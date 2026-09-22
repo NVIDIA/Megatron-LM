@@ -9,10 +9,22 @@ from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import count_parameters_in_layer
 
 
-def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+def hybrid_builder(
+    args,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    config=None,
+    pg_collection=None,
+    *,
+    random_seed: int,
+):
+    from megatron.training.argument_utils import model_seed_args
     print_rank_0('building Hybrid model ...')
     if config is None:
-        config = core_transformer_config_from_args(args, TransformerConfig)
+        config = core_transformer_config_from_args(
+            model_seed_args(args, random_seed), TransformerConfig
+        )
 
     if config.transformer_impl == "inference_optimized":
         hybrid_stack_spec = hybrid_inference_stack_spec

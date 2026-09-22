@@ -138,6 +138,7 @@ class LogitsSaverHooks:
         save_dir: str,
         k: int,
         *,
+        random_seed: int,
         p: Optional[float] = None,
         min_k: int = 1,
         save_dtype: str = 'fp16',
@@ -180,7 +181,7 @@ class LogitsSaverHooks:
         # Dataset-identity hash + serialised metadata, written as the
         # first member of every batched tar so the student loader can
         # verify alignment per-tar without an extra tarfile.open.
-        self.dataset_hash, self._dataset_identifiers = compute_dataset_hash()
+        self.dataset_hash, self._dataset_identifiers = compute_dataset_hash(random_seed=random_seed)
         self.metadata_dict: Dict[str, Any] = {
             "hash": self.dataset_hash,
             "identifiers": self._dataset_identifiers,
