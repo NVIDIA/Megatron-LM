@@ -294,7 +294,7 @@ class DBuffer:
             A DBuffer whose real local storage matches ``placements``. Ranges
             corresponding to meta tensors are left uninitialized.
         """
-        tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
+        tensors = tuple(tensors)
         if not tensors:
             raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
 
@@ -312,20 +312,26 @@ class DBuffer:
             device=mesh.device_type,
             block_size=block_size,
         )
-        # Only logical tensor ranges are initialized. Padding and layout gaps are not
-        # observable through get_tensor_view() and can remain unspecified.
         for index, tensor in enumerate(tensors):
-            owned_range = buffer._get_owned_range(index)
-            if owned_range is None or tensor.is_meta:
-                continue
-
-            source_slice = tensor.view(-1).narrow(
-                0, owned_range.tensor_relative_offset, owned_range.numel
-            )
-            buffer.local_buffer.narrow(
-                0, owned_range.buffer_relative_offset, owned_range.numel
-            ).copy_(source_slice)
+            buffer.copy_from(index, tensor)
         return buffer
+
+    def copy_from(self, index: int, tensor: torch.Tensor) -> None:
+        """Copy a full logical tensor's local owned range into this buffer.
+
+        Meta tensors leave their owned range unspecified. Padding and layout gaps
+        are not observable through ``get_tensor_view()`` and remain unspecified.
+        """
+        owned_range = self._get_owned_range(index)
+        if owned_range is None or tensor.is_meta:
+            return
+        tensor = tensor.detach().contiguous()
+        source_slice = tensor.view(-1).narrow(
+            0, owned_range.tensor_relative_offset, owned_range.numel
+        )
+        self.local_buffer.narrow(0, owned_range.buffer_relative_offset, owned_range.numel).copy_(
+            source_slice
+        )
 
     def _create_or_validate_out(
         self,

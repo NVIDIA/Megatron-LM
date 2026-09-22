@@ -218,12 +218,7 @@ def markdown_report(report: dict) -> str:
         f"Workload: `{report['measurement'].get('kernel_case') or report['measurement']['recipe']}`. "
         f"Status: **{report['status']}**.",
         "",
-        (
-            "Diagnostic only: external telemetry accompanies event timing, followed by profiles. "
-            "Ineligible for performance approval and baseline publication."
-            if report["measurement"].get("diagnostic_only")
-            else "Timings are unprofiled; each pair uses independent fresh processes."
-        ),
+        "Timings are unprofiled; each pair uses independent fresh processes.",
         "",
         "| Comparison | Median ratio | Paired bootstrap 95% interval | Limit | Status |",
         "| --- | ---: | --- | ---: | --- |",
@@ -277,24 +272,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--hidden-size", type=int, default=8192)
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
-    parser.add_argument(
-        "--diagnostics",
-        action="store_true",
-        help="Kernel-only telemetry and post-timing profiles; ineligible for performance gates",
-    )
     parser.add_argument("--max-overhead-ratio", type=float)
     parser.add_argument("--max-regression-ratio", type=float)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
-    if args.diagnostics and (
-        not args.kernel_case
-        or args.command
-        or args.max_overhead_ratio is not None
-        or args.max_regression_ratio is not None
-    ):
-        parser.error(
-            "Diagnostics require the built-in kernel runner and cannot use performance limits"
-        )
     if min(args.pairs, args.steps, args.gpus, args.tokens, args.hidden_size) < 1 or args.warmup < 0:
         parser.error("pairs, steps, and gpus must be positive; warmup must be nonnegative")
     if not args.kernel_case:
@@ -318,8 +299,6 @@ def main(argv: list[str] | None = None) -> int:
         command = [sys.executable, str(Path(__file__).with_name("run_kernel.py").resolve())]
         for option in ("kernel_case", "phase", "tokens", "hidden_size", "dtype", "warmup", "steps"):
             command.extend(["--" + option.replace("_", "-"), str(getattr(args, option))])
-        if args.diagnostics:
-            command.append("--diagnostics")
     elif not command:
         command = [sys.executable, str(Path(__file__).with_name("run_training.py").resolve())]
     checkouts = {"head": Path.cwd()}
@@ -348,8 +327,6 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         report["measurement"]["timing"] = "cuda_event_ms"
-        if args.diagnostics:
-            report["measurement"]["diagnostic_only"] = True
     _write(report, output)
     try:
         for pair in range(args.pairs):
@@ -432,8 +409,6 @@ def main(argv: list[str] | None = None) -> int:
             if "fail" in gated
             else "inconclusive" if "inconclusive" in gated else "pass" if gated else "reported"
         )
-        if args.diagnostics:
-            report["status"] = "diagnostic"
         if any(source["dirty"] for source in sources.values()) or report["machine"]["gpus"] is None:
             report["status"] = "inconclusive"
             report["error"] = "Clean source and GPU provenance are required for a gating result"
@@ -444,9 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     print(markdown_report(report))
     if args.report_only and report["status"] != "error" and "error" not in report:
         return 0
-    return {"pass": 0, "reported": 0, "diagnostic": 0, "fail": 1, "error": 1, "inconclusive": 2}[
-        report["status"]
-    ]
+    return {"pass": 0, "reported": 0, "fail": 1, "error": 1, "inconclusive": 2}[report["status"]]
 
 
 if __name__ == "__main__":

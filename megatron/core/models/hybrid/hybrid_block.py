@@ -36,6 +36,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -66,6 +67,8 @@ class HybridStackSubmodules:
     gdn2_layer: ModuleSpec | None = None
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    csa_layer: ModuleSpec | type | None = None
+    csa_qk_layernorm_layer: ModuleSpec | type | None = None
     mla_layer: Union[ModuleSpec, type] = IdentityOp
     mla_fused_down_proj_layer: ModuleSpec | None = None
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
@@ -101,6 +104,9 @@ class HybridStack(MegatronModule):
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
         boundary_layout (CPLayout, optional): CP layout at the stack boundary.
+        mtp_layer_number (int, optional): enclosing MTP depth for nested MoE metrics.
+        hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
+            to select hash-routed MoE layers.
     """
 
     def __init__(
@@ -116,6 +122,8 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        mtp_layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
         boundary_layout: CPLayout | None = None,
@@ -155,6 +163,7 @@ class HybridStack(MegatronModule):
         boundary_layout = (
             self.config.linear_cp_layout if boundary_layout is None else boundary_layout
         )
+        self.mtp_layer_number = mtp_layer_number
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -239,6 +248,27 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif type(layer_config) is layer_utils.CSALayerConfig:
+                    csa_layer_spec = (
+                        submodules.csa_qk_layernorm_layer
+                        if layer_config.qk_layernorm
+                        else submodules.csa_layer
+                    )
+                    if csa_layer_spec is None:
+                        raise ValueError(
+                            "C/H/W layers require the hybrid stack spec to provide `csa_layer` "
+                            "or, with qk_layernorm enabled, `csa_qk_layernorm_layer`."
+                        )
+                    layer = build_module(
+                        csa_layer_spec,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
                     mla_layer_spec = (
                         submodules.mla_fused_down_proj_layer
@@ -277,6 +307,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
+                        hash_moe_layer_threshold=hash_moe_layer_threshold,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
@@ -303,7 +334,8 @@ class HybridStack(MegatronModule):
                     raise ValueError(
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
                     )
-
+            if self.is_mtp_layer and self.mtp_layer_number is not None:
+                self._set_mtp_layer_number_for_moe_metrics(layer, self.mtp_layer_number)
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
@@ -360,6 +392,25 @@ class HybridStack(MegatronModule):
         the source of truth.
         """
         return get_layer_type_list_from_layer_config_list(self.layer_config_list)
+
+    @staticmethod
+    def _set_mtp_layer_number_for_moe_metrics(
+        layer: torch.nn.Module, mtp_layer_number: int
+    ) -> None:
+        """Propagate the enclosing MTP depth to nested MTP MoE routers."""
+        for module in layer.modules():
+            router = getattr(module, "router", None)
+            if router is not None and getattr(router, "is_mtp_layer", False):
+                router.mtp_layer_number = mtp_layer_number
+
+    @staticmethod
+    def _uses_hash_routing(layer: torch.nn.Module) -> bool:
+        """Return whether a (possibly mHC-wrapped) TransformerLayer uses hash routing."""
+        inner_layer = getattr(layer, "inner_layer", layer)
+        if not isinstance(inner_layer, TransformerLayer):
+            return False
+        router = getattr(getattr(inner_layer, "mlp", None), "router", None)
+        return bool(getattr(router, "is_hash_layer", False))
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -442,6 +493,7 @@ class HybridStack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        input_ids: Optional[Tensor] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -457,6 +509,8 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            input_ids (Tensor, optional): Token IDs forwarded to hash-routed
+                TransformerLayer instances. Defaults to None.
         Returns:
             Tensor: the output tensor.
         """
@@ -566,6 +620,7 @@ class HybridStack(MegatronModule):
                     attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
@@ -608,6 +663,8 @@ class HybridStack(MegatronModule):
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                                 physical_layer_idx, hidden_states
                             )
+                        # Keep both residuals in the layer's layout, inside the CP conversions.
+                        residual_accumulator = hidden_states
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
@@ -629,6 +686,8 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
+                                if input_ids is not None and self._uses_hash_routing(layer):
+                                    layer_kwargs["input_ids"] = input_ids
                                 hidden_states, _ = layer(**layer_kwargs)
                             elif layer_cp_metadata is not None:
                                 hidden_states = layer(
@@ -648,6 +707,7 @@ class HybridStack(MegatronModule):
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
+                        observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if cp_layout_state is not None:
                             hidden_states = cp_layout_state.finalize_layer(
                                 physical_layer_idx, hidden_states
