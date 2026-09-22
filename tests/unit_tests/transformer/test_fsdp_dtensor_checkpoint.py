@@ -20,7 +20,7 @@ Tests cover:
   3. Helper functions: get_expert_index_from_key, flatten_state_dict, etc.
 
 Note: handle_swiglu_in_state_dict and handle_gdn_in_state_dict require
-HAVE_MEGATRON_FSDP=True and a real distributed environment with DTensors.
+Megatron-FSDP and a real distributed environment with DTensors.
 We test their internal helper logic (is_swiglu_key, _key_in_glu_layer,
 _match_gdn_key) by extracting the logic into standalone testable units.
 For the checkpoint_inspector.py conversion functions, we test the
