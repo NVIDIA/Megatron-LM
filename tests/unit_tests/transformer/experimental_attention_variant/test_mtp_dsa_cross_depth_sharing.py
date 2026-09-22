@@ -170,18 +170,13 @@ def test_cross_depth_sharing_accepts_full_iteration_graph(shared_components):
     "shared_components",
     [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS],
 )
-def test_cross_depth_sharing_accepts_moe_only_graph(shared_components):
+def test_cross_depth_sharing_accepts_moe_router_graph(shared_components):
     config = _make_config(
         mtp_repeated_layer_shared_components=shared_components,
         cuda_graph_impl="transformer_engine",
-        cuda_graph_modules=["moe"],
+        cuda_graph_modules=["moe_router"],
         num_moe_experts=4,
         moe_grouped_gemm=True,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="hybridep",
-        moe_expert_rank_capacity_factor=1.2,
-        moe_paged_stash=True,
-        use_transformer_engine_op_fuser=True,
     )
 
     assert config.mtp_repeated_layer_shared_components == shared_components
