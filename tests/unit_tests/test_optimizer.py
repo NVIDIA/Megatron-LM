@@ -82,6 +82,17 @@ class Net(nn.Module):
         return x
 
 
+class WideResidualRetentionOptimizerNet(nn.Module):
+    """Small parameter set covering retention and ordinary weight-decay routing."""
+
+    def __init__(self):
+        super().__init__()
+        self.retention = nn.Parameter(torch.ones(128))
+        self.retention.is_wide_residual_retention_parameter = True
+        self.ordinary_vector = nn.Parameter(torch.ones(6))
+        self.ordinary_matrix = nn.Parameter(torch.ones(6, 6))
+
+
 def test_copy_optimizer_param_metadata_preserves_allreduce():
     source = torch.empty(1)
     destination = torch.empty_like(source)
@@ -177,6 +188,45 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
     assert wd_mults == {1.0, 0.0}
+
+
+@pytest.mark.parametrize("apply_wd_to_qk_layernorm", [False, True])
+def test_standard_overrides_apply_weight_decay_to_wide_residual_retention(
+    monkeypatch, apply_wd_to_qk_layernorm
+):
+    """Retention logits inherit ordinary WD despite being represented as 1-D parameters."""
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(0, value),
+    )
+    net = WideResidualRetentionOptimizerNet()
+    config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        weight_decay=0.1,
+        apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm,
+    )
+    overrides = get_standard_config_overrides(config)
+    check_config_overrides_consistency(config, overrides)
+    param_groups = _get_param_groups([net], config, overrides)
+
+    def group_for(parameter):
+        matches = [
+            group for group in param_groups if any(param is parameter for param in group['params'])
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    retention_group = group_for(net.retention)
+    vector_group = group_for(net.ordinary_vector)
+    matrix_group = group_for(net.ordinary_matrix)
+    assert retention_group['wd_mult'] == 1.0
+    assert vector_group['wd_mult'] == 0.0
+    assert matrix_group['wd_mult'] == 1.0
+    assert config.weight_decay * retention_group['wd_mult'] == pytest.approx(0.1)
+    assert config.weight_decay * vector_group['wd_mult'] == 0.0
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
