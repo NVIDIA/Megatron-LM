@@ -3250,7 +3250,10 @@ class TECudaGraphHelper:
                 raise RuntimeError(
                     "DSA metric tracker must be initialized before CUDA Graph capture."
                 )
-        if self.config.moe_paged_stash and is_chunk_cuda_graph_granularity(self.config):
+        # getattr: unit tests drive this entry point with stand-in configs.
+        if getattr(self.config, "moe_paged_stash", False) and is_chunk_cuda_graph_granularity(
+            self.config
+        ):
             from megatron.core.transformer.moe.paged_stash import (
                 paged_stash_prepare_for_cuda_graph_capture,
             )
