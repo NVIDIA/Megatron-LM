@@ -287,13 +287,9 @@ def test_read_train_state_returns_correct_train_state(
 
         assert isinstance(loaded_state, TrainState)
         assert loaded_state.iteration == populated_train_state.iteration
-        assert (
-            loaded_state.consumed_train_samples == populated_train_state.consumed_train_samples
-        )
+        assert loaded_state.consumed_train_samples == populated_train_state.consumed_train_samples
         assert loaded_state.skipped_train_samples == populated_train_state.skipped_train_samples
-        assert (
-            loaded_state.consumed_valid_samples == populated_train_state.consumed_valid_samples
-        )
+        assert loaded_state.consumed_valid_samples == populated_train_state.consumed_valid_samples
         assert loaded_state.num_floating_point_operations_so_far == num_fp_ops
         assert loaded_state.do_train == populated_train_state.do_train
         assert loaded_state.do_valid == populated_train_state.do_valid
