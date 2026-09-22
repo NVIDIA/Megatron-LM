@@ -115,13 +115,13 @@ class TestMcoreAdapterDense:
             pg_collection=self.pg_collection,
         )
         # FSDP installs DTensor shards; check the parameters used for compute.
-        parameters = (
-            parameter.unsharded
-            for module in model.module.modules()
-            if isinstance(module, FsdpModule)
-            for group in module.parameter_groups
-            for parameter in group.fsdp_parameters
-        )
+        parameters = []
+        for module in model.module.modules():
+            if not isinstance(module, FsdpModule):
+                continue
+            for group in module.parameter_groups:
+                for parameter in group.fsdp_parameters:
+                    parameters.append(parameter.unsharded)
         assert any(isinstance(p, MXFP8Tensor) for p in parameters) == fp8_param_gather
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
