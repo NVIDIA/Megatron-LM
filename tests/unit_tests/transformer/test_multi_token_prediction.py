@@ -48,6 +48,7 @@ from megatron.core.transformer.multi_token_prediction import (
     process_mtp_loss,
     roll_tensor,
     roll_tensor_precomputed_embeddings,
+    tie_output_layer_state_dict,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -4149,3 +4150,116 @@ class TestLearnedOutputContract:
         for tensor in (hidden_states, head_fn, base, scale):
             assert tensor.grad is not None
             assert torch.count_nonzero(tensor.grad) > 0
+
+
+class TestBorrowedOutputLayerAllocation:
+    """``output_layer.weight`` must be allocated iff the output projection owns it.
+
+    A tied output projection (``share_embeddings_and_output_weights=True``) borrows
+    the shared embedding weight whenever ``pre_process or mtp_process``
+    (``LanguageModule.shared_embedding_or_output_weight``), so on those stages
+    ``output_layer`` must not own a trainable weight: no forward expression ever
+    reads it, and a trainable-but-unused parameter breaks FSDP (``Missing gradient
+    for FSDP parameter ('module.output_layer.weight',)``) while silently rotting
+    under DDP weight decay. The trigger configuration is a tied MTP stage that is
+    not ``pre_process`` (MTP under PP > 1).
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_model(self, share_embeddings_and_output_weights, pre_process, mtp_num_layers=None):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+        )
+        transformer_layer_spec = get_gpt_layer_local_spec()
+        mtp_block_spec = (
+            get_gpt_mtp_block_spec(
+                config=config, spec=transformer_layer_spec, use_transformer_engine=False
+            )
+            if mtp_num_layers
+            else None
+        )
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=128,
+            max_sequence_length=32,
+            pre_process=pre_process,
+            post_process=True,
+            share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+            position_embedding_type="rope",
+            mtp_block_spec=mtp_block_spec,
+        )
+
+    @pytest.mark.parametrize(
+        "share_embeddings_and_output_weights, pre_process, mtp_num_layers",
+        [
+            pytest.param(True, True, None, id="tied-first-stage-borrows"),
+            pytest.param(True, False, 1, id="tied-mtp-stage-borrows"),
+            pytest.param(True, False, None, id="tied-last-stage-owns-duplicate"),
+            pytest.param(False, False, 1, id="untied-mtp-stage-owns"),
+            pytest.param(False, True, None, id="untied-first-stage-owns"),
+        ],
+    )
+    def test_own_weight_iff_not_borrowed(
+        self, share_embeddings_and_output_weights, pre_process, mtp_num_layers
+    ):
+        model = self._build_model(share_embeddings_and_output_weights, pre_process, mtp_num_layers)
+        if mtp_num_layers:
+            # The trigger stage: MTP on a non-pre_process stage.
+            assert model.mtp_process and not model.pre_process
+        borrowed = share_embeddings_and_output_weights and (model.pre_process or model.mtp_process)
+
+        if borrowed:
+            assert model.output_layer.weight is None
+            assert not any(
+                name.endswith("output_layer.weight") for name, _ in model.named_parameters()
+            )
+        else:
+            assert isinstance(model.output_layer.weight, torch.nn.Parameter)
+
+        # Whatever the projection runs with must always exist.
+        assert model.shared_embedding_or_output_weight() is not None
+
+    def test_tied_mtp_state_dict_has_no_output_layer_weight(self):
+        # The trigger configuration: tied embeddings, MTP stage, not pre_process.
+        model = self._build_model(True, pre_process=False, mtp_num_layers=1)
+        shared_weight = model.shared_embedding_or_output_weight()
+        assert shared_weight is model.embedding.word_embeddings.weight
+
+        assert "output_layer.weight" not in model.state_dict()
+        assert "embedding.word_embeddings.weight" in model.state_dict()
+
+        # The sharded state dict exercises the checkpoint tie path, which asserts
+        # that tied MTP stages carry no `output_layer.weight` key.
+        sharded_state_dict = model.sharded_state_dict()
+        assert "output_layer.weight" not in sharded_state_dict
+        assert "embedding.word_embeddings.weight" in sharded_state_dict
+
+        # The MTP output-layer tie is a no-op for a borrowed weight instead of
+        # inventing a key for a tensor this stage does not own.
+        tie_output_layer_state_dict(
+            sharded_state_dict, shared_weight, "output_layer.weight", None, None
+        )
+        assert "output_layer.weight" not in sharded_state_dict
+
+    def test_untied_mtp_state_dict_keeps_output_layer_weight(self):
+        model = self._build_model(False, pre_process=False, mtp_num_layers=1)
+        sharded_state_dict = model.sharded_state_dict()
+        assert "output_layer.weight" in sharded_state_dict
+
+        # With an own weight, the tie path keeps the key and marks it as a replica.
+        tie_output_layer_state_dict(
+            sharded_state_dict, model.output_layer.weight, "output_layer.weight", None, None
+        )
+        output_layer_entry = sharded_state_dict["output_layer.weight"]
+        assert output_layer_entry.key == "output_layer.weight"
+        assert output_layer_entry.replica_id == (1, 0, 0)
