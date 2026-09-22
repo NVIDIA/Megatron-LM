@@ -19,12 +19,7 @@ except ImportError:
 
 
 def model_provider(
-    model_builder: Callable,
-    pre_process=True,
-    post_process=True,
-    vp_stage: Optional[int] = None,
-    config=None,
-    pg_collection=None,
+    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
     *,
     profiling: ProfilingConfig,
 ) -> Union[GPTModel, HybridModel]:

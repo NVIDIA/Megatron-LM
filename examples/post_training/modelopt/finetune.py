@@ -536,6 +536,7 @@ def non_loss_data_func(model: GPTModel):
             print(e)
 
 
+
 def forward_step(data_iterator, model: GPTModel):
     """Forward training step.
 

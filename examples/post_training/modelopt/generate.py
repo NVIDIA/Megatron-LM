@@ -130,6 +130,7 @@ if __name__ == "__main__":
 
     tokenizer = get_hf_tokenizer()
 
+
     if args.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")

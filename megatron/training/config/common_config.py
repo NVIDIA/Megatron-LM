@@ -43,10 +43,10 @@ class ProfilingConfig:
 
     pytorch_profiler_collect_shapes: bool = False
     """Collect tensor shape in pytorch profiler."""
-
+  
     pytorch_profiler_collect_callstack: bool = False
     """Collect callstack in pytorch profiler."""
-
+  
     pytorch_profiler_collect_chakra: bool = False
     """Collect chakra trace in pytorch profiler."""
 

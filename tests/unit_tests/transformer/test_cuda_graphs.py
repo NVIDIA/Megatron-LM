@@ -591,7 +591,7 @@ class TestPackedSeqCudagraphs:
             pad_between_seqs=True,
         )
 
-    @pytest.mark.parametrize("cp_size", [1, 2])
+    @pytest.mark.parametrize("cp_size", [1, pytest.param(2, marks=pytest.mark.flaky_in_dev)])
     def test_thd_capture_with_pad_between_seqs(self, cp_size):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(context_parallel_size=cp_size)

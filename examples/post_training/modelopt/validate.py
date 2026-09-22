@@ -28,6 +28,7 @@ from model_provider import model_provider
 warnings.filterwarnings('ignore')
 
 
+
 def add_ar_validation_args(parser):
     """Add additional arguments for ModelOpt acceptance rate validation."""
     group = parser.add_argument_group(title='ModelOpt ar validation')
@@ -89,6 +90,8 @@ def report_current_memory_info():
     torch.distributed.barrier()
 
 
+
+
 if __name__ == "__main__":
     args = parse_and_validate_args(extra_args_provider=add_ar_validation_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
@@ -127,6 +130,7 @@ if __name__ == "__main__":
     if args.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
+
 
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()

@@ -448,6 +448,8 @@ def test_hetero_mimo_20l_checkpoint_round_trip_is_exact():
             str(round_trip_root),
             "--save-interval",
             "1",
+            "--exit-interval",
+            "1",
             "--load",
             str(source_root),
             resave_after_load=True,

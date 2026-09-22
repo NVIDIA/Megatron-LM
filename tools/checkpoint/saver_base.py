@@ -175,7 +175,7 @@ class MegatronCheckpointSaverBase:
         mpu.set_tensor_model_parallel_rank(0)
         mpu.set_pipeline_model_parallel_rank(0)
         mpu.set_expert_model_parallel_rank(0)
-
+        
         # For backward compatibility during local parallel states refactoring
         fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
         fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
@@ -189,7 +189,7 @@ class MegatronCheckpointSaverBase:
         mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
         mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
         mpu._EXPERT_DATA_PARALLEL_GROUP = fake_dp_ep_group
-
+        
         try:
             import torch_llm_debug_tools
             torch_llm_debug_tools.vscode_debugger_local_init()
@@ -357,19 +357,10 @@ class MegatronCheckpointSaverBase:
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
-                    save_checkpoint(
-                        self.md.iteration,
-                        [self.get_local_model(pp_rank, ep_rank, tp_rank)],
-                        None,
-                        None,
-                        num_floating_point_operations_so_far=0,
-                        pipeline_rank=pp_rank,
-                        pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
-                        expert_rank=ep_rank,
-                        expert_parallel=self.args.target_expert_parallel_size > 1,
-                        tensor_rank=tp_rank,
-                        profiling=self.profiling,
-                    )
+                    save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
+                        pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
+                        expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
+                        tensor_rank=tp_rank, profiling=self.profiling)
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 
@@ -539,6 +530,7 @@ class MegatronCheckpointSaverBase:
 
                 total_layer_num = total_layer_num + 1
                 self.check_message(msg)
+
 
             if pp_rank == self.args.target_pipeline_parallel_size - 1:
                 msg = self.queue_get("final norm")

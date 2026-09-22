@@ -100,6 +100,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Invalid load checkpoint directory: {args.load}")
 
+
     # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
     # Only the last pp stage may have extra_modules, hence broadcast from the last rank.
     export_extra_modules = hasattr(unwrapped_model, "eagle_module") or hasattr(

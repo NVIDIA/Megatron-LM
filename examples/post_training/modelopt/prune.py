@@ -194,7 +194,8 @@ if __name__ == "__main__":
         modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
     )
     model = get_model(
-        functools.partial(model_provider, prune_builder, profiling=profiling), wrap_with_ddp=False
+        functools.partial(model_provider, prune_builder, profiling=profiling),
+        wrap_with_ddp=False,
     )
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")

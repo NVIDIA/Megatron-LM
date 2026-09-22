@@ -145,17 +145,8 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
     return train_dataloader, valid_dataloader
 
 
-def _train(
-    model,
-    optimizer,
-    opt_param_scheduler,
-    forward_step,
-    train_dataloader,
-    valid_dataloader,
-    end_of_epoch_callback,
-    *,
-    profiling,
-):
+def _train(model, optimizer, opt_param_scheduler, forward_step,
+           train_dataloader, valid_dataloader, end_of_epoch_callback, *, profiling):
     """Train the model."""
     args = get_args()
     timers = get_timers()
@@ -204,26 +195,20 @@ def _train(
             params_norm = None
             if args.log_params_norm:
                 params_norm = calc_params_l2_norm(model)
-            report_memory_flag = training_log(
-                losses_dict,
-                losses_dict_sum,
-                optimizer.param_groups[0]['lr'],
-                iteration,
-                optimizer.get_loss_scale().item(),
-                report_memory_flag,
-                skipped_iter,
-                grad_norm,
-                params_norm,
-                num_zeros_in_grad,
-                profiling=profiling,
-            )
+            report_memory_flag = training_log(losses_dict, losses_dict_sum,
+                                              optimizer.param_groups[0]['lr'],
+                                              iteration,
+                                              optimizer.get_loss_scale().item(),
+                                              report_memory_flag, skipped_iter,
+                                              grad_norm, params_norm, num_zeros_in_grad,
+                                              profiling=profiling)
 
             # Autoresume
             if args.adlr_autoresume and \
                (iteration % args.adlr_autoresume_interval == 0):
-                check_adlr_autoresume_termination(
-                    iteration, model, optimizer, opt_param_scheduler, profiling=profiling
-                )
+                check_adlr_autoresume_termination(iteration, model,
+                                                  optimizer, opt_param_scheduler,
+                                                  profiling=profiling)
 
             # Checkpointing
             saved_checkpoint = False
@@ -320,16 +305,9 @@ def finetune(train_valid_datasets_provider, model_provider,
 
     # Finetune the model.
     if args.epochs > 0:
-        _train(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            forward_step,
-            train_dataloader,
-            valid_dataloader,
-            end_of_epoch_callback,
-            profiling=profiling,
-        )
+        _train(model, optimizer, opt_param_scheduler, forward_step,
+               train_dataloader, valid_dataloader, end_of_epoch_callback,
+               profiling=profiling)
     # Or just evaluate.
     else:
         if end_of_epoch_callback is not None:
