@@ -345,7 +345,7 @@ update_gtp_config(
 )
 ```
 
-`training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction, defaulting to `1` (the minimum needed for equal-sized AG/RS shards) when no low-precision tile size applies. The other knobs are usually left at defaults.
+`training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction, defaulting to `1` (the minimum needed for equal-sized AG/RS shards) when no low-precision tile size applies. Use `--gtp-remat-pad-for-alignment` to override this value; `0` disables padding and requires rows to divide evenly across GTP ranks. The other knobs are usually left at defaults.
 
 GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enabled automatically. The ownership and ordering protocol is described in [§3.6](#cross-graph-backward-reduce-scatter-overlap).
 
