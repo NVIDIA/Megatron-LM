@@ -114,6 +114,14 @@ _LOADED_ITERATION = None
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
+_WIDE_RESIDUAL_ARG_DEFAULTS = (
+    ('wide_residual_num_streams', None),
+    ('wide_residual_streamwise_sigmoid_init_scale', 0.01),
+    ('wide_residual_learned_retention', False),
+    ('wide_residual_retention_init', 0.999),
+    ('wide_residual_retention_max_forget', 0.10),
+)
+
 # Track deletion processes to prevent zombies
 _deletion_processes = []
 
@@ -223,6 +231,18 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
+    if getattr(args, 'wide_residual_num_streams', None) is not None or hasattr(
+        checkpoint_args, 'wide_residual_num_streams'
+    ):
+        for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
+            if arg_name in skip_args:
+                continue
+            checkpoint_value = getattr(checkpoint_args, arg_name, default)
+            args_value = getattr(args, arg_name, default)
+            assert checkpoint_value == args_value, (
+                f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
+                f'the input argument value ({args_value}).'
+            )
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
@@ -2385,6 +2405,12 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+
+    # Restore wide-residual architecture settings. The enabling argument has a None
+    # default and remains command-line overridable; concrete-default controls follow
+    # the checkpoint in the same way as other fixed model settings above.
+    for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
+        _set_arg(arg_name, force=default is not None)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
