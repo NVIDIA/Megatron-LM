@@ -104,7 +104,7 @@ dev = [
     "av",
     "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.26.0",
+    "nvidia-cudnn-frontend[cutedsl]==1.28.0",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
@@ -160,6 +160,9 @@ test = [
     "pyyaml",
     "nemo-run",
 ]
+# GitHub CI installs Testmon at runtime for baseline and selective test modes.
+# Testmon remains inactive unless pytest receives a --testmon option.
+testmon = ["pytest-testmon==2.2.0"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -175,7 +178,7 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-cudnn-frontend>=1.25.0",  # for TE
+    "nvidia-cudnn-frontend>=1.28.0",  # for TE
     "nvidia-mathdx",                  # for TE
 ]
 linting = [
@@ -202,6 +205,8 @@ no-build-isolation-package = [
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
+# The Mamba revision retained from main pins an older TileLang/TVM FFI family.
+# Override those transitive constraints for cuDNN Frontend 1.28 compatibility.
 # We don't define override-dependencies globally but rather locally where we need it.
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
@@ -209,6 +214,8 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    "tilelang==0.1.12",
+    "apache-tvm-ffi==0.1.11",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
@@ -220,7 +227,7 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.18.0+27486e03"
+version = "2.19.0+5e52befd"
 requires-dist = [
     # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
     # RunnablePassthrough() instantiation, which is imported transitively in
@@ -233,7 +240,7 @@ requires-dist = [
     "onnxscript",
     "onnx",
     "nvdlfw-inspect",
-    "nvidia-cudnn-frontend>=1.25.0",
+    "nvidia-cudnn-frontend>=1.28.0",
 ]
 
 [[tool.uv.dependency-metadata]]
@@ -247,7 +254,7 @@ flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
 deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM.git", rev = "714dd1a4a980f7937a74343d19a8eba4fe321480" }
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "27486e03cfc1fa41f6932dcecdc47c71c47eac3e" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5e52befd5262c06289106338c308079d6adb391f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "e3935393a290aed1822af52139b4b8ee270fed1f" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
@@ -300,6 +307,10 @@ omit = [
     "/opt/megatron-lm/tools/*",
     "/usr/local/lib/python3.12/dist-packages/*",
     "/opt/megatron-lm/_remote_module_non_scriptable",
+    # These fused paths are mostly Triton DSL kernels and PyTorch
+    # autograd-engine callbacks. The CUDA code is exercised by unit tests,
+    # but coverage.py cannot reliably trace those execution contexts.
+    "/opt/megatron-lm/megatron/core/fusions/*",
 ]
 parallel = true
 sigterm = false

@@ -7,28 +7,14 @@ import time
 _PROGRAM_START_TIME = time.time()
 
 import json
-
-# Suppress warnings on all ranks but rank 0.
 import os
-import warnings
 
-rank = int(os.environ.get('RANK', 0))
-if rank != 0:
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
-    # Some libraries (e.g., CUTLASS DSL) use warnings.catch_warnings() with
-    # simplefilter("always"), which overrides the filters above. Override
-    # showwarning as a fallback to suppress warnings that slip through.
-    _original_showwarning = warnings.showwarning
-
-    def _rank0_only_showwarning(message, category, filename, lineno, file=None, line=None):
-        if issubclass(category, (UserWarning, FutureWarning, DeprecationWarning)):
-            return
-        _original_showwarning(message, category, filename, lineno, file, line)
-
-    warnings.showwarning = _rank0_only_showwarning
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
@@ -72,12 +58,14 @@ from megatron.training import (
 from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.global_vars import initialize_runtime_services
 from model_provider import model_provider
 
 try:
@@ -573,10 +561,14 @@ if __name__ == "__main__":
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = hybrid_config_from_args(args, model_config_cls=ModelOptHybridModelConfig)
+        model_cfg = hybrid_config_from_args(
+            args, model_config_cls=ModelOptHybridModelConfig, vocab_size_from_tokenizer=True
+        )
     else:
-        model_cfg = hybrid_config_from_args(args)
+        model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    initialize_runtime_services(args)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

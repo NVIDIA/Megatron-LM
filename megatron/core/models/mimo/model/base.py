@@ -1,12 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import warnings
 from contextlib import ExitStack, contextmanager
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
@@ -58,11 +58,9 @@ class MimoModel(MegatronModule):
         # Initialize with language model's transformer config for MegatronModule compatibility
         super().__init__(mimo_config.language_model_spec.params['config'])
 
-        warnings.warn(
+        warn_single_rank(
             "MimoModel is experimental and still under active development. "
-            "The API may change without notice in future releases.",
-            category=UserWarning,
-            stacklevel=2,
+            "The API may change without notice in future releases."
         )
 
         self.mimo_config = mimo_config
@@ -275,6 +273,9 @@ class MimoModel(MegatronModule):
                 modality_embeddings, modality_token_indices, batch_size * seq_length
             )
             for modality_name, modality_emb in modality_embeddings.items():
+                # Bridges keep modality activations in parameter dtype; promote only when
+                # they join a higher-precision language-model residual stream.
+                modality_emb = modality_emb.to(dtype=dtype)
                 flat_combined_embeddings.index_copy_(
                     0, modality_token_indices[modality_name], modality_emb
                 )
@@ -299,6 +300,7 @@ class MimoModel(MegatronModule):
                     f"number of {modality_name} embeddings ({modality_emb.size(0)})"
                 )
 
+            modality_emb = modality_emb.to(dtype=dtype)
             expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)
             combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
 

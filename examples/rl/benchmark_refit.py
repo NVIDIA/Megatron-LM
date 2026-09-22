@@ -23,6 +23,7 @@ from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron
 
 
@@ -403,7 +404,7 @@ def benchmark_non_collocated():
 
 def main():
     """Main benchmark function."""
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_benchmark_args,
         args_defaults={
             'tokenizer_type': 'NullTokenizer',
@@ -416,6 +417,7 @@ def main():
     )
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
+    initialize_runtime_services(args)
     initialize_megatron(skip_dependency_compilation=True)
 
     args = get_args()
