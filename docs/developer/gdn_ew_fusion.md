@@ -1,14 +1,15 @@
-# GDN Elementwise Fusion
+# GDN and KDA Elementwise Fusion
 
-Gated DeltaNet (GDN) has two independent, opt-in `TransformerConfig` options:
+GDN-family layers have two independent, opt-in `TransformerConfig` options:
 
 | Option | Fused operations | Default |
 | --- | --- | --- |
 | `gdn_pre_gated_delta_rule_fusion` | Causal convolution, SiLU, layout transforms, Q/K L2 normalization, head expansion, beta and decay preparation | `False` |
-| `gdn_gated_output_norm_fusion` | Output RMSNorm and SiLU gating after the gated delta rule | `False` |
+| `gdn_gated_output_norm_fusion` | Output RMSNorm and SiLU (GDN) or sigmoid (KDA) gating after the gated delta rule | `False` |
 
 Both options support the `gdn` attention variant, including the deprecated
-`gated_delta_net` alias. They can be enabled independently or together. The
+`gated_delta_net` alias. They can be enabled independently or together. The post-GDR
+option also supports `kda`; KDA does not support pre-GDR fusion. The
 linear-attention recurrence and output projection retain their existing
 implementations. The post-GDR implementation is adapted from Layali Rashid's
 [output-gating fusion in PR #7368](https://github.com/NVIDIA/Megatron-LM/pull/7368).
@@ -26,6 +27,14 @@ config = TransformerConfig(
 )
 ```
 
+For KDA, set `experimental_attention_variant="kda"` and
+`gdn_gated_output_norm_fusion=True`, leaving `gdn_pre_gated_delta_rule_fusion=False`.
+KDA uses sigmoid gating regardless of the convolution activation. Its fused
+forward computes `RMSNorm(x) * sigmoid(gate)`; backward uses
+`sigmoid(gate) * (1 - sigmoid(gate))` for the gate derivative. Both variants share
+the layout-aware kernel and select their gate formula at compile time. Existing
+KDA head-count and head-dimension constraints still apply.
+
 ## Post-GDR requirements
 
 The post-GDR fusion checks its requirements on **every forward**, including
@@ -36,7 +45,7 @@ existing unfused path.
 The supported configuration requires:
 
 - `deterministic_mode=False`;
-- SiLU/Swish activation and an `RMSNorm` output normalization module;
+- an `RMSNorm` output normalization module; GDN also requires SiLU/Swish activation;
 - nonempty CUDA BF16 or FP16 recurrence output;
 - matching output and gate shapes `[batch, sequence_length, local_heads, head_dim]`
   with a power-of-two head dimension;
@@ -65,7 +74,8 @@ its existing dispatch. Selective `gdn_norm_out` recomputation retains its existi
 checkpoint lifecycle.
 
 The post-GDR kernels preserve the activation-dtype RMSNorm materialization boundary
-before the FP32 SiLU-gating multiply. They support first-order autograd only.
+before the FP32 gating multiply, and round the gradient entering RMSNorm to the
+activation dtype. They support first-order autograd only.
 Floating-point operation ordering can differ from the unfused path;
 correctness tests do not establish bitwise equivalence or training
 convergence. Enabling either fusion is incompatible with deterministic mode.

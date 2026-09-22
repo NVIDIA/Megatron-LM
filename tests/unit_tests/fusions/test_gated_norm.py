@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Forward/backward parity and support checks for the GDN output fusion.
+"""Forward/backward parity and support checks for GDN/KDA output fusion.
 
 Numerical reference coverage is adapted from Layali Rashid's PR #7368.
 """
@@ -24,7 +24,10 @@ def _assert_gradients_close(actual, expected, atol=0.03):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 @pytest.mark.parametrize("length,scale,zero_centered", [(37, 1.0, False), (97, 1e-5, True)])
 @pytest.mark.parametrize("contiguous_gate", [False, True])
-def test_strided_output_norm_forward_backward(length, scale, zero_centered, contiguous_gate):
+@pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
+def test_strided_output_norm_forward_backward(
+    length, scale, zero_centered, contiguous_gate, gate_activation
+):
     te = pytest.importorskip("transformer_engine.pytorch")
     torch.manual_seed(1234)
     norm = te.RMSNorm(
@@ -39,12 +42,15 @@ def test_strided_output_norm_forward_backward(length, scale, zero_centered, cont
     gate = projection[..., 3072:5120].reshape(1, length, 16, 128).detach().requires_grad_()
     if contiguous_gate:
         gate = gate.detach().contiguous().requires_grad_()
+    gate_fn = F.silu if gate_activation == "silu" else torch.sigmoid
     expected = (
-        (norm(x.reshape(-1, 128)) * F.silu(gate.reshape(-1, 128).float()))
+        (norm(x.reshape(-1, 128)) * gate_fn(gate.reshape(-1, 128).float()))
         .to(x.dtype)
         .reshape(x.shape)
     )
-    actual = gated_norm.fused_gated_norm(x, gate, norm.weight, norm.eps, zero_centered)
+    actual = gated_norm.fused_gated_norm(
+        x, gate, norm.weight, norm.eps, zero_centered, gate_activation=gate_activation
+    )
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
     dy = torch.randn_like(actual)
     inputs = (x, gate, norm.weight)
@@ -52,7 +58,9 @@ def test_strided_output_norm_forward_backward(length, scale, zero_centered, cont
     _assert_gradients_close(gradients, torch.autograd.grad(expected, inputs, dy), atol=0.05)
     # Check repeated forward/backward results alongside the numerical reference.
     for _ in range(2):
-        replay = gated_norm.fused_gated_norm(x, gate, norm.weight, norm.eps, zero_centered)
+        replay = gated_norm.fused_gated_norm(
+            x, gate, norm.weight, norm.eps, zero_centered, gate_activation=gate_activation
+        )
         replay_gradients = torch.autograd.grad(replay, inputs, dy)
         torch.testing.assert_close(replay, actual, atol=0, rtol=0)
         for got, ref in zip(replay_gradients, gradients):
@@ -104,7 +112,8 @@ def test_validate_supported_layout(norm_inputs, contiguous_gate):
         ((3, 13, 4, 64), "broadcast_gate"),
     ],
 )
-def test_generalized_layout_forward_backward(shape, layout, dtype, zero_centered):
+@pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
+def test_generalized_layout_forward_backward(shape, layout, dtype, zero_centered, gate_activation):
     """Compare values and source-tensor gradients, including projection-backed batches."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
@@ -153,16 +162,21 @@ def test_generalized_layout_forward_backward(shape, layout, dtype, zero_centered
         activation="silu",
         out_norm=norm,
     )
-    gated_norm.validate_gated_norm(module, x, gate)
-    expected = (norm(x.reshape(-1, dim)).reshape(shape) * F.silu(gate.float())).to(dtype)
-    actual = gated_norm.fused_gated_norm(x, gate, norm.weight, norm.eps, zero_centered)
+    gated_norm.validate_gated_norm(module, x, gate, gate_activation=gate_activation)
+    gate_fn = F.silu if gate_activation == "silu" else torch.sigmoid
+    expected = (norm(x.reshape(-1, dim)).reshape(shape) * gate_fn(gate.float())).to(dtype)
+    actual = gated_norm.fused_gated_norm(
+        x, gate, norm.weight, norm.eps, zero_centered, gate_activation=gate_activation
+    )
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
     # Noncontiguous upstream gradients also need to be read in logical order.
     dy = torch.randn((*shape[:-1], dim * 2), device="cuda", dtype=dtype)[..., ::2]
     inputs = (x_source, gate_source, norm.weight)
     gradients = torch.autograd.grad(actual, inputs, dy)
     _assert_gradients_close(gradients, torch.autograd.grad(expected, inputs, dy), atol=0.05)
-    replay = gated_norm.fused_gated_norm(x, gate, norm.weight, norm.eps, zero_centered)
+    replay = gated_norm.fused_gated_norm(
+        x, gate, norm.weight, norm.eps, zero_centered, gate_activation=gate_activation
+    )
     replay_gradients = torch.autograd.grad(replay, inputs, dy)
     torch.testing.assert_close(replay, actual, atol=0, rtol=0)
     for got, ref in zip(replay_gradients, gradients):

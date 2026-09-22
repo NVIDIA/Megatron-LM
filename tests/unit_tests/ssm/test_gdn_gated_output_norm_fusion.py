@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""GDN output fusion integration, adapted from Layali Rashid's PR #7368."""
+"""GDN/KDA output fusion integration, adapted from Layali Rashid's PR #7368."""
 
 from unittest.mock import patch
 
@@ -42,16 +42,27 @@ def _config(**overrides):
         transformer_impl="transformer_engine",
     )
     kwargs.update(overrides)
+    if kwargs["experimental_attention_variant"] == "kda":
+        kwargs["linear_num_key_heads"] = kwargs["linear_num_value_heads"]
     return TransformerConfig(**kwargs)
 
 
-def test_post_fusion_defaults_to_disabled(monkeypatch):
+@pytest.mark.parametrize("variant", ["gdn", "kda"])
+def test_post_fusion_defaults_to_disabled(monkeypatch, variant):
     monkeypatch.setenv("MCORE_GDN_FUSION", "1")
-    assert not _config().gdn_gated_output_norm_fusion
+    assert not _config(experimental_attention_variant=variant).gdn_gated_output_norm_fusion
 
 
-@pytest.mark.parametrize("variant", ["gdn", "gated_delta_net"])
-@pytest.mark.parametrize("pre_fusion", [False, True])
+@pytest.mark.parametrize(
+    "variant,pre_fusion",
+    [
+        ("gdn", False),
+        ("gdn", True),
+        ("gated_delta_net", False),
+        ("gated_delta_net", True),
+        ("kda", False),
+    ],
+)
 def test_post_fusion_is_independent_of_pre_fusion(variant, pre_fusion):
     config = _config(
         experimental_attention_variant=variant,
@@ -63,7 +74,7 @@ def test_post_fusion_is_independent_of_pre_fusion(variant, pre_fusion):
 
 
 @pytest.mark.parametrize("variant", [None, "gdn2"])
-def test_post_fusion_requires_gdn(variant):
+def test_post_fusion_requires_gdn_family(variant):
     with pytest.raises(ValueError, match="gdn_gated_output_norm_fusion"):
         _config(
             experimental_attention_variant=variant,
@@ -137,9 +148,9 @@ def _assert_close(actual, expected, grads, reference_grads):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("recompute", [False, True])
-@pytest.mark.parametrize("pre_fusion", [False, True])
-def test_post_fusion_module_parity(model_parallel, packed, recompute, pre_fusion):
-    model = _model(pre_fusion, recompute)
+@pytest.mark.parametrize("variant,pre_fusion", [("gdn", False), ("gdn", True), ("kda", False)])
+def test_post_fusion_module_parity(model_parallel, packed, recompute, variant, pre_fusion):
+    model = _model(pre_fusion, recompute, experimental_attention_variant=variant)
     hidden, dy, metadata = _inputs(packed)
     expected, reference_grads = _run(model, hidden, dy, metadata)
     model.config.gdn_gated_output_norm_fusion = True
@@ -155,9 +166,9 @@ def test_post_fusion_module_parity(model_parallel, packed, recompute, pre_fusion
     _assert_close(actual, expected, grads, reference_grads)
 
 
-@pytest.mark.parametrize("pre_fusion", [False, True])
-def test_post_fusion_revalidates_each_forward(model_parallel, pre_fusion):
-    model = _model(pre_fusion)
+@pytest.mark.parametrize("variant,pre_fusion", [("gdn", False), ("gdn", True), ("kda", False)])
+def test_post_fusion_revalidates_each_forward(model_parallel, variant, pre_fusion):
+    model = _model(pre_fusion, experimental_attention_variant=variant)
     model.config.gdn_gated_output_norm_fusion = True
     hidden = torch.randn(17, 1, 256, device="cuda", dtype=torch.bfloat16)
     with (
@@ -176,14 +187,15 @@ def test_post_fusion_revalidates_each_forward(model_parallel, pre_fusion):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("batch,heads,dim", [(2, 8, 64), (3, 4, 256)])
-@pytest.mark.parametrize("pre_fusion", [False, True])
+@pytest.mark.parametrize("variant,pre_fusion", [("gdn", False), ("gdn", True), ("kda", False)])
 @pytest.mark.parametrize("recompute", [False, True])
 def test_dense_batch_and_head_layout_parity(
-    model_parallel, batch, heads, dim, pre_fusion, recompute, dtype
+    model_parallel, batch, heads, dim, variant, pre_fusion, recompute, dtype
 ):
     model = _model(
         pre_fusion,
         recompute,
+        experimental_attention_variant=variant,
         linear_num_value_heads=heads,
         linear_key_head_dim=dim,
         linear_value_head_dim=dim,
@@ -210,11 +222,23 @@ def test_pre_fusion_rejects_deterministic_mode(model_parallel):
 @pytest.mark.parametrize(
     "tp,cp,sequence_parallel", [(1, 2, False), (1, 4, False), (2, 2, True), (4, 1, True)]
 )
-@pytest.mark.parametrize("batch,packed", [(1, False), (2, False), (1, True)])
-@pytest.mark.parametrize("pre_fusion", [False, True])
+@pytest.mark.parametrize(
+    "batch,packed,linear_cp_mode",
+    [(1, False, "headwise"), (2, False, "headwise"), (1, True, "headwise"), (1, True, "chunkwise")],
+)
+@pytest.mark.parametrize("variant,pre_fusion", [("gdn", False), ("gdn", True), ("kda", False)])
 @pytest.mark.parametrize("recompute", [False, True])
 def test_post_fusion_distributed_layout(
-    tp, cp, sequence_parallel, batch, packed, pre_fusion, recompute, value_heads
+    tp,
+    cp,
+    sequence_parallel,
+    batch,
+    packed,
+    linear_cp_mode,
+    variant,
+    pre_fusion,
+    recompute,
+    value_heads,
 ):
     """Enable the post fusion through CP redistribution and the complete backward."""
     if torch.distributed.get_world_size() < tp * cp:
@@ -228,8 +252,10 @@ def test_post_fusion_distributed_layout(
         model = _model(
             pre_fusion,
             recompute,
+            experimental_attention_variant=variant,
             tensor_model_parallel_size=tp,
             context_parallel_size=cp,
+            linear_cp_mode=linear_cp_mode,
             sequence_parallel=sequence_parallel,
             linear_num_key_heads=value_heads // 4,
             linear_num_value_heads=value_heads,
