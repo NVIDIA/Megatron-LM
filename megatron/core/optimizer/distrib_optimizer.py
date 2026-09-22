@@ -60,6 +60,7 @@ from ..fp8_utils import (
     is_grouped_tensor_with_quantized_storage,
     quantize_param_shard,
 )
+from ..tensor_parallel import gtp_api
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -1532,6 +1533,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Megatron-FSDP custom sharded state dict construction.
             state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
             return state_dict
+
+        if gtp_api.HAVE_GTP and sharding_type in ('fully_reshardable', 'fully_sharded_model_space'):
+            # These formats identify optimizer parameters by the model entry's data object.
+            # Gathered projection factories and dequantized FP8 entries own different tensors.
+            model_param_ids = {
+                id(entry.data)
+                for entry in nested_values(model_sharded_state_dict)
+                if isinstance(entry, (ShardedTensor, ShardedTensorFactory))
+            }
+            for buffer in self.buffers:
+                for param in buffer.param_index_map:
+                    if gtp_api.is_gtp_param(param) and id(param) not in model_param_ids:
+                        raise NotImplementedError(
+                            f"Distributed optimizer format '{sharding_type}' cannot map GTP "
+                            "parameters to gathered or dequantized model checkpoint data. "
+                            "Use 'dp_reshardable': disable --dist-ckpt-optim-fully-reshardable, "
+                            "or set metadata['distrib_optim_sharding_type'] = 'dp_reshardable'."
+                        )
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
             log_single_rank(

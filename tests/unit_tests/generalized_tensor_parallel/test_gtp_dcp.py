@@ -37,6 +37,7 @@ from megatron.core.extensions.transformer_engine import (  # noqa: E402
 )
 from megatron.core.fp8_utils import is_float8tensor  # noqa: E402
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add  # noqa: E402
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer  # noqa: E402
 from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
 from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN_FLA  # noqa: E402
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules  # noqa: E402
@@ -1508,6 +1509,25 @@ def _worker_fused_projection_checkpoint(world_size, *, kind, native_fp8=False):
         sharded_sd = model.sharded_state_dict(prefix=f'{kind}.', metadata={'dp_cp_group': pg.dp_cp})
         factory = sharded_sd[f'{kind}.{key}']
         assert isinstance(factory, ShardedTensorFactory)
+
+        # Reject incompatible optimizer formats before reading state or exchanging buffers.
+        optimizer = SimpleNamespace(
+            ddp_config=SimpleNamespace(use_megatron_fsdp=False),
+            buffers=[SimpleNamespace(param_index_map={weight: None})],
+            state_dict=mock.Mock(side_effect=RuntimeError("optimizer state reached")),
+        )
+        for sharding_type in ('fully_reshardable', 'fully_sharded_model_space'):
+            with pytest.raises(NotImplementedError, match="Use 'dp_reshardable'"):
+                DistributedOptimizer.sharded_state_dict(
+                    optimizer, sharded_sd, metadata={'distrib_optim_sharding_type': sharding_type}
+                )
+        optimizer.state_dict.assert_not_called()
+        # The buffer-based format must still proceed past the guard.
+        with pytest.raises(RuntimeError, match="optimizer state reached"):
+            DistributedOptimizer.sharded_state_dict(
+                optimizer, sharded_sd, metadata={'distrib_optim_sharding_type': 'dp_reshardable'}
+            )
+
         logical_rows, pad_rows = (1296, 48) if native_fp8 else (776, 24)
         assert tuple(factory.data.shape) == (logical_rows, config.hidden_size)
         assert factory.data.dtype == torch.bfloat16 and not is_float8tensor(factory.data)
