@@ -17,6 +17,8 @@ from tests.unit_tests.test_utilities import Utils
 
 class _RankGroup:
     """Process-group stub that reports a fixed local rank."""
+
+
 class _FakeGroup:
     """Minimal mock for a dist process group — used in single-process unit tests."""
 

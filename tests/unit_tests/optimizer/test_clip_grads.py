@@ -50,6 +50,8 @@ def test_default_grad_norm_skip_threshold_does_not_compare_grad_norm():
 
     assert update_successful
     assert optimizer.step_called
+
+
 class TestCountZerosFp32GtpPadding:
     """count_zeros_fp32 must exclude GTP alignment-padding rows: they are structural zeros
     (never written by the wgrad GEMM, see generalized_tensor_parallelism), not real zero
