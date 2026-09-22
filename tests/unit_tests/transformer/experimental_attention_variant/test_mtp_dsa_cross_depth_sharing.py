@@ -177,6 +177,11 @@ def test_cross_depth_sharing_accepts_moe_only_graph(shared_components):
         cuda_graph_modules=["moe"],
         num_moe_experts=4,
         moe_grouped_gemm=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.2,
+        moe_paged_stash=True,
+        use_transformer_engine_op_fuser=True,
     )
 
     assert config.mtp_repeated_layer_shared_components == shared_components
