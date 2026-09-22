@@ -177,6 +177,8 @@ def _install_checkpoint_resave_hook() -> None:
         return
 
     from megatron.core.utils import unwrap_model
+    from megatron.training.argument_utils import logger_config_from_args
+    from megatron.training.global_vars import get_args
     from megatron.training import training
     from megatron.training.checkpointing import save_checkpoint
 
@@ -208,6 +210,7 @@ def _install_checkpoint_resave_hook() -> None:
             dp_group=pg_collection.dp if pg_collection is not None else None,
             expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
             rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+            logger_config=logger_config_from_args(get_args()),
         )
         dist.barrier()
         raise SystemExit(0)

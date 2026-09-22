@@ -600,6 +600,28 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def logger_config_from_args(args: Namespace) -> LoggerConfig:
+    """Normalize logging inputs once at a legacy CLI/YAML boundary."""
+    from copy import deepcopy
+
+    config = LoggerConfig(**deepcopy(_default_config_from_args(
+        LoggerConfig, args, return_instance=False
+    )))
+    config.validate()
+    return config
+
+
+def logger_args_snapshot(args: Namespace, logger_config: LoggerConfig) -> Namespace:
+    """Project logging settings into detached checkpoint/metadata output."""
+    from copy import copy, deepcopy
+    from dataclasses import fields
+
+    snapshot = copy(args)
+    for config_field in fields(logger_config):
+        setattr(snapshot, config_field.name, deepcopy(getattr(logger_config, config_field.name)))
+    return snapshot
+
+
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
@@ -637,7 +659,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         ddp=ddp_config,
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=logger_config_from_args(args),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=ProfilingConfig(**prof_kwargs),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
@@ -701,7 +723,7 @@ def inference_cfg_container_from_args(
         dist=_default_config_from_args(DistributedInitConfig, args),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=logger_config_from_args(args),
         profiling=ProfilingConfig(**prof_kwargs),
     )
 

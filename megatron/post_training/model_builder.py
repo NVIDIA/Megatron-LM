@@ -82,6 +82,7 @@ class _ModelOptBuilderMixin:
             pre_process,
             post_process,
             vp_stage,
+            log_max_attention_logit=self._model_config.transformer.log_max_attention_logit,
             pg_collection=pg_collection,
         )
 
@@ -114,12 +115,16 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
         model._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
 
 
-def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
+def _load_teacher_model_config(
+    checkpoint_path: str, *, log_max_attention_logit: bool
+) -> Namespace:
     """Reads teacher config from a file.
 
     The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
     should specify any model architecture settings which differ from the main student model's.
     The field names should match those returned by get_args() and not TransformerConfig.
+    Attention logging inherits the current run's owned policy unless explicitly
+    overridden in the teacher YAML, preserving the existing teacher precedence.
     """
     args = get_args()
 
@@ -137,6 +142,7 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
             config_path = None
 
     args_dict = vars(args).copy()
+    args_dict["log_max_attention_logit"] = log_max_attention_logit
 
     if config_path is not None:
         with open(config_path) as f:
@@ -265,6 +271,7 @@ def modelopt_gpt_hybrid_builder(
     config=None,
     pg_collection=None,
     *,
+    log_max_attention_logit: bool,
     disable_moe_grouped_gemm: bool = False,
 ) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
@@ -293,6 +300,7 @@ def modelopt_gpt_hybrid_builder(
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     config = core_transformer_config_from_args(args)
+    config.log_max_attention_logit = log_max_attention_logit
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
@@ -495,7 +503,9 @@ def modelopt_gpt_hybrid_builder(
                 args.virtual_pipeline_model_parallel_size is None
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
-        teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
+        teacher_config_raw = _load_teacher_model_config(
+            args.export_kd_teacher_load, log_max_attention_logit=log_max_attention_logit
+        )
         teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
 
         distill_cfg = mtd_mcore.setup_distillation_config(

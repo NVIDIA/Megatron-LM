@@ -83,7 +83,7 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
-def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:
+def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None, *, logger_config) -> HybridModel:
     """Builds the model.
 
     Args:
@@ -97,7 +97,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     args = get_args()
     if has_nvidia_modelopt:
 
-        model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection)
+        model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection,
+                                       log_max_attention_logit=logger_config.log_max_attention_logit)
         from megatron.elastification.flextron_utils import (
             inject_flextron_forward_logic,
             setup_flextron_model,
@@ -119,6 +120,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
 
     print_rank_0('building Mamba model ...')
     config = core_transformer_config_from_args(args, TransformerConfig)
+    config.log_max_attention_logit = logger_config.log_max_attention_logit
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 
@@ -570,12 +572,12 @@ if __name__ == "__main__":
     )
 
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, logger_config=full_config.logger)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(full_config,
              train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             model_provider,
+             partial(model_provider, logger_config=full_config.logger),
              store=store,
              )

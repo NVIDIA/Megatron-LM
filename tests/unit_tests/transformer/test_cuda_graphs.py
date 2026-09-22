@@ -57,6 +57,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
+from megatron.training.argument_utils import logger_config_from_args
 from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -1570,7 +1571,8 @@ class TestPartialCudaGraph:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider
+            ModelType.encoder_or_decoder, self.model_provider,
+            logger_config=logger_config_from_args(get_args()),
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 

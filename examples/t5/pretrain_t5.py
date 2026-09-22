@@ -74,6 +74,7 @@ def model_provider(
     add_decoder=True,
     config=None,
     pg_collection=None,
+    *, logger_config,
 ) -> T5Model:
     """Builds the model.
 
@@ -92,6 +93,7 @@ def model_provider(
     
     if config is None:
         config = core_transformer_config_from_args(args)
+    config.log_max_attention_logit = logger_config.log_max_attention_logit
 
     encoder_config = deepcopy(config)
     encoder_config.num_layers = args.encoder_num_layers
@@ -274,14 +276,14 @@ if __name__ == "__main__":
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, logger_config=full_config.logger)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        model_provider,
+        partial(model_provider, logger_config=full_config.logger),
         get_embedding_ranks=t5_embedding_ranks,
         get_position_embedding_ranks=t5_position_embedding_ranks,
     )

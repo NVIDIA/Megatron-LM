@@ -2703,7 +2703,7 @@ def _add_ft_package_args(parser):
 def _add_logging_args(parser):
     from megatron.training.config import LoggerConfig
 
-    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
+    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath", "enable_one_logger", "one_logger_project", "one_logger_run_name", "one_logger_async", "app_tag_run_name", "app_tag_run_version", "otel_enabled", "otel_service_name", "otel_span_groups"])
     group = log_factory.build_group(parser, title="logging")
 
     otel_group = parser.add_argument_group(title='opentelemetry')

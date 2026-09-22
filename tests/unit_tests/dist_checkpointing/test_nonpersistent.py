@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.training.argument_utils import logger_config_from_args
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import (
     _NON_PERSISTENT_CKPT_SUBDIR,
@@ -63,9 +64,11 @@ class TestNonPersistentSaveAndLoad:
                 num_floating_point_operations_so_far,
                 {},
                 non_persistent_ckpt=True,
+                logger_config=logger_config_from_args(mock_args),
             )
             save_checkpoint(
-                3, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                3, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {},
+                logger_config=logger_config_from_args(mock_args),
             )
             save_checkpoint(
                 4,
@@ -75,11 +78,13 @@ class TestNonPersistentSaveAndLoad:
                 num_floating_point_operations_so_far,
                 {},
                 non_persistent_ckpt=True,
+                logger_config=logger_config_from_args(mock_args),
             )
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
             assert iteration == 4
             save_checkpoint(
-                6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {},
+                logger_config=logger_config_from_args(mock_args),
             )
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
             assert iteration == 6
@@ -91,6 +96,7 @@ class TestNonPersistentSaveAndLoad:
                 num_floating_point_operations_so_far,
                 {},
                 non_persistent_ckpt=True,
+                logger_config=logger_config_from_args(mock_args),
             )
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
             assert iteration == 8
@@ -142,7 +148,8 @@ class TestLegacySaveAndLoad:
             init_checkpointing_mock_args(mock_args, legacy_ckpt_dir)
 
             save_checkpoint(
-                2, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
+                2, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {},
+                logger_config=logger_config_from_args(mock_args),
             )
             iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
             assert iteration == 2

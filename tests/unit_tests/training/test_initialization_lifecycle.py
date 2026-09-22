@@ -17,7 +17,7 @@ from megatron.training.argument_utils import (
     hybrid_config_from_args,
     resolve_tokenizer_vocab_size,
 )
-from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.config.training_config import LoggerConfig, TokenizerConfig
 
 
 @pytest.fixture
@@ -78,7 +78,7 @@ def test_args_only_bootstrap_registers_args_and_constructs_services(monkeypatch,
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     global_vars.set_global_variables(args)
     assert global_vars.get_args() is args
-    initialize.assert_called_once_with(args, build_tokenizer=True)
+    initialize.assert_called_once_with(args, build_tokenizer=True, logger_config=LoggerConfig())
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args)
 
@@ -176,7 +176,7 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
         "_set_telemetry",
     ):
 
-        def record(received_args, service=name):
+        def record(received_args, service=name, **kwargs):
             assert received_args is args
             calls.append(service)
 
@@ -194,7 +194,7 @@ def test_runtime_service_order_and_microbatch_inputs(monkeypatch, isolated_globa
     if args_only:
         global_vars.set_global_variables(args)
     else:
-        global_vars.initialize_runtime_services(args)
+        global_vars.initialize_runtime_services(args, logger_config=LoggerConfig())
     assert isinstance(global_vars.get_train_state(), global_vars.TrainState)
     assert calls == [
         "microbatches",

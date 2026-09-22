@@ -58,7 +58,7 @@ from megatron.core.utils import (
     resolve_gtp_pad_for_alignment,
     unwrap_model,
 )
-from megatron.training.argument_utils import _default_config_from_args
+from megatron.training.argument_utils import _default_config_from_args, logger_args_snapshot
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
 
@@ -651,6 +651,7 @@ def save_checkpoint(
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *, logger_config,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -830,7 +831,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                args,
+                logger_args_snapshot(args, logger_config),
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1079,7 +1080,7 @@ def save_checkpoint(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully '
                     f'saved local checkpoint from iteration {iteration:7d}'
                 )
-                if args.log_progress and args.async_save:
+                if logger_config.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save,
                         f'Saved async local checkpoint\tIteration: {iteration}',
@@ -1141,7 +1142,7 @@ def save_checkpoint(
                     )
                     config = _default_config_from_args(TokenizerConfig, args)
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
-                if args.log_progress and args.async_save:
+                if logger_config.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
@@ -1175,7 +1176,7 @@ def save_checkpoint(
                                     args=(
                                         args.save,
                                         prev_iteration,
-                                        args.log_progress,
+                                        logger_config.log_progress,
                                         True,
                                         args.async_ckpt_cpu_priority,
                                         args.async_ckpt_io_priority,
@@ -1188,7 +1189,7 @@ def save_checkpoint(
                             else:
                                 th = threading.Thread(
                                     target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, args.log_progress),
+                                    args=(args.save, prev_iteration, logger_config.log_progress),
                                 )
                                 th.start()
 

@@ -262,7 +262,7 @@ def on_save_checkpoint_start(async_save):
             return productive_metrics
 
             
-def on_pretrain_start():
+def on_pretrain_start(*, logger_config):
     """ Function to be called at the start of pretrain function to track E2E meta data
     """
     args = get_args()
@@ -271,8 +271,8 @@ def on_pretrain_start():
     if one_logger:
         with one_logger.get_context_manager():
             job_name = os.environ.get('SLURM_JOB_NAME', None)
-            app_tag_run_name =  job_name if not args.app_tag_run_name else args.app_tag_run_name
-            app_tag_run_version = args.app_tag_run_version
+            app_tag_run_name =  job_name if not logger_config.app_tag_run_name else logger_config.app_tag_run_name
+            app_tag_run_version = logger_config.app_tag_run_version
             one_logger.store_set('app_tag_run_name', app_tag_run_name)
             one_logger.store_set('app_tag_run_version', app_tag_run_version)
             one_logger.store_set('train_throughput_per_gpu_max', 0.0)
@@ -290,7 +290,7 @@ def on_pretrain_start():
                 'model_seq_length': args.seq_length,
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,
-                'is_log_throughput_enabled': args.log_throughput,
+                'is_log_throughput_enabled': logger_config.log_throughput,
                 'app_run_type': 'training',
                 'summary_data_schema_version': '1.0.0',
                 'app_metrics_feature_tags': 'full',

@@ -160,12 +160,14 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(logger_config=logger_config)
 
     args = get_args()
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(logger_config=logger_config)
 
     tokenizer = build_tokenizer(args)
 

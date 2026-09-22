@@ -20,6 +20,8 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
@@ -27,6 +29,21 @@ from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hoo
 _LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
 _ENCODER_SEED_OFFSET = 10_000
+
+
+def _set_attention_logging(spec, enabled: bool) -> None:
+    """Project logging policy into nested MIMO specs before any modules are built."""
+    if isinstance(spec, TransformerConfig):
+        spec.log_max_attention_logit = enabled
+    elif isinstance(spec, ModuleSpec):
+        _set_attention_logging(spec.params, enabled)
+        _set_attention_logging(spec.submodules, enabled)
+    elif isinstance(spec, dict):
+        for value in spec.values():
+            _set_attention_logging(value, enabled)
+    elif isinstance(spec, (list, tuple)):
+        for value in spec:
+            _set_attention_logging(value, enabled)
 
 
 @dataclass(kw_only=True)
@@ -73,6 +90,8 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         pre_process: bool | None = None,
         post_process: bool | None = None,
         vp_stage: int | None = None,
+        *,
+        log_max_attention_logit: bool,
     ) -> MimoModel:
         """Build the bare rank-local MIMO model; the shared lifecycle places it later."""
         del pg_collection, pre_process, post_process, vp_stage
@@ -93,11 +112,13 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
                 raise ValueError(f"provider defines no encoder spec/token for module {name!r}")
             pg = active_pg if name == active_name else None
             modality_submodules_spec[name] = provider.encoder_specs[name](args, pg, grid)
+            _set_attention_logging(modality_submodules_spec[name], log_max_attention_logit)
             special_token_ids[name] = provider_token_ids[name]
 
         language_model_spec = provider.language_spec(
             args, active_pg if is_language else None, topology.grids[MIMO_LANGUAGE_MODULE_KEY]
         )
+        _set_attention_logging(language_model_spec, log_max_attention_logit)
         language_input_projections = {}
         for name, factory in provider.language_input_projection_specs.items():
             spec = factory(
@@ -107,6 +128,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
                 language_model_spec,
             )
             if spec is not None:
+                _set_attention_logging(spec, log_max_attention_logit)
                 language_input_projections[name] = spec
 
         mimo_config = MimoModelConfig(
@@ -137,6 +159,8 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        *,
+        log_max_attention_logit: bool,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if use_megatron_fsdp or use_torch_fsdp2:
@@ -159,9 +183,9 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         built_with_meta_device = getattr(args, "init_model_with_meta_device", False)
         if built_with_meta_device:
             with torch.device("meta"):
-                mimo_model = self.build_model(pg_collection)
+                mimo_model = self.build_model(pg_collection, log_max_attention_logit=log_max_attention_logit)
         else:
-            mimo_model = self.build_model(pg_collection)
+            mimo_model = self.build_model(pg_collection, log_max_attention_logit=log_max_attention_logit)
 
         mimo_model.model_type = model_type
         model_list = compose_hooks(self._model_config.pre_wrap_hooks)([mimo_model])

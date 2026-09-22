@@ -227,8 +227,10 @@ def main():
                                            'no_load_rng': True,
                                            'no_load_optim': True,
                                            'seq_length': 2048})
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(logger_config=logger_config)
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)

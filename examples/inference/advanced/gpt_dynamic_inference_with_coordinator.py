@@ -215,7 +215,7 @@ if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp8 optimizations
     # check for it.
     with torch.inference_mode():
-        args, is_vlm = parse_args_and_detect_vlm(
+        args, is_vlm, logger_config = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
@@ -235,21 +235,21 @@ if __name__ == "__main__":
             ),
         )
 
-        if getattr(args, 'moe_routing_trace_path', None):
+        if getattr(logger_config, 'moe_routing_trace_path', None):
             rank = dist.get_rank()
             max_steps = getattr(args, 'moe_routing_trace_max_inference_steps', None) or 10**9
             init_moe_router_tracer(
-                output_dir=args.moe_routing_trace_path,
+                output_dir=logger_config.moe_routing_trace_path,
                 max_steps=max_steps,
                 rank=rank,
                 capture_hidden_states=getattr(
-                    args, 'moe_routing_trace_capture_hidden_states', False
+                    logger_config, 'moe_routing_trace_capture_hidden_states', False
                 ),
-                capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
-                dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+                capture_logits=getattr(logger_config, 'moe_routing_trace_capture_logits', False),
+                dump_router_weights=getattr(logger_config, 'moe_routing_trace_dump_weights', False),
             )
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
+        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm, logger_config=logger_config)
         model = engine.controller.inference_wrapped_model.model
 
         tracer = get_moe_router_tracer()

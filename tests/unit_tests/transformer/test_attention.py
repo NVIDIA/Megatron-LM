@@ -23,6 +23,8 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
+from megatron.training.argument_utils import logger_config_from_args
+from megatron.training.global_vars import get_args
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
@@ -531,7 +533,7 @@ def _test_parallel_attention_correctness(
         mock_args.no_save_rng = True
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0)
+        save_checkpoint(10, gpt_model, None, None, 0, logger_config=logger_config_from_args(get_args()))
 
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention

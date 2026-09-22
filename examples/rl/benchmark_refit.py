@@ -61,7 +61,7 @@ def add_benchmark_args(parser):
 
 
 def model_provider(pre_process=True, post_process=True, parallel_output=False,
-                   pg_collection=None, config=None):
+                   pg_collection=None, config=None, *, logger_config):
     """Build the model."""
     args = get_args()
     if config is None:
@@ -73,6 +73,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=False,
         post_process=post_process,
         config=config,
         pg_collection=pg_collection,
+        log_max_attention_logit=logger_config.log_max_attention_logit,
     )
 
 
@@ -202,7 +203,7 @@ def print_results(timings):
             )
 
 
-def benchmark_collocated():
+def benchmark_collocated(*, logger_config):
     """Benchmark refit in collocated mode (both models on same GPUs)."""
     args = get_args()
     world_size = torch.distributed.get_world_size()
@@ -229,6 +230,7 @@ def benchmark_collocated():
     print_rank_0("Building source model...")
     src_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
+                logger_config=logger_config,
             pre_process=pre_process, post_process=post_process, parallel_output=False
         ),
         wrap_with_ddp=False
@@ -256,6 +258,7 @@ def benchmark_collocated():
 
     dst_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
+                logger_config=logger_config,
             pre_process=pre_process, post_process=post_process,
             pg_collection=dst_pg_collection, config=dst_config
         ),
@@ -289,7 +292,7 @@ def benchmark_collocated():
         refit_service.close()
 
 
-def benchmark_non_collocated():
+def benchmark_non_collocated(*, logger_config):
     """Benchmark refit in non-collocated mode (separate GPU sets)."""
     args = get_args()
     rank = torch.distributed.get_rank()
@@ -349,6 +352,7 @@ def benchmark_non_collocated():
         print_rank_0("Building source model...")
         src_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
+                logger_config=logger_config,
                 pre_process=pre_process, post_process=post_process, parallel_output=False
             ),
             wrap_with_ddp=False
@@ -368,6 +372,7 @@ def benchmark_non_collocated():
 
         dst_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
+                logger_config=logger_config,
                 pre_process=pre_process, post_process=post_process,
                 pg_collection=dst_pg_collection, config=dst_config
             ),
@@ -417,8 +422,10 @@ def main():
     )
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
-    initialize_runtime_services(args)
-    initialize_megatron(skip_dependency_compilation=True)
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(skip_dependency_compilation=True, logger_config=logger_config)
 
     args = get_args()
 
@@ -432,9 +439,9 @@ def main():
 
     try:
         if args.refit_mode == 'collocated':
-            benchmark_collocated()
+            benchmark_collocated(logger_config=logger_config)
         else:
-            benchmark_non_collocated()
+            benchmark_non_collocated(logger_config=logger_config)
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()

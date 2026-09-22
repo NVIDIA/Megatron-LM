@@ -281,7 +281,7 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, logger_config=full_config.logger)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
