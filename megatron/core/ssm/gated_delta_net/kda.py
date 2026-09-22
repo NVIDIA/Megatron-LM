@@ -19,6 +19,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
+    _build_with_kda_fp8_disabled,
     _GDNBase,
     a2a_cp_to_hp,
     a2a_hp_to_cp,
@@ -29,7 +30,7 @@ from megatron.core.ssm.gated_delta_net.common import (
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -80,6 +81,7 @@ class KimiDeltaAttention(_GDNBase):
         pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
     ) -> None:
+        config.validate_kda()
         if not HAVE_FLA or not HAVE_FLA_KDA:  # pragma: no cover
             raise ImportError(
                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
@@ -105,7 +107,8 @@ class KimiDeltaAttention(_GDNBase):
 
         # KDA keeps beta in a separate projection so its checkpoint layout remains
         # independent from the direct Q/K/V/F/G projection.
-        self.beta_proj = build_module(
+        self.beta_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.beta_proj,
             self.hidden_size,
             self.num_key_heads,
@@ -136,7 +139,8 @@ class KimiDeltaAttention(_GDNBase):
                 setattr(
                     self,
                     a_name,
-                    build_module(
+                    _build_with_kda_fp8_disabled(
+                        self.config,
                         getattr(submodules, a_name),
                         self.hidden_size,
                         head_dim,
@@ -152,7 +156,8 @@ class KimiDeltaAttention(_GDNBase):
                 setattr(
                     self,
                     b_name,
-                    build_module(
+                    _build_with_kda_fp8_disabled(
+                        self.config,
                         getattr(submodules, b_name),
                         head_dim,
                         output_dim,
@@ -328,6 +333,11 @@ class KimiDeltaAttention(_GDNBase):
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             if batch != 1:
                 raise ValueError("Packed KDA expects batch dimension to be 1.")
+            if self.config.deterministic_mode or causal_conv1d is None:
+                raise ValueError(
+                    "Packed KDA requires causal_conv1d and deterministic_mode=False. "
+                    "The convolution fallback does not support sequence boundaries."
+                )
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
