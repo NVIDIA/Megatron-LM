@@ -199,7 +199,11 @@ class RecipeConfig:
     def to_cfg_dict(self) -> dict:
         """Serialize recipe to dict configuration."""
 
-        return {"matchers": self._matchers_to_dict(), "configs": self.configs}
+        return {
+            "matchers": self._matchers_to_dict(),
+            "configs": self.configs,
+            "_target_": RecipeConfig.from_config_dict,
+        }
 
     def _matchers_to_dict(self) -> dict | None:
         # Reverses _build_matchers()
