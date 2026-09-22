@@ -1177,6 +1177,10 @@ class ChunkOffloadHandler:
         """Bulk reload group."""
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
+        # GPU-resident or already-consumed groups still occupy a reload slot.
+        # Consume only this slot: skipping ahead to the next CPU-backed group
+        # would reload activations before backward reaches their neighboring
+        # group, accumulating unused activations on GPU under partial offload.
         if not self._group_has_offloaded_tensor(group_to_reload):
             self._groups_to_reload.pop()
             return
@@ -1342,21 +1346,24 @@ class ChunkOffloadHandler:
 
     def on_group_start_backward(self, current_group=None):
         """
-        Called at the start of a layer group's backward pass.
-        Preloads tensors for the next group in backward order.
+        Called when backward reaches the group's forward-start marker.
+        The group's internal backward has run; preload the next backward group.
         """
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_backward {self}")
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
+        # The forward-start marker runs after this group's internal backward.
+        # At backward entry, a GPU-resident final group may still have its slot
+        # queued. Remove it before scheduling the next group. If an earlier
+        # pre_reload_last_layer()/bulk_reload() already consumed it, the top is
+        # a different group and must be left for bulk_reload() below.
         if (
             current_group is not None
             and len(self._groups_to_reload) > 0
             and self._groups_to_reload[-1] is current_group
         ):
-            # The matching commit node already consumed this group's saved tensors.
-            # If activation_offload_fraction kept it on GPU, the queued slot is a
-            # no-op and should not delay preloading the next backward group.
+            # A completed backward group must not retain CPU-backed tensors.
             assert not self._group_has_offloaded_tensor(current_group), (
                 f"Group {current_group._name} still has offloaded tensors queued after "
                 "its backward pass."
