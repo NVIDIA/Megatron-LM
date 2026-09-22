@@ -27,8 +27,18 @@ The following table summarizes MTP configuration fields:
 | --- | --- |
 | `mtp_num_layers` | Number of MTP layers. MTP extends prediction to multiple future tokens at each position. This stack uses `mtp_num_layers` sequential modules to predict that many additional tokens per position. Default: `None`. |
 | `mtp_loss_scaling_factor` | Weight for the MTP loss term. The implementation averages MTP losses across depths, multiplies by this factor, and adds the result to the training objective. Default: `0.1`. |
+| `mtp_loss_type` | MTP training objective: `cross_entropy` or `e2e_tv`. Default: `cross_entropy`. |
 | `mtp_use_repeated_layer` | Reuse one physical MTP layer for every prediction depth. Parameters are shared, while the hidden state, shifted token input, and query are recomputed at each depth. Default: `False`. |
 | `mtp_repeated_layer_shared_components` | Components to reuse from the first invocation of a repeated MTP layer at later prediction depths in the same forward. Supported values are `latent_kv` and `sparse_attention_index`; values must be unique and their order has no effect. Omit the option or use an empty list to disable repeated-layer sharing. Default: `None`. |
+
+## End-to-End TV Loss
+
+Set `mtp_loss_type: e2e_tv` and `mtp_detach_heads: true` to select the end-to-end
+TV objective when MTP is enabled. This mode uses `mtp_loss_scaling_factor` to scale
+the auxiliary loss. To train only MTP parameters, the optimizer must additionally
+freeze the base model or select only MTP parameters; `mtp_detach_heads` does not
+change the optimizer parameter set. See
+[Bebop](https://arxiv.org/abs/2606.12370) for the objective definition.
 
 ## Repeated-Layer Sharing
 
