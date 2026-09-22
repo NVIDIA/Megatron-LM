@@ -128,8 +128,10 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(logger_config=logger_config)
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -149,12 +151,19 @@ def main(model_type: str = "gpt"):
             # modelopt hooks have not been ported to the new ``ModelBuilder``
             # API yet. ``get_model`` also handles the modelopt-checkpoint
             # auto-detection side effect.
-            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+            from functools import partial
+
+            model = get_model(partial(modelopt_gpt_hybrid_builder,
+                                      log_max_attention_logit=logger_config.log_max_attention_logit,
+                                      barrier_with_L1_time=logger_config.barrier_with_L1_time),
+                              wrap_with_ddp=False)
         else:
             builder = get_model_builder(args, provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             model = builder.build_distributed_models(
-                pg_collection=pg_collection, wrap_with_ddp=False
+                pg_collection=pg_collection, wrap_with_ddp=False,
+                log_max_attention_logit=logger_config.log_max_attention_logit,
+                barrier_with_L1_time=logger_config.barrier_with_L1_time,
             )
 
     if args.load is not None:

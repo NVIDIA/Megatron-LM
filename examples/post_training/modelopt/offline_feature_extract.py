@@ -49,12 +49,14 @@ if __name__ == "__main__":
             'no_load_rng': True,
             'no_load_optim': True,
         })
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(logger_config=logger_config)
 
     args = get_args()
     tokenizer = get_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder, logger_config=logger_config), wrap_with_ddp=False)
 
     load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
     print_rank_0("Done loading checkpoint")
@@ -75,5 +77,4 @@ if __name__ == "__main__":
     extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "train"), 0, int(args.num_samples * 0.98))
     extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "valid"), int(args.num_samples * 0.98), int(args.num_samples * 0.99))
     extract_feature(sft_dataset, unwrapped_model, os.path.join(args.output_dir, "test"), int(args.num_samples * 0.99), args.num_samples)
-
 

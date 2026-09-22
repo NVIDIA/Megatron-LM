@@ -6,6 +6,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.training.argument_utils import logger_config_from_args
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
@@ -96,6 +97,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                    logger_config=logger_config_from_args(mock_args),
                 )
 
                 # Get optimizer A param state
@@ -183,6 +185,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                    logger_config=logger_config_from_args(mock_args),
                 )
 
                 optim_param_state_A = optimizer_A.state_dict()

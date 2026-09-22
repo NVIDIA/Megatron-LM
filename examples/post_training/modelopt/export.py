@@ -66,8 +66,10 @@ if __name__ == "__main__":
             'no_load_optim': True,
         },
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(logger_config=logger_config)
 
     args = get_args()
 
@@ -85,7 +87,7 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder, logger_config=logger_config), wrap_with_ddp=False
     )
 
     # Materialize the model from meta device to cpu before loading the checkpoint.

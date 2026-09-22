@@ -363,6 +363,9 @@ class LoggerConfig:
     log_energy: bool = False
     """If set, log energy consumption (in Joules)."""
 
+    run_workload_inspector_server: bool = False
+    """Run the optional workload-inspector web server during training."""
+
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 
@@ -386,6 +389,43 @@ class LoggerConfig:
 
     moe_routing_trace_dump_weights: bool = False
     """Save router weight tensors to a .pt sidecar file."""
+
+    enable_one_logger: bool = True
+    """Enable one-logger end-to-end metrics."""
+
+    one_logger_project: str = "megatron-lm"
+    """Project for one-logger metrics."""
+
+    one_logger_run_name: str | None = None
+    """Run name displayed by one-logger."""
+
+    one_logger_async: bool = False
+    """Run one-logger asynchronously."""
+
+    app_tag_run_name: str | None = None
+    """Application run name shared across training jobs."""
+
+    app_tag_run_version: str = "0.0.0"
+    """Application version associated with performance metrics."""
+
+    otel_enabled: bool = False
+    """Enable OpenTelemetry in addition to its environment configuration."""
+
+    otel_service_name: str | None = None
+    """Override the OpenTelemetry service name."""
+
+    otel_span_groups: str | None = None
+    """Override the OpenTelemetry span-group selection."""
+
+    def validate(self) -> None:
+        """Check logging requirements shared by CLI and native configurations."""
+        if self.log_memory_interval is not None:
+            assert self.log_memory_interval % self.log_interval == 0
+        if self.log_max_attention_logit:
+            from megatron.core.utils import is_te_min_version
+
+            assert is_te_min_version("2.9.0"), \
+                '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
 
 @dataclass(kw_only=True)

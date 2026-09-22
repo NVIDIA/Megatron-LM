@@ -52,6 +52,7 @@ def model_provider(
     parallel_output=True,
     config=None,
     pg_collection=None,
+    *, logger_config,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -122,6 +123,8 @@ def model_provider(
         language_transformer_config = core_transformer_config_from_args(get_args())
     else:
         language_transformer_config = config
+    language_transformer_config.log_max_attention_logit = logger_config.log_max_attention_logit
+    language_transformer_config.barrier_with_L1_time = logger_config.barrier_with_L1_time
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
     else:
@@ -500,14 +503,14 @@ if __name__ == "__main__":
         extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, logger_config=full_config.logger)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        model_provider,
+        partial(model_provider, logger_config=full_config.logger),
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )

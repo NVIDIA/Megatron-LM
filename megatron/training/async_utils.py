@@ -68,7 +68,7 @@ def _get_async_calls_queue():
     return _async_calls_queue
 
 
-def build_otel_worker_bootstrap(args):
+def build_otel_worker_bootstrap(args, *, logger_config):
     """Build the plain-dict otel config + resource attributes to hand to the
     persistent checkpoint worker process.
 
@@ -84,7 +84,7 @@ def build_otel_worker_bootstrap(args):
 
     from megatron.training.global_vars import build_telemetry_resource_attrs
 
-    service_name = getattr(args, 'otel_service_name', None)
+    service_name = getattr(logger_config, 'otel_service_name', None)
     if not service_name and not os.environ.get('OTEL_SERVICE_NAME', '').strip():
         service_name = 'megatron-lm'
 
@@ -104,7 +104,7 @@ def build_otel_worker_bootstrap(args):
     #       set_enabled_span_groups() with this AFTER setup_telemetry, overriding
     #       the base-safe set -- giving it trace_region etc. (save-side
     #       checkpoint internals). An OLD worker ignores this key.
-    worker_span_groups = getattr(args, 'otel_span_groups', None)
+    worker_span_groups = getattr(logger_config, 'otel_span_groups', None)
     resolved_span_groups = None
     if worker_span_groups:
         try:
@@ -120,7 +120,7 @@ def build_otel_worker_bootstrap(args):
             # rather than risk handing the worker something it can't resolve.
             worker_span_groups = 'per_step'
 
-    enabled = bool(getattr(args, 'otel_enabled', False))
+    enabled = bool(getattr(logger_config, 'otel_enabled', False))
     return {
         'enabled': enabled,
         'service_name': service_name,
@@ -136,7 +136,7 @@ def build_otel_worker_bootstrap(args):
     }
 
 
-def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
+def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn', *, logger_config):
     from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import get_write_results_queue
 
@@ -167,7 +167,7 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     # Older nvidia-resiliency-ext installs won't have this parameter yet --
     # degrade to no worker-side telemetry rather than hard-failing checkpointing.
     if "otel_bootstrap" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
-        warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap(args)
+        warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap(args, logger_config=logger_config)
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
         cpu_priority=args.async_ckpt_cpu_priority,

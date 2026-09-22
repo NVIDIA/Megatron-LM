@@ -145,7 +145,7 @@ def parse_args_and_detect_vlm(
     Callers that inject their own argv defaults first should compute user_passed_attrs beforehand
     and pass it in.
 
-    Returns (args, is_vlm).
+    Returns (args, is_vlm, logger_config).
     """
     if user_passed_attrs is None:
         user_passed_attrs = set()
@@ -161,8 +161,10 @@ def parse_args_and_detect_vlm(
     sys.argv[1:1] = _defaults
 
     args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(logger_config=logger_config)
     args = get_args()
 
     is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
@@ -175,10 +177,10 @@ def parse_args_and_detect_vlm(
     if torch.distributed.get_rank() == 0:
         print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
 
-    return args, is_vlm
+    return args, is_vlm, logger_config
 
 
-def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
+def _build_engine_for_vlm_or_gpt(is_vlm: bool, *, logger_config) -> DynamicInferenceEngine:
     """Build a DynamicInferenceEngine, wrapping with VLMInferenceWrapper when needed.
 
     The default ``get_dynamic_inference_engine`` only knows about GPT/Hybrid
@@ -189,10 +191,12 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     args = get_args()
 
     if not is_vlm:
-        return get_dynamic_inference_engine()
+        from megatron.inference.utils import get_model_for_inference
+
+        return get_dynamic_inference_engine(get_model_for_inference(logger_config=logger_config))
 
     tokenizer = build_tokenizer(args)
-    model = get_vlm_model(is_vlm=True)
+    model = get_vlm_model(is_vlm=True, logger_config=logger_config)
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     # Grow inference_config.max_sequence_length to accommodate the worst-case
@@ -430,7 +434,7 @@ if __name__ == "__main__":
             _defaults.append("--return-log-probs")
         sys.argv[1:1] = _defaults
 
-        args, is_vlm = parse_args_and_detect_vlm(
+        args, is_vlm, logger_config = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
             user_passed_attrs=user_passed_attrs,
@@ -449,7 +453,7 @@ if __name__ == "__main__":
 
         chat_template = _load_chat_template(getattr(args, 'chat_template', None))
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
+        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm, logger_config=logger_config)
 
         try:
             asyncio.run(

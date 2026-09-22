@@ -28,7 +28,7 @@ from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core import mpu, tensor_parallel
 
 
-def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
+def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None, *, logger_config):
     """Build the model."""
 
     print_rank_0('building BERT model ...')
@@ -36,6 +36,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     args = get_args()
     if config is None:
         config = core_transformer_config_from_args(args)
+    config.log_max_attention_logit = logger_config.log_max_attention_logit
+    config.barrier_with_L1_time = logger_config.barrier_with_L1_time
     num_tokentypes = 2 if args.bert_binary_head else 0
 
     if args.spec is None:
@@ -186,8 +188,8 @@ if __name__ == "__main__":
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, logger_config=full_config.logger)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(full_config, train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,
-             forward_step, model_provider)
+             forward_step, partial(model_provider, logger_config=full_config.logger))

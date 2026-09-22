@@ -268,8 +268,10 @@ def main():
         extra_args_provider=add_offline_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    initialize_runtime_services(args)
-    initialize_megatron()
+    from megatron.training.argument_utils import logger_config_from_args
+    logger_config = logger_config_from_args(args)
+    initialize_runtime_services(args, logger_config=logger_config)
+    initialize_megatron(logger_config=logger_config)
     _validate_high_level_api_args(args)
 
     if os.environ.get("NSIGHT_PREFIX"):
@@ -294,7 +296,7 @@ def main():
         stop_words=args.stop_words,
     )
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(logger_config=logger_config)
     inference_config = get_inference_config_from_model_and_args(model, args)
     requests = build_requests(args, tokenizer, sampling_params)
 

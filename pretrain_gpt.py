@@ -578,7 +578,7 @@ if __name__ == "__main__":
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, logger_config=full_config.logger)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,

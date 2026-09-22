@@ -409,7 +409,7 @@ def get_rl_runtime_state():
     return _rl_runtime_state
 
 
-def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer):
+def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer, *, logger_config):
     """Compute, log, and store RL token throughput metrics.
 
     Returns a string fragment to append to the training log line.
@@ -496,7 +496,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
         if wandb_writer is not None:
             wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
-    elif args.log_throughput:
+    elif logger_config.log_throughput:
         log_string += f' avg_seq_len: {args.seq_length} |'
 
     return log_string

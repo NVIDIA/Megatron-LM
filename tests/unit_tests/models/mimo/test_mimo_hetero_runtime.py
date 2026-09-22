@@ -224,6 +224,8 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
         data_parallel_random_init=True,
         use_layer_wise_distributed_optimizer=True,
         use_layer_wise_param_layout=False,
+        log_max_attention_logit=False,
+        barrier_with_L1_time=True,
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
@@ -264,7 +266,12 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     mocker.patch("examples.mimo.training.builder.configure_grad_sync")
     seed = mocker.patch("examples.mimo.training.builder.configure_module_rng")
 
-    builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+    builder.build_distributed_models(
+        mocker.Mock(),
+        ddp_config=DistributedDataParallelConfig(),
+        log_max_attention_logit=False,
+        barrier_with_L1_time=True,
+    )
 
     seed.assert_called_once_with(args, encoder_pg, _ENCODER_SEED_OFFSET, False)
     assert model.pg_collection is encoder_pg
@@ -279,7 +286,11 @@ def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
 
     with pytest.raises(NotImplementedError, match="has not been tested yet"):
         builder.build_distributed_models(
-            mocker.Mock(), ddp_config=DistributedDataParallelConfig(), **{fsdp_kwarg: True}
+            mocker.Mock(),
+            ddp_config=DistributedDataParallelConfig(),
+            **{fsdp_kwarg: True},
+            log_max_attention_logit=False,
+            barrier_with_L1_time=True,
         )
 
 
@@ -346,7 +357,10 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
     )
 
     result = builder.build_distributed_models(
-        mocker.Mock(), ddp_config=DistributedDataParallelConfig()
+        mocker.Mock(),
+        ddp_config=DistributedDataParallelConfig(),
+        log_max_attention_logit=False,
+        barrier_with_L1_time=True,
     )
 
     assert events == ["pre", "wrap", "configure", "post"]
@@ -381,7 +395,12 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
         ValueError,
         match=f"MIMO {hook_stage}-wrap hooks must return exactly one outer model; got {model_count}",
     ):
-        builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+        builder.build_distributed_models(
+            mocker.Mock(),
+            ddp_config=DistributedDataParallelConfig(),
+            log_max_attention_logit=False,
+            barrier_with_L1_time=True,
+        )
 
 
 def test_configure_module_rng_forwards_rng_tracker_options(mocker):

@@ -124,7 +124,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         >>> model = HybridModelBuilder(model_cfg).build_model(pg_collection)
         >>>
         >>> # Distributed training
-        >>> models = HybridModelBuilder(model_cfg).build_distributed_models(pg_collection)
+        >>> models = HybridModelBuilder(model_cfg).build_distributed_models(
+        ...     pg_collection, log_max_attention_logit=False, barrier_with_L1_time=True
+        ... )
     """
 
     def __init__(self, model_config: HybridModelConfig):
@@ -208,11 +210,16 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        *,
+        log_max_attention_logit: bool,
+        barrier_with_L1_time: bool,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
         Args:
             pg_collection: Model communication process groups.
+            log_max_attention_logit: Attention logging policy derived from LoggerConfig.
+            barrier_with_L1_time: Timing barrier policy derived from LoggerConfig.
             ddp_config: DistributedDataParallel configuration
             overlap_param_gather_with_optimizer_step: Whether to overlap parameter
                 gather with optimizer step.
@@ -230,6 +237,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
+        transformer_config.log_max_attention_logit = log_max_attention_logit
+        transformer_config.barrier_with_L1_time = barrier_with_L1_time
         composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
         model_list = unimodal_build_distributed_models(
             self.build_model,

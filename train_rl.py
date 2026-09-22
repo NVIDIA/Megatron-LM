@@ -37,7 +37,10 @@ import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
 
-def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+def _gpt_builder(
+    args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None,
+    *, log_max_attention_logit: bool, barrier_with_L1_time: bool,
+):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
     # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
     if config is None:
@@ -76,6 +79,8 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
             vp_stage=vp_stage,
             config=config,
             pg_collection=pg_collection,
+            log_max_attention_logit=log_max_attention_logit,
+            barrier_with_L1_time=barrier_with_L1_time,
         )
 
 
@@ -390,7 +395,10 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     def _model_builder(
-        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
+        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None,
+        *,
+        log_max_attention_logit: bool,
+        barrier_with_L1_time: bool,
     ):
         if is_hybrid_model(args):
             return hybrid_builder(
@@ -400,6 +408,8 @@ if __name__ == "__main__":
                 vp_stage,
                 config=config,
                 pg_collection=pg_collection,
+                log_max_attention_logit=log_max_attention_logit,
+                barrier_with_L1_time=barrier_with_L1_time,
             )
         else:
             return _gpt_builder(
@@ -409,6 +419,8 @@ if __name__ == "__main__":
                 vp_stage,
                 config=config,
                 pg_collection=pg_collection,
+                log_max_attention_logit=log_max_attention_logit,
+                barrier_with_L1_time=barrier_with_L1_time,
             )
 
     args = parse_and_validate_args(
@@ -424,12 +436,12 @@ if __name__ == "__main__":
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    initialize_runtime_services(args)
+    initialize_runtime_services(args, logger_config=full_config.logger)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, _model_builder),
+        partial(model_provider, _model_builder, logger_config=full_config.logger),
     )

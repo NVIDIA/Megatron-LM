@@ -148,17 +148,19 @@ def _graceful_shutdown(signum, frame):
 
 def set_global_variables(args, build_tokenizer=True):
     """Register args and construct runtime services for args-only callers."""
+    from megatron.training.argument_utils import logger_config_from_args
 
     assert args is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
 
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer)
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer, logger_config=logger_config_from_args(args))
 
 
-def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
+def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True, logger_config) -> None:
     """Construct services independently of CLI parsing and config construction."""
+    logger_config.validate()
 
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
@@ -178,13 +180,13 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
     )
     if build_tokenizer:
         _ = _build_tokenizer(args)
-    _set_tensorboard_writer(args)
-    _set_wandb_writer(args)
-    _set_one_logger(args)
+    _set_tensorboard_writer(args, logger_config=logger_config)
+    _set_wandb_writer(args, logger_config=logger_config)
+    _set_one_logger(args, logger_config=logger_config)
     _set_adlr_autoresume(args)
-    _set_timers(args)
+    _set_timers(args, logger_config=logger_config)
     _set_energy_monitor(args)
-    _set_telemetry(args)
+    _set_telemetry(args, logger_config=logger_config)
     _set_train_state()
 
     if args.enable_experimental:
@@ -271,41 +273,42 @@ def rebuild_tokenizer(args):
     return _build_tokenizer(args)
 
 
-def _set_tensorboard_writer(args):
+def _set_tensorboard_writer(args, *, logger_config):
     """Set tensorboard writer."""
     global _GLOBAL_TENSORBOARD_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
                                    'tensorboard writer')
 
-    if hasattr(args, 'tensorboard_dir') and \
-       args.tensorboard_dir and args.rank == (args.world_size - 1):
+    if hasattr(logger_config, 'tensorboard_dir') and \
+       logger_config.tensorboard_dir and args.rank == (args.world_size - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
             print('> setting tensorboard ...')
             _GLOBAL_TENSORBOARD_WRITER = SummaryWriter(
-                log_dir=args.tensorboard_dir,
-                max_queue=args.tensorboard_queue_size)
+                log_dir=logger_config.tensorboard_dir,
+                max_queue=logger_config.tensorboard_queue_size)
         except ModuleNotFoundError:
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '
                   'no TensorBoard logs will be written.', flush=True)
 
 
-def _set_wandb_writer(args):
+def _set_wandb_writer(args, *, logger_config):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
-    if getattr(args, 'wandb_project', '') and args.rank == (args.world_size - 1):
-        if args.wandb_exp_name == '':
+    if getattr(logger_config, 'wandb_project', '') and args.rank == (args.world_size - 1):
+        if logger_config.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
         import wandb
-        if args.wandb_save_dir:
-            save_dir = args.wandb_save_dir
+        if logger_config.wandb_save_dir:
+            save_dir = logger_config.wandb_save_dir
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        wandb_config = vars(args)
+        from megatron.training.argument_utils import logger_args_snapshot
+        wandb_config = vars(logger_args_snapshot(args, logger_config))
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.
@@ -313,30 +316,30 @@ def _set_wandb_writer(args):
                 wandb_config['kitchen_config_file_contents'] = f.read()
         wandb_kwargs = {
             'dir': save_dir,
-            'name': args.wandb_exp_name,
-            'project': args.wandb_project,
+            'name': logger_config.wandb_exp_name,
+            'project': logger_config.wandb_project,
             'config': wandb_config}
-        if args.wandb_entity:
-            wandb_kwargs['entity'] = args.wandb_entity
+        if logger_config.wandb_entity:
+            wandb_kwargs['entity'] = logger_config.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
 
 
-def _set_one_logger(args):
+def _set_one_logger(args, *, logger_config):
     global _GLOBAL_ONE_LOGGER
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
-    if args.enable_one_logger and args.rank == (args.world_size - 1):
-        if args.one_logger_async or getattr(args, 'wandb_project', ''):
+    if logger_config.enable_one_logger and args.rank == (args.world_size - 1):
+        if logger_config.one_logger_async or getattr(logger_config, 'wandb_project', ''):
             one_logger_async = True
         else:
             one_logger_async = False
         try:
             from one_logger import OneLogger
             config = {
-               'project': args.one_logger_project,
-               'name': args.one_logger_run_name,
+               'project': logger_config.one_logger_project,
+               'name': logger_config.one_logger_run_name,
                'async': one_logger_async,
             }
             one_logger = OneLogger(config=config)
@@ -365,11 +368,11 @@ def _set_adlr_autoresume(args):
         _GLOBAL_ADLR_AUTORESUME = AutoResume
 
 
-def _set_timers(args):
+def _set_timers(args, *, logger_config):
     """Initialize timers."""
     global _GLOBAL_TIMERS
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, 'timers')
-    _GLOBAL_TIMERS = Timers(args.timing_log_level, args.timing_log_option)
+    _GLOBAL_TIMERS = Timers(logger_config.timing_log_level, logger_config.timing_log_option)
 
 def _set_energy_monitor(args):
     """Initialize energy monitor."""
@@ -529,7 +532,7 @@ def build_telemetry_resource_attrs(args):
     return resource_attrs
 
 
-def _set_telemetry(args):
+def _set_telemetry(args, *, logger_config):
     """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
     global _GLOBAL_TELEMETRY_HANDLE
     try:
@@ -547,12 +550,12 @@ def _set_telemetry(args):
     )
     if not os.environ.get('OTEL_SERVICE_NAME', '').strip():
         config.service_name = 'megatron-lm'
-    if getattr(args, 'otel_enabled', False):
+    if getattr(logger_config, 'otel_enabled', False):
         config.enabled = True
-    if getattr(args, 'otel_service_name', None):
-        config.service_name = args.otel_service_name
-    if getattr(args, 'otel_span_groups', None):
-        config.span_groups = args.otel_span_groups
+    if getattr(logger_config, 'otel_service_name', None):
+        config.service_name = logger_config.otel_service_name
+    if getattr(logger_config, 'otel_span_groups', None):
+        config.span_groups = logger_config.otel_span_groups
 
     # Only pay for the resource-attribute build on the enabled path. It is not free:
     # _detect_gpu_identity() does an nvmlInit()/nvmlShutdown() round trip, and a run with

@@ -22,13 +22,18 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
-def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+def gpt_builder(
+    args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None,
+    *, log_max_attention_logit: bool, barrier_with_L1_time: bool,
+):
     print_rank_0('building GPT model ...')
     if config is None:
         if args.yaml_cfg is not None:
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
+    config.log_max_attention_logit = log_max_attention_logit
+    config.barrier_with_L1_time = barrier_with_L1_time
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:

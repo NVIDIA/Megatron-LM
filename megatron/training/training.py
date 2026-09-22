@@ -1613,6 +1613,7 @@ def pretrain(
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
     callback_manager = normalize_callbacks(callbacks)
+    cfg_container.logger.validate()
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1640,6 +1641,7 @@ def pretrain(
         seed_tp_group=getattr(pg_collection, "tp", None),
         seed_ep_group=getattr(pg_collection, "ep", None),
         seed_etp_group=getattr(pg_collection, "expt_tp", None),
+        logger_config=cfg_container.logger,
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1833,7 +1835,7 @@ def pretrain(
     app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
     # Track E2E metrics on pretrain start
-    one_logger_utils.on_pretrain_start()
+    one_logger_utils.on_pretrain_start(logger_config=cfg_container.logger)
 
     # Context used for persisting some state between checkpoint saves.
     if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
@@ -1920,6 +1922,7 @@ def pretrain(
                 if pg_collection is not None
                 else ProcessGroupCollection.use_mpu_process_groups()
             ),
+            logger_config=cfg_container.logger,
         )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -2136,6 +2139,7 @@ def pretrain(
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
                     callback_manager=callback_manager,
+                    logger_config=cfg_container.logger,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2159,7 +2163,8 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator
+                train_data_iterator=train_data_iterator,
+                logger_config=cfg_container.logger,
             )
 
         one_logger and one_logger.log_metrics(
@@ -2208,6 +2213,7 @@ def pretrain(
                 pg_collection=pg_collection, p2p_communicator=p2p_communicator,
                 callback_manager=callback_manager,
                 is_test=False,
+                logger_config=cfg_container.logger,
             )
 
     if args.do_test:
@@ -2227,6 +2233,7 @@ def pretrain(
             p2p_communicator=p2p_communicator,
             callback_manager=callback_manager,
             is_test=True,
+            logger_config=cfg_container.logger,
         )
 
     wandb_writer = get_wandb_writer()
@@ -2841,6 +2848,7 @@ def setup_model_and_optimizer(
     *,
     cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
+    logger_config,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2877,6 +2885,8 @@ def setup_model_and_optimizer(
             )
 
             return builder.build_distributed_models(
+                log_max_attention_logit=logger_config.log_max_attention_logit,
+                barrier_with_L1_time=logger_config.barrier_with_L1_time,
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
@@ -2958,6 +2968,8 @@ def setup_model_and_optimizer(
             update_train_iters(args)
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
+        config.log_num_zeros_in_grad = logger_config.log_num_zeros_in_grad
+        config.barrier_with_L1_time = logger_config.barrier_with_L1_time
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
@@ -3022,7 +3034,8 @@ def setup_model_and_optimizer(
         )
         args.iteration = 1
         save_checkpoint(
-            args.iteration, model, None, None, args.num_floating_point_operations_so_far
+            args.iteration, model, None, None, args.num_floating_point_operations_so_far,
+            logger_config=logger_config,
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -3126,6 +3139,7 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             args.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
+            logger_config=logger_config,
         )
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
@@ -3240,7 +3254,7 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None, *, logger_config):
     """Single training step.
 
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
@@ -3423,7 +3437,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
-    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    timers('optimizer', log_level=1).start(barrier=logger_config.barrier_with_L1_time)
     _opt_cm = (
         span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
@@ -3438,7 +3452,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
-    if args.qk_clip or args.log_max_attention_logit:
+    if args.qk_clip or logger_config.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
 
     timers('optimizer').stop()
@@ -3466,7 +3480,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
+    if logger_config.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
@@ -3609,6 +3623,7 @@ def training_log(
     model=None,
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
+    *, logger_config,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -3623,7 +3638,7 @@ def training_log(
     # iteration always prints: under --log-interval 100 that is an extra line inside an
     # interval still accumulating, so it must not reset; under --log-interval 1 that line
     # *is* the interval, so it must, or the next print covers two iterations.
-    should_reset = not is_first_iteration or iteration % args.log_interval == 0
+    should_reset = not is_first_iteration or iteration % logger_config.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -3653,7 +3668,7 @@ def training_log(
 
     # Logging.
     timers_to_log = []
-    if args.timing_log_level >= 1:
+    if logger_config.timing_log_level >= 1:
         timers_to_log.extend([
             'dataloader-next',
             'batch-generator',
@@ -3670,7 +3685,7 @@ def training_log(
             'optimizer-copy-main-to-model-params',
             'optimizer',
         ])
-    if args.timing_log_level >= 2:
+    if logger_config.timing_log_level >= 2:
         timers_to_log.extend([
             'forward-compute',
             'backward-compute',
@@ -3713,7 +3728,7 @@ def training_log(
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
-    if writer and (iteration % args.tensorboard_log_interval == 0):
+    if writer and (iteration % logger_config.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
         if learning_rate is not None:
@@ -3741,12 +3756,12 @@ def training_log(
             writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
-        if args.log_loss_scale_to_tensorboard:
+        if logger_config.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'loss-scale': loss_scale}, iteration)
-        if args.log_world_size_to_tensorboard:
+        if logger_config.log_world_size_to_tensorboard:
             writer.add_scalar('world-size', args.world_size, iteration)
             writer.add_scalar('world-size vs samples', args.world_size, args.consumed_train_samples)
             if wandb_writer:
@@ -3773,7 +3788,7 @@ def training_log(
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
-        if args.log_memory_to_tensorboard:
+        if logger_config.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
                 "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
@@ -3785,7 +3800,7 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
-        if args.log_max_attention_logit:
+        if logger_config.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
@@ -3900,7 +3915,7 @@ def training_log(
         )
 
     # Dump memory snapshot and print metrics to stdout.
-    if iteration % args.log_interval == 0 or is_first_iteration:
+    if iteration % logger_config.log_interval == 0 or is_first_iteration:
         should_prof_rank = (args.profile_ranks == [] or safe_get_rank() in args.profile_ranks)  # [] is all ranks
         if args.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
             rank = safe_get_rank()
@@ -3919,12 +3934,12 @@ def training_log(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
-        one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
+        one_logger_utils.track_e2e_metrics(logger_config.log_throughput, throughput)
 
         # We log to stdout after the first iteration (controlled by `is_first_iteration`)
         # to document initialization overhead. Log statistics to TensorBoard and
         # WandB according to the regular schedule.
-        if args.log_timers_to_tensorboard and not is_first_iteration:
+        if logger_config.log_timers_to_tensorboard and not is_first_iteration:
             if writer:
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
@@ -3946,14 +3961,14 @@ def training_log(
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0
         )
-        if args.log_throughput:
+        if logger_config.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
+            if logger_config.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
-        if args.log_energy:
+        if logger_config.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
             log_string += f' energy per GPU (J/iter/GPU): {energy:.1f} |'
@@ -4016,6 +4031,7 @@ def training_log(
         if args.perform_rl_step:
             log_string += rl_utils.log_rl_throughput_metrics(
                 args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
+                logger_config=logger_config,
             )
 
         if should_reset:
@@ -4045,7 +4061,7 @@ def training_log(
                 meter=_otel_telemetry_log.meter,
                 step_duration_ms=elapsed_time_per_iteration * 1000.0,
                 loss=_avg_loss,
-                throughput_tflops=throughput if args.log_throughput else None,
+                throughput_tflops=throughput if logger_config.log_throughput else None,
                 grad_norm=grad_norm,
                 learning_rate=learning_rate,
                 skipped_iters=_otel_skipped_iters_snapshot,
@@ -4062,17 +4078,19 @@ def training_log(
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
+                logger_config=logger_config,
             )
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
             if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
-        if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
+        if logger_config.log_memory_interval is not None and iteration % logger_config.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
+                logger_config=logger_config,
             )
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.
@@ -4081,30 +4099,30 @@ def training_log(
                 iteration=iteration,
                 timers=timers,
                 elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
-                throughput_tflops=throughput if args.log_throughput else None,
+                throughput_tflops=throughput if logger_config.log_throughput else None,
                 global_batch_size=batch_size,
                 wandb_writer=wandb_writer,
                 tb_writer=writer,
             )
 
         # Write timers to wandb, don't reset the counts.
-        if args.log_timers_to_tensorboard:
-            timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
-            timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
+        if logger_config.log_timers_to_tensorboard:
+            timers.write(timers_to_log, writer, iteration, normalizer=logger_config.log_interval, reset=False)
+            timers.write(timers_to_log, wandb_writer, iteration, normalizer=logger_config.log_interval, reset=False)
         # Log timers to stdout
-        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
+        timers.log(timers_to_log, normalizer=logger_config.log_interval, reset=should_reset)
 
     return report_memory_flag
 
 
-def _should_compute_params_norm(args, iteration, is_first_iteration):
+def _should_compute_params_norm(logger_config, iteration, is_first_iteration):
     """Whether this iteration can emit the parameter norm."""
-    return args.log_params_norm and (
+    return logger_config.log_params_norm and (
         is_first_iteration
-        or iteration % args.log_interval == 0
+        or iteration % logger_config.log_interval == 0
         or (
-            bool(args.tensorboard_dir)
-            and iteration % args.tensorboard_log_interval == 0
+            bool(logger_config.tensorboard_dir)
+            and iteration % logger_config.tensorboard_log_interval == 0
         )
     )
 
@@ -4195,6 +4213,7 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    *, logger_config,
 ):
     args = get_args()
     timers = get_timers()
@@ -4260,7 +4279,7 @@ def save_checkpoint_and_time(
         if should_report_memory:
             # Track memory before checkpoint save.
             # Gate on the full data-distribution group so gtp_remat peers do not each report.
-            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
+            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group, logger_config=logger_config)
 
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
@@ -4282,6 +4301,7 @@ def save_checkpoint_and_time(
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
                 cp_group=cp_group,
+                logger_config=logger_config,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -4291,7 +4311,7 @@ def save_checkpoint_and_time(
         if should_report_memory:
             # Track memory after checkpoint save.
             with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True):
-                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group)
+                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_gtp_remat_group, logger_config=logger_config)
         num_checkpoints_memory_reported += 1
 
         if args.fp8:
@@ -4312,7 +4332,7 @@ def save_checkpoint_and_time(
 
         one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
-        if args.log_progress and not non_persistent_ckpt:
+        if logger_config.log_progress and not non_persistent_ckpt:
             compute_throughputs_and_append_to_progress_log(
                 iteration, num_floating_point_operations_so_far
             )
@@ -4362,6 +4382,7 @@ def post_training_step_callbacks(
     prof,
     num_floating_point_operations_since_last_log_event,
     nsys_nvtx_context = None,
+    *, logger_config,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -4371,9 +4392,9 @@ def post_training_step_callbacks(
         torch.cuda.synchronize()
 
     # Straggler detector.
-    if iteration % args.log_interval == 0 and args.log_straggler:
+    if iteration % logger_config.log_interval == 0 and args.log_straggler:
         # Use FLOPs accumulated since last log event and then reset the counter
-        stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
+        stimer.report(num_floating_point_operations_since_last_log_event, logger_config.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
 
     # Check weight hash across DP replicas.
@@ -4393,7 +4414,7 @@ def post_training_step_callbacks(
 
     # Autoresume.
     if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
-        check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
+        check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler, logger_config=logger_config)
 
     # Profiling.
     if (
@@ -4442,6 +4463,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    *, logger_config,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -4463,6 +4485,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    logger_config=logger_config,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -4478,6 +4501,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            logger_config=logger_config,
         )
         saved_checkpoint = True
 
@@ -4495,6 +4519,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            logger_config=logger_config,
         )
         saved_checkpoint = True
 
@@ -4520,6 +4545,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    logger_config=logger_config,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -4542,12 +4568,29 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                logger_config=logger_config,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
 
     return False
+
+
+def _start_workload_inspector_server(logger_config):
+    """Start the optional inspector from the current run's logging policy."""
+    if logger_config.run_workload_inspector_server:
+        try:
+            import threading
+
+            from workload_inspector.utils.webserver import run_server
+
+            threading.Thread(
+                target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
+            ).start()
+        except ModuleNotFoundError:
+            print_rank_0("workload inspector module not found.")
+
 
 
 def train(
@@ -4565,6 +4608,7 @@ def train(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     callback_manager: CallbackManager | None = None,
+    *, logger_config,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4692,20 +4736,10 @@ def train(
     if args.hybrid_context_parallel:
         train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
-    if args.run_workload_inspector_server:
-        try:
-            import threading
-
-            from workload_inspector.utils.webserver import run_server
-
-            threading.Thread(
-                target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
-            ).start()
-        except ModuleNotFoundError:
-            print_rank_0("workload inspector module not found.")
+    _start_workload_inspector_server(logger_config)
 
     # Write args to tensorboard
-    write_args_to_tensorboard()
+    write_args_to_tensorboard(logger_config=logger_config)
 
     # Turn on training mode which enables dropout.
     for model_module in model:
@@ -4734,7 +4768,7 @@ def train(
         train_iters=args.train_iters,
         save=args.save,
         async_save=args.async_save,
-        log_throughput=args.log_throughput,
+        log_throughput=logger_config.log_throughput,
         num_floating_point_operations_so_far=args.num_floating_point_operations_so_far,
     )
 
@@ -4771,7 +4805,7 @@ def train(
     if config.finalize_model_grads_func is None:
         config.finalize_model_grads_func = finalize_model_grads
 
-    if args.log_energy:
+    if logger_config.log_energy:
         energy_monitor.setup()
         energy_monitor.resume()
 
@@ -4785,17 +4819,17 @@ def train(
     # Initialize router trace if requested.  The tracer attaches forward hooks
     # to all TopKRouter modules and writes one JSONL record per (iteration,
     # layer).  advance_step() is called at the end of each train_step().
-    if getattr(args, 'moe_routing_trace_path', None):
+    if getattr(logger_config, 'moe_routing_trace_path', None):
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        max_steps = getattr(args, 'moe_routing_trace_max_training_iters', None) or args.train_iters
+        max_steps = getattr(logger_config, 'moe_routing_trace_max_training_iters', None) or args.train_iters
         init_moe_router_tracer(
-            output_dir=args.moe_routing_trace_path,
+            output_dir=logger_config.moe_routing_trace_path,
             max_steps=max_steps,
             rank=rank,
             training_mode=True,
-            capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
-            capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
-            dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+            capture_hidden_states=getattr(logger_config, 'moe_routing_trace_capture_hidden_states', False),
+            capture_logits=getattr(logger_config, 'moe_routing_trace_capture_logits', False),
+            dump_router_weights=getattr(logger_config, 'moe_routing_trace_dump_weights', False),
         )
         get_moe_router_tracer().register_hooks(model)
 
@@ -4890,13 +4924,13 @@ def train(
         and args.use_pytorch_profiler
     ):
         if args.pytorch_profiler_collect_chakra:
-            et_dir = Path(f"{args.tensorboard_dir}/../chakra")
+            et_dir = Path(f"{logger_config.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
             et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         else:
             et = None
         def trace_handler(p):
-            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            profile_dir = Path(f"{logger_config.tensorboard_dir}/../torch_profile")
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
@@ -5037,6 +5071,7 @@ def train(
                         num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
+                        logger_config=logger_config,
                     )
                     print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
                                  "exiting so the run can be relaunched at the new batch size.")
@@ -5156,6 +5191,7 @@ def train(
                     forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
+                    logger_config=logger_config,
                 )
                 ft_integration.on_training_step_end()
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
@@ -5186,6 +5222,7 @@ def train(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                logger_config=logger_config,
             )
         if should_exit:
             break
@@ -5316,7 +5353,7 @@ def train(
                 loss_scale = 1.0
             params_norm = None
 
-            if _should_compute_params_norm(args, iteration, is_first_iteration):
+            if _should_compute_params_norm(logger_config, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
                 # + all-reduce that BLOCKS the training loop -- exposed goodput cost
                 # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
@@ -5349,6 +5386,7 @@ def train(
                     model=model,
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
+                    logger_config=logger_config,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5362,7 +5400,7 @@ def train(
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid \
                 and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter):
-            if args.log_energy:
+            if logger_config.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
             if should_disable_forward_pre_hook(args):
@@ -5407,7 +5445,7 @@ def train(
                                        non_loss_data_func=non_loss_data_func,
                                        pg_collection=pg_collection,
                                        p2p_communicator=p2p_communicator,
-                                       callback_manager=callback_manager, is_test=False)
+                                       callback_manager=callback_manager, is_test=False, logger_config=logger_config)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -5421,7 +5459,7 @@ def train(
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
             timers('interval-time', log_level=0).start(barrier=True)
-            if args.log_energy:
+            if logger_config.log_energy:
                 energy_monitor.resume()
             if args.num_experts is not None:
                 get_moe_metrics_tracker().clear()
@@ -5437,6 +5475,7 @@ def train(
             prof,
             num_floating_point_operations_since_last_log_event,
             nsys_nvtx_context,
+            logger_config=logger_config,
         )
 
         # Checkpoint and decide whether to exit.
@@ -5448,6 +5487,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            logger_config=logger_config,
         )
         if should_exit:
             break
@@ -5486,7 +5526,7 @@ def train(
         maybe_finalize_async_save(blocking=True, terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
-    if args.log_energy:
+    if logger_config.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
@@ -5787,6 +5827,7 @@ def evaluate_and_print_results(
     p2p_communicator=None,
     callback_manager: CallbackManager | None = None,
     is_test: bool = False,
+    *, logger_config,
 ):
     """Helper function to evaluate and dump results on screen."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -5870,7 +5911,7 @@ def evaluate_and_print_results(
                     total_loss_dict[key].item(),
                     args.consumed_train_samples,
                 )
-                if args.log_validation_ppl_to_tensorboard:
+                if logger_config.log_validation_ppl_to_tensorboard:
                     writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
