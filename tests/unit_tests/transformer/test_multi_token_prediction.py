@@ -4263,3 +4263,95 @@ class TestBorrowedOutputLayerAllocation:
         output_layer_entry = sharded_state_dict["output_layer.weight"]
         assert output_layer_entry.key == "output_layer.weight"
         assert output_layer_entry.replica_id == (1, 0, 0)
+
+    def _build_hybrid_model(self, monkeypatch, share, pre_process, with_mtp):
+        """Build ``HybridModel`` with its layer stacks stubbed out.
+
+        ``HybridStack`` and the hybrid MTP spec hard-require Transformer Engine
+        and MambaSSM at construction time (``HybridStack.final_norm`` is a
+        ``TENorm``, ``MambaMixer`` imports ``mamba_ssm``), so the decoder and MTP
+        block are replaced with inert stand-ins here. Everything this test
+        targets is real code: pattern parsing and ``mtp_process`` bookkeeping, the
+        ``output_layer`` allocation decision, and
+        ``setup_embeddings_and_output_layer``.
+        """
+
+        class _StubBlock(torch.nn.Module):
+            def __init__(self, *args, **kwargs):
+                super().__init__()
+
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_model.build_module",
+            lambda *args, **kwargs: _StubBlock(),
+        )
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock", _StubBlock
+        )
+        config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
+        )
+        return HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=32,
+            pre_process=pre_process,
+            post_process=True,
+            share_embeddings_and_output_weights=share,
+            position_embedding_type="rope",
+            hybrid_layer_pattern="M*/M*" if with_mtp else "M*",
+        )
+
+    @pytest.mark.parametrize(
+        "share_embeddings_and_output_weights, pre_process, with_mtp",
+        [
+            pytest.param(True, True, False, id="hybrid-tied-first-stage-borrows"),
+            pytest.param(True, False, True, id="hybrid-tied-mtp-stage-borrows"),
+            pytest.param(True, False, False, id="hybrid-tied-last-stage-owns-duplicate"),
+            pytest.param(False, False, True, id="hybrid-untied-mtp-stage-owns"),
+            pytest.param(False, True, False, id="hybrid-untied-first-stage-owns"),
+        ],
+    )
+    def test_hybrid_own_weight_iff_not_borrowed(
+        self, monkeypatch, share_embeddings_and_output_weights, pre_process, with_mtp
+    ):
+        model = self._build_hybrid_model(
+            monkeypatch, share_embeddings_and_output_weights, pre_process, with_mtp
+        )
+        if with_mtp:
+            # The trigger stage: MTP on a non-pre_process stage.
+            assert model.mtp_process and not model.pre_process
+        borrowed = share_embeddings_and_output_weights and (model.pre_process or model.mtp_process)
+
+        if borrowed:
+            assert model.output_layer.weight is None
+            assert not any(
+                name.endswith("output_layer.weight") for name, _ in model.named_parameters()
+            )
+        else:
+            assert isinstance(model.output_layer.weight, torch.nn.Parameter)
+
+        # Whatever the projection runs with must always exist.
+        assert model.shared_embedding_or_output_weight() is not None
+
+    def test_hybrid_tied_mtp_state_dict_has_no_output_layer_weight(self, monkeypatch):
+        # The trigger configuration: tied embeddings, MTP stage, not pre_process.
+        model = self._build_hybrid_model(monkeypatch, True, pre_process=False, with_mtp=True)
+        shared_weight = model.shared_embedding_or_output_weight()
+        assert shared_weight is model.embedding.word_embeddings.weight
+
+        assert "output_layer.weight" not in model.state_dict()
+        assert "embedding.word_embeddings.weight" in model.state_dict()
+
+        # The sharded state dict exercises the checkpoint tie path, which asserts
+        # that tied MTP stages carry no `output_layer.weight` key.
+        sharded_state_dict = model.sharded_state_dict()
+        assert "output_layer.weight" not in sharded_state_dict
+        assert "embedding.word_embeddings.weight" in sharded_state_dict
+
+        # The MTP output-layer tie is a no-op for a borrowed weight instead of
+        # inventing a key for a tensor this stage does not own.
+        tie_output_layer_state_dict(
+            sharded_state_dict, shared_weight, "output_layer.weight", None, None
+        )
+        assert "output_layer.weight" not in sharded_state_dict
