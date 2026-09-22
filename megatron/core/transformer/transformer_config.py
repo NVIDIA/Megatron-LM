@@ -1670,7 +1670,9 @@ class TransformerConfig(ModelParallelConfig):
         # Full-iteration capture cannot include the per-step pipeline shape handshake. Enable
         # the shared fixed-shape packed-P2P path before the base config validates its static
         # token-capacity, padding, and sequence-parallel divisibility requirements.
-        if self.cuda_graph_impl == "full_iteration" and self.sequence_packing_scheduler is not None:
+        if self.cuda_graph_impl == "full_iteration" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
             self.pipeline_p2p_fixed_shape = True
         super().__post_init__()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.

@@ -711,6 +711,22 @@ class TestCudaGraphConfigAndArguments:
         assert cfg.cuda_graph_static_dynamic_cp
         assert cfg.pipeline_p2p_fixed_shape
 
+    def test_thd_full_iteration_dynamic_cp_defaults_scheduler_before_fixed_shape(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='full_iteration',
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=1,
+            context_parallel_size=2,
+            dynamic_context_parallel=True,
+            cuda_graph_static_dynamic_cp=True,
+            pad_packed_seq_alignment='max',
+            max_seqlen_per_dp_cp_rank=64,
+            thd_max_packed_sequences=8,
+        )
+
+        assert cfg.sequence_packing_scheduler == 'default_dynamic_cp'
+        assert cfg.pipeline_p2p_fixed_shape
+
     def test_thd_full_iteration_static_dynamic_cp_flag_requires_dynamic_cp(self):
         with pytest.raises(AssertionError, match="requires --dynamic-context-parallel"):
             _base_cuda_graph_config(
