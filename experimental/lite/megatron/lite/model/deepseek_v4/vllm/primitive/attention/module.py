@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from vllm import envs
-from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
+from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     deepgemm_post_process_fp8_weight_block,
     per_token_group_quant_fp8,
@@ -23,6 +23,12 @@ from vllm.utils.deep_gemm import fp8_gemm_nt
 from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
+    DeploymentBlockFP8Adapter,
+    DeploymentFusedBlockFP8Adapter,
+    quantize_block_fp8_weight,
+    bind_source_scale_to_visible_weight,
+)
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
     attach_indexer_aux_loss,
     compressed_compact_graph,
@@ -40,21 +46,17 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
     prepare_cp_compression_geometry,
     quantized_main_k_visible,
 )
-from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
-    DeploymentBlockFP8Adapter,
-    DeploymentFusedBlockFP8Adapter,
-    bind_source_scale_to_visible_weight,
-    quantize_block_fp8_weight,
-)
 from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
     block_fp8_linear,
-    check_parameter_versions,
     fused_block_fp8_linear,
+    visible_linear,
+)
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
+    check_parameter_versions,
     fused_qkv_rms_norm,
     native_linear_vjp,
     parameter_versions,
     visible_functional_vjp,
-    visible_linear,
 )
 from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
 from megatron.lite.primitive.parallel import ParallelState
@@ -598,7 +600,9 @@ class VLLMAttention(CompressedSparseAttention):
         if boundary_hidden.shape[0] == 0:
             return kv_visible[:0]
 
-        from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            cp_utils,
+        )
 
         rows = boundary_hidden.shape[0]
         boundary_qr_kv = fused_block_fp8_linear(

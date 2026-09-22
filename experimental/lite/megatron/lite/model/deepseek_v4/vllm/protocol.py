@@ -8,21 +8,23 @@ from typing import Any, Iterator
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.deepseek_v4.lite.checkpoint import export_hf_weights as export_hf_weights
-from megatron.lite.model.deepseek_v4.lite.checkpoint import invalidate_bound_source_scales
-from megatron.lite.model.deepseek_v4.lite.checkpoint import load_hf_weights as load_hf_weights
-from megatron.lite.model.deepseek_v4.lite.checkpoint import save_hf_weights as save_hf_weights
-from megatron.lite.model.deepseek_v4.lite.protocol import MODULE_MAP
-from megatron.lite.model.deepseek_v4.lite.protocol import build_model_config as build_model_config
-from megatron.lite.model.deepseek_v4.lite.protocol import build_training_backend
-from megatron.lite.model.deepseek_v4.lite.protocol import is_expert_param as is_expert_param
-from megatron.lite.model.deepseek_v4.lite.protocol import pack_packed_batch
-from megatron.lite.model.deepseek_v4.lite.protocol import pack_r3_replay_mask as pack_r3_replay_mask
-from megatron.lite.model.deepseek_v4.lite.protocol import pack_routed_experts as pack_routed_experts
+from megatron.lite.model.deepseek_v4.lite.checkpoint import (
+    export_hf_weights as export_hf_weights,
+    invalidate_bound_source_scales,
+    load_hf_weights as load_hf_weights,
+    save_hf_weights as save_hf_weights,
+)
 from megatron.lite.model.deepseek_v4.lite.protocol import (
+    MODULE_MAP,
+    build_model_config as build_model_config,
+    build_training_backend,
+    is_expert_param as is_expert_param,
+    pack_packed_batch,
+    pack_r3_replay_mask as pack_r3_replay_mask,
+    pack_routed_experts as pack_routed_experts,
     unpack_forward_output as unpack_forward_output,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
@@ -90,7 +92,11 @@ def _local_num_tokens(batch: Any) -> int:
 
 @contextmanager
 def _vllm_forward_context(batch: Any, parallel_state, vllm_config) -> Iterator[None]:
-    from vllm.forward_context import DPMetadata, create_forward_context, override_forward_context
+    from vllm.forward_context import (
+        DPMetadata,
+        create_forward_context,
+        override_forward_context,
+    )
 
     input_ids = getattr(batch, "input_ids", None)
     if not isinstance(input_ids, torch.Tensor):
@@ -236,7 +242,10 @@ def _prepare_cp_forward_inputs(
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     _validate_contract(model_cfg, impl_cfg)
     init_batch_invariance()
-    from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Layer, DeepseekV4Model
+    from megatron.lite.model.deepseek_v4.vllm.model import (
+        DeepseekV4Layer,
+        DeepseekV4Model,
+    )
 
     parallel_state = init_parallel(impl_cfg.parallel)
     model = DeepseekV4Model(
