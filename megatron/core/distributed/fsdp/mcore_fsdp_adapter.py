@@ -548,7 +548,12 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 
 
 class FullyShardedDataParallelV2(_BaseDataParallel):
-    """MFSDP v2 wrapper for the Megatron model."""
+    """MFSDP v2 wrapper for the Megatron model.
+
+    Supports MXFP8 compute with either high-precision or MXFP8 parameter gathers.
+    For MXFP8 gathers, enable both ``config.fp8_param`` and ``ddp_config.fp8_param_gather``;
+    MCore's model initialization preserves the high-precision values used for main weights.
+    """
 
     def __init__(
         self,
@@ -798,8 +803,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
-        if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
-            raise ValueError("MFSDP v2 does not currently support FP8 or FP4.")
+        if config.fp4 or ddp_config.fp4_param_gather:
+            raise ValueError("MFSDP v2 does not currently support FP4.")
+        if config.fp8 or config.fp8_param or ddp_config.fp8_param_gather:
+            if not config.fp8 or config.fp8_recipe != "mxfp8":
+                raise ValueError("MFSDP v2 only supports FP8 with the MXFP8 recipe.")
+            if config.fp8_param != ddp_config.fp8_param_gather:
+                raise ValueError("MFSDP v2 requires fp8_param and fp8_param_gather to match.")
 
         if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
             raise ValueError(
