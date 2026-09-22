@@ -128,7 +128,7 @@ def _can_use_streamwise_triton(
         and logits.is_cuda
         and tensor.is_contiguous()
         and logits.is_contiguous()
-        and tensor.dtype in (torch.bfloat16, torch.float16)
+        and tensor.dtype in (torch.bfloat16, torch.float16, torch.float32)
         and logits.dtype in (torch.bfloat16, torch.float16, torch.float32)
         and logits.ndim == 1
         and logits.numel() >= num_streams

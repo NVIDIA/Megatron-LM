@@ -28,7 +28,7 @@ def _reference_writeback(
     residual: torch.Tensor,
     update: torch.Tensor,
     write_factors: torch.Tensor,
-    retention_factors: torch.Tensor,
+    retention_factors: torch.Tensor | None,
 ) -> torch.Tensor:
     """Apply the streamwise retained write equation directly."""
 
@@ -36,7 +36,9 @@ def _reference_writeback(
     stream_width = residual.shape[-1] // num_streams
     streams = residual.reshape(*residual.shape[:-1], num_streams, stream_width)
     factor_shape = (1,) * (residual.ndim - 1) + (num_streams, 1)
-    output = streams * retention_factors.reshape(factor_shape)
+    output = (
+        streams if retention_factors is None else streams * retention_factors.reshape(factor_shape)
+    )
     output = output + update.unsqueeze(-2) * write_factors.reshape(factor_shape)
     return output.reshape_as(residual)
 
@@ -249,7 +251,7 @@ def _run_fused_cuda_case(
     update: torch.Tensor,
     read_logits: torch.Tensor,
     write_logits: torch.Tensor,
-    retention_logits: torch.Tensor,
+    retention_logits: torch.Tensor | None,
     grad_output: torch.Tensor,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     num_streams = 3
@@ -260,11 +262,12 @@ def _run_fused_cuda_case(
         write_logits,
         num_streams,
         retention_logits=retention_logits,
-        retention_max_forget=0.2,
+        retention_max_forget=0.2 if retention_logits is not None else 0.0,
     )
-    gradients = torch.autograd.grad(
-        output, (residual, update, read_logits, write_logits, retention_logits), grad_output
-    )
+    grad_inputs = (residual, update, read_logits, write_logits)
+    if retention_logits is not None:
+        grad_inputs = (*grad_inputs, retention_logits)
+    gradients = torch.autograd.grad(output, grad_inputs, grad_output)
     return output, gradients
 
 
@@ -273,9 +276,40 @@ def _run_reference_cuda_case(
     update: torch.Tensor,
     read_logits: torch.Tensor,
     write_logits: torch.Tensor,
+    retention_logits: torch.Tensor | None,
+    grad_output: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    num_streams = 3
+    read_factors = torch.sigmoid(read_logits[:num_streams].float()).to(dtype=residual.dtype)
+    write_factors = (2.0 * torch.sigmoid(write_logits[:num_streams].float())).to(
+        dtype=residual.dtype
+    )
+    retention_factors = (
+        None
+        if retention_logits is None
+        else (1.0 - 0.2 * torch.sigmoid(-retention_logits[:num_streams].float())).to(
+            dtype=residual.dtype
+        )
+    )
+    read = _reference_read(residual, read_factors)
+    output = _reference_writeback(residual, update + 0.125 * read, write_factors, retention_factors)
+    grad_inputs = (residual, update, read_logits, write_logits)
+    if retention_logits is not None:
+        grad_inputs = (*grad_inputs, retention_logits)
+    gradients = torch.autograd.grad(output, grad_inputs, grad_output)
+    return output, gradients
+
+
+def _run_native_reference_cuda_case(
+    residual: torch.Tensor,
+    update: torch.Tensor,
+    read_logits: torch.Tensor,
+    write_logits: torch.Tensor,
     retention_logits: torch.Tensor,
     grad_output: torch.Tensor,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """Run the allocation-efficient PyTorch reference at production geometries."""
+
     num_streams = 3
     read = streamwise_read(residual, torch.sigmoid(read_logits[:num_streams].float()))
     output = streamwise_writeback(
@@ -288,6 +322,35 @@ def _run_reference_cuda_case(
         output, (residual, update, read_logits, write_logits, retention_logits), grad_output
     )
     return output, gradients
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
+def test_streamwise_triton_fp32_selector_respects_geometry_and_layout():
+    """FP32 should use Triton only when all existing fast-path constraints are satisfied."""
+
+    num_streams = 3
+    stream_width = 64
+    logits = torch.zeros(128, device="cuda", dtype=torch.float32)
+    eligible = torch.empty(256, num_streams * stream_width, device="cuda", dtype=torch.float32)
+
+    assert _can_use_streamwise_triton(eligible, logits, num_streams, stream_width)
+    assert not _can_use_streamwise_triton(eligible[:255], logits, num_streams, stream_width)
+
+    narrow = torch.empty(256, num_streams * 32, device="cuda", dtype=torch.float32)
+    assert not _can_use_streamwise_triton(narrow, logits, num_streams, 32)
+
+    noncontiguous = torch.empty(
+        256, num_streams * stream_width * 2, device="cuda", dtype=torch.float32
+    )[:, ::2]
+    assert noncontiguous.shape == eligible.shape
+    assert not noncontiguous.is_contiguous()
+    assert not _can_use_streamwise_triton(noncontiguous, logits, num_streams, stream_width)
+
+    fp64 = eligible.to(dtype=torch.float64)
+    assert not _can_use_streamwise_triton(fp64, logits, num_streams, stream_width)
 
 
 @pytest.mark.skipif(
@@ -325,8 +388,11 @@ def test_fused_cuda_production_geometry_gradients_signs_and_determinism(batch_to
     ]
     reference_leaves = [value.detach().clone().requires_grad_() for value in fused_leaves]
     fused_output, fused_gradients = _run_fused_cuda_case(*fused_leaves, grad_output)
-    reference_output, reference_gradients = _run_reference_cuda_case(*reference_leaves, grad_output)
+    reference_output, reference_gradients = _run_native_reference_cuda_case(
+        *reference_leaves, grad_output
+    )
 
+    assert fused_output.dtype == torch.bfloat16
     assert _relative_l2(fused_output, reference_output) <= 0.02
     for fused_gradient, reference_gradient in zip(fused_gradients, reference_gradients):
         assert _relative_l2(fused_gradient, reference_gradient) <= 0.02
@@ -348,6 +414,83 @@ def test_fused_cuda_production_geometry_gradients_signs_and_determinism(batch_to
     reason="Direct streamwise Triton kernels require CUDA and Triton.",
 )
 @pytest.mark.parametrize(
+    ("use_retention", "controller_dtype", "stream_width"),
+    [
+        (False, torch.float32, 64),
+        (True, torch.float32, 64),
+        (False, torch.bfloat16, 64),
+        (True, torch.bfloat16, 64),
+        (False, torch.float16, 64),
+        (True, torch.float16, 64),
+        (True, torch.bfloat16, 512),
+    ],
+    ids=(
+        "identity_fp32_controllers",
+        "retention_fp32_controllers",
+        "identity_bf16_controllers",
+        "retention_bf16_controllers",
+        "identity_fp16_controllers",
+        "retention_fp16_controllers",
+        "retention_bf16_controllers_wide_tile",
+    ),
+)
+def test_fused_cuda_fp32_training_covers_mixed_controller_dtypes(
+    use_retention, controller_dtype, stream_width
+):
+    """FP32 dispatch must support mixed controllers, both carry modes, and block widths."""
+
+    torch.manual_seed(2468)
+    num_streams = 3
+    residual = torch.randn(256, num_streams * stream_width, device="cuda", dtype=torch.float32)
+    update = torch.randn(256, stream_width, device="cuda", dtype=torch.float32)
+    read_logits = _padded_logits(
+        torch.tensor([-0.8, -0.7, -0.6], device="cuda", dtype=controller_dtype)
+    )
+    write_logits = _padded_logits(
+        torch.tensor([-0.01, 0.0, 0.01], device="cuda", dtype=controller_dtype)
+    )
+    retention_logits = _padded_logits(
+        torch.tensor([4.8, 4.9, 5.0], device="cuda", dtype=controller_dtype)
+    )
+    grad_output = torch.randn_like(residual)
+
+    assert _can_use_streamwise_triton(residual, read_logits, num_streams, stream_width)
+    source_inputs = [residual, update, read_logits, write_logits]
+    if use_retention:
+        source_inputs.append(retention_logits)
+    fused_leaves = [value.detach().clone().requires_grad_() for value in source_inputs]
+    reference_leaves = [value.detach().clone().requires_grad_() for value in source_inputs]
+    fused_retention = fused_leaves[4] if use_retention else None
+    reference_retention = reference_leaves[4] if use_retention else None
+
+    fused_output, fused_gradients = _run_fused_cuda_case(
+        *fused_leaves[:4], fused_retention, grad_output
+    )
+    reference_output, reference_gradients = _run_reference_cuda_case(
+        *reference_leaves[:4], reference_retention, grad_output
+    )
+
+    assert fused_output.dtype == torch.float32
+    assert type(fused_output.grad_fn).__name__ == "_StreamwiseSigmoidWritebackBackward"
+    assert _relative_l2(fused_output, reference_output) <= 2.0e-5
+    for index, (fused_gradient, reference_gradient) in enumerate(
+        zip(fused_gradients, reference_gradients)
+    ):
+        tolerance = 2.0e-5 if index < 2 else 5.0e-4
+        expected_dtype = torch.float32 if index < 2 else controller_dtype
+        if controller_dtype != torch.float32 and index >= 2:
+            tolerance = 0.02
+        assert fused_gradient.dtype == expected_dtype
+        assert _relative_l2(fused_gradient, reference_gradient) <= tolerance
+    for gradient in fused_gradients[2:]:
+        assert torch.count_nonzero(gradient[num_streams:]) == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
+    reason="Direct streamwise Triton kernels require CUDA and Triton.",
+)
+@pytest.mark.parametrize(
     ("context_factory", "use_retention"),
     [
         (torch.no_grad, False),
@@ -357,7 +500,10 @@ def test_fused_cuda_production_geometry_gradients_signs_and_determinism(batch_to
     ],
     ids=("no_grad", "no_grad_retention", "inference", "inference_retention"),
 )
-def test_fused_cuda_forward_only_context_matches_reference(context_factory, use_retention):
+@pytest.mark.parametrize("activation_dtype", [torch.bfloat16, torch.float32], ids=("bf16", "fp32"))
+def test_fused_cuda_forward_only_context_matches_reference(
+    context_factory, use_retention, activation_dtype
+):
     """Forward-only execution must not construct custom-autograd backward state."""
 
     torch.manual_seed(4321)
@@ -365,9 +511,9 @@ def test_fused_cuda_forward_only_context_matches_reference(context_factory, use_
     stream_width = 64
     max_forget = 0.2
     residual_source = torch.randn(
-        256, num_streams * stream_width, device="cuda", dtype=torch.bfloat16
+        256, num_streams * stream_width, device="cuda", dtype=activation_dtype
     )
-    update_source = torch.randn(256, stream_width, device="cuda", dtype=torch.bfloat16)
+    update_source = torch.randn(256, stream_width, device="cuda", dtype=activation_dtype)
     read_logits = _padded_logits(torch.tensor([-0.8, -0.7, -0.6], device="cuda"))
     write_logits = _padded_logits(torch.tensor([-0.01, 0.0, 0.01], device="cuda"))
     retention_logits = _padded_logits(torch.tensor([4.8, 4.9, 5.0], device="cuda"))
@@ -389,45 +535,51 @@ def test_fused_cuda_forward_only_context_matches_reference(context_factory, use_
             retention_max_forget=max_forget if use_retention else 0.0,
         )
 
-        reference_read = streamwise_read(residual, torch.sigmoid(read_logits[:num_streams].float()))
+        reference_read = _reference_read(
+            residual, torch.sigmoid(read_logits[:num_streams].float()).to(dtype=activation_dtype)
+        )
         retention_factors = None
         if use_retention:
-            retention_factors = 1.0 - max_forget * torch.sigmoid(
-                -retention_logits[:num_streams].float()
-            )
-        reference_output = streamwise_writeback(
+            retention_factors = (
+                1.0 - max_forget * torch.sigmoid(-retention_logits[:num_streams].float())
+            ).to(dtype=activation_dtype)
+        reference_output = _reference_writeback(
             residual,
             update + 0.125 * reference_read,
-            2.0 * torch.sigmoid(write_logits[:num_streams].float()),
-            retention_factors=retention_factors,
+            (2.0 * torch.sigmoid(write_logits[:num_streams].float())).to(dtype=activation_dtype),
+            retention_factors,
         )
         read_error = _relative_l2(read, reference_read)
         output_error = _relative_l2(output, reference_output)
 
     assert not output.requires_grad
-    assert read_error <= 0.02
-    assert output_error <= 0.02
+    assert output.dtype == activation_dtype
+    tolerance = 0.02 if activation_dtype == torch.bfloat16 else 2.0e-5
+    assert read_error <= tolerance
+    assert output_error <= tolerance
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not HAVE_STREAMWISE_TRITON,
     reason="Direct streamwise Triton kernels require CUDA and Triton.",
 )
-def test_fused_cuda_profile_has_no_map_construction_or_map_gradient_gemm():
+@pytest.mark.parametrize("activation_dtype", [torch.bfloat16, torch.float32], ids=("bf16", "fp32"))
+def test_fused_cuda_profile_has_no_map_construction_or_map_gradient_gemm(activation_dtype):
     torch.manual_seed(5678)
     num_streams = 3
     stream_width = 256
     residual = torch.randn(
-        2048, num_streams * stream_width, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        2048, num_streams * stream_width, device="cuda", dtype=activation_dtype, requires_grad=True
     )
     update = torch.randn(
-        2048, stream_width, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        2048, stream_width, device="cuda", dtype=activation_dtype, requires_grad=True
     )
     read_logits = _padded_logits(torch.tensor([-0.8, -0.7, -0.6], device="cuda"))
     write_logits = _padded_logits(torch.tensor([-0.01, 0.0, 0.01], device="cuda"))
     retention_logits = _padded_logits(torch.tensor([4.8, 4.9, 5.0], device="cuda"))
     grad_output = torch.randn_like(residual)
 
+    assert _can_use_streamwise_triton(residual, read_logits, num_streams, stream_width)
     _run_fused_cuda_case(residual, update, read_logits, write_logits, retention_logits, grad_output)
     torch.cuda.synchronize()
     with torch.profiler.profile(
