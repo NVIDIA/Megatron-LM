@@ -148,3 +148,10 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_gb200]
+
+  # MXFP8 loss curve compared with the BF16 DeepSeek proxy baseline.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mxfp8_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]

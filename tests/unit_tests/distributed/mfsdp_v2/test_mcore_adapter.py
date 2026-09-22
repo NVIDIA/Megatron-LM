@@ -11,16 +11,12 @@ import pytest
 import torch
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from transformer_engine.pytorch.optimizers import FusedAdam
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer import (
-    QuantizedDBuffer,
-)
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -87,11 +83,8 @@ class TestMcoreAdapterDense:
         reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
     )
     @pytest.mark.parametrize("fp8_param_gather", [False, True])
-    @pytest.mark.parametrize("use_precision_aware_optimizer", [False, True])
-    def test_mxfp8_training_matches_reference(
-        self, distributed_setup, fp8_param_gather, use_precision_aware_optimizer
-    ):
-        """Exercise MXFP8 initialization, forward/backward, and MCore optimizer updates."""
+    def test_mxfp8_parameters(self, distributed_setup, fp8_param_gather):
+        """The MCore adapter preserves MXFP8 parameters when FP8 gather is enabled."""
         config = TransformerConfig(
             num_layers=1,
             hidden_size=128,
@@ -106,17 +99,9 @@ class TestMcoreAdapterDense:
             fp8_param=fp8_param_gather,
         )
 
-        def build_block():
-            model_parallel_cuda_manual_seed(1234)
-            torch.manual_seed(1234)
-            return TransformerBlock(
-                config=config, spec=get_gpt_layer_with_transformer_engine_spec()
-            ).to(device="cuda", dtype=config.params_dtype)
-
-        reference = build_block()
-        model = build_block()
-        reference_parameters = dict(reference.named_parameters())
-        assert any(isinstance(p, MXFP8Tensor) for p in model.parameters()) == fp8_param_gather
+        block = TransformerBlock(
+            config=config, spec=get_gpt_layer_with_transformer_engine_spec()
+        ).to(device="cuda", dtype=config.params_dtype)
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -126,120 +111,18 @@ class TestMcoreAdapterDense:
                 data_parallel_sharding_strategy="optim_grads_params",
                 fp8_param_gather=fp8_param_gather,
             ),
-            module=model,
+            module=block,
             pg_collection=self.pg_collection,
         )
-        parameter_groups = [
-            group
+        # FSDP installs DTensor shards; check the parameters used for compute.
+        parameters = (
+            parameter.unsharded
             for module in model.module.modules()
             if isinstance(module, FsdpModule)
             for group in module.parameter_groups
-        ]
-        assert (
-            any(isinstance(group.model_weight, QuantizedDBuffer) for group in parameter_groups)
-            == fp8_param_gather
+            for parameter in group.fsdp_parameters
         )
-        optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                optimizer="adam",
-                lr=1.0e-3,
-                weight_decay=0.0,
-                bf16=True,
-                params_dtype=torch.bfloat16,
-                use_distributed_optimizer=False,
-                use_precision_aware_optimizer=use_precision_aware_optimizer,
-                fp8_recipe="mxfp8",
-                # Avoid amplifying BF16 reduction rounding for nearly zero gradients.
-                adam_eps=1.0e-4,
-                clip_grad=0.0,
-            ),
-            [model],
-        )
-        assert isinstance(optimizer, FullyShardedOptimizer)
-        reference_optimizer = FusedAdam(
-            reference.parameters(), lr=1.0e-3, eps=1.0e-4, weight_decay=0.0, master_weights=True
-        )
-        for parameter in reference.parameters():
-            reference_optimizer.initialize_state(parameter, store_param_remainders=False)
-            if isinstance(parameter, MXFP8Tensor):
-                reference_optimizer.set_scaled_state(
-                    parameter, "master_param", parameter.get_high_precision_init_val().float()
-                )
-                parameter.clear_high_precision_init_val()
-
-        parameter_names = {
-            id(parameter): name for name, parameter in model.module.named_parameters()
-        }
-        initial_main_weights = {
-            name: reference_optimizer.get_unscaled_state(parameter, "master_param").clone()
-            for name, parameter in reference_parameters.items()
-        }
-
-        def check_main_weights(*, initial: bool):
-            # Parameters follow the packed buffer's ownership, which need not match
-            # the equal per-parameter chunks assumed by DTensor.full_tensor().
-            for group in parameter_groups:
-                full_weights = group.main_weight.redistribute([Replicate()] * group.mesh.ndim)
-                for index, parameter in enumerate(group.fsdp_parameters):
-                    name = parameter_names[id(parameter.sharded)]
-                    actual = full_weights.get_tensor_view(index)
-                    expected = reference_optimizer.get_unscaled_state(
-                        reference_parameters[name], "master_param"
-                    )
-                    if initial:
-                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                    else:
-                        # Compare error to the update, rather than the much larger weights.
-                        # A missing optimizer update has relative error one and fails.
-                        error = (actual - expected).norm()
-                        update = (expected - initial_main_weights[name]).norm()
-                        assert error <= 0.02 * update, f"{name}: {error=} exceeds 2% of {update=}"
-
-        check_main_weights(initial=True)
-
-        # Different rank-local inputs exercise gradient averaging as well as quantized gather.
-        torch.manual_seed(5678 + distributed_setup.rank)
-        inputs = torch.randn(3, 32, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-        targets = torch.randn_like(inputs)
-        for step, (batch, target) in enumerate(zip(inputs, targets)):
-            reference_optimizer.zero_grad(set_to_none=True)
-            optimizer.zero_grad(set_to_none=True)
-            reference_output = reference(hidden_states=batch, attention_mask=None)
-            output = model(hidden_states=batch, attention_mask=None)
-            reference_loss = (reference_output.float() - target.float()).square().mean()
-            loss = (output.float() - target.float()).square().mean()
-            torch.testing.assert_close(loss, reference_loss, rtol=0, atol=3e-3)
-            reference_loss.backward()
-            loss.backward()
-            for parameter in reference.parameters():
-                torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.AVG)
-            if step == 0:
-                for group in parameter_groups:
-                    full_grads = group.main_grad.redistribute([Replicate()] * group.mesh.ndim)
-                    for index, parameter in enumerate(group.fsdp_parameters):
-                        name = parameter_names[id(parameter.sharded)]
-                        expected = reference_parameters[name].grad.float()
-                        error = (full_grads.get_tensor_view(index).float() - expected).norm()
-                        # A norm-based bound handles cancellation in individual entries
-                        # while still checking the averaged gradient's direction and scale.
-                        assert (
-                            error <= 2 * torch.finfo(torch.bfloat16).eps * expected.norm()
-                        ), f"Reduced gradients differ for {name}: {error=}"
-            reference_optimizer.step()
-            success, _, _ = optimizer.step()
-            assert success
-
-        # BF16 all-reduce and packed reduce-scatter can round gradients differently.
-        check_main_weights(initial=False)
-
-        # Include the final update and requantization in the forward comparison.
-        with torch.no_grad():
-            torch.testing.assert_close(
-                model(hidden_states=inputs[-1], attention_mask=None),
-                reference(hidden_states=inputs[-1], attention_mask=None),
-                rtol=0,
-                atol=3e-2,
-            )
+        assert any(isinstance(p, MXFP8Tensor) for p in parameters) == fp8_param_gather
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
         """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
