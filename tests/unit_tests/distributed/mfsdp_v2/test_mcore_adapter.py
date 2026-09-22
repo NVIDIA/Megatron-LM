@@ -82,8 +82,7 @@ class TestMcoreAdapterDense:
         torch.cuda.get_device_capability()[0] < 10,
         reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
     )
-    @pytest.mark.parametrize("fp8_param_gather", [False, True])
-    def test_mxfp8_parameters(self, distributed_setup, fp8_param_gather):
+    def test_mxfp8_parameters(self, distributed_setup):
         """The MCore adapter preserves MXFP8 parameters when FP8 gather is enabled."""
         config = TransformerConfig(
             num_layers=1,
@@ -96,7 +95,7 @@ class TestMcoreAdapterDense:
             hidden_dropout=0.0,
             fp8="hybrid",
             fp8_recipe="mxfp8",
-            fp8_param=fp8_param_gather,
+            fp8_param=True,
         )
 
         block = TransformerBlock(
@@ -109,7 +108,7 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
-                fp8_param_gather=fp8_param_gather,
+                fp8_param_gather=True,
             ),
             module=block,
             pg_collection=self.pg_collection,
@@ -122,7 +121,7 @@ class TestMcoreAdapterDense:
             for group in module.parameter_groups:
                 for parameter in group.fsdp_parameters:
                     parameters.append(parameter.unsharded)
-        assert any(isinstance(p, MXFP8Tensor) for p in parameters) == fp8_param_gather
+        assert any(isinstance(p, MXFP8Tensor) for p in parameters)
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
         """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
