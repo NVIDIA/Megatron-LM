@@ -599,6 +599,26 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 
 ### 3.3 Distributed checkpointing (DCP)
 
+**Fused projection sections.** Mamba, GDN, and GDP share
+`ssm.utils._split_in_proj_factory`. It gathers GTP row shards under `torch.no_grad()`,
+removes alignment padding, and checkpoints each semantic section in its TP-local
+layout. Loading restores the physical row shard and zero padding. Gated MLPs use the
+same low-level GTP helpers around their SwiGLU section factory.
+
+These gathered factories carry an `optimizer_factory` companion bound to the live
+parameter. Both distributed optimizer model-space paths use it through
+`ShardedTensorFactory.for_optimizer()`, which propagates outer key and replica
+ownership changes while retaining the physical GTP shard coordinate. It maps each physical
+optimizer tensor or flat DP fragment into the same semantic keys without GTP
+collectives. Partial boundary rows become rectangular DCP shards; no unsupported
+`ShardedTensor.flattened_range` leaves are emitted. The mapping also handles DP-owner-only construction; the training CLI restriction
+on memory-efficient fully reshardable GTP checkpoints remains in place.
+Ordinary model-space optimizer fragments use the same rectangular representation,
+including higher-dimensional weights and prepended expert or layer axes. The fragment
+factory preserves the original unsplit key and restores the local flat state on load.
+The companion is opt-in: the regular/Muon optimizer keeps its existing checkpoint
+mapping and on-disk keys.
+
 ![GTP_remat + DCP save/load reshard for a TP2×GTP2 weight](../../images/generalized_tensor_parallel/0612_gtp_dcp_tp2gtp2_save_load.png)
 
 GTP_remat supports **PyTorch / Mcore sharded distributed checkpointing** (`--ckpt-format torch_dist`, the `megatron.core.dist_checkpointing` `ShardedTensor` / `ShardedObject` format) for **both model weights and distributed-optimizer state**. Checkpoints are **fully resharding-capable**: a checkpoint saved at one `(TP, GTP_remat, EGTP_remat, DP, PP)` topology can be loaded at a *different* one — including a different GTP_remat/EGTP_remat size — without an offline conversion step.
@@ -631,7 +651,7 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 >
 > On **load**, the factory concatenates the sections into the unpadded TP-local tensor, restores zero padding, and selects this GTP rank's physical rows. Ordinary parameters and GDP's replicated input-projection bias use the section splitter directly; normal initialization leaves parameters unwrapped at `gtp_remat_size == 1`, so they skip gather and pad/slice. GDP keeps separate keys for every householder copy, including in its convolution parameters, which also reuse the shared splitter. The GTP merge accepts unflattened model weights. Cross-GTP model-weight resharding is covered by the fused-projection tests; full optimizer-state resharding depends on the optimizer and checkpoint format and is not validated by those tests. The Muon matrix-parameter path can rebuild per-shard optimizer metadata.
 >
-> **Distributed optimizer formats.** For gathered GTP projection factories and dequantized native-FP8 entries, distributed Adam's `fully_reshardable` and legacy `fully_sharded_model_space` formats cannot match the live parameters by object identity. These combinations are rejected even without changing topology. Use `dp_reshardable` by disabling `--dist-ckpt-optim-fully-reshardable`, or by setting `metadata['distrib_optim_sharding_type'] = 'dp_reshardable'` when calling the optimizer checkpoint API directly; model-only checkpoint save/load remains supported.
+> **Distributed optimizer formats.** Distributed Adam's `fully_reshardable` and legacy `fully_sharded_model_space` formats resolve gathered projection factories through their `optimizer_factory` companions and native-FP8 entries through the dequantized tensor's source identity. GTP parameters without either mapping are rejected before optimizer state is read or buffers are exchanged. `dp_reshardable` keeps its existing buffer-based layout and only supports DP resharding.
 >
 > **Grouped gated experts.** EGTP-sharded grouped gated `fc1` is rejected because its checkpoint factory does not gather before splitting gate/up. This guard does not reject ordinary `.weight` modules, including those inside `SequentialMLP`; their EGTP checkpoint behavior is not covered by the fused-projection tests.
 

@@ -2,6 +2,7 @@
 
 """GTP checkpoint regressions for the shared in_proj factory; run on 4 or 8 ranks."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,7 +12,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import is_main_replica
+from megatron.core.dist_checkpointing.dict_utils import dict_list_map_outplace, nested_values
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, is_main_replica
 from megatron.core.ssm import utils as ssm_utils
 
 pytestmark = pytest.mark.internal
@@ -19,21 +21,23 @@ pytestmark = pytest.mark.internal
 _KEY = 'decoder.in_proj.weight'
 _SECTIONS = [4, 8]
 _NAMES = ['first', 'second']
+_OFFSETS = ((0, 2, 5),)
 
 
 @pytest.fixture(scope='module')
 def projection_groups(cpu_default_process_group):
-    """Keep TP fixed at one and redistribute GTP ranks into DP when changing GTP size."""
+    """Build GTP/DP grids plus a TP2 grid to cover semantic-section offsets."""
     rank, world_size = dist.get_rank(), dist.get_world_size()
     assert world_size in (4, 8), 'Run with torchrun --nproc-per-node=4 or 8'
     rank_sets = []
     for size in (1, 2, 4):
         rank_sets.extend(tuple(range(start, start + size)) for start in range(0, world_size, size))
         rank_sets.extend(tuple(range(start, world_size, size)) for start in range(size))
+    rank_sets.extend((base + i, base + i + 2) for base in range(0, world_size, 4) for i in range(2))
     groups = {
         ranks: dist.new_group(list(ranks), backend='gloo') for ranks in dict.fromkeys(rank_sets)
     }
-    yield {
+    topologies = {
         size: (
             groups[(rank,)],
             groups[tuple(range(rank // size * size, (rank // size + 1) * size))],
@@ -41,12 +45,19 @@ def projection_groups(cpu_default_process_group):
         )
         for size in (1, 2, 4)
     }
+    base = rank // 4 * 4
+    topologies['tp2'] = (
+        groups[(base + rank % 2, base + rank % 2 + 2)],
+        topologies[2][1],
+        groups[tuple(range(rank % 4, world_size, 4))],
+    )
+    yield topologies
     for group in reversed(list(groups.values())):
         if group != dist.GroupMember.NON_GROUP_MEMBER:
             dist.destroy_process_group(group)
 
 
-def _factory(data, topology, padding_rows, sections=_SECTIONS):
+def _factory(data, topology, padding_rows, sections=_SECTIONS, sharded_offsets=_OFFSETS):
     tp, gtp, dp = topology
     gtp_rank, gtp_size = dist.get_rank(gtp), dist.get_world_size(gtp)
     local = F.pad(data, (0, 0, 0, padding_rows), value=-1).chunk(gtp_size)[gtp_rank].clone()
@@ -56,9 +67,9 @@ def _factory(data, topology, padding_rows, sections=_SECTIONS):
     original = ShardedTensor.from_rank_offsets(
         _KEY,
         weight,
-        (0, 2, 5),
-        (1, gtp_rank, gtp_size),
-        prepend_axis_num=1,
+        *sharded_offsets,
+        (len(sharded_offsets), gtp_rank, gtp_size),
+        prepend_axis_num=len(sharded_offsets),
         replica_id=(0, 0, dist.get_rank(dp)),
     )
     # Only parameter detection is mocked; gather, splitting and load-side slicing are real.
@@ -71,7 +82,7 @@ def _factory(data, topology, padding_rows, sections=_SECTIONS):
             weight=weight,
             tp_group=tp,
             dp_cp_group=dp,
-            sharded_offsets=((0, 2, 5),),
+            sharded_offsets=sharded_offsets,
         )
     return factory, weight
 
@@ -117,3 +128,95 @@ def test_in_proj_factory_gtp_rejects_padding_as_data(projection_groups):
     """Requested sections cannot count physical padding as logical projection rows."""
     with pytest.raises(ValueError, match='Split sections must cover the whole dimension size'):
         _factory(torch.ones(12, 3), projection_groups[2], padding_rows=4, sections=[4, 12])
+
+
+def test_in_proj_optimizer_factory_without_gtp(projection_groups):
+    """An ordinary parameter's optimizer companion keeps the parameter identity and replica."""
+    data = torch.arange(36, dtype=torch.float32).reshape(12, 3)
+    factory, weight = _factory(data, projection_groups[1], padding_rows=0)
+    assert factory.data is weight
+    assert factory.optimizer_factory.data is weight
+    assert factory.optimizer_factory.replica_id == factory.replica_id
+
+
+@pytest.mark.parametrize('tp_size', [1, 2])
+@pytest.mark.parametrize('flat_dp', [False, True], ids=['full_parameter', 'flat_dp_fragment'])
+def test_in_proj_optimizer_factory_gtp_offsets(projection_groups, flat_dp, tp_size):
+    """Physical GTP/DP optimizer slices tile each semantic section exactly once and restore."""
+    data = torch.arange(36 * tp_size, dtype=torch.float32).reshape(12 * tp_size, 3)
+    topology = projection_groups[2 if tp_size == 1 else 'tp2']
+    tp, gtp, dp = topology
+    sections = data.split([size * tp_size for size in _SECTIONS])
+    logical = torch.cat([section.chunk(tp_size)[dist.get_rank(tp)] for section in sections])
+    padding_rows = 4
+    factory, weight = _factory(logical, topology, padding_rows, sharded_offsets=())
+    companion = factory.optimizer_factory
+    # The optimizer values and dtype differ from the model checkpoint representation.
+    # Nonzero source padding must disappear when materializing the semantic sections.
+    optimizer_data = companion.data.detach().double() * 3 + 0.125
+    prefix = f'optimizer.state.exp_avg.{_KEY}'
+    state = replace(companion, key=prefix, data=optimizer_data)
+    if flat_dp:
+        dp_rank, dp_size = dist.get_rank(dp), dist.get_world_size(dp)
+        start = dp_rank * optimizer_data.numel() // dp_size
+        stop = (dp_rank + 1) * optimizer_data.numel() // dp_size
+        state = replace(
+            state,
+            data=optimizer_data.flatten()[start:stop],
+            flattened_range=slice(start, stop),
+            replica_id=(0, 0, 0),
+        )
+    with mock.patch.object(
+        dist, 'all_gather_into_tensor', side_effect=AssertionError('collective')
+    ):
+        tree = state.build()
+    parts = [part for part in nested_values(tree) if isinstance(part, ShardedTensor)]
+    payloads = [None] * dist.get_world_size()
+    dist.all_gather_object(payloads, parts)
+    expected_sections = {
+        f'{prefix}.{name}': section.double() * 3 + 0.125 for name, section in zip(_NAMES, sections)
+    }
+    saved = {key: torch.empty_like(full) for key, full in expected_sections.items()}
+    coverage = {
+        key: torch.zeros(full.shape, dtype=torch.int32) for key, full in expected_sections.items()
+    }
+
+    def selection(part):
+        return tuple(
+            slice(offset, offset + size)
+            for offset, size in zip(part.global_offset, part.local_shape)
+        )
+
+    for rank_parts in payloads:
+        for part in rank_parts:
+            part.validate_metadata_integrity()
+            assert part.dtype == torch.float64
+            assert not part.data.requires_grad
+            assert part.prepend_axis_num == 0
+            assert part.flattened_range is None
+            assert part.global_shape == expected_sections[part.key].shape
+            if is_main_replica(part.replica_id):
+                index = selection(part)
+                saved[part.key][index].copy_(part.data)
+                coverage[part.key][index] += 1
+    for key, expected in expected_sections.items():
+        assert torch.all(coverage[key] == 1), (key, coverage[key])
+        torch.testing.assert_close(saved[key], expected, rtol=0, atol=0)
+
+    def load_leaf(leaf):
+        if isinstance(leaf, ShardedTensor):
+            return saved[leaf.key][selection(leaf)].clone()
+        assert isinstance(leaf, LocalNonpersistentObject)
+        return leaf.unwrap()
+
+    loaded = dict_list_map_outplace(load_leaf, tree)
+    expected = F.pad(logical.double() * 3 + 0.125, (0, 0, 0, padding_rows)).chunk(2)[
+        dist.get_rank(gtp)
+    ]
+    if flat_dp:
+        expected = expected.flatten()[start:stop]
+    with mock.patch.object(
+        dist, 'all_gather_into_tensor', side_effect=AssertionError('collective')
+    ):
+        restored = state.merge_fn(loaded)
+    torch.testing.assert_close(restored, expected, rtol=0, atol=0)

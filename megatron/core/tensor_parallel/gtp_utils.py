@@ -19,6 +19,7 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.optimizer import _make_sharded_optimizer_factory
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
@@ -90,8 +91,8 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         full = original_merge_fn(sub_state_dict)
         if full.dim() != 2:
             # Fail loudly instead of padding/slicing a flattened buffer: only the
-            # unflattened 2-D model-weight factory is supported. Optimizer checkpoint
-            # formats require their own mapping; this wrapper does not handle them.
+            # unflattened 2-D model-weight factory is supported. Optimizer state uses
+            # the physical-parameter companion rather than this model merge.
             raise NotImplementedError(
                 "GTP fused-projection merge expects the unflattened 2-D projection; got "
                 f"a {full.dim()}-D tensor (flattened factories are unsupported)"
@@ -102,4 +103,45 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         start = gtp_rank * gtp_local_size
         return full[start : start + gtp_local_size].contiguous()
 
-    return replace(factory, merge_fn=_gtp_slice_after_cat)
+    return replace(
+        factory,
+        merge_fn=_gtp_slice_after_cat,
+        # Physical optimizer shards cover distinct offsets, so only DP replicas
+        # remain; the model factory's middle coordinate elects gathered GTP copies.
+        optimizer_factory=_fused_projection_optimizer_factory(
+            factory,
+            weight,
+            shard_offset=gtp_rank * weight.numel(),
+            replica_id=(factory.replica_id[0], 0, factory.replica_id[2]),
+        ),
+    )
+
+
+def _fused_projection_optimizer_factory(
+    factory: ShardedTensorFactory, weight: torch.Tensor, *, shard_offset: int = 0, replica_id=None
+) -> ShardedTensorFactory:
+    """Map physical optimizer slices into a fused projection's semantic checkpoint keys.
+
+    Model checkpoint factories may hold a gathered/dequantized tensor instead of the
+    live parameter. Optimizers need the parameter identity and must transform their own
+    data, including arbitrary flat DP fragments, without requiring GTP collectives.
+    Capture only the logical section metadata; intersect each physical input slice with
+    those sections at build time. Padding is omitted on save and restored as zeros.
+
+    Flat fragments are represented as ordinary rectangular shards (partial boundary
+    rows and complete interior rows), since DCP no longer accepts flattened tensors.
+    This helper supports the 1-D biases and 2-D weights of row-split projections.
+    """
+    if weight.ndim not in (1, 2):
+        raise ValueError("Fused projection optimizer factory expects a 1-D or 2-D parameter")
+    parts = factory.build()
+    if any(len(part.local_shape) != weight.ndim for part in parts):
+        raise ValueError("Expected row-ordered fused projection section metadata")
+    return _make_sharded_optimizer_factory(
+        parts,
+        weight,
+        factory.key,
+        physical_numel=weight.numel(),
+        shard_offset=shard_offset,
+        replica_id=factory.replica_id if replica_id is None else replica_id,
+    )

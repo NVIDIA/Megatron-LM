@@ -46,7 +46,7 @@ from ..dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
-from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
+from ..dist_checkpointing.optimizer import make_sharded_optimizer_fragment
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
     group_params_for_buffers,
@@ -74,6 +74,30 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+
+def _get_param_id_to_sharded_metadata(
+    model_sharded_state_dict: ShardedStateDict,
+) -> Dict[int, ShardedTensor | ShardedTensorFactory]:
+    """Index optimizer metadata once by exact parameter identity.
+
+    Prefer a factory's physical-parameter companion over its model representation.
+    Native-FP8 entries also resolve through their dequantized tensor's source identity.
+    Preserve the original keys, expert offsets and replica IDs in both cases.
+    """
+    result, dequantized = {}, {}
+    for entry in nested_values(model_sharded_state_dict):
+        if isinstance(entry, ShardedTensorFactory):
+            entry = entry.for_optimizer()
+        elif not isinstance(entry, ShardedTensor):
+            continue
+        if entry.data is not None:
+            result[id(entry.data)] = entry
+            source = getattr(entry.data, '_gtp_dequant_src', None)
+            if source is not None:
+                dequantized[id(source)] = entry
+    # Direct parameter bindings (including companions) take precedence over copies.
+    return {**dequantized, **result}
 
 
 class Range:
@@ -1535,21 +1559,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return state_dict
 
         if gtp_api.HAVE_GTP and sharding_type in ('fully_reshardable', 'fully_sharded_model_space'):
-            # These formats identify optimizer parameters by the model entry's data object.
-            # Gathered projection factories and dequantized FP8 entries own different tensors.
-            model_param_ids = {
-                id(entry.data)
-                for entry in nested_values(model_sharded_state_dict)
-                if isinstance(entry, (ShardedTensor, ShardedTensorFactory))
-            }
+            # Resolve physical optimizer views before reading state or exchanging buffers.
+            param_metadata = _get_param_id_to_sharded_metadata(model_sharded_state_dict)
             for buffer in self.buffers:
                 for param in buffer.param_index_map:
-                    if gtp_api.is_gtp_param(param) and id(param) not in model_param_ids:
+                    if gtp_api.is_gtp_param(param) and id(param) not in param_metadata:
                         raise NotImplementedError(
-                            f"Distributed optimizer format '{sharding_type}' cannot map GTP "
-                            "parameters to gathered or dequantized model checkpoint data. "
-                            "Use 'dp_reshardable': disable --dist-ckpt-optim-fully-reshardable, "
-                            "or set metadata['distrib_optim_sharding_type'] = 'dp_reshardable'."
+                            f"Distributed optimizer format '{sharding_type}' requires source-bound "
+                            "checkpoint metadata for GTP parameters. Gathered factories must "
+                            "provide an optimizer_factory companion; dequantized entries must "
+                            "retain their source parameter. Use 'dp_reshardable' otherwise."
                         )
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
@@ -1770,12 +1789,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return_on_all_ranks=return_on_all_ranks or is_loading,
         )
 
-        param_to_sharded_metadata = {}
-        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
-            model_sharded_state_dict
-        )
-        for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+        param_to_sharded_metadata = _get_param_id_to_sharded_metadata(model_sharded_state_dict)
 
         prefix = 'optimizer.state'
         model_space_state = {}
@@ -1809,13 +1823,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_world_end,
                     bucket_id,
                 ) in buffer.param_index_map.items():
-                    try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
-                    except KeyError as e:
+                    sharded_metadata = param_to_sharded_metadata.get(id(model_param))
+                    if sharded_metadata is None:
+                        name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                         raise ValueError(
-                            f"Model param {model_param} not in model_sharded_state_dict."
+                            f"Model param {name} (shape={tuple(model_param.shape)})"
+                            f" has no source-bound metadata in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
-                        ) from e
+                        )
                     assert (
                         sharded_metadata.flattened_range is None
                     ), f"Flattened model tensor not supported ({sharded_metadata})"
@@ -2028,12 +2043,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         This will allow changing TP and PP while using DistOpt (as with other optimizers).
         """
 
-        param_to_sharded_metadata = {}
-        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
-            model_sharded_state_dict
-        )
-        for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+        param_to_sharded_metadata = _get_param_id_to_sharded_metadata(model_sharded_state_dict)
 
         prefix = 'optimizer.state'
         state = {}
@@ -2047,13 +2057,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
-            try:
-                sharded_metadata = param_to_sharded_metadata[model_param]
-            except KeyError as e:
+            sharded_metadata = param_to_sharded_metadata.get(id(model_param))
+            if sharded_metadata is None:
+                name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                 raise ValueError(
-                    f"Model param {model_param} not in model_sharded_state_dict"
+                    f"Model param {name} (shape={tuple(model_param.shape)})"
+                    f" has no source-bound metadata in model_sharded_state_dict."
                     f" Hint: {KEEP_VARS_HINT}"
-                ) from e
+                )
 
             # Set DP corresponding replica_id coordinate to 0.
             assert (
@@ -2079,7 +2090,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 if isinstance(sharded_metadata, ShardedTensorFactory):
                     replace_kwargs.pop('dtype')
-                tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                    tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                else:
+                    tensors[state_key] = make_sharded_optimizer_fragment(
+                        sharded_metadata,
+                        state_ten,
+                        f'{prefix}.{state_key}',
+                        item_slice,
+                        replica_id=replica_id,
+                    )
                 tensors[state_key].validate_metadata_integrity()
             return tensors
 

@@ -109,6 +109,21 @@ The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
    - Slower than dp_reshardable.
    - Enabled via the ``--dist-ckpt-optim-fully-reshardable`` flag.
 
+### Optimizer metadata for transformed model entries
+
+Model checkpoint entries may contain a gathered or dequantized tensor instead of the
+live parameter. Distributed Adam's model-space formats resolve these entries using
+`ShardedTensorFactory.for_optimizer()` or an explicit dequantized-source identity.
+The lookup indexes parameter identities once per traversal; it preserves checkpoint
+keys, prepended expert/layer offsets, and replica ownership without guessing from names.
+Unresolved GTP parameters are rejected before optimizer state or communication is accessed.
+
+Fused projections and ordinary flat optimizer fragments share the same rectangular
+chunk builder. It intersects the physical slice with each logical section, preserving
+partial rows and higher-dimensional slabs. Trailing alignment padding is omitted from
+the checkpoint and restored as zeros. No GTP all-gather is needed to build or merge
+optimizer fragments; the model's gathered checkpoint representation is unchanged.
+
 ### Workflow for Changing Model Parallelism
 
 You can combine formats to optimize both flexibility and performance:
