@@ -1141,10 +1141,10 @@ class _HybridEPManager(_DispatchManager):
             # tokens_per_expert below still declares the full capacity. Keep the bool map.
             and not self.drop_and_pad
         ):
-            _, self.topk_idx = torch.topk(self.token_probs, self.router_topk, dim=-1)
-            self.topk_idx = self.topk_idx.to(torch.int16)
-            invalid_routes = ~self.routing_map.gather(1, self.topk_idx.long())
-            self.topk_idx = self.topk_idx.masked_fill(invalid_routes, -1)
+            route_hits, self.topk_idx = torch.topk(
+                self.routing_map.to(self.token_probs.dtype), self.router_topk, dim=-1
+            )
+            self.topk_idx = self.topk_idx.to(torch.int16).masked_fill(route_hits == 0, -1)
         else:
             self.topk_idx = None
 

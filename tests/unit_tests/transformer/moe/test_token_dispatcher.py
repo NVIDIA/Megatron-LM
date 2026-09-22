@@ -594,6 +594,36 @@ def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
     assert torch.equal(manager.topk_idx, torch.tensor([[0], [-1]], dtype=torch.int16))
 
 
+def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch):
+    """Dense ids must follow the bool map even when probs are nonzero outside the selected
+    routes (direct callers and the dispatcher test helper pass full-width weights); a topk over
+    probs would pick expert 1 here and drop the token's only real route."""
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="indices"
+    )
+    manager.group = object()
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    routing_map = torch.tensor(
+        [[True, False, False, True], [False, True, False, False], [False, False, False, False]]
+    )
+    probs = torch.tensor([[0.1, 0.5, 0.3, 0.1], [0.25, 0.25, 0.25, 0.25], [0.7, 0.1, 0.1, 0.1]])
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager.topk_idx.dtype == torch.int16
+    routes = [sorted(row[row >= 0].tolist()) for row in manager.topk_idx]
+    assert routes == [[0, 3], [1], []]
+    assert (manager.topk_idx[1] == -1).sum() == 1 and (manager.topk_idx[2] == -1).all()
+    # Full-width probs are passed through untouched for HybridEP to gather by index.
+    assert torch.equal(manager.token_probs, probs)
+
+
 def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
     """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
     topk assignments); the indices-mode topk reconstruction would drop the padded assignments
@@ -780,14 +810,21 @@ class TestFlexDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("routing_map_mode", ["bool", "indices"])
-    def test_hybridep_routing_map_modes_forward_backward(self, routing_map_mode):
+    @pytest.mark.parametrize("moe_router_fusion", [True, False])
+    def test_hybridep_routing_map_modes_forward_backward(self, routing_map_mode, moe_router_fusion):
+        """With router fusion the router hands HybridEP dense ids directly; without it the router
+        emits a bool map and indices mode must rebuild the ids from that map (the test helper's
+        uniform full-width probs would otherwise select unrouted experts)."""
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
-        if routing_map_mode == "indices" and (
-            not fused_topk_with_score_function_supports_topk_indices
-            or not HAVE_HYBRIDEP_DENSE_ROUTING
+        if routing_map_mode == "indices" and not HAVE_HYBRIDEP_DENSE_ROUTING:
+            pytest.skip("Dense HybridEP routing API is not available")
+        if (
+            routing_map_mode == "indices"
+            and moe_router_fusion
+            and not fused_topk_with_score_function_supports_topk_indices
         ):
-            pytest.skip("Dense TE/HybridEP routing APIs are not available")
+            pytest.skip("Dense TE fused top-k routing API is not available")
 
         container = MoEModelTestContainer(
             tp_size=1,
@@ -797,7 +834,7 @@ class TestFlexDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="flex",
-            moe_router_fusion=True,
+            moe_router_fusion=moe_router_fusion,
             moe_flex_dispatcher_backend="hybridep",
             moe_hybridep_routing_map_mode=routing_map_mode,
             hidden_size=1024,
