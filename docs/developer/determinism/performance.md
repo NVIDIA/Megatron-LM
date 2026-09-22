@@ -180,3 +180,137 @@ performance failure; exit 2 means missing/incompatible/uncertain evidence. Add
 `--require-performance-pass` to also return 2 for an unbudgeted bundle. Existing
 reports are not overwritten. Combining compatible coverage/performance CI jobs
 and calibrated PR-wide enforcement still needs the combined GPU workflow.
+
+## Publish and verify a historical baseline
+
+The existing CI log uploader already includes the kernel leaderboard, separate
+benchmark reports, raw timing files and launcher logs. Download the coverage and
+performance artifacts from the same clean source revision and compatible runtime
+context. Keep one attempt per directory; do not combine retries or allocations.
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/baseline.py publish \
+  --coverage /tmp/coverage-logs/determinism-coverage.json \
+  --leaderboard /tmp/perf-logs/kernel-leaderboard/leaderboard.json \
+  --revision <full-source-revision> \
+  --origin <CI-run-or-execution-reference> \
+  --store /shared/determinism-baselines
+```
+
+Publication recomputes the author/timing join for every declared requirement and
+requires a matching forward and backward report. It checks every separate
+`benchmark.json` against the leaderboard and every raw `kernel.json` against its
+embedded measurements. All rows must share the source, measurement protocol and
+timing GPU. Missing files, duplicate attempts, extra rows, incomplete evidence
+and failed numerical or performance checks prevent publication. No missing phase
+is filled from a nearby configuration or a different run.
+
+The store must be outside the downloaded artifact directory. Each baseline lives
+under the SHA-256 of its `baseline.json` manifest. It contains the original
+coverage aggregate, full performance reports, raw timing files and logs, with
+relative file names, sizes and hashes. Original runner paths inside reports are
+retained as provenance; verification does not require those paths to exist.
+The manifest also retains the recomputed author evidence. Identical publication
+reuses a verified bundle; existing baselines are never refreshed in place.
+
+After copying or archiving a bundle, verify it against the saved identifier:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/baseline.py verify \
+  /downloaded/baseline --expected-id <saved-manifest-sha256>
+```
+
+Verification checks the complete file inventory and recomputes the numerical
+evidence/timing join again. Hashes check integrity, not execution authenticity;
+the origin is supplied by the publisher and should reference the actual CI run.
+The coverage aggregate retains observations and checks; this tool does not
+reconstruct it from pytest shards or independently rerun GPU comparisons.
+
+Unbudgeted bundles remain `not_gated`. Publication never assigns limits, promotes
+historical timings into a performance pass, or makes cross-allocation timings
+equivalent to paired base/head measurements. H100 and GB200 remain separate
+contexts. Retain the content-addressed store in durable storage; the ordinary CI
+log artifact's retention period alone does not provide permanent publication.
+
+### Compare retained calibration runs
+
+Use pinned, verified, unbudgeted bundles to review variation across runs:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/calibration.py \
+  --baseline /store/first-run <first-manifest-sha256> \
+  --baseline /store/second-run <second-manifest-sha256> \
+  --output /reports/calibration.json
+```
+
+The command rechecks every bundle's files and author/timing join. It rejects
+duplicate identifiers, identical measurements republished with different metadata,
+and budgeted results whose selection could hide failed measurements. Invalid input
+fails the report instead of silently selecting the remaining passing records.
+
+Comparison groups retain exact source revisions, cases, shapes, inputs, precision,
+adapter, runtime settings and measurement protocol. H100/GB200, changed drivers,
+software versions, base revisions and phase protocols remain separate. Host names,
+GPU UUIDs and checkout locations remain in each run's provenance; they do not
+split a group. Counts of distinct timing GPUs do not establish statistical
+independence or prove separate scheduler allocations.
+
+Cache paths match by default. For runs using different explicit cache directories,
+`--compare-cache-locations` groups those locations while preserving the actual
+paths in every run. Unset and explicit cache locations still remain separate.
+This option does not establish equal cache contents, generated code or dispatch.
+Other runtime settings continue to require exact equality.
+
+For captured collectives, select the distinct pinned bundle format explicitly:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/calibration.py \
+  --collective-baseline /store/first-collective-run <first-manifest-sha256> \
+  --collective-baseline /store/second-collective-run <second-manifest-sha256> \
+  --output /reports/collective-calibration.json
+```
+
+Activation and collective inputs cannot be mixed in one invocation. The
+collective path rechecks every capture blob, replay/reference record, worker
+request and rank timing file before using the paired estimates. It also rejects
+reused raw timing arms under different publication metadata, including a
+head-only bundle that reuses arms from another base/head bundle. Repeated
+publication does not create another observation.
+
+Collective cohorts retain the **entire captured workload on every rank**, not
+only the row being displayed. Recipe identity, call order, input and upstream
+gradient byte hashes, shape/stride/storage offset, precision, rank membership,
+communicator options, source revisions, runtime and measurement settings must
+match. A changed peer input or neighboring captured call splits the cohort.
+Different event indices and groups remain separate even when their timings are
+identical. The tool does not infer equivalence across recipes, reorder events to
+make a match, or erase source/tooling differences to create repeated runs.
+
+The recorded hardware inventory and rank-to-device indices participate in the
+comparison. Host names, GPU UUIDs and checkout paths remain in run provenance;
+they do not split otherwise matching cohorts. Missing runtime/hardware metadata,
+inconsistent rank devices and ambiguous inventory entries fail calibration.
+The captured logical groups and hardware inventory do not prove physical fabric
+equivalence. Distinct device assignments do not prove independent allocations.
+
+The same `--compare-cache-locations` opt-in is available for collectives. JSON
+retains the original paths, full workload metadata, baseline identifiers, each
+run's paired ratios/intervals and arm medians. Markdown shows every event/group,
+including singleton cohorts. Hardware identifiers and environment values are
+part of the detailed provenance; retain and share reports according to the
+same access rules as their input artifacts.
+
+Each bundle contributes one median paired ratio. JSON retains each run's paired
+ratios and within-run intervals; Markdown shows the minimum, median, maximum and
+observed range across runs. Default/deterministic overhead stays separate from
+paired head/base regression. Raw event samples are never pooled to manufacture
+more independent observations, and the observed range is not a confidence or
+prediction bound. One-run groups are explicitly marked in JSON.
+
+The result remains `report_only` / `not_gated`. The tool does not choose budgets,
+approve promotion or replace production-recipe measurements. Inputs are selected
+published bundles, not a complete survey of executions. Preserve unsuccessful
+attempts alongside them when reviewing calibration and unexplained variation.
+
+CPU contract tests use explicitly synthetic GPU metadata and timings. They do
+not establish hardware latency, correctness, replay coverage or usable budgets.
