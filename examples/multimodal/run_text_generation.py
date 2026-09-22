@@ -42,6 +42,7 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, 
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.training.global_vars import initialize_runtime_services
 
 
 def is_first_rank():
@@ -843,7 +844,8 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
-    parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()

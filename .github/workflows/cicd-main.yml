@@ -242,6 +242,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+          ENABLE_SELECTIVE_UNIT_TESTS: ${{ vars.ENABLE_SELECTIVE_UNIT_TESTS }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
@@ -259,6 +260,7 @@ jobs:
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
           HAS_UNIT_TESTMON=$(echo "$LABELS"   | jq 'any(. == "Run selective unit tests")')
+          HAS_DISABLE_UNIT_TESTMON=$(echo "$LABELS" | jq 'any(. == "Disable selective unit tests")')
           # Synthetic PR pushes have no pull_request event payload for preflight.
           if echo "$LABELS" | jq -e 'any(. == "force-run-all")' > /dev/null; then
             FORCE_RUN_ALL=true
@@ -331,13 +333,29 @@ jobs:
 
           DEV=true
 
-          # Labeled PRs only read the shared main baseline. A missing or
+          # The repository variable sets the default; labels override it.
+          # Only an explicit true enables the default. The disable label wins
+          # if both labels are present, so full testing is always available.
+          UNIT_TESTMON_DEFAULT_ENABLED=false
+          if [[ "${ENABLE_SELECTIVE_UNIT_TESTS:-false}" == "true" ]]; then
+            UNIT_TESTMON_DEFAULT_ENABLED=true
+          fi
+          UNIT_TESTMON_REQUESTED=$UNIT_TESTMON_DEFAULT_ENABLED
+          if [[ "$HAS_UNIT_TESTMON" == "true" ]]; then
+            UNIT_TESTMON_REQUESTED=true
+          fi
+          if [[ "$HAS_DISABLE_UNIT_TESTMON" == "true" ]]; then
+            UNIT_TESTMON_REQUESTED=false
+          fi
+
+          # Eligible PRs only read the shared main baseline. A missing or
           # incompatible cache runs the full bucket without recording a database.
           UNIT_TESTMON_ELIGIBLE=false
           if [[ "$LABELS_VALID" == "true" \
-            && "$HAS_UNIT_TESTMON" == "true" \
+            && "$UNIT_TESTMON_REQUESTED" == "true" \
             && "$EVENT_NAME" == "push" \
             && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
+            && "$IS_MERGE_GROUP" != "true" \
             && "$HAS_RUN_TESTS" != "true" \
             && "$HAS_RUN_FUNCTIONAL" != "true" \
             && "$FORCE_RUN_ALL" != "true" \
@@ -384,7 +402,10 @@ jobs:
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
-          | \`unit_testmon_requested\` | \`$HAS_UNIT_TESTMON\` |
+          | \`unit_testmon_default_enabled\` | \`$UNIT_TESTMON_DEFAULT_ENABLED\` |
+          | \`unit_testmon_enable_label\` | \`$HAS_UNIT_TESTMON\` |
+          | \`unit_testmon_disable_label\` | \`$HAS_DISABLE_UNIT_TESTMON\` |
+          | \`unit_testmon_requested\` | \`$UNIT_TESTMON_REQUESTED\` |
           | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
 
           ### Decision tree

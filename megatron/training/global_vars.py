@@ -5,6 +5,7 @@
 import os
 import signal
 import sys
+from argparse import Namespace
 from datetime import timedelta
 
 import torch
@@ -153,12 +154,18 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, build_tokenizer=True):
-    """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
+    """Register args and construct runtime services for args-only callers."""
 
     assert args is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     set_args(args)
+
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer)
+
+
+def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True) -> None:
+    """Construct services independently of CLI parsing and config construction."""
 
     if args.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
@@ -261,6 +268,15 @@ def _build_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     _GLOBAL_TOKENIZER = build_tokenizer(args)
+    # Resolve the declared model field once, before any args-to-config conversion.
+    # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
+    if (
+        getattr(args, 'moe_num_hash_layers', 0) > 0
+        and getattr(args, 'hash_moe_vocab_size', None) is None
+    ):
+        args.hash_moe_vocab_size = _GLOBAL_TOKENIZER.vocab_size
+        if getattr(args, 'yaml_cfg', None) is not None:
+            args.language_model.hash_moe_vocab_size = args.hash_moe_vocab_size
     return _GLOBAL_TOKENIZER
 
 
