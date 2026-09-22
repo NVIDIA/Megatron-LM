@@ -2203,21 +2203,22 @@ class DynamicInferenceEngine(AbstractEngine):
         enable_prefix_caching = self.context.enable_prefix_caching and (
             not request_has_images or bool(media_cache_key)
         )
+        media_tensors = {
+            name: tensor
+            for name, tensor in (
+                ("imgs", imgs),
+                ("imgs_sizes", imgs_sizes),
+                ("num_frames", num_frames),
+                ("num_tiles", num_tiles),
+            )
+            if tensor is not None
+        }
         return DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             compact_prompt_tokens=compact_prompt_tokens,
-            media_tensors={
-                name: tensor
-                for name, tensor in (
-                    ("imgs", imgs),
-                    ("imgs_sizes", imgs_sizes),
-                    ("num_frames", num_frames),
-                    ("num_tiles", num_tiles),
-                )
-                if tensor is not None
-            },
+            media_tensors=media_tensors,
             sampling_params=sampling_params,
             offload_params=offload_params,
             block_size_tokens=self.context.block_size_tokens,
