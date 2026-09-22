@@ -1209,6 +1209,8 @@ class DynamicInferenceRequestRecord:
                 num_tiles=old_request.num_tiles,
                 imgs_sizes=old_request.imgs_sizes,
                 num_frames=old_request.num_frames,
+                video_frame_indices=old_request.video_frame_indices,
+                video_fps=old_request.video_fps,
                 media_tokens_preexpanded=old_request.media_tokens_preexpanded,
                 media_cache_key=old_request.media_cache_key,
                 decoder_seq_length=old_request.decoder_seq_length,

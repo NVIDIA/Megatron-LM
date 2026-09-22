@@ -17,13 +17,14 @@ from megatron.core.inference.inference_request import (
     serialize_multimodal_data,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
-    _compact_tokens_after_prefix,
     _expanded_prefix_stitching_metadata,
     _extract_media_url_bytes,
     _has_previous_turn_tokens,
     _last_assistant_message,
+    _replace_prefix_tokens,
     _replace_prefix_tokens_metadata,
     _sanitize_messages_for_template,
+    _suffix_tokens_after_prefix,
     _tokenize_with_media_slots_sync,
 )
 
@@ -59,10 +60,7 @@ def test_replace_prefix_tokens_metadata_ships_the_rendered_prefix_and_eos():
 
 
 def test_expanded_prefix_stitching_metadata_uses_model_input_tokens():
-    assistant = {
-        "prompt_token_ids": [10, 99, 99, 20],
-        "generation_token_ids": [7, 8],
-    }
+    assistant = {"prompt_token_ids": [10, 99, 99, 20], "generation_token_ids": [7, 8]}
 
     out = _expanded_prefix_stitching_metadata(2, 1, assistant)
 
@@ -72,12 +70,132 @@ def test_expanded_prefix_stitching_metadata_uses_model_input_tokens():
     assert out[PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD] == [7, 8]
 
 
-def test_compact_tokens_after_prefix_keeps_only_new_turn_suffix():
-    assert _compact_tokens_after_prefix(
-        2,
-        [1, 10, 42, 11, 500, 2],
-        [1, 10, 42, 11, 500, 2, 12, 13],
+def test_suffix_tokens_after_prefix_keeps_only_new_turn_suffix():
+    assert _suffix_tokens_after_prefix(
+        2, [1, 10, 42, 11, 500, 2], [1, 10, 42, 11, 500, 2, 12, 13]
     ) == [2, 12, 13]
+
+
+def test_suffix_tokens_after_prefix_accepts_multiple_eos_token_ids():
+    assert _suffix_tokens_after_prefix([2, 11], [1, 11, 10, 2], [1, 11, 10, 2, 12, 11, 13]) == [
+        2,
+        12,
+        11,
+        13,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("template_prefix", "current_tokens", "error"),
+    [
+        ([1, 10, 42], [1, 10, 42, 2, 12], "Could not locate an EOS-delimited"),
+        ([1, 2, 10, 2], [1, 2, 10, 12], "Expected 2 EOS token"),
+    ],
+)
+def test_suffix_tokens_after_prefix_rejects_missing_boundary(
+    template_prefix, current_tokens, error
+):
+    with pytest.raises(ValueError, match=error):
+        _suffix_tokens_after_prefix(2, template_prefix, current_tokens)
+
+
+@pytest.mark.parametrize(
+    ("previous_turn", "template_prefix", "current_turn", "expected"),
+    [
+        ([], [10, 2, 20, 2], [10, 2, 20, 2, 30, 31], [10, 2, 20, 2, 30, 31]),
+        (
+            [100, 101, 200, 201, 2],
+            [10, 2, 20, 2],
+            [10, 2, 20, 2, 30, 31],
+            [100, 101, 200, 201, 2, 30, 31],
+        ),
+        (
+            [100, 101, 200, 201],
+            [10, 2, 20, 2],
+            [10, 2, 20, 2, 30, 31],
+            [100, 101, 200, 201, 2, 30, 31],
+        ),
+        (
+            [100, 101, 200, 201, 2],
+            [10, 2, 20, 2],
+            [10, 999, 998, 2, 20, 2, 30, 31],
+            [100, 101, 200, 201, 2, 30, 31],
+        ),
+    ],
+    ids=(
+        "empty-exact-prefix-keeps-template",
+        "exact-prefix-ended-in-eos",
+        "generation-hit-token-limit",
+        "template-length-shifted",
+    ),
+)
+def test_text_prefix_stitching_preserves_exact_previous_tokens(
+    previous_turn, template_prefix, current_turn, expected
+):
+    assert _replace_prefix_tokens(2, previous_turn, template_prefix, current_turn) == expected
+
+
+def _legacy_replace_prefix_tokens(
+    eos_token_id,
+    previous_turn_token_ids,
+    retokenized_previous_turn_token_ids,
+    current_turn_token_ids,
+):
+    """Pre-change positional implementation, retained only for equivalence tests."""
+    if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
+        previous_turn_token_ids = previous_turn_token_ids[:-1]
+    boundary = len(retokenized_previous_turn_token_ids) - 1
+    scan_len = min(len(retokenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for position in reversed(range(scan_len)):
+        if current_turn_token_ids[position] == eos_token_id:
+            boundary = position
+            break
+    return previous_turn_token_ids + current_turn_token_ids[boundary:]
+
+
+@pytest.mark.parametrize(
+    ("previous_turn", "template_prefix", "current_turn"),
+    [
+        ([100, 101, 200, 201, 2], [10, 2, 20, 2], [10, 2, 20, 2, 30, 31]),
+        ([100, 101, 200, 201], [10, 2, 20, 2], [10, 2, 20, 2, 30, 31]),
+    ],
+)
+def test_text_prefix_stitching_matches_legacy_when_template_prefix_is_unchanged(
+    previous_turn, template_prefix, current_turn
+):
+    assert _replace_prefix_tokens(2, previous_turn, template_prefix, current_turn) == (
+        _legacy_replace_prefix_tokens(2, previous_turn, template_prefix, current_turn)
+    )
+
+
+def test_text_prefix_stitching_tracks_turn_when_template_strips_prior_reasoning():
+    previous_turn = [100, 101, 200, 201, 2]
+    # Rendering the assistant as the final message retains reasoning tokens.
+    template_prefix = [10, 2, 50, 51, 52, 20, 2]
+    # Rendering it as history strips those tokens. The new turn also contains
+    # an EOS, so "scan backwards within the old prefix length" selects the
+    # wrong delimiter.
+    current_turn = [10, 2, 20, 2, 30, 2, 31]
+
+    assert _replace_prefix_tokens(2, previous_turn, template_prefix, current_turn) == [
+        100,
+        101,
+        200,
+        201,
+        2,
+        30,
+        2,
+        31,
+    ]
+    assert _legacy_replace_prefix_tokens(
+        2, previous_turn, template_prefix, current_turn
+    ) != _replace_prefix_tokens(2, previous_turn, template_prefix, current_turn)
+
+
+def test_text_prefix_stitching_preserves_exact_trailing_eos_token():
+    assert _replace_prefix_tokens(
+        [2, 11], [100, 101, 200, 11], [10, 11, 20, 2], [10, 11, 20, 2, 30]
+    ) == [100, 101, 200, 11, 30]
 
 
 _USER = {"role": "user", "content": "hi"}
@@ -94,6 +212,12 @@ _ENGINE_METADATA = {"ng_capture": {"staging_chain": ["k1"]}}
 def test_has_previous_turn_tokens():
     assert _has_previous_turn_tokens(None) is False
     assert _has_previous_turn_tokens(_ASSISTANT_TEXT) is False  # dataset-provided history
+    assert (
+        _has_previous_turn_tokens(
+            {"role": "assistant", "content": "", "prompt_token_ids": [], "generation_token_ids": []}
+        )
+        is False
+    )
     assert _has_previous_turn_tokens(_ASSISTANT_WITH_TOKENS) is True
 
 
@@ -210,6 +334,395 @@ def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
     for line in src.splitlines():
         if "_tokenize_with_media_slots_sync" in line:
             assert "await" not in line, f"must be dispatched via the executor, got: {line.strip()}"
+
+
+class _PrefixStitchingTokenizer:
+    chat_template = "test-template"
+    unk_token_id = 0
+    eos_id = 2
+    bos = None
+    eod = None
+
+    def apply_chat_template(
+        self, messages, *, tokenize=True, add_generation_prompt=True, **_kwargs
+    ):
+        assert tokenize is True
+        if len(messages) == 2 and not add_generation_prompt:
+            # The template's prior assistant text tokenizes differently from the
+            # exact tokens returned by the model in the preceding request.
+            return [10, 2, 20, 2]
+        return [10, 2, 20, 2, 30, 31]
+
+    def detokenize(self, tokens, skip_special_tokens=True):
+        del skip_special_tokens
+        return " ".join(str(token) for token in tokens)
+
+    def convert_tokens_to_ids(self, token):
+        return 99 if token == "<image>" else self.unk_token_id
+
+
+class _PrefixStitchingClient:
+    def __init__(self):
+        self.submissions = []
+
+    def add_request_with_id(
+        self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+    ):
+        self.submissions.append(
+            {
+                "prompt_tokens": list(prompt_tokens),
+                "multi_modal_data": multi_modal_data,
+                "offload_params": offload_params,
+            }
+        )
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(
+            {
+                "uid": "prefix-stitching",
+                "status": "COMPLETED",
+                "generated_tokens": [77],
+                "prompt_length": len(prompt_tokens),
+                "prompt_tokens": list(prompt_tokens),
+                "compact_prompt_tokens": list(prompt_tokens),
+                "num_cached_tokens": 0,
+                "sampling_params": sampling_params.serialize(),
+                "routing_indices": None,
+            }
+        )
+        return 1, future
+
+    def abort_request(self, _request_id):
+        raise AssertionError("Successful request must not be aborted")
+
+
+def _prefix_stitching_app(quart, chat_completions, *, eval_mode=False):
+    tokenizer = _PrefixStitchingTokenizer()
+    client = _PrefixStitchingClient()
+    spec = MediaPromptSpec(model_token="<image>")
+    app = quart.Quart(__name__)
+    app.config.update(
+        client=client,
+        tokenizer=tokenizer,
+        parsers=[],
+        verbose=False,
+        multimodal_prompt_config=MultimodalPromptConfig(image_spec=spec, video_spec=spec),
+        default_temperature=1.0,
+        default_top_p=1.0,
+        default_top_k=0,
+        eval_mode=eval_mode,
+    )
+    app.register_blueprint(chat_completions.bp)
+    return app, client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prevent_retokenization", "eval_mode", "expected_prompt"),
+    [
+        (False, False, [10, 2, 20, 2, 30, 31]),
+        (True, True, [100, 101, 200, 201, 2, 30, 31]),
+        (None, True, [10, 2, 20, 2, 30, 31]),
+        (None, False, [100, 101, 200, 201, 2, 30, 31]),
+    ],
+    ids=(
+        "explicitly-disabled",
+        "explicitly-enabled",
+        "eval-default-disabled",
+        "rl-default-enabled",
+    ),
+)
+async def test_text_only_prefix_stitching_respects_prevent_retokenization(
+    prevent_retokenization, eval_mode, expected_prompt
+):
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(quart, chat_completions, eval_mode=eval_mode)
+    request_json = {
+        "messages": [
+            {"role": "user", "content": "first question"},
+            {
+                "role": "assistant",
+                "content": "first answer",
+                "prompt_token_ids": [100, 101],
+                "generation_token_ids": [200, 201, 2],
+            },
+            {"role": "user", "content": "second question"},
+        ],
+        "max_tokens": 1,
+    }
+    if prevent_retokenization is not None:
+        request_json["prevent_retokenization"] = prevent_retokenization
+    response = await app.test_client().post("/v1/chat/completions", json=request_json)
+
+    assert response.status_code == 200
+    assert client.submissions[0]["prompt_tokens"] == expected_prompt
+    assert client.submissions[0]["offload_params"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prevent_retokenization", [False, True])
+async def test_exact_message_tokens_and_offload_prefix_source_are_mutually_exclusive(
+    prevent_retokenization,
+):
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(quart, chat_completions)
+    response = await app.test_client().post(
+        "/v1/chat/completions",
+        json={
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {
+                    "role": "assistant",
+                    "content": "first answer",
+                    "prompt_token_ids": [100, 101],
+                    "generation_token_ids": [200, 201, 2],
+                },
+                {"role": "user", "content": "second question"},
+            ],
+            "offload_params": {"stager": {"request_id": "r0"}},
+            "prevent_retokenization": prevent_retokenization,
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "mutually exclusive prefix sources" in (await response.get_data()).decode()
+    assert client.submissions == []
+
+
+@pytest.mark.asyncio
+async def test_multimodal_exact_prefix_requires_prior_media_in_message_history():
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(quart, chat_completions)
+    response = await app.test_client().post(
+        "/v1/chat/completions",
+        json={
+            "messages": [
+                {"role": "user", "content": "image omitted from replayed history"},
+                {
+                    "role": "assistant",
+                    "content": "first answer",
+                    "prompt_token_ids": [100, 99, 99, 101],
+                    "generation_token_ids": [200, 2],
+                },
+                {"role": "user", "content": "second question"},
+            ],
+            "prevent_retokenization": True,
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "media tokens" in (await response.get_data()).decode()
+    assert "missing from message history" in (await response.get_data()).decode()
+    assert client.submissions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prevent_retokenization", [False, True])
+@pytest.mark.parametrize("current_turn_has_media", [False, True])
+async def test_multimodal_prefix_stitching_submits_exact_prefix_metadata_and_compact_suffix(
+    current_turn_has_media, prevent_retokenization
+):
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(quart, chat_completions)
+    image_url = f"data:image/png;base64,{base64.b64encode(b'image').decode()}"
+    current_content = [{"type": "text", "text": "second question"}]
+    if current_turn_has_media:
+        current_content.append({"type": "image_url", "image_url": {"url": image_url}})
+
+    def fake_multimodal_tokenize(
+        _tokenizer,
+        messages,
+        _media_slots,
+        _prompt_config,
+        *,
+        tools,
+        chat_template_kwargs,
+        add_generation_prompt=True,
+    ):
+        del tools, chat_template_kwargs
+        if len(messages) == 2 and not add_generation_prompt:
+            return [10, 42, 2, 20, 2]
+        return [10, 42, 2, 20, 2, 30, *([42] if current_turn_has_media else [])]
+
+    with mock.patch.object(
+        chat_completions, "_tokenize_with_media_slots_sync", side_effect=fake_multimodal_tokenize
+    ):
+        response = await app.test_client().post(
+            "/v1/chat/completions",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": image_url}}],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "first answer",
+                        "prompt_token_ids": [100, 99, 99, 101],
+                        "generation_token_ids": [200, 2],
+                    },
+                    {"role": "user", "content": current_content},
+                ],
+                "prevent_retokenization": prevent_retokenization,
+                "max_tokens": 1,
+            },
+        )
+
+    assert response.status_code == 200
+    submission = client.submissions[0]
+    assert submission["multi_modal_data"] is not None
+    if prevent_retokenization:
+        assert submission["prompt_tokens"] == [2, 30, *([42] if current_turn_has_media else [])]
+        assert submission["offload_params"] == {
+            PREFIX_EOS_TOKEN_ID_FIELD: 2,
+            PREFIX_MEDIA_COUNT_FIELD: 1,
+            PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [100, 99, 99, 101],
+            PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [200, 2],
+        }
+    else:
+        assert submission["prompt_tokens"] == [
+            10,
+            42,
+            2,
+            20,
+            2,
+            30,
+            *([42] if current_turn_has_media else []),
+        ]
+        assert submission["offload_params"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prevent_retokenization", [False, True])
+@pytest.mark.parametrize("prefix_has_media", [False, True])
+async def test_offloaded_prefix_stitching_metadata_covers_text_and_multimodal_history(
+    prefix_has_media, prevent_retokenization
+):
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(quart, chat_completions)
+    image_url = f"data:image/png;base64,{base64.b64encode(b'image').decode()}"
+    first_content = (
+        [{"type": "image_url", "image_url": {"url": image_url}}]
+        if prefix_has_media
+        else "first question"
+    )
+
+    def fake_multimodal_tokenize(
+        _tokenizer,
+        messages,
+        _media_slots,
+        _prompt_config,
+        *,
+        tools,
+        chat_template_kwargs,
+        add_generation_prompt=True,
+    ):
+        del tools, chat_template_kwargs
+        if len(messages) == 2 and not add_generation_prompt:
+            return [10, 42, 2, 20, 2]
+        return [10, 42, 2, 20, 2, 30]
+
+    patch = (
+        mock.patch.object(
+            chat_completions,
+            "_tokenize_with_media_slots_sync",
+            side_effect=fake_multimodal_tokenize,
+        )
+        if prefix_has_media
+        else mock.patch.object(
+            chat_completions,
+            "_apply_chat_template_sync",
+            side_effect=lambda _tokenizer, messages, _tools, _kwargs, add_generation_prompt=True: (
+                [10, 2, 20, 2]
+                if len(messages) == 2 and not add_generation_prompt
+                else [10, 2, 20, 2, 30]
+            ),
+        )
+    )
+    with patch:
+        response = await app.test_client().post(
+            "/v1/chat/completions",
+            json={
+                "messages": [
+                    {"role": "user", "content": first_content},
+                    {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "second question"},
+                ],
+                "offload_params": {"stager": {"request_id": "r0"}},
+                "prevent_retokenization": prevent_retokenization,
+                "max_tokens": 1,
+            },
+        )
+
+    assert response.status_code == 200
+    submission = client.submissions[0]
+    expected_template_prefix = [10, 42, 2, 20, 2] if prefix_has_media else [10, 2, 20, 2]
+    assert submission["offload_params"] == {
+        "stager": {"request_id": "r0"},
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: expected_template_prefix,
+        PREFIX_EOS_TOKEN_ID_FIELD: 2,
+        **({PREFIX_MEDIA_COUNT_FIELD: 1} if prefix_has_media else {}),
+    }
+
+
+@pytest.mark.asyncio
+async def test_text_prefix_with_new_suffix_media_stitches_before_media_expansion():
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(quart, chat_completions)
+    image_url = f"data:image/png;base64,{base64.b64encode(b'image').decode()}"
+
+    with mock.patch.object(
+        chat_completions, "_tokenize_with_media_slots_sync", return_value=[10, 2, 20, 2, 30, 42]
+    ):
+        response = await app.test_client().post(
+            "/v1/chat/completions",
+            json={
+                "messages": [
+                    {"role": "user", "content": "first question"},
+                    {
+                        "role": "assistant",
+                        "content": "first answer",
+                        "prompt_token_ids": [100, 101],
+                        "generation_token_ids": [200, 201, 2],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {"url": image_url}}],
+                    },
+                ],
+                "prevent_retokenization": True,
+                "max_tokens": 1,
+            },
+        )
+
+    assert response.status_code == 200
+    assert client.submissions[0]["prompt_tokens"] == [100, 101, 200, 201, 2, 30, 42]
+    assert client.submissions[0]["offload_params"] is None
 
 
 @pytest.mark.asyncio

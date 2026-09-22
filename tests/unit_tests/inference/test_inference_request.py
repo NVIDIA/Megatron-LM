@@ -12,6 +12,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     InferenceRequest,
     OffloadedRequestPayload,
@@ -500,6 +501,38 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     # Never-stamped requests record None epochs (non-RL serving).
     finished_cd = FinishedRequestRecord.from_request(merged_cd)
     assert finished_cd.policy_epoch is None and finished_cd.num_evictions == 0
+
+
+def test_vlm_checkpoint_preserves_video_timing_metadata_and_mask():
+    image_token_mask = torch.tensor([0, 1, -1])
+    request = DynamicVLMInferenceRequest(
+        request_id=5,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+        generated_tokens=[7, 8],
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(2, 3, 4, 4),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 1], [1, 1]]),
+        num_frames=torch.tensor([2]),
+        video_frame_indices=[[3, 7]],
+        video_fps=[29.97],
+        media_tokens_preexpanded=True,
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(2, 1, 4),
+        image_token_mask=image_token_mask,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+
+    record.checkpoint()
+
+    checkpoint = record[-1]
+    assert isinstance(checkpoint, DynamicVLMInferenceRequest)
+    assert checkpoint.prompt_tokens.tolist() == [99, 99, 5, 7, 8]
+    assert checkpoint.video_frame_indices == [[3, 7]]
+    assert checkpoint.video_fps == [29.97]
+    assert checkpoint.image_token_mask is image_token_mask
+    assert checkpoint.media_tokens_preexpanded is True
 
 
 def test_checkpoint_preserves_runtime_state_without_aliasing():

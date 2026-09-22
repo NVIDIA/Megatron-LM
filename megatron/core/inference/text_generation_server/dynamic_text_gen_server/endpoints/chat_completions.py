@@ -579,29 +579,27 @@ def _sanitize_chat_template_kwargs(raw_kwargs):
 
 
 def _replace_prefix_tokens(
-    eos_token_id,
+    eos_token_ids,
     previous_turn_token_ids,
-    retokeenized_previous_turn_token_ids,
+    retokenized_previous_turn_token_ids,
     current_turn_token_ids,
 ):
     """Replace the token ids that are associated with the previous turn with the actual tokens
     from the previous generation (rather than the ones from the chat template application)."""
 
-    # Strip the EOS from the previous turn token ids if it exists
-    if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
-        previous_turn_token_ids = previous_turn_token_ids[:-1]
+    if not previous_turn_token_ids:
+        return current_turn_token_ids
 
-    # Find the last EOS token id in the previous turn token ids
-    last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    # Note that the current conversation stat may be shorter than the previous conversation state.
-    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
-    for i in reversed(range(scan_len)):
-        if current_turn_token_ids[i] == eos_token_id:
-            last_eos_token_id_index = i
-            break
+    eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
 
-    # Replace the current turn token ids with the tokens from the previous generation
-    current_turn_additional_token_ids = current_turn_token_ids[last_eos_token_id_index:]
+    # Find the boundary of the current sequence's prompt.
+    current_turn_additional_token_ids = _suffix_tokens_after_prefix(
+        eos_token_ids, retokenized_previous_turn_token_ids, current_turn_token_ids
+    )
+    if previous_turn_token_ids[-1] in eos_token_ids:
+        # Preserve the exact EOS emitted previously. The rendered suffix begins
+        # with its own boundary EOS, which may be a different accepted EOS ID.
+        current_turn_additional_token_ids = current_turn_additional_token_ids[1:]
 
     # Return the previous turn token ids + the current turn token ids
     return previous_turn_token_ids + current_turn_additional_token_ids
@@ -611,9 +609,15 @@ def _has_previous_turn_tokens(last_assistant_message):
     """True when the last assistant message carries the token ids of a previous
     Megatron-Inference response, so the endpoint can replace the prefix with the exact prior turn here.
     Dataset-provided conversation history won't have these fields."""
-    return last_assistant_message is not None and (
-        isinstance(last_assistant_message.get("prompt_token_ids"), list)
-        and isinstance(last_assistant_message.get("generation_token_ids"), list)
+    if last_assistant_message is None:
+        return False
+    prompt_token_ids = last_assistant_message.get("prompt_token_ids")
+    generation_token_ids = last_assistant_message.get("generation_token_ids")
+    # Check that we have non-empty prompt or generation tokens.
+    return (
+        isinstance(prompt_token_ids, list)
+        and isinstance(generation_token_ids, list)
+        and bool(prompt_token_ids or generation_token_ids)
     )
 
 
@@ -625,49 +629,87 @@ def _last_assistant_message(template_messages):
     return None, None
 
 
-def _replace_prefix_tokens_metadata(eos_token_id, template_prefix_token_ids, offload_params):
+def _replace_prefix_tokens_metadata(eos_token_ids, template_prefix_token_ids, offload_params):
     """Ship the rendered prior-turn tokens so the engine's RequestPromptPreparer can replace the
     prefix with the exact prior tokens itself (NeMo RL's ``replace_prefix_tokens``)."""
     return {
         **offload_params,
         PREFIX_TEMPLATE_TOKEN_IDS_FIELD: list(template_prefix_token_ids),
-        PREFIX_EOS_TOKEN_ID_FIELD: eos_token_id,
+        PREFIX_EOS_TOKEN_ID_FIELD: _serialize_eos_token_ids(eos_token_ids),
     }
 
 
 def _expanded_prefix_stitching_metadata(
-    eos_token_id, prefix_media_count, last_assistant_message, offload_params=None
+    eos_token_ids, prefix_media_count, last_assistant_message, offload_params=None
 ):
     """Carry an exact expanded prefix while the wire prompt contains only the compact suffix."""
     return {
         **(offload_params or {}),
-        PREFIX_EOS_TOKEN_ID_FIELD: eos_token_id,
+        PREFIX_EOS_TOKEN_ID_FIELD: _serialize_eos_token_ids(eos_token_ids),
         PREFIX_MEDIA_COUNT_FIELD: prefix_media_count,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: list(
-            last_assistant_message["prompt_token_ids"]
-        ),
+        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: list(last_assistant_message["prompt_token_ids"]),
         PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: list(
             last_assistant_message["generation_token_ids"]
         ),
     }
 
 
-def _compact_tokens_after_prefix(eos_token_id, template_prefix_token_ids, current_tokens):
-    """Return the current-turn compact suffix, beginning at the prefix's final EOS."""
-    eos_count = template_prefix_token_ids.count(eos_token_id)
+def _normalize_eos_token_ids(eos_token_ids):
+    """Normalize one or more EOS IDs to a validated set."""
+    if type(eos_token_ids) is int:
+        eos_token_ids = [eos_token_ids]
+    if (
+        not isinstance(eos_token_ids, (list, tuple, set, frozenset))
+        or not eos_token_ids
+        or not all(type(token_id) is int for token_id in eos_token_ids)
+    ):
+        raise ValueError("EOS token IDs must be a non-empty integer or collection of integers.")
+    return frozenset(eos_token_ids)
+
+
+def _serialize_eos_token_ids(eos_token_ids):
+    """Keep the legacy scalar wire form while allowing a JSON-compatible list."""
+    normalized = _normalize_eos_token_ids(eos_token_ids)
+    if type(eos_token_ids) is int:
+        return eos_token_ids
+    return sorted(normalized)
+
+
+def _suffix_tokens_after_prefix(eos_token_ids, template_prefix_token_ids, current_tokens):
+    """Return the current-turn suffix, beginning at the prefix's final EOS."""
+    # Count the number of EOS tokens in the retokenized prefix.
+    eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
+    eos_count = sum(token_id in eos_token_ids for token_id in template_prefix_token_ids)
     if eos_count <= 0:
         raise ValueError("Could not locate an EOS-delimited previous turn.")
 
+    # Scan current_tokens from beginning to end. Return the suffix after eos_count
+    # EOS tokens have been seen.
+    # This guards against changes in templating or even upstream modification of
+    # the prefix tokens to ensure we retrieve the current turn's suffix / prompt.
     seen_eos = 0
     for position, token_id in enumerate(current_tokens):
-        if token_id == eos_token_id:
+        if token_id in eos_token_ids:
             seen_eos += 1
             if seen_eos == eos_count:
                 return current_tokens[position:]
     raise ValueError(
-        f"Expected {eos_count} EOS token(s) before the new turn, "
-        f"but found only {seen_eos}."
+        f"Expected {eos_count} EOS token(s) before the new turn, " f"but found only {seen_eos}."
     )
+
+
+def _contains_model_media_token(token_ids, tokenizer, prompt_config):
+    """Whether exact prior model tokens still reference image/video embeddings."""
+    if not isinstance(token_ids, list) or not hasattr(tokenizer, "convert_tokens_to_ids"):
+        return False
+
+    media_token_ids = set()
+    for modality in ("image", "video"):
+        spec = prompt_config.get_spec(modality)
+        token_id = tokenizer.convert_tokens_to_ids(spec.model_token)
+        if token_id is not None and token_id != getattr(tokenizer, "unk_token_id", None):
+            media_token_ids.add(int(token_id))
+    return any(type(token_id) is int and token_id in media_token_ids for token_id in token_ids)
 
 
 def _apply_chat_template_sync(
@@ -906,10 +948,11 @@ try:
                 "'offload_params' are mutually exclusive prefix sources",
                 status=400,
             )
-        replace_prefix_tokens_here = prevent_retokenization and has_previous_turn_tokens
-        replace_prefix_tokens_in_engine = (
+        use_exact_prefix_stitching = prevent_retokenization and has_previous_turn_tokens
+        use_offloaded_prefix_stitching = (
             offload_params is not None and last_assistant_message is not None
         )
+        use_prefix_stitching = use_exact_prefix_stitching or use_offloaded_prefix_stitching
 
         # Inject the server-configured chat template (e.g. pretraining.jinja for
         # VLM checkpoints). Loaded once at server startup from --chat-template
@@ -983,7 +1026,7 @@ try:
                         ),
                     )
 
-                if replace_prefix_tokens_here or replace_prefix_tokens_in_engine:
+                if use_prefix_stitching:
                     # Replace the re-rendered prefix with the exact tokens of the previous turn.
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
                     messages_to_last_assistant_message = template_messages[
@@ -992,6 +1035,20 @@ try:
                     previous_media_slots = [
                         slot for slot in media_slots if slot[2] <= last_assistant_message_idx
                     ]
+                    if (
+                        use_exact_prefix_stitching
+                        and not previous_media_slots
+                        and _contains_model_media_token(
+                            last_assistant_message["prompt_token_ids"],
+                            tokenize_chat_tok,
+                            prompt_config,
+                        )
+                    ):
+                        raise ValueError(
+                            "The exact previous prompt contains media tokens, but its image/video "
+                            "payload is missing from message history. Preserve prior media content "
+                            "when using prevent_retokenization."
+                        )
                     eos_token_id = tokenizer.eos_id
                     assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
 
@@ -1033,7 +1090,7 @@ try:
                             )
                         )
 
-                    if replace_prefix_tokens_in_engine:
+                    if use_offloaded_prefix_stitching:
                         # Offloaded tokens are stitched in engine via RequestPromptPreparer.
                         offload_params = _replace_prefix_tokens_metadata(
                             eos_token_id, retokenized_previous_turn_token_ids, offload_params
@@ -1043,22 +1100,16 @@ try:
                             # and compact / pre-expanded suffix from RequestPromptPreparer.
                             # PREFIX_MEDIA_COUNT_FIELD signals multimodal expansion and is
                             # used to figure out how many subsequent media tokens to expand.
-                            offload_params[PREFIX_MEDIA_COUNT_FIELD] = len(
-                                previous_media_slots
-                            )
+                            offload_params[PREFIX_MEDIA_COUNT_FIELD] = len(previous_media_slots)
                     elif previous_media_slots:
                         # Multi-modal post-expansion stitching passes the pre-expanded prefix
                         # and non-expanded suffix to the engine for stitching after expanding
                         # the multimodal tokens in the suffix only.
-                        prompt_tokens = _compact_tokens_after_prefix(
-                            eos_token_id,
-                            retokenized_previous_turn_token_ids,
-                            prompt_tokens,
+                        prompt_tokens = _suffix_tokens_after_prefix(
+                            eos_token_id, retokenized_previous_turn_token_ids, prompt_tokens
                         )
                         offload_params = _expanded_prefix_stitching_metadata(
-                            eos_token_id,
-                            len(previous_media_slots),
-                            last_assistant_message,
+                            eos_token_id, len(previous_media_slots), last_assistant_message
                         )
                     else:
                         # Neither offload nor multimodal. Just stitch here.
