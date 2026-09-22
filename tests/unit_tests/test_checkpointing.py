@@ -605,6 +605,8 @@ def test_load_checkpoint(
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
         num_floating_point_operations_so_far = 456
 
+        # Match the save policy: one shared stream unless DP RNG is rank-specific.
+        torch.manual_seed(rng_config.seed + (torch.distributed.get_rank() if owned_rng else 0))
         expected_cpu_rng = torch.get_rng_state().clone()
         with mock.patch("torch.save", wraps=torch.save) as serialized:
             save_checkpoint(
