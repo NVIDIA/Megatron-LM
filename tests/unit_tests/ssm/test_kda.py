@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import copy
 import os
 from dataclasses import fields
 
@@ -9,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import get_fp8_context, is_float8tensor
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -39,8 +39,9 @@ def _make_config(
     params_dtype: torch.dtype = torch.bfloat16,
     linear_cp_mode: str = "headwise",
     two_stage_gates: bool = False,
+    **overrides,
 ) -> KDALayerConfig:
-    return KDALayerConfig(
+    settings = dict(
         hidden_size=128,
         num_layers=1,
         num_attention_heads=4,
@@ -68,6 +69,8 @@ def _make_config(
         is_hybrid_model=True,
         transformer_impl="transformer_engine",
     )
+    settings.update(overrides)
+    return KDALayerConfig(**settings)
 
 
 def _build_kda(config: KDALayerConfig) -> KimiDeltaAttention:
@@ -186,6 +189,69 @@ def test_kda_packed_matches_unpacked_cp1(two_stage_gates):
 
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("deterministic_mode", [False, True])
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+def test_kda_rejects_packed_convolution_fallback(monkeypatch, deterministic_mode, two_stage_gates):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(321)
+        kda = _build_kda(
+            _make_config(deterministic_mode=deterministic_mode, two_stage_gates=two_stage_gates)
+        )
+        if not deterministic_mode:
+            monkeypatch.setattr("megatron.core.ssm.gated_delta_net.kda.causal_conv1d", None)
+        hidden_states = torch.randn(
+            (32, 1, kda.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=[0, 16, 32])
+        with pytest.raises(ValueError, match="deterministic_mode=False"):
+            kda(hidden_states, None, packed_seq_params=packed_seq_params)
+        output, _ = kda(hidden_states, None)
+        assert torch.isfinite(output).all()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+@pytest.mark.parametrize("disable_fp8", [False, True])
+def test_kda_fp8_parameter_initialization(two_stage_gates, disable_fp8):
+    """KDA exclusions must preserve BF16 weights inside an enclosing FP8 init context."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = _make_config(
+            two_stage_gates=two_stage_gates,
+            linear_num_key_heads=16,
+            linear_num_value_heads=16,
+            fp8="hybrid",
+            fp8_param=True,
+            kda_disable_fp8=disable_fp8,
+            use_cpu_initialization=False,
+        )
+        model_parallel_cuda_manual_seed(321)
+        reference = _build_kda(config)
+        model_parallel_cuda_manual_seed(321)
+        with get_fp8_context(config, is_init=True):
+            layer = _build_kda(config)
+
+        projections = ["in_proj", "out_proj", "beta_proj"]
+        if two_stage_gates:
+            projections += ["f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"]
+        for name in projections:
+            weight = getattr(layer, name).weight
+            assert is_float8tensor(weight) is (not disable_fp8), name
+            if disable_fp8:
+                assert weight.dtype == torch.bfloat16
+                torch.testing.assert_close(weight, getattr(reference, name).weight, atol=0, rtol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 @pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
 @pytest.mark.parametrize("two_stage_gates", [False, True])
 def test_kda_selective_recompute(recompute_module, two_stage_gates):
@@ -203,9 +269,11 @@ def test_kda_selective_recompute(recompute_module, two_stage_gates):
             return output.detach(), hidden_states.grad.detach().clone(), grads
 
         base_config = _make_config(two_stage_gates=two_stage_gates)
-        recompute_config = copy.deepcopy(base_config)
-        recompute_config.recompute_granularity = "selective"
-        recompute_config.recompute_modules = [recompute_module]
+        recompute_config = _make_config(
+            two_stage_gates=two_stage_gates,
+            recompute_granularity="selective",
+            recompute_modules=[recompute_module],
+        )
 
         model_parallel_cuda_manual_seed(42)
         base_kda = _build_kda(base_config)
@@ -366,3 +434,65 @@ def test_kda_layer_config_preserves_settings(explicit_settings):
     assert set(expected) <= {field.name for field in fields(KDALayerConfig)}
     for name, value in expected.items():
         assert getattr(layer_config, name) == value
+
+
+@pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
+@pytest.mark.parametrize("variant", [None, "kda"])
+def test_kda_layer_config_accepts_recompute_modules(recompute_module, variant):
+    config = _make_config(
+        recompute_granularity="selective",
+        recompute_modules=[recompute_module],
+        experimental_attention_variant=variant,
+        is_hybrid_model=False,
+    )
+    assert config.recompute_modules == [recompute_module]
+
+
+def test_kda_layer_config_defaults():
+    config = KDALayerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    assert config.linear_num_key_heads == config.linear_num_value_heads == 16
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"linear_num_value_heads": 8}, "head counts"),
+        ({"linear_value_head_dim": 64}, "head dimensions"),
+    ],
+)
+def test_kda_layer_config_rejects_unequal_heads(overrides, message):
+    with pytest.raises(ValueError, match=f"equal key and value {message}"):
+        _make_config(**overrides)
+
+    # from_config preserves stack values without running __post_init__. They must
+    # still be checked before any layer parameters or process groups are built.
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+    )
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    with pytest.raises(ValueError, match=f"equal key and value {message}"):
+        KimiDeltaAttention(create_layer_config(config, Symbols.KDA), submodules=None)
+
+
+def test_kda_recompute_modules_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="cannot be used together"):
+        _make_config(recompute_granularity="selective", recompute_modules=["gdn", "gdn_norm_out"])
+
+
+@pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])
+def test_gdn_recompute_rejects_non_gdn_models(recompute_module):
+    with pytest.raises(ValueError, match="only supported with GDN-family layers"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            recompute_granularity="selective",
+            recompute_modules=[recompute_module],
+        )
