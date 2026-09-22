@@ -2428,8 +2428,10 @@ class TestMultiTokenPrediction:
         builder_cls = model_cfg.get_builder_cls()
         builder = builder_cls(model_cfg)
         gpt_model = builder.build_distributed_models(
-            pg_collection=pg_collection, wrap_with_ddp=False,
+            pg_collection=pg_collection,
+            wrap_with_ddp=False,
             log_max_attention_logit=False,
+            barrier_with_L1_time=True,
         )
         sharded_state_dict = gpt_model[0].sharded_state_dict()
         for i in range(args.mtp_num_layers):
@@ -2459,7 +2461,8 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider,
+            ModelType.encoder_or_decoder,
+            self.model_provider,
             logger_config=logger_config_from_args(get_args()),
         )
         output_ref = gpt_model_ref[0].forward(
@@ -2508,7 +2511,8 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                ModelType.encoder_or_decoder, self.model_provider,
+                ModelType.encoder_or_decoder,
+                self.model_provider,
                 logger_config=logger_config_from_args(get_args()),
             )
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
@@ -2569,7 +2573,8 @@ class TestMultiTokenPrediction:
         model_parallel_cuda_manual_seed(_SEED)
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider,
+            ModelType.encoder_or_decoder,
+            self.model_provider,
             logger_config=logger_config_from_args(get_args()),
         )
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
@@ -2643,7 +2648,8 @@ class TestMultiTokenPrediction:
             batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider,
+            ModelType.encoder_or_decoder,
+            self.model_provider,
             logger_config=logger_config_from_args(get_args()),
         )
         assert unwrap_model(gpt_model[0]).mtp.config.mtp_hsm
@@ -2692,7 +2698,8 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider,
+            ModelType.encoder_or_decoder,
+            self.model_provider,
             logger_config=logger_config_from_args(get_args()),
         )
 
@@ -3884,8 +3891,10 @@ class TestMultiTokenPredictionHybrid:
         builder_cls = model_cfg.get_builder_cls()
         builder = builder_cls(model_cfg)
         mamba_model = builder.build_distributed_models(
-            pg_collection=pg_collection, wrap_with_ddp=False,
+            pg_collection=pg_collection,
+            wrap_with_ddp=False,
             log_max_attention_logit=False,
+            barrier_with_L1_time=True,
         )
         sharded_state_dict = mamba_model[0].sharded_state_dict()
 
@@ -4021,8 +4030,10 @@ class TestMultiTokenPredictionHybrid:
         try:
             model_parallel_cuda_manual_seed(_SEED)
             mamba_model = builder.build_distributed_models(
-                pg_collection=pg_collection, wrap_with_ddp=False,
+                pg_collection=pg_collection,
+                wrap_with_ddp=False,
                 log_max_attention_logit=False,
+                barrier_with_L1_time=True,
             )
             mamba_model = unwrap_model(mamba_model)
             assert isinstance(mamba_model[0], HybridModel)

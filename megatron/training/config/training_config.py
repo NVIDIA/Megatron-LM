@@ -363,6 +363,9 @@ class LoggerConfig:
     log_energy: bool = False
     """If set, log energy consumption (in Joules)."""
 
+    run_workload_inspector_server: bool = False
+    """Run the optional workload-inspector web server during training."""
+
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 

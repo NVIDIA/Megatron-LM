@@ -230,6 +230,7 @@ class TestGPTModel:
             ddp_config=cfg_container.ddp,
             data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
             log_max_attention_logit=False,
+            barrier_with_L1_time=True,
         )
 
         # Upcycle the dense model to the MoE model
@@ -269,7 +270,8 @@ class TestGPTModel:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, model_provider,
+            ModelType.encoder_or_decoder,
+            model_provider,
             logger_config=logger_config_from_args(get_args()),
         )
         dense_model = unwrap_model(dense_model)
@@ -376,6 +378,7 @@ class TestGPTModel:
             ddp_config=cfg_container.ddp,
             data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
             log_max_attention_logit=False,
+            barrier_with_L1_time=True,
         )
 
         # Upcycle the dense model to the MoE model

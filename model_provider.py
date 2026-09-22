@@ -58,7 +58,8 @@ def model_provider(
         model_builder = modelopt_gpt_hybrid_builder
 
     return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection,
-                         log_max_attention_logit=logger_config.log_max_attention_logit)
+                         log_max_attention_logit=logger_config.log_max_attention_logit,
+                         barrier_with_L1_time=logger_config.barrier_with_L1_time)
 
 
 def count_parameters_in_layer(model, layer_name):

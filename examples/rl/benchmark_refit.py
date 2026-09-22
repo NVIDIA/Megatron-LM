@@ -74,6 +74,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=False,
         config=config,
         pg_collection=pg_collection,
         log_max_attention_logit=logger_config.log_max_attention_logit,
+        barrier_with_L1_time=logger_config.barrier_with_L1_time,
     )
 
 

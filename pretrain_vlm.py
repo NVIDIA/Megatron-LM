@@ -124,6 +124,7 @@ def model_provider(
     else:
         language_transformer_config = config
     language_transformer_config.log_max_attention_logit = logger_config.log_max_attention_logit
+    language_transformer_config.barrier_with_L1_time = logger_config.barrier_with_L1_time
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
     else:

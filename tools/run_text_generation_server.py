@@ -154,7 +154,8 @@ def main(model_type: str = "gpt"):
             from functools import partial
 
             model = get_model(partial(modelopt_gpt_hybrid_builder,
-                                      log_max_attention_logit=logger_config.log_max_attention_logit),
+                                      log_max_attention_logit=logger_config.log_max_attention_logit,
+                                      barrier_with_L1_time=logger_config.barrier_with_L1_time),
                               wrap_with_ddp=False)
         else:
             builder = get_model_builder(args, provider=model_type)
@@ -162,6 +163,7 @@ def main(model_type: str = "gpt"):
             model = builder.build_distributed_models(
                 pg_collection=pg_collection, wrap_with_ddp=False,
                 log_max_attention_logit=logger_config.log_max_attention_logit,
+                barrier_with_L1_time=logger_config.barrier_with_L1_time,
             )
 
     if args.load is not None:

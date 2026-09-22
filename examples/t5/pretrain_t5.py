@@ -94,6 +94,7 @@ def model_provider(
     if config is None:
         config = core_transformer_config_from_args(args)
     config.log_max_attention_logit = logger_config.log_max_attention_logit
+    config.barrier_with_L1_time = logger_config.barrier_with_L1_time
 
     encoder_config = deepcopy(config)
     encoder_config.num_layers = args.encoder_num_layers

@@ -1550,7 +1550,9 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.no_save_rng = True
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0, logger_config=logger_config_from_args(get_args()))
+        save_checkpoint(
+            10, gpt_model, None, None, 0, logger_config=logger_config_from_args(get_args())
+        )
 
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention

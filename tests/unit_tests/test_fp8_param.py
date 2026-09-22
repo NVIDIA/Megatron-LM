@@ -284,8 +284,10 @@ class TestFP8Param:
             builder_cls = model_cfg.get_builder_cls()
             builder = builder_cls(model_cfg)
             gpt_model = builder.build_distributed_models(
-                pg_collection=pg_collection, wrap_with_ddp=False,
+                pg_collection=pg_collection,
+                wrap_with_ddp=False,
                 log_max_attention_logit=False,
+                barrier_with_L1_time=True,
             )
             gpt_model[0].eval()
             optimizer = None
@@ -841,7 +843,14 @@ class TestFP8Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
-            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0, logger_config=logger_config_from_args(get_args()))
+            save_checkpoint(
+                3,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                0,
+                logger_config=logger_config_from_args(get_args()),
+            )
             torch.distributed.barrier()
 
             self.cleanup_between_runs()

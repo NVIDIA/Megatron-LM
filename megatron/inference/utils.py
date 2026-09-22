@@ -88,7 +88,8 @@ def get_model_for_inference(*, logger_config) -> MegatronModule:
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
         # care of running the modelopt-checkpoint auto-detection side effect.
         model = _get_model(partial(modelopt_gpt_hybrid_builder,
-                                  log_max_attention_logit=logger_config.log_max_attention_logit),
+                                  log_max_attention_logit=logger_config.log_max_attention_logit,
+                                  barrier_with_L1_time=logger_config.barrier_with_L1_time),
                            wrap_with_ddp=False)
     else:
         builder = get_model_builder(args)
@@ -96,6 +97,7 @@ def get_model_for_inference(*, logger_config) -> MegatronModule:
         model = builder.build_distributed_models(
             pg_collection=pg_collection, wrap_with_ddp=False,
             log_max_attention_logit=logger_config.log_max_attention_logit,
+            barrier_with_L1_time=logger_config.barrier_with_L1_time,
         )
 
     # Load checkpoint.

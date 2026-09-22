@@ -37,7 +37,10 @@ import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
 
-def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None, *, log_max_attention_logit: bool):
+def _gpt_builder(
+    args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None,
+    *, log_max_attention_logit: bool, barrier_with_L1_time: bool,
+):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
     # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
     if config is None:
@@ -77,6 +80,7 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
             config=config,
             pg_collection=pg_collection,
             log_max_attention_logit=log_max_attention_logit,
+            barrier_with_L1_time=barrier_with_L1_time,
         )
 
 
@@ -392,7 +396,9 @@ if __name__ == "__main__":
 
     def _model_builder(
         args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None,
-        *, log_max_attention_logit: bool,
+        *,
+        log_max_attention_logit: bool,
+        barrier_with_L1_time: bool,
     ):
         if is_hybrid_model(args):
             return hybrid_builder(
@@ -403,6 +409,7 @@ if __name__ == "__main__":
                 config=config,
                 pg_collection=pg_collection,
                 log_max_attention_logit=log_max_attention_logit,
+                barrier_with_L1_time=barrier_with_L1_time,
             )
         else:
             return _gpt_builder(
@@ -413,6 +420,7 @@ if __name__ == "__main__":
                 config=config,
                 pg_collection=pg_collection,
                 log_max_attention_logit=log_max_attention_logit,
+                barrier_with_L1_time=barrier_with_L1_time,
             )
 
     args = parse_and_validate_args(

@@ -95,6 +95,7 @@ def model_provider(
 
     base_config = config or core_transformer_config_from_args(get_args())
     base_config.log_max_attention_logit = logger_config.log_max_attention_logit
+    base_config.barrier_with_L1_time = logger_config.barrier_with_L1_time
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = True

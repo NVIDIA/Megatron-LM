@@ -2886,6 +2886,7 @@ def setup_model_and_optimizer(
 
             return builder.build_distributed_models(
                 log_max_attention_logit=logger_config.log_max_attention_logit,
+                barrier_with_L1_time=logger_config.barrier_with_L1_time,
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
@@ -2968,6 +2969,7 @@ def setup_model_and_optimizer(
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.log_num_zeros_in_grad = logger_config.log_num_zeros_in_grad
+        config.barrier_with_L1_time = logger_config.barrier_with_L1_time
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
@@ -3435,7 +3437,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
-    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    timers('optimizer', log_level=1).start(barrier=logger_config.barrier_with_L1_time)
     _opt_cm = (
         span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
@@ -4570,6 +4572,22 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _start_workload_inspector_server(logger_config):
+    """Start the optional inspector from the current run's logging policy."""
+    if logger_config.run_workload_inspector_server:
+        try:
+            import threading
+
+            from workload_inspector.utils.webserver import run_server
+
+            threading.Thread(
+                target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
+            ).start()
+        except ModuleNotFoundError:
+            print_rank_0("workload inspector module not found.")
+
+
+
 def train(
     forward_step_func,
     model,
@@ -4713,17 +4731,7 @@ def train(
     if args.hybrid_context_parallel:
         train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
-    if args.run_workload_inspector_server:
-        try:
-            import threading
-
-            from workload_inspector.utils.webserver import run_server
-
-            threading.Thread(
-                target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
-            ).start()
-        except ModuleNotFoundError:
-            print_rank_0("workload inspector module not found.")
+    _start_workload_inspector_server(logger_config)
 
     # Write args to tensorboard
     write_args_to_tensorboard(logger_config=logger_config)

@@ -98,7 +98,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     if has_nvidia_modelopt:
 
         model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection,
-                                       log_max_attention_logit=logger_config.log_max_attention_logit)
+                                       log_max_attention_logit=logger_config.log_max_attention_logit,
+                                       barrier_with_L1_time=logger_config.barrier_with_L1_time)
         from megatron.elastification.flextron_utils import (
             inject_flextron_forward_logic,
             setup_flextron_model,
@@ -121,6 +122,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     print_rank_0('building Mamba model ...')
     config = core_transformer_config_from_args(args, TransformerConfig)
     config.log_max_attention_logit = logger_config.log_max_attention_logit
+    config.barrier_with_L1_time = logger_config.barrier_with_L1_time
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 

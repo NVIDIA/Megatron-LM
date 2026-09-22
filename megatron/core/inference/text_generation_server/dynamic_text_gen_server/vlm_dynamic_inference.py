@@ -231,12 +231,16 @@ def get_model(is_vlm: bool, *, logger_config) -> MegatronModule:
     if is_vlm:
         from model import model_provider  # examples/multimodal/model.py
 
-        model = _get_model(partial(model_provider, logger_config=logger_config), wrap_with_ddp=False)
+        model = _get_model(
+            partial(model_provider, logger_config=logger_config), wrap_with_ddp=False
+        )
     else:
         from gpt_builders import gpt_builder  # examples/inference/gpt
         from model_provider import model_provider
 
-        model = _get_model(partial(model_provider, gpt_builder, logger_config=logger_config), wrap_with_ddp=False)
+        model = _get_model(
+            partial(model_provider, gpt_builder, logger_config=logger_config), wrap_with_ddp=False
+        )
 
     assert args.load is not None
     args.exit_on_missing_checkpoint = True

@@ -611,7 +611,9 @@ class TestDistributedOptimizer:
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
 
-                save_checkpoint(10, model, optimizer, None, 0, logger_config=logger_config_from_args(mock_args))
+                save_checkpoint(
+                    10, model, optimizer, None, 0, logger_config=logger_config_from_args(mock_args)
+                )
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(*dest_tp_pp)

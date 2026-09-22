@@ -1571,7 +1571,8 @@ class TestPartialCudaGraph:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider,
+            ModelType.encoder_or_decoder,
+            self.model_provider,
             logger_config=logger_config_from_args(get_args()),
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.

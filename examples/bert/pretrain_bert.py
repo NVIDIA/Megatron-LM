@@ -37,6 +37,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     if config is None:
         config = core_transformer_config_from_args(args)
     config.log_max_attention_logit = logger_config.log_max_attention_logit
+    config.barrier_with_L1_time = logger_config.barrier_with_L1_time
     num_tokentypes = 2 if args.bert_binary_head else 0
 
     if args.spec is None:

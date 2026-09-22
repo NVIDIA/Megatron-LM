@@ -38,6 +38,8 @@ def test_cli_aliases_and_native_config_match():
             'service',
             '--otel-span-groups',
             'checkpoint',
+            '--no-barrier-with-level-1-timing',
+            '--run-workload-inspector-server',
         ]
     )
     config = logger_config_from_args(args)
@@ -51,6 +53,8 @@ def test_cli_aliases_and_native_config_match():
         otel_enabled=True,
         otel_service_name='service',
         otel_span_groups='checkpoint',
+        barrier_with_L1_time=False,
+        run_workload_inspector_server=True,
     )
     assert asdict(config) == asdict(expected)
 
@@ -229,17 +233,22 @@ def test_native_builder_projects_logging_before_construction(monkeypatch, model_
     builder_cls = gpt.GPTModelBuilder if model_kind == 'gpt' else hybrid.HybridModelBuilder
     transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
     transformer.log_max_attention_logit = not enabled
+    transformer.barrier_with_L1_time = not enabled
     config = config_cls(transformer=transformer, vocab_size=128, seq_length=16)
     models = [Mock()]
 
     def build(build_model, transformer_config, *args, **kwargs):
         assert transformer_config.log_max_attention_logit is enabled
+        assert transformer_config.barrier_with_L1_time is enabled
         return models
 
     monkeypatch.setattr(module, 'unimodal_build_distributed_models', build)
     assert (
         builder_cls(config).build_distributed_models(
-            Mock(), wrap_with_ddp=False, log_max_attention_logit=enabled
+            Mock(),
+            wrap_with_ddp=False,
+            log_max_attention_logit=enabled,
+            barrier_with_L1_time=enabled,
         )
         == models
     )
@@ -257,6 +266,7 @@ def test_mimo_projects_logging_before_module_construction(monkeypatch, enabled):
     ]
     for config in configs:
         config.log_max_attention_logit = not enabled
+        config.barrier_with_L1_time = not enabled
     language = ModuleSpec(module=Mock, params={'config': configs[0]})
     encoder = ModuleSpec(
         module=Mock,
@@ -283,11 +293,15 @@ def test_mimo_projects_logging_before_module_construction(monkeypatch, enabled):
 
     def construct(*args, **kwargs):
         assert all(config.log_max_attention_logit is enabled for config in configs)
+        assert all(config.barrier_with_L1_time is enabled for config in configs)
         return model
 
     monkeypatch.setattr(builder, 'MimoModel', construct)
     instance = builder.MimoModelBuilder(builder.MimoBuildConfig(_topology=topology))
-    assert instance.build_model(Mock(), log_max_attention_logit=enabled) is model
+    assert (
+        instance.build_model(Mock(), log_max_attention_logit=enabled, barrier_with_L1_time=enabled)
+        is model
+    )
 
 
 @pytest.mark.parametrize('enabled', [False, True])
@@ -299,6 +313,7 @@ def test_legacy_gpt_logging_preserves_config_factory(monkeypatch, source, enable
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     del args.log_max_attention_logit
+    del args.barrier_with_L1_time
     args.yaml_cfg = 'model.yaml' if source == 'yaml' else None
     config = Namespace(log_max_attention_logit=not enabled)
     from_args = Mock(return_value=config)
@@ -311,6 +326,7 @@ def test_legacy_gpt_logging_preserves_config_factory(monkeypatch, source, enable
     def construct(**kwargs):
         assert kwargs['config'] is config
         assert config.log_max_attention_logit is enabled
+        assert config.barrier_with_L1_time is enabled
         return model
 
     monkeypatch.setattr(gpt_builders, 'GPTModel', construct)
@@ -321,12 +337,14 @@ def test_legacy_gpt_logging_preserves_config_factory(monkeypatch, source, enable
             True,
             config=config if source == 'provided' else None,
             log_max_attention_logit=enabled,
+            barrier_with_L1_time=enabled,
         )
         is model
     )
     assert from_args.call_count == (source == 'args')
     assert from_yaml.call_count == (source == 'yaml')
     assert not hasattr(args, 'log_max_attention_logit')
+    assert not hasattr(args, 'barrier_with_L1_time')
 
 
 @pytest.mark.parametrize('enabled', [False, True])
@@ -339,13 +357,90 @@ def test_teacher_logging_inherits_owned_policy_with_explicit_yaml_override(
     args = Namespace(export_kd_teacher_model_config=None, kv_channels=8)
     if legacy_field == 'stale':
         args.log_max_attention_logit = not enabled
+        args.barrier_with_L1_time = not enabled
     before = vars(args).copy()
     if teacher_override is not None:
         (tmp_path / 'model_config.yaml').write_text(
             f'log_max_attention_logit: {str(teacher_override).lower()}\n'
+            f'barrier_with_L1_time: {str(teacher_override).lower()}\n'
         )
     monkeypatch.setattr(builder, 'get_args', lambda: args)
-    teacher = builder._load_teacher_model_config(str(tmp_path), log_max_attention_logit=enabled)
+    teacher = builder._load_teacher_model_config(
+        str(tmp_path), log_max_attention_logit=enabled, barrier_with_L1_time=enabled
+    )
     expected = enabled if teacher_override is None else teacher_override
     assert teacher.log_max_attention_logit is expected
+    assert teacher.barrier_with_L1_time is expected
     assert vars(args) == before
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_optimizer_receives_owned_logging_settings(monkeypatch, enabled):
+    from megatron.training import training
+
+    args = Namespace(
+        skip_train=False,
+        perform_rl_step=False,
+        logits_save_dir=None,
+        logits_load_dir=None,
+        use_gloo_process_groups=False,
+        dump_param_to_param_group_map=None,
+    )
+    config = Namespace(barrier_with_L1_time=not enabled, log_num_zeros_in_grad=not enabled)
+    monkeypatch.setattr(training, 'get_args', lambda: args)
+    monkeypatch.setattr(training, 'get_timers', Mock())
+    monkeypatch.setattr(training, 'get_one_logger', lambda: None)
+    monkeypatch.setattr(training, 'has_nvidia_modelopt', False)
+    monkeypatch.setattr(training, 'is_gtp_remat_active', lambda args: False)
+    monkeypatch.setattr(training, 'get_model', Mock(return_value=[Mock()]))
+    monkeypatch.setattr(training, 'unwrap_model', lambda model: model)
+    monkeypatch.setattr(training, 'get_megatron_optimizer_config', lambda args: (config, None))
+
+    class ObservedOptimizer(Exception):
+        pass
+
+    def construct(config, model, **kwargs):
+        assert config.barrier_with_L1_time is enabled
+        assert config.log_num_zeros_in_grad is enabled
+        raise ObservedOptimizer
+
+    monkeypatch.setattr(training, 'get_megatron_optimizer', construct)
+    with pytest.raises(ObservedOptimizer):
+        training.setup_model_and_optimizer(
+            Mock(),
+            model_provider_func=Mock(),
+            logger_config=LoggerConfig(barrier_with_L1_time=enabled, log_num_zeros_in_grad=enabled),
+        )
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_workload_inspector_uses_owned_policy(monkeypatch, enabled):
+    import threading
+    from megatron.training import training
+
+    run_server = Mock()
+    thread = Mock()
+    monkeypatch.setitem(
+        sys.modules, 'workload_inspector.utils.webserver', SimpleNamespace(run_server=run_server)
+    )
+    monkeypatch.setattr(threading, 'Thread', thread)
+    monkeypatch.setattr(training.torch.distributed, 'get_rank', lambda: 3)
+    monkeypatch.setattr(
+        training, 'get_args', Mock(side_effect=AssertionError('must not read args'))
+    )
+    training._start_workload_inspector_server(LoggerConfig(run_workload_inspector_server=enabled))
+    if enabled:
+        thread.assert_called_once_with(target=run_server, daemon=True, args=(3,))
+        thread.return_value.start.assert_called_once_with()
+    else:
+        thread.assert_not_called()
+
+
+def test_workload_inspector_remains_optional(monkeypatch):
+    from megatron.training import training
+
+    monkeypatch.setitem(sys.modules, 'workload_inspector.utils.webserver', None)
+    report = Mock()
+    monkeypatch.setattr(training, 'print_rank_0', report)
+    training._start_workload_inspector_server(LoggerConfig(run_workload_inspector_server=True))
+    report.assert_called_once_with('workload inspector module not found.')

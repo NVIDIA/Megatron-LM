@@ -291,7 +291,11 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         args.save = ckpt_dir
         args.load = ckpt_dir
         save_checkpoint(
-            iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
             logger_config=logger_config_from_args(get_args()),
         )
         print(f"save checkpoint done")

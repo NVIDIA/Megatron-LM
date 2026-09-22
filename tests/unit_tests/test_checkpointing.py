@@ -603,7 +603,11 @@ def test_load_checkpoint(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
+            iteration,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
             logger_config=logger_config_from_args(get_args()),
         )
 
@@ -667,7 +671,11 @@ def test_load_checkpoint_override_opt_param_scheduler(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
+            iteration,
+            [model],
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
             logger_config=logger_config_from_args(get_args()),
         )
 
@@ -731,7 +739,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
-            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops, logger_config=logger_config_from_args(get_args()))
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_fp_ops,
+                logger_config=logger_config_from_args(get_args()),
+            )
 
         second_job_mock_metadata = {
             **base_metadata,
@@ -747,7 +762,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             assert optimizer._called_metadata[-1] == first_job_mock_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
-            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops, logger_config=logger_config_from_args(get_args()))
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_fp_ops,
+                logger_config=logger_config_from_args(get_args()),
+            )
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
         assert optimizer._called_metadata == model._called_metadata
