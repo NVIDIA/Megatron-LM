@@ -302,3 +302,43 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
         replays=3,
         what=f"mhc proj_rms_compute_h[{backend}]",
     )
+
+
+def test_native_mhc_dtype_casts_replay_fwd_bwd():
+    """Native mHC reductions and FP32 mapping projections replay bit-exactly."""
+    from megatron.core.transformer.hyper_connection import (
+        native_h_aggregate,
+        native_h_post_bda,
+        native_proj_rms,
+    )
+
+    seeded()
+    s, b, n, c = 128, 2, 4, 128
+    x = _mhc_rand(s, b, n, c)
+    h_pre = _mhc_rand(s, b, n)
+    assert_replays_bit_exact(
+        native_h_aggregate, (x, h_pre), replays=3, what="native mHC h_aggregate"
+    )
+
+    h_res = _mhc_rand(s, b, n, n)
+    original_residual = _mhc_rand(s, b, n, c)
+    h_post = _mhc_rand(s, b, n)
+    x_single = _mhc_rand(s, b, c)
+    bias = _mhc_rand(c)
+    assert_replays_bit_exact(
+        lambda h_res, residual, h_post, x, bias: native_h_post_bda(
+            h_res, residual, h_post, x, bias
+        ),
+        (h_res, original_residual, h_post, x_single, bias),
+        replays=3,
+        what="native mHC h_post_bda",
+    )
+
+    projection_input = _mhc_rand(s * b, n * c, dtype=torch.float32)
+    projection_weight = _mhc_rand(n * n + 2 * n, n * c, dtype=torch.float32)
+    assert_replays_bit_exact(
+        lambda x, weight: native_proj_rms(x, weight, eps_inside_sqrt=True),
+        (projection_input, projection_weight),
+        replays=3,
+        what="native mHC proj_rms",
+    )
