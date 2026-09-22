@@ -95,6 +95,12 @@ uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/ker
   --output /tmp/kernel-leaderboard
 ```
 
+The H100 and GB200 `determinism-kernel-perf.yaml` recipes select this pilot at
+nightly cadence in L1 (and when labels bypass cadence). They use one GPU per
+measurement and upload `leaderboard.json`, `leaderboard.md`, full per-case
+reports, raw samples and logs through the existing assets directory. A cadence
+selects eligible jobs; a scheduled or explicit workflow trigger must still run.
+
 Each arm starts a fresh process with the requested policy before operator imports.
 CUDA events time all GPU work in the operator call. Compilation and warmup are
 excluded; backward also excludes forward/graph construction and upstream-gradient
@@ -124,8 +130,9 @@ uv run --no-sync python tests/performance_tests/shell_test_utils/determinism/ben
 ```
 
 `--tokens`, `--hidden-size`, and `--dtype` select another case configuration.
-Keep H100 and GB200 measurements separate. Set the launch environment
-explicitly for each platform and retain it in the report. Enforcing calibrated
+Keep H100 and GB200 baselines separate. The GB200 recipe uses
+`CUDA_DEVICE_MAX_CONNECTIONS=32`, matching its replay bucket; H100 uses 1.
+Historical baseline bundles are described below. Enforcing calibrated
 changed-kernel budgets remains separate from publishing measurements.
 
 ### Diagnose a timing difference
@@ -387,6 +394,44 @@ own format. Use the explicit collective publication and artifact-consumer paths
 below for this report kind. Reviewed baseline promotion and production-recipe
 performance acceptance remain separate work.
 
+### Run the collective CI producer
+
+The H100 and GB200 nightly `determinism_collective_perf` recipes run the complete
+capture/replay/reference/timing pipeline on one node (eight H100 or four GB200
+ranks). They require the collective capture/replay and early startup dependencies.
+An ordinary PR or merge-group cadence does not select this pilot; the existing
+explicit cadence bypass can select it. The existing workflow stamps the actual
+producer outcome, uploads its logs, and selects the corresponding
+`--collective-platform` CPU consumer. Missing or unsuccessful selected producers
+fail artifact verification; existing activation selection remains independent.
+
+To run the same producer in an allocated, clean source checkout:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/collective_pipeline.py \
+  --output /results/collective-performance --gpus 8
+```
+
+Use `--gpus 4` for the GB200 recipe. Launch the parent outside torchrun. The
+producer launches its own fresh worker groups, preserves every stage log and
+requires a fresh output directory. A failed capture, replay, accuracy check,
+recipe join or timing arm stops the pipeline and retains the incomplete attempt.
+The final CPU verification requires the complete matrix before marking the
+producer complete.
+
+This bounded synthetic workload covers six direct TP/SP mappings in FP32/BF16,
+forward/backward, with explicit rank-local inputs/upstream gradients, nonzero
+offsets and noncontiguous three-dimensional tensors. Pair-sized and world-sized
+groups exercise distinct priority/CTA options, producing 96 events per rank.
+The default three fresh-process policy pairs use 20 warmup and 50 measured
+samples per event. CI measures current-head deterministic/default overhead;
+base/head comparisons remain available through the separate
+`benchmark_collectives.py --base-checkout` entrypoint. No budgets are imposed by
+this pilot, and complete results remain `not_gated`. It does not establish
+production recipe, multi-node, overlap or full-state/restart acceptance. Recipe
+and workflow implementation alone does not establish a successful protected CI
+run.
+
 ### Publish and transport captured collective evidence
 
 Publish a complete capture, its matching replay/accuracy report and timing tree:
@@ -448,3 +493,87 @@ fails verification. The derived bundles retain the source records and unbudgeted
 status. The nightly producer recipes and workflow selection described above
 provide the automatic path. Protected CI acceptance, reviewed performance limits
 and durable baseline promotion remain separate rollout requirements.
+
+## Consume CI artifacts
+
+The shared GitHub test action stamps only the latest kernel replay bucket and
+kernel performance pilot. Their existing log artifacts retain the repository,
+actual checked-out revision, run ID, run attempt, platform, test case and raw
+producer outcome/exit code. Their names include the run and attempt so a rerun
+does not silently consume an earlier attempt. Other log names are unchanged.
+
+When the actual integration matrix selects `determinism_kernel_perf`, the CPU
+`cicd-determinism-baselines` job downloads those current-attempt artifacts into
+separate named directories. For each selected platform it requires exactly one
+successful replay producer and one successful timing producer, checks all source
+identities and the observed GPU, then invokes the baseline publisher above.
+Failed/missing producers, mismatched sources or duplicate uploads cannot pass.
+A lone upload retry is accepted; two available copies remain ambiguous and must
+be investigated instead of selecting the more favorable report. Data from a
+platform whose performance pilot was not selected receive no verification credit.
+The consumer executes the checked-out verifier, never code from log artifacts.
+
+The job retains `report.json`, `report.md` and each successfully verified scoped
+bundle in `determinism-baselines-<run>-a<attempt>`, including diagnostic reports on
+failure. The final CI gate waits for artifact verification. A complete artifact
+check does not turn `not_gated` timing into a performance pass. The consumer needs
+the measured coverage producer from the companion coverage change (#7317);
+registration-only reports cannot substitute for it.
+
+To reproduce the consumer after downloading the original named artifacts:
+
+```bash
+python tests/performance_tests/shell_test_utils/determinism/ci_artifacts.py collect \
+  --artifacts /tmp/determinism-inputs --output /tmp/determinism-candidates \
+  --repository NVIDIA/Megatron-LM --revision <full-source-revision> \
+  --run-id <run-id> --attempt <run-attempt> --platform dgx_h100 --platform dgx_gb200
+```
+
+Pass only platforms selected by that run's actual performance matrix. The output
+directory must be empty and outside the downloaded inputs. A partial rerun that
+does not rerun both required producers cannot reuse older evidence and remains
+unverified. Run both producers in the new attempt to obtain a complete candidate.
+GitHub artifact retention is temporary; durable storage, reviewed promotion and
+calibrated performance budgets remain separate responsibilities. CPU transport
+tests do not establish successful protected CI execution or GPU acceptance.
+
+CPU tests:
+
+```bash
+PYTHONPATH=. python -m pytest --confcutdir=tests/unit_tests/determinism_reporting \
+  tests/unit_tests/determinism_reporting/test_paired_performance.py
+```
+
+### CI rollout and retry behavior
+
+Land this PR after #7419, #7317, and #7260. The operator pilots intentionally fail
+on missing or incompatible evidence, including on label-triggered runs. Ordinary
+unlabelled PR cadence does not select the operator pilots. The training benchmark
+wrapper uses `--report-only` until per-recipe budgets are calibrated: confidence
+intervals and limit violations remain in the report, while malformed measurements
+and missing provenance still fail. Three pairs have an empirical interval bounded
+by the minimum and maximum observed ratios; use more pairs for calibration.
+
+Each training/kernel attempt has a separate output directory. A byte-identical
+GitHub upload retry with the same producer ID is deduplicated with both receipts;
+different contents or independent producers remain ambiguous and cannot pass.
+Coverage stamps select the dev environment. Stamping failures do not fail ordinary
+unit jobs, but a selected pilot's consumer still requires the artifact.
+
+Full reporting tests require CPU PyTorch and run with:
+
+```bash
+python -m pytest --confcutdir=tests/unit_tests/determinism_reporting tests/unit_tests/determinism_reporting
+```
+
+Runtime/driver/SKU matching stays strict so timing is joined to evidence from the
+same configuration. Heterogeneous nodes need their own coverage producers.
+
+The kernel pilot receives a 150-minute action timeout inside a 180-minute job
+budget; other integration jobs keep their existing limits. Actual calibration
+wall time still needs current CI measurement.
+
+Replay reports distinguish requested side-stream contention from effective
+contention. With `CUDA_DEVICE_MAX_CONNECTIONS=1`, the serialized replay remains
+eligible only for that same runtime policy and is not evidence of concurrent
+stream stress.
