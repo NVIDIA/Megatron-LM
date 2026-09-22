@@ -36,6 +36,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
@@ -46,6 +47,10 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.residual_recompute import (
+    build_residual_stream_recompute_plan,
+    residual_stream_recompute_enabled,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -632,6 +637,17 @@ class HybridStack(MegatronModule):
             and "mhc" in self.config.recompute_modules
         )
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
+        use_residual_stream_recompute = (
+            self.uses_wide_residual_stream
+            and residual_stream_recompute_enabled(self.config, self.training)
+        )
+        residual_stream_recompute_plan = (
+            build_residual_stream_recompute_plan(
+                len(self.layers), self.config.residual_stream_recompute_num_layers
+            )
+            if use_residual_stream_recompute
+            else [None] * len(self.layers)
+        )
 
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
@@ -660,6 +676,7 @@ class HybridStack(MegatronModule):
                     )
                 ):
                     layer_packed_seq_params = packed_seq_params
+                    residual_stream_recompute_context = residual_stream_recompute_plan[layer_idx]
                     mhc_manager = mhc_layer_managers[layer_idx]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
@@ -671,6 +688,10 @@ class HybridStack(MegatronModule):
                     )
 
                     if isinstance(layer, ShortcutMoEBlock):
+                        if residual_stream_recompute_context is not None:
+                            raise TypeError(
+                                "Residual-stream recomputation does not support ShortcutMoEBlock."
+                            )
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -707,6 +728,15 @@ class HybridStack(MegatronModule):
                                 )
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                                if residual_stream_recompute_context is not None:
+                                    if isinstance(layer, HyperConnectionHybridLayer):
+                                        raise TypeError(
+                                            "Residual-stream recomputation does not support "
+                                            "HyperConnectionHybridLayer."
+                                        )
+                                    layer_kwargs["residual_stream_recompute_context"] = (
+                                        residual_stream_recompute_context
+                                    )
                                 if mhc_manager is not None and isinstance(
                                     layer, HyperConnectionHybridLayer
                                 ):
@@ -714,15 +744,26 @@ class HybridStack(MegatronModule):
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = input_ids
                                 hidden_states, _ = layer(**layer_kwargs)
-                            elif layer_cp_metadata is not None:
-                                hidden_states = layer(
+                            elif isinstance(layer, MambaLayer):
+                                layer_kwargs = dict(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
-                                    packed_sequence_cp_metadata=layer_cp_metadata,
                                 )
-                            else:  # MambaLayer, Expert, or MLP
+                                if layer_cp_metadata is not None:
+                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                                if residual_stream_recompute_context is not None:
+                                    layer_kwargs["residual_stream_recompute_context"] = (
+                                        residual_stream_recompute_context
+                                    )
+                                hidden_states = layer(**layer_kwargs)
+                            else:  # Expert or MLP
+                                if residual_stream_recompute_context is not None:
+                                    raise TypeError(
+                                        "Residual-stream recomputation in HybridStack supports "
+                                        "TransformerLayer and MambaLayer modules only."
+                                    )
                                 hidden_states = layer(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
@@ -738,6 +779,8 @@ class HybridStack(MegatronModule):
                                 physical_layer_idx, hidden_states
                             )
 
+                    if residual_stream_recompute_context is not None:
+                        residual_stream_recompute_context.finalize(hidden_states)
                     self._finalize_mhc_recompute_layer(
                         manager=mhc_manager,
                         hidden_states=hidden_states,
