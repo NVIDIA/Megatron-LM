@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Frost BF16 local experts with discrete parameters and MCore main gradients.
+"""cuDNN BF16 local experts with discrete parameters and MCore main gradients.
 
 Each outstanding autograd call owns its intermediates. Execution uses one CUDA
 stream; returned tensors never alias reusable workspace. Activation storage is
@@ -23,7 +23,7 @@ from torch.autograd.function import once_differentiable
 
 
 @triton.jit
-def _frost_offsets(COUNTS, OFFSETS, PADDED, E: tl.constexpr, BE: tl.constexpr):
+def _cudnn_offsets(COUNTS, OFFSETS, PADDED, E: tl.constexpr, BE: tl.constexpr):
     expert = tl.arange(0, BE)
     count = tl.load(COUNTS + expert, expert < E, other=0).to(tl.int32)
     tl.store(OFFSETS + expert, tl.cumsum(count), expert < E)
@@ -31,7 +31,7 @@ def _frost_offsets(COUNTS, OFFSETS, PADDED, E: tl.constexpr, BE: tl.constexpr):
 
 
 @triton.jit
-def _frost_maps(OFF, PAD, FORWARD, INVERSE, CAP: tl.constexpr, E: tl.constexpr, BE: tl.constexpr):
+def _cudnn_maps(OFF, PAD, FORWARD, INVERSE, CAP: tl.constexpr, E: tl.constexpr, BE: tl.constexpr):
     rows = tl.program_id(0) * 128 + tl.arange(0, 128)
     experts = tl.arange(0, BE)
     ends = tl.load(PAD + experts, experts < E, other=2147483647)
@@ -47,7 +47,7 @@ def _frost_maps(OFF, PAD, FORWARD, INVERSE, CAP: tl.constexpr, E: tl.constexpr, 
 
 
 @triton.jit
-def _frost_pack_forward(X, P, MAP, PX, PP, CAP: tl.constexpr, H: tl.constexpr):
+def _cudnn_pack_forward(X, P, MAP, PX, PP, CAP: tl.constexpr, H: tl.constexpr):
     index = tl.program_id(0) * 2048 + tl.arange(0, 2048)
     row, col = index // H, index % H
     source = tl.load(MAP + row, row < CAP, other=-1)
@@ -58,7 +58,7 @@ def _frost_pack_forward(X, P, MAP, PX, PP, CAP: tl.constexpr, H: tl.constexpr):
 
 
 @triton.jit
-def _frost_pack_backward(DY, MAP, PDY, CAP: tl.constexpr, H: tl.constexpr):
+def _cudnn_pack_backward(DY, MAP, PDY, CAP: tl.constexpr, H: tl.constexpr):
     index = tl.program_id(0) * 2048 + tl.arange(0, 2048)
     row, col = index // H, index % H
     source = tl.load(MAP + row, row < CAP, other=-1)
@@ -67,7 +67,7 @@ def _frost_pack_backward(DY, MAP, PDY, CAP: tl.constexpr, H: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["R"])
-def _frost_unpack_forward(PY, MAP, Y, R, H: tl.constexpr):
+def _cudnn_unpack_forward(PY, MAP, Y, R, H: tl.constexpr):
     index = tl.program_id(0) * 2048 + tl.arange(0, 2048)
     row, col = index // H, index % H
     source = tl.load(MAP + row, row < R, other=0)
@@ -75,7 +75,7 @@ def _frost_unpack_forward(PY, MAP, Y, R, H: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["R"])
-def _frost_unpack_backward(PDX, PDP, MAP, DX, DP, R, H: tl.constexpr):
+def _cudnn_unpack_backward(PDX, PDP, MAP, DX, DP, R, H: tl.constexpr):
     index = tl.program_id(0) * 2048 + tl.arange(0, 2048)
     row, col = index // H, index % H
     source = tl.load(MAP + row, row < R, other=0)
@@ -255,8 +255,8 @@ class _ExpertContext:
         if rows == 0:
             return torch.empty_like(x)
         self._allocate("x", "c", "a", "y")
-        _frost_offsets[(1,)](counts, self.offsets, self.padded, e, triton.next_power_of_2(e))
-        _frost_maps[(triton.cdiv(cap, 128),)](
+        _cudnn_offsets[(1,)](counts, self.offsets, self.padded, e, triton.next_power_of_2(e))
+        _cudnn_maps[(triton.cdiv(cap, 128),)](
             self.offsets,
             self.padded,
             self.forward_map,
@@ -265,7 +265,7 @@ class _ExpertContext:
             e,
             triton.next_power_of_2(e),
         )
-        _frost_pack_forward[(triton.cdiv(cap * h, 2048),)](
+        _cudnn_pack_forward[(triton.cdiv(cap * h, 2048),)](
             x, p, self.forward_map, self.x, self.p, cap, h
         )
         v = self.views
@@ -292,7 +292,7 @@ class _ExpertContext:
         )
         y = torch.empty_like(x)
         if rows:
-            _frost_unpack_forward[(triton.cdiv(rows * h, 2048),)](
+            _cudnn_unpack_forward[(triton.cdiv(rows * h, 2048),)](
                 self.y, self.inverse_map, y, rows, h
             )
         self._free("a", "y")
@@ -305,7 +305,7 @@ class _ExpertContext:
             return torch.empty_like(dy), torch.empty(p_shape, device=dy.device, dtype=torch.float32)
         self._allocate("a", "dy", "dx", "dc")
         cap = self.capacity
-        _frost_pack_backward[(triton.cdiv(cap * h, 2048),)](dy, self.forward_map, self.dy, cap, h)
+        _cudnn_pack_backward[(triton.cdiv(cap * h, 2048),)](dy, self.forward_map, self.dy, cap, h)
         self.dp.zero_()
         v = self.views
         self.dglu.execute(
@@ -354,13 +354,13 @@ class _ExpertContext:
         dx = torch.empty_like(dy)
         dp = torch.empty(p_shape, device=dy.device, dtype=torch.float32)
         if rows:
-            _frost_unpack_backward[(triton.cdiv(rows * h, 2048),)](
+            _cudnn_unpack_backward[(triton.cdiv(rows * h, 2048),)](
                 self.dx, self.dp, self.inverse_map, dx, dp, rows, h
             )
         return dx, dp
 
 
-class _FrostExpertsFunction(torch.autograd.Function):
+class _CudnnExpertsFunction(torch.autograd.Function):
     """Bind one invocation to its parameter storage and DDP main-gradient buffers."""
 
     @staticmethod
@@ -391,7 +391,7 @@ class _FrostExpertsFunction(torch.autograd.Function):
 
         if ctx.used:
             raise RuntimeError(
-                "Frost experts require one backward per forward; "
+                "cuDNN experts require one backward per forward; "
                 "retained-graph replay is unsupported"
             )
         ctx.used = True
@@ -400,13 +400,13 @@ class _FrostExpertsFunction(torch.autograd.Function):
             x, p, *_ = ctx.saved_tensors
             if ctx.owner.signature(ctx.weights, backward=True) != ctx.signature:
                 raise RuntimeError(
-                    "Frost expert parameter or main_grad storage changed before backward"
+                    "cuDNN expert parameter or main_grad storage changed before backward"
                 )
             if (
                 torch.cuda.current_stream(x.device).cuda_stream
                 != ctx.owner.context_streams[id(ctx.plan)]
             ):
-                raise RuntimeError("Frost expert backward must use its forward CUDA stream")
+                raise RuntimeError("cuDNN expert backward must use its forward CUDA stream")
             dx, dp = ctx.plan.backward(ctx.owner, dy.contiguous(), ctx.bindings, p.shape)
             dummy = get_dummy_wgrads_for_params(list(ctx.weights))
             ctx.owner.backward_calls += 1
@@ -417,8 +417,8 @@ class _FrostExpertsFunction(torch.autograd.Function):
             ctx.plan = None
 
 
-class FrostBf16Experts(torch.nn.Module):
-    """Frost local expert execution over MCore's existing discrete parameters.
+class CudnnBf16Experts(torch.nn.Module):
+    """cuDNN local expert execution over MCore's existing discrete parameters.
 
     Args:
         experts: Number of local experts.
@@ -436,7 +436,7 @@ class FrostBf16Experts(torch.nn.Module):
             or not math.isfinite(clamp)
             or clamp <= 0
         ):
-            raise ValueError("Frost expert dimensions and clamp must be positive")
+            raise ValueError("cuDNN expert dimensions and clamp must be positive")
         self.experts, self.hidden, self.intermediate, self.clamp = (
             experts,
             hidden,
@@ -470,7 +470,7 @@ class FrostBf16Experts(torch.nn.Module):
                 or not weight.is_cuda
                 or not weight.is_contiguous()
             ):
-                raise ValueError("Frost requires contiguous discrete BF16 expert weights")
+                raise ValueError("cuDNN requires contiguous discrete BF16 expert weights")
             grad = getattr(weight, "main_grad", None) if backward else None
             if backward and (
                 not weight.requires_grad
@@ -482,7 +482,7 @@ class FrostBf16Experts(torch.nn.Module):
                 or not hasattr(weight, "grad_added_to_main_grad")
             ):
                 raise ValueError(
-                    "Frost training requires trainable parameters with MCore FP32 main_grad "
+                    "cuDNN training requires trainable parameters with MCore FP32 main_grad "
                     "and DDP hooks"
                 )
             signature.append(
@@ -496,7 +496,7 @@ class FrostBf16Experts(torch.nn.Module):
         """Bind current pointers and reserve a context for one autograd invocation."""
         signature = self.signature(weights, backward=backward)
         if any(entry[2] != x.device for entry in signature):
-            raise ValueError("Frost inputs and expert parameters must be on the same CUDA device")
+            raise ValueError("cuDNN inputs and expert parameters must be on the same CUDA device")
         if self.pointer_cache is None or self.pointer_cache[0] != signature:
             e = self.experts
             ptrs = [
@@ -564,22 +564,22 @@ class FrostBf16Experts(torch.nn.Module):
             or x.shape[1] != self.hidden
             or not x.is_contiguous()
         ):
-            raise ValueError("Frost requires contiguous CUDA BF16 [rows, hidden] inputs")
+            raise ValueError("cuDNN requires contiguous CUDA BF16 [rows, hidden] inputs")
         if torch.cuda.get_device_capability(x.device) != (10, 0):
-            raise ValueError("Frost BF16 experts currently require SM100")
+            raise ValueError("cuDNN BF16 experts currently require SM100")
         if x.device.index != torch.cuda.current_device():
-            raise ValueError("Frost inputs must be on the current CUDA device")
+            raise ValueError("cuDNN inputs must be on the current CUDA device")
         stream = (x.device, torch.cuda.current_stream(x.device).cuda_stream)
         if self.execution_stream is not None and stream != self.execution_stream:
-            raise RuntimeError("Frost BF16 experts currently require one execution CUDA stream")
+            raise RuntimeError("cuDNN BF16 experts currently require one execution CUDA stream")
         self.execution_stream = stream
         if torch.are_deterministic_algorithms_enabled():
             raise ValueError(
-                "Frost expert wgrad uses atomic accumulation; " "deterministic mode is unsupported"
+                "cuDNN expert wgrad uses atomic accumulation; " "deterministic mode is unsupported"
             )
         if torch.cuda.is_current_stream_capturing() or torch.is_autocast_enabled():
             raise ValueError(
-                "Frost BF16 experts currently require eager execution without autocast"
+                "cuDNN BF16 experts currently require eager execution without autocast"
             )
         if (
             counts.device != x.device
@@ -587,23 +587,23 @@ class FrostBf16Experts(torch.nn.Module):
             or counts.shape != (self.experts,)
             or not counts.is_contiguous()
         ):
-            raise ValueError("Frost requires contiguous CUDA integer counts, one per local expert")
+            raise ValueError("cuDNN requires contiguous CUDA integer counts, one per local expert")
         if (
             p.device != x.device
             or p.dtype != torch.float32
             or p.numel() != x.shape[0]
             or not p.is_contiguous()
         ):
-            raise ValueError("Frost requires one contiguous FP32 probability per input row")
+            raise ValueError("cuDNN requires one contiguous FP32 probability per input row")
         if len(weights) != 2 * self.experts:
-            raise ValueError("Frost requires FC1 weights followed by FC2 weights for every expert")
-        torch._assert_async((counts >= 0).all(), "Frost expert counts must be nonnegative")
+            raise ValueError("cuDNN requires FC1 weights followed by FC2 weights for every expert")
+        torch._assert_async((counts >= 0).all(), "cuDNN expert counts must be nonnegative")
         torch._assert_async(
-            counts.sum() == x.shape[0], "Frost expert counts must sum to the input row count"
+            counts.sum() == x.shape[0], "cuDNN expert counts must sum to the input row count"
         )
         need_backward = torch.is_grad_enabled() and any(t.requires_grad for t in (x, p, *weights))
         if need_backward:
-            return _FrostExpertsFunction.apply(x, counts, p, self, *weights)
+            return _CudnnExpertsFunction.apply(x, counts, p, self, *weights)
         plan, bindings, _ = self.acquire(x, weights, backward=False)
         try:
             y = plan.forward(self, x, counts, p, bindings)

@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 import transformer_engine
 
-from tests.unit_tests.fusions.test_frost_bf16_module import (
+from tests.unit_tests.fusions.test_cudnn_bf16_module import (
     _assert_error,
     _canonical,
     _interleave,
@@ -31,7 +31,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def main() -> None:
-    """Compare Frost with a selected native TE route at the expert-module boundary."""
+    """Compare cuDNN with a selected native TE route at the expert-module boundary."""
     import cudnn
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -59,7 +59,7 @@ def main() -> None:
             (type(v) is int and v >= 0 for v in count_fixture['counts'])
         )
         rows = sum(count_fixture['counts'])
-    adapter_file = __import__("megatron.core.fusions.frost_bf16_experts", fromlist=[""]).__file__
+    adapter_file = __import__("megatron.core.fusions.cudnn_bf16_experts", fromlist=[""]).__file__
     assert adapter_file is not None
     result = dict(
         status='running',
@@ -106,11 +106,11 @@ def main() -> None:
     save()
     try:
         arms = {
-            b: _make_arm(b, experts, hidden, intermediate) for b in ['transformer_engine', 'frost']
+            b: _make_arm(b, experts, hidden, intermediate) for b in ['transformer_engine', 'cudnn']
         }
-        native, frost = (arms['transformer_engine'][0], arms['frost'][0])
+        native, cudnn_experts = (arms['transformer_engine'][0], arms['cudnn'][0])
         with torch.no_grad():
-            for (n, s), (_, d) in zip(native.named_parameters(), frost.named_parameters()):
+            for (n, s), (_, d) in zip(native.named_parameters(), cudnn_experts.named_parameters()):
                 d.copy_(_interleave(s) if n.startswith('linear_fc1') else s)
         counts0 = (
             torch.tensor(count_fixture['counts'], device='cuda', dtype=torch.int64)
@@ -130,7 +130,7 @@ def main() -> None:
         result['stage'] = 'correctness'
         save()
         ref = _run(native, arms['transformer_engine'][1], xs, counts, ps, dys, False)
-        out = _run(frost, arms['frost'][1], xs, counts, ps, dys, False)
+        out = _run(cudnn_experts, arms['cudnn'][1], xs, counts, ps, dys, False)
         for j, (actual, expected) in enumerate(zip(out[0], ref[0])):
             for k, (x, y) in enumerate(zip(actual, expected)):
                 check(f"mb{j}.{['y', 'dx', 'dp'][k]}", x, y, 0.01 if k == 0 else 0.03)
@@ -200,7 +200,7 @@ def main() -> None:
                     if e.device_time_total > 0
                 ]
                 prof.export_chrome_trace(args.output + '.' + backend + '.trace.json')
-        owner = frost._frost_bf16_ops[0]
+        owner = cudnn_experts._cudnn_bf16_ops[0]
         result['route'] = {
             key: getattr(owner, key)
             for key in ['forward_calls', 'backward_calls', 'max_inflight', 'created_contexts']
@@ -209,7 +209,7 @@ def main() -> None:
             b: statistics.median((r[b]['wall_ms'] for r in result['timing'])) for b in arms
         }
         result['latency_reduction'] = (
-            1 - result['median_wall_ms']['frost'] / result['median_wall_ms']['transformer_engine']
+            1 - result['median_wall_ms']['cudnn'] / result['median_wall_ms']['transformer_engine']
         )
         result['status'] = 'passed'
         save()

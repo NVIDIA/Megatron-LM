@@ -1,7 +1,7 @@
-# Experimental Frost BF16 experts for DSv4.1
+# Experimental cuDNN BF16 experts for DSv4.1
 
 This prototype selects cuDNN Frontend grouped GEMMs inside the existing
-`TEGroupedMLP` module with `moe_bf16_expert_backend="frost"`. The default remains
+`TEGroupedMLP` module with `moe_bf16_expert_backend="cudnn"`. The default remains
 `transformer_engine`. This is a local-expert integration, not a complete DSv4.1
 model recipe or a claim of full-model training acceleration.
 
@@ -42,7 +42,7 @@ This is a validation snapshot, not a released cuDNN Frontend version. Build its
 Python package using the normal Frontend installation instructions, and verify
 `cudnn.__file__` resolves to that build before testing this backend.
 
-The module test compares the real TE module and DDP against Frost for outputs,
+The module test compares the real TE module and DDP against cuDNN for outputs,
 input/probability gradients, and accumulated FP32 parameter gradients. It also
 covers changing routing, empty experts, multiple outstanding microbatches, and
 host/device counts. Separate tests cover checkpoint layout and deterministic
@@ -52,10 +52,10 @@ cases and 236 registry checks. The 300 checks are not 300 numerical workloads.
 
 ```bash
 torchrun --nproc-per-node=1 -m pytest \
-  tests/unit_tests/fusions/test_frost_bf16_experts.py \
-  tests/unit_tests/fusions/test_frost_bf16_checkpoint.py \
-  tests/unit_tests/fusions/test_frost_bf16_module.py \
-  tests/unit_tests/determinism/kernels/test_frost_bf16_experts.py
+  tests/unit_tests/fusions/test_cudnn_bf16_experts.py \
+  tests/unit_tests/fusions/test_cudnn_bf16_checkpoint.py \
+  tests/unit_tests/fusions/test_cudnn_bf16_module.py \
+  tests/unit_tests/determinism/kernels/test_cudnn_bf16_experts.py
 ```
 
 ## Reproduce module performance
@@ -64,10 +64,10 @@ From this repository root, using the required Frontend build and a B200:
 
 ```bash
 torchrun --nnodes=1 --nproc-per-node=1 --master-addr=127.0.0.1 --master-port=29589 \
-  tests/performance_tests/frost_bf16_experts.py \
+  tests/performance_tests/cudnn_bf16_experts.py \
   --baseline auto --microbatches 32 --pairs 12 --profile \
   --counts-file tests/performance_tests/fixtures/dsv41_expert_counts.json \
-  --output frost-source-counts.json
+  --output cudnn-source-counts.json
 ```
 
 Repeat in a fresh process with a different output name. Run with `--baseline
@@ -88,16 +88,16 @@ microbatches with real DDP FP32 gradient accumulation.
 A B200 (148 SMs), PyTorch 2.14 development build, TE 2.18, cuDNN 9.28 and CuTe
 DSL 4.7 measured the following medians over 12 paired samples per process:
 
-| Count bank | Native TE GroupedTensor (ms) | Frost (ms) | Latency reduction |
+| Count bank | Native TE GroupedTensor (ms) | cuDNN (ms) | Latency reduction |
 | --- | ---: | ---: | ---: |
 | Source-derived, 24,587 rows | 254.243 | 233.848 | 8.02% |
 | Independent process repeat | 255.732 | 236.319 | 7.59% |
 | Balanced, 24,576 rows | 241.846 | 210.911 | 12.79% |
 
-Frost won 12/12 pairs in each run. The separately measured TE legacy route was
-slower (260.380 ms versus Frost 236.235 ms for source-derived counts). Profiling
+cuDNN won 12/12 pairs in each run. The separately measured TE legacy route was
+slower (260.380 ms versus cuDNN 236.235 ms for source-derived counts). Profiling
 confirmed the GroupedTensor baseline's native `ptrGroup` GEMMs and the expected
-Frost GEMM/dGLU/wgrad kernels. This is a world-size-1, post-dispatch local-expert
+cuDNN GEMM/dGLU/wgrad kernels. This is a world-size-1, post-dispatch local-expert
 module measurement. Router, EP communication, shared experts, optimizer and
 other layers are excluded. It does not establish full-model speedup, distributed
 training correctness or convergence, and is not a performance guarantee for

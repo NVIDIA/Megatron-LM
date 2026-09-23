@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Actual TEGroupedMLP/DDP training parity for the optional Frost expert backend."""
+"""Actual TEGroupedMLP/DDP training parity for the optional cuDNN expert backend."""
 
 from contextlib import nullcontext
 
@@ -15,12 +15,12 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
-from tests.unit_tests.fusions.test_frost_bf16_experts import _config
+from tests.unit_tests.fusions.test_cudnn_bf16_experts import _config
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
-    reason="Frost BF16 expert kernels require SM100",
+    reason="cuDNN BF16 expert kernels require SM100",
 )
 
 
@@ -58,7 +58,7 @@ def _make_arm(backend: str, experts: int = 2, hidden: int = 256, intermediate: i
         moe_ffn_hidden_size=intermediate,
         num_attention_heads=4,
         moe_bf16_expert_backend=backend,
-        moe_mlp_glu_interleave_size=32 if backend == "frost" else None,
+        moe_mlp_glu_interleave_size=32 if backend == "cudnn" else None,
         bias_activation_fusion=True,
     )
     groups = ProcessGroupCollection.use_mpu_process_groups()
@@ -118,10 +118,10 @@ def test_actual_grouped_mlp_accumulation(monkeypatch, inflight, host_counts):
     try:
         torch.manual_seed(4122)
         native, native_ddp = _make_arm("transformer_engine")
-        frost, frost_ddp = _make_arm("frost")
+        cudnn_experts, cudnn_ddp = _make_arm("cudnn")
         with torch.no_grad():
             for (name, source), (_, target) in zip(
-                native.named_parameters(), frost.named_parameters()
+                native.named_parameters(), cudnn_experts.named_parameters()
             ):
                 target.copy_(_interleave(source) if name.startswith("linear_fc1") else source)
         counts = [
@@ -135,7 +135,7 @@ def test_actual_grouped_mlp_accumulation(monkeypatch, inflight, host_counts):
             probs = [torch.rand(386, device="cuda", dtype=torch.float32) for _ in counts]
             upstream = [torch.randn_like(x) / 128 for x in inputs]
             reference = _run(native, native_ddp, inputs, counts, probs, upstream, inflight)
-            actual = _run(frost, frost_ddp, inputs, counts, probs, upstream, inflight)
+            actual = _run(cudnn_experts, cudnn_ddp, inputs, counts, probs, upstream, inflight)
             for values, expected in zip(actual[0], reference[0]):
                 for index, (a, b) in enumerate(zip(values, expected)):
                     _assert_error(a, b, 0.01 if index == 0 else 0.03)
@@ -144,7 +144,7 @@ def test_actual_grouped_mlp_accumulation(monkeypatch, inflight, host_counts):
                 _assert_error(
                     _canonical(value) if name.startswith("linear_fc1") else value, expected, 0.03
                 )
-        owner = frost._frost_bf16_ops[0]
+        owner = cudnn_experts._cudnn_bf16_ops[0]
         assert owner.forward_calls == owner.backward_calls == 4
         assert owner.max_inflight == (2 if inflight else 1)
         assert len(owner.compiled_plans) == 6

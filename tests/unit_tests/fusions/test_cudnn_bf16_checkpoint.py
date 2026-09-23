@@ -13,7 +13,7 @@ from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 @pytest.mark.parametrize("singleton", [False, True])
 @pytest.mark.parametrize("shape", [(256,), (256, 64)])
 @pytest.mark.parametrize("optimizer_state", [False, True])
-def test_frost_glu_checkpoint_layout(interleave, singleton, shape, optimizer_state):
+def test_cudnn_glu_checkpoint_layout(interleave, singleton, shape, optimizer_state):
     """Canonical checkpoint values/offsets and inverse local layout, including FP32 states."""
     canonical = torch.arange(torch.tensor(shape).prod().item(), device="cuda").float()
     canonical = (canonical / 1003).reshape(shape)
@@ -63,7 +63,7 @@ def test_frost_glu_checkpoint_layout(interleave, singleton, shape, optimizer_sta
 
 
 @pytest.mark.parametrize("interleave", [0, -1, 3, True, 1.5])
-def test_frost_glu_checkpoint_invalid_block(interleave):
+def test_cudnn_glu_checkpoint_invalid_block(interleave):
     sharded = ShardedTensor.from_rank_offsets("weight", torch.empty(256, 64, device="cuda"))
     with pytest.raises(ValueError, match="interleave size"):
         apply_swiglu_sharded_factory(sharded, (), glu_interleave_size=interleave)

@@ -936,8 +936,8 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
 
-    moe_bf16_expert_backend: Literal["transformer_engine", "frost"] = "transformer_engine"
-    """Local BF16 expert implementation. ``frost`` opts into cuDNN Frontend on SM100.
+    moe_bf16_expert_backend: Literal["transformer_engine", "cudnn"] = "transformer_engine"
+    """Local BF16 expert implementation. ``cudnn`` opts into cuDNN Frontend on SM100.
 
     Requires discrete interleave32 clamped SwiGLU parameters, eager execution,
     expert TP1 and FP32 main-gradient accumulation. Quantized training, FSDP,
@@ -1640,18 +1640,18 @@ class TransformerConfig(ModelParallelConfig):
                 "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
             )
 
-        if self.moe_bf16_expert_backend not in ("transformer_engine", "frost"):
-            raise ValueError("moe_bf16_expert_backend must be 'transformer_engine' or 'frost'.")
-        if self.moe_bf16_expert_backend == "frost":
+        if self.moe_bf16_expert_backend not in ("transformer_engine", "cudnn"):
+            raise ValueError("moe_bf16_expert_backend must be 'transformer_engine' or 'cudnn'.")
+        if self.moe_bf16_expert_backend == "cudnn":
             if not (self.moe_grouped_gemm and self.bf16 and self.params_dtype == torch.bfloat16):
-                raise ValueError("Frost BF16 experts require grouped GEMM and BF16 parameters.")
+                raise ValueError("cuDNN BF16 experts require grouped GEMM and BF16 parameters.")
             if self.fp8 or self.fp4 or self.quant_recipe is not None:
-                raise ValueError("Frost BF16 experts do not support quantization.")
+                raise ValueError("cuDNN BF16 experts do not support quantization.")
             if self.use_transformer_engine_op_fuser or self.moe_use_grouped_tensor:
-                raise ValueError("Frost BF16 experts require the discrete parameter module path.")
+                raise ValueError("cuDNN BF16 experts require the discrete parameter module path.")
             if self.moe_single_grouped_weight or self.add_bias_linear or self.moe_latent_size:
                 raise ValueError(
-                    "Frost BF16 experts require discrete weights without bias or latent projection."
+                    "cuDNN BF16 experts require discrete weights without bias or latent projection."
                 )
             if not (
                 self.gated_linear_unit
@@ -1666,12 +1666,12 @@ class TransformerConfig(ModelParallelConfig):
                 and not self.use_te_activation_func
             ):
                 raise ValueError(
-                    "Frost BF16 experts require interleave32 clamped SwiGLU "
+                    "cuDNN BF16 experts require interleave32 clamped SwiGLU "
                     "with zero linear offset."
                 )
             if not self.gradient_accumulation_fusion or self.cuda_graph_impl != "none":
                 raise ValueError(
-                    "Frost BF16 experts require eager FP32 main-gradient accumulation."
+                    "cuDNN BF16 experts require eager FP32 main-gradient accumulation."
                 )
             if (
                 self.delay_wgrad_compute
@@ -1688,14 +1688,14 @@ class TransformerConfig(ModelParallelConfig):
                 or self.deterministic_mode
             ):
                 raise ValueError(
-                    "Frost BF16 experts do not yet support delayed/overlapped wgrad "
+                    "cuDNN BF16 experts do not yet support delayed/overlapped wgrad "
                     "or expert activation offload."
                 )
 
             if self.expert_tensor_parallel_size not in (None, 1):
-                raise ValueError("Frost BF16 experts require expert tensor parallel size 1.")
+                raise ValueError("cuDNN BF16 experts require expert tensor parallel size 1.")
             if self.recompute_granularity != "selective" or "moe_act" not in self.recompute_modules:
-                raise ValueError("Frost BF16 experts require selective moe_act recomputation.")
+                raise ValueError("cuDNN BF16 experts require selective moe_act recomputation.")
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True

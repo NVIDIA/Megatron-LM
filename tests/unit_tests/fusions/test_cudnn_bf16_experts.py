@@ -20,7 +20,7 @@ def _config(**changes):
         num_moe_experts=4,
         moe_router_topk=2,
         moe_grouped_gemm=True,
-        moe_bf16_expert_backend="frost",
+        moe_bf16_expert_backend="cudnn",
         moe_mlp_glu_interleave_size=32,
         activation_func=F.silu,
         activation_func_clamp_value=10.0,
@@ -37,20 +37,20 @@ def _config(**changes):
     return TransformerConfig(**values)
 
 
-def test_frost_backend_uses_real_generated_cli():
+def test_cudnn_backend_uses_real_generated_cli():
     parser = _add_network_size_args(argparse.ArgumentParser())
-    args = parser.parse_args(["--moe-bf16-expert-backend", "frost"])
-    assert args.moe_bf16_expert_backend == "frost"
+    args = parser.parse_args(["--moe-bf16-expert-backend", "cudnn"])
+    assert args.moe_bf16_expert_backend == "cudnn"
     assert parser.parse_args([]).moe_bf16_expert_backend == "transformer_engine"
 
 
-def test_frost_config_opt_in_preserves_native_default():
-    assert _config().moe_bf16_expert_backend == "frost"
+def test_cudnn_config_opt_in_preserves_native_default():
+    assert _config().moe_bf16_expert_backend == "cudnn"
     config = _config(moe_bf16_expert_backend="transformer_engine", moe_mlp_glu_interleave_size=None)
     assert config.moe_bf16_expert_backend == "transformer_engine"
 
 
-def test_frost_allows_source_recipe_attention_offload_configuration():
+def test_cudnn_allows_source_recipe_attention_offload_configuration():
     config = _config(
         fine_grained_activation_offloading=True, offload_modules=["core_attn", "attn_proj"]
     )
@@ -79,6 +79,6 @@ def test_frost_allows_source_recipe_attention_offload_configuration():
         dict(fine_grained_activation_offloading=True, offload_modules=["fused_group_mlp"]),
     ],
 )
-def test_frost_rejects_unsupported_training_contracts(changes):
-    with pytest.raises(ValueError, match="[Ff]rost|moe_bf16_expert_backend"):
+def test_cudnn_rejects_unsupported_training_contracts(changes):
+    with pytest.raises(ValueError, match="cuDNN|moe_bf16_expert_backend"):
         _config(**changes)
