@@ -24,6 +24,9 @@ class MultimodalProjector(MegatronModule):
         projector_type (str): Projector type
         input_size (int): Input size from feature encoder
         tp_group (torch.distributed.ProcessGroup): Tensor parallel group
+        name (str | None): Qualified module path of this projector within the model.
+            A quant_recipe needs it to select the projector while its parameters are
+            being created; without it the recipe only takes effect in the forward pass.
     """
 
     def __init__(
@@ -34,6 +37,7 @@ class MultimodalProjector(MegatronModule):
         input_size: int,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
         self.projector_type = projector_type
@@ -51,6 +55,7 @@ class MultimodalProjector(MegatronModule):
                     input_size=input_size,
                     tp_group=tp_group,
                     pg_collection=pg_collection,
+                    name=(name + ".encoder") if name is not None else None,
                 )
             elif self.projector_type == "affine":
                 self.encoder = submodules.linear_fc1(
@@ -65,6 +70,7 @@ class MultimodalProjector(MegatronModule):
                     tp_comm_buffer_name=None,
                     tp_group=tp_group,
                     pg_collection=pg_collection,
+                    name=(name + ".encoder") if name is not None else None,
                 )
             else:
                 raise Exception(f"Unsupported multimodal projection type {self.projector_type}")

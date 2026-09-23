@@ -12,7 +12,12 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    describe_layer,
+    is_log_quantization_types_enabled,
+    qtype_debug_note,
+)
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -280,6 +285,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         name: str | None = None,
     ):
         super().__init__(config=config)
+
+        # Qualified module path of this block within the model, used to look up
+        # per-module quantization configs while the layers are being built. Leave
+        # it None and a quant_recipe cannot select layers until after construction.
+        self.name = name
+        # The quantization log describes the model, not the iteration, so each block
+        # reports its layers once however many microbatches run.
+        self._logged_quantization_structure = False
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -707,7 +720,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # No intermediate_hidden_states requested: just hidden_states
                     hidden_states = checkpointed_result
             else:
+                log_structure = (
+                    is_log_quantization_types_enabled() and not self._logged_quantization_structure
+                )
+                self._logged_quantization_structure = True
                 for l_no, layer in enumerate(self.layers):
+                    if log_structure:
+                        where = (
+                            f"{self.name}.layers.{l_no}" if self.name is not None else f"[{l_no}]"
+                        )
+                        qtype_debug_note(f"{where} ({describe_layer(layer)})")
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:

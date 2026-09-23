@@ -261,7 +261,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
-            name="decoder" if self.config.quant_recipe is not None else None,
+            name="decoder",
         )
         if hasattr(self, 'cudagraph_manager') and hasattr(self.decoder, 'cudagraph_manager'):
             del self.decoder.cudagraph_manager

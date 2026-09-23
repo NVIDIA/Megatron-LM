@@ -2458,7 +2458,13 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
-                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
+                    # layer_number is 1-based; self.layers is indexed from 0, and the name
+                    # has to match the path named_modules() reports for the same layer.
+                    name=(
+                        (self.name + f".layers.{layer_number - 1}")
+                        if self.name is not None
+                        else None
+                    ),
                 )
             return module
 
@@ -2477,7 +2483,13 @@ class MultiTokenPredictionBlock(MegatronModule):
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
                     hash_moe_layer_threshold=self.hash_moe_layer_threshold,
-                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
+                    # layer_number is 1-based; self.layers is indexed from 0, and the name
+                    # has to match the path named_modules() reports for the same layer.
+                    name=(
+                        (self.name + f".layers.{layer_number - 1}")
+                        if self.name is not None
+                        else None
+                    ),
                 )
             return module
 

@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import inspect
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
@@ -13,6 +14,30 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 
 # Initialize logger
 logger = logging.getLogger(__name__)
+
+
+def build_named_module(spec: ModuleSpec, name: Optional[str]) -> nn.Module:
+    """Build ``spec``, passing ``name`` only when its module accepts one.
+
+    Encoders and projections come from user-supplied specs, and some wrap third-party
+    models whose constructors take no ``name``. Those still build; they just cannot be
+    matched by a quant_recipe until after their parameters exist, so a recipe entry
+    targeting them changes the forward pass but not the parameter dtype.
+    """
+    if name is None:
+        return build_module(spec)
+    module = spec.module if hasattr(spec, "module") else spec
+    params = getattr(spec, "params", None) or {}
+    if "name" in params or not isinstance(module, type):
+        return build_module(spec)
+    try:
+        accepts_name = "name" in inspect.signature(module).parameters
+    except (TypeError, ValueError):
+        accepts_name = False
+    if not accepts_name:
+        logger.debug(f"{module.__name__} takes no 'name'; skipping quantization path plumbing")
+        return build_module(spec)
+    return build_module(spec, name=name)
 
 
 class ModalitySubmodules(ABC, nn.Module):
@@ -110,7 +135,11 @@ class ModalitySubmodules(ABC, nn.Module):
 
     @classmethod
     def from_spec(
-        cls, module_spec: ModuleSpec, is_first_stage: bool = True, is_last_stage: bool = True
+        cls,
+        module_spec: ModuleSpec,
+        is_first_stage: bool = True,
+        is_last_stage: bool = True,
+        name: Optional[str] = None,
     ) -> 'ModalitySubmodules':
         """Create a modality submodule from ModuleSpec configuration.
 
@@ -122,6 +151,9 @@ class ModalitySubmodules(ABC, nn.Module):
             is_last_stage (bool): Whether this is the last pipeline stage for this module.
                 Controls input projection initialization (only built on last stage).
                 Defaults to True.
+            name (Optional[str]): Qualified path of this submodule within the model. Children
+                are named below it so a quant_recipe can select them while their parameters
+                are created. Must match the path MIMOModel reports for the same module.
 
         Returns:
             ModalitySubmodules: An instance of the modality submodule
@@ -138,7 +170,9 @@ class ModalitySubmodules(ABC, nn.Module):
         if 'encoders' in submodules:
             for encoder_name, encoder_spec in submodules['encoders'].items():
                 logger.debug(f"Building {cls.__name__} encoder: {encoder_spec.module.__name__}")
-                encoder = build_module(encoder_spec)
+                encoder = build_named_module(
+                    encoder_spec, (name + f".encoders.{encoder_name}") if name is not None else None
+                )
                 encoders[encoder_name] = encoder
 
         # Build decoders (needed on all stages for pipeline processing)
@@ -146,18 +180,22 @@ class ModalitySubmodules(ABC, nn.Module):
         if 'decoders' in submodules:
             for decoder_name, decoder_spec in submodules['decoders'].items():
                 logger.debug(f"Building {cls.__name__} decoder: {decoder_spec.module.__name__}")
-                decoder = build_module(decoder_spec)
+                decoder = build_named_module(
+                    decoder_spec, (name + f".decoders.{decoder_name}") if name is not None else None
+                )
                 decoders[decoder_name] = decoder
 
         # Build input projections only on last stage
         # (projection happens after encoding, before sending to language model)
         input_projections = []
         if is_last_stage and 'input_projections' in submodules:
-            for proj_spec in submodules['input_projections']:
+            for index, proj_spec in enumerate(submodules['input_projections']):
                 logger.debug(
                     f"Building {cls.__name__} input projection: {proj_spec.module.__name__}"
                 )
-                projection = build_module(proj_spec)
+                projection = build_named_module(
+                    proj_spec, (name + f".input_projections.{index}") if name is not None else None
+                )
                 input_projections.append(projection)
         elif 'input_projections' in submodules:
             logger.debug(f"Skipping {cls.__name__} input projections (not last stage)")
@@ -166,11 +204,13 @@ class ModalitySubmodules(ABC, nn.Module):
         # (projection happens before decoding, after receiving from language model)
         output_projections = []
         if is_first_stage and 'output_projections' in submodules:
-            for proj_spec in submodules['output_projections']:
+            for index, proj_spec in enumerate(submodules['output_projections']):
                 logger.debug(
                     f"Building {cls.__name__} output projection: {proj_spec.module.__name__}"
                 )
-                projection = build_module(proj_spec)
+                projection = build_named_module(
+                    proj_spec, (name + f".output_projections.{index}") if name is not None else None
+                )
                 output_projections.append(projection)
         elif 'output_projections' in submodules:
             logger.debug(f"Skipping {cls.__name__} output projections (not first stage)")

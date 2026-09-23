@@ -741,7 +741,7 @@ class MegatronMultimodalTokenizer:
         assistant_turn_loss: Optional[List[bool]] = None,
         **kwargs,
     ):
-        """Convert a conversation to tokens.
+        """Convert a conversation to tokens, or to a rendered string.
 
         Each turn's ``content`` may be either a legacy string or a list of structured parts
         of the form
