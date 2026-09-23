@@ -1978,7 +1978,7 @@ def _worker_count_zeros_excludes_gtp_padding(rank, world_size, port):
         )
     finally:
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 class TestGTPCountZerosExcludesPadding:
@@ -2058,7 +2058,7 @@ def _worker_bias_is_replicated(rank, world_size, port, gtp_remat_size):
         )
     finally:
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 class TestGTPReplicatedBias:
