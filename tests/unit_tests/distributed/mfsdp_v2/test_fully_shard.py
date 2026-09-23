@@ -191,7 +191,7 @@ _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
 def test_fully_shard_sgd_losses_match_baseline(
     distributed_setup, num_microbatches, placements_factory
 ):
-    """Every supported sharding strategy should match single-rank SGD."""
+    """Every supported sharding strategy should match gradient-averaged SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -212,12 +212,14 @@ def test_fully_shard_sgd_losses_match_baseline(
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
 
-    micro_batch_size = 2
-    x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
-    target = torch.randn(num_microbatches, micro_batch_size, 4, device=device)
+    microbatch_size = 2
+    # Keep initialization identical, but exercise reduction of distinct rank-local gradients.
+    torch.manual_seed(5678 + rank)
+    x = torch.randn(num_microbatches, microbatch_size, 8, device=device)
+    target = torch.randn(num_microbatches, microbatch_size, 4, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+    def train(model, optimizer, log_prefix, *, reduce_grads: bool) -> list[torch.Tensor]:
         losses = []
         for step in range(5):
             optimizer.zero_grad()
@@ -236,11 +238,17 @@ def test_fully_shard_sgd_losses_match_baseline(
                     )
                     (loss / num_microbatches).backward()
 
+            if reduce_grads:
+                # The unsharded baseline needs the same DP average as FSDP, after accumulation.
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+                    parameter.grad.div_(world_size)
+
             optimizer.step()
         return losses
 
-    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "FSDP")
+    baseline_losses = train(baseline, baseline_optimizer, "Baseline", reduce_grads=True)
+    sharded_losses = train(model, optimizer, "FSDP", reduce_grads=False)
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
