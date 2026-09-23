@@ -34,7 +34,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_using_quantization_scales
 
 
 def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_heads: int):
@@ -951,16 +950,11 @@ class DSGQACoreAttention(MegatronModule):
                 f"dsa_kernel_backend='{dsa_kernel_backend}' requires "
                 "dsa_indexer_rotate_activation."
             )
-        if (
-            self.config.fp8 is not None
-            or self.config.fp8_param
-            or is_using_quantization_scales(self.config)
-        ):
-            raise NotImplementedError(
-                f"dsa_kernel_backend='{dsa_kernel_backend}' does not yet support "
-                "quantized/FP8 "
-                "indexer projections."
-            )
+        # No quantization check here. The min-memory kernels read indexer.linear_q and
+        # linear_k as raw tensors, which is what an FP8 parameter would break; the indexer
+        # builds and runs both under get_fp8_disabled_context, so they keep a high-precision
+        # copy. Everything else the kernels consume -- query, key, value, hidden_states -- is a
+        # TE module output, which is dequantized before it leaves the module.
         if not simplified_indexer and self.config.layernorm_zero_centered_gamma:
             raise NotImplementedError(
                 f"dsa_kernel_backend='{dsa_kernel_backend}' does not yet support "
