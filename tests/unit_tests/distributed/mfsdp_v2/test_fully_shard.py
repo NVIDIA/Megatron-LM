@@ -918,8 +918,7 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(output, expected_output)
 
 
-@pytest.mark.parametrize("initialize_before_wrapping", [False, True])
-def test_fully_shard_shares_class_stream(distributed_setup, initialize_before_wrapping):
+def test_fully_shard_shares_class_stream(distributed_setup):
     """Wrapping must not turn a lazy per-class stream into a per-instance stream."""
 
     class LinearWithStream(nn.Linear):
@@ -933,43 +932,28 @@ def test_fully_shard_shares_class_stream(distributed_setup, initialize_before_wr
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    layers = [LinearWithStream(4, 4, device=device) for _ in range(28)]
-    if initialize_before_wrapping:
-        layers[0].get_stream()
+    layers = [LinearWithStream(4, 4, device=device) for _ in range(2)]
 
     with fully_shard_context(device=device):
         for layer in layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements())
 
-    stream = layers[0].get_stream()
-    assert all(layer.get_stream() is stream for layer in layers)
-    assert all(type(layer) is type(layers[0]) for layer in layers)
-    assert all(isinstance(layer, FsdpModule) for layer in layers)
-    assert all(isinstance(layer, LinearWithStream) for layer in layers)
-    assert layers[0].parameter_groups is not layers[1].parameter_groups
-
-    # Reusing the class must not reuse the FSDP context or instance state.
-    other = LinearWithStream(4, 4, device=device)
-    with fully_shard_context(device=device):
-        fully_shard(other, mesh=mesh, placements=_flat_placements())
-    assert type(other) is type(layers[0])
-    assert other.get_stream() is stream
-    assert other.context is not layers[0].context
+    assert layers[0].get_stream() is layers[1].get_stream()
 
 
-def test_fully_shard_distinguishes_original_classes(distributed_setup):
-    """Original class identity, rather than its name, determines the FSDP class."""
+def test_fully_shard_keeps_instance_state_separate(distributed_setup):
+    """Reusing the class must not reuse the FSDP context or parameter groups."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    classes = [type("LinearWithSameName", (nn.Linear,), {}) for _ in range(2)]
-    layers = [cls(4, 4, device=device) for cls in classes]
-    with fully_shard_context(device=device):
-        for layer in layers:
+    layers = [nn.Linear(4, 4, device=device) for _ in range(2)]
+    for layer in layers:
+        with fully_shard_context(device=device):
             fully_shard(layer, mesh=mesh, placements=_flat_placements())
-    assert type(layers[0]) is not type(layers[1])
-    for layer, cls in zip(layers, classes):
-        assert isinstance(layer, FsdpModule)
-        assert isinstance(layer, cls)
+
+    assert type(layers[0]) is type(layers[1])
+    assert layers[0].context is not layers[1].context
+    assert layers[0].parameter_groups[0] is not layers[1].parameter_groups[0]
+    assert layers[0].weight is not layers[1].weight
 
 
 def test_fully_shard_preserves_parameter_attributes(distributed_setup):

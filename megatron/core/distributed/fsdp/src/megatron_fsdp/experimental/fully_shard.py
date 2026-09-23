@@ -15,6 +15,7 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
+import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -29,7 +30,6 @@ from .module import FsdpContext, FsdpModule
 from .schedule import SchedulePolicy
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
-_FSDP_CLASSES: dict[type[nn.Module], type[nn.Module]] = {}
 
 MeshAxis = int | str
 
@@ -242,11 +242,10 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
-    module_cls = module.__class__
-    if module_cls not in _FSDP_CLASSES:
-        # Classmethods may lazily cache shared state, such as a communication
-        # stream. A new subclass per instance would duplicate that state.
-        _FSDP_CLASSES[module_cls] = type(
-            f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {}
-        )
-    module.__class__ = _FSDP_CLASSES[module_cls]
+    module.__class__ = _get_fsdp_class(module.__class__)
+
+
+@functools.cache
+def _get_fsdp_class(module_cls: type[nn.Module]) -> type[nn.Module]:
+    """Reuse the subclass so classmethods share lazy state, such as CUDA streams."""
+    return type(f"Fsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
