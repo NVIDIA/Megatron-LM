@@ -21,6 +21,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import dsa_layout, dsa_masking
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -777,6 +778,7 @@ class DSGQACoreAttention(MegatronModule):
                 k_channels if k_channels is not None else config.kv_channels
             )
         self.softmax_scale = softmax_scale
+        self.cp_comm_type = dsa_layout.normalize_cp_comm_type(cp_comm_type)
 
     def forward(
         self,
@@ -792,7 +794,6 @@ class DSGQACoreAttention(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
     ):
         assert attention_bias is None, "attention_bias is not supported for DSA-GQA."
-        assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         if key.size(0) != hidden_states.size(0):
             if self.config.sequence_parallel:
                 raise NotImplementedError(
@@ -810,8 +811,13 @@ class DSGQACoreAttention(MegatronModule):
                 )
             if attn_mask_type != AttnMaskType.causal or attention_mask is not None:
                 raise NotImplementedError("CuTe requires causal attention without a custom mask.")
-            return self._forward_cute(query, key, value, hidden_states, indexer_input_norm)
+            return self._forward_cute(
+                query, key, value, hidden_states, indexer_input_norm, packed_seq_params
+            )
 
+        assert (
+            packed_seq_params is None
+        ), "Packed sequence is not supported for this DSA-GQA backend."
         sq, b, _, _ = query.size()
         skv = key.size(0)
         dsa_min_memory_backend = getattr(self.config, "dsa_min_memory_backend", "reference")
@@ -1043,6 +1049,83 @@ class DSGQACoreAttention(MegatronModule):
             use_gather=sparse_attention_use_gather,
         )
 
+    def _get_unpadded_cp_metadata(self, *, sq, cp_size, cp_rank, device, stream_id):
+        """Cache one fixed-shape SBHD mapping on the stream that created it."""
+        cache_key = (sq, cp_size, cp_rank, device, stream_id)
+        cached = getattr(self, "_unpadded_cp_metadata", None)
+        if cached is None or cached[0] != cache_key:
+            # Evaluation may precede training; autograd must be able to save these indices.
+            with torch.inference_mode(False):
+                positions = dsa_layout.build_zigzag_cp_local_positions(
+                    sq * cp_size, cp_size, cp_rank, device
+                )
+                key_reorder = dsa_layout.build_zigzag_allgather_cp_key_reorder(sq, cp_size, device)
+                starts = torch.zeros_like(positions)
+                ends = positions + 1
+            cached = (cache_key, (positions, key_reorder, starts, ends))
+            self._unpadded_cp_metadata = cached
+        return cached[1]
+
+    def _get_cute_layout(self, query, packed_seq_params, cp_size, cp_rank):
+        """Describe local query visibility and restore rank-gathered keys to global order."""
+        sq = query.shape[0]
+        if packed_seq_params is None:
+            if cp_size == 1:
+                return None, None, None
+            positions, key_reorder, starts, ends = self._get_unpadded_cp_metadata(
+                sq=sq,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                device=query.device,
+                stream_id=(
+                    torch.cuda.current_stream(query.device).cuda_stream if query.is_cuda else 0
+                ),
+            )
+            return (starts, ends), None, key_reorder
+
+        if packed_seq_params.qkv_format != 'thd':
+            raise NotImplementedError("CuTe packed attention requires THD metadata.")
+        cu_q, cu_k = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+        # The batch producer supplies complete physical boundaries. Check CPU
+        # callers without introducing a device-to-host read in the CUDA path.
+        if cu_q.device.type == 'cpu' and (cu_q[0] != 0 or cu_q[-1] != sq * cp_size):
+            raise ValueError("Packed CuTe boundaries must cover all physical rows from zero.")
+        if (
+            cu_q.shape != cu_k.shape
+            or cu_q.dtype != cu_k.dtype
+            or cu_q.device != cu_k.device
+            or cu_q.stride() != cu_k.stride()
+            or cu_q.data_ptr() != cu_k.data_ptr()
+        ):
+            raise NotImplementedError(
+                "CuTe packed self-attention requires shared global Q/K document boundaries."
+            )
+        valid_rows = dsa_masking.extract_query_valid_rows_from_packed_seq_params(
+            packed_seq_params, b=1, sq=sq, device=query.device
+        )
+        if valid_rows is None:
+            raise ValueError("Packed CuTe attention requires PackedSeqParams.real_token_mask_q.")
+        key_reorder = None
+        if cp_size > 1:
+            positions, key_reorder = (
+                dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                    cu_q,
+                    cu_k,
+                    cp_size,
+                    cp_rank,
+                    query.device,
+                    local_output_size=sq,
+                    key_local_output_size=sq,
+                    global_output_size=sq * cp_size,
+                    query_cu_seqlens_cover_output=True,
+                    key_cu_seqlens_cover_output=True,
+                )
+            )
+        else:
+            positions = torch.arange(sq, device=query.device, dtype=torch.int64)
+        bounds = dsa_masking.generate_varlen_mask_params_for_positions(cu_q, positions)
+        return bounds, valid_rows.reshape(-1), key_reorder
+
     def _forward_cute(
         self,
         query: torch.Tensor,
@@ -1050,10 +1133,33 @@ class DSGQACoreAttention(MegatronModule):
         value: torch.Tensor,
         hidden_states: torch.Tensor,
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec],
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> torch.Tensor:
-        """Run the explicit CuTe backend using the existing GQA indexer and loss attachment."""
+        """Project local indexer inputs, gather keys, then run the local CuTe kernels."""
         from megatron.core.transformer.experimental_attention_variant.dsa_cute_kernels import (
             run_cute_sparse_attention,
+        )
+
+        query, _ = dsa_layout.ensure_sbhd(query, "query")
+        key, _ = dsa_layout.ensure_sbhd(key, "key")
+        value, _ = dsa_layout.ensure_sbhd(value, "value")
+        if query.shape[1] != 1 or key.shape[0] != query.shape[0]:
+            raise ValueError("CuTe requires B1 self-attention with local Q/K/V shards.")
+        cp_group = getattr(self.indexer.pg_collection, 'cp', None)
+        cp_size = cp_group.size() if cp_group is not None else 1
+        cp_rank = cp_group.rank() if cp_group is not None else 0
+        if packed_seq_params is not None:
+            if packed_seq_params.local_cp_size not in (None, cp_size) or (
+                packed_seq_params.cp_group is not None
+                and packed_seq_params.cp_group is not cp_group
+            ):
+                raise NotImplementedError("CuTe currently uses the configured fixed CP domain.")
+        if cp_size > 1 and (
+            self.cp_comm_type != 'allgather' or self.config.attention_cp_layout != 'zigzag'
+        ):
+            raise NotImplementedError("CuTe CP requires zigzag all-gather attention.")
+        row_bounds, valid_rows, key_reorder = self._get_cute_layout(
+            query, packed_seq_params, cp_size, cp_rank
         )
 
         # The outer attention hook supplies TE's already-normalized activation.
@@ -1063,9 +1169,31 @@ class DSGQACoreAttention(MegatronModule):
         use_indexer_loss = self.training and torch.is_grad_enabled() and loss_coeff > 0
         with torch.enable_grad() if use_indexer_loss else torch.no_grad():
             q_indexer, k_indexer = self.indexer.forward_qk(indexer_input, use_rope=False)
-        denominator = get_indexer_loss_denominator(
-            num_rows=query.shape[0] * query.shape[1],
-            calculate_per_token_loss=self.config.calculate_per_token_loss,
+        if cp_size > 1:
+            # Each rank owns queries and consumes every key. Backward reduce-scatter
+            # sums the contributions from those query shards into the original local rows.
+            key = gather_from_sequence_parallel_region(key, group=cp_group).index_select(
+                0, key_reorder
+            )
+            value = gather_from_sequence_parallel_region(value, group=cp_group).index_select(
+                0, key_reorder
+            )
+            k_indexer = gather_from_sequence_parallel_region(
+                k_indexer, group=cp_group
+            ).index_select(0, key_reorder)
+        valid_count = None
+        if use_indexer_loss and valid_rows is not None and not self.config.calculate_per_token_loss:
+            valid_count = valid_rows.sum(dtype=torch.float32)
+            if cp_size > 1:
+                torch.distributed.all_reduce(valid_count, group=cp_group)
+        denominator = (
+            get_indexer_loss_denominator(
+                num_rows=query.shape[0] * cp_size,
+                calculate_per_token_loss=self.config.calculate_per_token_loss,
+                valid_row_count=valid_count,
+            )
+            if use_indexer_loss
+            else 1
         )
         output, indexer_loss = run_cute_sparse_attention(
             query,
@@ -1077,6 +1205,8 @@ class DSGQACoreAttention(MegatronModule):
             softmax_scale=self.softmax_scale,
             loss_coeff=loss_coeff if use_indexer_loss else 0.0,
             loss_denominator=denominator,
+            row_bounds=row_bounds,
+            query_valid_rows=valid_rows,
         )
         if use_indexer_loss:
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -1084,6 +1214,9 @@ class DSGQACoreAttention(MegatronModule):
                 raw_loss=indexer_loss / loss_coeff,
                 layer_number=self.layer_number,
                 num_layers=self.config.num_layers,
+                # Each rank returns a contribution to the global objective. Sum
+                # CP first; averaging replicated sums over DP+CP then only averages DP.
+                reduce_group=cp_group if cp_size > 1 else None,
                 avg_group=getattr(self.indexer.pg_collection, 'dp_cp', None),
             )
             return DSAIndexerLossAutoScaler.apply(output, indexer_loss)

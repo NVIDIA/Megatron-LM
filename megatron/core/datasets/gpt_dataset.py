@@ -320,6 +320,11 @@ class GPTDataset(MegatronDataset):
             loss_mask = torch.zeros_like(loss_mask)
 
         if self.config.inter_document_masking:
+            # Keep input-row validity before padding is folded into the final document.
+            # The fetched lengths exclude storage padding; an extra label token must not
+            # count beyond the input tensor. This is independent of LM loss masking.
+            real_token_count = min(sum(document_lengths), tokens.numel())
+            padding_mask = torch.arange(tokens.numel()) >= real_token_count
             # document_lengths come from _query_document_sample_shuffle_indices
             # which fetches sequence_length + add_extra_token_to_sequence tokens
             # total. The extra token is appended to the last document part (used
@@ -366,6 +371,7 @@ class GPTDataset(MegatronDataset):
                 "position_ids": position_ids,
                 "cu_seqlens": padded_cu_seqlens,
                 "max_seqlen": max_seqlen,
+                "padding_mask": padding_mask,
             }
         elif self.config.create_attention_mask:
             result = {

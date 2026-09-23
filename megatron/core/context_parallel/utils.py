@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, Iterable
 
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, build_thd_padding_mask
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
 
@@ -59,7 +59,7 @@ def _get_batch_on_this_cp_rank_contiguous(
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
-    sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids')
+    sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask')
     if cp_size == 1:
         return batch
 
@@ -107,8 +107,9 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
     if cp_size == 1:
         return batch
 
+    sequence_keys = ('tokens', 'labels', 'loss_mask', 'position_ids')
     sequence_tensor = None
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in (*sequence_keys, 'padding_mask'):
         sequence_tensor = batch.get(key)
         if sequence_tensor is not None:
             break
@@ -118,20 +119,22 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
     physical_cu_seqlens = cu_seqlens if cu_seqlens_padded is None else cu_seqlens_padded
     if sequence_tensor is not None:
-        source_positions = torch.arange(
-            sequence_tensor.size(1), dtype=physical_cu_seqlens.dtype, device=sequence_tensor.device
-        )
-        sequence_ids = torch.searchsorted(physical_cu_seqlens[1:], source_positions, right=True)
-        valid_ends = physical_cu_seqlens[:-1] + cu_seqlens[1:] - cu_seqlens[:-1]
-        source_valid = source_positions < valid_ends.index_select(0, sequence_ids)
+        if batch.get('padding_mask') is not None:
+            source_padding = batch['padding_mask'].squeeze(0)
+        else:
+            source_padding = build_thd_padding_mask(
+                cu_seqlens, physical_cu_seqlens, sequence_tensor.size(1)
+            )
         index = rank_order_indices.view(cp_size, -1)[cp_rank]
         valid_index = index.clamp_min(0)
-        padding = (index < 0) | ~source_valid.index_select(0, valid_index)
-        for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+        padding = (index < 0) | source_padding.index_select(0, valid_index)
+        for key in sequence_keys:
             tensor = batch.get(key)
             if tensor is not None:
                 local_tensor = tensor.index_select(1, valid_index)
                 batch[key] = local_tensor.masked_fill(padding.view(1, -1), 0)
+        if batch.get('padding_mask') is not None:
+            batch['padding_mask'] = padding.view(1, -1)
     batch['cu_seqlens_padded'] = target_cu_seqlens_padded.unsqueeze(0)
     if batch.get('max_seqlen') is not None:
         max_seqlen = (target_cu_seqlens_padded[1:] - target_cu_seqlens_padded[:-1]).max()
@@ -165,6 +168,22 @@ def _build_packed_seq_params(
 
     max_seqlen = int(batch['max_seqlen'].item())
     local_cp_size = batch.get('local_cp_size')
+    padding_mask = batch.get('padding_mask')
+    real_token_mask_q = None
+    if padding_mask is not None:
+        if padding_mask.ndim != 2 or padding_mask.size(0) != 1:
+            raise ValueError(
+                "Packed THD padding_mask must have shape [1, local_tokens], got "
+                f"{tuple(padding_mask.shape)}"
+            )
+        for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+            tensor = batch.get(key)
+            if tensor is not None and tensor.size(1) != padding_mask.size(1):
+                raise ValueError(
+                    f"Packed THD padding_mask has {padding_mask.size(1)} rows but {key} has "
+                    f"{tensor.size(1)}"
+                )
+        real_token_mask_q = (~padding_mask.squeeze(0)).contiguous()
     return PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=qkv_cu_seqlens,
@@ -175,9 +194,11 @@ def _build_packed_seq_params(
         max_seqlen_kv=max_seqlen,
         local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
         cp_group=batch.get('hybrid_cp_group'),
+        # Preserve the upstream global-coordinate contract even after CP shards the rows.
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
         pad_between_seqs=pad_between_seqs,
+        real_token_mask_q=real_token_mask_q,
     )
 
 
@@ -193,6 +214,8 @@ def get_batches_on_this_cp_rank(
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
     tokens_per_sample: int | None = None,
+    physical_token_count: int | None = None,
+    local_token_alignment: int = 1,
 ) -> ContextParallelBatch:
     """Partition a batch and prepare metadata for the requested CP layouts.
 
@@ -205,12 +228,47 @@ def get_batches_on_this_cp_rank(
     sequence. The same rank ordering is used to build the zigzag batch tensors and their
     ``PackedSeqParams``. When both layouts are requested, it also defines the
     activation-conversion plan. All other cases use the standard batch sharder.
+
+    Supplying ``physical_token_count`` requests a real-token padding mask for packed
+    inputs whose cumulative lengths retain the logical document lengths, including
+    metadata-only pipeline stages. Existing masks take precedence over reconstruction.
     """
     from megatron.core.utils import get_batch_on_this_cp_rank
 
     requested_layouts = set(additional_layouts)
     requested_layouts.add(boundary_layout)
     cp_size = torch.distributed.get_world_size(cp_group)
+
+    if local_token_alignment <= 0:
+        raise ValueError("local_token_alignment must be a positive integer")
+    # Only callers requesting a real-token mask supply the physical extent.
+    # Metadata-only and embedding-only callers retain their existing layout contract.
+    if batch.get('cu_seqlens') is not None and physical_token_count is not None:
+        sequence_tensor = next(
+            (
+                batch[key]
+                for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask')
+                if batch.get(key) is not None
+            ),
+            None,
+        )
+        if sequence_tensor is not None:
+            tensor_token_count = sequence_tensor.size(1)
+            if physical_token_count != tensor_token_count:
+                raise ValueError(
+                    "Packed THD physical_token_count disagrees with the token-aligned batch "
+                    f"shape: {physical_token_count} != {tensor_token_count}"
+                )
+            physical_token_count = tensor_token_count
+        if batch.get('padding_mask') is None:
+            batch = dict(batch)
+            cu_seqlens = batch['cu_seqlens'].squeeze(0)
+            cu_seqlens_padded = batch.get('cu_seqlens_padded')
+            if cu_seqlens_padded is not None:
+                cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
+            batch['padding_mask'] = build_thd_padding_mask(
+                cu_seqlens, cu_seqlens_padded, physical_token_count
+            ).unsqueeze(0)
 
     build_packed_zigzag_view = (
         not is_hybrid_cp
@@ -229,7 +287,11 @@ def get_batches_on_this_cp_rank(
             cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
         tp_size = tp_group.size() if sequence_parallel else 1
         zigzag_metadata = _build_thd_zigzag_metadata(
-            cu_seqlens, cu_seqlens_padded, cp_size, tp_size
+            cu_seqlens,
+            cu_seqlens_padded,
+            cp_size,
+            tp_size,
+            local_token_alignment=local_token_alignment,
         )
 
         batches_by_layout = {
@@ -279,7 +341,14 @@ def get_batches_on_this_cp_rank(
 
     has_sequence_data = any(
         batch.get(key) is not None
-        for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'attention_mask')
+        for key in (
+            'tokens',
+            'labels',
+            'loss_mask',
+            'position_ids',
+            'attention_mask',
+            'padding_mask',
+        )
     )
     if has_sequence_data:
         # Copy the dictionary because the CP sharder replaces sequence-valued entries in place.

@@ -385,6 +385,7 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
+
     dsa_gqa_backend: Optional[
         Literal['reference', 'triton-min-memory', 'torch-min-memory', 'cute']
     ] = None
@@ -3864,12 +3865,10 @@ class TransformerConfig(ModelParallelConfig):
                 assert (
                     self.dsa_indexer_mode == 'simplified'
                 ), "DSA over GQA requires dsa_indexer_mode='simplified'."
-                # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
-                # below). The GQA path does not: its min-memory kernels have no
-                # sequence-parallel gather and no CP support yet.
+                # Reference and min-memory GQA backends still require local attention.
                 assert (
-                    self.context_parallel_size == 1
-                ), "Context parallelism is not supported by DSA over GQA."
+                    self.context_parallel_size == 1 or self.dsa_gqa_backend == 'cute'
+                ), "Context parallelism for DSA over GQA requires the CuTe backend."
                 assert (
                     not self.sequence_parallel
                 ), "Sequence parallelism is not supported by DSA over GQA."
@@ -3942,6 +3941,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("CuTe requires the simplified learned-Q/K indexer.")
             if self.tensor_model_parallel_size != 1:
                 raise ValueError("CuTe GQA integration currently requires TP1.")
+            if self.context_parallel_size > 1 and self.attention_cp_layout != 'zigzag':
+                raise ValueError(
+                    "CuTe GQA context parallelism requires the zigzag attention layout."
+                )
             if self.num_attention_heads not in (16, 32, 96) or self.kv_channels != 256:
                 raise ValueError("CuTe requires 16, 32 or 96 query heads of dimension 256.")
             if self.num_query_groups != 1 or self.dsa_indexer_head_dim != 128:
