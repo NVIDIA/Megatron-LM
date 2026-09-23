@@ -12,6 +12,10 @@ Note that this is distinct from the ``dsa_layer`` already present in
 (``AbsorbedMLASelfAttention``). This spec applies DSA over *GQA*, reusing the
 stack's existing attention layer slot.
 
+Two stacks are provided, differing only in their Mamba mixer: ``dsa_stack_spec`` derives
+from ``hybrid_stack_spec``, ``gdp_dsa_stack_spec`` from ``gated_delta_product_stack_spec``.
+Both share the same attention layer, so DSA over GQA applies to either unchanged.
+
 Usage::
 
     --spec megatron.core.transformer.experimental_attention_variant.dsa_layer_specs \
@@ -20,7 +24,10 @@ Usage::
 
 import copy
 
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import DSGroupedSelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -41,3 +48,4 @@ def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
 
 
 dsa_stack_spec = _with_dsa_gqa_attention(hybrid_stack_spec)
+gdp_dsa_stack_spec = _with_dsa_gqa_attention(gated_delta_product_stack_spec)
