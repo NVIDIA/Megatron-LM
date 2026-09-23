@@ -274,6 +274,23 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _mfsdp_v2_disables_pipeline_output_dealloc(args) -> bool:
+    """Whether the pipeline-output pseudo-free must stay disabled for ``args``.
+
+    Megatron-FSDP v2 registers a full-backward hook on every FSDP module, and
+    PyTorch delivers ``grad_output`` to that hook by wrapping the module output
+    in ``BackwardHookFunction``, whose forward returns its inputs. The pipeline
+    stage output therefore becomes an autograd view of the module's own output,
+    and ``deallocate_output_tensor()`` must not pseudo-free it: the base tensor
+    owns the storage and keeps it alive, so the swap would reclaim no memory.
+    Disable the optimization for this configuration instead of aborting on the
+    view guard.
+    """
+    return bool(
+        getattr(args, 'use_megatron_fsdp', False) and getattr(args, 'megatron_fsdp_version', 1) == 2
+    )
+
+
 def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
@@ -303,7 +320,7 @@ def core_transformer_config_from_args(args, config_class=None):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
-    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
