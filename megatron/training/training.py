@@ -4089,10 +4089,42 @@ def train_step(
     )
 
 
+def _get_dsa_indexer_logging_layer_counts(args, tracker_layers: int) -> tuple[int, int]:
+    """Return tracker slots and the number of hybrid layers that own a DSA indexer.
+
+    The tracker is indexed by layer number, so it spans every decoder layer; only the attention
+    layers ever write to it. Reporting the mean therefore needs the count of layers that own an
+    indexer, not the tracker length -- an 8B stack with four attention layers in fifty-two would
+    otherwise divide by thirteen times too many.
+
+    A pattern may not mix ``*`` with ``D`` or ``+`` (hybrid_layer_allocation rejects it), so
+    whichever attention symbol appears is the one carrying the indexer and counting both is
+    unambiguous.
+    """
+    from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+    from megatron.core.models.hybrid.layers.utils import Symbols
+
+    def _count(pattern: Optional[str]) -> int:
+        if not pattern:
+            return 0
+        return sum(pattern.count(symbol) for symbol in (Symbols.ATTENTION, Symbols.DS_ATTENTION))
+
+    parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+    mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
+    tracker_layers = args.num_layers + mtp_pattern_layers
+    mtp_indexer_repeats = 1 if args.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+    indexer_layers = _count(parsed_pattern.main_pattern) + (
+        _count(parsed_pattern.mtp_pattern) * mtp_indexer_repeats
+    )
+    return tracker_layers, indexer_layers
+
+
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
     """Return tracker slots and active CSA indexer modules for loss logging."""
     tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
     if args.csa_compress_ratios is None:
+        if args.experimental_attention_variant == 'dsa' and is_hybrid_model(args):
+            return _get_dsa_indexer_logging_layer_counts(args, tracker_layers)
         return tracker_layers, None
 
     ratios = args.csa_compress_ratios
