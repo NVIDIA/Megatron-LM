@@ -234,9 +234,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="tensor_parallel_layers",
         sources=("megatron/core/tensor_parallel/layers.py",),
-        tests=(K + "test_tensor_parallel_kernels.py",),
+        tests=(
+            K + "test_tensor_parallel_kernels.py",
+            "tests/unit_tests/tensor_parallel/test_layers.py",
+        ),
         kind="torch-op",
-        notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding) and local Column/RowParallelLinear "
+        notes="VocabParallelEmbedding (F.embedding with the PyTorch deterministic flag) "
+        "and local Column/RowParallelLinear "
         "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
     ),
     KernelEntry(
@@ -277,9 +281,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/transformer/moe/test_moe_utils_unpermute.py",
+        ),
         kind="torch-op",
-        notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
+        notes="permute/unpermute (scatter_add_ with an index_add_ fallback before torch 2.9), "
+        "routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels.",
     ),
     KernelEntry(
