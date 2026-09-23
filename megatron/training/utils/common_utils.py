@@ -70,6 +70,9 @@ def _get_param_data(param, force_create_fp32_copy, bf16):
     Returns (data_tensor, is_sharded) where is_sharded indicates the param has
     a sharded main_param from the distributed optimizer.
     """
+    if hasattr(param, 'main_param_model_shard'):
+        shard = param.main_param_model_shard if force_create_fp32_copy else param.main_param
+        return (shard.float() if shard is not None else None), True
     if bf16:
         if not force_create_fp32_copy and hasattr(param, 'main_param'):
             if getattr(param, 'main_param_sharded', False):

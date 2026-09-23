@@ -1656,7 +1656,6 @@ def pretrain(
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
-
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
@@ -2040,8 +2039,14 @@ def pretrain(
                 dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
                 assert "vp_stage" in dataset_provider_parameters, \
                     "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-                vp_stage_train_valid_test_dataset_provider = \
-                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                provider_kwargs = {'vp_stage': vp_stage}
+                if 'requires_token_ids' in dataset_provider_parameters:
+                    provider_kwargs['requires_token_ids'] = getattr(
+                        unwrap_model(model[vp_stage]), 'requires_token_context', False
+                    )
+                vp_stage_train_valid_test_dataset_provider = functools.partial(
+                    train_valid_test_dataset_provider, **provider_kwargs
+                )
                 if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                     vp_stage_train_valid_test_dataset_provider.is_distributed = True
                 iterators = build_train_valid_test_data_iterators(
@@ -2051,8 +2056,19 @@ def pretrain(
                 valid_data_iterator.append(iterators[1])
                 test_data_iterator.append(iterators[2])
         else:
+            dataset_provider = train_valid_test_dataset_provider
+            if 'requires_token_ids' in inspect.signature(dataset_provider).parameters:
+                dataset_provider = functools.partial(
+                    dataset_provider,
+                    requires_token_ids=getattr(
+                        unwrap_model(model[0]), 'requires_token_context', False
+                    ),
+                )
+                dataset_provider.is_distributed = getattr(
+                    train_valid_test_dataset_provider, 'is_distributed', False
+                )
             train_data_iterator, valid_data_iterator, test_data_iterator = (
-                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+                build_train_valid_test_data_iterators(dataset_provider)
             )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -2972,7 +2988,12 @@ def setup_model_and_optimizer(
             if mup_overrides:
                 config_overrides = {**(config_overrides or {}), **mup_overrides}
 
-        optimizer = get_megatron_optimizer(
+        optimizer_factory = get_megatron_optimizer
+        if getattr(args, 'engram_layer_ids', None):
+            from megatron.core.transformer.engram.optimizer import get_engram_optimizer
+
+            optimizer_factory = get_engram_optimizer
+        optimizer = optimizer_factory(
             config,
             model,
             config_overrides=config_overrides,
@@ -3240,6 +3261,22 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
+def _update_mtp_loss_scaling_factor(model, args, iteration):
+    """Derive MTP weight from completed updates, including immediately after resume."""
+    target = getattr(args, 'mtp_loss_scaling_factor_decay', None)
+    if target is None:
+        return
+    if iteration is None:
+        iteration = getattr(args, 'curr_iteration', getattr(args, 'iteration', 0))
+    start = args.mtp_loss_scaling_factor_decay_start
+    weight = target if iteration >= start else args.mtp_loss_scaling_factor
+    for chunk in model:
+        for module in chunk.modules():
+            config = getattr(module, 'config', None)
+            if config is not None and hasattr(config, 'mtp_loss_scaling_factor'):
+                config.mtp_loss_scaling_factor = weight
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -3249,6 +3286,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         preserves the default behavior.
     """
     args = get_args()
+    _update_mtp_loss_scaling_factor(model, args, iteration)
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -5564,6 +5602,7 @@ def evaluate(
     """Evaluation."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    _update_mtp_loss_scaling_factor(model, args, None)
     timers = get_timers()
 
     step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
@@ -5756,7 +5795,6 @@ def evaluate(
     timers.log(['evaluate'])
 
     rerun_state_machine.set_mode(rerun_mode)
-
 
     # OTel: set eval_iters on the active span started by the @_otel_trace_fn decorator.
     # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,

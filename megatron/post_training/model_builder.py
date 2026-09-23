@@ -56,6 +56,12 @@ class ModelOptHybridModelConfig(HybridModelConfig):
     builder: ClassVar[str] = "megatron.post_training.model_builder.ModelOptHybridModelBuilder"
 
 
+def _validate_modelopt_engram(config: Any) -> None:
+    """Reject memory configuration that the ModelOpt construction path cannot preserve."""
+    if getattr(config, "engram_layer_ids", None):
+        raise ValueError("Engram does not support ModelOpt model construction")
+
+
 class _ModelOptBuilderMixin:
     """Shared `build_model()` override for the legacy ModelOpt model construction path.
 
@@ -72,6 +78,7 @@ class _ModelOptBuilderMixin:
         post_process: bool | None = None,
         vp_stage: int | None = None,
     ) -> MegatronModule:
+        _validate_modelopt_engram(self._model_config.transformer)
         args = get_args()
         if pre_process is None:
             pre_process = is_pp_first_stage(pg_collection.pp)
@@ -289,6 +296,7 @@ def modelopt_gpt_hybrid_builder(
     Returns:
         MCoreGPTModel | MCoreHybridModel: The returned model
     """
+    _validate_modelopt_engram(args)
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.

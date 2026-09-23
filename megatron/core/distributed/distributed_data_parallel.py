@@ -305,14 +305,18 @@ class DistributedDataParallel(_BaseDataParallel):
             expt_gtp_remat=self.expt_gtp_remat_group,
         )
         for buffer_key, (params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            buffer_config = buffer_key.get_ddp_config(self.ddp_config)
+            if buffer_key.optimizer_sharding_group is not None:
+                data_parallel_group = buffer_key.optimizer_sharding_group
+                scaling_factor = 1.0
+            elif buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
                 data_parallel_group = self.intra_dp_cp_group
                 scaling_factor = gradient_scaling_factor
 
-            if not config.calculate_per_token_loss:
+            if not config.calculate_per_token_loss and buffer_key.optimizer_sharding_group is None:
                 target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
@@ -338,18 +342,24 @@ class DistributedDataParallel(_BaseDataParallel):
             param_layout = (
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
+            if buffer_key.optimizer_sharding_group is not None and param_layout is None:
+                from ..optimizer.distrib_optimizer import DistributedOptimizer
+
+                param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                    params, None, data_parallel_group.size(), buffer_config, param_indices
+                )
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
-                self.ddp_config,
+                buffer_config,
                 buffer_key.param_dtype,
                 buffer_key.grad_dtype,
                 params_with_names,
                 data_parallel_group,
-                self.bucket_size,
+                None if buffer_key.optimizer_sharding_group is not None else self.bucket_size,
                 param_to_name,
                 scaling_factor,
                 param_indices,
-                self.ddp_config.nccl_ub,
+                buffer_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
             )
@@ -401,6 +411,9 @@ class DistributedDataParallel(_BaseDataParallel):
         # without use_distributed_optimizer.
         if self.ddp_config.overlap_param_gather:
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+                bucket_groups = [
+                    group for group in bucket_groups if group.ddp_config.overlap_param_gather
+                ]
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
@@ -432,7 +445,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 # first. Backend-agnostic: DDP never learns which consumers use it.
                 ready_callback = (
                     _BucketParamReadyCallback(self, bucket_group)
-                    if self.ddp_config.overlap_param_gather
+                    if bucket_group.ddp_config.overlap_param_gather
                     else None
                 )
                 for bucket in bucket_group.buckets:
@@ -592,7 +605,11 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
-                if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
+                bucket_group = self.param_to_bucket_group[param]
+                if (
+                    bucket_group.ddp_config.overlap_grad_reduce
+                    and cudagraph_wgrad_ready_event is None
+                ):
                     # GTP_remat keeps its real wgrad in main_grad (via finalize); param.grad here is
                     # throwaway (None or a dummy), so skip this assert and rely on
                     # grad_added_to_main_grad below.
@@ -606,10 +623,8 @@ class DistributedDataParallel(_BaseDataParallel):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
 
-                if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(
-                        param, self.force_all_reduce
-                    )
+                if bucket_group.ddp_config.overlap_grad_reduce:
+                    bucket_group.register_grad_ready(param, self.force_all_reduce)
 
         return hook
 
@@ -639,7 +654,7 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         bucket_group.start_param_sync(force_sync=force_sync)
 
-        if self.ddp_config.overlap_param_gather:
+        if bucket_group.ddp_config.overlap_param_gather:
             return
 
         bucket_group._post_param_sync()
@@ -738,7 +753,10 @@ class DistributedDataParallel(_BaseDataParallel):
         for param in self.module.parameters():
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
-            if is_expert_parallel:
+            sharding_group = getattr(param, 'optimizer_sharding_group', None)
+            if sharding_group is not None:
+                data_parallel_group = sharding_group
+            elif is_expert_parallel:
                 data_parallel_group = self.expt_dp_group
             else:
                 data_parallel_group = self.dp_cp_group

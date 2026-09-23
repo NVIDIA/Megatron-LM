@@ -469,6 +469,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite.",
     ),
     KernelEntry(
+        name="engram_row_sharded_embedding",
+        sources=("megatron/core/transformer/engram/memory.py",),
+        tests=(K + "test_engram_kernels.py",),
+        kind="torch-op",
+        notes="Variable-split all-to-all lookup followed by repeated-address FP32 index_add_ "
+        "accumulation into the owner-local main_grad buffer; forward values and gradients "
+        "are replayed byte-exactly on two, four and eight ranks.",
+    ),
+    KernelEntry(
         name="nccl_allocator",
         sources=("megatron/core/nccl_allocator.py",),
         kind="cuda-ext",

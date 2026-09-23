@@ -37,6 +37,7 @@ def checkpointed_forward(
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
     input_ids: Optional[Tensor] = None,
+    token_context: Tensor | None = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -50,6 +51,7 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        token_context (Tensor, optional): Explicit microbatch context saved for consumer layers.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -74,6 +76,7 @@ def checkpointed_forward(
             rotary_pos_emb_global,
             padding_mask=None,
             input_ids=None,
+            token_context=None,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -127,6 +130,8 @@ def checkpointed_forward(
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
                 if input_ids is not None and getattr(router, "is_hash_layer", False):
                     layer_kwargs["input_ids"] = input_ids
+                if getattr(layer, 'accepts_token_context', False):
+                    layer_kwargs['token_context'] = token_context
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
@@ -143,6 +148,7 @@ def checkpointed_forward(
                             "attention_bias",
                             "padding_mask",
                             "input_ids",
+                            "token_context",
                         ):
                             layer_kwargs.pop(k, None)
                         if (
@@ -178,6 +184,7 @@ def checkpointed_forward(
             *rotary_pos_emb,
             padding_mask,
             input_ids,
+            token_context,
         )
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
