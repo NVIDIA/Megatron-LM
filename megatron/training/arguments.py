@@ -5432,6 +5432,8 @@ def _add_varlen_dataset_args(parser):
         '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
         '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
         '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'Lengths count content tokens: a sampled length n yields n valid training '
+        'tokens after appending EOD and shifting, capped at --seq-length, before padding. '
         'If not specified, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, '
         'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
