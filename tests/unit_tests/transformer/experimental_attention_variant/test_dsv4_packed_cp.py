@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Packed DSv4 CP parity against per-document SBHD; run on at least 4 GPUs."""
+"""DSv4 backend, packed-layout and CP parity; run on at least 4 GPUs."""
 
 import json
 from copy import copy
@@ -33,19 +33,26 @@ class _CP1:
         return 0
 
 
+def _similarities(actual, expected):
+    a, b = actual.flatten().double(), expected.flatten().double()
+    cosine = 1.0 if torch.equal(a, b) else torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+    denominator = (a.square() + b.square()).sum()
+    tensor_sim = (2 * (a * b).sum() / denominator).item() if denominator else 1.0
+    return cosine, tensor_sim
+
+
 def _assert_match(actual, expected):
     assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
     assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
-    # Keep both relative-norm and elementwise gates while the diagnostic
-    # controls separate BF16 accumulation, backend and CP effects.
-    delta = (actual.float() - expected.float()).square().sum()
-    energy = expected.float().square().sum().clamp_min(1e-12)
-    assert delta / energy < 2e-3
-    torch.testing.assert_close(actual, expected, atol=0.06, rtol=0.06)
+    # Match dev's CP criteria: direction and magnitude, reduced in FP64.
+    cosine, tensor_sim = _similarities(actual, expected)
+    assert cosine > 0.999, f"cosine similarity {cosine:.8f} must exceed 0.999"
+    assert tensor_sim > 0.999, f"tensor similarity {tensor_sim:.8f} must exceed 0.999"
 
 
-def _reference_per_document(model, hidden, physical, real):
-    """Use the existing native SBHD backend without packed layout or CP helpers."""
+def _forward_per_document(model, hidden, physical, real):
+    """Run the configured SBHD backend without packed layout or CP helpers."""
     outputs = []
     for i, (start, end) in enumerate(zip(physical, physical[1:])):
         length = real[i + 1] - real[i]
@@ -69,7 +76,7 @@ def _run_attention(model, hidden, grad, packed, *, documents=None, cp_group=None
     if documents is None:
         output, _ = model(hidden, attention_mask=None, packed_seq_params=packed)
     else:
-        output = _reference_per_document(model, hidden, *documents)
+        output = _forward_per_document(model, hidden, *documents)
     output.backward(grad)
     result = {"output": output.detach(), "input_grad": hidden.grad.detach()}
     for name, param in model.named_parameters():
@@ -83,7 +90,7 @@ def _run_attention(model, hidden, grad, packed, *, documents=None, cp_group=None
 
 
 def _compare_results(actual, expected, label, failures, rows=None):
-    """Report every tensor before failing, keeping both existing error gates."""
+    """Report every tensor before failing either of dev's similarity gates."""
     assert actual.keys() == expected.keys(), label
     for name, value in actual.items():
         reference = expected[name]
@@ -92,6 +99,7 @@ def _compare_results(actual, expected, label, failures, rows=None):
         a, b = value.float(), reference.float()
         delta = a - b
         energy = b.square().sum().clamp_min(1e-12)
+        cosine, tensor_sim = _similarities(value, reference)
         stats = {
             "comparison": label,
             "tensor": name,
@@ -101,11 +109,9 @@ def _compare_results(actual, expected, label, failures, rows=None):
             "max_abs": delta.abs().max().item(),
             "mismatch_fraction": (delta.abs() > 0.06 + 0.06 * b.abs()).float().mean().item(),
             "reference_norm": b.norm().item(),
-            "cosine": (
-                1.0
-                if torch.equal(a, b)
-                else torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
-            ),
+            "actual_norm": a.norm().item(),
+            "cosine": cosine,
+            "tensor_sim": tensor_sim,
         }
         try:
             _assert_match(value, reference)
@@ -177,17 +183,8 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
             recompute_granularity="selective" if recompute else None,
             recompute_modules=["mla_up_proj"] if recompute else [],
         )
-        # Keep RoPE arithmetic identical. Sum each document's auxiliary loss
-        # with one global divisor, matching the packed mean over real tokens.
-        ref_cfg = replace(
-            cfg,
-            context_parallel_size=1,
-            dsa_kernel_backend="none",
-            calculate_per_token_loss=True,
-            dsa_indexer_loss_coeff=coeff / real_cu[-1],
-            recompute_granularity=None,
-            recompute_modules=[],
-        )
+        # Isolate CP: keep the packed layout, backend and recompute settings identical.
+        ref_cfg = replace(cfg, context_parallel_size=1)
         model = _build_attention(cfg, 1, pg).cuda()
         reference = _build_attention(ref_cfg, 1, ref_pg).cuda()
         reference.load_state_dict(model.state_dict())
@@ -208,64 +205,39 @@ def test_packed_cp_matches_full_attention_and_gradients(cp_size, ratio, sparse, 
         rows = slice(pg.cp.rank() * count, (pg.cp.rank() + 1) * count)
         documents = (physical_cu, real_cu)
         actual = _run_attention(model, whole[rows], grad[rows], packed, cp_group=pg.cp)
-        expected = _run_attention(reference, whole, grad, packed, documents=documents)
+        expected = _run_attention(reference, whole, grad, packed)
         failures = []
         label = f"ratio={ratio}:cp={cp_size}:fp32_wgrad"
-        _compare_results(actual, expected, f"{label}:cp_vs_native", failures, rows)
+        _compare_results(actual, expected, f"{label}:cp_vs_fused_cp1", failures, rows)
         if ratio == 4 and coeff == 0:
             for name, value in actual.items():
                 if ".indexer." in name:
                     assert torch.count_nonzero(value) == 0, name
 
-        # Limit extra controls to the problematic sparse/recompute case. They
-        # separate CP, recompute and backend effects without expanding the matrix.
-        if ratio == 4 and sparse and recompute:
+        # Check the preceding stages once per configuration, not again for CP4.
+        if cp_size == 2:
             state = model.state_dict()
 
-            def run_control(config, groups, *, native=False):
-                attention = _build_attention(config, 1, groups).cuda()
+            def run_control(config, *, sbhd=False):
+                attention = _build_attention(config, 1, ref_pg).cuda()
                 attention.load_state_dict(state)
-                is_cp = config.context_parallel_size > 1
                 return _run_attention(
-                    attention,
-                    whole[rows] if is_cp else whole,
-                    grad[rows] if is_cp else grad,
-                    packed,
-                    documents=documents if native else None,
-                    cp_group=pg.cp if is_cp else None,
+                    attention, whole, grad, packed, documents=documents if sbhd else None
                 )
 
-            eager_cfg = replace(cfg, recompute_granularity=None, recompute_modules=[])
-            eager = run_control(eager_cfg, pg)
-            fused_cp1 = run_control(replace(eager_cfg, context_parallel_size=1), ref_pg)
-            _compare_results(actual, eager, f"{label}:recompute_vs_eager", failures)
-            _compare_results(eager, fused_cp1, f"{label}:cp_vs_fused_cp1", failures, rows)
-            _compare_results(fused_cp1, expected, f"{label}:fused_cp1_vs_native", failures)
-
-            # Keep the old BF16-wgrad result visible as a diagnostic baseline;
-            # correctness gates above use FP32 accumulation from the TE GEMM onward.
-            bf16_actual = run_control(replace(cfg, gradient_accumulation_fusion=False), pg)
-            bf16_expected = run_control(
-                replace(
-                    ref_cfg,
-                    gradient_accumulation_fusion=False,
-                    recompute_granularity=cfg.recompute_granularity,
-                    recompute_modules=cfg.recompute_modules,
-                ),
-                ref_pg,
-                native=True,
+            # Sum each document's auxiliary loss using the packed global real-token count.
+            sbhd_cfg = replace(
+                ref_cfg, calculate_per_token_loss=True, dsa_indexer_loss_coeff=coeff / real_cu[-1]
             )
-            baseline_failures = []
-            _compare_results(
-                bf16_actual,
-                bf16_expected,
-                f"ratio={ratio}:cp={cp_size}:bf16_wgrad_baseline",
-                baseline_failures,
-                rows,
-            )
-            for result in (bf16_actual, bf16_expected):
-                for name, value in result.items():
-                    assert torch.isfinite(value).all(), f"Non-finite BF16 baseline: {name}"
+            native_sbhd = run_control(replace(sbhd_cfg, dsa_kernel_backend="none"), sbhd=True)
+            fused_sbhd = run_control(sbhd_cfg, sbhd=True)
+            _compare_results(fused_sbhd, native_sbhd, f"{label}:sbhd_fused_vs_native", failures)
+            _compare_results(expected, fused_sbhd, f"{label}:thd_cp1_vs_fused_sbhd", failures)
+            if recompute:
+                eager = run_control(
+                    replace(ref_cfg, recompute_granularity=None, recompute_modules=[])
+                )
+                _compare_results(expected, eager, f"{label}:recompute_vs_eager", failures)
         assert not failures, "\n\n".join(failures)
     finally:
         Utils.destroy_model_parallel()
