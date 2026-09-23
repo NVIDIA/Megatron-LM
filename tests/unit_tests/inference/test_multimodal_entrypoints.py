@@ -320,7 +320,6 @@ async def test_generate_multimodal_entrypoint_with_toy_model(
     )
 
     assert result is service.last_request
-    assert result.compact_prompt_tokens.tolist() == _PROMPT_TOKENS
     assert result.generated_text == "toy output"
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1
@@ -331,7 +330,6 @@ async def test_generate_multimodal_entrypoint_with_toy_model(
 
     payload = OffloadedRequestPayload.from_request(result)
     toy = _toy_preprocessed_media(modality)
-    assert payload.compact_prompt_token_ids == _PROMPT_TOKENS
     assert payload.prompt_token_ids == result.prompt_tokens.tolist()
     expected_keys = {"imgs", "imgs_sizes"} | ({"num_frames"} if modality == "video" else set())
     assert set(payload.media_tensors) == expected_keys
@@ -398,7 +396,6 @@ async def test_completions_multimodal_entrypoint_with_toy_model(
     assert len(payload["choices"]) == 2
     assert payload["choices"][0]["text"] == "7 8"
     assert compute_key.call_count == 1
-    assert service.last_request.compact_prompt_tokens.tolist() == _PROMPT_TOKENS
     assert service.last_wire_data[modality] == [_MEDIA_BYTES]
     assert service.wrapper._forward_vision_encoder.call_count == 1
     assert int((service.last_request.image_token_mask >= 0).sum()) == (

@@ -9,9 +9,8 @@ import pytest
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
     PREFIX_MEDIA_COUNT_FIELD,
-    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD,
-    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     compute_media_cache_key,
     serialize_multimodal_data,
@@ -54,20 +53,16 @@ def test_replace_prefix_tokens_metadata_ships_the_rendered_prefix_and_eos():
     out = _replace_prefix_tokens_metadata(eos, template_prefix, offload_params)
 
     assert out[PREFIX_TEMPLATE_TOKEN_IDS_FIELD] == [1, 99, 2, 99]
-    assert out[PREFIX_EOS_TOKEN_ID_FIELD] == 99
+    assert out[PREFIX_EOS_TOKEN_ID_FIELD] == [99]
     assert out["ng_capture"] == {"staging_chain": ["k1"]}
     assert offload_params == {"ng_capture": {"staging_chain": ["k1"]}}  # input not mutated
 
 
-def test_expanded_prefix_stitching_metadata_uses_model_input_tokens():
-    assistant = {"prompt_token_ids": [10, 99, 99, 20], "generation_token_ids": [7, 8]}
-
-    out = _expanded_prefix_stitching_metadata(2, 1, assistant)
-
-    assert out[PREFIX_EOS_TOKEN_ID_FIELD] == 2
-    assert out[PREFIX_MEDIA_COUNT_FIELD] == 1
-    assert out[PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD] == [10, 99, 99, 20]
-    assert out[PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD] == [7, 8]
+def test_expanded_prefix_stitching_metadata_marks_expanded_prefix():
+    assert _expanded_prefix_stitching_metadata(1, 6) == {
+        PREFIX_MEDIA_COUNT_FIELD: 1,
+        PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6,
+    }
 
 
 def test_suffix_tokens_after_prefix_keeps_only_new_turn_suffix():
@@ -383,7 +378,6 @@ class _PrefixStitchingClient:
                 "generated_tokens": [77],
                 "prompt_length": len(prompt_tokens),
                 "prompt_tokens": list(prompt_tokens),
-                "compact_prompt_tokens": list(prompt_tokens),
                 "num_cached_tokens": 0,
                 "sampling_params": sampling_params.serialize(),
                 "routing_indices": None,
@@ -395,8 +389,8 @@ class _PrefixStitchingClient:
         raise AssertionError("Successful request must not be aborted")
 
 
-def _prefix_stitching_app(quart, chat_completions, *, eval_mode=False):
-    tokenizer = _PrefixStitchingTokenizer()
+def _prefix_stitching_app(quart, chat_completions, *, eval_mode=False, tokenizer=None):
+    tokenizer = tokenizer or _PrefixStitchingTokenizer()
     client = _PrefixStitchingClient()
     spec = MediaPromptSpec(model_token="<image>")
     app = quart.Quart(__name__)
@@ -589,12 +583,19 @@ async def test_multimodal_prefix_stitching_submits_exact_prefix_metadata_and_com
     submission = client.submissions[0]
     assert submission["multi_modal_data"] is not None
     if prevent_retokenization:
-        assert submission["prompt_tokens"] == [2, 30, *([42] if current_turn_has_media else [])]
+        assert submission["prompt_tokens"] == [
+            100,
+            99,
+            99,
+            101,
+            200,
+            2,
+            30,
+            *([42] if current_turn_has_media else []),
+        ]
         assert submission["offload_params"] == {
-            PREFIX_EOS_TOKEN_ID_FIELD: 2,
             PREFIX_MEDIA_COUNT_FIELD: 1,
-            PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [100, 99, 99, 101],
-            PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [200, 2],
+            PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6,
         }
     else:
         assert submission["prompt_tokens"] == [
@@ -677,13 +678,149 @@ async def test_offloaded_prefix_stitching_metadata_covers_text_and_multimodal_hi
 
     assert response.status_code == 200
     submission = client.submissions[0]
+    expected_prompt = [10, 42, 2, 20, 2, 30] if prefix_has_media else [10, 2, 20, 2, 30]
+    assert submission["prompt_tokens"] == expected_prompt
     expected_template_prefix = [10, 42, 2, 20, 2] if prefix_has_media else [10, 2, 20, 2]
     assert submission["offload_params"] == {
         "stager": {"request_id": "r0"},
         PREFIX_TEMPLATE_TOKEN_IDS_FIELD: expected_template_prefix,
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
         **({PREFIX_MEDIA_COUNT_FIELD: 1} if prefix_has_media else {}),
     }
+
+
+class _MultiEosPrefixStitchingTokenizer(_PrefixStitchingTokenizer):
+    eod = 2
+    generation_config = {"eos_token_id": [2, 11]}
+
+
+def _image_history_request(
+    image_url, generation_token_ids, prompt_token_ids=(100, 99, 99, 101), **request_kwargs
+):
+    return {
+        "messages": [
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}]},
+            {
+                "role": "assistant",
+                "content": "first answer",
+                "prompt_token_ids": list(prompt_token_ids),
+                "generation_token_ids": generation_token_ids,
+            },
+            {"role": "user", "content": "second question"},
+        ],
+        "prevent_retokenization": True,
+        "max_tokens": 1,
+        **request_kwargs,
+    }
+
+
+def _fake_image_history_tokenize(
+    _tokenizer,
+    messages,
+    _media_slots,
+    _prompt_config,
+    *,
+    tools,
+    chat_template_kwargs,
+    add_generation_prompt=True,
+):
+    del tools, chat_template_kwargs
+    if len(messages) == 2 and not add_generation_prompt:
+        return [10, 42, 2, 20, 2]
+    return [10, 42, 2, 20, 2, 30]
+
+
+@pytest.mark.asyncio
+async def test_text_prefix_stitching_recognizes_every_model_eos():
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(
+        quart, chat_completions, tokenizer=_MultiEosPrefixStitchingTokenizer()
+    )
+    response = await app.test_client().post(
+        "/v1/chat/completions",
+        json={
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {
+                    "role": "assistant",
+                    "content": "first answer",
+                    "prompt_token_ids": [100, 101],
+                    "generation_token_ids": [200, 201, 11],
+                },
+                {"role": "user", "content": "second question"},
+            ],
+            "prevent_retokenization": True,
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.submissions[0]["prompt_tokens"] == [100, 101, 200, 201, 11, 30, 31]
+
+
+@pytest.mark.asyncio
+async def test_multimodal_prefix_stitching_recognizes_every_model_eos():
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    app, client = _prefix_stitching_app(
+        quart, chat_completions, tokenizer=_MultiEosPrefixStitchingTokenizer()
+    )
+    image_url = f"data:image/png;base64,{base64.b64encode(b'image').decode()}"
+    with mock.patch.object(
+        chat_completions,
+        "_tokenize_with_media_slots_sync",
+        side_effect=_fake_image_history_tokenize,
+    ):
+        response = await app.test_client().post(
+            "/v1/chat/completions", json=_image_history_request(image_url, [200, 11])
+        )
+
+    assert response.status_code == 200
+    submission = client.submissions[0]
+    assert submission["prompt_tokens"] == [100, 99, 99, 101, 200, 11, 30]
+    assert submission["offload_params"][PREFIX_EXPANDED_TOKEN_COUNT_FIELD] == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("add_BOS", "expected_prompt", "expected_prefix_count"),
+    [(False, [100, 99, 99, 101, 200, 2, 30], 6), (True, [1, 100, 99, 99, 101, 200, 2, 30], 7)],
+)
+async def test_multimodal_expanded_prefix_count_follows_bos_handling(
+    add_BOS, expected_prompt, expected_prefix_count
+):
+    quart = pytest.importorskip("quart")
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints import (
+        chat_completions,
+    )
+
+    tokenizer = _PrefixStitchingTokenizer()
+    tokenizer.bos = 1
+    app, client = _prefix_stitching_app(quart, chat_completions, tokenizer=tokenizer)
+    image_url = f"data:image/png;base64,{base64.b64encode(b'image').decode()}"
+    with mock.patch.object(
+        chat_completions,
+        "_tokenize_with_media_slots_sync",
+        side_effect=_fake_image_history_tokenize,
+    ):
+        response = await app.test_client().post(
+            "/v1/chat/completions",
+            json=_image_history_request(
+                image_url, [200, 2], prompt_token_ids=[1, 100, 99, 99, 101], add_BOS=add_BOS
+            ),
+        )
+
+    assert response.status_code == 200
+    submission = client.submissions[0]
+    assert submission["prompt_tokens"] == expected_prompt
+    assert submission["offload_params"][PREFIX_EXPANDED_TOKEN_COUNT_FIELD] == expected_prefix_count
 
 
 @pytest.mark.asyncio
@@ -769,7 +906,6 @@ async def test_n_choices_prepare_and_serialize_shared_media_once():
                     "generated_tokens": [request_id],
                     "prompt_length": len(prompt_tokens),
                     "prompt_tokens": prompt_tokens,
-                    "compact_prompt_tokens": prompt_tokens,
                     "num_cached_tokens": 0,
                     "sampling_params": sampling_params.serialize(),
                     "routing_indices": None,

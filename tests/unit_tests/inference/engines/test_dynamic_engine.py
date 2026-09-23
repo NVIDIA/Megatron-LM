@@ -45,9 +45,8 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
     PREFIX_MEDIA_COUNT_FIELD,
-    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD,
-    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD,
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -247,7 +246,6 @@ def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
     request = _call_build_vlm_request(engine, tokens, media_tokens_preexpanded=True)
 
     assert torch.equal(request.prompt_tokens, tokens)
-    assert request.compact_prompt_tokens is None
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
     wrapper.expand_image_tokens.assert_not_called()
     wrapper.resolve_media_token_id.assert_not_called()
@@ -294,59 +292,52 @@ def test_build_vlm_request_keeps_compact_expansion_path():
     assert encoder_kwargs["num_image_tiles"] is None
     assert torch.equal(encoder_kwargs["imgs_sizes"], torch.tensor([[2, 2]]))
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
-    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
 
 
 def test_build_vlm_request_stitches_expanded_multimodal_prefix():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    compact_tokens = torch.tensor([2, 30, 40], dtype=torch.int64)
+    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 2, 30, 40], dtype=torch.int64)
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
-        [-1, 0, 1, -1], dtype=torch.int64
+        [-1, 0, 1, -1, -1, -1, -1], dtype=torch.int64
     )
     stitching_metadata = {
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
         PREFIX_MEDIA_COUNT_FIELD: 1,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 8, 2],
+        PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7,
     }
 
     request = _call_build_vlm_request(
-        engine, compact_tokens, media_tokens_preexpanded=False, offload_params=stitching_metadata
+        engine, stitched_tokens, media_tokens_preexpanded=False, offload_params=stitching_metadata
     )
 
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 7, 8, 2, 30, 40]
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1, -1, -1, -1, -1, -1]
-    assert request.compact_prompt_tokens is None
     assert request.media_tokens_preexpanded is True
     assert request.offload_params is None
+    assert wrapper.build_preexpanded_media_token_mask.call_args.args[0].tolist() == [
+        10,
+        99,
+        99,
+        20,
+        7,
+        8,
+        2,
+    ]
     wrapper.expand_image_tokens.assert_not_called()
 
 
-def test_build_vlm_request_moves_requested_bos_before_stitched_prefix():
-    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    engine.controller.tokenizer.bos = 1
-    suffix_tokens = torch.tensor([1, 2, 30, 40], dtype=torch.int64)
-    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
-        [-1, 0, 1, -1], dtype=torch.int64
-    )
-    stitching_metadata = {
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
-        PREFIX_MEDIA_COUNT_FIELD: 1,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 8, 2],
-    }
+def test_build_vlm_request_rejects_expanded_prefix_longer_than_prompt():
+    engine, _ = _build_mock_vlm_engine(torch.ones(2, 4))
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 10}
 
-    request = _call_build_vlm_request(
-        engine,
-        suffix_tokens,
-        media_tokens_preexpanded=False,
-        offload_params=stitching_metadata,
-        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0, add_BOS=True),
-    )
-
-    assert request.prompt_tokens.tolist() == [1, 10, 99, 99, 20, 7, 8, 2, 30, 40]
-    assert request.image_token_mask.tolist() == [-1, -1, 0, 1, -1, -1, -1, -1, -1, -1]
+    with pytest.raises(ValueError, match="exceeds the prompt length"):
+        _call_build_vlm_request(
+            engine,
+            torch.tensor([10, 99, 99, 20], dtype=torch.int64),
+            media_tokens_preexpanded=False,
+            offload_params=stitching_metadata,
+        )
 
 
 def test_expanded_prefix_metadata_reports_every_missing_preparer_field():
@@ -354,52 +345,39 @@ def test_expanded_prefix_metadata_reports_every_missing_preparer_field():
         dynamic_engine._take_expanded_prefix_stitching_metadata({PREFIX_MEDIA_COUNT_FIELD: 1})
 
     message = str(error.value)
-    assert PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD in message
-    assert PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD in message
-    assert PREFIX_EOS_TOKEN_ID_FIELD in message
-    assert "RequestPromptPreparer must return all four fields" in message
+    assert PREFIX_EXPANDED_TOKEN_COUNT_FIELD in message
+    assert "RequestPromptPreparer must be configured" in message
 
 
 @pytest.mark.parametrize(
-    ("field", "bad_value", "expected_description"),
+    ("field", "bad_value"),
     [
-        (PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD, "not-a-list", "exact, already-expanded token IDs"),
-        (PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD, [True], "exact token IDs generated"),
-        (PREFIX_MEDIA_COUNT_FIELD, -1, "nonnegative integer"),
-        (PREFIX_EOS_TOKEN_ID_FIELD, "2", "integer EOS token ID"),
-        (PREFIX_EOS_TOKEN_ID_FIELD, [2, True], "list of integer EOS token IDs"),
+        (PREFIX_EXPANDED_TOKEN_COUNT_FIELD, -1),
+        (PREFIX_EXPANDED_TOKEN_COUNT_FIELD, True),
+        (PREFIX_MEDIA_COUNT_FIELD, -1),
+        (PREFIX_MEDIA_COUNT_FIELD, "1"),
     ],
 )
-def test_expanded_prefix_metadata_validates_each_field(field, bad_value, expected_description):
-    metadata = {
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 8, 2],
-        PREFIX_MEDIA_COUNT_FIELD: 1,
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
-    }
+def test_expanded_prefix_metadata_validates_each_field(field, bad_value):
+    metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
     metadata[field] = bad_value
 
-    with pytest.raises(ValueError, match=expected_description):
+    with pytest.raises(ValueError, match="nonnegative integer"):
         dynamic_engine._take_expanded_prefix_stitching_metadata(metadata)
 
 
 def test_build_vlm_request_expands_only_new_suffix_media():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(4, 4))
-    suffix_tokens = torch.tensor([2, 30, 42, 40], dtype=torch.int64)
-    wrapper.expand_image_tokens.return_value = ([[2, 30, -1, -1, 40]], [[None, None, 0, 1, None]])
+    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 11, 30, 42, 40], dtype=torch.int64)
+    wrapper.expand_image_tokens.return_value = ([[30, -1, -1, 40]], [[None, 0, 1, None]])
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
-        [-1, 0, 1, -1], dtype=torch.int64
+        [-1, 0, 1, -1, -1, -1, -1], dtype=torch.int64
     )
-    stitching_metadata = {
-        PREFIX_EOS_TOKEN_ID_FIELD: [2, 11],
-        PREFIX_MEDIA_COUNT_FIELD: 1,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 8, 11],
-    }
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
 
     request = _call_build_vlm_request(
         engine,
-        suffix_tokens,
+        stitched_tokens,
         media_tokens_preexpanded=False,
         offload_params=stitching_metadata,
         imgs_sizes=torch.tensor([[2, 2], [3, 3]]),
@@ -408,28 +386,23 @@ def test_build_vlm_request_expands_only_new_suffix_media():
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 7, 8, 11, 30, 99, 99, 40]
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, -1]
     wrapper.expand_image_tokens.assert_called_once()
+    assert wrapper.expand_image_tokens.call_args.args[0] == [[30, 42, 40]]
     assert torch.equal(
         wrapper.expand_image_tokens.call_args.kwargs["imgs_sizes"], torch.tensor([[3, 3]])
     )
 
 
-def test_build_vlm_request_stitches_preexpanded_suffix_without_double_expansion():
+def test_build_vlm_request_preexpanded_stitched_prompt_is_not_expanded_again():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(4, 4))
-    suffix_tokens = torch.tensor([2, 30, 99, 99, 40], dtype=torch.int64)
-    wrapper.build_preexpanded_media_token_mask.side_effect = (
-        torch.tensor([-1, -1, 0, 1, -1], dtype=torch.int64),
-        torch.tensor([-1, 0, 1, -1], dtype=torch.int64),
+    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 2, 30, 99, 99, 40], dtype=torch.int64)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, -1], dtype=torch.int64
     )
-    stitching_metadata = {
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
-        PREFIX_MEDIA_COUNT_FIELD: 1,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 8, 2],
-    }
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
 
     request = _call_build_vlm_request(
         engine,
-        suffix_tokens,
+        stitched_tokens,
         media_tokens_preexpanded=True,
         offload_params=stitching_metadata,
         imgs_sizes=torch.tensor([[2, 2], [3, 3]]),
@@ -437,27 +410,21 @@ def test_build_vlm_request_stitches_preexpanded_suffix_without_double_expansion(
 
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 7, 8, 2, 30, 99, 99, 40]
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, -1]
-    assert request.compact_prompt_tokens is None
     assert request.media_tokens_preexpanded is True
     wrapper.expand_image_tokens.assert_not_called()
 
 
 def test_build_vlm_request_offsets_suffix_embeddings_after_multiple_prefix_media():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(6, 4))
-    wrapper.expand_image_tokens.return_value = ([[2, 30, -1, -1, 40]], [[None, None, 0, 1, None]])
+    wrapper.expand_image_tokens.return_value = ([[30, -1, -1, 40]], [[None, 0, 1, None]])
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
-        [-1, 0, 1, -1, 2, 3, -1], dtype=torch.int64
+        [-1, 0, 1, -1, 2, 3, -1, -1, -1], dtype=torch.int64
     )
-    stitching_metadata = {
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
-        PREFIX_MEDIA_COUNT_FIELD: 2,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20, 99, 99, 21],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 2],
-    }
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 2, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 9}
 
     request = _call_build_vlm_request(
         engine,
-        torch.tensor([2, 30, 42, 40], dtype=torch.int64),
+        torch.tensor([10, 99, 99, 20, 99, 99, 21, 7, 2, 30, 42, 40], dtype=torch.int64),
         media_tokens_preexpanded=False,
         offload_params=stitching_metadata,
         imgs_sizes=torch.tensor([[2, 2], [3, 3], [4, 4]]),
@@ -549,14 +516,14 @@ def test_build_vlm_request_preserves_adjacent_compact_media_placeholders():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     compact_tokens = torch.tensor([10, 42, 42, 20], dtype=torch.int64)
     # The expanded sequence is structurally ambiguous: it could also represent
-    # one placeholder expanded to two positions. The saved compact prompt is
+    # one placeholder expanded to two positions. The admission mask is
     # therefore required for lossless multi-turn reconstruction.
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
 
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
-    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
 
 
 def test_build_vlm_request_enables_media_salted_prefix_caching():
@@ -1957,7 +1924,6 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     request = DynamicVLMInferenceRequest(
         request_id=31,
         prompt_tokens=torch.tensor([99, 99, 5]),
-        compact_prompt_tokens=torch.tensor([99, 5]),
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         num_img_embeddings_per_tile=0,
         imgs=torch.ones(1),
@@ -1999,7 +1965,6 @@ def test_finished_vlm_reply_omits_input_only_tensors():
     request = DynamicVLMInferenceRequest(
         request_id=31,
         prompt_tokens=torch.tensor([99, 5]),
-        compact_prompt_tokens=torch.tensor([99, 5]),
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         num_img_embeddings_per_tile=0,
         imgs=torch.ones(1),
@@ -2046,11 +2011,10 @@ def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
     assert engine._vision_embedding_cache_bytes == 4
 
 
-def test_refresh_vlm_request_recomputes_embeddings_and_mask():
+def test_refresh_vlm_request_recomputes_embeddings_from_preserved_mask():
     request = DynamicVLMInferenceRequest(
         request_id=32,
         prompt_tokens=torch.tensor([99, 99, 5, 7]),
-        compact_prompt_tokens=torch.tensor([99, 5]),
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         block_hash_salt="w7\0media",
         media_cache_key="media",
@@ -2063,23 +2027,17 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
         video_fps=[30.0],
         decoder_seq_length=0,
         image_embeddings=None,
-        image_token_mask=None,
+        image_token_mask=torch.tensor([0, 1, -1]),
     )
     wrapper = types.SimpleNamespace(
-        multimodal_prompt_config=MultimodalPromptConfig(
-            video_spec=MediaPromptSpec(expansion_mode="temporal_patch")
-        ),
-        resolve_media_token_id=mock.Mock(return_value=99),
-        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
-        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4))
     )
     retained_imgs = mock.Mock()
     device_imgs = torch.ones(1)
     retained_imgs.to.return_value = device_imgs
     request.imgs = retained_imgs
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    tokenizer = object()
-    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=tokenizer)
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
     engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
     engine._cache_vision_embedding = mock.Mock()
 
@@ -2091,10 +2049,6 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
     assert encoder_kwargs["num_image_tiles"] is None
     assert encoder_kwargs["imgs_sizes"].device == request.prompt_tokens.device
     assert encoder_kwargs["num_frames"].device == request.prompt_tokens.device
-    expansion_kwargs = wrapper.expand_image_tokens.call_args.kwargs
-    assert expansion_kwargs["tokenizer"] is tokenizer
-    assert expansion_kwargs["video_frame_indices"] == [[0]]
-    assert expansion_kwargs["video_fps"] == [30.0]
     assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
     assert request.image_token_mask.tolist() == [0, 1, -1, -1]
     engine._cache_vision_embedding.assert_called_once()
@@ -2106,6 +2060,28 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
     )
 
 
+def test_refresh_vlm_request_without_mask_fails_for_compact_admitted_request():
+    request = DynamicVLMInferenceRequest(
+        request_id=34,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=None,
+        image_token_mask=None,
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(), tokenizer=object()
+    )
+
+    with pytest.raises(RuntimeError, match="media token mask was not retained"):
+        engine._refresh_vlm_request_data(request)
+
+
 def test_refresh_stitched_request_preserves_generated_media_token_as_text():
     original_mask = torch.tensor([0, 1, -1])
     request = DynamicVLMInferenceRequest(
@@ -2113,7 +2089,6 @@ def test_refresh_stitched_request_preserves_generated_media_token_as_text():
         # The last 99 was generated and must remain text rather than becoming
         # a third media embedding position during a weight-refit refresh.
         prompt_tokens=torch.tensor([99, 99, 5, 99]),
-        compact_prompt_tokens=None,
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         media_tokens_preexpanded=True,
         num_img_embeddings_per_tile=0,
@@ -2154,7 +2129,6 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     original_request = DynamicVLMInferenceRequest(
         request_id=33,
         prompt_tokens=torch.tensor([99, 99, 5], device=device),
-        compact_prompt_tokens=torch.tensor([99, 5], device=device),
         sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
         block_hash_salt="media",
         media_cache_key="media",
@@ -2185,9 +2159,7 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     engine.requests = {checkpointed_request.request_id: types.SimpleNamespace(record=record)}
     refreshed_embeddings = torch.ones(2, 1, 4, device=device)
     wrapper = types.SimpleNamespace(
-        resolve_media_token_id=mock.Mock(return_value=99),
-        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
-        _forward_vision_encoder=mock.Mock(return_value=refreshed_embeddings),
+        _forward_vision_encoder=mock.Mock(return_value=refreshed_embeddings)
     )
     engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
     engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
@@ -2198,7 +2170,6 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
 
     assert checkpointed_request.prompt_tokens.tolist() == [99, 99, 5, 7, 8]
     assert checkpointed_request.prompt_tokens.device == device
-    assert checkpointed_request.compact_prompt_tokens is original_request.compact_prompt_tokens
     assert checkpointed_request.imgs is imgs
     assert checkpointed_request.imgs_sizes is imgs_sizes
     assert checkpointed_request.media_cache_key == "media"
@@ -2326,7 +2297,7 @@ def test_payload_offload_stages_only_eligible_completed_replies(
         assert payload.generated_token_ids == [10, 11]
         assert payload.generated_log_probs == [-0.5, -0.25]
         assert ok_wire["payload_offloaded"] is True and ok_wire["generated_log_probs"] is None
-        for prompt_field in ("prompt_tokens", "compact_prompt_tokens", "remaining_prompt_tokens"):
+        for prompt_field in ("prompt_tokens", "remaining_prompt_tokens"):
             assert ok_wire[prompt_field] is None, prompt_field
     else:
         assert not getattr(engine.payload_stager, "staged", [])
@@ -2426,14 +2397,9 @@ def test_engine_defers_expanded_multimodal_stitching_past_prompt_preparer():
 
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.prompt_preparer = _Preparer()
-    params = {
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
-        PREFIX_MEDIA_COUNT_FIELD: 1,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 8, 2],
-    }
+    params = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
     message = _submit_request_message(
-        17, SamplingParams(temperature=0.5).serialize(), [10, 42, 20, 2, 30], params
+        17, SamplingParams(temperature=0.5).serialize(), [10, 99, 99, 20, 7, 8, 2, 30], params
     )
 
     assert engine._prepare_submit_request_message(message) is message
@@ -2442,15 +2408,14 @@ def test_engine_defers_expanded_multimodal_stitching_past_prompt_preparer():
 def test_engine_prompt_preparer_materializes_deferred_multimodal_prefix():
     class _Preparer:
         def prepare_prompt(self, prompt, *, offload_params=None):
-            assert prompt == [2, 30, 42]
+            assert prompt == [10, 42, 2, 20, 2, 30, 42]
             assert offload_params[PREFIX_MEDIA_COUNT_FIELD] == 1
             assert offload_params["template_prefix_token_ids"] == [10, 42, 2, 20, 2]
             return RequestPromptPreparationResult(
-                prompt=prompt,
+                prompt=[100, 99, 99, 101, 200, 2, 30, 42],
                 offload_params={
                     **offload_params,
-                    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [100, 99, 99, 101],
-                    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [200, 2],
+                    PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6,
                     "stager_metadata": {"key": "value"},
                 },
             )
@@ -2458,12 +2423,12 @@ def test_engine_prompt_preparer_materializes_deferred_multimodal_prefix():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.prompt_preparer = _Preparer()
     params = {
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
         PREFIX_MEDIA_COUNT_FIELD: 1,
         "template_prefix_token_ids": [10, 42, 2, 20, 2],
     }
     message = _submit_request_message(
-        17, SamplingParams(temperature=0.5).serialize(), [2, 30, 42], params
+        17, SamplingParams(temperature=0.5).serialize(), [10, 42, 2, 20, 2, 30, 42], params
     )
 
     prepared = engine._prepare_submit_request_message(message)
@@ -2472,13 +2437,8 @@ def test_engine_prompt_preparer_materializes_deferred_multimodal_prefix():
         prepared_params
     )
 
-    assert msgpack.unpackb(prepared[1], raw=False) == [2, 30, 42]
-    assert stitching_metadata == {
-        PREFIX_EOS_TOKEN_ID_FIELD: 2,
-        PREFIX_MEDIA_COUNT_FIELD: 1,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [100, 99, 99, 101],
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [200, 2],
-    }
+    assert msgpack.unpackb(prepared[1], raw=False) == [100, 99, 99, 101, 200, 2, 30, 42]
+    assert stitching_metadata == {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6}
     assert remaining == {"stager_metadata": {"key": "value"}}
 
 

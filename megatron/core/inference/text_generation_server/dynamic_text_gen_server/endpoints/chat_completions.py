@@ -23,9 +23,8 @@ _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
     PREFIX_MEDIA_COUNT_FIELD,
-    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD,
-    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     prepare_multimodal_data,
     unwrap_serialized_tensors,
@@ -34,6 +33,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import model_eos_token_ids
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
@@ -63,8 +63,6 @@ _TOKEN_ID_FIELDS_TO_REDACT = {
     "generated_tokens",
     "prompt_token_ids",
     "generation_token_ids",
-    PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD,
-    PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD,
 }
 
 _INDEX_FIELDS_TO_REDACT = {"routing_indices", "moe_topk_indices", "prompt_moe_topk_indices"}
@@ -639,18 +637,11 @@ def _replace_prefix_tokens_metadata(eos_token_ids, template_prefix_token_ids, of
     }
 
 
-def _expanded_prefix_stitching_metadata(
-    eos_token_ids, prefix_media_count, last_assistant_message, offload_params=None
-):
-    """Carry an exact expanded prefix while the wire prompt contains only the compact suffix."""
+def _expanded_prefix_stitching_metadata(prefix_media_count, expanded_prefix_token_count):
+    """Mark the exact, already-expanded prefix so the engine only expands the tokens after it."""
     return {
-        **(offload_params or {}),
-        PREFIX_EOS_TOKEN_ID_FIELD: _serialize_eos_token_ids(eos_token_ids),
         PREFIX_MEDIA_COUNT_FIELD: prefix_media_count,
-        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: list(last_assistant_message["prompt_token_ids"]),
-        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: list(
-            last_assistant_message["generation_token_ids"]
-        ),
+        PREFIX_EXPANDED_TOKEN_COUNT_FIELD: expanded_prefix_token_count,
     }
 
 
@@ -668,11 +659,8 @@ def _normalize_eos_token_ids(eos_token_ids):
 
 
 def _serialize_eos_token_ids(eos_token_ids):
-    """Keep the legacy scalar wire form while allowing a JSON-compatible list."""
-    normalized = _normalize_eos_token_ids(eos_token_ids)
-    if type(eos_token_ids) is int:
-        return eos_token_ids
-    return sorted(normalized)
+    """Serialize one or more EOS IDs as a JSON-compatible list."""
+    return sorted(_normalize_eos_token_ids(eos_token_ids))
 
 
 def _suffix_tokens_after_prefix(eos_token_ids, template_prefix_token_ids, current_tokens):
@@ -681,7 +669,10 @@ def _suffix_tokens_after_prefix(eos_token_ids, template_prefix_token_ids, curren
     eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
     eos_count = sum(token_id in eos_token_ids for token_id in template_prefix_token_ids)
     if eos_count <= 0:
-        raise ValueError("Could not locate an EOS-delimited previous turn.")
+        raise ValueError(
+            "Could not locate an EOS-delimited previous turn: the chat template's turn "
+            f"terminator is not among the model EOS token IDs {sorted(eos_token_ids)}."
+        )
 
     # Scan current_tokens from beginning to end. Return the suffix after eos_count
     # EOS tokens have been seen.
@@ -694,7 +685,7 @@ def _suffix_tokens_after_prefix(eos_token_ids, template_prefix_token_ids, curren
             if seen_eos == eos_count:
                 return current_tokens[position:]
     raise ValueError(
-        f"Expected {eos_count} EOS token(s) before the new turn, " f"but found only {seen_eos}."
+        f"Expected {eos_count} EOS token(s) before the new turn, but found only {seen_eos}."
     )
 
 
@@ -1049,8 +1040,10 @@ try:
                             "payload is missing from message history. Preserve prior media content "
                             "when using prevent_retokenization."
                         )
-                    eos_token_id = tokenizer.eos_id
-                    assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
+                    eos_token_ids = set(model_eos_token_ids(tokenizer))
+                    if getattr(tokenizer, "eos_id", None) is not None:
+                        eos_token_ids.add(tokenizer.eos_id)
+                    assert eos_token_ids, "Your tokenizer must have an EOS token ID!"
 
                     warnings.warn(
                         "Avoiding prefix retokenization."
@@ -1093,36 +1086,32 @@ try:
                     if use_offloaded_prefix_stitching:
                         # Offloaded tokens are stitched in engine via RequestPromptPreparer.
                         offload_params = _replace_prefix_tokens_metadata(
-                            eos_token_id, retokenized_previous_turn_token_ids, offload_params
+                            eos_token_ids, retokenized_previous_turn_token_ids, offload_params
                         )
                         if previous_media_slots:
-                            # Multimodal post-expansion stitching requires an expanded prefix
-                            # and compact / pre-expanded suffix from RequestPromptPreparer.
+                            # Multimodal post-expansion stitching requires the expanded prefix
+                            # length from RequestPromptPreparer and a compact / pre-expansion suffix.
                             # PREFIX_MEDIA_COUNT_FIELD signals multimodal expansion and is
                             # used to figure out how many subsequent media tokens to expand.
                             offload_params[PREFIX_MEDIA_COUNT_FIELD] = len(previous_media_slots)
-                    elif previous_media_slots:
-                        # Multi-modal post-expansion stitching passes the pre-expanded prefix
-                        # and non-expanded suffix to the engine for stitching after expanding
-                        # the multimodal tokens in the suffix only.
-                        prompt_tokens = _suffix_tokens_after_prefix(
-                            eos_token_id, retokenized_previous_turn_token_ids, prompt_tokens
-                        )
-                        offload_params = _expanded_prefix_stitching_metadata(
-                            eos_token_id, len(previous_media_slots), last_assistant_message
-                        )
                     else:
-                        # Neither offload nor multimodal. Just stitch here.
+                        # Not offloaded. Just stitch here.
                         previous_turn_token_ids = (
                             last_assistant_message["prompt_token_ids"]
                             + last_assistant_message["generation_token_ids"]
                         )
                         prompt_tokens = _replace_prefix_tokens(
-                            eos_token_id,
+                            eos_token_ids,
                             previous_turn_token_ids,
                             retokenized_previous_turn_token_ids,
                             prompt_tokens,
                         )
+                        if previous_media_slots:
+                            # The previous turn is already expanded. The engine only
+                            # expands the media tokens after it.
+                            offload_params = _expanded_prefix_stitching_metadata(
+                                len(previous_media_slots), len(previous_turn_token_ids)
+                            )
 
             else:
                 if media_slots:
@@ -1189,6 +1178,7 @@ try:
             # input. Since we pre-tokenize via apply_chat_template, we must handle
             # BOS ourselves, matching the logic in tokenize_prompt().
             if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
+                prompt_length = len(prompt_tokens)
                 start_idx = 0
                 while start_idx < len(prompt_tokens) and prompt_tokens[start_idx] == tokenizer.bos:
                     start_idx += 1
@@ -1197,6 +1187,12 @@ try:
 
                 if add_BOS:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
+
+                if offload_params and PREFIX_EXPANDED_TOKEN_COUNT_FIELD in offload_params:
+                    # BOS changes happen inside the expanded prefix.
+                    offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] += (
+                        len(prompt_tokens) - prompt_length
+                    )
 
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
             ignore_eos = bool(req.get("ignore_eos", False))

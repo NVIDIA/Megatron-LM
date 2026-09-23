@@ -598,21 +598,16 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
         "return_prompt_tokens",
         "payload_offloaded",
         "expected_prompt_field",
-        "expected_compact_prompt_field",
         "expected_remaining_prompt_field",
     ),
     [
-        (False, False, None, None, None),  # default: prompt state dropped from payload
-        (True, False, [1, 2, 3, 4], [1, 99, 4], [1, 2, 3, 4]),  # opt-in: prompt state preserved
-        (True, True, None, None, None),  # offload drops the prompt even when opted in
+        (False, False, None, None),  # default: prompt state dropped from payload
+        (True, False, [1, 2, 3, 4], [1, 2, 3, 4]),  # opt-in: prompt state preserved
+        (True, True, None, None),  # offload drops the prompt even when opted in
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
-    return_prompt_tokens,
-    payload_offloaded,
-    expected_prompt_field,
-    expected_compact_prompt_field,
-    expected_remaining_prompt_field,
+    return_prompt_tokens, payload_offloaded, expected_prompt_field, expected_remaining_prompt_field
 ):
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
@@ -628,15 +623,10 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
         num_tokens_to_generate=5, termination_id=0, return_prompt_tokens=return_prompt_tokens
     )
     prompt = torch.tensor([1, 2, 3, 4])
-    compact_prompt = torch.tensor([1, 99, 4])
     # prompt_len=4 + generated=[10] → total_tokens=5 → routing_indices.shape[0] must be 4.
     routing = np.zeros((4, 2, 1), dtype=np.int32)
     req = _make_dynamic_request(
-        prompt_tokens=prompt,
-        compact_prompt_tokens=compact_prompt,
-        sampling_params=sp,
-        generated_tokens=[10],
-        routing_indices=routing,
+        prompt_tokens=prompt, sampling_params=sp, generated_tokens=[10], routing_indices=routing
     )
 
     obj = req.serialize(payload_offloaded=payload_offloaded)
@@ -646,12 +636,10 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     assert obj["prompt_length"] == 4
     # Payload either preserves the serialized tensor values or drops them (present but None).
     assert unwrapped_obj["prompt_tokens"] == expected_prompt_field
-    assert unwrapped_obj["compact_prompt_tokens"] == expected_compact_prompt_field
     assert unwrapped_obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
     assert obj["payload_offloaded"] is payload_offloaded
     # Local instance is unaffected — the drop is wire-only.
     assert req.prompt_tokens is prompt
-    assert req.compact_prompt_tokens is compact_prompt
     # routing_indices survives the prompt-only drop path, but payload offload strips it.
     # The former's shape check would crash if it used temporarily-None self.prompt_tokens.
     if payload_offloaded:
@@ -680,8 +668,6 @@ def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(m
     """A serialization failure must not clear prompt state on the live request."""
     request = _make_dynamic_request()
     prompt_tokens = request.prompt_tokens
-    request.compact_prompt_tokens = torch.tensor([1, 99, 4])
-    compact_prompt_tokens = request.compact_prompt_tokens
     request.remaining_prompt_tokens = request.prompt_tokens[2:]
     remaining_prompt_tokens = request.remaining_prompt_tokens
 
@@ -694,7 +680,6 @@ def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(m
         request.serialize()
 
     assert request.prompt_tokens is prompt_tokens
-    assert request.compact_prompt_tokens is compact_prompt_tokens
     assert request.remaining_prompt_tokens is remaining_prompt_tokens
 
 
@@ -914,7 +899,6 @@ def test_offloaded_request_payload_and_serialize():
             prompt_tokens=torch.tensor([1, 2, 3]),
             sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
             generated_tokens=[10, 11],
-            compact_prompt_tokens=torch.tensor([1, 2]) if multimodal else None,
             media_tensors={"imgs": imgs} if multimodal else None,
         )
         req.generated_log_probs = [-0.5, -0.25]
@@ -929,10 +913,9 @@ def test_offloaded_request_payload_and_serialize():
     assert payload.generated_log_probs == [-0.5, -0.25]
     assert payload.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
     assert payload.routing_indices is routing
-    assert payload.compact_prompt_token_ids is None and payload.media_tensors is None
+    assert payload.media_tensors is None
 
     vlm_payload = OffloadedRequestPayload.from_request(make_request(multimodal=True))
-    assert vlm_payload.compact_prompt_token_ids == [1, 2]
     assert torch.equal(vlm_payload.media_tensors["imgs"], imgs)
     assert vlm_payload.media_tensors["imgs"].device.type == "cpu"
 

@@ -46,6 +46,28 @@ def detokenize_tokens(
     return tokenizer.detokenize(tokens)
 
 
+def model_eos_token_ids(tokenizer: Any) -> frozenset:
+    """Return the model-level EOS token IDs.
+
+    Honors `generation_config.eos_token_id` (which HF may declare as a LIST, e.g.
+    `[2, 11]`) in addition to the tokenizer's single `eod`. The generation_config is
+    read off the tokenizer if present (HF tokenizers attach it; other tokenizers
+    won't).
+    """
+    ids = set()
+    eod = getattr(tokenizer, "eod", None)
+    if eod is not None:
+        ids.add(int(eod))
+    gen_cfg = getattr(tokenizer, "generation_config", None)
+    if isinstance(gen_cfg, dict):
+        eos = gen_cfg.get("eos_token_id")
+        if isinstance(eos, int) and not isinstance(eos, bool):
+            ids.add(eos)
+        elif isinstance(eos, (list, tuple)):
+            ids.update(int(e) for e in eos if isinstance(e, int) and not isinstance(e, bool))
+    return frozenset(ids)
+
+
 class InferenceMode:
     """Process-wide flag indicating whether an inference engine is currently using the model.
 
