@@ -328,6 +328,9 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # DSA
     ####################
+    dsa_indexer_mode: Literal['standard', 'simplified'] = 'standard'
+    """DSA indexer formulation. Simplified uses one Q head and a plain Q/K dot product."""
+
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -343,6 +346,14 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
+    dsa_fwd_use_dense_attn: bool = False
+    """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
+
+    dsa_reset_indexer_on_load: bool = False
+    """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
+
+    dsa_indexer_reset_method: Literal['random', 'main-q-mean', 'main-q-mean-rescaled'] = 'random'
+    """How to initialize DSA indexer parameters when resetting after checkpoint load."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
@@ -351,10 +362,30 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
-    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
-    """Optional fused DSA kernel backend.
-    ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
-    backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
+    dsa_kernel_backend: Literal[
+        "none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"
+    ] = "none"
+    """Which DSA implementation to run. This is the only backend selector.
+
+    Support matrix:
+
+    =================== ============ ============ =========================================
+    value               DSA over MLA DSA over GQA notes
+    =================== ============ ============ =========================================
+    ``none``            yes          no           no fused kernels; PyTorch fallback
+    ``tilelang``        yes          no           fused TileLang kernels
+    ``cudnn``           yes          no           fused cuDNN kernels
+    ``min-memory-triton`` no         yes          streamed min-memory, Triton kernels
+    ``min-memory-torch``  no         yes          streamed min-memory, Triton dispatch off
+    ``reference``       no           yes          dense-mask reference the kernels are A/B'd against
+    =================== ============ ============ =========================================
+
+    ``cudnn`` selects the fused cuDNN indexer, which exists only on the standard-indexer path
+    and so is MLA-only: the simplified indexer the GQA path requires has no cuDNN branch.
+
+    On the DSA-over-GQA path ``none`` resolves to ``min-memory-triton``, since "no fused
+    kernels" has no meaning there. ``tilelang`` and ``cudnn`` are rejected rather than silently
+    downgraded; see ``__post_init__``."""
 
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
@@ -370,7 +401,6 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
-
     ####################
     # Compressed sparse attention
     ####################
@@ -592,7 +622,8 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc".
+    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "dsa_simple_routing", "dsa_indexer_k", "dsa_selected_scores".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -608,6 +639,17 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_mhc_connections=True. Cannot be used with "mlp".
+    "dsa_simple_routing": recompute the simplified DSA routing top-k in the backward pass
+            instead of saving the forward indices, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_topk) of index storage. Applies only to the
+            min-memory DSA backends, which are the only ones that can save the routing.
+    "dsa_indexer_k": reproject the full DSA indexer K in the backward pass instead of saving
+            it, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_head_dim) of storage.
+    "dsa_selected_scores": recompute the selected DSA indexer logits in the backward pass
+            instead of saving roughly O(batch * seq_len * dsa_indexer_topk) of them. Only the
+            sparse KL objective materializes these, so this has no effect without
+            dsa_indexer_use_sparse_loss.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
     "mhc" use output-discarding checkpointing, "core_attn", "mlp", "moe", and
     "shared_experts" use normal checkpointing.
@@ -2151,6 +2193,9 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_in_proj",
                     "gdp_qkv",
                     "mhc",
+                    "dsa_simple_routing",
+                    "dsa_indexer_k",
+                    "dsa_selected_scores",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -3410,8 +3455,143 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
+        if self.dsa_fwd_use_dense_attn:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
+        if self.dsa_indexer_mode == "simplified":
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
+        if self.dsa_reset_indexer_on_load:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
+
         if self.experimental_attention_variant == "dsa":
+            assert self.dsa_indexer_mode in (
+                'standard',
+                'simplified',
+            ), "dsa_indexer_mode must be 'standard' or 'simplified'."
+            simplified_indexer = self.dsa_indexer_mode == 'simplified'
+            # The dense indexer warmup and the indexer reset were built for, and have only
+            # been exercised with, the simplified indexer. The standard DeepSeek indexer
+            # reaches the same code paths, so refuse the combination rather than let an
+            # untested one run.
+            assert (
+                simplified_indexer or not self.dsa_fwd_use_dense_attn
+            ), "dsa_fwd_use_dense_attn requires dsa_indexer_mode='simplified'."
+            assert (
+                simplified_indexer or not self.dsa_reset_indexer_on_load
+            ), "dsa_reset_indexer_on_load requires dsa_indexer_mode='simplified'."
+            assert (
+                simplified_indexer or self.dsa_indexer_reset_method == 'random'
+            ), "dsa_indexer_reset_method requires dsa_indexer_mode='simplified'."
+            if simplified_indexer:
+                assert (
+                    self.num_query_groups == 1
+                ), "The initial simplified DSA implementation requires num_query_groups == 1."
+                assert self.dsa_indexer_n_heads in (None, 1), (
+                    "Simplified DSA derives one indexer Q head from the single KV group; "
+                    "leave dsa_indexer_n_heads unset or set it to 1."
+                )
+                assert self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim > 0, (
+                    "Simplified DSA requires a positive dsa_indexer_head_dim when "
+                    "explicitly set."
+                )
+                self.dsa_indexer_n_heads = 1
+                if self.dsa_indexer_head_dim is None:
+                    self.dsa_indexer_head_dim = self.kv_channels
+                # Simplified DSA scores a plain Q/K dot product, with no Hadamard rotation to
+                # apply. dsa_indexer_rotate_activation defaults True for the standard indexer,
+                # so resolve it here rather than making every simplified config turn it off.
+                self.dsa_indexer_rotate_activation = False
+                main_q_reset = self.dsa_indexer_reset_method in (
+                    'main-q-mean',
+                    'main-q-mean-rescaled',
+                )
+                assert not (
+                    main_q_reset and self.dsa_indexer_head_dim != self.kv_channels
+                ), "Main-Q initialization requires dsa_indexer_head_dim == kv_channels."
+                assert not (
+                    main_q_reset and self.qk_layernorm
+                ), "Main-Q initialization is not defined when qk_layernorm is enabled."
+            else:
+                assert (
+                    self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0
+                ), "dsa_indexer_n_heads must be set to a positive integer when using DSA."
+                assert (
+                    self.dsa_indexer_head_dim is not None and self.dsa_indexer_head_dim > 0
+                ), "dsa_indexer_head_dim must be set to a positive integer when using DSA."
+                assert (
+                    self.dsa_indexer_reset_method == 'random'
+                ), "Main-Q reset methods are only supported by simplified DSA."
+            assert (
+                self.dsa_reset_indexer_on_load or self.dsa_indexer_reset_method == 'random'
+            ), "A non-random dsa_indexer_reset_method requires dsa_reset_indexer_on_load."
+            assert (
+                self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
+            ), "dsa_indexer_topk must be set to a positive integer when using DSA."
+            min_memory_dsa_backend = self.dsa_kernel_backend in (
+                'min-memory-triton',
+                'min-memory-torch',
+            )
+            dense_dsa_warmup = self.dsa_fwd_use_dense_attn
+            assert (
+                not dense_dsa_warmup or min_memory_dsa_backend
+            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_kernel_backend."
+            # The simplified indexer has only ever been exercised on the GQA path. Rather than
+            # let an untested combination run, refuse it; the MLA path keeps the standard indexer.
+            assert not (
+                self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            ), "dsa_indexer_mode='simplified' is not supported with multi_latent_attention."
+
+            # These limits are DSGroupedSelfAttention's, and the simplified indexer is the only
+            # signal the config has for it. Non-MLA alone also caught standard-indexer
+            # DSAttention with one query group, which has none of them.
+            if not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified':
+                # 'none' is the field default and means "no fused kernels" on the MLA path.
+                # The GQA path has no such mode, so resolve it to the streamed min-memory
+                # backend -- the one intended for production -- rather than failing. Note this
+                # is not a literal reading of "none": that backend does use Triton kernels.
+                if self.dsa_kernel_backend == 'none':
+                    self.dsa_kernel_backend = 'min-memory-triton'
+                assert self.dsa_kernel_backend in (
+                    'min-memory-triton',
+                    'min-memory-torch',
+                    'reference',
+                ), (
+                    "DSA over GQA supports dsa_kernel_backend in ('min-memory-triton', "
+                    f"'min-memory-torch', 'reference'); got {self.dsa_kernel_backend!r}. "
+                    "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
+                )
+                # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
+                # below). The GQA path does not: its min-memory kernels have no
+                # sequence-parallel gather and no CP support yet.
+                assert (
+                    self.context_parallel_size == 1
+                ), "Context parallelism is not supported by DSA over GQA."
+                assert (
+                    not self.sequence_parallel
+                ), "Sequence parallelism is not supported by DSA over GQA."
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if min_memory_dsa_backend:
+                if dense_dsa_warmup:
+                    assert not self.dsa_indexer_use_sparse_loss, (
+                        "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
+                        "dsa_indexer_use_sparse_loss."
+                    )
+                    assert (
+                        self.dsa_indexer_loss_coeff or 0.0
+                    ) > 0.0, "dsa_fwd_use_dense_attn requires dsa_indexer_loss_coeff > 0."
+                else:
+                    assert (
+                        self.dsa_indexer_loss_coeff or 0.0
+                    ) > 0.0, "min-memory dsa_kernel_backend requires dsa_indexer_loss_coeff > 0."
+                assert simplified_indexer or self.dsa_indexer_rotate_activation, (
+                    "min-memory dsa_kernel_backend requires dsa_indexer_rotate_activation for "
+                    "the standard DeepSeek indexer."
+                )
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
