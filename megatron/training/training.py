@@ -162,6 +162,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
+from megatron.training.kernel_warmup import warmup_training_kernels
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -1651,7 +1652,7 @@ def pretrain(
     timers = get_timers()
 
     # OTel span setup (_start_otel_job_spans) is deferred until after
-    # set_jit_fusion_options() below, where program_start/main_entry/pretrain_entry
+    # kernel warmup below, where program_start/main_entry/pretrain_entry
     # and the other startup timestamps are all available -- see the block right
     # after those are extracted from _STARTUP_TIMESTAMPS.
 
@@ -1664,6 +1665,21 @@ def pretrain(
         append_to_progress_log(args.save, "Starting job")
 
     set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
+
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        # Encoder-only ranks have no language-model kernels or TP group to warm up.
+        warmup_tp_group = (
+            pg_collection.get_language_model_collection().tp
+            if pg_collection.has_language_model()
+            else None
+        )
+    else:
+        warmup_tp_group = (
+            pg_collection.tp if pg_collection is not None else mpu.get_tensor_model_parallel_group()
+        )
+    if warmup_tp_group is not None:
+        warmup_training_kernels(args, warmup_tp_group)
+        print_rank_0("Finished training-kernel warmup.")
 
     timestamp_after_set_jit_fusion_options = time.time()
 
