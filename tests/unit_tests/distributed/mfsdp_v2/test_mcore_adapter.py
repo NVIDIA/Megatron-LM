@@ -437,8 +437,12 @@ class TestMcoreAdapterDense:
 class TestMcoreAdapterCudaGraph:
     """Exercise MFSDP v2 full-iteration and optimizer CUDA graphs together."""
 
-    def setup_method(self):
-        Utils.initialize_model_parallel(1, 1)
+    @pytest.fixture(autouse=True)
+    def setup(self, outer_strategy):
+        self.num_instances = 1 if outer_strategy is None else 2
+        Utils.initialize_model_parallel(
+            1, 1, num_distributed_optimizer_instances=self.num_instances
+        )
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
 
@@ -454,7 +458,10 @@ class TestMcoreAdapterCudaGraph:
         StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
         _destroy_model_parallel()
 
-    def test_full_iteration_and_optimizer_cuda_graph_match_eager(self):
+    @pytest.mark.parametrize(
+        "outer_strategy", [None, "no_shard", "optim"], ids=["fsdp", "hsdp_overlap", "hfsdp_overlap"]
+    )
+    def test_full_iteration_and_optimizer_cuda_graph_match_eager(self, outer_strategy):
         """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
         eager_config = TransformerConfig(
             num_layers=2,
@@ -483,6 +490,9 @@ class TestMcoreAdapterCudaGraph:
                     # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).
                     megatron_fsdp_main_grads_dtype=torch.float32,
                     megatron_fsdp_cuda_graph_mode=enable_cuda_graph,
+                    num_distributed_optimizer_instances=self.num_instances,
+                    outer_dp_sharding_strategy=outer_strategy or "no_shard",
+                    overlap_dp_outer_communication=outer_strategy is not None,
                 ),
                 module=model,
                 pg_collection=self.pg_collection,
@@ -520,12 +530,18 @@ class TestMcoreAdapterCudaGraph:
             assert seq_length is None
             assert not forward_only
             microbatch_losses = []
-            for _ in range(num_microbatches):
+            for microbatch_index in range(num_microbatches):
                 batch = next(data_iterator[0])
                 # Pipeline schedules receive model chunks as a list, including with PP=1.
-                output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
-                loss = output.float().square().mean()
-                (loss / num_microbatches).backward()
+                sync_context = (
+                    model[0].no_sync()
+                    if microbatch_index < num_microbatches - 1
+                    else contextlib.nullcontext()
+                )
+                with sync_context:
+                    output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
+                    loss = output.float().square().mean()
+                    (loss / num_microbatches).backward()
                 microbatch_losses.append({"loss": loss.detach()})
             return microbatch_losses
 

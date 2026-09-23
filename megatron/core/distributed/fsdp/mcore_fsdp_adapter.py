@@ -657,7 +657,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             schedule_policy=schedule_policy,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            overlap_dp_outer_communication=ddp_config.overlap_dp_outer_communication,
+        ):
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives
