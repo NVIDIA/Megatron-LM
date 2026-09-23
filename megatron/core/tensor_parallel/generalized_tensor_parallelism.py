@@ -336,6 +336,36 @@ def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
     return buf
 
 
+# Weights owing a flush. Entries outlive an early flush: the fence is where the count is learned.
+_GTP_PENDING_WGRAD_ACCUM: set = set()
+
+
+def _collect_inflight_wgrad_reduce_scatters() -> None:
+    """Add a still-running reduce-scatter's result into main_grad.
+
+    wait_async_comms() only waits for it, never adds it, so without this the gradient is lost.
+    """
+    for param in list(_GTP_PENDING_WGRAD_ACCUM):
+        if param._wgrad_rs_handle is not None:
+            param._wait_reduce_scatter(finalize_grad=True)
+            param._already_finalized = False  # the cascade must not skip the next one
+
+
+def _close_wgrad_accumulation_windows() -> None:
+    """Reduce-scatter what is still accumulating, then learn each weight's consume count.
+
+    Most iterations flushed earlier; this catches iteration 1 and mispredicted counts.
+    """
+    if not _GTP_PENDING_WGRAD_ACCUM:
+        return
+    for param in list(_GTP_PENDING_WGRAD_ACCUM):
+        param.flush_accumulated_wgrad()  # no-op if the last-consume trigger already flushed
+        # Learn AFTER any re-opened window, so an undercount self-corrects.
+        param._wgrad_accum_expected = param._wgrad_accum_consumes
+        param._wgrad_accum_consumes = 0
+    _GTP_PENDING_WGRAD_ACCUM.clear()
+
+
 def _wgrad_pool_put(buf: torch.Tensor):
     """Return a pool-owned buffer for reuse (no-op for untagged buffers; see
     _wgrad_pool_get)."""
@@ -408,6 +438,9 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     runner's replay stream (its tail = captured Phase 2 main_grad.add_). Under whole-step capture
     there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
+    # Before the drain: wait_async_comms() waits without adding, losing the result.
+    if not torch.cuda.is_current_stream_capturing():
+        _collect_inflight_wgrad_reduce_scatters()
     wait_async_comms()
     cur = torch.cuda.current_stream()
     # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
@@ -415,6 +448,10 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
         cur.wait_stream(s)
     for s in _RS_STREAMS.values():
         cur.wait_stream(s)
+    # AFTER the joins: this fires grad-ready, which can dispatch a DP collective that would
+    # race peers' main_grad.add_ still queued on rs_stream.
+    if not torch.cuda.is_current_stream_capturing():
+        _close_wgrad_accumulation_windows()
     # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
     # whole-step capture there are no runners, so stop here while capturing.
     if torch.cuda.is_current_stream_capturing():
@@ -466,15 +503,31 @@ def update_gtp_config(**kwargs):
         setattr(GTP_CONFIG, key, value)
 
 
+def _num_microbatches_can_change() -> bool:
+    """True when num_microbatches can change mid-run (--step-batch-size-schedule)."""
+    # Lazy: a module-scope import here can silently flip HAVE_GTP to False.
+    from megatron.core import num_microbatches_calculator as nmb
+
+    calc = nmb._GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    # Never initialized (unit tests): nothing can vary it.
+    return calc is not None and not isinstance(calc, nmb.ConstantNumMicroBatchesCalculator)
+
+
 def tag_gtp_params_with_names(model):
     """Populate _debug_name on every GTPShardedParam with its full dotted parameter name.
 
     Call once after model construction so the linking log prints human-readable names
     instead of raw tensor ids.
     """
+    # Off under a stepped batch schedule: a rising consume count double-fires grad-ready and
+    # drops a contribution (see _is_last_expected_consume).
+    accum_ok = not _num_microbatches_can_change()
     for name, param in model.named_parameters():
         if is_gtp_param(param):
             param._debug_name = name
+            # output_layer ONLY: the one GTP weight taking several backwards that also runs
+            # mcore's linear backward. TE-backed weights never consume the flag.
+            param._wgrad_accum_enabled = accum_ok and name.endswith("output_layer.weight")
 
 
 def configure_gtp_remat_from_recipe(
@@ -984,6 +1037,11 @@ def _init_gtp_runtime_attrs(obj):
     # _ensure_no_shared_buffer_with.
     obj._ag_ticket_recompute = None
     obj._recompute_buf_parity = None
+    # Pre-RS wgrad accumulation (output_layer under MTP).
+    obj._wgrad_accum_enabled = False  # static per-weight opt-in
+    obj._wgrad_accum_buf = None  # the buffer being summed into; non-None == a flush is owed
+    obj._wgrad_accum_expected = 0  # consume count learned last iteration
+    obj._wgrad_accum_consumes = 0  # consumes so far this iteration
     # Chain identity (GRAPHED/UNGRAPHED). Defaults to UNGRAPHED; classify_gtp_chains(model)
     # walks the model at init (after set_cuda_graph_modules) and reclassifies on param name +
     # active cuda_graph_modules.
@@ -1847,6 +1905,10 @@ class GTPShardedParam(torch.nn.Parameter):
         if ring_slot is not None:
             return self._gtp_graph_wgrad_ring_view
 
+        # Mid-accumulation: hand back the buffer the first backward filled, not a fresh one.
+        if self._wgrad_accum_buf is not None:
+            return self._wgrad_accum_buf
+
         # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
         if is_gtp_symm_pool_registered(self.group):
             # Lifecycle invariant: get_wgrad_tensor -> GEMM -> _prepare consumes the slot -> RS.
@@ -2206,7 +2268,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         return send_bufs, release_bufs
 
-    def wgrad_reduce_scatter(self, wgrad, nvtx_label=None):
+    def wgrad_reduce_scatter(self, wgrad, nvtx_label=None, async_op=None):
         """Reduce-scatter wgrad(s): sync for the last weight, async+deferred for others.
         Accepts a single tensor (non-routed) or a list (routed experts).
 
@@ -2218,6 +2280,18 @@ class GTPShardedParam(torch.nn.Parameter):
         wgrads = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
+        if self._wgrad_accum_buf is not None and wgrads[0] is self._wgrad_accum_buf:
+            # Identity, not just "accumulating": only a wgrad that IS the buffer was summed
+            # into it. Anything else (autograd's own grad_output) must still reduce now.
+            ret = None  # accumulation is single-weight; the batched shape is unreachable
+            if self._is_last_expected_consume():
+                # Sum complete: fire the one RS HERE, with backward left to overlap it; at the
+                # end-of-backward drain it would be fully exposed.
+                self.flush_accumulated_wgrad(async_op=None)
+            if GTP_CONFIG.async_reduction:
+                self._drain_next_w_reduce_scatter()
+            return ret
+
         # MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
         # more than one backward. The previous reduce-scatter may still be running: starting
         # another would reuse this weight's ticket, i.e. the same output buffer, and overwrite
@@ -2227,7 +2301,9 @@ class GTPShardedParam(torch.nn.Parameter):
             # Accounted for here, so the cascade below must not skip the next one.
             self._already_finalized = False
 
-        if GTP_CONFIG.async_reduction and self.prev_w is not None:
+        if async_op is None:
+            async_op = GTP_CONFIG.async_reduction and self.prev_w is not None
+        if async_op:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
             _, rs_handle, release_bufs = self._reduce_scatter(
@@ -2257,7 +2333,14 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
-        if GTP_CONFIG.async_reduction and self.next_w is not None:
+        if GTP_CONFIG.async_reduction:
+            self._drain_next_w_reduce_scatter()
+
+        return ret
+
+    def _drain_next_w_reduce_scatter(self):
+        """Cascade step: finalize the chain successor's in-flight reduce-scatter, if any."""
+        if self.next_w is not None:
             # Backward normally walks the chain in reverse, so next_w has already started its
             # reduce-scatter by now. That only holds while each weight is used once per forward.
             # MTP's second embedding lookup sits late in the forward, so the embedding's backward
@@ -2287,8 +2370,6 @@ class GTPShardedParam(torch.nn.Parameter):
                     self._handle_megatron_grad_accum(w)
                     cache.release(w._rs_ticket)
 
-        return ret
-
     def batched_wgrad_reduce_scatter(self, wgrad_list, nvtx_label=None):
         """Batched version of wgrad_reduce_scatter."""
         assert self.is_routed_expert and self.weight_list is not None
@@ -2312,6 +2393,57 @@ class GTPShardedParam(torch.nn.Parameter):
     def finalize_group_grads(self, wgrads, nvtx_label=None):
         """Protocol: reduce-scatter the group's freshly computed weight grad(s)."""
         return self.wgrad_reduce_scatter(wgrads, nvtx_label=nvtx_label)
+
+    def _can_accumulate_wgrad(self) -> bool:
+        """Eligibility, not state: opted in, and not on a graphed or ring-slot path.
+
+        Whether it IS accumulating right now is ``_wgrad_accum_buf is not None``.
+        """
+        if not self._wgrad_accum_enabled:
+            return False
+        # A graph bakes in the schedule and the ring slot owns its own lifecycle.
+        if _chain_is_graphed(self.chain_id) or torch.cuda.is_current_stream_capturing():
+            return False
+        return getattr(self, "_gtp_graph_wgrad_ring_slot", None) is None
+
+    def record_wgrad_consume(self, buf) -> bool:
+        """Record this backward; True if it should ADD into ``buf`` rather than overwrite.
+
+        False on the first -- that overwrite IS the zero-fill. Taking ``buf`` here, not in
+        get_wgrad_tensor, is what makes _buf mean exactly "a flush is owed".
+        """
+        if not self._can_accumulate_wgrad():
+            return False
+        first = self._wgrad_accum_buf is None
+        self._wgrad_accum_buf = buf
+        self._wgrad_accum_consumes += 1
+        _GTP_PENDING_WGRAD_ACCUM.add(self)
+        return not first
+
+    def _is_last_expected_consume(self) -> bool:
+        """A PREDICTION: this is consume number N, and last iteration had N of them.
+
+        '==', not '>=': _consumes resets only at the fence, so >= would re-fire on every later
+        consume -- one RS each, and DDP's golden grad-ready count breaks.
+
+        A rising count would fire grad-ready twice and drop that iteration's last consume, so
+        tag_gtp_params_with_names leaves the feature off under --step-batch-size-schedule.
+        """
+        return self._wgrad_accum_consumes == self._wgrad_accum_expected
+
+    def flush_accumulated_wgrad(self, async_op=False):
+        """Reduce-scatter the accumulated wgrad once and fold it into main_grad.
+
+        Clearing _buf first closes the window AND lets wgrad_reduce_scatter run its ordinary
+        path. async_op: None = that path's own rule, False = forced sync for the fence, which
+        has already drained the async comms.
+        """
+        if self._wgrad_accum_buf is None:
+            return
+        wgrad = self._wgrad_accum_buf
+        self._wgrad_accum_buf = None
+        label = f"{self._debug_name}.gtp_wgrad_accum_flush"
+        return self.wgrad_reduce_scatter(wgrad, nvtx_label=label, async_op=async_op)
 
     def grad_buffer(self):
         """Protocol: the wgrad accumulation scratch buffer for this weight."""
@@ -2701,6 +2833,13 @@ def reset_gtp_state():
     GTPShardedParam._link_tables_flushed = False
     GTPShardedParam._recompute_link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
+    # A backward that never reached the fence leaves entries pointing at a torn-down model, and
+    # a surviving _buf would make the next iteration's first backward ADD onto a stale sum.
+    for param in _GTP_PENDING_WGRAD_ACCUM:
+        param._wgrad_accum_buf = None
+        param._wgrad_accum_consumes = 0
+        param._wgrad_accum_expected = 0
+    _GTP_PENDING_WGRAD_ACCUM.clear()
     clear_graph_wgrad_rings()
 
 
