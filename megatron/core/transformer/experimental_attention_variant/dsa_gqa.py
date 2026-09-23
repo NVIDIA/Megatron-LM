@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -521,28 +522,33 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                     cp_group=self.pg_collection.cp,
                 )
 
-        self.linear_q = build_module(
-            submodules.linear_q,
-            self.hidden_size,
-            self.index_head_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
-        self.linear_k = build_module(
-            submodules.linear_k,
-            self.hidden_size,
-            self.index_head_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        # The indexer scores every query against every key to pick top-k, so its inputs decide
+        # which keys the layer attends to at all. Quantizing these two projections would put that
+        # discrete choice at FP8 resolution while buying almost nothing: both are hidden_size ->
+        # index_head_dim (128), negligible beside the attention projections.
+        with get_fp8_disabled_context(config, is_init=True):
+            self.linear_q = build_module(
+                submodules.linear_q,
+                self.hidden_size,
+                self.index_head_dim,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
+            self.linear_k = build_module(
+                submodules.linear_k,
+                self.hidden_size,
+                self.index_head_dim,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
         if self.pg_collection.tp.size() > 1:
             for param in self.parameters():
                 setattr(param, "average_gradients_across_tp_domain", True)
@@ -583,8 +589,11 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                 hidden_states, group=self.pg_collection.tp
             )
         seqlen, batch_size, _ = hidden_states.shape
-        q, _ = self.linear_q(hidden_states)
-        k, _ = self.linear_k(hidden_states)
+        # Matches the construction context above: high-precision parameters would still be
+        # multiplied in FP8 inside an enclosing autocast.
+        with get_fp8_disabled_context(self.config):
+            q, _ = self.linear_q(hidden_states)
+            k, _ = self.linear_k(hidden_states)
         q = q.reshape(seqlen, batch_size, 1, self.index_head_dim)
         k = k.reshape(seqlen, batch_size, 1, self.index_head_dim)
         return (
