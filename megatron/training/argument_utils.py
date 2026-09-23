@@ -710,15 +710,18 @@ def inference_cfg_container_from_args(
             model_cfg = gpt_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
-    ckpt_kwargs["save_rng"] = not args.no_save_rng
-    ckpt_kwargs["load_optim"] = not args.no_load_optim
-    ckpt_kwargs["load_rng"] = not args.no_load_rng
-    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
-    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+    # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.
+    # Preserve canonical config values or defaults when an alias is absent.
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        if hasattr(args, f"no_{name}"):
+            ckpt_kwargs[name] = not getattr(args, f"no_{name}")
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        if hasattr(args, f"ckpt_{name}"):
+            ckpt_kwargs[name] = getattr(args, f"ckpt_{name}")
 
     prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
-    prof_kwargs["use_nsys_profiler"] = args.profile
+    if hasattr(args, "profile"):
+        prof_kwargs["use_nsys_profiler"] = args.profile
 
     cfg = InferenceConfigContainer(
         model=model_cfg,
