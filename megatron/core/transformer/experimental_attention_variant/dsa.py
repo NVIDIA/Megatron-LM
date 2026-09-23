@@ -2351,7 +2351,8 @@ class DSAttention(MegatronModule):
                 query_valid_rows,
                 self.config.calculate_per_token_loss,
                 self.config.dsa_indexer_scoring_relu,
-                getattr(self.config, 'dsa_kernel_backend', 'none') == 'cudnn',
+                # By keyword: non_compressed_lse sits in between and stays None here.
+                use_cudnn=getattr(self.config, 'dsa_kernel_backend', 'none') == 'cudnn',
             )
 
         fused_output = None
