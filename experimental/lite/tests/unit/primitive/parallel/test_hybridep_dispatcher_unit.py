@@ -54,12 +54,10 @@ def hybridep_dispatcher(monkeypatch, transformer_engine_import_stub):
     monkeypatch.setattr(mod.dist, "all_reduce", lambda tensor, op=None, group=None: None)
 
     def make(num_experts=4, **kwargs):
-        ps = ParallelState(ep_size=1, ep_rank=0, ep_group=object(), tp_ep_group=object())
+        ps = ParallelState(ep_size=2, ep_rank=0, ep_group=object(), tp_ep_group=object())
         d = mod.TokenDispatcher(num_experts=num_experts, hidden_size=2, ps=ps,
                                 dispatch_backend="hybridep", **kwargs)
-        d.ep_size = 1  # fake buffer holds every expert, dispatcher still takes the hybridep path
-        d.use_hybridep = True
-        d.num_local_experts = num_experts
+        d.num_local_experts = num_experts  # the fake single-rank buffer holds every expert
         return d, mod
 
     return make
