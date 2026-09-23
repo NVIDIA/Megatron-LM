@@ -29,6 +29,7 @@ from .module import FsdpContext, FsdpModule
 from .schedule import SchedulePolicy
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
+_FSDP_CLASSES: dict[type[nn.Module], type[nn.Module]] = {}
 
 MeshAxis = int | str
 
@@ -242,5 +243,10 @@ def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
     module_cls = module.__class__
-    fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
-    module.__class__ = fsdp_cls
+    if module_cls not in _FSDP_CLASSES:
+        # Classmethods may lazily cache shared state, such as a communication
+        # stream. A new subclass per instance would duplicate that state.
+        _FSDP_CLASSES[module_cls] = type(
+            f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {}
+        )
+    module.__class__ = _FSDP_CLASSES[module_cls]
