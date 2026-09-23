@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import warnings
+from dataclasses import replace
 from functools import partial
 from typing import Optional, Union
 
@@ -742,10 +743,18 @@ def get_gpt_mtp_block_spec_for_backend(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
-    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+    elif isinstance(spec, ModuleSpec) and spec.module in (
+        TransformerLayer,
+        WideResidualTransformerLayer,
+    ):
         transformer_layer_spec = spec
     else:
         raise ValueError(f"Invalid spec: {spec}")
+
+    if transformer_layer_spec.module == WideResidualTransformerLayer:
+        # The main decoder owns wide-stream connections, while MTP consumes its
+        # ordinary-width readout. Select the ordinary layer class in the MTP spec up front.
+        transformer_layer_spec = replace(transformer_layer_spec, module=TransformerLayer)
 
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
         mtp_model_layer_spec=transformer_layer_spec,
