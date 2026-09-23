@@ -306,10 +306,12 @@ class TestFP8Param:
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
-            has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            assert has_param_layout == args.use_layer_wise_param_layout, (
-                "LayerWise test did not enter the requested parameter-layout path: "
-                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
+            # Dev builds both layouts; the flag selects padded rather than compact storage.
+            assert getattr(gpt_model[0], "full_param_layout", None) is not None
+            actual_padded = gpt_model[0].ddp_config.use_layer_wise_param_layout
+            assert actual_padded == args.use_layer_wise_param_layout, (
+                "LayerWise test did not select the requested padded/compact layout: "
+                f"requested={args.use_layer_wise_param_layout}, actual={actual_padded}"
             )
         self._on_model_built(gpt_model, optimizer, args)
 
