@@ -39,13 +39,13 @@ def ps():
     return init_parallel(ParallelConfig(tp=1, ep=2, pp=1, cp=1))
 
 
-def _mcore_config():
+def _mcore_config(fused=False, num_sms=None):
     return SimpleNamespace(
         moe_router_topk=TOPK, moe_permute_fusion=False, moe_expert_capacity_factor=None,
         moe_pad_expert_input_to_capacity=False, moe_hybridep_pad_variable_tokens=True,
         moe_hybridep_routing_map_mode="indices", moe_expert_rank_capacity_factor=None,
-        moe_flex_dispatcher_num_sms=None, moe_hybridep_num_blocks_permute=None,
-        moe_hybridep_num_blocks_unpermute=None, moe_permute_fusion_into_hybridep=False,
+        moe_flex_dispatcher_num_sms=num_sms, moe_hybridep_num_blocks_permute=None,
+        moe_hybridep_num_blocks_unpermute=None, moe_permute_fusion_into_hybridep=fused,
         moe_hybridep_num_sms_preprocessing=108, use_transformer_engine_op_fuser=False,
         moe_use_grouped_tensor=False, fp8=False, fp4=False,
     )
@@ -64,12 +64,12 @@ def _expert_fn(dispatched: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
     return (dispatched.float() * (probs.unsqueeze(1) + 0.5)).to(dispatched.dtype)
 
 
-def _run_lite(ps, hidden, scores, indices, backend: str):
+def _run_lite(ps, hidden, scores, indices, backend: str, **kwargs):
     from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 
     hidden = hidden.clone().requires_grad_(True)
     scores = scores.clone().requires_grad_(True)
-    d = TokenDispatcher(EXPERTS, HIDDEN, ps, dispatch_backend=backend)
+    d = TokenDispatcher(EXPERTS, HIDDEN, ps, dispatch_backend=backend, **kwargs)
     dispatched, tpe, probs = d.dispatch(hidden, scores, indices)
     combined = d.combine(_expert_fn(dispatched, probs))
     (combined.float().sum() + probs.sum()).backward()
@@ -77,14 +77,17 @@ def _run_lite(ps, hidden, scores, indices, backend: str):
                 grad_hidden=hidden.grad, grad_scores=scores.grad)
 
 
-def _run_mcore(ps, hidden, scores, indices):
+def _run_mcore(ps, hidden, scores, indices, fused=False, num_sms=None):
+    from megatron.core.transformer.moe import fused_a2a
     from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
+
+    fused_a2a.reset_hybrid_ep_buffer()  # mcore keeps one global buffer; rebuild it with this num_sms
 
     hidden = hidden.clone().requires_grad_(True)
     scores = scores.clone().requires_grad_(True)
     routing_map = torch.zeros(hidden.size(0), EXPERTS, dtype=torch.bool, device="cuda").scatter_(1, indices, True)
     probs_2d = torch.zeros(hidden.size(0), EXPERTS, dtype=scores.dtype, device="cuda").scatter_add(1, indices, scores)
-    manager = _HybridEPManager(ps.tp_ep_group, EXPERTS // ps.ep_size, EXPERTS, _mcore_config(), router_topk=TOPK)
+    manager = _HybridEPManager(ps.tp_ep_group, EXPERTS // ps.ep_size, EXPERTS, _mcore_config(fused, num_sms), router_topk=TOPK)
     manager.setup_metadata(routing_map, probs_2d)
     dispatched = manager.dispatch(hidden)
     probs = manager.dispatched_probs
@@ -110,6 +113,18 @@ def test_hybridep_bitwise_matches_mcore(ps, tokens):
     _assert_bitwise(lite, ref, f"tokens={tokens}")
     if dist.get_rank() == 0:
         print(f"\nhybridep bitwise vs mcore ok: tokens={tokens} tpe={lite['tpe'].tolist()}", flush=True)
+
+
+@pytest.mark.parametrize("fused,num_sms", [(True, None), (False, 16), (True, 16)], ids=["fused", "sms16", "fused_sms16"])
+def test_hybridep_knobs_bitwise_match_mcore(ps, fused, num_sms):
+    from megatron.lite.primitive.modules.dispatcher import reset_hybridep_buffers
+
+    reset_hybridep_buffers()
+    hidden, scores, indices = _inputs(96 if ps.ep_rank == 0 else 64, seed=300 + ps.ep_rank)
+    lite = _run_lite(ps, hidden, scores, indices, "hybridep", hybridep_fused_permute=fused, hybridep_num_sms=num_sms)
+    ref = _run_mcore(ps, hidden, scores, indices, fused=fused, num_sms=num_sms)
+    _assert_bitwise(lite, ref, f"fused={fused} num_sms={num_sms}")
+    reset_hybridep_buffers()
 
 
 def test_hybridep_matches_alltoall(ps):

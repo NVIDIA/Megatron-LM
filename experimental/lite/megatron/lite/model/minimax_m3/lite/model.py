@@ -116,6 +116,8 @@ class M3MoELayer(nn.Module):
         ps: ParallelState,
         *,
         moe_dispatcher: str = "alltoall",
+        moe_hybridep_num_sms: int | None = None,
+        moe_hybridep_fused_permute: bool = False,
         moe_act_recompute: bool = False,
         moe_permute_fusion: bool | None = None,
     ):
@@ -134,6 +136,8 @@ class M3MoELayer(nn.Module):
             ps,
             dispatch_backend=moe_dispatcher,
             moe_permute_fusion=moe_permute_fusion,
+            hybridep_num_sms=moe_hybridep_num_sms,
+            hybridep_fused_permute=moe_hybridep_fused_permute,
         )
         self.shared_expert = M3SharedExpert(config, ps)
 
@@ -165,6 +169,8 @@ class MiniMaxM3Layer(nn.Module):
         *,
         msa_backend: str,
         moe_dispatcher: str = "alltoall",
+        moe_hybridep_num_sms: int | None = None,
+        moe_hybridep_fused_permute: bool = False,
         moe_act_recompute: bool = False,
     ):
         super().__init__()
@@ -216,6 +222,8 @@ class MiniMaxM3Layer(nn.Module):
                 config,
                 ps,
                 moe_dispatcher=moe_dispatcher,
+                moe_hybridep_num_sms=moe_hybridep_num_sms,
+                moe_hybridep_fused_permute=moe_hybridep_fused_permute,
                 moe_act_recompute=moe_act_recompute,
                 moe_permute_fusion=True,
             )
@@ -288,6 +296,8 @@ class MiniMaxM3Model(nn.Module):
                     ps,
                     idx,
                     moe_dispatcher=train_config.moe_dispatcher,
+                    moe_hybridep_num_sms=train_config.moe_hybridep_num_sms,
+                    moe_hybridep_fused_permute=train_config.moe_hybridep_fused_permute,
                     moe_act_recompute=moe_act_recompute,
                     msa_backend=msa_backend,
                 )

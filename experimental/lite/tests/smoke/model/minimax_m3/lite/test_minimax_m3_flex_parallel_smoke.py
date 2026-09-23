@@ -22,7 +22,7 @@ DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95
 def _train_config(ps):
     return SimpleNamespace(
         tp=ps.tp_size, ep=ps.ep_size, etp=ps.etp_size, pp=ps.pp_size, cp=ps.cp_size, vpp=None,
-        moe_dispatcher="alltoall", fp8=False, recompute_modules=[], deterministic=True,
+        moe_dispatcher="alltoall", moe_hybridep_num_sms=None, moe_hybridep_fused_permute=False, fp8=False, recompute_modules=[], deterministic=True,
     )
 
 

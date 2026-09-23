@@ -58,10 +58,12 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
     return deep_ep.Buffer(group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes)
 
 
-def _get_hybridep_buffer(group: dist.ProcessGroup, hidden_size: int, num_local_experts: int, max_tokens: int):
+def _get_hybridep_buffer(
+    group: dist.ProcessGroup, hidden_size: int, num_local_experts: int, max_tokens: int, num_sms: int | None
+):
     if HybridEPBuffer is None:
         raise RuntimeError("HybridEP buffer requested but deep_ep.HybridEPBuffer is not installed.")
-    key = (id(group), hidden_size, num_local_experts)
+    key = (id(group), hidden_size, num_local_experts, num_sms)
     buf = _hybridep_buffers.get(key)
     if buf is None:
         buf = HybridEPBuffer(
@@ -69,6 +71,8 @@ def _get_hybridep_buffer(group: dist.ProcessGroup, hidden_size: int, num_local_e
             hidden_dim=hidden_size,
             max_num_of_tokens_per_rank=max_tokens,
             num_local_experts=num_local_experts,
+            num_sms_dispatch_api=num_sms,
+            num_sms_combine_api=num_sms,
         )
         _hybridep_buffers[key] = buf
     return buf
@@ -239,6 +243,7 @@ class _HybridEPDispatch(torch.autograd.Function):
         num_local_experts: int,
         num_experts: int,
         num_tokens_per_rank: int,
+        fused: bool,
     ):
         if topk_idx is not None:
             routing_kwargs = {"topk_idx": topk_idx, "num_of_experts": num_experts}
@@ -250,28 +255,36 @@ class _HybridEPDispatch(torch.autograd.Function):
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
             num_of_tokens_per_rank=num_tokens_per_rank,
+            **({"fuse_permute_dispatch": True} if fused else {}),
             **routing_kwargs,
         )
         ctx.buffer = buffer
         ctx.handle = handle
+        ctx.fused = fused
         return dispatched, dispatched_probs, tokens_per_expert, handle
 
     @staticmethod
     def backward(ctx, grad_hidden, grad_probs, grad_tokens_per_expert, grad_handle):
         del grad_tokens_per_expert, grad_handle
         combined_hidden, combined_probs = ctx.buffer.combine_with_unpermute(
-            hidden=grad_hidden, probs=grad_probs, handle=ctx.handle
+            hidden=grad_hidden,
+            probs=grad_probs,
+            handle=ctx.handle,
+            **({"fuse_unpermute_combine": True} if ctx.fused else {}),
         )
-        return None, combined_hidden, None, None, combined_probs, None, None, None
+        return None, combined_hidden, None, None, combined_probs, None, None, None, None
 
 
 class _HybridEPCombine(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, buffer, expert_output: torch.Tensor, handle, num_permuted_tokens):
-        combined, _ = buffer.combine_with_unpermute(hidden=expert_output, handle=handle)
+    def forward(ctx, buffer, expert_output: torch.Tensor, handle, num_permuted_tokens, fused: bool):
+        combined, _ = buffer.combine_with_unpermute(
+            hidden=expert_output, handle=handle, **({"fuse_unpermute_combine": True} if fused else {})
+        )
         ctx.buffer = buffer
         ctx.handle = handle
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.fused = fused
         return combined
 
     @staticmethod
@@ -281,8 +294,9 @@ class _HybridEPCombine(torch.autograd.Function):
             scaling_factor=None,
             handle=ctx.handle,
             num_permuted_tokens=ctx.num_permuted_tokens,
+            **({"fuse_permute_dispatch": True} if ctx.fused else {}),
         )
-        return None, dispatched, None, None
+        return None, dispatched, None, None, None
 
 
 class TokenDispatcher:
@@ -298,6 +312,8 @@ class TokenDispatcher:
         moe_permute_fusion: bool | None = None,
         hybridep_dense_routing: bool = True,
         hybridep_max_tokens: int | None = None,
+        hybridep_num_sms: int | None = None,
+        hybridep_fused_permute: bool = False,
     ):
         self.ps = ps
         self.num_experts = num_experts
@@ -323,6 +339,8 @@ class TokenDispatcher:
         # HybridEP dense routing needs int16 expert ids; duplicate experts per token are malformed there.
         self.hybridep_dense_routing = hybridep_dense_routing and num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
         self.hybridep_max_tokens = hybridep_max_tokens
+        self.hybridep_num_sms = hybridep_num_sms
+        self.hybridep_fused_permute = hybridep_fused_permute
         self._hybridep_buffer = None
         self._num_permuted_tokens = None
 
@@ -530,7 +548,7 @@ class TokenDispatcher:
         t = hidden_states.size(0)
         if self._hybridep_buffer is None:
             self._hybridep_buffer = _get_hybridep_buffer(
-                group, self.hidden_size, self.num_local_experts, self.hybridep_max_tokens or t
+                group, self.hidden_size, self.num_local_experts, self.hybridep_max_tokens or t, self.hybridep_num_sms
             )
         routing_map, probs_2d = _routing_tensors(topk_scores, topk_indices, self.num_experts)
         # HybridEP only supports fp32 probs (same cast as mcore _HybridEPManager.dispatch).
@@ -548,6 +566,7 @@ class TokenDispatcher:
             self.num_local_experts,
             self.num_experts,
             int(num_tokens_per_rank.item()),
+            self.hybridep_fused_permute,
         )
         tokens_per_expert = tokens_per_expert.to(torch.int64)
         self._handle = handle
@@ -557,7 +576,7 @@ class TokenDispatcher:
 
     def _combine_hybridep(self, expert_output):
         combined = _HybridEPCombine.apply(
-            self._hybridep_buffer, expert_output, self._handle, self._num_permuted_tokens
+            self._hybridep_buffer, expert_output, self._handle, self._num_permuted_tokens, self.hybridep_fused_permute
         )
         self._handle = None
         self._num_permuted_tokens = None
