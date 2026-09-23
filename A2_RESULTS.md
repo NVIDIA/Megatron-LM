@@ -19,4 +19,12 @@ A follow-up chunk-size sweep on the H512 / 8192-token shape found q=4096 much fa
 
 Forward allocated peak fell from 1227.12 / 1227.05 to 1217.21 / 1217.22 MiB. The larger chunk cuts the earlier q=512 slowdown to 4–5%, but does not produce a complete-step allocated-peak saving or a speedup over native. q=2048, 6144, and 8192 pilots were slower than q=4096. A corresponding H1024 / 4096-token screening pair was speed-neutral with worse reserved memory; its second pair ran out of GPU memory and is excluded. Further round-major packing variants reduced GPU operation count but were slower in EP1/EP2 pilots; an EP4 fixed-route 20-step multi-round variant showed BF16 accumulation-order drift (first-gradient relative L2 about 0.0059), so neither variant replaced this branch. The experimental failure does not change the exact EP4 q=512 comparison above.
 
+An asynchronous double-buffer prototype passed isolated EP1/EP2 forward/backward tests and had one encouraging short pilot. Three reversed-order pairs of 30 measured optimizer steps after five warmups on GPUs 5–6 rejected it:
+
+| H512, 8192 tokens, BF16, EP2, q=2048 | Native, launches 0 / 1 / 2 | Double buffer, launches 0 / 1 / 2 | Speedup, launches 0 / 1 / 2 | Native / candidate peak allocated MiB | Native / candidate peak reserved MiB |
+|---|---:|---:|---:|---:|---:|
+| Complete optimizer step | 56.95 / 58.40 / 57.98 ms | 68.74 / 67.95 / 67.82 ms | 0.828× / 0.860× / 0.855× | 1410.16 / 1410.42 | 1822 / 1774 |
+
+Its forward allocated peak fell by about 10 MiB, but the full-step allocated peak did not. The short pilot was not representative, and the double-buffer code was not integrated.
+
 The isolated return operator passed 36 forward/backward cases per rank on both EP2 and EP4, including FP64, FP32, BF16, skewed/empty splits, and expert spans crossing chunk boundaries. A 20-step EP4 fixed-route full-model comparison matched native initial parameter hashes, routes, every loss, first-step gradients, and final parameters exactly on all four ranks. The BF16 accumulator matches the native unpermute path. No pretrained weights were downloaded, and temporary parameter/gradient snapshots were deleted after comparison. Eight-rank model training remains untested because other users occupied part of the node; their processes were not interrupted.
