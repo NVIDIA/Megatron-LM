@@ -39,6 +39,19 @@ class _ChunkedReturn(torch.autograd.Function):
         ctx.input_shape = rows.shape
         send = rows.new_empty((min(group.size() * q, sum(send_splits)), rows.shape[1]))
         recv = rows.new_empty((min(group.size() * q, sum(recv_splits)), rows.shape[1]))
+        if rounds == 1:
+            output = rows.new_empty((tokens, rows.shape[1]))
+            torch.index_select(rows, 0, order, out=send)
+            work = dist.all_to_all_single(recv, send, output_split_sizes=recv_splits,
+                                          input_split_sizes=send_splits, group=group,
+                                          async_op=True)
+            output.zero_()
+            work.wait()
+            if torch.are_deterministic_algorithms_enabled():
+                output.index_add_(0, mapping, recv)
+            else:
+                output.scatter_add_(0, mapping[:, None].expand_as(recv), recv)
+            return output
         output = torch.zeros((tokens, rows.shape[1]), dtype=rows.dtype, device=rows.device)
         for k in range(rounds):
             sends, send_starts = _round(send_splits, q, k)
@@ -66,6 +79,12 @@ class _ChunkedReturn(torch.autograd.Function):
         send = grad_output.new_empty((min(group.size() * q, sum(send_splits)), grad_output.shape[1]))
         recv = grad_output.new_empty((min(group.size() * q, sum(recv_splits)), grad_output.shape[1]))
         grad_rows = grad_output.new_empty(ctx.input_shape)
+        if ctx.rounds == 1:
+            torch.index_select(grad_output, 0, mapping, out=send)
+            dist.all_to_all_single(recv, send, output_split_sizes=recv_splits,
+                                   input_split_sizes=send_splits, group=group)
+            grad_rows.index_copy_(0, order, recv)
+            return grad_rows, None, None, None, None, None, None, None, None
         for k in range(ctx.rounds):
             sends, send_starts = _round(send_splits, q, k)
             recvs, recv_starts = _round(recv_splits, q, k)

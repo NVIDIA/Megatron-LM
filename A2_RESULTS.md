@@ -62,4 +62,16 @@ A separate 2×RTX PRO 6000 Blackwell instance was used for a supplementary test 
 | v12 pair 1, candidate then native | 18.873 ms | 21.499 ms | 0.878× | 594.21 / 594.27 MiB |
 | v13 pilot | 17.170 ms | 17.601 ms | 0.976× | 594.21 / 594.21 MiB |
 
-The reversed v12 pair does not support a repeatable speedup. A 4096-token, one-layer q=16384 screen gave native 14.294 ms and v12 41.081 ms, but the profiler showed that NCCL and attention kernels outside the A2 return also slowed substantially during the candidate run, so that pair is not attributable to A2. The instance's pre-existing vLLM service occupied both GPUs throughout. Raw JSON and profiler tables were synced to `evidence/remote-pro6000` outside this repository because the instance has no persistent volume. The production branch remains at v9 pending a comparable TE/5090 result.
+The reversed v12 pair does not support a repeatable speedup. A 4096-token, one-layer q=16384 screen gave native 14.294 ms and v12 41.081 ms, but the profiler showed that NCCL and attention kernels outside the A2 return also slowed substantially during the candidate run, so that pair is not attributable to A2. The instance's pre-existing vLLM service occupied both GPUs throughout. Raw JSON and profiler tables were synced to `evidence/remote-pro6000` outside this repository because the instance has no persistent volume.
+
+The subsequent v14 single-round path launches the NCCL exchange asynchronously, zeros the token output while it is in flight, then accumulates received rows. The multi-round path is unchanged. It passed the same isolated EP2 cases, including FP64/FP32/BF16 and empty peers. A deterministic, fixed-route FP32 local-spec comparison over 20 complete steps matched native initial weights, routes, every loss, first gradients, and final parameters exactly on both ranks; temporary `.pt` snapshots were deleted after comparison. Five reverse-order pairs on the same two GPUs measured 30 complete optimizer steps after five warmups:
+
+| H256, 2048 tokens, local spec, FP32, EP2 | Native step | v14 step | Native / v14 speedup | Native / v14 allocated peak |
+|---|---:|---:|---:|---:|
+| Pair 0, v14 then native | 38.323 ms | 36.054 ms | 1.063× | 594.21 / 594.27 MiB |
+| Pair 1, native then v14 | 45.190 ms | 40.539 ms | 1.115× | 594.21 / 594.27 MiB |
+| Pair 2, v14 then native | 38.442 ms | 38.552 ms | 0.997× | 594.21 / 594.27 MiB |
+| Pair 3, native then v14 | 15.714 ms | 15.327 ms | 1.025× | 594.21 / 594.27 MiB |
+| Pair 4, v14 then native | 19.371 ms | 18.593 ms | 1.042× | 594.21 / 594.27 MiB |
+
+Four pairs favored v14 and one was effectively tied. The large absolute-time swings reflect intermittent load from the instance's existing inference service, so this is a supplementary local-backend result rather than the requested TE/5090 acceptance result. The 8×RTX 5090 host remained unreachable over SSH when these runs completed; no process was stopped and no environment was updated.
