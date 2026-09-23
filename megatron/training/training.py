@@ -1551,6 +1551,42 @@ def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
     return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
 
 
+def _get_train_full_dataset_sample_count(args, dataset_provider):
+    """Measure the training horizon without restoring a temporary dataloader.
+
+    Opt-in providers must accept ``restore_dataloader_state=False`` and expose
+    the finite loader through ``_dataloader`` on ranks that own training data.
+    Actual restoration happens after model setup resolves the checkpoint iteration.
+    """
+    if not getattr(dataset_provider, 'supports_train_full_dataset', False):
+        raise ValueError(
+            "--train-full-dataset requires a dataset provider that declares "
+            "supports_train_full_dataset"
+        )
+    if args.train_iters is not None or args.train_samples is not None:
+        raise ValueError(
+            "--train-full-dataset cannot be combined with --train-iters or --train-samples"
+        )
+
+    train_data_iterator, _, _ = dataset_provider(None, restore_dataloader_state=False)
+    local_num_samples = (
+        len(train_data_iterator._dataloader)
+        if hasattr(train_data_iterator, '_dataloader')
+        else None
+    )
+    total_num_samples = reduce_max_stat_across_model_parallel_group(
+        _reduce_sum_across_data_parallel_group(
+            local_num_samples,
+            with_context_parallel=getattr(
+                args, 'deduplicate_dataloader_across_context_parallel', False
+            ),
+        )
+    )
+    if total_num_samples is None:
+        raise ValueError("--train-full-dataset resolved to an empty training dataset")
+    return int(total_num_samples)
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1875,39 +1911,10 @@ def pretrain(
     callback_manager.trigger("on_setup_start")
 
     if args.train_full_dataset:
-        if not getattr(
-            train_valid_test_dataset_provider, 'supports_train_full_dataset', False
-        ):
-            raise ValueError(
-                "--train-full-dataset requires a dataset provider that declares "
-                "supports_train_full_dataset"
-            )
-        if args.train_iters is not None or args.train_samples is not None:
-            raise ValueError(
-                "--train-full-dataset cannot be combined with --train-iters or --train-samples"
-            )
-
         # The scheduler must know the training horizon before model and optimizer setup.
-        # External multimodal providers expose the underlying finite loader through
-        # ``_dataloader`` even though their public iterator is cyclic.
-        args.iteration = 0
-        train_data_iterator, _, _ = train_valid_test_dataset_provider(None)
-        local_num_samples = (
-            len(train_data_iterator._dataloader)
-            if hasattr(train_data_iterator, '_dataloader')
-            else None
+        args.train_samples = _get_train_full_dataset_sample_count(
+            args, train_valid_test_dataset_provider
         )
-        total_num_samples = reduce_max_stat_across_model_parallel_group(
-            _reduce_sum_across_data_parallel_group(
-                local_num_samples,
-                with_context_parallel=getattr(
-                    args, 'deduplicate_dataloader_across_context_parallel', False
-                ),
-            )
-        )
-        if total_num_samples is None:
-            raise ValueError("--train-full-dataset resolved to an empty training dataset")
-        args.train_samples = int(total_num_samples)
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
