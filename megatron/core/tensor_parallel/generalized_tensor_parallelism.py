@@ -476,27 +476,6 @@ def tag_gtp_params_with_names(model):
         if is_gtp_param(param):
             param._debug_name = name
 
-    # GTP stores contiguous rows of the logical [gate | up] weight. Unlike ordinary
-    # MLPs, grouped gated fc1 has no checkpoint wiring to gather before splitting
-    # gate/up, so reject EGTP for these modules.
-    for mod_name, mod in model.named_modules():
-        if not mod_name.endswith("linear_fc1"):
-            continue
-        cfg = getattr(mod, "config", None)
-        if cfg is None or not getattr(cfg, "gated_linear_unit", False):
-            continue
-        if getattr(mod, "weight", None) is not None:
-            continue
-        if any(
-            name.startswith("weight") and name[6:].isdigit() and is_gtp_param(param)
-            for name, param in mod.named_parameters(recurse=False)
-        ):
-            raise NotImplementedError(
-                f"{mod_name}: gated_linear_unit with EGTP-sharded grouped weights is not "
-                "supported: the logical-layout checkpoint wiring (transformer/mlp.py) only "
-                "covers non-grouped fc1. Disable EGTP for grouped gated fc1 or port the wiring."
-            )
-
 
 def configure_gtp_remat_from_recipe(
     *,
@@ -505,6 +484,7 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    pad_for_alignment=None,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the training recipe.
@@ -517,7 +497,11 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
-        pad_for_alignment=resolve_gtp_pad_for_alignment(fp4=fp4, fp8_recipe=fp8_recipe, fp8=fp8),
+        pad_for_alignment=(
+            pad_for_alignment
+            if pad_for_alignment is not None
+            else resolve_gtp_pad_for_alignment(fp4=fp4, fp8_recipe=fp8_recipe, fp8=fp8)
+        ),
     )
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:

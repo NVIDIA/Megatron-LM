@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -82,10 +83,12 @@ def _get_param_id_to_sharded_metadata(
     """Index optimizer metadata once by exact parameter identity.
 
     Prefer a factory's physical-parameter companion over its model representation.
-    Native-FP8 entries also resolve through their dequantized tensor's source identity.
+    Dequantized and padding-trimmed entries also resolve through their source identity.
     Preserve the original keys, expert offsets and replica IDs in both cases.
     """
-    result, dequantized = {}, {}
+    from megatron.core.tensor_parallel.gtp_utils import gtp_entry_backlink
+
+    result, source_bound = {}, {}
     for entry in nested_values(model_sharded_state_dict):
         if isinstance(entry, ShardedTensorFactory):
             entry = entry.for_optimizer()
@@ -93,11 +96,48 @@ def _get_param_id_to_sharded_metadata(
             continue
         if entry.data is not None:
             result[id(entry.data)] = entry
-            source = getattr(entry.data, '_gtp_dequant_src', None)
+            source = gtp_entry_backlink(entry)
             if source is not None:
-                dequantized[id(source)] = entry
+                source_bound[id(source)] = entry
     # Direct parameter bindings (including companions) take precedence over copies.
-    return {**dequantized, **result}
+    return {**source_bound, **result}
+
+
+def _validate_gtp_optimizer_padding(model_param: torch.Tensor, logical_numel: int) -> None:
+    """Validate a logical state size against this parameter's known GTP padding."""
+    expected_numel = model_param.numel()
+    pad_length = getattr(model_param, 'pad_length', 0)
+    gtp_size = getattr(model_param, 'gtp_remat_size', 1)
+    group = getattr(model_param, 'group', None)
+    if (
+        not gtp_api.HAVE_GTP
+        or not gtp_api.is_gtp_param(model_param)
+        or pad_length <= 0
+        or gtp_size <= 1
+        or group is None
+    ):
+        raise ValueError(
+            f"Optimizer state has {logical_numel} elements, expected {expected_numel}; "
+            "the parameter has no GTP alignment padding."
+        )
+    shard_rows = model_param.shape[0]
+    logical_rows = shard_rows * gtp_size - pad_length
+    keep_rows = max(0, min(shard_rows, logical_rows - group.rank() * shard_rows))
+    expected_logical_numel = keep_rows * math.prod(model_param.shape[1:])
+    if logical_numel != expected_logical_numel:
+        raise ValueError(
+            f"Optimizer state has {logical_numel} elements, expected {expected_logical_numel} "
+            f"logical elements or {expected_numel} padded elements."
+        )
+
+
+def _restore_gtp_optimizer_padding(state: torch.Tensor, model_param: torch.Tensor) -> torch.Tensor:
+    """Restore only the known alignment tail of a fully reshardable optimizer state."""
+    expected_numel = model_param.numel()
+    if state.numel() == expected_numel:
+        return state
+    _validate_gtp_optimizer_padding(model_param, state.numel())
+    return torch.cat((state, state.new_zeros(expected_numel - state.numel())))
 
 
 class Range:
@@ -2004,7 +2044,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             len(state_ten),
                             param_world_end - param_world_start,
                         )
-                        state_ten = state_ten.reshape(sharded_metadata.data.shape)
+                        want_shape = tuple(sharded_metadata.data.shape)
+                        if getattr(sharded_metadata, 'gtp_pad_src', None) is not None:
+                            # The plain model entry excludes this physical shard's pad tail.
+                            # Fused companion factories retain physical data and trim at build.
+                            _validate_gtp_optimizer_padding(model_param, math.prod(want_shape))
+                            state_ten = state_ten[: math.prod(want_shape)]
+                        state_ten = state_ten.reshape(want_shape)
                         replace_kwargs = dict(
                             key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                             data=state_ten,
@@ -2230,12 +2276,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         replica_id=replica_id,
                     )
                 else:
+                    logical_numel = math.prod(sharded_metadata.local_shape)
+                    if logical_numel != model_param.numel():
+                        _validate_gtp_optimizer_padding(model_param, logical_numel)
                     tensors[state_key] = make_sharded_optimizer_fragment(
                         sharded_metadata,
                         state_ten,
                         f'{prefix}.{state_key}',
                         item_slice,
                         replica_id=replica_id,
+                        physical_numel=model_param.numel(),
                     )
                 tensors[state_key].validate_metadata_integrity()
             return tensors
@@ -2587,7 +2637,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         if k == "step":
                             # Handle torch Adam "step" state separately.
                             continue
-                        v_flat = v.flatten()
+                        v_flat = _restore_gtp_optimizer_padding(v.flatten(), model_param)
                         v_flat = v_flat[
                             param_range_map["param"].start : param_range_map["param"].end
                         ]

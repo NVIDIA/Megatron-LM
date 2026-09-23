@@ -207,19 +207,6 @@ def _worker_grouped_weight_list(rank, world_size, port):
 
 
 class TestWrapModuleParams:
-    @pytest.mark.parametrize('weight_name', ['weight0', 'weight64'])
-    def test_rejects_egtp_grouped_gated_fc1(self, weight_name):
-        model = nn.Module()
-        model.linear_fc1 = nn.Module()
-        model.linear_fc1.config = SimpleNamespace(gated_linear_unit=True)
-        model.linear_fc1.register_parameter(
-            weight_name, GTPShardedParam(torch.ones(4, 4, device="cuda"))
-        )
-        with pytest.raises(NotImplementedError, match="gated_linear_unit with EGTP-sharded"):
-            gtp_module.tag_gtp_params_with_names(model)
-        model.linear_fc1.config.gated_linear_unit = False
-        gtp_module.tag_gtp_params_with_names(model)
-
     def test_linear_weight_replaced(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_linear_param_replaced, 4)

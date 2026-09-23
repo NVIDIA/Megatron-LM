@@ -1087,6 +1087,72 @@ def check_param_hashes_across_dp_replicas(
     return all_param_hashes_match
 
 
+def _make_gtp_logical_sharded_tensor(
+    tensor,
+    key,
+    *,
+    tp_axis,
+    tp_rank,
+    tp_size,
+    gtp_rank,
+    gtp_remat_size,
+    pad_length,
+    prepend_offsets,
+    prepend_axis_num,
+    other_offsets,
+    replica_id,
+    **kwargs,
+):
+    """Describe padded GTP storage in logical checkpoint coordinates.
+
+    For TP2/GTP2 with 12 logical rows per TP rank and 8-row physical shards,
+    the saved spans are [0:8], [8:12], [12:20], [20:24]. A uniform padded grid
+    would shift the second TP rank by four rows. Trim each shard to logical rows
+    and use explicit offsets; an entirely padded shard contributes an empty slice.
+    """
+    shard_rows = tensor.shape[0]
+    logical_rows = shard_rows * gtp_remat_size - pad_length
+
+    start = min(gtp_rank * shard_rows, logical_rows)
+    keep = min(shard_rows, max(0, logical_rows - start))
+
+    # Preserve parameter identity when no trimming is needed.
+    local = tensor if keep == shard_rows else tensor[:keep]
+    if tp_axis == 0:
+        global_dim0 = logical_rows * tp_size
+        offset_dim0 = tp_rank * logical_rows + start
+    else:
+        global_dim0 = logical_rows
+        offset_dim0 = start
+
+    sharded = ShardedTensor.from_rank_offsets(
+        key,
+        local,
+        *prepend_offsets,
+        *other_offsets,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
+        **kwargs,
+    )
+    global_shape = list(sharded.global_shape)
+    global_offset = list(sharded.global_offset)
+    global_shape[prepend_axis_num] = global_dim0
+    global_offset[prepend_axis_num] = offset_dim0
+    sharded.global_shape = tuple(global_shape)
+    sharded.global_offset = tuple(global_offset)
+    # Uneven shards: the regular-grid divisibility rule no longer applies.
+    sharded.axis_fragmentations = None
+    if keep != shard_rows:
+        # Identity and storage differ for native FP8: the live parameter resolves
+        # optimizer metadata, while the dequantized buffer receives loaded data.
+        # Keep both links on the entry because slicing/detach drop tensor attributes.
+        _live = getattr(tensor, "_gtp_dequant_src", None)
+        sharded.gtp_pad_src = tensor if _live is None else _live
+        sharded.gtp_pad_buffer = tensor
+    sharded.validate_metadata_integrity()
+    return sharded
+
+
 def make_tp_sharded_tensor_for_checkpoint(
     tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
 ):
@@ -1148,8 +1214,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
-    gtp_pad_length = 0  # overwritten below for GTP params
-
+    gtp_pad_length = 0
     # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
     # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
     # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
@@ -1180,7 +1245,10 @@ def make_tp_sharded_tensor_for_checkpoint(
             # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas): the
             # group stamped on the param by the caller's pg_collection, else the MPU globals.
             dp_replica_id = gtp_replica_rank(tensor)
-            gtp_pad_length = getattr(tensor, "pad_length", 0)
+            # Alignment padding is a local allocation detail: it is stripped below and the
+            # shard is placed at its logical offset, so the saved global shape is exact and
+            # needs no allow_shape_mismatch waiver (that waiver used to hide the shift).
+            gtp_pad_length = int(getattr(tensor, "pad_length", 0) or 0)
             # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
             # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
             # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
@@ -1197,6 +1265,25 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
+
+    if gtp_pad_length:
+        # dim 0 is described explicitly by the helper; keep only the offsets for other axes.
+        other_offsets = [off for off in new_offsets if off[0] != prepend_axis_num]
+        return _make_gtp_logical_sharded_tensor(
+            tensor,
+            key,
+            tp_axis=tp_axis,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            gtp_rank=gtp_rank,
+            gtp_remat_size=gtp_remat_size,
+            pad_length=gtp_pad_length,
+            prepend_offsets=prepend_offsets,
+            prepend_axis_num=prepend_axis_num,
+            other_offsets=other_offsets,
+            replica_id=replica_id,
+            **kwargs,
+        )
 
     sharded_tensor = ShardedTensor.from_rank_offsets(
         key,

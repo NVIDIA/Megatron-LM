@@ -62,11 +62,16 @@ def test_unmatched_metadata_does_not_guess_by_debug_name(expert):
 
 
 @pytest.mark.parametrize('companion_first', [False, True])
-def test_factory_companion_preserves_outer_prefix_and_identity(companion_first):
+@pytest.mark.parametrize('trimmed', [False, True])
+def test_factory_companion_preserves_outer_prefix_and_identity(companion_first, trimmed):
     param = torch.nn.Parameter(torch.ones(4, 3))
     companion = ShardedTensorFactory('weight', param, lambda *args: [], lambda parts: parts)
     factory = replace(companion, data=torch.ones(8, 3), optimizer_factory=companion)
-    entries = [replace(factory, key='model_0.weight'), _entry(param)]
+    entry = _entry(param)
+    if trimmed:
+        entry = replace(entry, data=entry.data[:2], local_shape=(2, 3))
+        entry.gtp_pad_src = param
+    entries = [replace(factory, key='model_0.weight'), entry]
     if not companion_first:
         entries.reverse()
     resolved = _get_param_id_to_sharded_metadata({'weights': entries})[id(param)]

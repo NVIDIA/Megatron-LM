@@ -23,6 +23,33 @@ from megatron.core.dist_checkpointing.optimizer import _make_sharded_optimizer_f
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
+def gtp_entry_backlink(entry: ShardedTensor | ShardedTensorFactory) -> torch.Tensor | None:
+    """Resolve a dequantized or padding-trimmed entry to its live parameter.
+
+    Native-FP8 copies carry ``_gtp_dequant_src`` on the tensor. Trimmed entries carry
+    ``gtp_pad_src`` on the ShardedTensor because slicing and detach drop tensor
+    attributes. Both refer to the live parameter, including padded native FP8.
+    """
+    src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+    if src is None:
+        src = getattr(entry, 'gtp_pad_src', None)
+    return src
+
+
+def untrimmed_gtp_shard(sh_ten: ShardedTensor) -> torch.Tensor:
+    """Return the full data buffer behind a padding-trimmed checkpoint entry.
+
+    Collectives need equal shard sizes. For native FP8, ``gtp_pad_buffer`` holds
+    the dequantized buffer; the live parameter in ``gtp_pad_src`` has different
+    storage and must not replace it. Optimizer entries can use a single backlink
+    because their identity and data buffers coincide.
+    """
+    src = getattr(sh_ten, "gtp_pad_buffer", None)
+    if src is None:
+        src = getattr(sh_ten, "gtp_pad_src", None)
+    return sh_ten.data if src is None else src
+
+
 @torch.no_grad()
 def _gtp_gather_rows_for_save(
     sh_ten: ShardedTensor,
@@ -51,7 +78,7 @@ def _gtp_gather_rows_for_save(
 
     gtp_remat_group = weight.group
     gtp_rank = torch.distributed.get_rank(gtp_remat_group)
-    local = sh_ten.data.contiguous()
+    local = untrimmed_gtp_shard(sh_ten).contiguous()
     gathered = torch.empty(
         (local.shape[0] * torch.distributed.get_world_size(gtp_remat_group),) + local.shape[1:],
         dtype=local.dtype,
