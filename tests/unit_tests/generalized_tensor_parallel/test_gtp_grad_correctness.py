@@ -193,7 +193,7 @@ def _worker(rank, world_size, port, calculate_per_token_loss=False):
     base_grads = _full_main_grads(base_stack)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     # ---------- Phase B: GTP_remat=2 DP=2 (replicate>1!) ----------
     ps.initialize_model_parallel(
@@ -223,7 +223,7 @@ def _worker(rank, world_size, port, calculate_per_token_loss=False):
     gtp_grads = _full_main_grads(gtp_stack)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     # ---------- Compare reduced gradients on rank 0 ----------
     if rank == 0:
@@ -352,7 +352,7 @@ def _worker_distopt(rank, world_size, port):
     base_gn = _run_step_distopt(base_ddp, base_optim, rank)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     # ---------- Phase B: GTP_remat=2 DP=2, dist-opt + Adam ----------
     ps.initialize_model_parallel(
@@ -376,7 +376,7 @@ def _worker_distopt(rank, world_size, port):
     gtp_gn = _run_step_distopt(gtp_ddp, gtp_optim, rank)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     if rank == 0:
         ratio = gtp_gn / max(base_gn, 1e-12)
@@ -491,7 +491,7 @@ def _worker_moe_distopt(rank, world_size, port):
     base_gn = _run_step_distopt(base_ddp, base_optim, rank)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     # ---------- Phase B: GTP2/EGTP2, EP2 (EGTP_remat actually shards experts) ----------
     ps.initialize_model_parallel(
@@ -535,7 +535,7 @@ def _worker_moe_distopt(rank, world_size, port):
     moe_gn = _run_step_distopt(moe_ddp, moe_optim, rank)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     if rank == 0:
         ratio = moe_gn / max(base_gn, 1e-12)
@@ -595,7 +595,7 @@ def _worker_moe_gtp_egtp_mismatch(rank, world_size, port, gtp, egtp):
     base_gn = _run_step_distopt(base_ddp, base_optim, rank)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     # ---------- Phase B: GTP={gtp}/EGTP={egtp}, EP2 (mismatched) ----------
     ps.initialize_model_parallel(
@@ -636,7 +636,7 @@ def _worker_moe_gtp_egtp_mismatch(rank, world_size, port, gtp, egtp):
     moe_gn = _run_step_distopt(moe_ddp, moe_optim, rank)
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     if rank == 0:
         ratio = moe_gn / max(base_gn, 1e-12)
@@ -713,7 +713,7 @@ def _run_gtp2_phase(rank, saved, fp32_accum):
     ]
 
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
     return grad_norms
 
 
@@ -744,7 +744,7 @@ def _worker_fp32accum(rank, world_size, port):
     saved = {n: p.data.clone() for n, p in ref_stack.named_parameters()}
     del ref_stack
     ps.destroy_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     plain_gns = _run_gtp2_phase(rank, saved, fp32_accum=False)
     fp32_gns = _run_gtp2_phase(rank, saved, fp32_accum=True)
@@ -775,7 +775,7 @@ def _reset_gtp_global_state():
     """
     import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
     gtp_module.get_global_GTP_cache().clear()
     gtp_module._wgrad_buf_pool.clear()
     gtp_module._inflight_comm_params.clear()

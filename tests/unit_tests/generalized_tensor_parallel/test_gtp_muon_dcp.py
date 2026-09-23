@@ -134,11 +134,7 @@ class TestGTPMuonDCP:
 
         from megatron.core import parallel_state as ps
         from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
-        from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
-            GTP_CONFIG,
-            GTPShardedParam,
-            update_gtp_config,
-        )
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
         from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
 
         Utils.initialize_model_parallel(1, 1)  # bootstrap torch.distributed + model parallel
@@ -147,11 +143,9 @@ class TestGTPMuonDCP:
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
         )
         model_parallel_cuda_manual_seed(2)
-        # Disable GTP_remat alignment padding so the tiny test dims slice cleanly by gtp_remat_size.
-        _orig_pad = GTP_CONFIG.pad_for_alignment
-        update_gtp_config(pad_for_alignment=0)
-        # GTP_remat dims (divisible by gtp_remat_size=2); GPU init (CPU affine not GTP_remat-aware
-        # for the strided QKV weight).
+        # Dims are multiples of pad_for_alignment(16) * gtp_remat_size(2) == 32, so GTP_remat
+        # padding is a no-op here; GPU init (CPU affine not GTP_remat-aware for the strided QKV
+        # weight).
         moe_cfg = dict(
             hidden_size=64,
             num_attention_heads=8,
@@ -201,8 +195,6 @@ class TestGTPMuonDCP:
                 optim_sd_B = optimizer_B.sharded_state_dict(model_sd_B, metadata=meta)
                 save(optim_sd_B, ckpt_dir_B)
 
-                update_gtp_config(pad_for_alignment=_orig_pad)
-
                 Utils.destroy_model_parallel()
                 Utils.initialize_model_parallel(1, 1)
                 from megatron.core.dist_checkpointing import load_plain_tensors
@@ -247,10 +239,8 @@ class TestGTPMuonDCP:
         from megatron.core.fp8_utils import is_float8tensor
         from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
         from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
-            GTP_CONFIG,
             is_gtp_param,
             tag_gtp_params_with_names,
-            update_gtp_config,
         )
 
         Utils.initialize_model_parallel(1, 1)  # bootstrap torch.distributed + model parallel
@@ -259,10 +249,8 @@ class TestGTPMuonDCP:
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
         )
         model_parallel_cuda_manual_seed(2)
-        # MXFP8 needs shard dims % 32; padding off so dims slice cleanly by the remat size.
-        _orig_pad = GTP_CONFIG.pad_for_alignment
-        update_gtp_config(pad_for_alignment=0)
-
+        # _initialize_native_fp8_moe_model's dims are already sized as multiples of the MXFP8
+        # block (32) times gtp_remat_size, so GTP_remat padding is a no-op here.
         # MXFP8 params can't be aliased into the DDP param buffer (replace_raw_data unsupported);
         # the production native-FP8 path sets reuse_grad_buf_for_mxfp8_param_ag to skip that
         # aliasing. The shared harness builds its own mock args, so wrap init_basic_mock_args to
@@ -322,8 +310,6 @@ class TestGTPMuonDCP:
             optimizer_B.load_state_dict(state_dict)
             optim_sd_B = optimizer_B.sharded_state_dict(model_sd_B, metadata=meta)
             save(optim_sd_B, ckpt_dir_B)
-
-            update_gtp_config(pad_for_alignment=_orig_pad)
 
             Utils.destroy_model_parallel()
             Utils.initialize_model_parallel(1, 1)

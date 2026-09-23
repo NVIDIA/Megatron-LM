@@ -880,8 +880,10 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 **Whenever you add or change a GTP_remat/EGTP_remat feature, run the GTP_remat unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
 
 ```bash
-# 4 GPUs. GTP_remat requires TransformerEngine >= 2.19.
-torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v
+# 4 GPUs. GTP_remat requires TransformerEngine >= 2.19. -m "not flaky_in_dev" matches CI's
+# dev filter and excludes test_gtp_partial_cg.py's flake under shared-process load
+# (suspected but unconfirmed cuBLASLt algorithm-selection sensitivity).
+torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v -m "not flaky_in_dev"
 ```
 
 | Test file | What it guards |

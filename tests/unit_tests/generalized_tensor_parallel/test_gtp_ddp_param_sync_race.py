@@ -186,7 +186,7 @@ def _gtp_env():
     finally:
         gtp_module.GTP_CONFIG.pad_for_alignment = orig_pad
         ps.destroy_model_parallel()
-        gtp_module.GTPShardedParam._chain_state = {}
+        gtp_module.GTPShardedParam._chain_state.clear()
         gtp_module.get_global_GTP_cache().clear()
         ps.initialize_model_parallel()
 
