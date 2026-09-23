@@ -10,7 +10,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg,
@@ -176,6 +175,8 @@ class GQAttention(nn.Module):
 
     def _build_core_attn(self, attention_backend: str) -> nn.Module:
         if attention_backend == "magi":
+            from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
+
             return MagiDotProductAttention(head_dim=self.head_dim)
         cp_kwargs = {}
         if self.ps.cp_size > 1:
