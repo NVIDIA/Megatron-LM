@@ -3546,12 +3546,10 @@ class TransformerConfig(ModelParallelConfig):
                 self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
             ), "dsa_indexer_mode='simplified' is not supported with multi_latent_attention."
 
-            if not self.multi_latent_attention:
-                # Only the simplified indexer is implemented for DSA over GQA; the standard
-                # DeepSeek indexer remains available for DSA over MLA.
-                assert (
-                    self.dsa_indexer_mode == 'simplified'
-                ), "DSA over GQA requires dsa_indexer_mode='simplified'."
+            # These limits are DSGroupedSelfAttention's, and the simplified indexer is the only
+            # signal the config has for it. Non-MLA alone also caught standard-indexer
+            # DSAttention with one query group, which has none of them.
+            if not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified':
                 # 'none' is the field default and means "no fused kernels" on the MLA path.
                 # The GQA path has no such mode, so resolve it to the streamed min-memory
                 # backend -- the one intended for production -- rather than failing. Note this
