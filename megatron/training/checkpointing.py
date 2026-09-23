@@ -3,8 +3,6 @@
 """Input/output checkpointing."""
 
 import contextlib
-import copy
-import dataclasses
 import inspect
 import multiprocessing
 import os
@@ -832,7 +830,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                checkpoint_args_snapshot(args),
+                args,
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1657,23 +1655,6 @@ def maybe_save_dataloader_state(
     dataloader_save_dict = {}
     dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
     torch.save(dataloader_save_dict, data_state_save_path)
-
-
-def checkpoint_args_snapshot(args: Namespace) -> Namespace:
-    """Project config-owned settings into a separate legacy checkpoint snapshot.
-
-    Profiling settings describe the saving run, but are not restored by
-    load_args_from_checkpoint: the resumed run keeps its own profiling policy.
-    Never update live args or retain mutable config fields in an async save.
-    """
-    cfg = get_run_config()
-    # Temporary duplication for legacy checkpoint readers during the training-loop
-    # refactor: cfg.profiling is authoritative; only this detached args copy is updated.
-    snapshot = copy.copy(args)
-    for config_field in dataclasses.fields(cfg.profiling):
-        name = "profile" if config_field.name == "use_nsys_profiler" else config_field.name
-        setattr(snapshot, name, copy.deepcopy(getattr(cfg.profiling, config_field.name)))
-    return snapshot
 
 
 def generate_state_dict(

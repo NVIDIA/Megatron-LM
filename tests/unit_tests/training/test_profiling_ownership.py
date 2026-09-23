@@ -272,25 +272,6 @@ def test_pytorch_consumer_inputs_and_resume_progress(
     assert observer.unregister_callback.call_count == int(chakra)
 
 
-def test_checkpoint_snapshot_uses_config_not_live_args(run_config):
-    args, config = cli_config("--profile", "--profile-ranks", "1", "3", "--record-memory-history")
-    run_config.profiling = config
-    args.profile = False
-    args.profile_ranks = [99]
-    snapshot = checkpointing.checkpoint_args_snapshot(args)
-    assert snapshot is not args
-    assert snapshot.profile is True and snapshot.profile_ranks == [1, 3]
-    assert args.profile is False and args.profile_ranks == [99]
-    config.profile_ranks.append(5)
-    assert snapshot.profile_ranks == [1, 3]  # Async-save snapshot is detached.
-    remove_profiling_args(args)
-    snapshot = checkpointing.checkpoint_args_snapshot(args)
-    for field in fields(config):
-        name = "profile" if field.name == "use_nsys_profiler" else field.name
-        assert getattr(snapshot, name) == getattr(config, field.name)
-        assert not hasattr(args, name)
-
-
 def test_checkpoint_profiling_does_not_override_current_run(monkeypatch):
     args, config = cli_config("--profile-step-start", "7", "--profile-ranks", "2")
     args.rank = 0

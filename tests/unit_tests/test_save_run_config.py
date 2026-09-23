@@ -12,7 +12,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
 from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
@@ -32,7 +31,6 @@ class MockFullConfig:
 
     def __init__(self, data):
         self._data = data
-        self.profiling = ProfilingConfig()
 
     def to_yaml(self, yaml_path):
         with open(yaml_path, "w") as f:
