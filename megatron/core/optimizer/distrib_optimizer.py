@@ -1902,9 +1902,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             # Per-buffer (not self.data_parallel_group): can differ, see
             # BufferKey.excludes_cp_from_bucket.
-            buf_dp_group = self.buffers[gbuf_idx].data_parallel_group
+            buffer = self.buffers[gbuf_idx]
+            buf_dp_group = buffer.data_parallel_group
             buf_dp_rank = buf_dp_group.rank()
             buf_dp_world_size = buf_dp_group.size()
+            # excludes_cp_from_bucket buffers share one key across CP ranks; fold in the CP
+            # rank (via group membership, not axis order) so states don't alias. params[0] is
+            # representative -- excludes_cp_from_bucket is itself a BufferKey field.
+            cp_key_suffix = ''
+            first_param = buffer.params[0]
+            if getattr(first_param, 'excludes_cp_from_bucket', False):
+                weight_ranks = set(torch.distributed.get_process_group_ranks(first_param.group))
+                cp_ranks = [
+                    r
+                    for r in torch.distributed.get_process_group_ranks(buffer.dp_cp_group)
+                    if r in weight_ranks
+                ]
+                cp_key_suffix = f'.cp_rank_{cp_ranks.index(torch.distributed.get_rank())}'
             for dtype, gbuf_range_map_for_all_buckets in state[gbuf_idx].items():
                 for bucket_idx, bucket_state in enumerate(gbuf_range_map_for_all_buckets):
                     # Compute local DP contiguous shard's size.
@@ -1919,6 +1933,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     sharded_bucket_key = (
                         f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
+                        f'{cp_key_suffix}'
                     )
 
                     # The global ckpt tensors must be fully covered.

@@ -1244,32 +1244,32 @@ def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base):
         GTPShardedParam._chain_state = {}
 
 
-def _worker_gtp_cp_distrib_optimizer_save_load_roundtrip(rank, world_size, ckpt_base):
-    """DistributedOptimizer ckpt save->load with CP folded into GTP_remat (world=4: cp2*gtp2).
+def _worker_dp_reshardable_cp_gtp_roundtrip(rank, world_size, ckpt_base, cp_size, gtp_remat_size):
+    """DistributedOptimizer dp_reshardable ckpt round-trip, world=4, covering CP-only (cp4),
+    CP folded into GTP (cp2 x gtp2), and GTP-only (gtp4).
 
-    Covers the OPTIMIZER-state path (unlike test_gtp_cp_sharded_save_load_roundtrip, which only
-    covers the model weight): excludes_cp_from_bucket buffers must use their own (CP-free)
-    data_parallel_group for checkpoint offsets, not the optimizer-wide (CP-inclusive) one.
+    Stamps every optimizer-state tensor to a RANK-DISTINCT value before saving and asserts the
+    value THIS rank loads back matches what THIS rank originally saved. A same-key aliasing bug
+    (e.g. two CP ranks sharing one checkpoint key) would instead silently hand every rank the
+    SAME (one winning rank's) value -- a plain resave-equality check can't tell the two apart
+    since the corruption is consistent across both saves.
     """
     from functools import partial
 
-    from megatron.core.dist_checkpointing import load, load_plain_tensors, save
+    from megatron.core.dist_checkpointing import load, save
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
     from megatron.core.transformer.enums import AttnBackend
     from tests.unit_tests.dist_checkpointing import TempNamedDir, setup_model_and_optimizer
     from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
-    from tests.unit_tests.generalized_tensor_parallel.test_gtp_muon_dcp import check_equal
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
-        context_parallel_size=2,
-        gtp_remat_size=2,
+        context_parallel_size=cp_size,
+        gtp_remat_size=gtp_remat_size,
     )
     try:
-        assert (
-            ps.get_gtp_weight_remat_group().size() == 4
-        ), f"expected cp(2)*gtp_remat(2)=4, got {ps.get_gtp_weight_remat_group().size()}"
         moe_cfg = dict(
             hidden_size=64,
             num_attention_heads=8,
@@ -1280,56 +1280,74 @@ def _worker_gtp_cp_distrib_optimizer_save_load_roundtrip(rank, world_size, ckpt_
             attention_backend=AttnBackend.unfused,
         )
         meta = {'distrib_optim_sharding_type': 'dp_reshardable'}
-        with TempNamedDir(ckpt_base / 'gtp_cp_distrib_optim_A', sync=True) as ckpt_dir_A:
-            with TempNamedDir(ckpt_base / 'gtp_cp_distrib_optim_B', sync=True) as ckpt_dir_B:
-                model_A, optimizer_A = setup_model_and_optimizer(
-                    seed=2,
-                    tp=1,
-                    pp=1,
-                    cp=2,
-                    bf16=True,
-                    dist_opt=True,
-                    use_param_layout=True,
-                    initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
-                    optimizer='adam',
-                )
-                dense_gtp_params = [
-                    p
-                    for p in model_A[0].parameters()
-                    if isinstance(p, GTPShardedParam)
-                    and getattr(p, 'excludes_cp_from_bucket', False)
-                ]
-                assert dense_gtp_params, (
-                    "no dense excludes_cp_from_bucket GTP param present; test is not "
-                    "exercising the CP-fold buffer path"
-                )
+        with TempNamedDir(ckpt_base / 'dp_reshardable_cp_gtp', sync=True) as ckpt_dir:
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=1,
+                pp=1,
+                cp=cp_size,
+                bf16=True,
+                dist_opt=True,
+                use_param_layout=True,
+                initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
+                optimizer='adam',
+            )
+            model_sd_A = model_A[0].sharded_state_dict()
+            optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=meta)
 
-                model_sd_A = model_A[0].sharded_state_dict()
-                optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=meta)
-                save(optim_sd_A, ckpt_dir_A)
+            # Stamp a rank-distinct value into every leaf tensor and snapshot it by
+            # (key, global_offset): the bucket key alone is shared by every param packed into
+            # that bucket, disambiguated only by offset.
+            snapshot = {}
+            for leaf in nested_values(optim_sd_A):
+                if not isinstance(leaf, ShardedTensor):
+                    continue
+                leaf.data.fill_(float(rank))
+                snapshot[(leaf.key, leaf.global_offset)] = leaf.data.clone()
+            assert snapshot, "no ShardedTensor leaves found; test is not exercising anything"
+            # Only CP-folded GTP buffers are tagged; every other key stays unchanged.
+            tagged = any('.cp_rank_' in key for key, _ in snapshot)
+            assert tagged == (
+                cp_size > 1 and gtp_remat_size > 1
+            ), f"cp{cp_size} gtp{gtp_remat_size}: .cp_rank_ tag present={tagged}"
 
-                model_B, optimizer_B = setup_model_and_optimizer(
-                    seed=3,
-                    tp=1,
-                    pp=1,
-                    cp=2,
-                    bf16=True,
-                    dist_opt=True,
-                    use_param_layout=True,
-                    initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
-                    optimizer='adam',
-                )
-                model_sd_B = model_B[0].sharded_state_dict()
-                load_sharded_sd = optimizer_B.sharded_state_dict(
-                    model_sd_B, is_loading=True, metadata=meta
-                )
-                state_dict = load(load_sharded_sd, ckpt_dir_A)
-                optimizer_B.load_state_dict(state_dict)
-                optim_sd_B = optimizer_B.sharded_state_dict(model_sd_B, metadata=meta)
-                save(optim_sd_B, ckpt_dir_B)
+            save(optim_sd_A, ckpt_dir)
 
-                if rank == 0:
-                    check_equal(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=1,
+                cp=cp_size,
+                bf16=True,
+                dist_opt=True,
+                use_param_layout=True,
+                initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
+                optimizer='adam',
+            )
+            model_sd_B = model_B[0].sharded_state_dict()
+            load_sharded_sd = optimizer_B.sharded_state_dict(
+                model_sd_B, is_loading=True, metadata=meta
+            )
+            state_dict = load(load_sharded_sd, ckpt_dir)
+            optimizer_B.load_state_dict(state_dict)
+
+            # Re-wrap optimizer_B's now-loaded live state and compare THIS rank's own value.
+            optim_sd_B_after = optimizer_B.sharded_state_dict(model_sd_B, metadata=meta)
+            checked = 0
+            for leaf in nested_values(optim_sd_B_after):
+                if not isinstance(leaf, ShardedTensor):
+                    continue
+                snapshot_key = (leaf.key, leaf.global_offset)
+                if snapshot_key not in snapshot:
+                    continue
+                torch.testing.assert_close(
+                    leaf.data.cpu(), snapshot[snapshot_key].cpu(), rtol=0, atol=0
+                )
+                checked += 1
+            assert checked == len(snapshot), (
+                f"only matched {checked}/{len(snapshot)} keys after load; some of this rank's "
+                "own saved state was not found back under its own (key, offset)"
+            )
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
@@ -2294,9 +2312,14 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_gtp_cp_sharded_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
 
-    def test_gtp_cp_distrib_optimizer_save_load_roundtrip(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize(
+        "cp_size,gtp_remat_size", [(4, 1), (2, 2), (1, 4)], ids=["cp4", "cp2_gtp2", "gtp4"]
+    )
+    def test_dp_reshardable_cp_gtp_roundtrip(self, tmp_path_dist_ckpt, cp_size, gtp_remat_size):
         _require_world_size(4)
-        _worker_gtp_cp_distrib_optimizer_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _worker_dp_reshardable_cp_gtp_roundtrip(
+            dist.get_rank(), 4, tmp_path_dist_ckpt, cp_size, gtp_remat_size
+        )
 
     def test_public_wrapper_delegates(self):
         _require_world_size(4)
