@@ -1098,10 +1098,15 @@ class DSGroupedSelfAttention(SelfAttention):
         name: str | None = None,
     ):
         if config.experimental_attention_variant == "dsa":
+            # Asserted here, not in transformer_config: the config cannot tell which attention class
+            # a spec will build.
+            assert config.dsa_indexer_mode == 'simplified', (
+                "DSGroupedSelfAttention implements only the simplified indexer; got "
+                f"dsa_indexer_mode={config.dsa_indexer_mode!r}. The standard DeepSeek indexer "
+                "remains available for DSA over MLA."
+            )
             submodules = copy.copy(submodules)
             dense_core_attention = submodules.core_attention
-            # DSA over GQA implements only the simplified indexer; TransformerConfig
-            # enforces dsa_indexer_mode='simplified' for the non-MLA path.
             indexer_spec = ModuleSpec(
                 module=SimplifiedDSGQAIndexer,
                 submodules=SimplifiedDSGQAIndexerSubmodules(
