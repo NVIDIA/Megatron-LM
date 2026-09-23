@@ -59,6 +59,18 @@ class Placements:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
+
+
 @contextmanager
 def fully_shard_context(
     device: torch.device | None = None,

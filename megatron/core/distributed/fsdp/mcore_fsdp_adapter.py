@@ -15,6 +15,7 @@
 import contextlib
 import logging
 import random
+from contextlib import nullcontext
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -38,6 +39,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -57,6 +59,9 @@ try:
         fully_shard,
         fully_shard_context,
         microbatch,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
+        current_fully_shard_context,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
@@ -569,8 +574,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 unspecified, transformer, MoE transformer, and Mamba layers are used.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
-            device: Device whose type is used to construct the data-parallel mesh.
-                Defaults to CUDA.
+            device: Device used to construct the data-parallel mesh and, when this wrapper
+                opens its own ``fully_shard_context``, that context's device. Defaults to
+                CUDA. When the caller has already opened an ambient context (multi-chunk
+                wrapping), this wrapper joins it and the ambient context's device and
+                ``use_symmetric_memory`` settings apply instead.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
                 data-parallel mesh.
 
@@ -651,7 +659,20 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
         )
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        common_fully_shard_kwargs = dict(
+            mixed_precision_policy=self.mp_policy,
+            schedule_policy=schedule_policy,
+            register_hooks=not config.overlap_moe_expert_parallel_comm,
+        )
+        # Join the caller's ambient context when one is active (VPP chunks); otherwise
+        # open and finalize our own.
+        active_context = current_fully_shard_context()
+        construction_context = (
+            nullcontext(active_context)
+            if active_context is not None
+            else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
+        )
+        with construction_context:
             if expert_dp_mesh is not None:
                 # Expert parameters use expert-DP rather than the full dense-DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -664,9 +685,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
-                            schedule_policy=schedule_policy,
+                            **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -680,19 +700,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
-                        mixed_precision_policy=self.mp_policy,
-                        schedule_policy=schedule_policy,
+                        **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=dense_placements,
-                mixed_precision_policy=self.mp_policy,
-                schedule_policy=schedule_policy,
+                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
             )
         super().__init__(config=config, module=module)
+
+        if config.overlap_moe_expert_parallel_comm:
+            register_combined_1f1b_hooks(self.module)
 
     @staticmethod
     def _validate_config(
@@ -732,7 +750,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # Context parallelism is absent on purpose: the mesh is built from dp_cp, which
         # already folds CP ranks into the axis this shards and reduces gradients over.
-        unsupported_parallelisms = ["tensor_model_parallel_size", "pipeline_model_parallel_size"]
+        # Pipeline parallelism is supported with MFSDP v2 as long as a single shared
+        # FsdpContext is opened across all VPP model chunks (see
+        # wrap_model_chunks_with_ddp / dist_utils._ddp_wrap). The data-parallel mesh is
+        # built solely from dp_cp, so DP sharding is unaffected by how layers are split
+        # across pipeline stages or virtual stages.
+        unsupported_parallelisms = ["tensor_model_parallel_size"]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
                 "MFSDP v2 does not currently support: "
@@ -744,7 +767,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp"):
+        for group_name in ("tp",):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
@@ -807,8 +830,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
-        if ddp_config.delay_wgrad_compute:
-            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
         if ddp_config.num_buckets is not None:
             raise ValueError("MFSDP v2 does not support num_buckets.")
         if ddp_config.megatron_fsdp_use_decoupled_grad:
@@ -843,6 +864,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
+        if self.config.overlap_moe_expert_parallel_comm:
+            # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
+            # Synchronize gradients here to ensure it is safe to call optimizer.step().
+            context = self.module.context
+            context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
