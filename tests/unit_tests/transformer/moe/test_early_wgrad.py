@@ -138,15 +138,22 @@ class TestEarlyExpertWgrad:
     def test_launch_precedes_shared_input_gradient_merge(self, monkeypatch, recompute, fp8):
         layer = self.make_layer(recompute=recompute, fp8=fp8)
         order = []
-        original_dispatch = layer.token_dispatcher.token_dispatch
+        dispatcher = layer.token_dispatcher
+        dispatch_method = "token_dispatch"
+        if self.dispatcher_backend != "alltoall":
+            # Register the observation before Flex installs its wgrad post-hook.
+            dispatcher = dispatcher._comm_manager
+            dispatch_method = "dispatch"
+        original_dispatch = getattr(dispatcher, dispatch_method)
         original_preprocess = layer.token_dispatcher.dispatch_preprocess
         original_shared = layer.shared_experts.pre_forward_comm
         original_wgrad = layer.backward_dw
 
         def dispatch(*args, **kwargs):
             output = original_dispatch(*args, **kwargs)
-            if output[0].grad_fn is not None:
-                output[0].grad_fn.register_hook(lambda *unused: order.append("dispatch"))
+            hidden_states = output[0] if self.dispatcher_backend == "alltoall" else output
+            if hidden_states.grad_fn is not None:
+                hidden_states.grad_fn.register_hook(lambda *unused: order.append("dispatch"))
             return output
 
         def shared(hidden_states, *args, **kwargs):
@@ -172,7 +179,7 @@ class TestEarlyExpertWgrad:
             order.append("wgrad")
             return original_wgrad(*args, **kwargs)
 
-        monkeypatch.setattr(layer.token_dispatcher, "token_dispatch", dispatch)
+        monkeypatch.setattr(dispatcher, dispatch_method, dispatch)
         monkeypatch.setattr(layer.token_dispatcher, "dispatch_preprocess", preprocess)
         monkeypatch.setattr(layer.shared_experts, "pre_forward_comm", shared)
         monkeypatch.setattr(layer, "backward_dw", wgrad)

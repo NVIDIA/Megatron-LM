@@ -44,10 +44,7 @@ from megatron.core.transformer.moe.moe_utils import (
     sort_chunks_by_idxs,
     unpermute,
 )
-from megatron.core.transformer.moe.shared_experts import (
-    SharedExpertMLP,
-    set_tensor_grad_fn_sequence_sr,
-)
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
@@ -63,23 +60,6 @@ _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
      num_local_tokens: S/TP*B
      num_global_tokens: num_local_tokens*TP*EP
 """
-
-
-class _DispatchBackwardCallback(torch.autograd.Function):
-    """Run independent work before the routed input gradient reaches a shared fork."""
-
-    @staticmethod
-    def forward(ctx, hidden_states, callback):
-        """Wrap only the communication input; shared experts keep the original tensor."""
-        ctx.callback = callback
-        return hidden_states
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Dispatch backward has submitted communication when this node becomes ready."""
-        ctx.callback()
-        ctx.callback = None
-        return grad_output, None
 
 
 class MoETokenDispatcher:
@@ -2121,21 +2101,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        dispatch_input = hidden_states
-        if dispatch_backward_callback is not None:
-            dispatch_input = _DispatchBackwardCallback.apply(
-                hidden_states, dispatch_backward_callback
-            )
         dispatched_hidden_states = self._comm_manager.dispatch(
-            dispatch_input, async_finish, allocate_on_comm_stream
+            hidden_states, async_finish, allocate_on_comm_stream
         )
         if dispatch_backward_callback is not None and dispatched_hidden_states.grad_fn is not None:
-            # Shared FC1 backward uses dispatch's sequence number minus one.
-            # Prioritize the callback over that branch once dispatch backward
-            # makes it ready, so shared computation cannot delay its submission.
-            set_tensor_grad_fn_sequence_sr(
-                dispatch_input, dispatched_hidden_states.grad_fn._sequence_nr()
-            )
+            # Managers return the dispatch Function's output directly. Its post-hook
+            # submits wgrad before autograd proceeds to the shared-input gradient merge.
+            def launch_wgrad(grad_inputs, grad_outputs):
+                dispatch_backward_callback()
+
+            dispatched_hidden_states.grad_fn.register_hook(launch_wgrad)
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
