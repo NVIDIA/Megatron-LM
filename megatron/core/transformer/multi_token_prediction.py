@@ -1612,14 +1612,17 @@ class MultiTokenPredictionLayer(MegatronModule):
             return_sum=False,
         )
         if padding_mask is not None:
-            padding_mask, _ = roll_tensor(
-                padding_mask,
+            # roll_tensor zero-fills sequence ends. Roll validity so these new
+            # positions remain padding (True), including packed/CP boundaries.
+            valid_mask, _ = roll_tensor(
+                ~padding_mask,
                 shifts=-1,
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
+            padding_mask = ~valid_mask
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 

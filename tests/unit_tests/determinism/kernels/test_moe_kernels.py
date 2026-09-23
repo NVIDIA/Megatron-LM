@@ -237,15 +237,20 @@ def test_group_limited_topk_replays():
         ),
     ],
 )
-def test_switch_load_balancing_loss_replays(fused):
+@pytest.mark.parametrize("all_padding", [False, True])
+def test_switch_load_balancing_loss_replays(fused, all_padding):
     seeded()
     routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
+    if all_padding:
+        routing_map.zero_()
+        probs.zero_()
     probs = probs.detach().requires_grad_(True)
     tokens_per_expert = routing_map.sum(dim=0)
+    total_num_tokens = tokens_per_expert.sum() // 8 if all_padding else 65536
 
     def fn(probs):
         return moe_utils.switch_load_balancing_loss_func(
-            probs, tokens_per_expert, 65536, 8, 256, 1e-2, fused=fused
+            probs, tokens_per_expert, total_num_tokens, 8, 256, 1e-2, fused=fused
         )
 
     assert_replays_bit_exact(fn, (probs,), replays=4, what=f"aux loss[fused={fused}]")

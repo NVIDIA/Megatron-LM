@@ -695,43 +695,79 @@ class TestMultiTokenPredictionLayer:
             assert len(mtp.layers) == config.mtp_num_layers
             assert all(_resolve_is_first_microbatch(m) is True for m in te_modules)
 
-    def test_get_embeddings_rolls_padding_mask(self):
-        """Test that _get_embeddings rolls padding_mask alongside input ids."""
+    @pytest.mark.parametrize("cp", [1, 2])
+    @pytest.mark.parametrize("layout", ["unpacked", "packed", "padded_packed"])
+    def test_get_embeddings_rolls_padding_mask(self, cp, layout):
+        """Shifted sequence ends and existing padding stay excluded at every MTP depth."""
+        if Utils.world_size < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
         torch.manual_seed(_SEED)
-        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
-        mtp_layer = mtp.layers[0]
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=cp, use_te=cp > 1)
+        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        cp_group = get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        capacities = [16] if layout == "unpacked" else [8, 12]
+        lengths = [5, 9] if layout == "padded_packed" else capacities
+        logical, physical, local_indices = [0], [0], []
+        for length, capacity in zip(lengths, capacities):
+            start = physical[-1]
+            width = capacity // (2 * cp)
+            for chunk in (cp_rank, 2 * cp - cp_rank - 1):
+                local_indices.extend(range(start + chunk * width, start + (chunk + 1) * width))
+            logical.append(logical[-1] + length)
+            physical.append(start + capacity)
+        index = torch.tensor(local_indices, device="cuda")
+        packed_seq_params = None
+        if layout != "unpacked":
+            cu_seqlens = torch.tensor(logical, dtype=torch.int32, device="cuda")
+            padded = torch.tensor(physical, dtype=torch.int32, device="cuda")
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cu_seqlens_q_padded=padded if layout == "padded_packed" else None,
+                cu_seqlens_kv_padded=padded if layout == "padded_packed" else None,
+                qkv_format="thd",
+            )
 
-        seq_len = 6
-        batch_size = 2
-        input_ids = torch.tensor([[1, 2, 3, 4, 0, 0], [5, 6, 7, 0, 0, 0]], dtype=torch.int64)
-        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
-        padding_mask = torch.tensor(
-            [[True, True, True, True, False, False], [True, True, True, False, False, False]]
-        )
-        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+        # Cover right-padded, fully valid, and entirely padded rows. Expected masks
+        # come from original valid lengths, independently of the rolling helper.
+        valid_lengths = [[length - 2, length, 0] for length in lengths]
+        full_mask = torch.ones(3, physical[-1], dtype=torch.bool, device="cuda")
+        for start, row_lengths in zip(physical, valid_lengths):
+            for row, length in enumerate(row_lengths):
+                full_mask[row, start : start + length] = False
+        padding_mask = full_mask.index_select(-1, index)
+        input_ids = torch.arange(physical[-1], device="cuda").repeat(3, 1).index_select(-1, index)
+        position_ids = input_ids.clone()
+        hidden_states = torch.randn(index.numel(), 3, config.hidden_size, device="cuda")
 
         def fake_embedding(input_ids, position_ids):
-            return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
+            return torch.zeros(input_ids.size(1), 3, config.hidden_size, device="cuda")
 
-        rolled_input_ids, rolled_position_ids, rolled_padding_mask, _, _, _ = (
-            mtp_layer._get_embeddings(
+        for depth in range(1, 4):
+            original_mask = padding_mask.clone()
+            input_ids, position_ids, shifted_mask, _, _, _ = mtp_layer._get_embeddings(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 padding_mask=padding_mask,
                 embedding=fake_embedding,
                 hidden_states=hidden_states,
-                packed_seq_params=None,
+                packed_seq_params=packed_seq_params,
             )
-        )
-
-        expected_input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
-        expected_position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
-        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
-
-        assert torch.equal(rolled_input_ids, expected_input_ids)
-        assert torch.equal(rolled_position_ids, expected_position_ids)
-        assert torch.equal(rolled_padding_mask, expected_padding_mask)
+            expected = torch.ones_like(full_mask)
+            for start, row_lengths in zip(physical, valid_lengths):
+                for row, length in enumerate(row_lengths):
+                    expected[row, start : start + max(length - depth, 0)] = False
+            expected = expected.index_select(-1, index)
+            passed = torch.tensor(
+                [torch.equal(shifted_mask, expected), torch.equal(padding_mask, original_mask)],
+                dtype=torch.int32,
+                device="cuda",
+            )
+            # Fail together so a boundary failure cannot strand a peer in the next roll.
+            torch.distributed.all_reduce(passed, op=torch.distributed.ReduceOp.MIN)
+            assert passed.all().item(), f"Invalid padding mask at MTP depth {depth}"
+            padding_mask = shifted_mask
 
     @pytest.mark.parametrize("with_mask", [False, True])
     def test_get_embeddings_does_not_add_a_mask_roll(self, monkeypatch, with_mask):
@@ -753,7 +789,7 @@ class TestMultiTokenPredictionLayer:
             "megatron.core.transformer.multi_token_prediction.roll_tensor", capture_roll
         )
 
-        mtp_layer._get_embeddings(
+        result = mtp_layer._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=lambda input_ids, position_ids: torch.zeros(
@@ -763,6 +799,7 @@ class TestMultiTokenPredictionLayer:
             mtp_input_mask=mtp_input_mask,
         )
 
+        assert result[2] is None
         assert len(rolled_shapes) == 2  # Token metadata and position IDs.
         expected_metadata_batch = 2 * input_ids.size(0) if with_mask else input_ids.size(0)
         assert rolled_shapes[0][0] == expected_metadata_batch
@@ -841,7 +878,7 @@ class TestMultiTokenPredictionLayer:
         batch_size = 2
         input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64)
         position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
-        padding_mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
+        padding_mask = torch.tensor([[False, False, False, True], [False, False, True, True]])
         hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
         attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
         seen = {}
@@ -885,7 +922,9 @@ class TestMultiTokenPredictionLayer:
             embedding=fake_embedding,
         )
 
-        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+        expected_padding_mask = torch.tensor(
+            [[False, False, True, True], [False, True, True, True]]
+        )
         assert torch.equal(seen["padding_mask"], expected_padding_mask)
         assert torch.equal(returned_padding_mask, expected_padding_mask)
 
