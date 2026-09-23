@@ -85,8 +85,6 @@ class MegatronCheckpointLoaderBase:
             margs.no_persist_layer_norm = True
 
         self.margs = margs
-        from megatron.training.argument_utils import rng_config_from_args
-        self.rng_config = rng_config_from_args(margs)
         self.checkpoint_args = checkpoint_args
 
     def _maybe_ensure_additional_required_arguments(self):
@@ -212,7 +210,7 @@ class MegatronCheckpointLoaderBase:
                 self.margs.consumed_train_samples = 0
                 self.margs.consumed_valid_samples = 0
                 self.margs.exit_on_missing_checkpoint = True
-                load_checkpoint(model_list, None, None, rng_config=self.rng_config)
+                load_checkpoint(model_list, None, None)
 
                 # Validate that train/valid samples match across ranks
                 nonlocal consumed_train_samples, consumed_valid_samples
@@ -489,3 +487,4 @@ class MegatronCheckpointLoaderBase:
     def send_model_over_queue(self):
         """Creates model schema and sends the model over the queue"""
         raise NotImplementedError
+

@@ -130,7 +130,7 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
         restore_sharded_modelopt_state([model], sharded_load_dir)
 
 
-def load_kd_teacher_checkpoint(model, *, rng_config) -> None:
+def load_kd_teacher_checkpoint(model) -> None:
     """Load the teacher checkpoint for ModelOpt distillation if the model has one."""
     args = get_args()
     if not getattr(args, "export_kd_teacher_load", None):
@@ -145,9 +145,7 @@ def load_kd_teacher_checkpoint(model, *, rng_config) -> None:
     if args.export_kd_teacher_ckpt_format is not None:
         args.ckpt_format = args.export_kd_teacher_ckpt_format
     try:
-        load_checkpoint(
-            [teacher], None, None, load_arg='export_kd_teacher_load', rng_config=rng_config
-        )
+        load_checkpoint([teacher], None, None, load_arg='export_kd_teacher_load')
     finally:
         args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
     print_rank_0("... teacher loaded successfully.")

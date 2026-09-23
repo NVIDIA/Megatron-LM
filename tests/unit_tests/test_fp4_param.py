@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.training.argument_utils import rng_config_from_args
 import gc
 import os
 import sys
@@ -211,18 +210,13 @@ class TestFP4Param:
         )
         if inference:
             gpt_model = get_model(
-                self.model_provider,
-                ModelType.encoder_or_decoder,
-                wrap_with_ddp=False,
-                rng_config=rng_config_from_args(args),
+                self.model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False
             )
             gpt_model[0].eval()
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
-                ModelType.encoder_or_decoder,
-                self.model_provider,
-                rng_config=rng_config_from_args(args),
+                ModelType.encoder_or_decoder, self.model_provider
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -460,7 +454,7 @@ class TestFP4Param:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
         model_parallel_cuda_manual_seed(_SEED)
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider, rng_config=rng_config_from_args(args)
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(model) == 1
         return args, model, optimizer, opt_param_scheduler
@@ -527,9 +521,7 @@ class TestFP4Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
-            save_checkpoint(
-                3, model, optimizer, opt_param_scheduler, 0, rng_config=rng_config_from_args(args)
-            )
+            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
             self.cleanup_between_runs()
@@ -537,13 +529,7 @@ class TestFP4Param:
             args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
                 tp_size, str(ckpt_dir), **kwargs
             )
-            iteration, _ = load_checkpoint(
-                model,
-                optimizer,
-                opt_param_scheduler,
-                strict=True,
-                rng_config=rng_config_from_args(args),
-            )
+            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
             assert iteration == 3
             loaded_state = self.quantized_param_state(model[0])
 

@@ -605,22 +605,16 @@ def rng_config_from_args(args: Namespace) -> RNGConfig:
     return _default_config_from_args(RNGConfig, args)
 
 
-def model_seed_args(args: Namespace, random_seed: int) -> Namespace:
-    """Supply the owned seed to legacy model-config factories without mutating args."""
-    from copy import copy
-
-    snapshot = copy(args)
-    snapshot.seed = random_seed
-    return snapshot
-
-
-def rng_args_snapshot(args: Namespace, rng_config: RNGConfig) -> Namespace:
+def rng_args_snapshot(args: Namespace) -> Namespace:
     """Project owned RNG settings into detached legacy construction/metadata input."""
     from copy import copy
 
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
     snapshot = copy(args)
-    for config_field in fields(rng_config):
-        setattr(snapshot, config_field.name, getattr(rng_config, config_field.name))
+    for config_field in fields(cfg.rng):
+        setattr(snapshot, config_field.name, getattr(cfg.rng, config_field.name))
     return snapshot
 
 
@@ -687,7 +681,7 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
 
 
 def inference_cfg_container_from_args(
-    args: Namespace, model_cfg=None
+    args: Namespace, model_cfg=None, *, build_model_config: bool = True
 ) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
@@ -700,8 +694,9 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
+        build_model_config: Leave the model unset for legacy model-provider entrypoints.
     """
-    if model_cfg is None:
+    if model_cfg is None and build_model_config:
         if getattr(args, "hybrid_layer_pattern", None) is not None:
             model_cfg = hybrid_config_from_args(args)
         else:

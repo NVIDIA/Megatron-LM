@@ -24,10 +24,11 @@ from megatron.post_training.utils import report_current_memory_info, to_empty_if
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 ALGO_TO_CONFIG = {
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
@@ -109,10 +110,9 @@ if __name__ == "__main__":
             'no_load_rng': True,
             'no_load_optim': True,
         })
-    from megatron.training.argument_utils import rng_config_from_args
-    rng_config = rng_config_from_args(args)
-    initialize_runtime_services(args, rng_config=rng_config)
-    initialize_megatron(rng_config=rng_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
     check_arguments()
 
     args = get_args()
@@ -132,8 +132,7 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=rng_config),
-        wrap_with_ddp=False,
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
     report_current_memory_info()
 
@@ -164,7 +163,7 @@ if __name__ == "__main__":
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
     elif args.load is not None:
-        load_checkpoint(model, None, None, rng_config=rng_config)
+        load_checkpoint(model, None, None)
 
     if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]
@@ -189,6 +188,6 @@ if __name__ == "__main__":
     print_rank_0(f"Converted Model:\n {model}")
     torch.distributed.barrier()
 
-    save_checkpoint(1, model, None, None, 0, release=True, rng_config=rng_config)
+    save_checkpoint(1, model, None, None, 0, release=True)
 
     destroy_model_parallel()

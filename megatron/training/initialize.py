@@ -43,6 +43,7 @@ from megatron.training import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+from megatron.training.global_vars import get_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +62,6 @@ def initialize_megatron(
     seed_etp_group=None,
     skip_random_seed=False,
     skip_dependency_compilation=False,
-    *,
-    rng_config,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -116,6 +115,7 @@ def initialize_megatron(
 
     # torch.distributed initialization
     def finish_mpu_init():
+        cfg = get_run_config()
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed(
@@ -136,17 +136,17 @@ def initialize_megatron(
 
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
-            rng_config.resolve_cuda_graphs(
+            cfg.rng.resolve_cuda_graphs(
                 transformer_impl=args.transformer_impl,
                 cuda_graph_impl=args.cuda_graph_impl,
                 rank=args.rank,
             )
-            print_rank_0("> setting random seeds to {} ...".format(rng_config.seed))
+            print_rank_0("> setting random seeds to {} ...".format(cfg.rng.seed))
             _set_random_seed(
-                rng_config.seed,
-                rng_config.data_parallel_random_init,
-                rng_config.te_rng_tracker,
-                rng_config.inference_rng_tracker,
+                cfg.rng.seed,
+                cfg.rng.data_parallel_random_init,
+                cfg.rng.te_rng_tracker,
+                cfg.rng.inference_rng_tracker,
                 use_cudagraphable_rng=args.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,
@@ -509,10 +509,10 @@ def _set_random_seed(
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
-def write_args_to_tensorboard(*, rng_config):
+def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     from megatron.training.argument_utils import rng_args_snapshot
-    args = rng_args_snapshot(get_args(), rng_config)
+    args = rng_args_snapshot(get_args())
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):

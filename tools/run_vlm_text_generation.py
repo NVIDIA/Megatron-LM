@@ -21,9 +21,10 @@ from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from pretrain_vlm import model_provider
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_text_generation_args(parser):
@@ -202,19 +203,16 @@ def main():
     logging.getLogger(__name__).warning("Models using pipeline parallelism are not supported yet.")
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    from megatron.training.argument_utils import rng_config_from_args
-    rng_config = rng_config_from_args(args)
-    initialize_runtime_services(args, rng_config=rng_config)
-    initialize_megatron(rng_config=rng_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     # Set up model and load checkpoint.
-    model = get_model(
-        partial(model_provider, rng_config=rng_config), wrap_with_ddp=False, rng_config=rng_config
-    )
+    model = get_model(model_provider, wrap_with_ddp=False)
 
     args = get_args()
     if args.load is not None:
-        _ = load_checkpoint(model, None, None, rng_config=rng_config)
+        _ = load_checkpoint(model, None, None)
 
     model = model[0]
     model.eval()

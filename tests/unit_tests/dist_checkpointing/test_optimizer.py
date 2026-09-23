@@ -1,7 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from megatron.training import checkpointing
-from megatron.training.argument_utils import rng_config_from_args
 import re
 from copy import deepcopy
 from functools import partial
@@ -463,9 +461,7 @@ def initialize_real_model(
 def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
         with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-            return load_checkpoint(
-                *args, **kwargs, rng_config=rng_config_from_args(checkpointing.get_args())
-            )
+            return load_checkpoint(*args, **kwargs)
 
 
 class TestDistributedOptimizer:
@@ -556,7 +552,6 @@ class TestDistributedOptimizer:
                     None,
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                    rng_config=rng_config_from_args(mock_args),
                 )
 
                 # Get optimizer A param state
@@ -614,9 +609,7 @@ class TestDistributedOptimizer:
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
 
-                save_checkpoint(
-                    10, model, optimizer, None, 0, rng_config=rng_config_from_args(mock_args)
-                )
+                save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(*dest_tp_pp)

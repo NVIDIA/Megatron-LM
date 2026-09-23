@@ -693,9 +693,7 @@ def test_gpt_builder_forwards_rope_scaling_factor():
     ):
         from gpt_builders import gpt_builder
 
-        gpt_builder(
-            mock_args, pre_process=True, post_process=True, config=mock_config, random_seed=1234
-        )
+        gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
 
         mock_gpt_model.assert_called_once()
         _, call_kwargs = mock_gpt_model.call_args

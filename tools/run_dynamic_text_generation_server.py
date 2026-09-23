@@ -53,14 +53,14 @@ from megatron.core.utils import (  # noqa: E402
 )
 from megatron.inference.utils import (  # noqa: E402
     get_dynamic_inference_engine,
-    get_model_for_inference,
     get_inference_config_from_model_and_args,
 )
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron  # noqa: E402
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_text_generation_server_args(parser: argparse.ArgumentParser):
@@ -146,7 +146,7 @@ def parse_args_and_detect_vlm(
     Callers that inject their own argv defaults first should compute user_passed_attrs beforehand
     and pass it in.
 
-    Returns (args, is_vlm, rng_config).
+    Returns (args, is_vlm).
     """
     if user_passed_attrs is None:
         user_passed_attrs = set()
@@ -162,10 +162,9 @@ def parse_args_and_detect_vlm(
     sys.argv[1:1] = _defaults
 
     args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
-    from megatron.training.argument_utils import rng_config_from_args
-    rng_config = rng_config_from_args(args)
-    initialize_runtime_services(args, rng_config=rng_config)
-    initialize_megatron(rng_config=rng_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
     args = get_args()
 
     is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
@@ -178,10 +177,10 @@ def parse_args_and_detect_vlm(
     if torch.distributed.get_rank() == 0:
         print(f"Auto-detected model type: {'VLM' if is_vlm else 'GPT'}")
 
-    return args, is_vlm, rng_config
+    return args, is_vlm
 
 
-def _build_engine_for_vlm_or_gpt(is_vlm: bool, *, rng_config) -> DynamicInferenceEngine:
+def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     """Build a DynamicInferenceEngine, wrapping with VLMInferenceWrapper when needed.
 
     The default ``get_dynamic_inference_engine`` only knows about GPT/Hybrid
@@ -192,10 +191,10 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool, *, rng_config) -> DynamicInferenc
     args = get_args()
 
     if not is_vlm:
-        return get_dynamic_inference_engine(get_model_for_inference(rng_config=rng_config))
+        return get_dynamic_inference_engine()
 
     tokenizer = build_tokenizer(args)
-    model = get_vlm_model(is_vlm=True, rng_config=rng_config)
+    model = get_vlm_model(is_vlm=True)
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     # Grow inference_config.max_sequence_length to accommodate the worst-case
@@ -433,7 +432,7 @@ if __name__ == "__main__":
             _defaults.append("--return-log-probs")
         sys.argv[1:1] = _defaults
 
-        args, is_vlm, rng_config = parse_args_and_detect_vlm(
+        args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
             user_passed_attrs=user_passed_attrs,
@@ -452,7 +451,7 @@ if __name__ == "__main__":
 
         chat_template = _load_chat_template(getattr(args, 'chat_template', None))
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm, rng_config=rng_config)
+        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
 
         try:
             asyncio.run(

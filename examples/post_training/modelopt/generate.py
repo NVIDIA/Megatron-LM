@@ -21,9 +21,10 @@ from megatron.post_training.utils import report_current_memory_info, to_empty_if
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 warnings.filterwarnings('once')
 
@@ -80,10 +81,9 @@ if __name__ == "__main__":
             'no_load_rng': True,
             'no_load_optim': True,
         })
-    from megatron.training.argument_utils import rng_config_from_args
-    rng_config = rng_config_from_args(args)
-    initialize_runtime_services(args, rng_config=rng_config)
-    initialize_megatron(rng_config=rng_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     check_arguments()
 
@@ -103,11 +103,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder, rng_config=rng_config),
-        wrap_with_ddp=False,
-        rng_config=rng_config,
-    )
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
@@ -133,13 +129,7 @@ if __name__ == "__main__":
 
 
     if args.load is not None:
-        load_checkpoint(
-            model,
-            None,
-            None,
-            strict=not args.untie_embeddings_and_output_weights,
-            rng_config=rng_config,
-        )
+        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     unwrapped_model = unwrap_model(model)[0]

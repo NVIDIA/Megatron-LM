@@ -15,20 +15,13 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.utils import log_single_rank
+from megatron.training.argument_utils import rng_args_snapshot
 
 
 
 def model_provider(
-    pre_process=True,
-    post_process=True,
-    add_encoder=True,
-    add_decoder=True,
-    parallel_output=True,
-    vp_stage=None,
-    config=None,
-    pg_collection=None,
-    *,
-    rng_config,
+    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
+    vp_stage=None, config=None, pg_collection=None,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -47,7 +40,6 @@ def model_provider(
     Returns:
         model: A multimodal model.
     """
-    from megatron.training.argument_utils import rng_args_snapshot
     args = get_args()
     use_te = args.use_te
 
@@ -101,7 +93,7 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    base_config = config or core_transformer_config_from_args(rng_args_snapshot(args, rng_config))
+    base_config = config or core_transformer_config_from_args(rng_args_snapshot(get_args()))
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = True

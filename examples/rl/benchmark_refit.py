@@ -22,10 +22,11 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
-from megatron.training.argument_utils import rng_args_snapshot
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.argument_utils import rng_args_snapshot
 from megatron.training.initialize import initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_benchmark_args(parser):
@@ -61,19 +62,12 @@ def add_benchmark_args(parser):
     return parser
 
 
-def model_provider(
-    pre_process=True,
-    post_process=True,
-    parallel_output=False,
-    pg_collection=None,
-    config=None,
-    *,
-    rng_config,
-):
+def model_provider(pre_process=True, post_process=True, parallel_output=False,
+                   pg_collection=None, config=None):
     """Build the model."""
     args = get_args()
     if config is None:
-        config = core_transformer_config_from_args(rng_args_snapshot(args, rng_config))
+        config = core_transformer_config_from_args(rng_args_snapshot(args))
 
     return gpt_builder(
         args=args,
@@ -81,7 +75,6 @@ def model_provider(
         post_process=post_process,
         config=config,
         pg_collection=pg_collection,
-        random_seed=rng_config.seed,
     )
 
 
@@ -211,7 +204,7 @@ def print_results(timings):
             )
 
 
-def benchmark_collocated(*, rng_config):
+def benchmark_collocated():
     """Benchmark refit in collocated mode (both models on same GPUs)."""
     args = get_args()
     world_size = torch.distributed.get_world_size()
@@ -238,13 +231,9 @@ def benchmark_collocated(*, rng_config):
     print_rank_0("Building source model...")
     src_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
-            pre_process=pre_process,
-            post_process=post_process,
-            parallel_output=False,
-            rng_config=rng_config,
+            pre_process=pre_process, post_process=post_process, parallel_output=False
         ),
-        wrap_with_ddp=False,
-        rng_config=rng_config,
+        wrap_with_ddp=False
     )
     src_model[0] = src_model[0].cuda()
 
@@ -259,7 +248,7 @@ def benchmark_collocated(*, rng_config):
         use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
     )
 
-    dst_config = core_transformer_config_from_args(rng_args_snapshot(args, rng_config))
+    dst_config = core_transformer_config_from_args(rng_args_snapshot(args))
     if args.num_experts:
         dst_config.expert_model_parallel_size = dst_ep
     dst_config.tensor_model_parallel_size = dst_tp
@@ -269,14 +258,10 @@ def benchmark_collocated(*, rng_config):
 
     dst_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
-            pre_process=pre_process,
-            post_process=post_process,
-            pg_collection=dst_pg_collection,
-            config=dst_config,
-            rng_config=rng_config,
+            pre_process=pre_process, post_process=post_process,
+            pg_collection=dst_pg_collection, config=dst_config
         ),
         wrap_with_ddp=False,
-        rng_config=rng_config,
         config=dst_config,
         pg_collection=dst_pg_collection,
     )
@@ -306,7 +291,7 @@ def benchmark_collocated(*, rng_config):
         refit_service.close()
 
 
-def benchmark_non_collocated(*, rng_config):
+def benchmark_non_collocated():
     """Benchmark refit in non-collocated mode (separate GPU sets)."""
     args = get_args()
     rank = torch.distributed.get_rank()
@@ -366,20 +351,16 @@ def benchmark_non_collocated(*, rng_config):
         print_rank_0("Building source model...")
         src_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
-                pre_process=pre_process,
-                post_process=post_process,
-                parallel_output=False,
-                rng_config=rng_config,
+                pre_process=pre_process, post_process=post_process, parallel_output=False
             ),
-            wrap_with_ddp=False,
-            rng_config=rng_config,
+            wrap_with_ddp=False
         )
         src_model[0] = src_model[0].cuda()
         dst_model = None
     else:  # is_dst_rank
         # Build destination model
         print_rank_0("Building destination model...")
-        dst_config = core_transformer_config_from_args(rng_args_snapshot(args, rng_config))
+        dst_config = core_transformer_config_from_args(rng_args_snapshot(args))
         if args.num_experts:
             dst_config.expert_model_parallel_size = dst_ep
         dst_config.tensor_model_parallel_size = dst_tp
@@ -389,14 +370,10 @@ def benchmark_non_collocated(*, rng_config):
 
         dst_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
-                pre_process=pre_process,
-                post_process=post_process,
-                pg_collection=dst_pg_collection,
-                config=dst_config,
-                rng_config=rng_config,
+                pre_process=pre_process, post_process=post_process,
+                pg_collection=dst_pg_collection, config=dst_config
             ),
             wrap_with_ddp=False,
-            rng_config=rng_config,
             config=dst_config,
             pg_collection=dst_pg_collection,
         )
@@ -442,10 +419,9 @@ def main():
     )
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
-    from megatron.training.argument_utils import rng_config_from_args
-    rng_config = rng_config_from_args(args)
-    initialize_runtime_services(args, rng_config=rng_config)
-    initialize_megatron(skip_dependency_compilation=True, rng_config=rng_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron(skip_dependency_compilation=True)
 
     args = get_args()
 
@@ -459,9 +435,9 @@ def main():
 
     try:
         if args.refit_mode == 'collocated':
-            benchmark_collocated(rng_config=rng_config)
+            benchmark_collocated()
         else:
-            benchmark_non_collocated(rng_config=rng_config)
+            benchmark_non_collocated()
     finally:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()

@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.training.config.common_config import RNGConfig
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -377,9 +376,7 @@ class TestHybridModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = model_list
         mock_compose.return_value = Mock(return_value=None)
 
-        self.builder.build_distributed_models(
-            self.pg, rng_config=RNGConfig(data_parallel_random_init=False)
-        )
+        self.builder.build_distributed_models(self.pg)
 
         assert mock_unimodal.called
 
@@ -391,9 +388,7 @@ class TestHybridModelBuilderBuildDistributedModels:
         # post_wrap hook returns None → original list is kept
         mock_compose.return_value = Mock(return_value=None)
 
-        result = self.builder.build_distributed_models(
-            self.pg, rng_config=RNGConfig(data_parallel_random_init=False)
-        )
+        result = self.builder.build_distributed_models(self.pg)
 
         assert result is model_list
 
@@ -408,9 +403,7 @@ class TestHybridModelBuilderBuildDistributedModels:
 
         hook1 = Mock()
         self.config.pre_wrap_hooks = [hook1]
-        self.builder.build_distributed_models(
-            self.pg, rng_config=RNGConfig(data_parallel_random_init=False)
-        )
+        self.builder.build_distributed_models(self.pg)
 
         # First compose_hooks call must be with the pre_wrap_hooks list
         assert mock_compose.call_args_list[0] == call([hook1])
@@ -428,9 +421,7 @@ class TestHybridModelBuilderBuildDistributedModels:
         composed_post = Mock(return_value=wrapped_list)
         mock_compose.side_effect = [composed_pre, composed_post]
 
-        result = self.builder.build_distributed_models(
-            self.pg, rng_config=RNGConfig(data_parallel_random_init=False)
-        )
+        result = self.builder.build_distributed_models(self.pg)
 
         composed_post.assert_called_once_with(model_list)
         assert result is wrapped_list
@@ -442,9 +433,7 @@ class TestHybridModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = model_list
         mock_compose.return_value = Mock(return_value=None)
 
-        result = self.builder.build_distributed_models(
-            self.pg, rng_config=RNGConfig(data_parallel_random_init=False)
-        )
+        result = self.builder.build_distributed_models(self.pg)
 
         assert result is model_list
 
@@ -458,9 +447,7 @@ class TestHybridModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = model_list
         mock_compose.return_value = Mock(return_value=None)
 
-        self.builder.build_distributed_models(
-            self.pg, rng_config=RNGConfig(data_parallel_random_init=False)
-        )
+        self.builder.build_distributed_models(self.pg)
 
         # unimodal_build_distributed_models is called with all positional args:
         # build_model, transformer_config, pg_collection, ddp_config,

@@ -49,6 +49,20 @@ def experimental(request):
     config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
 
 
+@pytest.fixture
+def run_config(monkeypatch):
+    """Provide a config owner for isolated training-runtime consumers."""
+    from types import SimpleNamespace
+
+    from megatron.training import global_vars
+    from megatron.training.config import RNGConfig
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    container = SimpleNamespace(rng=RNGConfig())
+    global_vars.set_run_config(container)
+    return container
+
+
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0

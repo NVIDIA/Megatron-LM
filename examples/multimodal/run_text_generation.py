@@ -42,7 +42,12 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, 
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def is_first_rank():
@@ -155,8 +160,9 @@ def get_evaluation_dataloader(
     return dataloader
 
 
-def generate_samples(model, config: EvaluationConfig, print_output, *, random_seed: int):
+def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
+    cfg = get_run_config()
     args = get_args()
 
     dataloader = get_evaluation_dataloader(
@@ -204,7 +210,7 @@ def generate_samples(model, config: EvaluationConfig, print_output, *, random_se
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=random_seed, legacy=True
+            controller, max_batch_size=1, random_seed=cfg.rng.seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -254,7 +260,7 @@ def generate_samples(model, config: EvaluationConfig, print_output, *, random_se
                     top_p_sampling=config.top_p,
                     add_BOS=False,
                     temperature=config.temperature,
-                    random_seed=random_seed,
+                    random_seed=cfg.rng.seed,
                     detokenize_segments=False,
                     data_parallel=True,
             )
@@ -438,7 +444,7 @@ def get_output_path(config, dp_rank):
         return f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
 
 
-def generate_and_write_samples(model, config, print_output=True, *, random_seed: int):
+def generate_and_write_samples(model, config, print_output=True):
     """Generate text and write to an output file."""
     dp_rank = parallel_state.get_data_parallel_rank()
 
@@ -448,7 +454,7 @@ def generate_and_write_samples(model, config, print_output=True, *, random_seed:
         print(f"output path: {output_file.name}")
 
     with torch.no_grad():
-        for output in generate_samples(model, config, print_output, random_seed=random_seed):
+        for output in generate_samples(model, config, print_output):
             if is_first_rank():
                 output_file.write(json.dumps(output) + "\n")
                 output_file.flush()
@@ -803,9 +809,7 @@ def run_eval(config, iteration=None):
     return score
 
 
-def run_evaluation_loop(
-    model, configs, output_dir_override=None, iteration=None, print_output=True, *, random_seed: int
-):
+def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None, print_output=True):
     """
     Common evaluation loop used by both online evaluation during training and standalone evaluation.
 
@@ -828,9 +832,7 @@ def run_evaluation_loop(
             config.output_path = os.path.join(output_dir_override, args.language_model_type)
 
         # Generate samples and write to file
-        generate_and_write_samples(
-            model, config, print_output=print_output, random_seed=random_seed
-        )
+        generate_and_write_samples(model, config, print_output=print_output)
 
         # Synchronize before evaluation
         torch.distributed.barrier()
@@ -849,33 +851,21 @@ def run_evaluation_loop(
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    from megatron.training.argument_utils import rng_config_from_args
-    rng_config = rng_config_from_args(args)
-    initialize_runtime_services(args, rng_config=rng_config)
-    initialize_megatron(rng_config=rng_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     args = get_args()
 
     def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
-        return model_provider(
-            pre_process,
-            post_process,
-            add_encoder=add_encoder,
-            add_decoder=add_decoder,
-            parallel_output=False,
-            rng_config=rng_config,
-        )
+        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
+                              parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(
-        wrapped_model_provider,
-        model_type=ModelType.encoder_or_decoder,
-        wrap_with_ddp=False,
-        rng_config=rng_config,
-    )
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None, rng_config=rng_config)
+        _ = load_checkpoint(model, None, None)
 
     model = model[0]
     model.eval()
@@ -883,7 +873,7 @@ def eval_tasks():
     configs = get_evaluation_configs()
 
     # Use the common evaluation loop
-    run_evaluation_loop(model, configs, iteration=args.ckpt_step, random_seed=rng_config.seed)
+    run_evaluation_loop(model, configs, iteration=args.ckpt_step)
 
 
 if __name__ == "__main__":

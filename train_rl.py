@@ -25,7 +25,7 @@ from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -37,17 +37,7 @@ import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
 
-
-def _gpt_builder(
-    args,
-    pre_process,
-    post_process,
-    vp_stage=None,
-    config=None,
-    pg_collection=None,
-    *,
-    random_seed: int
-):
+def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
     # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
     if config is None:
@@ -56,8 +46,9 @@ def _gpt_builder(
             recompute_granularity_from_args = args.recompute_granularity
             args.recompute_granularity = None
 
-        from megatron.training.argument_utils import model_seed_args
-        config = core_transformer_config_from_args(model_seed_args(args, random_seed))
+        from megatron.training.argument_utils import rng_args_snapshot
+
+        config = core_transformer_config_from_args(rng_args_snapshot(args))
 
         if recompute_granularity_from_args is not None:
             config.recompute_granularity = recompute_granularity_from_args
@@ -87,7 +78,6 @@ def _gpt_builder(
             vp_stage=vp_stage,
             config=config,
             pg_collection=pg_collection,
-            random_seed=random_seed,
         )
 
 
@@ -402,14 +392,7 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     def _model_builder(
-        args,
-        pre_process,
-        post_process,
-        vp_stage=None,
-        config=None,
-        pg_collection=None,
-        *,
-        random_seed: int
+        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
     ):
         if is_hybrid_model(args):
             return hybrid_builder(
@@ -419,7 +402,6 @@ if __name__ == "__main__":
                 vp_stage,
                 config=config,
                 pg_collection=pg_collection,
-                random_seed=random_seed,
             )
         else:
             return _gpt_builder(
@@ -429,7 +411,6 @@ if __name__ == "__main__":
                 vp_stage,
                 config=config,
                 pg_collection=pg_collection,
-                random_seed=random_seed,
             )
 
     args = parse_and_validate_args(
@@ -445,12 +426,13 @@ if __name__ == "__main__":
     else:
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    initialize_runtime_services(args, rng_config=full_config.rng)
+    set_run_config(full_config)
+    initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, _model_builder, rng_config=full_config.rng),
+        partial(model_provider, _model_builder),
     )

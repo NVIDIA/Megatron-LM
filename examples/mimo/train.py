@@ -14,7 +14,7 @@ from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import parse_and_validate_args
 import torch
 from megatron.training import get_args, pretrain, print_rank_0
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
@@ -281,7 +281,8 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args, rng_config=full_config.rng)
+    set_run_config(full_config)
+    initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,

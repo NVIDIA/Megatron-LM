@@ -2,7 +2,6 @@
 """Pretrain and SFT Hybrid."""
 
 # Capture the true program start time BEFORE any heavy imports.
-from functools import update_wrapper
 import time
 
 _PROGRAM_START_TIME = time.time()
@@ -48,7 +47,6 @@ from megatron.core.utils import (
     get_te_version,
     get_torch_version,
 )
-from megatron.core.utils import get_model_config
 from megatron.training import (
     get_args,
     get_timers,
@@ -61,14 +59,18 @@ from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
+    rng_args_snapshot,
 )
-from megatron.training.argument_utils import model_seed_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
 from model_provider import model_provider
 
 try:
@@ -99,10 +101,11 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None, *, config):
+def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
+    config = core_transformer_config_from_args(rng_args_snapshot(args))
 
     if args.sequence_packing_scheduler is not None:
         (
@@ -227,13 +230,7 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir,
-    decode_threads,
-    prefetch_factor,
-    msc_prefetch_depth,
-    kd_loss_alpha,
-    ignore_errors,
-    random_seed,
+    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -249,16 +246,11 @@ def _build_cached_logits_loss_func(
         msc_prefetch_depth=msc_prefetch_depth,
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
-        random_seed=random_seed,
     )
 
 
 def loss_func(
-    loss_mask: torch.Tensor,
-    output_tensor: torch.Tensor,
-    model: Optional[HybridModel] = None,
-    *,
-    random_seed: int,
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None
 ):
     """Loss function.
 
@@ -282,7 +274,6 @@ def loss_func(
             msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
-            random_seed=random_seed,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
@@ -329,7 +320,7 @@ def loss_func(
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: HybridModel, *, random_seed: int):
+def forward_step(data_iterator, model: HybridModel):
     """Forward training step.
 
     Args:
@@ -343,7 +334,7 @@ def forward_step(data_iterator, model: HybridModel, *, random_seed: int):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = get_batch(data_iterator, vp_stage, config=get_model_config(model))
+        cp_batch = get_batch(data_iterator, vp_stage)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -371,13 +362,13 @@ def forward_step(data_iterator, model: HybridModel, *, random_seed: int):
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model, random_seed=random_seed)
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False, *, random_seed: int):
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = core_transformer_config_from_args(model_seed_args(args, random_seed))
+    config = core_transformer_config_from_args(rng_args_snapshot(args))
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
@@ -390,8 +381,9 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False, *, random_
     )
 
 
-def core_gpt_dataset_config_from_args(args: Any, *, random_seed: int) -> GPTDatasetConfig:
+def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     """Build the GPT dataset config from parsed CLI args."""
+    cfg = get_run_config()
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -405,7 +397,7 @@ def core_gpt_dataset_config_from_args(args: Any, *, random_seed: int) -> GPTData
             sequences_per_dataset = json.load(f)
 
     return GPTDatasetConfig(
-        random_seed=random_seed,
+        random_seed=cfg.rng.seed,
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,
@@ -436,16 +428,14 @@ def core_gpt_dataset_config_from_args(args: Any, *, random_seed: int) -> GPTData
     )
 
 
-def train_valid_test_datasets_provider(
-    train_val_test_num_samples, vp_stage=None, *, random_seed: int
-):
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
     args = get_args()
-    config = core_gpt_dataset_config_from_args(args, random_seed=random_seed)
+    config = core_gpt_dataset_config_from_args(args)
 
     is_packed_sequence = False
     if args.sft:
@@ -473,12 +463,7 @@ def train_valid_test_datasets_provider(
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        partial(
-            is_dataset_built_on_rank,
-            vp_stage=vp_stage,
-            is_packed_sequence=is_packed_sequence,
-            random_seed=random_seed,
-        ),
+        partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
         config,
     ).build()
 
@@ -588,15 +573,13 @@ if __name__ == "__main__":
     else:
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    initialize_runtime_services(args, rng_config=full_config.rng)
+    set_run_config(full_config)
+    initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
-        update_wrapper(
-            partial(train_valid_test_datasets_provider, random_seed=full_config.rng.seed),
-            train_valid_test_datasets_provider,
-        ),
+        train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
-        partial(forward_step, random_seed=full_config.rng.seed),
+        forward_step,
         store=store,
     )

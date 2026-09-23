@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.training.argument_utils import rng_config_from_args
 import os
 import shutil
 import subprocess
@@ -223,13 +222,9 @@ class Pipeline:
 
     @staticmethod
     def build_model():
-        model_provider_func = partial(
-            model_provider, gpt_builder, rng_config=rng_config_from_args(get_args())
-        )
+        model_provider_func = partial(model_provider, gpt_builder)
         models = get_model(
-            model_provider_func=model_provider_func,
-            model_type=ModelType.encoder_or_decoder,
-            rng_config=rng_config_from_args(get_args()),
+            model_provider_func=model_provider_func, model_type=ModelType.encoder_or_decoder
         )
         [m.eval() for m in models]
 
@@ -749,9 +744,7 @@ class LLaVAPipeline(Pipeline):
         from examples.multimodal.model import model_provider
 
         models = get_model(
-            model_provider_func=partial(model_provider, rng_config=rng_config_from_args(get_args())),
-            model_type=ModelType.encoder_or_decoder,
-            rng_config=rng_config_from_args(get_args()),
+            model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder
         )
         [m.eval() for m in models]
 

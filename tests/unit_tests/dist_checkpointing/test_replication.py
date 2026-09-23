@@ -1,6 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from megatron.training import checkpointing
-from megatron.training.argument_utils import rng_config_from_args
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -137,7 +135,6 @@ class TestLocalCheckpointingReplication:
                 num_floating_point_operations_so_far,
                 checkpointing_context=self.checkpointing_context,
                 non_persistent_ckpt=True,
-                rng_config=rng_config_from_args(checkpointing.get_args()),
             )
             if async_save:
                 maybe_finalize_async_save(True)
@@ -161,7 +158,6 @@ class TestLocalCheckpointingReplication:
                 optimizer,
                 opt_param_scheduler,
                 checkpointing_context=self.checkpointing_context,
-                rng_config=rng_config_from_args(checkpointing.get_args()),
             )
             assert iteration == 1
         # Perform cleanup to ensure no side effects on subsequent tests

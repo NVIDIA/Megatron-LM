@@ -215,7 +215,7 @@ if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp8 optimizations
     # check for it.
     with torch.inference_mode():
-        args, is_vlm, rng_config = parse_args_and_detect_vlm(
+        args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
@@ -249,7 +249,7 @@ if __name__ == "__main__":
                 dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
             )
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm, rng_config=rng_config)
+        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
         model = engine.controller.inference_wrapped_model.model
 
         tracer = get_moe_router_tracer()
@@ -263,7 +263,7 @@ if __name__ == "__main__":
             if not get_model_config(model).moe_enable_routing_replay:
                 tracer.register_hooks(model)
 
-        requests = build_requests(args, tokenizer, sampling_params, random_seed=rng_config.seed)
+        requests = build_requests(args, tokenizer, sampling_params)
 
         if dist.get_rank() == 0:
             setup_prefix = build_dynamic_engine_setup_prefix(args, model, engine.context, requests)

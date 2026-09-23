@@ -206,6 +206,7 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+from megatron.training.global_vars import get_run_config
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
@@ -1640,7 +1641,6 @@ def pretrain(
         seed_tp_group=getattr(pg_collection, "tp", None),
         seed_ep_group=getattr(pg_collection, "ep", None),
         seed_etp_group=getattr(pg_collection, "expt_tp", None),
-        rng_config=cfg_container.rng,
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1921,7 +1921,6 @@ def pretrain(
                 if pg_collection is not None
                 else ProcessGroupCollection.use_mpu_process_groups()
             ),
-            rng_config=cfg_container.rng,
         )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -2011,7 +2010,6 @@ def pretrain(
                     wrap_with_ddp=False,
                     pg_collection=inference_pg_collection,
                     config=inference_config,
-                    rng_config=cfg_container.rng,
                 )
             inference_model[0].eval()
 
@@ -2139,7 +2137,6 @@ def pretrain(
                     p2p_communicator=p2p_communicator,
                     pg_collection=pg_collection,
                     callback_manager=callback_manager,
-                    rng_config=cfg_container.rng,
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
@@ -2163,8 +2160,7 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
-                rng_config=cfg_container.rng,
+                train_data_iterator=train_data_iterator
             )
 
         one_logger and one_logger.log_metrics(
@@ -2509,16 +2505,9 @@ def _forward_backward_grad_context(args):
     return grad_context, forward_only
 
 
-def get_model(
-    model_provider_func,
-    model_type=ModelType.encoder_or_decoder,
-    wrap_with_ddp=True,
-    config=None,
-    pg_collection=None,
-    *,
-    rng_config,
-):
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
+    cfg = get_run_config()
     args = get_args()
     args.model_type = model_type
     if pg_collection is None:
@@ -2714,7 +2703,7 @@ def get_model(
             current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if rng_config.data_parallel_random_init:
+        if cfg.rng.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
 
@@ -2854,7 +2843,6 @@ def setup_model_and_optimizer(
     *,
     cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
-    rng_config,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2897,19 +2885,13 @@ def setup_model_and_optimizer(
                 use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
-                rng_config=rng_config,
+                data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
-            return get_model(
-                model_provider_func,
-                model_type,
-                wrap_with_ddp=wrap_with_ddp,
-                pg_collection=pg_collection,
-                rng_config=rng_config,
-            )
+            return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
 
     # Configure GTP weight-remat padding/loss reduction before model construction (pad
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
@@ -2956,7 +2938,6 @@ def setup_model_and_optimizer(
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
-            random_seed=rng_config.seed,
             save_dir=args.logits_save_dir,
             k=args.logits_save_top_k,
             p=args.logits_save_top_p,
@@ -3043,12 +3024,7 @@ def setup_model_and_optimizer(
         )
         args.iteration = 1
         save_checkpoint(
-            args.iteration,
-            model,
-            None,
-            None,
-            args.num_floating_point_operations_so_far,
-            rng_config=rng_config,
+            args.iteration, model, None, None, args.num_floating_point_operations_so_far
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -3082,7 +3058,6 @@ def setup_model_and_optimizer(
                 dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
-                rng_config=rng_config,
             )
         # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
         # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
@@ -3107,7 +3082,7 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
 
-        load_kd_teacher_checkpoint(model, rng_config=rng_config)
+        load_kd_teacher_checkpoint(model)
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
@@ -3153,7 +3128,6 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             args.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
-            rng_config=rng_config,
         )
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
@@ -4218,8 +4192,6 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
-    *,
-    rng_config,
 ):
     args = get_args()
     timers = get_timers()
@@ -4307,7 +4279,6 @@ def save_checkpoint_and_time(
                 expt_dp_group=expt_dp_group,
                 rng_state_key_prefix=rng_state_key_prefix,
                 cp_group=cp_group,
-                rng_config=rng_config,
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -4387,9 +4358,7 @@ def post_training_step_callbacks(
     iteration,
     prof,
     num_floating_point_operations_since_last_log_event,
-    nsys_nvtx_context=None,
-    *,
-    rng_config,
+    nsys_nvtx_context = None,
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
@@ -4421,9 +4390,7 @@ def post_training_step_callbacks(
 
     # Autoresume.
     if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
-        check_adlr_autoresume_termination(
-            iteration, model, optimizer, opt_param_scheduler, rng_config=rng_config
-        )
+        check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
 
     # Profiling.
     if (
@@ -4472,8 +4439,6 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
-    *,
-    rng_config,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -4495,7 +4460,6 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
-                    rng_config=rng_config,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -4511,7 +4475,6 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
-            rng_config=rng_config,
         )
         saved_checkpoint = True
 
@@ -4529,7 +4492,6 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
-            rng_config=rng_config,
         )
         saved_checkpoint = True
 
@@ -4555,7 +4517,6 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
-                    rng_config=rng_config,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -4578,7 +4539,6 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
-                rng_config=rng_config,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -4602,8 +4562,6 @@ def train(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     callback_manager: CallbackManager | None = None,
-    *,
-    rng_config,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -4659,15 +4617,14 @@ def train(
             args.load = None
             args.finetune = True
             load_checkpoint(
-                model,
-                None,  # Don't load optimizer state
-                None,  # Don't load scheduler state
-                checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and getattr(args, "use_torch_fsdp2", False)
-                and args.ckpt_format == "torch_dist",
-                rng_config=rng_config,
-            )
+                    model,
+                    None,  # Don't load optimizer state
+                    None,  # Don't load scheduler state
+                    checkpointing_context=checkpointing_context,
+                    skip_load_to_model_and_opt=HAVE_FSDP2
+                    and getattr(args, "use_torch_fsdp2", False)
+                    and args.ckpt_format == "torch_dist",
+                )
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
             # Reload RL training checkpoint weights
@@ -4675,15 +4632,14 @@ def train(
             args.finetune = finetune
             print_rank_0("> Reloading RL training checkpoint...")
             load_checkpoint(
-                model,
-                None,
-                None,
-                checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and getattr(args, "use_torch_fsdp2", False)
-                and args.ckpt_format == "torch_dist",
-                rng_config=rng_config,
-            )
+                    model,
+                    None,
+                    None,
+                    checkpointing_context=checkpointing_context,
+                    skip_load_to_model_and_opt=HAVE_FSDP2
+                    and getattr(args, "use_torch_fsdp2", False)
+                    and args.ckpt_format == "torch_dist",
+                )
 
             args.no_load_optim = no_load_optim
 
@@ -4746,7 +4702,7 @@ def train(
             print_rank_0("workload inspector module not found.")
 
     # Write args to tensorboard
-    write_args_to_tensorboard(rng_config=rng_config)
+    write_args_to_tensorboard()
 
     # Turn on training mode which enables dropout.
     for model_module in model:
@@ -5078,7 +5034,6 @@ def train(
                         num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
-                        rng_config=rng_config,
                     )
                     print_rank_0("[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
                                  "exiting so the run can be relaunched at the new batch size.")
@@ -5228,7 +5183,6 @@ def train(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
-                rng_config=rng_config,
             )
         if should_exit:
             break
@@ -5480,7 +5434,6 @@ def train(
             prof,
             num_floating_point_operations_since_last_log_event,
             nsys_nvtx_context,
-            rng_config=rng_config,
         )
 
         # Checkpoint and decide whether to exit.
@@ -5492,7 +5445,6 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
-            rng_config=rng_config,
         )
         if should_exit:
             break

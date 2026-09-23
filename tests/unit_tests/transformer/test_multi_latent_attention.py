@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.training.argument_utils import rng_config_from_args
 import os
 from inspect import signature
 from unittest import mock
@@ -1452,7 +1451,7 @@ class TestMLAClipQK:
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, run_config
 ):
     if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
         pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
@@ -1541,13 +1540,7 @@ def test_parallel_multi_latent_attention_correctness(
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(
-            get_model(
-                initialize_gpt_model,
-                config=transformer_config,
-                rng_config=rng_config_from_args(mock_args),
-            )
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
 
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -1555,7 +1548,7 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.no_save_rng = True
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0, rng_config=rng_config_from_args(mock_args))
+        save_checkpoint(10, gpt_model, None, None, 0)
 
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention
@@ -1582,16 +1575,10 @@ def test_parallel_multi_latent_attention_correctness(
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(
-            get_model(
-                initialize_gpt_model,
-                config=transformer_config,
-                rng_config=rng_config_from_args(mock_args),
-            )
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-                load_checkpoint(gpt_model, None, None, rng_config=rng_config_from_args(mock_args))
+                load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank
         cp_group = parallel_state.get_context_parallel_group()

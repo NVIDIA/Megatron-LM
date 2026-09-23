@@ -36,7 +36,7 @@ from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.global_vars import set_global_variables
+from megatron.training.global_vars import initialize_runtime_services, set_args, set_run_config
 from megatron.training.training import pretrain
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -90,7 +90,11 @@ def _parse_and_validate() -> argparse.Namespace:
 def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
-    set_global_variables(args, build_tokenizer=False)
+    set_args(args)
+    model_cfg = MimoBuildConfig()
+    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(cfg)
+    initialize_runtime_services(args, build_tokenizer=False)
     provider = resolve_provider(args)
 
     prefetch_loader = None
@@ -118,12 +122,12 @@ def main() -> None:
             return models
 
         hooks.append(capture_model)
-    model_cfg = MimoBuildConfig(_topology=topology, post_wrap_hooks=hooks)
-    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    model_cfg._topology = topology
+    model_cfg.post_wrap_hooks = hooks
 
     def train_valid_test_data_provider(_train_val_test_num_samples):
         nonlocal prefetch_loader
-        loaders = build_train_valid_test_data_loaders(args, topology, random_seed=cfg.rng.seed)
+        loaders = build_train_valid_test_data_loaders(args, topology)
         iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
         if not args.mimo_encoder_prefetch or loaders[0] is None:
             return iterators

@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from megatron.training.argument_utils import rng_config_from_args
 import gc
 import os
 import sys
@@ -1571,7 +1570,7 @@ class TestPartialCudaGraph:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder, self.model_provider, rng_config=rng_config_from_args(args)
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 

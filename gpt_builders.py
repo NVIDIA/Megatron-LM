@@ -19,26 +19,17 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.argument_utils import rng_args_snapshot
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
-def gpt_builder(
-    args,
-    pre_process,
-    post_process,
-    vp_stage=None,
-    config=None,
-    pg_collection=None,
-    *,
-    random_seed: int
-):
-    from megatron.training.argument_utils import model_seed_args
+def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
     if config is None:
         if args.yaml_cfg is not None:
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
-            config = core_transformer_config_from_args(model_seed_args(args, random_seed))
+            config = core_transformer_config_from_args(rng_args_snapshot(args))
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:

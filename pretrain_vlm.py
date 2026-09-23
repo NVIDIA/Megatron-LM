@@ -2,7 +2,6 @@
 """Pretrain vision language model."""
 
 # Capture the true program start time BEFORE any heavy imports.
-from functools import update_wrapper
 import time
 
 _PROGRAM_START_TIME = time.time()
@@ -41,7 +40,11 @@ from megatron.training import (
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
 from pretrain_gpt import loss_func
 
 
@@ -53,8 +56,6 @@ def model_provider(
     parallel_output=True,
     config=None,
     pg_collection=None,
-    *,
-    rng_config,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -72,7 +73,6 @@ def model_provider(
     Returns:
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
-    from megatron.training.argument_utils import rng_args_snapshot
     args = get_args()
     vision_model_type = "clip"
 
@@ -123,9 +123,9 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
     if config is None:
-        language_transformer_config = core_transformer_config_from_args(
-            rng_args_snapshot(args, rng_config)
-        )
+        from megatron.training.argument_utils import rng_args_snapshot
+
+        language_transformer_config = core_transformer_config_from_args(rng_args_snapshot(get_args()))
     else:
         language_transformer_config = config
     if args.decoder_num_layers is not None:
@@ -247,7 +247,7 @@ def model_provider(
     return model
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, *, random_seed: int):
+def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build the train test and validation datasets.
 
     Args:
@@ -256,10 +256,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, *, random_see
     Returns:
         train_ds, val_ds, test_ds (megatron.core.datasets.multimodal_dataset.MockMultimodalDataset): Train, validation, and test datasets, respectively.
     """
+    cfg = get_run_config()
     args = get_args()
 
     config = MultimodalDatasetConfig(
-        random_seed=random_seed,
+        random_seed=cfg.rng.seed,
         split=args.split,
         sequence_length=args.dataloader_seq_length,
         tokenizer=get_tokenizer(),
@@ -404,7 +405,7 @@ def get_batch(data_iterator):
     return tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params
 
 
-def forward_step(data_iterator, model: LLaVAModel, *, random_seed: int):
+def forward_step(data_iterator, model: LLaVAModel):
     """Forward training step.
 
     Args:
@@ -434,7 +435,7 @@ def forward_step(data_iterator, model: LLaVAModel, *, random_seed: int):
         packed_seq_params=packed_seq_params,
     )
 
-    return output_tensor, partial(loss_func, loss_mask, random_seed=random_seed)
+    return output_tensor, partial(loss_func, loss_mask)
 
 
 def add_vlm_extra_args(parser):
@@ -506,17 +507,15 @@ if __name__ == "__main__":
         extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args, rng_config=full_config.rng)
+    set_run_config(full_config)
+    initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
-        update_wrapper(
-            partial(train_valid_test_datasets_provider, random_seed=full_config.rng.seed),
-            train_valid_test_datasets_provider,
-        ),
+        train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
-        partial(forward_step, random_seed=full_config.rng.seed),
-        partial(model_provider, rng_config=full_config.rng),
+        forward_step,
+        model_provider,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )

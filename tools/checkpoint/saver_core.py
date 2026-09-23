@@ -41,11 +41,11 @@ class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):
         if self.md.model_type == 'GPT':
             from model_provider import model_provider
             from gpt_builders import gpt_builder
-            self.model_provider = partial(model_provider, gpt_builder, rng_config=self.rng_config)
+            self.model_provider = partial(model_provider, gpt_builder)
             self.margs.model_type = ModelType.encoder_or_decoder
         elif self.md.model_type == 'BERT':
             from pretrain_bert import model_provider
-            self.model_provider = partial(model_provider, rng_config=self.rng_config)
+            self.model_provider = model_provider
             self.margs.model_type = ModelType.encoder_or_decoder
         else:
             raise Exception(f'unrecognized model type: {self.args.model_type}')

@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.training.argument_utils import rng_config_from_args
 import gc
 import inspect
 import os
@@ -355,9 +354,7 @@ class TestMoESingleGroupedWeightNumerics:
 
         batch = self.get_batch()
         model, optimizer, _ = setup_model_and_optimizer(
-            model_type=ModelType.encoder_or_decoder,
-            model_provider_func=self.model_provider,
-            rng_config=rng_config_from_args(args),
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(
@@ -468,9 +465,7 @@ class TestMoESingleGroupedWeightNumerics:
         )
 
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_type=ModelType.encoder_or_decoder,
-            model_provider_func=self.model_provider,
-            rng_config=rng_config_from_args(args),
+            model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         self.assert_storage_path_is_exercised(model[0], "mxfp8", True, single_weight)
@@ -502,14 +497,7 @@ class TestMoESingleGroupedWeightNumerics:
         for step in range(4):
             if checkpoint_before_step is not None and step == checkpoint_before_step:
                 force_param_sync(model, optimizer=optimizer)
-                save_checkpoint(
-                    step,
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    0,
-                    rng_config=rng_config_from_args(args),
-                )
+                save_checkpoint(step, model, optimizer, opt_param_scheduler, 0)
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
             losses.append(self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch))
@@ -525,9 +513,7 @@ class TestMoESingleGroupedWeightNumerics:
         for _ in range(2):
             self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
         force_param_sync(model, optimizer=optimizer)
-        save_checkpoint(
-            2, model, optimizer, opt_param_scheduler, 0, rng_config=rng_config_from_args(args)
-        )
+        save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -536,13 +522,7 @@ class TestMoESingleGroupedWeightNumerics:
         args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
             single_weight=load_single_weight, checkpoint_dir=checkpoint_dir
         )
-        loaded_iteration, _ = load_checkpoint(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            strict=True,
-            rng_config=rng_config_from_args(args),
-        )
+        loaded_iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
         assert loaded_iteration == 2
         return self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
 
@@ -626,9 +606,7 @@ class TestMoESingleGroupedWeightNumerics:
             )
 
             model, optimizer, _ = setup_model_and_optimizer(
-                model_type=ModelType.encoder_or_decoder,
-                model_provider_func=self.model_provider,
-                rng_config=rng_config_from_args(args),
+                model_type=ModelType.encoder_or_decoder, model_provider_func=self.model_provider
             )
             assert len(model) == 1
             self.assert_storage_path_is_exercised(

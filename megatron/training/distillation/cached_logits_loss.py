@@ -247,10 +247,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         decode_threads: int = 1,
         decode_lookahead: Optional[int] = None,
         msc_prefetch_depth: int = 2,
-        *,
-        random_seed: int,
     ):
-        self.random_seed = random_seed
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
         self.dp_rank = dp_rank
@@ -261,7 +258,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
         # Per-tar dataset-identity verification: each tar stream validates its
         # leading _meta.json before yielding any payload data.
-        self._expected_hash, _ = compute_dataset_hash(random_seed=random_seed)
+        self._expected_hash, _ = compute_dataset_hash()
 
         self._decode_threads = max(1, decode_threads)
         if decode_lookahead is None:
@@ -657,10 +654,7 @@ class CachedLogitsKDLoss:
         decode_threads: int = 1,
         prefetch_factor: int = 2,
         msc_prefetch_depth: int = 2,
-        *,
-        random_seed: int,
     ):
-        self.random_seed = random_seed
         self.logprobs_dir = logprobs_dir
         self._decode_threads = decode_threads
         self._prefetch_factor = prefetch_factor
@@ -699,7 +693,6 @@ class CachedLogitsKDLoss:
             start_iteration=start_iteration,
             decode_threads=self._decode_threads,
             msc_prefetch_depth=self._msc_prefetch_depth,
-            random_seed=self.random_seed,
         )
         # Remote shard discovery uses rank-0 collectives, so it must run in the
         # main training process rather than a DataLoader worker.
@@ -811,10 +804,7 @@ class LossFuncCallable:
         kd_loss_alpha: float = 0.5,
         ignore_errors: bool = False,
         msc_prefetch_depth: int = 2,
-        *,
-        random_seed: int,
     ):
-        self.random_seed = random_seed
         self.logprobs_dir = logprobs_dir
         self.decode_threads = decode_threads
         self.prefetch_factor = prefetch_factor
@@ -845,7 +835,6 @@ class LossFuncCallable:
                 decode_threads=self.decode_threads,
                 prefetch_factor=self.prefetch_factor,
                 msc_prefetch_depth=self.msc_prefetch_depth,
-                random_seed=self.random_seed,
             )
 
         # LM loss

@@ -18,14 +18,7 @@ except ImportError:
 
 
 def model_provider(
-    model_builder: Callable,
-    pre_process=True,
-    post_process=True,
-    vp_stage: Optional[int] = None,
-    config=None,
-    pg_collection=None,
-    *,
-    rng_config,
+    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
 ) -> Union[GPTModel, HybridModel]:
     """Builds the model.
 
@@ -63,15 +56,7 @@ def model_provider(
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_hybrid_builder
 
-    return model_builder(
-        args,
-        pre_process,
-        post_process,
-        vp_stage,
-        config=config,
-        pg_collection=pg_collection,
-        random_seed=rng_config.seed,
-    )
+    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
 
 
 def count_parameters_in_layer(model, layer_name):

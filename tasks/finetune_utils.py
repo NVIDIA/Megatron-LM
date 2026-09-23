@@ -21,6 +21,7 @@ from megatron.training.training import training_log
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.utils import calc_params_l2_norm
 from megatron.training.utils import check_adlr_autoresume_termination
+from megatron.training.global_vars import get_run_config
 
 
 def process_batch(batch):
@@ -144,18 +145,10 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
     return train_dataloader, valid_dataloader
 
 
-def _train(
-    model,
-    optimizer,
-    opt_param_scheduler,
-    forward_step,
-    train_dataloader,
-    valid_dataloader,
-    end_of_epoch_callback,
-    *,
-    rng_config
-):
+def _train(model, optimizer, opt_param_scheduler, forward_step,
+           train_dataloader, valid_dataloader, end_of_epoch_callback):
     """Train the model."""
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
 
@@ -182,7 +175,7 @@ def _train(
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
-        train_dataloader.sampler.set_epoch(rng_config.seed + epoch)
+        train_dataloader.sampler.set_epoch(cfg.rng.seed + epoch)
 
         # For all the batches in the dataset.
         for iteration_, batch in enumerate(train_dataloader):
@@ -213,17 +206,14 @@ def _train(
             # Autoresume
             if args.adlr_autoresume and \
                (iteration % args.adlr_autoresume_interval == 0):
-                check_adlr_autoresume_termination(
-                    iteration, model, optimizer, opt_param_scheduler, rng_config=rng_config
-                )
+                check_adlr_autoresume_termination(iteration, model,
+                                                  optimizer, opt_param_scheduler)
 
             # Checkpointing
             saved_checkpoint = False
             if args.save and args.save_interval and \
                iteration % args.save_interval == 0:
-                save_checkpoint(
-                    iteration, model, optimizer, opt_param_scheduler, rng_config=rng_config
-                )
+                save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
                 saved_checkpoint = True
 
             # Evaluation
@@ -237,16 +227,14 @@ def _train(
             # Exiting based on iterations
             if args.exit_interval and iteration % args.exit_interval == 0:
                 if not saved_checkpoint:
-                    save_checkpoint(
-                        iteration, model, optimizer, opt_param_scheduler, rng_config=rng_config
-                    )
+                    save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
                 torch.distributed.barrier()
                 print_rank_0('exiting program at iteration {}'.format(iteration))
                 sys.exit()
 
         # Checkpointing at the end of each epoch.
         if args.save:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler, rng_config=rng_config)
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
         # Callback at the end of each epoch.
         if end_of_epoch_callback is not None:
@@ -259,9 +247,7 @@ def finetune(train_valid_datasets_provider, model_provider,
              end_of_epoch_callback_provider=None,
              task_collate_fn=None):
     """Main finetune function used across all tasks."""
-    from megatron.training.argument_utils import rng_config_from_args
     args = get_args()
-    rng_config = rng_config_from_args(args)
     timers = get_timers()
 
     # Train and validation data loaders.
@@ -283,9 +269,7 @@ def finetune(train_valid_datasets_provider, model_provider,
 
     # Build model, optimizer and learning rate scheduler.
     timers('model and optimizer', log_level=0).start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_type, model_provider, rng_config=rng_config
-    )
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_type, model_provider)
     timers('model and optimizer').stop()
 
     # If pretrained checkpoint is provided and we have not trained for
@@ -297,7 +281,7 @@ def finetune(train_valid_datasets_provider, model_provider,
         args.load = args.pretrained_checkpoint
         original_rng = args.no_load_rng
         args.no_load_rng = True
-        _ = load_checkpoint(model, None, None, rng_config=rng_config)
+        _ = load_checkpoint(model, None, None)
         args.load = original_load
         args.no_load_rng = original_rng
         # This is critical when only model is loaded. We should make sure
@@ -313,16 +297,8 @@ def finetune(train_valid_datasets_provider, model_provider,
 
     # Finetune the model.
     if args.epochs > 0:
-        _train(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            forward_step,
-            train_dataloader,
-            valid_dataloader,
-            end_of_epoch_callback,
-            rng_config=rng_config,
-        )
+        _train(model, optimizer, opt_param_scheduler, forward_step,
+               train_dataloader, valid_dataloader, end_of_epoch_callback)
     # Or just evaluate.
     else:
         if end_of_epoch_callback is not None:

@@ -10,11 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.training import arguments, checkpointing, initialize
-from megatron.training.argument_utils import (
-    model_seed_args,
-    rng_args_snapshot,
-    rng_config_from_args,
-)
+from megatron.training.argument_utils import rng_args_snapshot, rng_config_from_args
 from megatron.training.config.common_config import RNGConfig
 
 
@@ -44,7 +40,7 @@ def test_tracker_resolution_matches_cli_policy(monkeypatch, graph, transformer, 
 
 
 @pytest.mark.parametrize("deleted", [False, True])
-def test_detached_metadata_uses_owner_without_modifying_live_args(deleted):
+def test_detached_metadata_uses_owner_without_modifying_live_args(deleted, run_config):
     args = Namespace(
         seed=1,
         te_rng_tracker=False,
@@ -55,23 +51,23 @@ def test_detached_metadata_uses_owner_without_modifying_live_args(deleted):
     rng = RNGConfig(
         seed=987, te_rng_tracker=True, inference_rng_tracker=True, data_parallel_random_init=True
     )
+    run_config.rng = rng
     if deleted:
         for item in fields(RNGConfig):
             delattr(args, item.name)
     original = vars(args).copy()
-    snapshot = rng_args_snapshot(args, rng)
+    snapshot = rng_args_snapshot(args)
     assert snapshot is not args
     assert snapshot.iteration == 17
     assert rng_config_from_args(snapshot) == rng
-    assert vars(args) == original
-    model_input = model_seed_args(args, rng.seed)
-    assert model_input.seed == 987
     assert vars(args) == original
 
 
 @pytest.mark.parametrize("lazy", [False, True])
 @pytest.mark.parametrize("skip", [False, True])
-def test_initialization_uses_owner_and_preserves_deferred_seeding(monkeypatch, lazy, skip):
+def test_initialization_uses_owner_and_preserves_deferred_seeding(
+    monkeypatch, lazy, skip, run_config
+):
     args = _args_without_rng()
     args.lazy_mpu_init = lazy
     monkeypatch.setattr(initialize, "get_args", lambda: args)
@@ -91,8 +87,9 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(monkeypatch, l
     rng = RNGConfig(
         seed=919, data_parallel_random_init=True, te_rng_tracker=True, inference_rng_tracker=True
     )
+    run_config.rng = rng
     finish = initialize.initialize_megatron(
-        allow_no_cuda=True, skip_random_seed=skip, skip_dependency_compilation=True, rng_config=rng
+        allow_no_cuda=True, skip_random_seed=skip, skip_dependency_compilation=True
     )
     if lazy:
         seed.assert_not_called()
@@ -126,7 +123,8 @@ def test_invalid_seed_still_rejected_at_seeding_not_config_construction(seed):
 
 
 @pytest.mark.parametrize("dp_random", [False, True])
-def test_checkpoint_gather_uses_explicit_policy_without_global_args(monkeypatch, dp_random):
+def test_checkpoint_gather_uses_owner_without_global_args(monkeypatch, dp_random, run_config):
+    run_config.rng.data_parallel_random_init = dp_random
     monkeypatch.setattr(checkpointing, "get_args", Mock(side_effect=AssertionError("args read")))
     monkeypatch.setattr(checkpointing.torch.cuda, "get_rng_state", lambda: "cuda")
     monkeypatch.setattr(
@@ -144,14 +142,7 @@ def test_checkpoint_gather_uses_explicit_policy_without_global_args(monkeypatch,
 
     collect = Mock(side_effect=gather)
     monkeypatch.setattr(checkpointing.torch.distributed, "all_gather_object", collect)
-    state = checkpointing.get_rng_state(
-        "torch",
-        group,
-        group,
-        dp_group=group,
-        dp_cp_group=group,
-        data_parallel_random_init=dp_random,
-    )
+    state = checkpointing.get_rng_state("torch", group, group, dp_group=group, dp_cp_group=group)
     assert len(state) == (2 if dp_random else 1)
     assert collect.call_count == int(dp_random)
     assert state[0]["cuda_rng_state"] == "cuda"
@@ -159,46 +150,50 @@ def test_checkpoint_gather_uses_explicit_policy_without_global_args(monkeypatch,
 
 @pytest.mark.parametrize("current_dp", [False, True])
 @pytest.mark.parametrize("saved_dp", [False, True])
-def test_checkpoint_policy_retains_current_run_precedence(monkeypatch, current_dp, saved_dp):
+def test_checkpoint_policy_retains_current_run_precedence(
+    monkeypatch, current_dp, saved_dp, run_config
+):
     args = _args_without_rng()
     args.use_dist_ckpt = False
-    checkpoint_args = rng_args_snapshot(
-        args, RNGConfig(seed=123, data_parallel_random_init=saved_dp)
-    )
+    run_config.rng = RNGConfig(seed=123, data_parallel_random_init=saved_dp)
+    checkpoint_args = rng_args_snapshot(args)
     monkeypatch.setattr(checkpointing, "get_args", lambda: args)
     monkeypatch.setattr(checkpointing, "get_checkpoint_version", lambda: 3.0)
     rng = RNGConfig(seed=987, data_parallel_random_init=current_dp)
+    run_config.rng = rng
     if current_dp and not saved_dp:
         with pytest.raises(AssertionError, match="data_parallel_random_init"):
-            checkpointing.check_checkpoint_args(checkpoint_args, rng_config=rng)
+            checkpointing.check_checkpoint_args(checkpoint_args)
     else:
-        checkpointing.check_checkpoint_args(checkpoint_args, rng_config=rng)
+        checkpointing.check_checkpoint_args(checkpoint_args)
     assert rng.seed == 987
     assert rng.data_parallel_random_init == current_dp
     assert not hasattr(args, "seed")
 
 
-def test_tensorboard_records_owned_rng_values(monkeypatch):
+def test_tensorboard_records_owned_rng_values(monkeypatch, run_config):
     args = Namespace(iteration=19, seed=1)
     writer = Mock()
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "get_tensorboard_writer", lambda: writer)
-    rng = RNGConfig(seed=321, te_rng_tracker=True)
-    initialize.write_args_to_tensorboard(rng_config=rng)
+    run_config.rng = RNGConfig(seed=321, te_rng_tracker=True)
+    initialize.write_args_to_tensorboard()
     writer.add_text.assert_any_call("seed", "321", global_step=19)
     writer.add_text.assert_any_call("te_rng_tracker", "True", global_step=19)
     assert vars(args) == {"iteration": 19, "seed": 1}
 
 
-def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch):
+def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, run_config):
     from megatron.training.distillation import utils_logits
 
     args = Namespace(seed=999, seq_length=32, train_samples=16)
     monkeypatch.setattr(utils_logits, "get_args", lambda: args)
     monkeypatch.setattr(utils_logits, "_blend_identifiers", lambda args: {"mock": True})
-    first_hash, first_fields = utils_logits.compute_dataset_hash(random_seed=123)
+    run_config.rng.seed = 123
+    first_hash, first_fields = utils_logits.compute_dataset_hash()
     del args.seed
-    assert utils_logits.compute_dataset_hash(random_seed=123) == (first_hash, first_fields)
+    assert utils_logits.compute_dataset_hash() == (first_hash, first_fields)
     assert first_fields["seed"] == 123
-    second_hash, _ = utils_logits.compute_dataset_hash(random_seed=124)
+    run_config.rng.seed = 124
+    second_hash, _ = utils_logits.compute_dataset_hash()
     assert first_hash != second_hash

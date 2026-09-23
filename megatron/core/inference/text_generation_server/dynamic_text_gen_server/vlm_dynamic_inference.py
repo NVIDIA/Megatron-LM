@@ -224,27 +224,19 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     return True
 
 
-def get_model(is_vlm: bool, *, rng_config) -> MegatronModule:
+def get_model(is_vlm: bool) -> MegatronModule:
     """Build and load the model; dispatches to the right model_provider."""
     args = get_args()
 
     if is_vlm:
         from model import model_provider  # examples/multimodal/model.py
 
-        model = _get_model(
-            partial(model_provider, rng_config=rng_config),
-            wrap_with_ddp=False,
-            rng_config=rng_config,
-        )
+        model = _get_model(partial(model_provider), wrap_with_ddp=False)
     else:
         from gpt_builders import gpt_builder  # examples/inference/gpt
         from model_provider import model_provider
 
-        model = _get_model(
-            partial(model_provider, gpt_builder, rng_config=rng_config),
-            wrap_with_ddp=False,
-            rng_config=rng_config,
-        )
+        model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
 
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
@@ -253,7 +245,6 @@ def get_model(is_vlm: bool, *, rng_config) -> MegatronModule:
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
-        rng_config=rng_config,
     )
 
     assert len(model) == 1, "Virtual PP not supported for VLM inference"

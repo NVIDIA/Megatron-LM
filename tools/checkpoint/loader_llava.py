@@ -99,8 +99,7 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         else:
             sys.path.insert(0, './examples/multimodal')
         from examples.multimodal.model import model_provider
-        from functools import partial
-        return partial(model_provider, rng_config=self.rng_config)
+        return model_provider
 
     def build_checkpoint_metadata(self, true_vocab_size):
         """
