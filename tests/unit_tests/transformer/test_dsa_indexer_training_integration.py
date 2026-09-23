@@ -17,6 +17,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     SimplifiedDSGQAIndexer,
     SimplifiedDSGQAIndexerSubmodules,
 )
+from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -598,3 +599,59 @@ def test_dsa_indexer_reset_broadcasts_only_indexer_params_across_dp(monkeypatch)
     assert len(calls) == 1
     assert calls[0][0].data_ptr() == model.indexer.weight.data_ptr()
     assert calls[0][1:] == (11, dp_group)
+
+
+def _indexer_count_args(pattern, num_layers, mtp_num_layers=0, mtp_use_repeated_layer=False):
+    return SimpleNamespace(
+        num_layers=num_layers,
+        mtp_num_layers=mtp_num_layers,
+        mtp_use_repeated_layer=mtp_use_repeated_layer,
+        hybrid_layer_pattern=pattern,
+        csa_compress_ratios=None,
+        experimental_attention_variant='dsa',
+    )
+
+
+def test_indexer_layer_count_counts_attention_layers_not_every_layer(monkeypatch):
+    """The tracker spans every decoder layer; only the attention layers own an indexer.
+
+    Averaging over the tracker length instead of the indexer count under-reports the loss by the
+    ratio between them -- 13x for the 8B pattern, which is four attention layers in fifty-two.
+    """
+    from megatron.training import training
+
+    monkeypatch.setattr(training, "is_hybrid_model", lambda args: True)
+    pattern = "M-" * 24 + "*-" * 2  # 48 mamba/mlp layers, then 2 attention layers
+    args = _indexer_count_args(pattern, num_layers=len(pattern))
+
+    tracker_layers, indexer_layers = training._get_indexer_logging_layer_counts(args)
+
+    assert tracker_layers == len(pattern)
+    assert indexer_layers == 2
+    assert indexer_layers != tracker_layers
+
+
+def test_indexer_layer_count_includes_mtp_depths(monkeypatch):
+    """MTP repeats its pattern once per prediction depth, and each copy owns an indexer."""
+    from megatron.training import training
+
+    monkeypatch.setattr(training, "is_hybrid_model", lambda args: True)
+    args = _indexer_count_args("M*M*/M*", num_layers=4, mtp_num_layers=2)
+
+    tracker_layers, indexer_layers = training._get_indexer_logging_layer_counts(args)
+
+    # "M*M*/M*" is two attention layers in the main pattern and one per MTP depth.
+    depths = parse_hybrid_pattern(args.hybrid_layer_pattern).mtp_num_depths
+    assert indexer_layers == 2 + depths
+    assert tracker_layers == 4 + 2
+
+
+def test_indexer_layer_count_is_left_alone_without_dsa(monkeypatch):
+    """A non-DSA run keeps the old behaviour: no count, so the tracker length is used."""
+    from megatron.training import training
+
+    monkeypatch.setattr(training, "is_hybrid_model", lambda args: True)
+    args = _indexer_count_args("M*M*", num_layers=4)
+    args.experimental_attention_variant = None
+
+    assert training._get_indexer_logging_layer_counts(args) == (4, None)
