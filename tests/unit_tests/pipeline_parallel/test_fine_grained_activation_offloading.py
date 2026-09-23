@@ -2,6 +2,7 @@
 
 import gc
 import logging
+import math
 import os
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
@@ -34,12 +35,13 @@ DELTA = 20  # MiB
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
-def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatch):
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 0.7, 0.8, 1.0])
+def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatch, fraction):
     """Actual H2D reloads must stay one group ahead of a sequential backward pass.
 
     A chain of sin operations saves one equally sized activation per group. Warmup
-    reserves the final group, and fraction=0.5 keeps the latter half of the remaining
-    groups on GPU. Reloading at every resident group's backward boundary would pull
+    uses an online fraction quota; the final policy reserves the last group and
+    selects an independent prefix. Reloading at every resident boundary would pull
     all earlier offloaded groups back to GPU before any of them are consumed.
 
     Observe real reload events and saved-tensor consumption without changing stream
@@ -87,7 +89,7 @@ def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatc
             vp_stage=None,
             min_offloaded_tensor_size=1,
             delta_offload_bytes_across_pp_ranks=0,
-            activation_offload_fraction=0.5,
+            activation_offload_fraction=fraction,
         )
         output = input_tensor
         for index in range(num_groups):
@@ -117,9 +119,38 @@ def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatc
     try:
         # Discover the groups and let the production warmup policy apply the
         # fraction; do not manually construct or edit either scheduling queue.
+        reference = input_tensor
+        for _ in range(num_groups):
+            reference = reference.sin()
+        expected_grad = torch.autograd.grad(reference.sum(), input_tensor)[0]
+        expected_output = reference.detach()
+        del reference
+
         output = forward()
+        manager = PipelineOffloadManager.get_instance()
+        warmup_chunk = manager.cur_forward_chunk()
+        warmup_indices = [
+            index
+            for index, group in enumerate(warmup_chunk.offload_groups)
+            if any(isinstance(state, tuple) for state in group._tensors.values())
+        ]
+        assert len(warmup_indices) == math.ceil(num_groups * fraction)
+        # Check the quota at every prefix, including the three-group case where
+        # fraction 0.7 deliberately offloads all three to favor GPU headroom.
+        for count in range(1, num_groups + 1):
+            assert sum(index < count for index in warmup_indices) == math.ceil(count * fraction)
+        assert all(group.offload for group in warmup_chunk.offload_groups)
+        assert all(
+            group.total_offload_bytes == group_bytes and group.total_tensor_count == 1
+            for group in warmup_chunk.offload_groups
+        )
+        pool = manager._cpu_tensor_pool
+        warmup_allocations = pool._stats["total_allocated"]
+        assert warmup_allocations == len(warmup_indices)
+        torch.testing.assert_close(output, expected_output)
         torch.cuda.synchronize()
         output.sum().backward()
+        torch.testing.assert_close(input_tensor.grad, expected_grad)
         torch.cuda.synchronize()
         del output
         input_tensor.grad = None
@@ -133,9 +164,13 @@ def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatc
             for index, group in enumerate(chunk.offload_groups)
             if any(isinstance(state, tuple) for state in group._tensors.values())
         }
-        num_offloaded = (num_groups - 1) // 2
+        eligible_count = num_groups - 1
+        num_offloaded = eligible_count - int(eligible_count * (1 - fraction))
         assert list(offloaded_groups.values()) == list(range(num_offloaded))
         assert all(len(group._tensors) == 1 for group in chunk.offload_groups)
+        # Equal-shaped buffers are reused across the different warmup/steady masks.
+        assert pool._stats["total_allocated"] == warmup_allocations
+        torch.testing.assert_close(output, expected_output)
 
         monkeypatch.setattr(OffloadTensorGroup, "record_reload_event", record_reload_event)
         monkeypatch.setattr(OffloadTensorGroup, "pop_tensor", pop_tensor)
@@ -143,13 +178,16 @@ def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatc
         output.sum().backward()
         torch.cuda.synchronize()
 
+        torch.testing.assert_close(input_tensor.grad, expected_grad)
         assert backward_order == list(reversed(range(num_groups)))
         assert [index for _, index in reload_events] == list(reversed(range(num_offloaded)))
         assert all(not group._tensors for group in chunk.offload_groups)
         peak_pending = max(len(pending) for _, _, pending, _ in samples)
         peak_pending_bytes = max(size for _, _, _, size in samples)
         print(
-            f"Partial offload cadence: groups={num_groups}, offloaded={num_offloaded}, "
+            f"Partial offload cadence: fraction={fraction}, groups={num_groups}, "
+            f"warmup_offloaded={len(warmup_indices)}, pool_bytes={warmup_allocations * group_bytes}, "
+            f"offloaded={num_offloaded}, "
             f"peak_pending_groups={peak_pending}, peak_pending_bytes={peak_pending_bytes}, "
             f"reloads=(backward_group, reload_group) "
             f"{reload_events}"
@@ -321,6 +359,57 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
     handler.offload_groups = list(groups)
     handler._max_group_size = len(groups)
     return handler
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_warmup_fraction_counts_only_eligible_groups_and_keeps_view_metadata():
+    base = torch.ones(64, 96, device="cuda")
+    opt_out = torch.ones(16, device="cuda")
+    opt_out._do_not_offload = True
+    tensors_by_group = [
+        ("core_attn", [torch.ones(16, device="cuda")]),
+        ("empty", []),
+        ("ineligible", [torch.ones(16), torch.ones(1, device="cuda"), opt_out]),
+        ("expert_fc1", [base[:, :80].detach(), base[:, 16:], base[::8, ::8]]),
+        ("attn_proj", [torch.ones(16, device="cuda")]),
+    ]
+    groups = []
+    for group_index, (name, tensors) in enumerate(tensors_by_group):
+        group = OffloadTensorGroup(name)
+        for tensor_index, tensor in enumerate(tensors):
+            group.push_tensor((group_index, tensor_index), tensor)
+        groups.append(group)
+    chunk = _make_warmup_chunk(groups)
+    chunk.min_offloaded_tensor_size = 16
+    chunk._activation_offload_fraction = 0.5
+    chunk._groups_to_offload = list(groups)
+    try:
+        for group in groups:
+            chunk.bulk_offload(group._name, [])
+        torch.cuda.synchronize()
+        # Empty/ineligible groups do not advance the quota, and module names do
+        # not get independent quotas: only the first and third candidates copy.
+        assert [
+            i
+            for i, group in enumerate(groups)
+            if any(isinstance(state, tuple) for state in group._tensors.values())
+        ] == [0, 4]
+        assert groups[1].total_offload_bytes == groups[2].total_offload_bytes == 0
+        assert chunk.cpu_tensor_pool._stats["allocation_requests"] == 2
+        # The skipped MoE group has no CPU pool, but its storage-sized copies,
+        # logical gather, and redundant storage still have complete metadata.
+        skipped = groups[3]
+        storage_bytes = base.untyped_storage().nbytes()
+        gather_bytes = base[::8, ::8].numel() * base.element_size()
+        assert not skipped.use_cpu_pool
+        assert all(isinstance(tensor, torch.Tensor) for tensor in skipped._tensors.values())
+        assert skipped.total_tensor_count == 3
+        assert skipped.total_offload_bytes == 2 * storage_bytes + gather_bytes
+        assert skipped.duplicate_storage_tensor_count == 2
+        assert skipped.duplicate_storage_bytes == storage_bytes + gather_bytes
+        assert all(group.offload for group in groups)
+    finally:
+        torch.cuda.synchronize()
 
 
 def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:

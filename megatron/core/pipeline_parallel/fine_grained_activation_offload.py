@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import math
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
@@ -394,6 +395,7 @@ class OffloadTensorGroup:
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
+        self._offload_info_collected = False
         # Warmup-only bookkeeping for redundant copies within this group.
         self.duplicate_storage_tensor_count = 0
         self.duplicate_storage_bytes = 0
@@ -429,9 +431,9 @@ class OffloadTensorGroup:
         """Wait for the reload event."""
         stream.wait_event(self._reload_event)
 
-    def update_offload_info(self, tensor):
-        """Update the offload information with the tensor actually copied to CPU."""
-        self.total_offload_bytes += tensor.numel() * tensor.element_size()
+    def update_offload_info(self, num_bytes: int):
+        """Account for a candidate transfer without allocating a CPU backup."""
+        self.total_offload_bytes += num_bytes
         self.total_tensor_count += 1
 
     def set_duplicate_storage_info(self, tensor_count, duplicate_bytes):
@@ -790,6 +792,7 @@ class PipelineOffloadManager:
             min_offloaded_tensor_size,
             self._cpu_tensor_pool,
             max_inflight_offloads=max_inflight_offloads,
+            activation_offload_fraction=activation_offload_fraction,
         )
         debug_rank(f"init_model_chunk_offload_handler {cur_chunk}")
         self._stages[cur_vpp_rank].append(cur_chunk)
@@ -905,22 +908,14 @@ class ChunkOffloadHandler:
         """
         debug_rank("--------offload")
 
-        view_meta = None
-        if not src_tensor.is_contiguous():
-            storage = src_tensor.untyped_storage()
-            element_size = src_tensor.element_size()
-            covered_bytes = src_tensor.numel() * element_size
-            if (
-                storage.nbytes() % element_size == 0
-                and covered_bytes >= self.BASE_OFFLOAD_MIN_COVERAGE * storage.nbytes()
-            ):
-                view_meta = (src_tensor.size(), src_tensor.stride(), src_tensor.storage_offset())
-                # Flat alias of the full storage; contiguous by construction.
-                src_tensor = torch.empty(0, dtype=src_tensor.dtype, device=src_tensor.device).set_(
-                    storage
-                )
-            else:
-                src_tensor = src_tensor.contiguous()
+        view_meta = self._get_offload_view_meta(src_tensor)
+        if view_meta is not None:
+            # Flat alias of the full storage; contiguous by construction.
+            src_tensor = torch.empty(0, dtype=src_tensor.dtype, device=src_tensor.device).set_(
+                src_tensor.untyped_storage()
+            )
+        elif not src_tensor.is_contiguous():
+            src_tensor = src_tensor.contiguous()
 
         if use_cpu_pool:
             cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
@@ -932,6 +927,19 @@ class ChunkOffloadHandler:
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
         state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
         return state
+
+    @classmethod
+    def _get_offload_view_meta(cls, tensor):
+        """Describe a full-storage transfer, or return None for a logical tensor copy."""
+        if not tensor.is_contiguous():
+            storage_bytes = tensor.untyped_storage().nbytes()
+            element_size = tensor.element_size()
+            if (
+                storage_bytes % element_size == 0
+                and tensor.numel() * element_size >= cls.BASE_OFFLOAD_MIN_COVERAGE * storage_bytes
+            ):
+                return (tensor.size(), tensor.stride(), tensor.storage_offset())
+        return None
 
     @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
     def reload(self, state, non_blocking=None):
@@ -956,6 +964,7 @@ class ChunkOffloadHandler:
         min_offloaded_tensor_size,
         cpu_tensor_pool,
         max_inflight_offloads: Optional[int] = None,
+        activation_offload_fraction: float = 1.0,
     ):
         self.do_offload = True
 
@@ -979,6 +988,8 @@ class ChunkOffloadHandler:
         self.min_offloaded_tensor_size = min_offloaded_tensor_size
         self.cpu_tensor_pool = cpu_tensor_pool
         self.is_warmup = True
+        self._activation_offload_fraction = activation_offload_fraction
+        self._warmup_eligible_groups = 0
         # Max per-group-name inflight offloads not yet joined on the main stream (None = off).
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
@@ -1096,36 +1107,17 @@ class ChunkOffloadHandler:
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
-            # Warmup-only accounting local to this offload group. Every tensor in
-            # the group is alive here, so device + data_ptr identifies its storage.
-            storage_records = (
-                defaultdict(
-                    lambda: {
-                        "storage_bytes": 0,
-                        "transfer_count": 0,
-                        "full_storage_count": 0,
-                        "transferred_bytes": 0,
-                    }
-                )
-                if self.is_warmup
-                else None
-            )
+            if self.is_warmup:
+                self._collect_offload_info(group_to_offload)
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
                     state = self.offload(
                         tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
                     )
-                    # Account the bytes actually copied to CPU (the base storage
-                    # for view offloads).
-                    if self.is_warmup:
-                        group_to_offload.update_offload_info(state[1])
-                        self._record_offload_transfer(tensor_on_device, state, storage_records)
                     # record_stream on the view marks the shared storage
                     # allocation, so this also covers base-storage offloads.
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
-            if self.is_warmup:
-                self._set_duplicate_storage_info(group_to_offload, storage_records)
             group_to_offload.record_offload_event(self.d2h_stream)
         nvtx_range_pop(nvtx_msg)
         # Under full-iteration CG capture, the main stream may not wait on d2h
@@ -1137,17 +1129,32 @@ class ChunkOffloadHandler:
             self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
             self._drain_offload_pending(gname)
 
-    @staticmethod
-    def _record_offload_transfer(tensor_on_device, state, storage_records):
-        """Record one transfer for group-local duplicate-byte accounting."""
-        _, cpu_backup, _, view_meta = state
-        storage = tensor_on_device.untyped_storage()
-        storage_key = (tensor_on_device.device, storage.data_ptr(), storage.nbytes())
-        record = storage_records[storage_key]
-        record["storage_bytes"] = storage.nbytes()
-        record["transfer_count"] += 1
-        record["full_storage_count"] += int(view_meta is not None)
-        record["transferred_bytes"] += cpu_backup.numel() * cpu_backup.element_size()
+    def _collect_offload_info(self, group):
+        """Discover eligible bytes and duplicate storage even when warmup skips the copy."""
+        if group._offload_info_collected:
+            return
+        storage_records = defaultdict(
+            lambda: {
+                "storage_bytes": 0,
+                "transfer_count": 0,
+                "full_storage_count": 0,
+                "transferred_bytes": 0,
+            }
+        )
+        for tensor in group._tensors.values():
+            if not self.tensor_need_offloading_checker(tensor):
+                continue
+            storage = tensor.untyped_storage()
+            full_storage = self._get_offload_view_meta(tensor) is not None
+            num_bytes = storage.nbytes() if full_storage else tensor.numel() * tensor.element_size()
+            group.update_offload_info(num_bytes)
+            record = storage_records[(tensor.device, storage.data_ptr(), storage.nbytes())]
+            record["storage_bytes"] = storage.nbytes()
+            record["transfer_count"] += 1
+            record["full_storage_count"] += int(full_storage)
+            record["transferred_bytes"] += num_bytes
+        self._set_duplicate_storage_info(group, storage_records)
+        group._offload_info_collected = True
 
     @staticmethod
     def _set_duplicate_storage_info(group, storage_records):
@@ -1218,9 +1225,22 @@ class ChunkOffloadHandler:
         """Determine if the current group should be offloaded."""
         assert group in self._groups_to_offload, f"Group {group} is not pending offload"
         debug_rank(f"should_bulk_offload {self.is_warmup} {group.offload}")
-        # Don't offload if the chunk is not in warmup stage
         if self.is_warmup:
-            return True
+            # The final eligible group count is unknown until warmup finishes.
+            # Each increase in ceil(k * fraction) grants one copy. Empty/ineligible
+            # groups do not consume quota, and group.offload remains unchanged so
+            # post_warmup_callback can apply margin, PP delta, and its prefix policy.
+            self._collect_offload_info(group)
+            if group.total_offload_bytes == 0:
+                return False
+            previous_quota = math.ceil(
+                self._warmup_eligible_groups * self._activation_offload_fraction
+            )
+            self._warmup_eligible_groups += 1
+            return (
+                math.ceil(self._warmup_eligible_groups * self._activation_offload_fraction)
+                > previous_quota
+            )
         # Don't offload if the group is marked as not offloadable
         if not group.offload:
             return False
