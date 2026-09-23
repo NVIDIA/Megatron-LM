@@ -2057,10 +2057,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 child_indexer_params, child_non_indexer_params = (
                     optimizer.get_dsa_split_parameters()
                 )
-                indexer_grads += optimizer.get_main_grads_for_grad_norm(child_indexer_params)
-                non_indexer_grads += optimizer.get_main_grads_for_grad_norm(
-                    child_non_indexer_params
-                )
+                indexer_grads += optimizer._filter_grads_for_norm(child_indexer_params)
+                non_indexer_grads += optimizer._filter_grads_for_norm(child_non_indexer_params)
             indexer_grad_norm = get_grad_norm_fp32(
                 indexer_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
