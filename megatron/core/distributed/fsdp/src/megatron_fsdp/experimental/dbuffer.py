@@ -16,6 +16,7 @@
 
 import dataclasses
 from collections.abc import Iterable
+from functools import lru_cache
 
 import torch
 import torch.distributed as dist
@@ -58,6 +59,18 @@ def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
     """Convert a DTensor Partial reduction name to a torch.distributed op."""
     reduce_ops = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.AVG}
     return reduce_ops[partial_placement.reduce_op]
+
+
+@lru_cache(maxsize=None)
+def _get_combined_group(
+    ranks: tuple[int, ...], axis_groups: tuple[dist.ProcessGroup, ...]
+) -> dist.ProcessGroup:
+    """Cache a combined group using its constituent process groups as identity."""
+    # Only members participate: other DP/EP domains may create different groups.
+    # Including the existing groups in the key prevents reuse after reinitialization.
+    return dist.new_group(
+        ranks=list(ranks), backend=dist.get_backend(axis_groups[0]), use_local_synchronization=True
+    )
 
 
 class DBuffer:
@@ -454,8 +467,9 @@ class DBuffer:
     ) -> "DBuffer":
         """Gather one or more sharded axes into Replicate placements.
 
-        Axes are gathered in mesh order to preserve the contiguous shard layout.
-        Intermediate destinations are views into the final output allocation.
+        Multiple axes use one collective over their combined process group.
+        Output chunk views account for the difference between group rank order
+        and the inner-to-outer order of shards in the buffer.
         """
         axes = (mesh_axis,) if isinstance(mesh_axis, int) else tuple(mesh_axis)
         if any(axis < -self.mesh.ndim or axis >= self.mesh.ndim for axis in axes):
@@ -474,20 +488,41 @@ class DBuffer:
         if not axes:
             return self.redistribute(placements, out=out)
         out = self._create_or_validate_out(out, placements=placements)
-        source = self
-        placements = list(self.placements)
-        for axis in axes:
-            placements[axis] = Replicate()
-            destination = out.view(placements)
-            # Registration is scoped to the collective's process group.
-            if destination.is_symmetric_memory:
-                destination.rendezvous(axis)
+        # Singleton dimensions do not change the collective's rank domain.
+        active_axes = tuple(axis for axis in axes if self.mesh.size(axis) > 1)
+        if len(active_axes) <= 1:
+            axis = active_axes[0] if active_axes else axes[0]
+            if out.is_symmetric_memory:
+                out.rendezvous(axis)
             dist.all_gather_into_tensor(
-                output_tensor=destination.local_buffer,
-                input_tensor=source.local_buffer,
+                output_tensor=out.local_buffer,
+                input_tensor=self.local_buffer,
                 group=self.mesh.get_group(axis),
             )
-            source = destination
+            return out
+
+        coordinate = self.mesh.get_coordinate()
+        rank_grid = self.mesh.mesh[
+            tuple(
+                slice(None) if axis in active_axes else rank for axis, rank in enumerate(coordinate)
+            )
+        ]
+        # get_local_range() shards inner axes first, so outer axes vary fastest.
+        ranks_by_chunk = (
+            rank_grid.permute(tuple(reversed(range(len(active_axes))))).flatten().tolist()
+        )
+        group = _get_combined_group(
+            tuple(sorted(ranks_by_chunk)), tuple(self.mesh.get_group(axis) for axis in active_axes)
+        )
+        chunk_by_rank = {rank: chunk for chunk, rank in enumerate(ranks_by_chunk)}
+        # The list collective scatters rank-ordered results into these views.
+        # NCCL may use an internal staging allocation for this permutation.
+        chunks = out.local_buffer.chunk(group.size())
+        dist.all_gather(
+            [chunks[chunk_by_rank[rank]] for rank in dist.get_process_group_ranks(group)],
+            self.local_buffer,
+            group=group,
+        )
         return out
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":

@@ -3,6 +3,7 @@
 """Unit tests for Megatron-FSDP DBuffer."""
 
 from collections.abc import Iterable
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -709,23 +710,54 @@ def test_multi_axis_view_and_allgather(distributed_setup, destination):
     saved = sharded.local_buffer.clone()
     replicated.local_buffer.fill_(-1)
     sharded.local_buffer.copy_(saved)
-    if destination == "redistribute":
-        result = sharded.redistribute([Replicate(), Replicate()], out=replicated)
-    else:
-        out = None
-        if destination == "aliased":
-            out = replicated
-        elif destination == "separate":
-            out = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
-            out.local_buffer.fill_(-1)
-        # Accept a generator in reverse order; the implementation orders the collectives.
-        result = sharded.allgather((axis for axis in [1, 0]), out=out)
-        if out is not None:
-            assert result is out
+    with (
+        patch.object(dist, "all_gather", wraps=dist.all_gather) as gather,
+        patch.object(
+            dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor
+        ) as gather_into,
+    ):
+        if destination == "redistribute":
+            result = sharded.redistribute([Replicate(), Replicate()], out=replicated)
+        else:
+            out = None
+            if destination == "aliased":
+                out = replicated
+            elif destination == "separate":
+                out = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+                out.local_buffer.fill_(-1)
+            result = sharded.allgather((axis for axis in [1, 0]), out=out)
+            if out is not None:
+                assert result is out
+        assert gather.call_count + gather_into.call_count == 1
     _assert_dbuffer_local_tensors_close(result, tensors)
     sliced = result.redistribute([RowAtomic(), RowAtomic()])
     for index in range(len(tensors)):
         torch.testing.assert_close(sliced.get_tensor_view(index), expected.get_tensor_view(index))
+
+
+@pytest.mark.parametrize("axes", [(0, 1), (1, 2), (0, 1, 2)])
+def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes):
+    if distributed_setup.world_size % 4:
+        pytest.skip("Requires a world size divisible by four.")
+    mesh = init_device_mesh(
+        distributed_setup.device.type, (2, 2, distributed_setup.world_size // 4)
+    )
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source_placements = [Replicate() if axis < min(axes) else RowAtomic() for axis in range(3)]
+    target_placements = [Replicate() if axis <= max(axes) else RowAtomic() for axis in range(3)]
+    source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
+    expected = DBuffer.distribute_tensors(tensors, mesh, target_placements)
+    with (
+        patch.object(dist, "all_gather", wraps=dist.all_gather) as gather,
+        patch.object(
+            dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor
+        ) as gather_into,
+    ):
+        result = source.allgather(axes)
+        assert gather.call_count + gather_into.call_count == 1
+    assert result.placements == tuple(target_placements)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
 
 
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
