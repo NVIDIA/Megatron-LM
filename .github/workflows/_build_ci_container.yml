@@ -130,10 +130,6 @@ jobs:
         with:
           python-version: 3.12
 
-      - name: Validate native wheel cache configuration
-        if: inputs.is-maintainer && !inputs.lts
-        run: python -m unittest discover -s tests/test_utils -p test_uv_cache_key.py
-
       - name: Download test data
         shell: bash
         env:
@@ -250,7 +246,6 @@ jobs:
               docker/.ngc_version.dev
               docker/common/install_nccl.sh
               docker/common/install_nccl_m2n.sh
-              docker/common/uv_cache_key.py
               docker/patches/deepep.patch
               docker/patches/deepep-nvshmem.patch
               megatron/core/__init__.py
@@ -321,19 +316,50 @@ jobs:
           # one ABI for the key and a different ABI when the image is built.
           BASE_DIGEST=$(docker buildx imagetools inspect "$FROM_IMAGE_NAME" --format '{{.Manifest.Digest}}')
           [[ "$BASE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          BASE_IMAGE="${FROM_IMAGE_NAME}@${BASE_DIGEST}"
-          case "$(uname -m)" in
-            x86_64) TARGET_ARCH=amd64 ;;
-            aarch64 | arm64) TARGET_ARCH=arm64 ;;
-            *) echo "Unsupported build architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
-          ABI=$(python docker/common/uv_cache_key.py \
-            --base-image "$BASE_IMAGE" --architecture "$TARGET_ARCH" \
-            --cuda-archs "$NVTE_CUDA_ARCHS")
+          BASE_IMAGE="${FROM_IMAGE_NAME%@*}@${BASE_DIGEST}"
+          # Fingerprint the locked build tools; uv keys individual native wheels
+          # by source/version, so unrelated runtime updates can reuse them.
+          BUILD_TOOLS=$(python - <<'PYTHON'
+          import json
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())
+          packages = tomllib.loads(Path("uv.lock").read_text())["package"]
+          root = next(p for p in packages if p["name"] == project["project"]["name"])
+          pending = [d["name"] for d in root["dev-dependencies"]["build"]]
+          selected = set()
+          while pending:
+              name = pending.pop()
+              if name in selected or name in {"torch", "torchvision", "triton"}:
+                  continue
+              matches = [p for p in packages if p["name"] == name]
+              assert matches, f"Missing locked build dependency: {name}"
+              selected.add(name)
+              for package in matches:
+                  pending.extend(d["name"] for d in package.get("dependencies", []))
+                  for dependencies in package.get("optional-dependencies", {}).values():
+                      pending.extend(d["name"] for d in dependencies)
+          settings = dict(project["tool"]["uv"])
+          settings.pop("sources", None)
+          settings["dependency-metadata"] = [
+              m for m in settings.get("dependency-metadata", []) if m["name"] in selected
+          ]
+          print(json.dumps({"settings": settings,
+                            "build": project["dependency-groups"]["build"],
+                            "packages": [p for p in packages if p["name"] in selected]},
+                           sort_keys=True))
+          PYTHON
+          )
+          ABI=$({
+            printf '%s\n' "$BASE_IMAGE" "$(uname -m)" "$NVTE_CUDA_ARCHS" "$BUILD_TOOLS"
+            sha256sum docker/Dockerfile.ci.dev docker/common/install_nccl.sh \
+              .github/workflows/_build_ci_container.yml
+          } | sha256sum | cut -c1-32)
           SCOPE_HASH=$(printf '%s' "$CACHE_SCOPE" | sha256sum | cut -c1-16)
           BASELINE_HASH=$(printf '%s' "$BASELINE_SCOPE" | sha256sum | cut -c1-16)
-          CACHE_IMAGE="${REGISTRY}/megatron-lm:uvcache-v1-${SCOPE_HASH}-${ABI}-${TARGET_ARCH}"
-          BASELINE_IMAGE="${REGISTRY}/megatron-lm:uvcache-v1-${BASELINE_HASH}-${ABI}-${TARGET_ARCH}"
+          CACHE_IMAGE="${REGISTRY}/megatron-lm:uvcache-v2-${SCOPE_HASH}-${ABI}"
+          BASELINE_IMAGE="${REGISTRY}/megatron-lm:uvcache-v2-${BASELINE_HASH}-${ABI}"
           DONOR=""
           for candidate in "$CACHE_IMAGE" "$BASELINE_IMAGE"; do
             if digest=$(docker buildx imagetools inspect "$candidate" --format '{{.Manifest.Digest}}' 2>/dev/null); then
@@ -353,15 +379,8 @@ jobs:
             echo "id=mcore-uv-$ABI"
             echo "donor=$DONOR"
             echo "image=$CACHE_IMAGE"
-            echo "snapshot=${CACHE_IMAGE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             echo "publish=$PUBLISH"
           } >> "$GITHUB_OUTPUT"
-          {
-            echo "### Native wheel cache"
-            echo "- Compatibility key: \`$ABI\` ($TARGET_ARCH)"
-            echo "- Restored snapshot: \`${DONOR:-none; build from source}\`"
-            echo "- Cache destination: \`$CACHE_IMAGE\`"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Restore native wheel cache
         id: uv_cache_restore
@@ -462,7 +481,6 @@ jobs:
             NVTE_CUDA_ARCHS=${{ env.NVTE_CUDA_ARCHS }}
           tags: |
             ${{ steps.uv_cache.outputs.image }}
-            ${{ steps.uv_cache.outputs.snapshot }}
 
       - name: Verify exported cache
         if: inputs.verify-cache
