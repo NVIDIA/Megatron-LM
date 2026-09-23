@@ -1,0 +1,6 @@
+{
+  "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental": {
+    "dgx_h100": ["tests/unit_tests/distributed/mfsdp_v2/**/*.py"],
+    "dgx_gb200": ["tests/unit_tests/**/*.py"]
+  }
+}

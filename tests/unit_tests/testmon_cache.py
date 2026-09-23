@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import re
 import sqlite3
@@ -14,15 +15,17 @@ import sys
 from contextlib import closing
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, distributions, version
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
+RECIPE_PLATFORMS = frozenset({"dgx_h100", "dgx_gb200"})
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
+SOURCE_MAPPING_FILE = "tests/unit_tests/testmon_source_mapping.json"
 COMPATIBILITY_FILES = (
     ".github/actions/action.yml",
     ".github/workflows/_build_ci_container.yml",
@@ -35,6 +38,7 @@ COMPATIBILITY_FILES = (
     "tests/unit_tests/find_test_cases.py",
     "tests/unit_tests/testmon_selector.py",
     "tests/unit_tests/testmon_cache.py",
+    SOURCE_MAPPING_FILE,
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
@@ -99,11 +103,85 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _validate_mapping_path(path: str) -> None:
+    if (
+        not path
+        or PurePosixPath(path).is_absolute()
+        or str(PurePosixPath(path)) != path
+        or ".." in PurePosixPath(path).parts
+        or "\\" in path
+        or any(character in path for character in "\r\n\0")
+    ):
+        raise ValueError(f"invalid Testmon mapping path: {path!r}")
+
+
+def _source_mapping(root: Path) -> dict[str, dict[str, list[str]]]:
+    mapping = _read_json(root / SOURCE_MAPPING_FILE)
+    for source, platforms in mapping.items():
+        _validate_mapping_path(source)
+        if source == "." or any(character in source for character in "*?[]"):
+            raise ValueError(f"expected a source directory in Testmon mapping: {source!r}")
+        if not isinstance(platforms, dict) or not platforms:
+            raise ValueError(f"expected recipe platforms for mapped source: {source!r}")
+        for recipe_platform, buckets in platforms.items():
+            if recipe_platform not in RECIPE_PLATFORMS:
+                raise ValueError(f"unsupported mapped Testmon platform: {recipe_platform!r}")
+            if not isinstance(buckets, list) or not buckets:
+                raise ValueError(f"expected unit-test buckets for mapped source: {source!r}")
+            for bucket in buckets:
+                if not isinstance(bucket, str):
+                    raise ValueError(f"invalid mapped unit-test bucket: {bucket!r}")
+                _validate_mapping_path(bucket)
+                if not bucket.startswith("tests/unit_tests/") or not bucket.endswith(".py"):
+                    raise ValueError(f"invalid mapped unit-test bucket: {bucket!r}")
+    return mapping
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
+def _mapped_source_inputs(root: Path, bucket: str, recipe_platform: str) -> dict[str, str]:
+    """Fingerprint mapped source trees independently of traced test dependencies."""
+    inputs = {}
+    for source, platforms in _source_mapping(root).items():
+        if bucket not in platforms.get(recipe_platform, []):
+            continue
+        directory = root / source
+        parent = root
+        for part in PurePosixPath(source).parts:
+            parent /= part
+            if parent.is_symlink():
+                raise ValueError(f"mapped source directory contains a symlink: {source}")
+        try:
+            directory.stat()
+        except FileNotFoundError:
+            # Removing a source tree must compare against its recorded files.
+            continue
+        if not directory.is_dir():
+            raise ValueError(f"mapped source is not a directory: {source}")
+        for current, directories, filenames in os.walk(directory, onerror=_raise_walk_error):
+            directories[:] = sorted(
+                name
+                for name in directories
+                if name not in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+            )
+            for name in [*directories, *filenames]:
+                path = Path(current) / name
+                if path.suffix in {".pyc", ".pyo"}:
+                    continue
+                if path.is_symlink():
+                    raise ValueError(f"mapped source contains a symlink: {path}")
+                if name in filenames:
+                    inputs[str(path.relative_to(root))] = _digest(path)
+    return dict(sorted(inputs.items()))
+
+
 def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
-    if recipe_platform not in {"dgx_h100", "dgx_gb200"}:
+    if recipe_platform not in RECIPE_PLATFORMS:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
@@ -120,6 +198,7 @@ def cache_identity(
         "environment": "dev",
         "tag": "latest",
         "inputs": inputs,
+        "source_inputs": _mapped_source_inputs(root, bucket, recipe_platform),
     }
     bucket_hash = hashlib.sha256(bucket.encode()).hexdigest()[:16]
     return {
@@ -235,6 +314,11 @@ def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
     if matched_key != identity["cache_prefix"] + generation:
         raise ValueError("restored Testmon key does not match its generation")
     if manifest.get("schema") != SCHEMA or manifest.get("identity") != identity["compatibility"]:
+        recorded = manifest.get("identity")
+        if isinstance(recorded, dict) and recorded.get("source_inputs", {}) != identity[
+            "compatibility"
+        ].get("source_inputs", {}):
+            raise ValueError("Testmon mapped source files changed; full unit-test bucket required")
         raise ValueError("Testmon cache compatibility changed")
     if manifest.get("source_ref") != "refs/heads/main" or not re.fullmatch(
         r"[0-9a-f]{40}", str(manifest.get("source_sha", ""))

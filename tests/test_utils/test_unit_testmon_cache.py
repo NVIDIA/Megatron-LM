@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -26,6 +27,8 @@ cache = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cache)
 IMAGE_ID = "sha256:" + "a" * 64
 BUCKET = "tests/unit_tests/pipeline_parallel/**/*.py"
+MAPPED_BUCKET = "tests/unit_tests/distributed/mfsdp_v2/**/*.py"
+MAPPED_SOURCE = "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental"
 
 
 @pytest.fixture
@@ -40,6 +43,7 @@ def source_tree(tmp_path):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
+    (root / cache.SOURCE_MAPPING_FILE).write_bytes((ROOT / cache.SOURCE_MAPPING_FILE).read_bytes())
     return root
 
 
@@ -47,13 +51,35 @@ def source_tree(tmp_path):
 def generation(tmp_path, source_tree):
     identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     directory = tmp_path / "assets_dir/testmon"
+    _create_generation(directory, identity)
+    return directory, identity
+
+
+def _create_generation(directory, identity):
     for phase in cache.PHASES:
         path = directory / phase / ".testmondata"
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         database = DB(str(path))
         database.con.close()
         cache.record_phase(directory, phase)
     cache.finalize(directory, identity, "b" * 40, "123-1")
+
+
+@pytest.fixture
+def mapped_source(source_tree):
+    directory = source_tree / MAPPED_SOURCE
+    directory.mkdir(parents=True)
+    (directory / "module.py").write_text("def hook():\n    return True\n")
+    (directory / "nested").mkdir()
+    (directory / "nested/hooks.py").write_text("def nested_hook():\n    return False\n")
+    return directory
+
+
+@pytest.fixture
+def mapped_generation(tmp_path, source_tree, mapped_source):
+    identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    directory = tmp_path / "assets_dir/testmon"
+    _create_generation(directory, identity)
     return directory, identity
 
 
@@ -69,6 +95,220 @@ def test_source_edits_preserve_identity(source_tree):
     before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     (source_tree / "megatron/core/ordinary.py").write_text("changed source")
     assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
+
+
+def test_configured_source_mappings_target_existing_recipe_buckets():
+    mapping = json.loads((ROOT / cache.SOURCE_MAPPING_FILE).read_text())
+    recipe_buckets = {}
+    for platform in ("h100", "gb200"):
+        recipe = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
+        )
+        recipe_buckets[f"dgx_{platform}"] = {
+            bucket for product in recipe["products"] for bucket in product["test_case"]
+        }
+    assert mapping
+    for source, platforms in mapping.items():
+        assert (ROOT / source).is_dir(), source
+        assert set(platforms) <= recipe_buckets.keys(), source
+        for platform, buckets in platforms.items():
+            assert set(buckets) <= recipe_buckets[platform], (source, platform)
+
+
+def test_unchanged_mapped_sources_accept_the_recorded_baseline(source_tree, mapped_generation):
+    directory, producer = mapped_generation
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    expected_paths = [f"{MAPPED_SOURCE}/module.py", f"{MAPPED_SOURCE}/nested/hooks.py"]
+    assert consumer["compatibility"]["source_inputs"] == {
+        name: hashlib.sha256((source_tree / name).read_bytes()).hexdigest()
+        for name in expected_paths
+    }
+    assert consumer == producer
+    before = _snapshot(directory)
+    cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    assert _snapshot(directory) == before
+
+
+@pytest.mark.parametrize("change", ["modified", "added", "deleted", "renamed"])
+def test_mapped_source_changes_reject_baseline_without_affecting_other_buckets(
+    source_tree, mapped_source, mapped_generation, change
+):
+    directory, producer = mapped_generation
+    unrelated_before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    source = mapped_source / "module.py"
+    if change == "modified":
+        source.write_text("def hook():\n    return False\n")
+    elif change == "added":
+        (mapped_source / "nested/added.py").write_text("def added_hook():\n    return True\n")
+    elif change == "deleted":
+        source.unlink()
+    else:
+        source.rename(mapped_source / "renamed.py")
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert consumer["cache_prefix"] == producer["cache_prefix"]
+    assert consumer["compatibility"]["source_inputs"] != producer["compatibility"]["source_inputs"]
+    before = _snapshot(directory)
+    with pytest.raises(ValueError, match="mapped source"):
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    assert _snapshot(directory) == before
+    assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == unrelated_before
+
+
+def test_unmapped_source_changes_preserve_mapped_bucket_identity(source_tree, mapped_generation):
+    directory, producer = mapped_generation
+    (source_tree / "megatron/core/ordinary.py").write_text("changed unrelated source")
+    # A prefix match must not include a sibling directory with a similar name.
+    sibling = source_tree / f"{MAPPED_SOURCE}_other"
+    sibling.mkdir()
+    (sibling / "module.py").write_text("changed neighboring source")
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert consumer == producer
+    cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+
+
+@pytest.mark.parametrize(
+    "platform,bucket,invalidated",
+    [
+        ("dgx_gb200", "tests/unit_tests/**/*.py", True),
+        ("dgx_h100", "tests/unit_tests/**/*.py", False),
+        ("dgx_gb200", "tests/unit_tests/generalized_tensor_parallel/**/*.py", False),
+    ],
+)
+def test_mapped_source_change_only_invalidates_platform_bucket_owning_tests(
+    tmp_path, source_tree, mapped_source, platform, bucket, invalidated
+):
+    producer = cache.cache_identity(source_tree, bucket, platform, IMAGE_ID)
+    directory = tmp_path / "assets_dir/testmon"
+    _create_generation(directory, producer)
+    (mapped_source / "module.py").write_text("def hook():\n    return False\n")
+    consumer = cache.cache_identity(source_tree, bucket, platform, IMAGE_ID)
+    assert consumer["cache_prefix"] == producer["cache_prefix"]
+    before = _snapshot(directory)
+    if invalidated:
+        assert producer["compatibility"]["source_inputs"]
+        with pytest.raises(ValueError, match="mapped source"):
+            cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    else:
+        assert consumer == producer
+        assert consumer["compatibility"]["source_inputs"] == {}
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    assert _snapshot(directory) == before
+
+
+@pytest.mark.parametrize("present", [False, True], ids=["missing-directory", "empty-directory"])
+def test_new_source_after_empty_baseline_requires_full_bucket(tmp_path, source_tree, present):
+    source = source_tree / MAPPED_SOURCE
+    if present:
+        source.mkdir(parents=True)
+    producer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert producer["compatibility"]["source_inputs"] == {}
+    directory = tmp_path / "assets_dir/testmon"
+    _create_generation(directory, producer)
+    cache.validate_cache(directory, producer, producer["cache_prefix"] + "123-1")
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "new.py").write_text("def new_hook():\n    return True\n")
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    with pytest.raises(ValueError, match="mapped source"):
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+
+
+def test_removing_entire_mapped_directory_rejects_baseline(
+    source_tree, mapped_source, mapped_generation
+):
+    directory, producer = mapped_generation
+    shutil.rmtree(mapped_source)
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert consumer["compatibility"]["source_inputs"] == {}
+    with pytest.raises(ValueError, match="mapped source"):
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+
+
+@pytest.mark.parametrize(
+    "generated",
+    ["__pycache__/module.cpython-312.pyc", ".pytest_cache/state", "module.pyc", "module.pyo"],
+)
+def test_generated_files_do_not_invalidate_mapped_source_baseline(
+    source_tree, mapped_source, mapped_generation, generated
+):
+    directory, producer = mapped_generation
+    path = mapped_source / generated
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"generated runtime artifact")
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert consumer == producer
+    cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        "{",
+        "[]",
+        json.dumps({MAPPED_SOURCE: []}),
+        json.dumps({MAPPED_SOURCE: None}),
+        json.dumps({MAPPED_SOURCE: {}}),
+        json.dumps({MAPPED_SOURCE: {"unsupported_platform": [MAPPED_BUCKET]}}),
+        json.dumps({MAPPED_SOURCE: {"dgx_h100": []}}),
+        json.dumps({MAPPED_SOURCE: {"dgx_h100": None}}),
+        json.dumps({MAPPED_SOURCE: {"dgx_h100": MAPPED_BUCKET}}),
+        json.dumps({MAPPED_SOURCE: {"dgx_h100": [None]}}),
+        json.dumps({MAPPED_SOURCE: {"dgx_h100": ["outside/tests.py"]}}),
+        json.dumps({"/absolute/source": {"dgx_h100": [MAPPED_BUCKET]}}),
+        json.dumps({"../outside": {"dgx_h100": [MAPPED_BUCKET]}}),
+        json.dumps({"source/../outside": {"dgx_h100": [MAPPED_BUCKET]}}),
+        json.dumps({"./source": {"dgx_h100": [MAPPED_BUCKET]}}),
+        json.dumps({"source//nested": {"dgx_h100": [MAPPED_BUCKET]}}),
+        json.dumps({"source/**/*.py": {"dgx_h100": [MAPPED_BUCKET]}}),
+    ],
+)
+def test_invalid_source_mapping_rejects_identity(source_tree, mapping):
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(mapping)
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_mapping_can_target_multiple_buckets_including_single_file(source_tree, mapped_source):
+    single_file_bucket = "tests/unit_tests/distributed/mfsdp_v2/test_hooks.py"
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
+        json.dumps({MAPPED_SOURCE: {"dgx_h100": [MAPPED_BUCKET, single_file_bucket]}})
+    )
+    wildcard = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    single_file = cache.cache_identity(source_tree, single_file_bucket, "dgx_h100", IMAGE_ID)
+    assert (
+        single_file["compatibility"]["source_inputs"] == wildcard["compatibility"]["source_inputs"]
+    )
+    assert single_file["compatibility"]["source_inputs"]
+
+
+@pytest.mark.parametrize("kind", ["root", "ancestor", "file", "directory"])
+def test_symlinks_in_mapped_sources_reject_identity(source_tree, mapped_source, tmp_path, kind):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "hook.py").write_text("def hook():\n    return True\n")
+    if kind in {"root", "ancestor"}:
+        link = mapped_source if kind == "root" else mapped_source.parent
+        shutil.rmtree(link)
+        link.symlink_to(outside, target_is_directory=True)
+    elif kind == "file":
+        (mapped_source / "linked.py").symlink_to(outside / "hook.py")
+    else:
+        (mapped_source / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises((OSError, ValueError)):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_unreadable_mapped_source_rejects_identity(source_tree, mapped_source, monkeypatch):
+    unreadable = mapped_source / "module.py"
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(path):
+        if path == unreadable:
+            raise PermissionError("mapped source cannot be read")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    with pytest.raises((OSError, ValueError)):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
 
 
 @pytest.mark.parametrize(
@@ -336,6 +576,7 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "different-image",
         "missing-image",
         "changed-config",
+        "mapped-source-change",
         "miss",
         "error",
         "invalid",
@@ -343,7 +584,7 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
     ],
 )
 def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
-    generation, source_tree, tmp_path, restore
+    generation, source_tree, mapped_source, tmp_path, restore
 ):
     directory, identity = generation
     if restore == "different-image":
@@ -353,6 +594,11 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     elif restore == "changed-config":
         (source_tree / "tests/unit_tests/find_test_cases.py").write_text("changed")
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    elif restore == "mapped-source-change":
+        identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+        _create_generation(directory, identity)
+        (mapped_source / "module.py").write_text("def hook():\n    return False\n")
+        identity = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
     identity_file = runtime_dir / "unit-testmon-identity.json"

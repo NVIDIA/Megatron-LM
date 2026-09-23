@@ -408,8 +408,9 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
     ("overrides", "expected"),
     [
         ({}, "true"),
-        ({"HAS_UNIT_TESTMON": "false"}, "false"),
+        ({"UNIT_TESTMON_REQUESTED": "false"}, "false"),
         ({"EVENT_NAME": "merge_group"}, "false"),
+        ({"IS_MERGE_GROUP": "true"}, "false"),
         ({"REF": "refs/heads/main"}, "false"),
         ({"LABELS_VALID": "false"}, "false"),
         ({"HAS_RUN_TESTS": "true"}, "false"),
@@ -418,7 +419,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
         ({"HAS_LTS": "true"}, "false"),
     ],
 )
-def test_pr_label_gate(overrides, expected):
+def test_pr_eligibility_gate(overrides, expected):
     workflow = _source(".github/workflows/cicd-main.yml")
     start = workflow.index("          UNIT_TESTMON_ELIGIBLE=false")
     end = workflow.index('\n\n          echo "scope=', start)
@@ -426,9 +427,10 @@ def test_pr_label_gate(overrides, expected):
     environment = {
         **os.environ,
         "LABELS_VALID": "true",
-        "HAS_UNIT_TESTMON": "true",
+        "UNIT_TESTMON_REQUESTED": "true",
         "EVENT_NAME": "push",
         "REF": "refs/heads/pull-request/123",
+        "IS_MERGE_GROUP": "false",
         "HAS_RUN_TESTS": "false",
         "HAS_RUN_FUNCTIONAL": "false",
         "FORCE_RUN_ALL": "false",
