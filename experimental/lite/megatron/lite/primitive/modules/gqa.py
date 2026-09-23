@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg, split_grouped_qkvg_for_tp
+from megatron.lite.primitive.modules.gqa_utils import (
+    split_grouped_qkvg,
+    split_grouped_qkvg_for_tp,
+)
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import (
@@ -172,10 +175,6 @@ class GQAttention(nn.Module):
 
     def _build_core_attn(self, attention_backend: str) -> nn.Module:
         if attention_backend == "magi":
-            # Deferred: a module-level import here would make attention.magi's package
-            # (attention/__init__.py) run before this class finishes defining, and
-            # attention/__init__.py imports msa.py, which imports GQAttention back
-            # from this module -- a circular import.
             from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
 
             return MagiDotProductAttention(head_dim=self.head_dim)
@@ -215,10 +214,7 @@ class GQAttention(nn.Module):
         self.attention_backend = attention_backend
 
     def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-        packed_seq_params=None,
+        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
@@ -395,18 +391,6 @@ class GQAttention(nn.Module):
             v = qkv[..., (q_per_group + 1) * hd : (q_per_group + 2) * hd]
             return q, None, k, v
 
-        if self._replicate_kv:
-            # Flat layout, tp > num_kv_heads: the column-parallel qkv is sharded 1/tp contiguously and
-            # all-gathered above, so ``qkv`` is the full canonical [Q | K | V]; pick this rank's q heads and
-            # the kv head serving its group (the same weight layout ``split_qkv`` produces at load time).
-            if self._output_gate:
-                raise NotImplementedError("flat qkv layout with output gate does not support tp > num_kv_heads")
-            heads = qkv.view(*lead, self.num_heads + 2 * self.num_kv_heads, hd)
-            g = self.ps.tp_rank // (self.ps.tp_size // self.num_kv_heads)
-            q = heads[..., self.ps.tp_rank * nq : (self.ps.tp_rank + 1) * nq, :]
-            k = heads[..., self.num_heads + g : self.num_heads + g + 1, :]
-            v = heads[..., self.num_heads + self.num_kv_heads + g : self.num_heads + self.num_kv_heads + g + 1, :]
-            return q, None, k, v
         if self._output_gate:
             q_block = qkv[..., : nq * 2 * hd].reshape(*lead, nq, 2 * hd)
             kv_block = qkv[..., nq * 2 * hd :].reshape(*lead, 2 * nkv, hd)
