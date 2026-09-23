@@ -260,8 +260,8 @@ class _GroupExchangePlan:
 
     Built once per param identity tuple by :meth:`LayerShardedMuon._build_plan` and
     invalidated by both setters; ``step()`` only consumes it. Index spaces: ``i`` indexes
-    the group's grad-bearing params, ``n`` the routed sub-list, ``k`` this rank's homed
-    subset of the routed list (``homed``).
+    the group's grad-bearing params, ``n`` the routed sub-list, ``k`` the subset of the
+    routed list that stage 1 delivers to this rank (``stage1_routed_indices``).
     """
 
     param_ids: tuple[int, ...]
@@ -271,7 +271,7 @@ class _GroupExchangePlan:
     ns_homes: list[tuple[int, int]]  # per n: (g_home, t_home)
     g_home: dict[int, int]  # n -> g_home, the stage-1 routing table
     pad_lengths: list[int]  # per n
-    homed: list[int]  # k -> n: routed params whose g_home is this rank, in stage-1 order
+    stage1_routed_indices: list[int]  # k -> n: routed params whose g_home is this rank
     tp_exchanges: dict[int, tuple[list[int], dict[int, int]]]  # tp_dim -> (k's, j -> t_home)
     tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
     # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
@@ -689,19 +689,22 @@ class LayerShardedMuon(TensorParallelMuon):
         # This rank's share of the stage-1 exchange, by the rule the router itself applies
         # (a trivial gtp_remat group homes everything locally).
         if gtp_remat_size <= 1:
-            homed = list(range(len(routed)))
+            stage1_routed_indices = list(range(len(routed)))
         else:
-            homed = params_by_home(len(routed), g_home, gtp_remat_size)[
+            stage1_routed_indices = params_by_home(len(routed), g_home, gtp_remat_size)[
                 get_pg_rank(gtp_remat_group)
             ]
         by_tp_dim: dict[int | None, list[int]] = {0: [], 1: [], None: []}
-        for k, n in enumerate(homed):
+        for k, n in enumerate(stage1_routed_indices):
             by_tp_dim[specs[routed[n]].tp_dim].append(k)
         tp_exchanges: dict[int, tuple[list[int], dict[int, int]]] = {}
         for pd in (0, 1):
             positions = by_tp_dim[pd]
             if positions:
-                t_home = {j: ns_homes[homed[positions[j]]][1] for j in range(len(positions))}
+                t_home = {
+                    j: ns_homes[stage1_routed_indices[positions[j]]][1]
+                    for j in range(len(positions))
+                }
                 tp_exchanges[pd] = (positions, t_home)
 
         return _GroupExchangePlan(
@@ -712,7 +715,7 @@ class LayerShardedMuon(TensorParallelMuon):
             ns_homes=ns_homes,
             g_home=g_home,
             pad_lengths=[specs[i].pad_length for i in routed],
-            homed=homed,
+            stage1_routed_indices=stage1_routed_indices,
             tp_exchanges=tp_exchanges,
             tp_complete=by_tp_dim[None],
         )
@@ -738,10 +741,12 @@ class LayerShardedMuon(TensorParallelMuon):
                 continue
             plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
 
-            # 1. Momentum update on the local shard.
-            # NOTE: with nesterov=False, ``moms[i]`` aliases the momentum buffer
+            # 1. Momentum update on the local shard. Each entry is this rank's local
+            #    Newton-Schulz input: the Nesterov-corrected direction, or the momentum
+            #    buffer itself.
+            # NOTE: with nesterov=False, ``local_ns_inputs[i]`` aliases the momentum buffer
             # (``.float()`` is a no-op on fp32); everything below treats it as read-only.
-            moms: list[torch.Tensor] = []
+            local_ns_inputs: list[torch.Tensor] = []
             with _phase("momentum"):
                 for p in params:
                     grad = p.grad
@@ -749,10 +754,10 @@ class LayerShardedMuon(TensorParallelMuon):
                     self._apply_weight_decay_inplace(p, grad, lr, group["weight_decay"])
                     state["momentum_buffer"].lerp_(grad, 1 - beta)
                     if self.nesterov:
-                        m = grad.lerp(state["momentum_buffer"], beta)
+                        local_ns_input = grad.lerp(state["momentum_buffer"], beta)
                     else:
-                        m = state["momentum_buffer"]
-                    moms.append(m.float())
+                        local_ns_input = state["momentum_buffer"]
+                    local_ns_inputs.append(local_ns_input.float())
 
             # 2. Replicated params (whole on every rank of the domain, which is every param
             #    of a single-rank domain): local Newton-Schulz on each rank's own copy,
@@ -760,23 +765,27 @@ class LayerShardedMuon(TensorParallelMuon):
             #    broadcasting the result back.
             if plan.replicated:
                 with _phase("ns_replicated"), fp32_matmul_precision(self.fp32_matmul_prec):
-                    for i, upd in self._run_ns({i: moms[i] for i in plan.replicated}).items():
-                        self._apply_update(params[i], upd, lr)
+                    replicated_ns_outputs = self._run_ns(
+                        {i: local_ns_inputs[i] for i in plan.replicated}
+                    )
+                    for i, ns_output in replicated_ns_outputs.items():
+                        self._apply_update(params[i], ns_output, lr)
             if not plan.routed:
                 continue
-            r_params = [params[i] for i in plan.routed]
-            r_moms = [moms[i] for i in plan.routed]
-            homed = plan.homed
+            # The rank-local shards that enter the GTP_remat / TP routing path.
+            local_param_shards = [params[i] for i in plan.routed]
+            local_ns_input_shards = [local_ns_inputs[i] for i in plan.routed]
+            stage1_routed_indices = plan.stage1_routed_indices
             route_plans = plan.route_plans
 
             with fp32_matmul_precision(self.fp32_matmul_prec):
                 with _phase("a2a_fwd"):
                     # 3. Stage-1 all_to_all over gtp_remat (dim 0): each param's gtp_remat
-                    #    extent is assembled on its g_home column. The router homes the
-                    #    same params on this rank as ``plan.homed`` (both use
-                    #    params_by_home).
-                    stage1, _ = route_to_ns_home(
-                        r_moms,
+                    #    extent is assembled on its g_home column. The router delivers the
+                    #    same params to this rank as ``plan.stage1_routed_indices`` (both
+                    #    use params_by_home).
+                    stage1_ns_inputs, _ = route_to_ns_home(
+                        local_ns_input_shards,
                         plan.g_home,
                         gtp_remat_group,
                         0,
@@ -787,29 +796,40 @@ class LayerShardedMuon(TensorParallelMuon):
                     # contiguous dim-0 tail for every partition dim (after TP assembly it
                     # would be embedded per TP block), the same strip point the parent's
                     # duplicated path uses.
-                    stage1 = [
-                        self._strip_pad(t, plan.pad_lengths[homed[k]]) for k, t in enumerate(stage1)
+                    stage1_ns_inputs = [
+                        self._strip_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
+                        for k, t in enumerate(stage1_ns_inputs)
                     ]
 
                     # 4. Stage-2 all_to_all over TP, one exchange per partition dim.
                     #    GTP_REMAT-only params skip it: every TP peer of the column already
-                    #    holds their full matrix.
-                    full_by_k: dict[int, torch.Tensor] = {}
-                    tp_selected: dict[int, tuple[list[torch.Tensor], list[int]]] = {}
+                    #    holds their full matrix. Both dicts below are keyed by ``k``, the
+                    #    stage-1 index.
+                    full_ns_inputs_by_stage1_index: dict[int, torch.Tensor] = {}
+                    # Forward TP-routing state the reverse exchange needs, per partition dim:
+                    # the TP-local shards sent and the positions this rank's home received.
+                    tp_reverse_context_by_partition_dim: dict[
+                        int, tuple[list[torch.Tensor], list[int]]
+                    ] = {}
                     for pd, (positions, t_home) in plan.tp_exchanges.items():
-                        templates = [stage1[k] for k in positions]
-                        fulls, my_sel = route_to_ns_home(
-                            templates,
+                        tp_local_ns_input_shards = [stage1_ns_inputs[k] for k in positions]
+                        local_full_ns_inputs, tp_input_indices_for_local_home = route_to_ns_home(
+                            tp_local_ns_input_shards,
                             t_home,
                             tp_group,
                             pd,
                             plan=route_plans.setdefault(("s2f", pd), {}),
                         )
-                        tp_selected[pd] = (templates, my_sel)
-                        for n_sel, full in zip(my_sel, fulls):
-                            full_by_k[positions[n_sel]] = full
+                        tp_reverse_context_by_partition_dim[pd] = (
+                            tp_local_ns_input_shards,
+                            tp_input_indices_for_local_home,
+                        )
+                        for tp_index, full_ns_input in zip(
+                            tp_input_indices_for_local_home, local_full_ns_inputs
+                        ):
+                            full_ns_inputs_by_stage1_index[positions[tp_index]] = full_ns_input
                     for k in plan.tp_complete:
-                        full_by_k[k] = stage1[k]
+                        full_ns_inputs_by_stage1_index[k] = stage1_ns_inputs[k]
 
                 # 5. Full-matrix Newton-Schulz on the home (identical to duplicated mode),
                 #    batched by shape; see _run_ns. The TP-complete (GTP_REMAT-only)
@@ -820,47 +840,65 @@ class LayerShardedMuon(TensorParallelMuon):
                 #    Pooled chunking would put the same replicated matrix in a baddbmm
                 #    chunk on one column and addmm on another, and the TP replicas of its
                 #    weight would drift apart and compound every step.
-                tp_complete = set(plan.tp_complete)
+                tp_complete_indices = set(plan.tp_complete)
                 with _phase("ns"):
-                    ns_by_k = self._run_ns(
-                        {k: v for k, v in full_by_k.items() if k not in tp_complete}
+                    ns_outputs_by_stage1_index = self._run_ns(
+                        {
+                            k: v
+                            for k, v in full_ns_inputs_by_stage1_index.items()
+                            if k not in tp_complete_indices
+                        }
                     )
-                    ns_by_k.update(self._run_ns({k: full_by_k[k] for k in plan.tp_complete}))
+                    ns_outputs_by_stage1_index.update(
+                        self._run_ns(
+                            {k: full_ns_inputs_by_stage1_index[k] for k in plan.tp_complete}
+                        )
+                    )
 
             with _phase("a2a_bwd"):
-                # 6. Reverse stage-2 all_to_all: scatter NS results back to TP parts.
-                col_updates: list = [None] * len(homed)
+                # 6. Reverse stage-2 all_to_all: scatter NS results back to TP parts. The
+                #    result, per stage-1 index, is the update for the TP-local shard.
+                stage1_update_shards: list = [None] * len(stage1_routed_indices)
                 for pd, (positions, t_home) in plan.tp_exchanges.items():
-                    templates, my_sel = tp_selected[pd]
-                    ns_sub = [ns_by_k[positions[n]] for n in my_sel]
-                    parts = route_from_ns_home(
-                        ns_sub,
-                        my_sel,
-                        templates,
+                    tp_local_ns_input_shards, tp_input_indices_for_local_home = (
+                        tp_reverse_context_by_partition_dim[pd]
+                    )
+                    tp_ns_outputs = [
+                        ns_outputs_by_stage1_index[positions[tp_index]]
+                        for tp_index in tp_input_indices_for_local_home
+                    ]
+                    tp_update_shards = route_from_ns_home(
+                        tp_ns_outputs,
+                        tp_input_indices_for_local_home,
+                        tp_local_ns_input_shards,
                         t_home,
                         tp_group,
                         pd,
                         plan=route_plans.setdefault(("s2b", pd), {}),
                     )
-                    for n, part in enumerate(parts):
-                        col_updates[positions[n]] = part
+                    for tp_index, tp_update_shard in enumerate(tp_update_shards):
+                        stage1_update_shards[positions[tp_index]] = tp_update_shard
                 for k in plan.tp_complete:
-                    col_updates[k] = ns_by_k[k]
+                    stage1_update_shards[k] = ns_outputs_by_stage1_index[k]
 
                 # Restore the padding (zero rows) before the reverse gtp_remat exchange:
                 # its split sizes derive from the padded momentum shards, and every
                 # rank's shard slice must line up again.
-                col_updates = [
-                    None if t is None else self._restore_pad(t, plan.pad_lengths[homed[k]])
-                    for k, t in enumerate(col_updates)
+                stage1_update_shards = [
+                    (
+                        None
+                        if t is None
+                        else self._restore_pad(t, plan.pad_lengths[stage1_routed_indices[k]])
+                    )
+                    for k, t in enumerate(stage1_update_shards)
                 ]
 
-                # 7. Reverse stage-1 all_to_all: scatter column updates back to the
+                # 7. Reverse stage-1 all_to_all: scatter the TP-local updates back to the
                 #    gtp_remat shards.
                 update_shards = route_from_ns_home(
-                    col_updates,
-                    homed,
-                    r_moms,
+                    stage1_update_shards,
+                    stage1_routed_indices,
+                    local_ns_input_shards,
                     plan.g_home,
                     gtp_remat_group,
                     0,
@@ -869,6 +907,6 @@ class LayerShardedMuon(TensorParallelMuon):
 
             # 8. Weight update on the local shard.
             with _phase("update"):
-                for p, shard in zip(r_params, update_shards):
+                for p, shard in zip(local_param_shards, update_shards):
                     if shard is not None:
                         self._apply_update(p, shard, lr)
