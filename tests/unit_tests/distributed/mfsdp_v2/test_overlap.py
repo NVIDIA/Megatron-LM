@@ -43,7 +43,7 @@ class MultiChildModel(nn.Module):
         return x
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -71,7 +71,7 @@ _GEMM_OP_NAME_SUBSTRING = "aten::mm"
     [
         pytest.param(_zero1_placements, id="zero1"),
         pytest.param(_zero2_placements, id="zero2"),
-        pytest.param(_flat_placements, id="zero3"),
+        pytest.param(_default_placements, id="zero3"),
     ],
 )
 @pytest.mark.parametrize(
@@ -193,7 +193,7 @@ def test_overlaps_communication_and_compute(
             num_children - 1,
             2 * (num_children - 1),
         ),
-        _flat_placements: (
+        _default_placements: (
             4 * num_children,
             2 * num_children,
             4 * (num_children - 1),
@@ -269,7 +269,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     mesh = init_device_mesh(device.type, (world_size,))
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    placements = _flat_placements()
+    placements = _default_placements()
     with fully_shard_context(device=device) as context:
         for layer in model.layers:
             fully_shard(

@@ -60,7 +60,7 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_run_config, get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -1121,8 +1121,46 @@ def save_checkpoint(
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
+                # Save run_config.yaml
+                checkpoint_name = get_checkpoint_name(
+                    save_dir,
+                    release=release,
+                    iteration=iteration,
+                    return_base_dir=True,
+                )
+                if iteration > 0:
+                    from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+
+                    run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
+
+                    # NOTE(@maanug-nv): this try-except is a temporary safeguard for
+                    # unit tests that do not create a config container.
+                    # in the future, run_config.to_yaml() should always run.
+                    try:
+                        run_config = get_run_config()
+                    except AssertionError as e:
+                        if str(e) != 'run config is not initialized.':
+                            raise
+                        warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+                    else:
+                        run_config.to_yaml(run_config_filename)
+
+                # Save tokenizer files for torch_dist checkpoints (if enabled)
+                if (
+                    args.save_tokenizer_assets
+                    and args.ckpt_format == 'torch_dist'
+                    and iteration > 0
+                ):
+                    config = _default_config_from_args(TokenizerConfig, args)
+                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
+                if args.log_progress and args.async_save:
+                    append_to_progress_log(
+                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
+                    )
+
                 with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write('release' if release else str(iteration))
+
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
                     f'checkpoint from iteration {int(iteration):7d} to {args.save} '
@@ -1130,21 +1168,6 @@ def save_checkpoint(
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
                 )
-                # Save tokenizer files for torch_dist checkpoints (if enabled)
-                if (
-                    args.save_tokenizer_assets
-                    and args.ckpt_format == 'torch_dist'
-                    and iteration > 0
-                ):
-                    checkpoint_name = get_checkpoint_name(
-                        save_dir, iteration=iteration, return_base_dir=True
-                    )
-                    config = _default_config_from_args(TokenizerConfig, args)
-                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
-                if args.log_progress and args.async_save:
-                    append_to_progress_log(
-                        args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
-                    )
 
                 if save_retain_interval is not None:
                     if (

@@ -53,20 +53,26 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
     group.add_argument(
         "--default-temperature",
         type=float,
-        default=1.0,
-        help="Default temperature sampling value when a request omits temperature.",
+        default=None,
+        help="Server-level temperature default when a request omits temperature. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     group.add_argument(
         "--default-top-p",
         type=float,
-        default=1.0,
-        help="Default top-p sampling value when a request omits top_p.",
+        default=None,
+        help="Server-level top-p default when a request omits top_p. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     group.add_argument(
         "--default-top-k",
         type=int,
-        default=0,
-        help="Default top-k sampling value when a request omits top_k.",
+        default=None,
+        help="Server-level top-k default when a request omits top_k. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 0 if neither is set.",
     )
     group.add_argument(
         "--eval-mode",

@@ -15,7 +15,7 @@
 """DBuffer placement definitions.
 
 DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
-types directly. ``Flat`` and ``BlockAtomic`` are DBuffer-specific dim-0
+types directly. ``RowAtomic`` and ``BlockAtomic`` are DBuffer-specific dim-0
 ``Shard`` placements whose local storage is part of one flattened buffer.
 
 =============  =============  ====================
@@ -33,17 +33,17 @@ from collections.abc import Iterable
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = ["BlockAtomic", "Flat", "changed_mesh_axis"]
+__all__ = ["BlockAtomic", "RowAtomic", "changed_mesh_axis"]
 
 
-class Flat(Shard):
-    """DBuffer-specific flattened dim-0 shard placement."""
+class RowAtomic(Shard):
+    """DBuffer-specific dim-0 shard placement that keeps each row intact."""
 
     def __init__(self) -> None:
         super().__init__(0)
 
     def __eq__(self, other: object) -> bool:
-        # PyTorch Shard.__eq__ compares only dim, so distinguish Flat from BlockAtomic.
+        # PyTorch Shard.__eq__ compares only dim, so distinguish RowAtomic from BlockAtomic.
         return isinstance(other, Shard) and other.dim == 0 and not isinstance(other, BlockAtomic)
 
 
