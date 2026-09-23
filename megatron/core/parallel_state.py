@@ -612,6 +612,7 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     gtp_remat_size: int = 1,
     expert_gtp_remat_size: int = 1,
+    gtp_remat_fold_cp: bool = False,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
     nccl_communicator_config_path: Optional[str] = None,
@@ -706,6 +707,11 @@ def initialize_model_parallel(
             every forward AND backward pass. A first-class orthogonal axis on the
             expert grid. Independent from ``gtp_remat_size``. Maps to
             ``ModelParallelConfig.expert_gtp_weight_remat_size``.
+
+        gtp_remat_fold_cp (bool, default = False):
+            Fold CP into the dense GTP weight group (group = cp x gtp_remat), at any
+            ``gtp_remat_size`` including 1. Off: the group is the plain gtp_remat axis and CP is
+            reduced by the ordinary dp_cp bucket. Maps to ``ModelParallelConfig.gtp_remat_fold_cp``.
 
         num_distributed_optimizer_instances (int, default = 1):
             The number of distributed optimizer replicas across the data-
@@ -807,8 +813,10 @@ def initialize_model_parallel(
     # GTP_remat requires a single distributed-optimizer instance: partial-distopt sharding of the
     # data domain would need gtp_remat-aware sizing. Assert early so all group builds below can
     # assume one instance when GTP_remat/EGTP is active.
+    # CP folds into the dense GTP weight group only when gtp_remat_fold_cp is set (at any GTP size).
+    fold_cp = context_parallel_size > 1 and gtp_remat_fold_cp
     assert not (
-        (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
+        (gtp_remat_size > 1 or fold_cp or expert_gtp_remat_size > 1)
         and num_distributed_optimizer_instances > 1
     ), "GTP_remat with num_distributed_optimizer_instances > 1 is not yet supported."
 
@@ -931,8 +939,8 @@ def initialize_model_parallel(
     ) // num_distributed_optimizer_instances
 
     # Build the generalized tensor parallel group: the axis a GTP weight is sharded over.
-    # CP is FOLDED IN when active (group = cp x gtp_remat), so a CP rank's partial wgrad is
-    # summed by this group's reduce-scatter for free, keeping weight-sharding callers CP-unaware.
+    # With gtp_remat_fold_cp, CP is FOLDED IN (group = cp x gtp_remat), so a CP rank's partial
+    # wgrad is summed by this group's reduce-scatter, keeping weight-sharding callers CP-unaware.
     # `config.gtp_weight_remat_size` stays CP-FREE (see get_gtp_weight_remat_size_no_cp); see
     # also BufferKey.excludes_cp_from_bucket and gtp_replica_rank for the consequences.
     global _GTP_WEIGHT_REMAT_GROUP
@@ -940,7 +948,7 @@ def initialize_model_parallel(
     assert (
         _GTP_WEIGHT_REMAT_GROUP is None
     ), "generalized tensor parallel group is already initialized"
-    if context_parallel_size > 1 and gtp_remat_size > 1:
+    if fold_cp:
         gtp_rank_sets = decoder_rank_generator.get_ranks('cp-gtp_remat')
     else:
         gtp_rank_sets = decoder_rank_generator.get_gtp_ranks(gtp_remat_size)
@@ -960,7 +968,7 @@ def initialize_model_parallel(
     global _GTP_WEIGHT_REMAT_GROUP_NO_CP
     global _GTP_WEIGHT_REMAT_SIZE_NO_CP
     _GTP_WEIGHT_REMAT_SIZE_NO_CP = gtp_remat_size
-    if context_parallel_size > 1 and gtp_remat_size > 1:
+    if fold_cp:
         for gtp_no_cp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
             group = create_group(
                 gtp_no_cp_ranks,
@@ -974,7 +982,7 @@ def initialize_model_parallel(
         _GTP_WEIGHT_REMAT_GROUP_NO_CP = _GTP_WEIGHT_REMAT_GROUP
 
     # Disable Gloo under GTP_remat (out of scope; the GTP_remat optimizer uses DCP).
-    if gtp_remat_size > 1:
+    if gtp_remat_size > 1 or fold_cp:
         create_gloo_process_groups = False
 
     # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp group.
@@ -1747,7 +1755,7 @@ def get_gtp_weight_remat_group(check_initialized=True):
 
 def get_gtp_weight_remat_world_size():
     """Return the CP-FREE GTP_remat world size (``config.gtp_weight_remat_size``), NOT
-    ``get_gtp_weight_remat_group().size()`` which folds CP in."""
+    ``get_gtp_weight_remat_group().size()`` which may fold CP in."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         group = get_gtp_weight_remat_group_no_cp(check_initialized=False)
         return group.size() if group is not None else 0
@@ -1777,7 +1785,7 @@ def get_gtp_weight_remat_group_no_cp(check_initialized=True):
 
 def get_gtp_weight_remat_size_no_cp():
     """Return the CP-FREE GTP_remat degree (``config.gtp_weight_remat_size``); the group itself
-    folds CP in, so use this for global-batch accounting where CP must not be counted."""
+    may fold CP in, so use this for global-batch accounting where CP must not be counted."""
     return _GTP_WEIGHT_REMAT_SIZE_NO_CP
 
 

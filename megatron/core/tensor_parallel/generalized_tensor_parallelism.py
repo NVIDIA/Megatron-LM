@@ -2872,11 +2872,11 @@ def reset_gtp_state():
 
 def gtp_replica_rank(param, explicit_group=None):
     """Rank of this process among the true replicas of ``param``'s GTP shard: the DP peers
-    EXCLUDING every axis the weight is sharded over (gtp_remat, and CP too since the gtp_remat
-    group folds it in) -- a dense weight elects over CP-free ``dp``, a routed-expert weight
+    EXCLUDING every axis the weight is sharded over -- a dense weight elects over ``dp`` if its
+    group folds CP in (gtp_remat_fold_cp), else over ``dp_cp``; a routed-expert weight
     (``allreduce=False``) over ``expt_dp``. Resolution order: ``explicit_group`` ->
-    (dense-only) MPU globals, overriding the stale CP-inclusive ``param.gtp_replica_group``
-    stamp -> ``param.gtp_replica_group`` -> MPU globals.
+    (dense-only) MPU globals, overriding the ``param.gtp_replica_group`` stamp ->
+    ``param.gtp_replica_group`` -> MPU globals.
     """
     from megatron.core.utils import get_pg_rank  # noqa: E402
 
@@ -2887,8 +2887,10 @@ def gtp_replica_rank(param, explicit_group=None):
 
     is_expert = not getattr(param, 'allreduce', True)  # routed-expert weight
     if not is_expert and parallel_state.is_initialized():
+        # Folded: CP peers hold different shards -> exclude CP. Unfolded: CP peers are replicas.
         return parallel_state.get_data_parallel_rank(
-            with_context_parallel=False, with_gtp_remat=False
+            with_context_parallel=not getattr(param, 'excludes_cp_from_bucket', False),
+            with_gtp_remat=False,
         )
 
     group = getattr(param, 'gtp_replica_group', None)

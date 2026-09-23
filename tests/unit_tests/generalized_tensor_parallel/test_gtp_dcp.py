@@ -1068,6 +1068,7 @@ def _worker_gtp_cp_writer_election_no_gaps(rank, world_size, port):
         pipeline_model_parallel_size=1,
         context_parallel_size=2,
         gtp_remat_size=2,
+        gtp_remat_fold_cp=True,
     )
     gtp_group = ps.get_gtp_weight_remat_group()
     assert gtp_group.size() == 4, f"expected cp(2)*gtp_remat(2)=4, got {gtp_group.size()}"
@@ -1128,6 +1129,7 @@ def _worker_vocab_embedding_wiring_no_gaps_under_cp(rank, world_size, port):
         pipeline_model_parallel_size=1,
         context_parallel_size=2,
         gtp_remat_size=2,
+        gtp_remat_fold_cp=True,
     )
     pg_collection = ProcessGroupCollection.use_mpu_process_groups(
         required_pgs=['tp', 'dp', 'dp_cp', 'gtp_remat']
@@ -1182,11 +1184,11 @@ def _worker_vocab_embedding_wiring_no_gaps_under_cp(rank, world_size, port):
             )
 
 
-def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base):
-    """End-to-end DCP save->load of a GTP-sharded weight with CP folded in (real
-    VocabParallelEmbedding; world=4 -> tp1*cp2*gtp2*dp1). Each rank fills its shard with a
-    rank-distinctive value and asserts the LOADED shard matches -- catches a shard swap/overwrite,
-    not just a crash (see test_gtp_cp_writer_election_no_gaps for the writer-count check).
+def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base, fold=True):
+    """End-to-end DCP save->load of a GTP-sharded weight under CP, folded or not (real
+    VocabParallelEmbedding; world=4 -> tp1*cp2*gtp2*dp1). Each shard is filled with a
+    shard-distinctive value and every rank asserts its LOADED shard matches -- catches a shard
+    swap/overwrite, not just a crash. Unfolded, CP peers are replicas: exactly one must write.
     """
     from megatron.core.dist_checkpointing import load, save
     from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
@@ -1199,6 +1201,7 @@ def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base):
         pipeline_model_parallel_size=1,
         context_parallel_size=2,
         gtp_remat_size=2,
+        gtp_remat_fold_cp=fold,
     )
     try:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
@@ -1221,13 +1224,14 @@ def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base):
             config=config,
             pg_collection=pg_collection,
         ).cuda()
-        assert embedding.gtp_remat_size == 4, f"expected cp(2)*gtp_remat(2)=4, {embedding}"
+        assert embedding.gtp_remat_size == (4 if fold else 2), f"fold={fold}: {embedding}"
 
-        # Rank-distinctive local shard: if load ever mixes up which rank's data lands where,
-        # this catches it (a uniform-fill weight would not).
+        # Shard-distinctive fill (rank within the weight group): distinct per rank when folded,
+        # shared by CP replicas when not. A uniform fill would hide a shard mix-up.
+        shard_id = ps.get_gtp_weight_remat_group().rank()
         with torch.no_grad():
             embedding.weight.copy_(
-                torch.full_like(embedding.weight, fill_value=float(rank), dtype=torch.bfloat16)
+                torch.full_like(embedding.weight, fill_value=float(shard_id), dtype=torch.bfloat16)
             )
         original_local = embedding.weight.detach().clone()
 
@@ -1244,9 +1248,11 @@ def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base):
         GTPShardedParam._chain_state = {}
 
 
-def _worker_dp_reshardable_cp_gtp_roundtrip(rank, world_size, ckpt_base, cp_size, gtp_remat_size):
+def _worker_dp_reshardable_cp_gtp_roundtrip(
+    rank, world_size, ckpt_base, cp_size, gtp_remat_size, fold_cp=False
+):
     """DistributedOptimizer dp_reshardable ckpt round-trip, world=4, covering CP-only (cp4),
-    CP folded into GTP (cp2 x gtp2), and GTP-only (gtp4).
+    CP x GTP_remat with and without gtp_remat_fold_cp, and GTP_remat-only (gtp4).
 
     Stamps every optimizer-state tensor to a RANK-DISTINCT value before saving and asserts the
     value THIS rank loads back matches what THIS rank originally saved. A same-key aliasing bug
@@ -1268,6 +1274,7 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(rank, world_size, ckpt_base, cp_size
         pipeline_model_parallel_size=1,
         context_parallel_size=cp_size,
         gtp_remat_size=gtp_remat_size,
+        gtp_remat_fold_cp=fold_cp,
     )
     try:
         moe_cfg = dict(
@@ -1278,6 +1285,7 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(rank, world_size, ckpt_base, cp_size
             use_cpu_initialization=False,
             # conftest pins NVTE_FLASH_ATTN=0; AttnBackend.auto requires it unset or 1.
             attention_backend=AttnBackend.unfused,
+            gtp_remat_fold_cp=fold_cp,
         )
         meta = {'distrib_optim_sharding_type': 'dp_reshardable'}
         with TempNamedDir(ckpt_base / 'dp_reshardable_cp_gtp', sync=True) as ckpt_dir:
@@ -1308,8 +1316,8 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(rank, world_size, ckpt_base, cp_size
             # Only CP-folded GTP buffers are tagged; every other key stays unchanged.
             tagged = any('.cp_rank_' in key for key, _ in snapshot)
             assert tagged == (
-                cp_size > 1 and gtp_remat_size > 1
-            ), f"cp{cp_size} gtp{gtp_remat_size}: .cp_rank_ tag present={tagged}"
+                cp_size > 1 and fold_cp
+            ), f"cp{cp_size} gtp{gtp_remat_size} fold={fold_cp}: .cp_rank_ tag present={tagged}"
 
             save(optim_sd_A, ckpt_dir)
 
@@ -2308,17 +2316,22 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_vocab_embedding_wiring_no_gaps_under_cp(dist.get_rank(), 4, None)
 
-    def test_gtp_cp_sharded_save_load_roundtrip(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize("fold", [True, False], ids=["fold", "no_fold"])
+    def test_gtp_cp_sharded_save_load_roundtrip(self, tmp_path_dist_ckpt, fold):
         _require_world_size(4)
-        _worker_gtp_cp_sharded_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt)
+        _worker_gtp_cp_sharded_save_load_roundtrip(dist.get_rank(), 4, tmp_path_dist_ckpt, fold)
 
     @pytest.mark.parametrize(
-        "cp_size,gtp_remat_size", [(4, 1), (2, 2), (1, 4)], ids=["cp4", "cp2_gtp2", "gtp4"]
+        "cp_size,gtp_remat_size,fold_cp",
+        [(4, 1, False), (2, 2, False), (1, 4, False), (4, 1, True), (2, 2, True)],
+        ids=["cp4", "cp2_gtp2", "gtp4", "cp4_fold", "cp2_gtp2_fold"],
     )
-    def test_dp_reshardable_cp_gtp_roundtrip(self, tmp_path_dist_ckpt, cp_size, gtp_remat_size):
+    def test_dp_reshardable_cp_gtp_roundtrip(
+        self, tmp_path_dist_ckpt, cp_size, gtp_remat_size, fold_cp
+    ):
         _require_world_size(4)
         _worker_dp_reshardable_cp_gtp_roundtrip(
-            dist.get_rank(), 4, tmp_path_dist_ckpt, cp_size, gtp_remat_size
+            dist.get_rank(), 4, tmp_path_dist_ckpt, cp_size, gtp_remat_size, fold_cp
         )
 
     def test_public_wrapper_delegates(self):

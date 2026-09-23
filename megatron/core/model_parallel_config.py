@@ -75,6 +75,13 @@ class ModelParallelConfig:
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
     """
 
+    gtp_remat_fold_cp: bool = False
+    """Fold CP into the dense GTP weight-sharding group (group = cp x gtp_remat), at any
+       ``gtp_weight_remat_size`` including 1. Off: the group is the plain gtp_remat axis and CP
+       is reduced by the ordinary dp_cp bucket. No effect when CP is 1. Batch accounting is
+       unchanged either way.
+    """
+
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
@@ -499,6 +506,13 @@ class ModelParallelConfig:
        calling barrier with their timers will not result in hangs. This can happen if for example
        the user adds a level 1 timer that is not called by all ranks.
     """
+
+    @property
+    def dense_gtp_remat_active(self) -> bool:
+        """Whether dense weights are GTP-sharded (by GTP_remat, or by CP via gtp_remat_fold_cp)."""
+        return self.gtp_weight_remat_size > 1 or (
+            self.gtp_remat_fold_cp and self.context_parallel_size > 1
+        )
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

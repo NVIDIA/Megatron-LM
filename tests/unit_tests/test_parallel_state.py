@@ -57,10 +57,12 @@ def test_cp_more_local_than_gtp_remat_rank_layout():
     assert cp_stride < gtp_remat_stride
 
 
-def test_initialize_model_parallel_with_cp_and_gtp_remat():
+@pytest.mark.parametrize("fold", [True, False])
+def test_initialize_model_parallel_with_cp_and_gtp_remat(fold):
     """initialize_model_parallel(context_parallel_size>1, gtp_remat_size>1) together: the actual
     group-construction path (cp, gtp_remat, dp, dp-cp, gtp_remat-dp-cp, tp-gtp_remat-pp), not
-    just RankGenerator math in isolation.
+    just RankGenerator math in isolation. The weight group folds CP in only with
+    gtp_remat_fold_cp; every other group is identical either way.
     """
     Utils.destroy_model_parallel()
     actual_world_size = torch.cuda.device_count()
@@ -73,6 +75,7 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
         gtp_remat_size=gtp_remat_size,
+        gtp_remat_fold_cp=fold,
     )
 
     order = ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp')
@@ -91,10 +94,9 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
         raise AssertionError(f"rank {my_rank} not found in any '{token}' group")
 
     assert group_ranks(ps.get_context_parallel_group()) == expected_group('cp')
-    # The weight-sharding group FOLDS CP IN: a dense weight is cut into cp x gtp_remat shards,
-    # so every weight-sharding caller is CP-unaware by construction.
-    assert group_ranks(ps.get_gtp_weight_remat_group()) == expected_group('cp-gtp_remat')
-    assert ps.get_gtp_weight_remat_group().size() == cp_size * gtp_remat_size
+    # Folded: a dense weight is cut into cp x gtp_remat shards. Unfolded: plain gtp_remat axis.
+    weight_token = 'cp-gtp_remat' if fold else 'gtp_remat'
+    assert group_ranks(ps.get_gtp_weight_remat_group()) == expected_group(weight_token)
     # The CP-free axis survives only for the replicated-grad AVG, whose params already had CP
     # reduced by their ordinary dp_cp bucket.
     assert group_ranks(ps.get_gtp_weight_remat_group_no_cp()) == expected_group('gtp_remat')
@@ -107,6 +109,28 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat():
         ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=True)
     ) == expected_group('gtp_remat-dp-cp')
     assert group_ranks(ps.get_model_parallel_group()) == expected_group('tp-gtp_remat-pp')
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("fold", [True, False])
+def test_gtp_remat_fold_cp_at_gtp1(fold):
+    """gtp_remat_fold_cp at gtp_remat_size=1: the weight group becomes the CP group (knob on) or
+    stays a singleton (knob off); the CP-free degree stays 1 either way."""
+    Utils.destroy_model_parallel()
+    cp_size = 2
+    if torch.cuda.device_count() % cp_size != 0:
+        pytest.skip(f"Test requires world_size divisible by {cp_size}")
+    Utils.initialize_model_parallel(context_parallel_size=cp_size, gtp_remat_fold_cp=fold)
+
+    def group_ranks(group):
+        return sorted(torch.distributed.get_process_group_ranks(group))
+
+    cp_ranks = group_ranks(ps.get_context_parallel_group())
+    gtp_ranks = group_ranks(ps.get_gtp_weight_remat_group())
+    assert gtp_ranks == (cp_ranks if fold else [torch.distributed.get_rank()])
+    assert ps.get_gtp_weight_remat_size_no_cp() == 1
+    assert ps.get_gtp_weight_remat_group_no_cp().size() == 1
 
     Utils.destroy_model_parallel()
 

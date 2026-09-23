@@ -646,7 +646,7 @@ def finalize_model_grads(
         # gtp_remat peers' distinct tokens. Falls back to replicate dp_cp when gtp is inactive.
         dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
         # CP-FREE gtp_remat for the replicated-grad AVG below; NOT pg_collection.gtp_remat,
-        # which folds CP in and would double-count it.
+        # which may fold CP in and would then double-count it.
         gtp_remat_group = getattr(pg_collection, 'gtp_remat_no_cp', None)
         if gtp_remat_group is None:
             gtp_remat_group = parallel_state.get_gtp_weight_remat_group_no_cp(

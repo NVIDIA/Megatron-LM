@@ -85,7 +85,7 @@ class MultimodalProjector(MegatronModule):
             num_tokens = hidden_states.numel() // hidden_states.shape[-1]
             padding = (
                 alignment
-                if num_tokens == 0 and self.config.gtp_weight_remat_size > 1
+                if num_tokens == 0 and self.config.dense_gtp_remat_active
                 else (-num_tokens) % alignment
             )
             if padding:

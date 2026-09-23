@@ -70,7 +70,8 @@ _GTP_ONLY_WORLD_SIZES = [4, 8]
 _TP_GTP_SHAPES = [(2, 2), (2, 4), (4, 2)]
 # (cp_size, gtp_remat_size) for the CP + GTP shapes (TP1); world size is their product. CP is
 # folded into the weight-sharding group, so the weight is cut into cp*gtp_remat row shards.
-_CP_GTP_SHAPES = [(2, 2), (2, 4), (4, 2)]
+# (4, 1) needs gtp_remat_fold_cp (always on in _init_model_parallel_with_cp).
+_CP_GTP_SHAPES = [(2, 2), (2, 4), (4, 2), (4, 1)]
 
 
 def _make_muon(pg_collection, tp_mode="distributed"):
@@ -282,6 +283,11 @@ def _worker_padded_distributed_parity(
         local.pad_length = pad_length
 
         out = opt.scaled_orthogonalize_fn_with_gtp_remat(local, local, pgc.tp, partition_dim)
+        torch.testing.assert_close(out, expected, atol=_ATOL, rtol=_RTOL)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
 
 def _init_model_parallel_with_cp(cp_size, gtp_remat_size):
     ps.destroy_model_parallel()
@@ -290,6 +296,7 @@ def _init_model_parallel_with_cp(cp_size, gtp_remat_size):
         pipeline_model_parallel_size=1,
         context_parallel_size=cp_size,
         gtp_remat_size=gtp_remat_size,
+        gtp_remat_fold_cp=True,
     )
 
 
