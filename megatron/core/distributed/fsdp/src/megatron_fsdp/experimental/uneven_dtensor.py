@@ -54,8 +54,9 @@ _OPTIMIZER_STATE_KEY = "state"
 def _dbuffer_chunk_metadata(buffer: DBuffer, index: int) -> ChunkStorageMetadata:
     """Return the chunk of logical tensor ``index`` this rank holds in ``buffer``.
 
-    Flat placements shard the flat buffer, and every logical tensor is row-aligned within it, so a
-    rank always owns whole dim-0 rows and the chunk is a dim-0 range of the global tensor.
+    RowAtomic placements shard the flat buffer, and every logical tensor is row-aligned
+    within it, so a rank always owns whole dim-0 rows and the chunk is a dim-0 range of the
+    global tensor.
 
     Args:
         buffer: Buffer holding the logical tensor.
@@ -138,7 +139,7 @@ def attach_uneven_dtensor_metadata(
 
 def _build_chunk_metadata(row_offset: int, rows: int, shape: torch.Size) -> ChunkStorageMetadata:
     """Build chunk metadata for a dim-0 row range of a tensor of shape ``shape``."""
-    # Flat placements only shard dim 0, so every other dimension is fully owned from offset 0.
+    # RowAtomic placements only shard dim 0, so every other dimension is fully owned from offset 0.
     return ChunkStorageMetadata(
         offsets=(row_offset, *(0,) * (len(shape) - 1)), sizes=(rows, *shape[1:])
     )
