@@ -171,7 +171,9 @@ def initialize_runtime_services(args: Namespace, *, build_tokenizer: bool = True
 
     cfg = get_run_config()
     cfg.rng.resolve_cuda_graphs(
-        transformer_impl=args.transformer_impl, cuda_graph_impl=args.cuda_graph_impl, rank=args.rank
+        transformer_impl=getattr(args, "transformer_impl", "local"),
+        cuda_graph_impl=getattr(args, "cuda_graph_impl", "none"),
+        rank=args.rank,
     )
 
     if args.step_batch_size_schedule is not None:

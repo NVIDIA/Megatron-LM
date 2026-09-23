@@ -28,10 +28,7 @@ def isolated_globals(monkeypatch):
 
 
 def _runtime_args():
-    parser = ArgumentParser()
-    arguments.add_megatron_arguments(parser)
-    args = parser.parse_args([])
-    vars(args).update(
+    return Namespace(
         rank=0,
         global_batch_size=8,
         micro_batch_size=2,
@@ -46,7 +43,6 @@ def _runtime_args():
         exit_signal_handler_for_training=False,
         disable_jit_fuser=False,
     )
-    return args
 
 
 @pytest.mark.parametrize("experimental", [False, True])
@@ -76,12 +72,31 @@ def test_parse_only_prepares_args(monkeypatch, isolated_globals, experimental):
     services.assert_not_called()
 
 
-def test_args_only_bootstrap_registers_args_and_constructs_services(monkeypatch, isolated_globals):
+@pytest.mark.parametrize("aliases", [None, False, True])
+def test_args_only_bootstrap_registers_args_and_constructs_services(
+    monkeypatch, isolated_globals, aliases
+):
     args = _runtime_args()
+    # Sparse legacy namespaces must not acquire new checkpoint requirements.
+    if aliases is not None:
+        for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+            setattr(args, f"no_{name}", aliases)
+        args.ckpt_fully_parallel_save = aliases
+        args.ckpt_fully_parallel_load = aliases
+        args.profile = aliases
     initialize = Mock()
     monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
     global_vars.set_global_variables(args)
     assert global_vars.get_args() is args
+    cfg = global_vars.get_run_config()
+    assert cfg.model is None
+    assert cfg.checkpoint.save_optim is (not aliases)
+    assert cfg.checkpoint.save_rng is (not aliases)
+    assert cfg.checkpoint.load_optim is (not aliases)
+    assert cfg.checkpoint.load_rng is (not aliases)
+    assert cfg.checkpoint.fully_parallel_save is (True if aliases is None else aliases)
+    assert cfg.checkpoint.fully_parallel_load is bool(aliases)
+    assert cfg.profiling.use_nsys_profiler is bool(aliases)
     initialize.assert_called_once_with(args, build_tokenizer=True)
     with pytest.raises(AssertionError, match="already initialized"):
         global_vars.set_global_variables(args)
