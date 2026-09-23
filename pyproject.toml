@@ -92,7 +92,7 @@ mlm = [
 ]
 
 dev = [
-    "nvidia-modelopt[torch]>=0.44; sys_platform != 'darwin'",
+    "nvidia-modelopt[torch]>=0.47; sys_platform != 'darwin'",
     "nvidia-resiliency-ext==0.6.0",
     "tqdm",
     "einops~=0.8",
