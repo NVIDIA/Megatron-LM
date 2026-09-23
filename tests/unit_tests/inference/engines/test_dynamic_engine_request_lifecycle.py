@@ -23,6 +23,7 @@ REQUEST_FIELD_POLICY = {
     "inference_parameters": "checkpoint:drop-deprecated-alias / merge:drop",
     "prompt_tokens": "checkpoint:append-output / merge:first / wire:opt-in",
     "compact_prompt_tokens": "checkpoint:preserve / merge:first / wire:opt-in",
+    "media_tensors": "checkpoint:preserve / merge:first / wire:drop",
     "prompt_length": "checkpoint:reset / merge:reset / wire:derive",
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",
@@ -32,6 +33,7 @@ REQUEST_FIELD_POLICY = {
     "generated_segments": "checkpoint:drop / merge:drop-unsupported",
     "generated_sequence_lengths": "checkpoint:drop / merge:drop-unsupported",
     "generated_tokens": "checkpoint:reset / merge:concatenate",
+    "acceptance_step_lengths": "checkpoint:reset / merge:concatenate",
     "prompt_log_probs": "checkpoint:reset / merge:most-complete-original-prompt",
     "generated_log_probs": "checkpoint:reset / merge:concatenate",
     "prompt_top_n_logprobs": "checkpoint:reset / merge:most-complete-original-prompt",
@@ -50,12 +52,16 @@ REQUEST_FIELD_POLICY = {
     "enable_prefix_caching": "checkpoint:preserve / merge:first",
     "num_cached_tokens": "checkpoint:reset / merge:first-observation",
     "num_matched_prefix_blocks": "checkpoint:reset / merge:reset",
+    "mtp_private_suffix_start": "checkpoint:reset / merge:reset",
     "block_hash_salt": "checkpoint:preserve / merge:first",
     "precomputed_block_hashes": "checkpoint:recompute / merge:first",
     "disaggregated_params": "checkpoint:reset / merge:last",
     "ttft": "checkpoint:reset / merge:first-populated",
     "events": "checkpoint:new-segment / merge:concatenate",
     "event_add_engine": "checkpoint:preserve-original / merge:drop / wire:drop",
+    "offload_params": "checkpoint:share / merge:first / wire:drop",
+    "payload_offloaded": "checkpoint:reset / merge:reset / wire:set-by-serialize",
+    "payload_stage_metadata": "checkpoint:reset / merge:reset / wire:set-by-serialize",
 }
 
 SAMPLING_FIELD_POLICY = {
@@ -84,13 +90,15 @@ SAMPLING_FIELD_POLICY = {
 def test_checkpoint_field_policy_tables_are_exhaustive():
     request_fields = {field.name for field in fields(DynamicInferenceRequest)}
     sampling_fields = {field.name for field in fields(SamplingParams)}
-    assert request_fields == set(REQUEST_FIELD_POLICY), (
-        f"unclassified={sorted(request_fields - REQUEST_FIELD_POLICY)}, "
-        f"stale={sorted(REQUEST_FIELD_POLICY - request_fields)}"
+    classified_request_fields = set(REQUEST_FIELD_POLICY)
+    classified_sampling_fields = set(SAMPLING_FIELD_POLICY)
+    assert request_fields == classified_request_fields, (
+        f"unclassified={sorted(request_fields - classified_request_fields)}, "
+        f"stale={sorted(classified_request_fields - request_fields)}"
     )
-    assert sampling_fields == set(SAMPLING_FIELD_POLICY), (
-        f"unclassified={sorted(sampling_fields - SAMPLING_FIELD_POLICY)}, "
-        f"stale={sorted(SAMPLING_FIELD_POLICY - sampling_fields)}"
+    assert sampling_fields == classified_sampling_fields, (
+        f"unclassified={sorted(sampling_fields - classified_sampling_fields)}, "
+        f"stale={sorted(classified_sampling_fields - sampling_fields)}"
     )
 
 

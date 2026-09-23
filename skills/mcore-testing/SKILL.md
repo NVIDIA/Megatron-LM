@@ -216,6 +216,8 @@ decimals until they are regenerated from a CI run.
 
 ---
 
+Golden comparisons report absolute and relative errors; see [diagnostics](../../docs/developer/determinism/testing.md).
+
 ## Common Pitfalls
 
 | Problem | Cause | Fix |

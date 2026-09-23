@@ -68,6 +68,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.sequence_parallel = self.config.sequence_parallel
 
         self.inference_context = inference_context
+        configured_prompt_contract = getattr(
+            self.inference_context.config, "multimodal_prompt_config", None
+        )
+        if configured_prompt_contract is not None:
+            self.multimodal_prompt_config = configured_prompt_contract
 
         # Get the inference pg_collection from the config if it exists; otherwise the training
         # pg_collection might be used during RL
