@@ -146,18 +146,78 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             and self.mixer.supports_two_stage_attention()
         )
 
-    def _prepare_mixer_input(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
-        """Apply the layer's residual conversion and pre-mixer normalization."""
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
+    def _prepare_mixer_input(
+        self,
+        hidden_states: Tensor,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ) -> tuple[Tensor, Tensor, tuple[Tensor, ...] | None, ResidualStreamRecomputeContext | None]:
+        """Read the residual branch and apply its pre-mixer normalization."""
+
+        residual_connection = self._get_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
+        )
+        connection_state = None
+        if residual_connection is not None:
+            if recompute_context is None:
+                hidden_states, connection_state = apply_module(residual_connection)(
+                    hidden_states,
+                    operation="read",
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                    branch_input_dtype=self.config.params_dtype,
+                )
+            else:
+                hidden_states, connection_state = checkpoint_residual_read(
+                    residual_connection,
+                    hidden_states,
+                    recompute_context,
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                    branch_input_dtype=self.config.params_dtype,
+                )
+            residual = residual_connection.residual_stream(connection_state)
+        else:
+            residual = (
+                hidden_states.float() if self.config.fp32_residual_connection else hidden_states
+            )
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = apply_module(self.norm)(hidden_states)
-        return hidden_states, residual
+        if recompute_context is not None and not isinstance(self.norm, IdentityOp):
+            hidden_states = recompute_context.checkpoint(apply_module(self.norm), hidden_states)
+        else:
+            hidden_states = apply_module(self.norm)(hidden_states)
+        return hidden_states, residual, connection_state, recompute_context
 
-    def _apply_mixer_bda(self, mixer_out_with_bias, residual: Tensor) -> Tensor:
-        """Apply the layer's bias-dropout-add tail to a projected mixer output."""
+    def _apply_mixer_bda(
+        self,
+        mixer_out_with_bias,
+        residual: Tensor,
+        connection_state: tuple[Tensor, ...] | None = None,
+        recompute_context: ResidualStreamRecomputeContext | None = None,
+    ) -> Tensor:
+        """Write a connected mixer branch or apply the ordinary bias-dropout-add tail."""
+
+        residual_connection = self._get_residual_connection()
+        if residual_connection is not None:
+            if connection_state is None:
+                raise RuntimeError("Missing state for the Mamba residual connection.")
+            if recompute_context is not None and not recompute_context.is_block_end:
+                return checkpoint_residual_write(
+                    residual_connection,
+                    mixer_out_with_bias,
+                    connection_state,
+                    recompute_context,
+                    dropout_probability=self.hidden_dropout,
+                    training=self.training,
+                )
+            with self.bias_dropout_add_exec_handler():
+                return apply_module(residual_connection)(
+                    mixer_out_with_bias,
+                    operation="write",
+                    state=connection_state,
+                    dropout_probability=self.hidden_dropout,
+                    training=self.training,
+                )
+
         with self.bias_dropout_add_exec_handler():
             return self.mamba_bda(training=self.training, fused=self.config.bias_dropout_fusion)(
                 mixer_out_with_bias, residual, self.hidden_dropout
@@ -175,6 +235,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Run normalization, input projection, and the selective SSM/SSD.
 
@@ -193,26 +254,55 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         inference_context = deprecate_inference_params(inference_context, inference_params)
         assert inference_context is None, "Two-stage mixer execution does not support inference."
 
-        hidden_states, residual = self._prepare_mixer_input(hidden_states)
+        hidden_states, residual, connection_state, _ = self._prepare_mixer_input(
+            hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+        )
 
         ssm_output = self.mixer.forward_pre_attn_and_core_attn(
             hidden_states,
             packed_seq_params=packed_seq_params,
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
-        return ssm_output, residual
+        if connection_state is None:
+            return ssm_output, residual
+        return ssm_output, residual, connection_state
 
     def forward_post_core_attn(
         self,
         ssm_output: Tensor,
         residual: Tensor,
+        *positional_args,
         inference_context: Optional[BaseInferenceContext] = None,
         padding_mask: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
-        """Apply Mamba's output projection and the original residual/BDA operation."""
+        """Apply Mamba's output projection and residual-stream or ordinary BDA update."""
+
+        connection_state = None
+        if positional_args and isinstance(positional_args[0], tuple):
+            connection_state = positional_args[0]
+            positional_args = positional_args[1:]
+        if len(positional_args) > 2:
+            raise TypeError("Mamba post-core attention received too many positional arguments.")
+        if positional_args:
+            if inference_context is not None:
+                raise TypeError("Mamba post-core attention received inference_context twice.")
+            inference_context = positional_args[0]
+        if len(positional_args) == 2:
+            if padding_mask is not None:
+                raise TypeError("Mamba post-core attention received padding_mask twice.")
+            padding_mask = positional_args[1]
+
         del inference_context, padding_mask
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
-        return self._apply_mixer_bda(mixer_out_with_bias, residual)
+        recompute_context = (
+            residual_stream_recompute_context
+            if self._get_residual_connection() is not None
+            else None
+        )
+        return self._apply_mixer_bda(
+            mixer_out_with_bias, residual, connection_state, recompute_context=recompute_context
+        )
 
     def _get_residual_connection(self):
         """Return an optional architecture-owned connection around the Mamba mixer."""
@@ -262,43 +352,12 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
-            residual_connection = self._get_residual_connection()
-            recompute_context = (
-                residual_stream_recompute_context if residual_connection is not None else None
+            hidden_states, residual, connection_state, recompute_context = (
+                self._prepare_mixer_input(
+                    hidden_states,
+                    residual_stream_recompute_context=residual_stream_recompute_context,
+                )
             )
-            connection_state = None
-            if residual_connection is not None:
-                if recompute_context is None:
-                    hidden_states, connection_state = apply_module(residual_connection)(
-                        hidden_states,
-                        operation="read",
-                        fp32_residual_connection=self.config.fp32_residual_connection,
-                        branch_input_dtype=self.config.params_dtype,
-                    )
-                else:
-                    hidden_states, connection_state = checkpoint_residual_read(
-                        residual_connection,
-                        hidden_states,
-                        recompute_context,
-                        fp32_residual_connection=self.config.fp32_residual_connection,
-                        branch_input_dtype=self.config.params_dtype,
-                    )
-                residual = residual_connection.residual_stream(connection_state)
-            else:
-                residual = hidden_states
-
-            if residual_connection is None:
-                hidden_states, residual = self._prepare_mixer_input(hidden_states)
-            else:
-                # The residual connection requests this dtype from its read kernel, so this is
-                # normally an alias. Keep the guard for hooks and custom connection subclasses.
-                hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-                if recompute_context is not None and not isinstance(self.norm, IdentityOp):
-                    hidden_states = recompute_context.checkpoint(
-                        apply_module(self.norm), hidden_states
-                    )
-                else:
-                    hidden_states = apply_module(self.norm)(hidden_states)
 
             # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
@@ -318,29 +377,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                         packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                     )
 
-            if residual_connection is not None:
-                if connection_state is None:
-                    raise RuntimeError("Missing state for the Mamba residual connection.")
-                if recompute_context is not None and not recompute_context.is_block_end:
-                    hidden_states = checkpoint_residual_write(
-                        residual_connection,
-                        mixer_out_with_bias,
-                        connection_state,
-                        recompute_context,
-                        dropout_probability=self.hidden_dropout,
-                        training=self.training,
-                    )
-                else:
-                    with self.bias_dropout_add_exec_handler():
-                        hidden_states = apply_module(residual_connection)(
-                            mixer_out_with_bias,
-                            operation="write",
-                            state=connection_state,
-                            dropout_probability=self.hidden_dropout,
-                            training=self.training,
-                        )
-            else:
-                hidden_states = self._apply_mixer_bda(mixer_out_with_bias, residual)
+            hidden_states = self._apply_mixer_bda(
+                mixer_out_with_bias, residual, connection_state, recompute_context=recompute_context
+            )
 
             return hidden_states
 
