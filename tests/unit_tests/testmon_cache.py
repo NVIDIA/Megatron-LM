@@ -134,29 +134,36 @@ def _source_mapping(root: Path) -> dict[str, dict[str, list[str]]]:
         raise ValueError("expected a Testmon mapping document with a mappings list")
     mapping = {}
     for entry in document["mappings"]:
-        if not isinstance(entry, dict) or set(entry) != {"source_dir", "test_buckets"}:
-            raise ValueError("expected source_dir and test_buckets in each Testmon mapping")
-        source = entry["source_dir"]
+        if not isinstance(entry, dict) or set(entry) != {"source_dirs", "test_buckets"}:
+            raise ValueError("expected source_dirs and test_buckets in each Testmon mapping")
+        sources = entry["source_dirs"]
         platforms = entry["test_buckets"]
-        _validate_mapping_path(source)
-        if source == "." or any(character in source for character in "*?[]"):
-            raise ValueError(f"expected a source directory in Testmon mapping: {source!r}")
-        if source in mapping:
-            raise ValueError(f"duplicate Testmon source directory: {source!r}")
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("expected a nonempty source_dirs list in each Testmon mapping")
+        for source in sources:
+            _validate_mapping_path(source)
+            if source == "." or any(character in source for character in "*?[]"):
+                raise ValueError(f"expected a source directory in Testmon mapping: {source!r}")
         if not isinstance(platforms, dict) or not platforms:
-            raise ValueError(f"expected recipe platforms for mapped source: {source!r}")
+            raise ValueError(f"expected recipe platforms for mapped sources: {sources!r}")
         for recipe_platform, buckets in platforms.items():
             if recipe_platform not in RECIPE_PLATFORMS:
                 raise ValueError(f"unsupported mapped Testmon platform: {recipe_platform!r}")
             if not isinstance(buckets, list):
-                raise ValueError(f"expected unit-test buckets for mapped source: {source!r}")
+                raise ValueError(f"expected unit-test buckets for mapped sources: {sources!r}")
             for bucket in buckets:
                 if not isinstance(bucket, str):
                     raise ValueError(f"invalid mapped unit-test bucket: {bucket!r}")
                 _validate_mapping_path(bucket)
                 if not bucket.startswith("tests/unit_tests/") or not bucket.endswith(".py"):
                     raise ValueError(f"invalid mapped unit-test bucket: {bucket!r}")
-        mapping[source] = platforms
+        # Rules are additive: repeated sources keep every configured target.
+        for source in sources:
+            targets = mapping.setdefault(source, {})
+            for recipe_platform, buckets in platforms.items():
+                targets[recipe_platform] = sorted(
+                    set(targets.get(recipe_platform, [])) | set(buckets)
+                )
     return mapping
 
 

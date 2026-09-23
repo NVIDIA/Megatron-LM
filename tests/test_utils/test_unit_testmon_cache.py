@@ -91,8 +91,8 @@ def _snapshot(directory):
     }
 
 
-def _mapping_document(test_buckets, source=MAPPED_SOURCE):
-    return {"mappings": [{"source_dir": source, "test_buckets": test_buckets}]}
+def _mapping_document(test_buckets, sources=(MAPPED_SOURCE,)):
+    return {"mappings": [{"source_dirs": list(sources), "test_buckets": test_buckets}]}
 
 
 def test_source_edits_preserve_identity(source_tree):
@@ -113,12 +113,13 @@ def test_configured_source_mappings_target_existing_recipe_buckets():
         }
     assert document["mappings"]
     for mapping in document["mappings"]:
-        source = mapping["source_dir"]
+        sources = mapping["source_dirs"]
         platforms = mapping["test_buckets"]
-        assert (ROOT / source).is_dir(), source
-        assert set(platforms) <= recipe_buckets.keys(), source
+        for source in sources:
+            assert (ROOT / source).is_dir(), source
+        assert set(platforms) <= recipe_buckets.keys(), sources
         for platform, buckets in platforms.items():
-            assert set(buckets) <= recipe_buckets[platform], (source, platform)
+            assert set(buckets) <= recipe_buckets[platform], (sources, platform)
 
 
 def test_unchanged_mapped_sources_accept_the_recorded_baseline(source_tree, mapped_generation):
@@ -217,6 +218,54 @@ def test_gb200_source_mapping_can_be_enabled_explicitly(tmp_path, source_tree, m
         cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
 
 
+@pytest.mark.parametrize("changed_source", [0, 1], ids=["first-source", "second-source"])
+def test_each_source_change_invalidates_all_configured_platform_buckets(
+    tmp_path, source_tree, mapped_source, changed_source
+):
+    second_source = source_tree / "megatron/core/second_source"
+    second_source.mkdir()
+    (second_source / "hook.py").write_text("def second_hook():\n    return True\n")
+    sources = [MAPPED_SOURCE, str(second_source.relative_to(source_tree))]
+    platforms = {
+        "dgx_h100": [MAPPED_BUCKET, BUCKET],
+        "dgx_gb200": [
+            "tests/unit_tests/**/*.py",
+            "tests/unit_tests/generalized_tensor_parallel/**/*.py",
+        ],
+    }
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
+        yaml.safe_dump(_mapping_document(platforms, sources))
+    )
+    expected_paths = {
+        f"{MAPPED_SOURCE}/module.py",
+        f"{MAPPED_SOURCE}/nested/hooks.py",
+        f"{sources[1]}/hook.py",
+    }
+    baselines = []
+    for platform, buckets in platforms.items():
+        for bucket in buckets:
+            identity = cache.cache_identity(source_tree, bucket, platform, IMAGE_ID)
+            assert set(identity["compatibility"]["source_inputs"]) == expected_paths
+            directory = tmp_path / f"baseline-{len(baselines)}"
+            _create_generation(directory, identity)
+            baselines.append((platform, bucket, directory, identity))
+    unrelated_bucket = "tests/unit_tests/tensor_parallel/**/*.py"
+    unrelated_before = cache.cache_identity(source_tree, unrelated_bucket, "dgx_h100", IMAGE_ID)
+    changed_file = [mapped_source / "module.py", second_source / "hook.py"][changed_source]
+    changed_file.write_text("def changed_hook():\n    return False\n")
+    for platform, bucket, directory, producer in baselines:
+        consumer = cache.cache_identity(source_tree, bucket, platform, IMAGE_ID)
+        assert consumer["cache_prefix"] == producer["cache_prefix"]
+        before = _snapshot(directory)
+        with pytest.raises(ValueError, match="mapped source"):
+            cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+        assert _snapshot(directory) == before
+    assert (
+        cache.cache_identity(source_tree, unrelated_bucket, "dgx_h100", IMAGE_ID)
+        == unrelated_before
+    )
+
+
 def test_empty_platform_bucket_list_ignores_mapped_source_changes(source_tree, mapped_source):
     (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
         yaml.safe_dump(_mapping_document({"dgx_h100": []}))
@@ -282,8 +331,19 @@ def test_generated_files_do_not_invalidate_mapped_source_baseline(
         {"mappings": {}},
         {"mappings": [], "unexpected": True},
         {"mappings": [None]},
-        {"mappings": [{"source_dir": MAPPED_SOURCE}]},
-        {"mappings": [{"source_dir": MAPPED_SOURCE, "test_buckets": {}, "unexpected": True}]},
+        {"mappings": [{"source_dirs": [MAPPED_SOURCE]}]},
+        {"mappings": [{"source_dirs": [MAPPED_SOURCE], "test_buckets": {}, "unexpected": True}]},
+        {
+            "mappings": [
+                {"source_dir": MAPPED_SOURCE, "test_buckets": {"dgx_h100": [MAPPED_BUCKET]}}
+            ]
+        },
+        {
+            "mappings": [
+                {"source_dirs": MAPPED_SOURCE, "test_buckets": {"dgx_h100": [MAPPED_BUCKET]}}
+            ]
+        },
+        {"mappings": [{"source_dirs": None, "test_buckets": {"dgx_h100": [MAPPED_BUCKET]}}]},
         _mapping_document([]),
         _mapping_document(None),
         _mapping_document({}),
@@ -292,13 +352,15 @@ def test_generated_files_do_not_invalidate_mapped_source_baseline(
         _mapping_document({"dgx_h100": MAPPED_BUCKET}),
         _mapping_document({"dgx_h100": [None]}),
         _mapping_document({"dgx_h100": ["outside/tests.py"]}),
-        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source=None),
-        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="/absolute/source"),
-        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="../outside"),
-        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="source/../outside"),
-        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="./source"),
-        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="source//nested"),
-        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="source/**/*.py"),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=[]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=[None]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=[MAPPED_SOURCE, 1]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=["/absolute/source"]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=["../outside"]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=["source/../outside"]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=["./source"]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=["source//nested"]),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, sources=["source/**/*.py"]),
     ],
 )
 def test_invalid_source_mapping_rejects_identity(source_tree, mapping):
@@ -317,14 +379,58 @@ def test_invalid_or_unsafe_yaml_rejects_identity(source_tree, mapping):
         cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
 
 
-def test_duplicate_source_directory_rejects_identity(source_tree):
-    document = _mapping_document({"dgx_h100": [MAPPED_BUCKET]})
-    document["mappings"].append(
-        {"source_dir": MAPPED_SOURCE, "test_buckets": {"dgx_gb200": ["tests/unit_tests/**/*.py"]}}
+def test_repeated_sources_merge_targets_without_duplicates_or_cross_source_leaks(
+    source_tree, mapped_source
+):
+    second_source = source_tree / "megatron/core/second_source"
+    second_source.mkdir()
+    (second_source / "hook.py").write_text("def second_hook():\n    return True\n")
+    second_source_name = str(second_source.relative_to(source_tree))
+    gb200_bucket = "tests/unit_tests/**/*.py"
+    document = _mapping_document(
+        {"dgx_h100": [MAPPED_BUCKET, MAPPED_BUCKET]},
+        sources=[MAPPED_SOURCE, second_source_name, MAPPED_SOURCE],
+    )
+    document["mappings"].extend(
+        [
+            _mapping_document(
+                {"dgx_h100": [BUCKET, MAPPED_BUCKET], "dgx_gb200": [gb200_bucket, gb200_bucket]}
+            )["mappings"][0],
+            _mapping_document({"dgx_h100": []})["mappings"][0],
+        ]
     )
     (source_tree / cache.SOURCE_MAPPING_FILE).write_text(yaml.safe_dump(document))
-    with pytest.raises(ValueError):
-        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    mapping = cache._source_mapping(source_tree)
+    assert set(mapping) == {MAPPED_SOURCE, second_source_name}
+    assert set(mapping[MAPPED_SOURCE]["dgx_h100"]) == {MAPPED_BUCKET, BUCKET}
+    assert len(mapping[MAPPED_SOURCE]["dgx_h100"]) == 2
+    assert mapping[MAPPED_SOURCE]["dgx_gb200"] == [gb200_bucket]
+    assert mapping[second_source_name] == {"dgx_h100": [MAPPED_BUCKET]}
+    targets = [("dgx_h100", MAPPED_BUCKET), ("dgx_h100", BUCKET), ("dgx_gb200", gb200_bucket)]
+    before = {
+        target: cache.cache_identity(source_tree, target[1], target[0], IMAGE_ID)
+        for target in targets
+    }
+    first_source_paths = {f"{MAPPED_SOURCE}/module.py", f"{MAPPED_SOURCE}/nested/hooks.py"}
+    assert set(before[targets[0]]["compatibility"]["source_inputs"]) == first_source_paths | {
+        f"{second_source_name}/hook.py"
+    }
+    for target in targets[1:]:
+        assert set(before[target]["compatibility"]["source_inputs"]) == first_source_paths
+    (second_source / "hook.py").write_text("def second_hook():\n    return False\n")
+    after_second = {
+        target: cache.cache_identity(source_tree, target[1], target[0], IMAGE_ID)
+        for target in targets
+    }
+    assert after_second[targets[0]] != before[targets[0]]
+    for target in targets[1:]:
+        assert after_second[target] == before[target]
+    (mapped_source / "module.py").write_text("def first_hook():\n    return False\n")
+    for platform, bucket in targets:
+        assert (
+            cache.cache_identity(source_tree, bucket, platform, IMAGE_ID)
+            != after_second[(platform, bucket)]
+        )
 
 
 def test_missing_yaml_dependency_rejects_identity(source_tree, monkeypatch):

@@ -7,7 +7,8 @@ CUDA autograd callbacks:
 
 ```yaml
 mappings:
-  - source_dir: megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
+  - source_dirs:
+      - megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
     test_buckets:
       dgx_h100:
         - tests/unit_tests/distributed/mfsdp_v2/**/*.py
@@ -15,19 +16,44 @@ mappings:
 
 | Key | Meaning |
 | --- | --- |
-| `mappings` | List of source-directory rules. Use `[]` to configure no overrides. |
-| `source_dir` | Repository-relative source directory to watch recursively, without wildcards or a trailing slash. |
-| `test_buckets` | Hardware platforms and their buckets to run fully when the source directory changes. |
+| `mappings` | List of rules. Add multiple entries for independent groups; use `[]` to configure no overrides. |
+| `source_dirs` | Nonempty list of repository-relative source directories to watch recursively, without wildcards or trailing slashes. |
+| `test_buckets` | Hardware platforms and their buckets to run fully when **any** listed source directory changes. Multiple platform keys are supported. |
 | `dgx_h100` / `dgx_gb200` | Optional platform keys; each value is a list of exact `test_case` bucket names from that platform's unit-test recipe. |
 
-Add another list entry for a new source directory, or add more buckets under a
-platform. A directory can require multiple buckets, and a bucket can depend on
-multiple directories. Each source directory must have a single entry.
+Every rule can list multiple source directories, multiple hardware platforms,
+and multiple buckets per platform. A change in **any** listed directory forces
+**all** that rule's configured buckets on their respective platforms. Separate
+rules are additive: if a source appears in several rules, its targets are merged.
+Repeated source paths or bucket names do not create duplicate test executions.
+An empty list does not cancel a target added by another rule.
 
 The example overrides only H100's MFSDP v2 bucket. GB200 is omitted, so its jobs
 keep their normal Testmon selection. Omitted platforms and empty bucket lists
 do not create an override or select a broader bucket automatically. This also
 means the mapping does not protect GB200 against missing trace dependencies.
+
+For illustration, a separate rule could group several source directories and
+test buckets as follows. This rule is not enabled by the example configuration:
+
+```yaml
+mappings:
+  - source_dirs:
+      - megatron/core/transformer
+      - megatron/core/tensor_parallel
+    test_buckets:
+      dgx_h100:
+        - tests/unit_tests/transformer/**/*.py
+        - tests/unit_tests/models/**/*.py
+      dgx_gb200:
+        - tests/unit_tests/**/*.py
+        - tests/unit_tests/generalized_tensor_parallel/**/*.py
+  - source_dirs:
+      - megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
+    test_buckets:
+      dgx_h100:
+        - tests/unit_tests/distributed/mfsdp_v2/**/*.py
+```
 
 The shared baseline records paths and content hashes for each bucket's mapped
 source files, including subdirectories. An added, modified, deleted, or renamed
