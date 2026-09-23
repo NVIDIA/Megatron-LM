@@ -701,6 +701,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
+        name="dsa_tilelang_absorbed_shape_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",),
+        tests=(K + "test_dsa_tilelang_shapes.py",),
+        kind="dispatch",
+        notes="SparseMLA forward replay with NoPE channel padding and invalid top-k slot padding. "
+        "Backward atomic accumulation remains covered by the DSA family exemption below; "
+        "output and gradient parity are checked in test_dsa_tilelang_shapes under transformer/.",
+    ),
+    KernelEntry(
         name="dsa_tilelang_kernels",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/ops/indexer.py",
