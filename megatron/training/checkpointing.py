@@ -1667,6 +1667,8 @@ def checkpoint_args_snapshot(args: Namespace) -> Namespace:
     Never update live args or retain mutable config fields in an async save.
     """
     cfg = get_run_config()
+    # Temporary duplication for legacy checkpoint readers during the training-loop
+    # refactor: cfg.profiling is authoritative; only this detached args copy is updated.
     snapshot = copy.copy(args)
     for config_field in dataclasses.fields(cfg.profiling):
         name = "profile" if config_field.name == "use_nsys_profiler" else config_field.name

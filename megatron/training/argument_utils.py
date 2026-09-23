@@ -624,6 +624,8 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
     from copy import deepcopy
 
+    # Legacy args retain these fields temporarily during the training-loop refactor;
+    # ProfilingConfig is authoritative after construction.
     kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
     if hasattr(args, "profile"):
         kwargs["use_nsys_profiler"] = args.profile

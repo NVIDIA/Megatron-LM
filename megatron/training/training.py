@@ -1647,6 +1647,8 @@ def pretrain(
 
     timestamp_after_initialize_megatron = time.time()
 
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
     set_run_config(cfg_container)
     timers = get_timers()
@@ -2867,6 +2869,8 @@ def setup_model_and_optimizer(
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
@@ -3637,6 +3641,8 @@ def training_log(
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
     cfg = get_run_config()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -4390,6 +4396,8 @@ def post_training_step_callbacks(
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
     cfg = get_run_config()
 
     # Bring CPU and GPU back in sync if on right iteration.
@@ -4601,6 +4609,8 @@ def train(
     """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
     cfg = get_run_config()
     timers = get_timers()
 

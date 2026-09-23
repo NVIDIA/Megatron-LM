@@ -105,6 +105,8 @@ def main():
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()
@@ -112,6 +114,8 @@ def main():
     args = get_args()
 
     # Match the legacy tool's NVTX gating.
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
     cfg = get_run_config()
     if cfg.profiling.use_nsys_profiler and cfg.profiling.nvtx_ranges:
         configure_nvtx_profiling(True)

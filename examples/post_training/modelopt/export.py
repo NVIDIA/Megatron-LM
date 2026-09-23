@@ -67,6 +67,8 @@ if __name__ == "__main__":
             'no_load_optim': True,
         },
     )
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()

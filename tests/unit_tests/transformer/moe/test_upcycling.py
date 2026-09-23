@@ -135,6 +135,8 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
 
     validate_args(args)
     set_global_variables(args, False)
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
     set_run_config(pretrain_cfg_container_from_args(args))
     return args
 

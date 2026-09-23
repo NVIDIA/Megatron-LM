@@ -140,6 +140,8 @@ class MegatronCheckpointLoaderBase:
             self.queue.put("exit")
             sys.exit(1)
 
+        # Temporary args/config duplication during the training-loop refactor:
+        # profiling is config-owned; unmigrated consumers still use legacy args.
         set_run_config(inference_cfg_container_from_args(self.margs, build_model_config=False))
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
         mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
