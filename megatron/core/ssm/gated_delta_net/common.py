@@ -593,6 +593,32 @@ class _GDNBase(MegatronModule):
 
         return sharded_state_dict
 
+    def _projections_reading_hidden_states(self) -> list[nn.Module]:
+        """Linear projections whose input is the layer's hidden states.
+
+        These modules consume the input-layernorm output directly; variants with additional
+        projections (KDA) extend the list.
+        """
+        return [self.in_proj]
+
+    def set_for_recompute_input_layernorm(self) -> None:
+        """Prepare the layer for recomputing the input layernorm (needed under FP8/FP4).
+
+        With "layernorm" in ``recompute_modules`` the TransformerLayer discards the
+        input-layernorm output after the forward and recomputes it in the backward. Under
+        FP8/FP4 the Transformer Engine linears would otherwise keep their own quantized copy of
+        that output, so every projection that reads the hidden states is told to save its
+        original input instead (mirrors ``SelfAttention.set_for_recompute_input_layernorm``).
+        Projections that fuse the normalization themselves (a TE LayerNormLinear in_proj, the
+        default for GatedDeltaNet) read the residual stream rather than a separate layernorm
+        output and have no ``save_original_input`` switch; they are left alone.
+        """
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        for module in self._projections_reading_hidden_states():
+            if hasattr(module, "save_original_input"):
+                set_save_original_input(module)
+
     def backward_dw(self):
         """Execute weight gradient computation for all linear layers."""
         self._backward_in_proj()

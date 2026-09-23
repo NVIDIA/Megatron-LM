@@ -878,6 +878,21 @@ class KimiDeltaAttention(_GDNBase):
                 f"{tuple(cu_seqlens_kv.shape)}."
             )
 
+    def _projections_reading_hidden_states(self) -> list[torch.nn.Module]:
+        """in_proj plus the separate f / gate / beta projections that also read hidden states.
+
+        f_b_proj and g_b_proj consume the low-rank latents, not the hidden states. Under
+        sequence parallelism beta_proj reads an all-gathered copy of the hidden states rather
+        than the layernorm output itself, so saving its original input would only cost memory.
+        """
+        modules = super()._projections_reading_hidden_states()
+        if not self.use_legacy_fused_projections:
+            modules.append(self.f_proj if self.config.kda_f_lora_rank is None else self.f_a_proj)
+            modules.append(self.g_proj if self.config.kda_gate_lora_rank is None else self.g_a_proj)
+        if not self.config.sequence_parallel:
+            modules.append(self.beta_proj)
+        return modules
+
     def backward_dw(self) -> None:
         """Execute weight-gradient computation for all KDA projections."""
 

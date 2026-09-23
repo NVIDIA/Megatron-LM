@@ -18,6 +18,7 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -192,6 +193,12 @@ def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
             gated_linear_unit=True,
         )
         kda = _build_kda(config)
+        kda.set_for_recompute_input_layernorm()
+        # Only projections consuming the input-layernorm output must retain that input.
+        direct_inputs = {"in_proj", "beta_proj", "f_proj", "f_a_proj", "g_proj", "g_a_proj"}
+        for name, module in kda.named_children():
+            if name.endswith("_proj"):
+                assert module.save_original_input == (name in direct_inputs), name
         assert kda.act_fn is F.silu
         assert kda.activation == "silu"
         legacy_fused = f_lora_rank is None and gate_lora_rank is None
@@ -281,6 +288,31 @@ def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
         for name, parameter in kda.named_parameters():
             if parameter.grad is not None:
                 assert torch.isfinite(parameter.grad).all(), f"non-finite gradient in {name}"
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+def test_kda_input_layernorm_recompute_fp8_sequence_parallel():
+    Utils.initialize_model_parallel(2, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = replace(
+            _make_config(tp_size=2, sequence_parallel=True, f_lora_rank=16, gate_lora_rank=16),
+            fp8="e4m3",
+            fp8_recipe="tensorwise",
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
+        )
+        layer = TransformerLayer(config, hybrid_stack_spec.submodules.kda_layer.submodules)
+        assert layer.recompute_input_layernorm
+        kda = layer.self_attention
+        assert kda.in_proj.save_original_input
+        assert kda.f_a_proj.save_original_input
+        assert kda.g_a_proj.save_original_input
+        # SP beta consumes an all-gathered copy, not the discarded layernorm output.
+        assert not kda.beta_proj.save_original_input
     finally:
         Utils.destroy_model_parallel()
 
