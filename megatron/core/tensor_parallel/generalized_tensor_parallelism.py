@@ -503,18 +503,31 @@ def update_gtp_config(**kwargs):
         setattr(GTP_CONFIG, key, value)
 
 
+def _num_microbatches_can_change() -> bool:
+    """True when num_microbatches can change mid-run (--step-batch-size-schedule)."""
+    # Lazy: a module-scope import here can silently flip HAVE_GTP to False.
+    from megatron.core import num_microbatches_calculator as nmb
+
+    calc = nmb._GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    # Never initialized (unit tests): nothing can vary it.
+    return calc is not None and not isinstance(calc, nmb.ConstantNumMicroBatchesCalculator)
+
+
 def tag_gtp_params_with_names(model):
     """Populate _debug_name on every GTPShardedParam with its full dotted parameter name.
 
     Call once after model construction so the linking log prints human-readable names
     instead of raw tensor ids.
     """
+    # Off under a stepped batch schedule: a rising consume count double-fires grad-ready and
+    # drops a contribution (see _is_last_expected_consume).
+    accum_ok = not _num_microbatches_can_change()
     for name, param in model.named_parameters():
         if is_gtp_param(param):
             param._debug_name = name
             # output_layer ONLY: the one GTP weight taking several backwards that also runs
             # mcore's linear backward. TE-backed weights never consume the flag.
-            param._wgrad_accum_enabled = name.endswith("output_layer.weight")
+            param._wgrad_accum_enabled = accum_ok and name.endswith("output_layer.weight")
 
 
 def configure_gtp_remat_from_recipe(
@@ -2395,8 +2408,8 @@ class GTPShardedParam(torch.nn.Parameter):
         '==', not '>=': _consumes resets only at the fence, so >= would re-fire on every later
         consume -- one RS each, and DDP's golden grad-ready count breaks.
 
-        KNOWN LIMITATION: an iteration whose count INCREASES (--rampup-batch-size) fires
-        grad-ready twice and drops its last consume from that iteration's gradient.
+        A rising count would fire grad-ready twice and drop that iteration's last consume, so
+        tag_gtp_params_with_names leaves the feature off under --step-batch-size-schedule.
         """
         return self._wgrad_accum_consumes == self._wgrad_accum_expected
 
