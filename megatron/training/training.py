@@ -457,6 +457,25 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
     return attended / (mean_seqlen / 2)
 
 
+def _logit_flops_per_token(hidden_size, vocab_size, mtp_num_layers=0, mtp_detach_heads=False):
+    """Return training FLOPs per token for the final and MTP logit projections.
+
+    The final language-model head always participates in forward, dgrad, and
+    wgrad. MTP draft heads do the same by default, but ``mtp_detach_heads``
+    detaches their shared output weight and therefore removes only wgrad; the
+    draft hidden states still require dgrad for the MTP layer parameters.
+    """
+    fma_expansion_factor = 2
+    final_head_passes = 3
+    draft_head_passes = 2 if mtp_detach_heads else 3
+    return (
+        fma_expansion_factor
+        * hidden_size
+        * vocab_size
+        * (final_head_passes + mtp_num_layers * draft_head_passes)
+    )
+
+
 def _dsa_indexer_flops(
     *,
     hidden_size,
@@ -1374,6 +1393,7 @@ def num_floating_point_operations(
         kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
+        mtp_detach_heads=False,
         q_lora_rank=None,
         kv_lora_rank=0,
         qk_head_dim=0,
@@ -1496,9 +1516,13 @@ def num_floating_point_operations(
             +
             # MTP norms (eh_norm + final_norm) and eh projection (2 * h^2).
             2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
-            + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
-        return flops_fwd * 3
+        return flops_fwd * 3 + total_tokens * _logit_flops_per_token(
+            hidden_size,
+            vocab_size,
+            mtp_num_layers=mtp_num_layers,
+            mtp_detach_heads=mtp_detach_heads,
+        )
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1922,11 +1946,12 @@ def num_floating_point_operations(
                     + 2 * args.hidden_size * args.hidden_size
                 )
                 # Logit.
-                + forward_backward_expansion_factor
-                * fma_expansion_factor
-                * args.hidden_size
-                * args.padded_vocab_size
-                * (mtp_num_layers + 1)  # MTP + final logit
+                + _logit_flops_per_token(
+                    args.hidden_size,
+                    args.padded_vocab_size,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_detach_heads=getattr(args, "mtp_detach_heads", False),
+                )
             )
             # Self Attention (core L^2 part). For BSHD the default
             # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
@@ -2041,6 +2066,7 @@ def num_floating_point_operations(
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            mtp_detach_heads=getattr(args, "mtp_detach_heads", False),
             q_lora_rank=args.q_lora_rank,
             kv_lora_rank=args.kv_lora_rank,
             qk_head_dim=args.qk_head_dim,
