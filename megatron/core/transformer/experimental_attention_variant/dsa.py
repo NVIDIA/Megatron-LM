@@ -397,9 +397,20 @@ class DSAIndexerLossLoggingHelper:
                 torch.distributed.all_reduce(
                     values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
                 )
+            # Sum over every rank holding a distinct micro-batch, then divide once. gtp_remat
+            # ranks each carry their own, so they are a second data dimension beside dp. CP is
+            # excluded on purpose: the loss is already summed across it before it gets here.
+            contributing_ranks = pg_collection.dp.size()
             torch.distributed.all_reduce(
-                values, group=pg_collection.dp, op=torch.distributed.ReduceOp.AVG
+                values, group=pg_collection.dp, op=torch.distributed.ReduceOp.SUM
             )
+            gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
+            if gtp_remat_group is not None and gtp_remat_group.size() > 1:
+                torch.distributed.all_reduce(
+                    values, group=gtp_remat_group, op=torch.distributed.ReduceOp.SUM
+                )
+                contributing_ranks *= gtp_remat_group.size()
+            values /= contributing_ranks
 
     @staticmethod
     def track_indexer_metrics(
