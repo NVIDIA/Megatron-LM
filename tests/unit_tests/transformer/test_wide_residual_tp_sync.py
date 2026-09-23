@@ -11,7 +11,8 @@ from megatron.core import parallel_state
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 from tests.unit_tests.test_utilities import Utils
 

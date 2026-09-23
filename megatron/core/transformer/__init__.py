@@ -2,9 +2,10 @@
 
 from .module import MegatronModule
 from .spec_utils import ModuleSpec, build_module
-from .transformer_config import MLATransformerConfig, TransformerConfig, WideResidualConfig
+from .transformer_config import MLATransformerConfig, TransformerConfig
 from .transformer_layer import (
     HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
 )
+from .wide_residual_config import WideResidualConfig

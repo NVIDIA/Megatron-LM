@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.transformer.wide_residual_layer import (
     LearnedWideResidualRetention,
     StreamwiseSigmoidMap,
