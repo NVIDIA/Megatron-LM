@@ -6008,9 +6008,17 @@ def train(
                 with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
                     params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
             if grad_norm is not None and iteration % args.tensorboard_log_interval == 0:
-                indexer_grad_norm, non_indexer_grad_norm = calc_dsa_split_grad_norms(
-                    model, optimizer
+                split_grad_norms = (
+                    optimizer.get_last_dsa_split_grad_norms()
+                    if hasattr(optimizer, "get_last_dsa_split_grad_norms")
+                    else None
                 )
+                if split_grad_norms is not None:
+                    indexer_grad_norm, non_indexer_grad_norm = split_grad_norms
+                else:
+                    indexer_grad_norm, non_indexer_grad_norm = calc_dsa_split_grad_norms(
+                        model, optimizer
+                    )
                 indexer_grad_norm = reduce_max_stat_across_model_parallel_group(indexer_grad_norm)
                 non_indexer_grad_norm = reduce_max_stat_across_model_parallel_group(
                     non_indexer_grad_norm
@@ -6068,59 +6076,6 @@ def train(
                 _octx.detach(_report_token)
                 _report_span.end()
 
-        if args.log_params_norm:
-            params_norm = calc_params_l2_norm(model)
-        writer = get_tensorboard_writer()
-        wandb_writer = get_wandb_writer()
-        if grad_norm is not None and iteration % args.tensorboard_log_interval == 0:
-            split_grad_norms = (
-                optimizer.get_last_dsa_split_grad_norms()
-                if hasattr(optimizer, "get_last_dsa_split_grad_norms")
-                else None
-            )
-            if split_grad_norms is not None:
-                indexer_grad_norm, non_indexer_grad_norm = split_grad_norms
-            else:
-                indexer_grad_norm, non_indexer_grad_norm = calc_dsa_split_grad_norms(
-                    model, optimizer
-                )
-            indexer_grad_norm = reduce_max_stat_across_model_parallel_group(indexer_grad_norm)
-            non_indexer_grad_norm = reduce_max_stat_across_model_parallel_group(
-                non_indexer_grad_norm
-            )
-        if num_zeros_in_grad is not None and iteration % args.tensorboard_log_interval == 0:
-            (
-                indexer_num_zeros_in_grad,
-                non_indexer_num_zeros_in_grad,
-            ) = calc_dsa_split_grad_num_zeros(model, optimizer)
-            indexer_num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
-                indexer_num_zeros_in_grad
-            )
-            non_indexer_num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
-                non_indexer_num_zeros_in_grad
-            )
-        learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
-        indexer_learning_rate = get_indexer_lr_for_logging(optimizer.param_groups)
-        report_memory_flag = training_log(
-            loss_dict,
-            total_loss_dict,
-            learning_rate,
-            indexer_learning_rate,
-            iteration,
-            loss_scale,
-            report_memory_flag,
-            skipped_iter,
-            grad_norm,
-            non_indexer_grad_norm,
-            indexer_grad_norm,
-            params_norm,
-            num_zeros_in_grad,
-            non_indexer_num_zeros_in_grad,
-            indexer_num_zeros_in_grad,
-            max_attention_logit,
-            pg_collection=model_pg_collection,
-            is_first_iteration=is_first_iteration,
-        )
         is_first_iteration = False
 
         # Evaluation.
