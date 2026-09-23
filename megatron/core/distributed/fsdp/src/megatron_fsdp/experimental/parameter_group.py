@@ -474,8 +474,8 @@ class FsdpParameterGroup:
         accumulating each backward through the standard zero_grad contract; the
         last microbatch reduces the DP-outer axes, finalizing main_grad to
         main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
-        to Flat for HFSDP) so ``.grad`` is the fully reduced gradient before
-        ``optimizer.step()``. With every axis Flat (plain DP) main_grad already
+        to RowAtomic for HFSDP) so ``.grad`` is the fully reduced gradient before
+        ``optimizer.step()``. With every axis RowAtomic (plain DP) main_grad already
         rests finalized.
         """
         assert self.main_grad is not None
