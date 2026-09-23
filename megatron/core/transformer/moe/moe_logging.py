@@ -44,6 +44,9 @@ class MetricEntry:
 # Module-level global tracker (follows parallel_state / global_vars pattern)
 # ---------------------------------------------------------------------------
 _MOE_METRICS_TRACKER: Optional['MoEMetricsTracker'] = None
+_LOAD_BALANCING_LOSSES = frozenset(
+    ("load_balancing_loss", "seq_load_balancing_loss", "global_load_balancing_loss")
+)
 
 
 def get_moe_metrics_tracker() -> 'MoEMetricsTracker':
@@ -137,11 +140,13 @@ class MoEMetricsTracker:
         force_initialize: bool = False,
         track_names: Optional[Union[str, List[str]]] = None,
         num_layers: Optional[int] = None,
+        num_moe_layers: Optional[int] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
         total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
         percentiles: Optional[Dict[str, List[float]]] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        num_hash_layers: int = 0,
     ) -> str:
         """Sync metrics across ranks, aggregate, log, and clear.
 
@@ -161,6 +166,8 @@ class MoEMetricsTracker:
                 whose tensor sizes must match ranks that do have MoE layers.
             track_names: Metric name(s) to report.  ``None`` reports all.
             num_layers: Total transformer layers (required when *force_initialize*).
+            num_moe_layers: Number of MoE aux-loss contributors to average over.
+                When set, this overrides ``moe_layer_freq`` and ``mtp_num_layers``.
             moe_layer_freq: MoE layer frequency or binary pattern list.
             mtp_num_layers: Extra layers from Multi-Token Prediction.
             total_loss_dict: Megatron training-loop accumulator.  Metrics
@@ -169,26 +176,39 @@ class MoEMetricsTracker:
             percentiles: Per-metric percentiles to compute, e.g.
                 ``{"load_imbalance": [0.5, 0.95]}``.
             pg_collection: Custom process-group collection for reduction.
+            num_hash_layers: Main-stack MoE layers using hash routing. These do not
+                contribute load-balancing losses; MTP layers remain learned routers.
 
         Returns:
             Formatted log string for console output.
         """
         metric_names = self._resolve_names(track_names)
 
+        if force_initialize and num_layers is None:
+            raise ValueError("num_layers must be provided when force_initialize=True.")
+        if num_moe_layers is None:
+            num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
+        if num_moe_layers <= 0:
+            raise ValueError("MoE metrics require at least one MoE layer.")
+        if not 0 <= num_hash_layers <= num_moe_layers:
+            raise ValueError("num_hash_layers must be between zero and num_moe_layers.")
+        if num_hash_layers == num_moe_layers:
+            # These losses are not applicable when there are no learned MoE contributors.
+            metric_names = [name for name in metric_names if name not in _LOAD_BALANCING_LOSSES]
+
         # Pre-create entries on PP ranks that lack MoE layers.
         # Tensor size must be (num_layers + mtp_num_layers) to match ranks that
         # recorded via record(), otherwise all_reduce across PP will hang.
         if force_initialize:
-            if num_layers is None:
-                raise ValueError("num_layers must be provided when force_initialize=True.")
             init_size = num_layers + (mtp_num_layers or 0)
             for name in metric_names:
                 self.ensure_initialized(name, init_size)
 
         self._sync_metrics(metric_names, pg_collection)
 
-        num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
-        scalars = self._aggregate(loss_scale, num_moe_layers, metric_names, percentiles)
+        scalars = self._aggregate(
+            loss_scale, num_moe_layers, metric_names, percentiles, num_hash_layers
+        )
 
         # Megatron integration: accumulate loss metrics into total_loss_dict
         console_scalars = dict(scalars)
@@ -255,12 +275,17 @@ class MoEMetricsTracker:
         """
         if pg_collection is None:
             pp_group = parallel_state.get_pipeline_model_parallel_group()
+            dp_group = None
+        else:
+            pp_group = pg_collection.pp
+            dp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None)
+        # The metric DP-average must span gtp_remat peers (they hold distinct tokens), else the
+        # displayed value is a 1/gtp_remat subsample and looks noisy. Use the gtp_remat-inclusive
+        # group; CP ranks (already summed in reduce_group) average as a no-op.
+        if dp_group is None:
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
             )
-        else:
-            pp_group = pg_collection.pp
-            dp_group = pg_collection.dp
 
         for name in metric_names:
             if name not in self._metrics:
@@ -310,10 +335,12 @@ class MoEMetricsTracker:
         num_moe_layers: int,
         metric_names: List[str],
         percentiles: Optional[Dict[str, List[float]]] = None,
+        num_hash_layers: int = 0,
     ) -> Dict[str, Union[float, torch.Tensor]]:
         """Aggregate per-layer values into scalar summaries.
 
-        Always computes the mean across MoE layers.  If *percentiles* specifies
+        Computes the mean across contributing MoE layers, excluding hash layers
+        for load-balancing losses. If *percentiles* specifies
         quantiles for a metric, those are computed over non-zero layer values and
         added as ``"{name}_p{pct}"`` keys.
         """
@@ -335,7 +362,10 @@ class MoEMetricsTracker:
                     for pct, pct_val in zip(pcts, pct_vals):
                         result[f"{name}_p{int(pct * 100)}"] = pct_val
 
-            result[name] = values.sum() / num_moe_layers
+            num_contributors = num_moe_layers
+            if name in _LOAD_BALANCING_LOSSES:
+                num_contributors -= num_hash_layers
+            result[name] = values.sum() / num_contributors
 
         return result
 

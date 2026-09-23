@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import io
 import logging
@@ -30,11 +30,15 @@ from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
 from megatron.core.dist_checkpointing.serialization import (
+    get_default_load_sharded_strategy,
+    get_default_save_sharded_strategy,
     load_sharded_metadata,
     load_tensors_metadata,
 )
-from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
+)
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -47,6 +51,12 @@ class TestSerialization:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_default_torch_dist_strategies(self):
+        assert isinstance(get_default_load_sharded_strategy(), TorchDistLoadShardedStrategy)
+        assert isinstance(
+            get_default_save_sharded_strategy("torch_dist"), TorchDistSaveShardedStrategy
+        )
 
     def test_single_process_save_load(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
@@ -529,8 +539,6 @@ class TestSerialization:
         not is_torch_min_version("2.3.0"),
         reason="remove_sharded_tensors relies on Torch APIs introduced in v2.3.0",
     )
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_remove_sharded_tensors(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
 
@@ -554,7 +562,10 @@ class TestSerialization:
             save_strategy = TorchDistSaveShardedStrategy(
                 "torch_dist", 1, separation_hint=prefix_name
             )
-            save(state_dict, ckpt_dir, save_strategy)
+            # separation_hint is only supported by the nvrx async writer, so this must
+            # go through the async save path (executed synchronously here).
+            async_request = save(state_dict, ckpt_dir, save_strategy, async_sharded_save=True)
+            async_request.execute_sync()
 
             files = os.listdir(ckpt_dir)
             prefix_files = [f for f in files if f.startswith(prefix_name)]
@@ -577,7 +588,10 @@ class TestSerialization:
             assert len(prefix_files) == 0
 
             new_metadata = fs_reader.read_metadata()
-            assert set(new_metadata.state_dict_metadata.keys()) == {'keyA'}
+            assert set(new_metadata.state_dict_metadata.keys()) == {
+                'common_state/shard_0_1',
+                'keyA',
+            }
 
         Utils.destroy_model_parallel()
 
@@ -840,7 +854,7 @@ class TestNonStrictLoad:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_unexpected_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -911,7 +925,7 @@ class TestNonStrictLoad:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_missing_keys_raises_error_during_validation'
         ) as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -975,7 +989,7 @@ class TestNonStrictLoad:
     def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity):
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
 
             def load_with_flag(strict):
@@ -1012,7 +1026,7 @@ class TestNonStrictLoad:
 
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
-            save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
+            save_strategy = TorchDistSaveShardedStrategy()
             save(sharded_state_dict, ckpt_dir, save_strategy)
             torch.distributed.barrier()
             sharded_metadata = load_sharded_metadata(ckpt_dir)

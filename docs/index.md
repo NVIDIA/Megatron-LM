@@ -65,17 +65,38 @@ models/index
 :hidden:
 :caption: Advanced Features
 
+user-guide/deterministic-training
 user-guide/features/moe
-user-guide/features/context_parallel
 user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
+user-guide/features/checkpoint-merge
 user-guide/features/optimizer_cpu_offload
-user-guide/features/pipeline_parallel_layout
 user-guide/features/fine_grained_activation_offloading
 user-guide/data-loading
 user-guide/features/megatron_energon
 user-guide/features/megatron_rl
 user-guide/features/tokenizers
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: Inference
+
+mcore-inference-user-guide
+```
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: Observability
+
+user-guide/observability/index
+user-guide/observability/configuration
+user-guide/observability/span-groups
+user-guide/observability/metrics
+user-guide/observability/pipeline-parallel
+user-guide/observability/extending
 ```
 
 ```{toctree}
@@ -87,6 +108,7 @@ developer/contribute
 developer/submit
 developer/oncall
 developer/generate_docs
+developer/gdn_ew_fusion
 ```
 
 ```{toctree}
@@ -103,5 +125,6 @@ apidocs/index.rst
 :hidden:
 :caption: Resources
 
+user-guide/hybrid-model-migration
 advanced/index
 ```

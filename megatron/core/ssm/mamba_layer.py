@@ -6,10 +6,15 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Protocol, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -17,20 +22,15 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormInterface
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
-
-
-class LayerNormBuilder(Protocol):
-    """A protocol showing how MambaLayer expects to construct its LayerNorm."""
-
-    def __call__(self, config: TransformerConfig, hidden_size: int, /) -> LayerNormInterface: ...
 
 
 @dataclass
@@ -57,7 +57,7 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayer(GraphableMegatronModule):
+class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     """
     A single Mamba layer.
 
@@ -96,7 +96,11 @@ class MambaLayer(GraphableMegatronModule):
             pp_layer_offset=pp_layer_offset,
             name=(name + f".mixer") if name is not None else None,
         )
-        self.norm = submodules.norm(self.config, self.config.hidden_size)
+        self.norm = submodules.norm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
@@ -116,6 +120,81 @@ class MambaLayer(GraphableMegatronModule):
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
 
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether the configured sequence mixer supports two-stage execution."""
+        return (
+            isinstance(self.mixer, TwoStageAttentionLayer)
+            and self.mixer.supports_two_stage_attention()
+        )
+
+    def _prepare_mixer_input(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
+        """Apply the layer's residual conversion and pre-mixer normalization."""
+        residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
+
+        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+        hidden_states = apply_module(self.norm)(hidden_states)
+        return hidden_states, residual
+
+    def _apply_mixer_bda(self, mixer_out_with_bias, residual: Tensor) -> Tensor:
+        """Apply the layer's bias-dropout-add tail to a projected mixer output."""
+        with self.bias_dropout_add_exec_handler():
+            return self.mamba_bda(training=self.training, fused=self.config.bias_dropout_fusion)(
+                mixer_out_with_bias, residual, self.hidden_dropout
+            )
+
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        sequence_len_offset: Optional[int] = None,  # Not used in MambaLayer
+        padding_mask: Optional[Tensor] = None,  # Not used in MambaLayer
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+    ):
+        """Run normalization, input projection, and the selective SSM/SSD.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
+                b is batch size, and h is hidden size.
+            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
+            inference_context (BaseInferenceContext, optional): Must be ``None`` because two-stage
+                mixer execution is training-only.
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+
+        Returns:
+            Tuple containing the core SSM result and residual.
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        assert inference_context is None, "Two-stage mixer execution does not support inference."
+
+        hidden_states, residual = self._prepare_mixer_input(hidden_states)
+
+        ssm_output = self.mixer.forward_pre_attn_and_core_attn(
+            hidden_states,
+            packed_seq_params=packed_seq_params,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+        )
+        return ssm_output, residual
+
+    def forward_post_core_attn(
+        self,
+        ssm_output: Tensor,
+        residual: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        padding_mask: Optional[Tensor] = None,
+    ):
+        """Apply Mamba's output projection and the original residual/BDA operation."""
+        del inference_context, padding_mask
+        mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
+        return self._apply_mixer_bda(mixer_out_with_bias, residual)
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -125,6 +204,7 @@ class MambaLayer(GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -139,6 +219,8 @@ class MambaLayer(GraphableMegatronModule):
             inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
+                packed-sequence metadata for chunkwise CP.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -146,23 +228,32 @@ class MambaLayer(GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
-        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = apply_module(self.norm)(hidden_states)
-
-        mixer_out_with_bias = self.mixer(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
-        )
-
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
-
-        return hidden_states
+        # Whole-layer + mixer lens spans, mirroring transformer_layer.py so the hybrid
+        # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
+        # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
+        # group is enabled, so zero cost on normal runs.
+        with _otel_managed_span(
+            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        ):
+            # Mamba mixer: conv + selective SSM/SSD -- the compute block, analog of the
+            # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
+            # lands on the first pass).
+            hidden_states, residual = self._prepare_mixer_input(hidden_states)
+            with _otel_managed_span('layer', 'megatron.layer.mamba'):
+                if packed_sequence_cp_metadata is None:
+                    mixer_out_with_bias = self.mixer(
+                        hidden_states,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                    )
+                else:
+                    mixer_out_with_bias = self.mixer(
+                        hidden_states,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                        packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    )
+            return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

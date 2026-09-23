@@ -37,7 +37,7 @@ python -m pip install python-gitlab
 python tools/trigger_internal_ci.py \
   --gitlab-origin gitlab \
   [--access-token glpat-<your-token>] \
-  [--functional-test-scope L1,L2] \
+  [--functional-test-scope mr] \
   [--functional-test-repeat 5] \
   [--functional-test-cases all] \
   [--functional-test-name release-testing/mcore-vX.Y.Z] \
@@ -49,7 +49,7 @@ python tools/trigger_internal_ci.py \
 |---|---|---|
 | `--gitlab-origin` | *(required)* | Git remote name for the internal GitLab |
 | `--access-token` | `$GITLAB_TOKEN` | Personal access token with `api` scope |
-| `--functional-test-scope` | `L1,L2` | `FUNCTIONAL_TEST_SCOPE` pipeline variable |
+| `--functional-test-scope` | `mr` | `FUNCTIONAL_TEST_SCOPE` pipeline variable |
 | `--functional-test-repeat` | `5` | `FUNCTIONAL_TEST_REPEAT` pipeline variable |
 | `--functional-test-cases` | `all` | `FUNCTIONAL_TEST_CASES` pipeline variable |
 | `--functional-test-name` | commit SHA | `FUNCTIONAL_TEST_NAME` pipeline variable — names the run for `pre-release`/`release` scopes (used as the run name and W&B experiment). |

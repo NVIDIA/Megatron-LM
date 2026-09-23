@@ -1,18 +1,31 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
 import logging
 import time
-import uuid
 
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.inference_request import (
+    prepare_multimodal_data,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import detokenize_tokens
+
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
+from .common import (
+    abort_requests,
+    attach_stage_metadata,
+    collect_stage_metadata,
+    validate_offload_params,
+)
 
 logger = logging.getLogger(__name__)
 
 
 try:
-    from quart import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -26,6 +39,13 @@ try:
         req = await request.get_json(force=True)
         if req is None:
             return "Invalid or missing JSON body", 400
+
+        # Opaque metadata forwarded to the engine's payload stager. Keys starting
+        # with '_' are engine-owned and rejected here so a client cannot forge them.
+        offload_params = req.get("offload_params")
+        offload_params_error = validate_offload_params(offload_params)
+        if offload_params_error is not None:
+            return offload_params_error, 400
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -65,9 +85,11 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
+            temperature = float(
+                req.get("temperature", current_app.config.get('default_temperature', 1.0))
+            )
+            top_p = float(req.get("top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(req.get("top_k", current_app.config.get('default_top_k', 0)))
             echo = bool(req.get("echo", False))
 
             if temperature == 0.0:
@@ -95,6 +117,41 @@ try:
 
             ignore_eos = bool(req.get("ignore_eos", False))
 
+            # Optional vLLM-style multimodal input. HTTP callers provide
+            # base64/data-URL bytes; preprocessed tensors are direct-API only.
+            request_multi_modal_data = req.get("multi_modal_data") or {}
+            if not isinstance(request_multi_modal_data, dict):
+                raise ValueError("multi_modal_data must be a dictionary.")
+            unsupported_modalities = set(request_multi_modal_data) - {"image", "video"}
+            if unsupported_modalities:
+                raise ValueError(
+                    "Unsupported multimodal modalities: " f"{sorted(unsupported_modalities)}."
+                )
+            populated_modalities = [
+                modality
+                for modality in ("image", "video")
+                if request_multi_modal_data.get(modality)
+            ]
+            if len(populated_modalities) > 1:
+                raise ValueError("A completions request cannot mix image and video inputs.")
+            multi_modal_data = None
+            if populated_modalities:
+                modality = populated_modalities[0]
+                encoded_media = request_multi_modal_data[modality]
+                if isinstance(encoded_media, str):
+                    encoded_media = [encoded_media]
+                if not isinstance(encoded_media, list) or any(
+                    not isinstance(item, str) for item in encoded_media
+                ):
+                    raise ValueError(f"multi_modal_data.{modality} must be a string or list[str].")
+                media_bytes = [
+                    base64.b64decode(
+                        item.split(",", 1)[1] if item.startswith("data:") and "," in item else item
+                    )
+                    for item in encoded_media
+                ]
+                multi_modal_data = {modality: media_bytes}
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -105,31 +162,119 @@ try:
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
                 termination_id=-1 if ignore_eos else None,
+                streaming_interval=int(req.get("streaming_interval", 1)),
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
 
         # --- 3. Send Requests to Engine ---
+        stream_requested = bool(req.get("stream", False))
+        incremental_detokenizers = []
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for prompt_tokens in prompts_as_tokens
+                ]
+            except ValueError as error:
+                return str(error), 400
+
         tasks = []
-        for prompt_tokens in prompts_as_tokens:
-            per_req_params = SamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                return_log_probs=sampling_params.return_log_probs,
-                top_n_logprobs=sampling_params.top_n_logprobs,
-                skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
-                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
-                stop_words=sampling_params.stop_words,
-                termination_id=sampling_params.termination_id,
+        # Populated on the non-streaming path only; the streaming path aborts
+        # through the AsyncStream callback its generator already owns.
+        request_ids = []
+        # The submission loop itself can fail partway -- the zmq send, or
+        # multimodal serialization on a malformed payload -- with the earlier
+        # prompts already submitted to the engine. Without this the exception
+        # escapes the handler and those requests generate to their token limit
+        # holding batch slots, the same leak the abort below closes.
+        #
+        # TODO: streaming submissions made before a mid-loop failure are not
+        # covered. Their handles are AsyncStreams, not ids, and they abort
+        # through openai_stream's finally, which never runs because the
+        # generator is never started.
+        try:
+            # Hash and serialize shared media once before fanning it out across
+            # the prompts in this batch, the same way chat completions does.
+            prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
+            for prompt_tokens in prompts_as_tokens:
+                per_req_params = SamplingParams(
+                    temperature=sampling_params.temperature,
+                    top_k=sampling_params.top_k,
+                    top_p=sampling_params.top_p,
+                    return_log_probs=sampling_params.return_log_probs,
+                    top_n_logprobs=sampling_params.top_n_logprobs,
+                    skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
+                    num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                    stop_words=sampling_params.stop_words,
+                    termination_id=sampling_params.termination_id,
+                    # This endpoint always echoes prompt_token_ids in its response, so
+                    # keep the prompt tokens on the payload (default is now to drop them).
+                    return_prompt_tokens=True,
+                    streaming_interval=sampling_params.streaming_interval,
+                    # This frontend detokenizes its own output while formatting the response.
+                    # Keep that work off the coordinator so it can forward the reply body unchanged.
+                    detokenize_generations=False,
+                )
+                if stream_requested:
+                    tasks.append(
+                        client.add_request_streaming(
+                            prompt_tokens,
+                            per_req_params,
+                            multi_modal_data=prepared_multimodal_data,
+                            offload_params=offload_params,
+                        )
+                    )
+                else:
+                    # add_request_with_id, not add_request: a non-streaming response
+                    # writes nothing to the socket while generating, so a disconnect
+                    # is never discovered as a broken pipe. Aborting needs the ids.
+                    request_id, future = client.add_request_with_id(
+                        prompt_tokens,
+                        per_req_params,
+                        multi_modal_data=prepared_multimodal_data,
+                        offload_params=offload_params,
+                    )
+                    request_ids.append(request_id)
+                    tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return f"Error submitting request: {e}", 500
+
+        if stream_requested:
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    tasks,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=False,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    echo_prompts=prompts_as_strings if echo else None,
+                    prompt_token_ids=prompts_as_tokens if echo else None,
+                ),
+                content_type="text/event-stream",
             )
-            tasks.append(client.add_request(prompt_tokens, per_req_params))
+            response.timeout = None
+            return response
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             return f"Error during inference: {e}", 500
 
@@ -169,15 +314,25 @@ try:
         prompt_tokens_counts = []
 
         request_idx = 0
+        response_uid = None
+        response_metadata = {}
         for completed_request in batch_results:
             result = unwrap_serialized_tensors(completed_request)
-            full_text = result["generated_text"] or ""
+            if response_uid is None:
+                response_uid = result["uid"]
+            collect_stage_metadata(response_metadata, result)
+            generated_tokens = result.get("generated_tokens") or []
+            full_text = detokenize_tokens(
+                tokenizer, generated_tokens, remove_EOD=not sampling_params.detokenize_stop_sequence
+            )
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
-            generated_tokens = result.get("generated_tokens") or []
             prompt_tokens_list = result.get("prompt_tokens") or []
             total_completion_tokens += len(generated_tokens)
-            prompt_tokens_counts.append(len(prompt_tokens_list))
+            prompt_token_count = result.get("prompt_length")
+            if prompt_token_count is None:
+                prompt_token_count = len(prompt_tokens_list)
+            prompt_tokens_counts.append(prompt_token_count)
 
             finish_reason = "length"
             sampling_params_result = result.get("sampling_params") or {}
@@ -185,18 +340,27 @@ try:
             if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
                 finish_reason = "stop"
 
+            # Under payload offload the engine dropped the per-token log probs from the reply,
+            # so the OpenAI logprobs block is absent.
+            payload_offloaded = bool(result.get("payload_offloaded"))
+
+            # Clamped: processed logprobs can be -inf, which JSON cannot carry.
+            generated_log_probs = json_safe_logprobs(result.get('generated_log_probs') or [])
+
             logprobs_data = None
-            if sampling_params.return_log_probs:
-                # Get prompt tokens and logprobs
+            if sampling_params.return_log_probs and not payload_offloaded:
                 prompt_tokens_list = result["prompt_tokens"] or []
 
-                prompt_log_probs = result.get('prompt_log_probs') or []
-                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
+                prompt_log_probs = json_safe_logprobs(result.get('prompt_log_probs') or [])
+                prompt_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('prompt_top_n_logprobs') or []
+                )
 
                 # Get generated tokens and logprobs
                 generated_tokens_list = result["generated_tokens"] or []
-                generated_log_probs = result.get('generated_log_probs') or []
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
+                generated_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('generated_top_n_logprobs') or []
+                )
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
@@ -255,13 +419,17 @@ try:
                 "finish_reason": finish_reason,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
+            if not payload_offloaded:
+                choice_data["generation_log_probs"] = generated_log_probs
+
+            # Speculative decoding (e.g. MTP): per-engine-step emitted token counts, summing to
+            # the generated token count. Empty/None when spec decoding is off. `ttft` is the real
+            # time-to-first-token in seconds; `tpot` is a SPARSE per-token step-time sample (only
+            # populated on logging steps), so a dense TPOT must come from ttft + total latency.
+            choice_data["acceptance_step_lengths"] = result.get("acceptance_step_lengths")
+            choice_data["ttft"] = result.get("ttft")
+            choice_data["tpot"] = result.get("tpot")
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -277,20 +445,23 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
-        return jsonify(
-            {
-                "id": str(uuid.uuid4()),
-                "object": "text_completion",  # as per the openAI spec
-                "created": int(time.time()),
-                "model": "EMPTY",
-                "choices": choices,
-                "usage": {
-                    "prompt_tokens": prompt_token_count,
-                    "completion_tokens": total_completion_tokens,
-                    "total_tokens": prompt_token_count + total_completion_tokens,
-                },
-            }
-        )
+        response = {
+            "id": response_uid,
+            "object": "text_completion",  # as per the openAI spec
+            "created": int(time.time()),
+            "model": "EMPTY",
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": prompt_token_count,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": prompt_token_count + total_completion_tokens,
+            },
+        }
+        # Under payload offload the stager's response metadata (e.g. a store handle
+        # for the log probs dropped from the reply) rides at the top level, as it
+        # does on /v1/chat/completions.
+        attach_stage_metadata(response, response_metadata)
+        return jsonify(response)
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")

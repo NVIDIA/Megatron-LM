@@ -9,14 +9,12 @@ _PROGRAM_START_TIME = time.time()
 
 import json
 
-# Suppress warnings on all ranks but rank 0.
-import os
-import warnings
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
-rank = int(os.environ.get('RANK', 0))
-if rank != 0:
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
@@ -26,8 +24,10 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -46,6 +46,8 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_te_version,
+    get_torch_version,
 )
 from megatron.training import (
     get_args,
@@ -56,16 +58,21 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.global_vars import initialize_runtime_services
 from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+    from megatron.post_training.model_builder import ModelOptModelConfig
+    from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -94,6 +101,19 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
+
+    if args.sequence_packing_scheduler is not None:
+        return get_batch_on_this_rank_for_sequence_packing(
+            data_iterator,
+            vpp_size=config.virtual_pipeline_model_parallel_size,
+            mtp_on_this_rank=mtp_on_this_rank_func(
+                layout=config.pipeline_model_parallel_layout,
+                mtp_num_layers=config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=vp_stage,
+            ),
+            vp_stage=vp_stage,
+        )
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -289,43 +309,61 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator', log_level=2).start()
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        (
-            attention_mask,
-            cu_seqlens,
-            cu_seqlens_padded,
-            hybrid_cp_group,
-            labels,
-            local_cp_size,
-            loss_mask,
-            max_seqlen,
-            position_ids,
-            tokens,
-        ) = get_batch(data_iterator, vp_stage)
+        batch = get_batch(data_iterator, vp_stage)
 
-    packed_seq_params = None
-    if cu_seqlens is not None:
-        # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
-        # for consistency, but PackedSeqParams and TE expect 1-D.
-        cu_seqlens = cu_seqlens.squeeze(0)
-        if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
-        # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
-        # attention only computes work for real tokens within each chunk.
-        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-        cu_seqlens_for_params = (
-            cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-        )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_for_params,
-            cu_seqlens_kv=cu_seqlens_for_params,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(max_seqlen.item()),
-            max_seqlen_kv=int(max_seqlen.item()),
-            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-            cp_group=hybrid_cp_group,
-        )
+        if len(batch) == 7:
+            (
+                tokens,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                packed_seq_params,
+                padding_mask,
+            ) = batch
+        elif len(batch) == 6:
+            tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = batch
+            padding_mask = None
+        else:
+            (
+                attention_mask,
+                cu_seqlens,
+                cu_seqlens_padded,
+                hybrid_cp_group,
+                labels,
+                local_cp_size,
+                loss_mask,
+                max_seqlen,
+                position_ids,
+                tokens,
+            ) = batch
+
+            padding_mask = None
+            packed_seq_params = None
+            if cu_seqlens is not None:
+                # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
+                # for consistency, but PackedSeqParams and TE expect 1-D.
+                cu_seqlens = cu_seqlens.squeeze(0)
+                if cu_seqlens_padded is not None:
+                    cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
+                # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
+                # attention only computes work for real tokens within each chunk.
+                update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+                cu_seqlens_for_params = (
+                    cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+                )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
+                packed_seq_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens_for_params,
+                    cu_seqlens_kv=cu_seqlens_for_params,
+                    cu_seqlens_q_padded=cu_seqlens_padded,
+                    cu_seqlens_kv_padded=cu_seqlens_padded,
+                    max_seqlen_q=int(max_seqlen.item()),
+                    max_seqlen_kv=int(max_seqlen.item()),
+                    local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
+                    cp_group=hybrid_cp_group,
+                    tokens_per_sample=args.seq_length,
+                )
 
     timers('batch-generator').stop()
 
@@ -335,7 +373,13 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 args.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             schedule_plan = model.build_schedule_plan(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
             return schedule_plan, partial(loss_func, loss_mask, model=model)
         else:
@@ -346,6 +390,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 labels=labels,
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -409,6 +454,9 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,
+        "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
+        "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
+        "varlen_sbhd_validation": args.varlen_sbhd_validation,
     }
 
     # add FIM args to the config
@@ -447,8 +495,22 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     is_packed_sequence = False
     if args.sft:
-        dataset_type = SFTDataset
+        if args.mock_data:
+            dataset_type = MockSFTDataset
+        else:
+            dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
+    elif args.use_varlen_dataset:
+        # Variable-length packed (THD) dataset, independent of --sft.
+        # Reuses SFTDataset's THD packing internally but is gated
+        # by its own top-level flag.
+        if args.mock_data:
+            dataset_type = MockVarlenDataset
+        else:
+            dataset_type = VarlenDataset
+        # SBHD validation mode runs the non-packed pipeline; THD mode
+        # is the packed-sequence path.
+        is_packed_sequence = not args.varlen_sbhd_validation
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset
@@ -490,6 +552,10 @@ if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
 
+    print_rank_0(f'> PyTorch version ................ {get_torch_version()}')
+    print_rank_0(f'> Megatron-Core version .......... {mcore_version}')
+    print_rank_0(f'> Transformer Engine version ... {get_te_version()}')
+
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
@@ -503,8 +569,17 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    model_cfg = gpt_config_from_args(args)
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+        model_cfg = gpt_config_from_args(
+            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
+        )
+    else:
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    initialize_runtime_services(args)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

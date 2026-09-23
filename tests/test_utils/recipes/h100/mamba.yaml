@@ -13,7 +13,9 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -34,7 +36,11 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
   script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
     set -euo pipefail
     ls
     cd /opt/megatron-lm
@@ -57,10 +63,15 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
+  - test_case: [hybrid_llama3_proxy_mfsdp_v2_cuda_graph]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [L1, L2]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -68,7 +79,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp1_pp4_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [L1, L2]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -76,7 +87,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp1_pp2_vpp2_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [L1, L2]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -84,7 +95,7 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [L1, L2]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
@@ -92,7 +103,14 @@ products:
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [L1, L2]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
+
+  - test_case: [hybrid_nemotron_v3_pico_7b_a1b_tp1_ep8_QAD_dgx_h100_1N8G]
+    products:
+      # Disabled while the deterministic total-loss mismatch is investigated.
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]

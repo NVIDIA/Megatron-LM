@@ -2,13 +2,17 @@
 
 """Layout helpers for DeepSeek sparse attention."""
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.utils import get_pg_size
 
 __all__ = [
+    "PackedCPIndexerLayout",
+    "build_packed_cp_indexer_layout",
     "build_packed_allgather_cp_local_positions",
     "build_packed_allgather_cp_query_positions_and_key_reorder",
     "build_zigzag_allgather_cp_key_reorder",
@@ -19,6 +23,93 @@ __all__ = [
     "get_packed_qk_cu_seqlens",
     "normalize_cp_comm_type",
 ]
+
+
+@dataclass(frozen=True)
+class PackedCPIndexerLayout:
+    """Segment metadata shared by packed-CP DSA indexer backends."""
+
+    segment_q_lengths: torch.Tensor
+    segment_k_lengths: torch.Tensor
+    segment_cu_q: torch.Tensor
+    segment_cu_k: torch.Tensor
+    segment_key_starts: torch.Tensor
+    source_indices: torch.Tensor
+
+
+def build_packed_cp_indexer_layout(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    key_size: int,
+    local_key_layout: bool = False,
+) -> PackedCPIndexerLayout:
+    """Build packed-CP front/back segment metadata for fused DSA indexers.
+
+    ``local_key_layout`` describes the single-sequence optimization where the
+    key tensor contains only this CP rank's local front/back chunks. Otherwise,
+    ``key_size`` is the globally ordered packed key length.
+    """
+    if cp_size <= 1 or not 0 <= cp_rank < cp_size:
+        raise RuntimeError("packed CP indexer layout requires a valid CP rank and cp_size > 1")
+    if cu_seqlens_q.shape != cu_seqlens_kv.shape or cu_seqlens_q.numel() < 2:
+        raise RuntimeError("packed CP indexer layout requires matching non-empty q/k cu_seqlens")
+
+    device = cu_seqlens_q.device
+    cu_q = cu_seqlens_q.to(device=device, dtype=torch.int64).contiguous()
+    cu_k = cu_seqlens_kv.to(device=device, dtype=torch.int64).contiguous()
+    segment_divisor = 2 * cp_size
+
+    if local_key_layout:
+        if cu_q.numel() != 2 or key_size % 2 != 0:
+            raise RuntimeError(
+                "local-key packed CP indexer layout requires one sequence and even key rows"
+            )
+        half = key_size // 2
+        segment_q_lengths = torch.full((2,), half, dtype=torch.int64, device=device)
+        segment_k_lengths = torch.tensor((half, key_size), dtype=torch.int64, device=device)
+        segment_key_starts = torch.zeros(2, dtype=torch.int64, device=device)
+        total_segment_k = key_size + half
+    else:
+        if key_size % segment_divisor != 0:
+            raise RuntimeError(
+                f"packed CP key length must be divisible by {segment_divisor}, got {key_size}"
+            )
+        q_lengths = cu_q[1:] - cu_q[:-1]
+        k_lengths = cu_k[1:] - cu_k[:-1]
+        q_half = q_lengths // segment_divisor
+        k_half = k_lengths // segment_divisor
+        segment_q_lengths = torch.stack((q_half, q_half), dim=1).reshape(-1)
+        segment_k_lengths = torch.stack(
+            ((cp_rank + 1) * k_half, k_lengths - cp_rank * k_half), dim=1
+        ).reshape(-1)
+        segment_key_starts = cu_k[:-1].repeat_interleave(2)
+        total_segment_k = key_size + key_size // segment_divisor
+
+    zero = torch.zeros(1, dtype=torch.int64, device=device)
+    segment_cu_q = torch.cat((zero, segment_q_lengths.cumsum(dim=0))).contiguous()
+    segment_cu_k = torch.cat((zero, segment_k_lengths.cumsum(dim=0))).contiguous()
+
+    segment_ids = torch.repeat_interleave(
+        torch.arange(segment_k_lengths.numel(), device=device),
+        segment_k_lengths,
+        output_size=total_segment_k,
+    )
+    segment_offsets = torch.arange(total_segment_k, device=device, dtype=torch.int64)
+    segment_offsets -= torch.repeat_interleave(
+        segment_cu_k[:-1], segment_k_lengths, output_size=total_segment_k
+    )
+    source_indices = segment_key_starts.index_select(0, segment_ids) + segment_offsets
+    return PackedCPIndexerLayout(
+        segment_q_lengths=segment_q_lengths,
+        segment_k_lengths=segment_k_lengths,
+        segment_cu_q=segment_cu_q,
+        segment_cu_k=segment_cu_k,
+        segment_key_starts=segment_key_starts,
+        source_indices=source_indices,
+    )
 
 
 def normalize_cp_comm_type(cp_comm_type: Optional[str]) -> str:
@@ -118,7 +209,7 @@ def get_cp_positions_from_layout(
         cp_group is not None
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
-        and cp_group.size() == cp_size
+        and get_pg_size(cp_group) == cp_size
     ):
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
         all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
@@ -136,6 +227,8 @@ def build_packed_allgather_cp_local_positions(
     cp_rank: int,
     device: torch.device,
     output_size: Optional[int] = None,
+    *,
+    cu_seqlens_cover_output: bool = False,
 ) -> torch.Tensor:
     """Build local packed-token positions for one CP rank under zigzag THD sharding.
 
@@ -189,6 +282,16 @@ def build_packed_allgather_cp_local_positions(
         output_size = int(segment_lens.sum().item())
     if output_size == 0:
         return torch.empty(0, dtype=torch.int64, device=device)
+    if not cu_seqlens_cover_output:
+        # Packed tensors may carry padded rows not represented by unpadded cu_seqlens.
+        # Give those rows deterministic positions after all real tokens so KV reorder
+        # keeps valid packed tokens ordered and moves padding to the suffix.
+        pad_len = (
+            torch.tensor(output_size, dtype=torch.int64, device=device) - segment_lens.sum()
+        ).clamp_min(0)
+        pad_start = cu_seqlens_i64[-1] + cp_rank * output_size
+        segment_starts = torch.cat((segment_starts, pad_start.view(1)), dim=0)
+        segment_lens = torch.cat((segment_lens, pad_len.view(1)), dim=0)
 
     segment_ids = torch.repeat_interleave(
         torch.arange(segment_lens.numel(), dtype=torch.int64, device=device),
@@ -209,7 +312,11 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     cp_rank: int,
     device: torch.device,
     local_output_size: Optional[int] = None,
+    key_local_output_size: Optional[int] = None,
     global_output_size: Optional[int] = None,
+    *,
+    query_cu_seqlens_cover_output: bool = False,
+    key_cu_seqlens_cover_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build packed-query positions and gathered-KV reorder index for allgather CP.
 
@@ -220,11 +327,23 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     to global packed order, matching the Slime GLM5 implementation semantics.
     """
     query_positions = build_packed_allgather_cp_local_positions(
-        cu_seqlens_q, cp_size, cp_rank, device, output_size=local_output_size
+        cu_seqlens_q,
+        cp_size,
+        cp_rank,
+        device,
+        output_size=local_output_size,
+        cu_seqlens_cover_output=query_cu_seqlens_cover_output,
     )
+    if key_local_output_size is None:
+        key_local_output_size = local_output_size
     gathered_key_positions = [
         build_packed_allgather_cp_local_positions(
-            cu_seqlens_kv, cp_size, rank, device, output_size=local_output_size
+            cu_seqlens_kv,
+            cp_size,
+            rank,
+            device,
+            output_size=key_local_output_size,
+            cu_seqlens_cover_output=key_cu_seqlens_cover_output,
         )
         for rank in range(cp_size)
     ]
@@ -245,7 +364,10 @@ def extract_query_positions_from_position_ids(
     if position_ids is None:
         return None
     if position_ids.ndim == 2:
-        if position_ids.size(0) > 1:
+        # ``torch.equal`` on CUDA forces a per-forward host/device sync, so only run the eager
+        # cross-batch consistency check off the CUDA training path (tests/CPU). On CUDA we rely on
+        # the dataloader contract that DSA position_ids are identical across the batch dimension.
+        if position_ids.size(0) > 1 and not position_ids.is_cuda:
             assert torch.equal(
                 position_ids[0], position_ids[-1]
             ), "Allgather-CP DSA expects identical position_ids across batch"

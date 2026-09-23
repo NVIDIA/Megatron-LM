@@ -93,7 +93,7 @@ cat > ./distributed_config.env << 'EOF'
 GPUS_PER_NODE=8
 NUM_NODES=1
 MASTER_ADDR=localhost
-MASTER_PORT=6000
+MASTER_PORT=29500
 NODE_RANK=0
 EOF
 ```

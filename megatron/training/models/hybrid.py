@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, ClassVar, Literal, override
 
+import torch
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -50,6 +52,7 @@ class HybridModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     hybrid_attention_ratio: float = 0.0
@@ -179,6 +182,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,
@@ -202,6 +206,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         data_parallel_random_init: bool = False,
         mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
+        use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool = True,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -216,6 +222,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
+            use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+                controls whether to compute and supply a shard-aligned param layout to DDP.
 
         Returns:
             List of model stages.
@@ -235,6 +244,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             mixed_precision_wrapper,
             composed_pre_wrap_hook,
             model_type,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

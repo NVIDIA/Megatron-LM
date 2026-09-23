@@ -9,7 +9,7 @@
 
 # Advanced Features
 
-Guides for Megatron Core training features.
+Guides for Megatron Core training and inference features.
 
 ```{toctree}
 :maxdepth: 2
@@ -17,13 +17,13 @@ Guides for Megatron Core training features.
 cuda_graph
 fine_grained_activation_offloading
 moe
-context_parallel
 megatron_fsdp
 dist_optimizer
+checkpoint-merge
 optimizer_cpu_offload
 paged_stash
-pipeline_parallel_layout
 tokenizers
 megatron_energon
 megatron_rl
+../../mcore-inference-user-guide
 ```

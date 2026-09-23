@@ -7,7 +7,45 @@ import torch
 import torch.nn as nn
 
 from megatron.core import fp8_utils
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    HAVE_MXFP8_TENSOR = True
+except ImportError:
+    HAVE_MXFP8_TENSOR = False
+
+# MXFP8 needs Blackwell or newer.
+mxfp8_available = HAVE_MXFP8_TENSOR and get_device_arch_version() >= 10
+reason_for_no_mxfp8 = "MXFP8 requires Transformer Engine and device arch >= 10"
+
+
+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    ("is_init", "config_values", "te_helper"),
+    [
+        (
+            False,
+            {"fp8": "hybrid", "fp4": None, "fp8_param": False, "fp4_param": False},
+            "fp8_autocast",
+        ),
+        (True, {"fp8": None, "fp4": None, "fp8_param": True, "fp4_param": False}, "fp8_model_init"),
+    ],
+)
+def test_get_fp8_disabled_context_uses_disabled_te_context(is_init, config_values, te_helper):
+    config = Mock(**config_values)
+    disabled_context = Mock()
+
+    with patch.object(
+        fp8_utils.transformer_engine.pytorch, te_helper, return_value=disabled_context
+    ) as te_context:
+        result = fp8_utils.get_fp8_disabled_context(config, is_init=is_init)
+
+    assert result is disabled_context
+    te_context.assert_called_once_with(enabled=False)
 
 
 class MockTELinear(nn.Module):
@@ -130,3 +168,66 @@ class TestFP8Padding:
 
             # Verify output has original shape
             assert output.shape == (6, 2, 4096)  # Back to original seq_len
+
+
+@pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+class TestCopyTensorsToQuantizedParams:
+    """Cover the batched MXFP8 param copy-back used by _post_param_sync.
+
+    ``copy_tensors_to_quantized_params`` bypasses ``copy_`` and calls the destination quantizer
+    directly, so the contract to protect is that it still writes exactly what the per-param
+    ``copy_tensor_to_quantized_param`` would have written.
+    """
+
+    SHAPES = [(1024, 512), (2048, 256), (512, 1024)]
+
+    def _make_param(self, shape):
+        quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        tensor = quantizer.make_empty(shape, dtype=torch.bfloat16, device="cuda")
+        return torch.nn.Parameter(tensor, requires_grad=False)
+
+    def _raw_buffers(self, param):
+        """The four buffers MXFP8 storage is made of, i.e. everything a cast writes."""
+        data = param.data
+        return (
+            data._rowwise_data,
+            data._rowwise_scale_inv,
+            data._columnwise_data,
+            data._columnwise_scale_inv,
+        )
+
+    def test_matches_per_param_copy(self):
+        """Batched copy-back is bitwise identical to copying one param at a time."""
+        torch.manual_seed(0)
+        reference_params = [self._make_param(shape) for shape in self.SHAPES]
+        batched_params = [self._make_param(shape) for shape in self.SHAPES]
+        # Sources are flat slices, matching how _post_param_sync views the param buffer.
+        srcs = [
+            torch.randn(shape, dtype=torch.bfloat16, device="cuda").view(-1)
+            for shape in self.SHAPES
+        ]
+
+        for param, src in zip(reference_params, srcs):
+            fp8_utils.copy_tensor_to_quantized_param(param, src)
+        fp8_utils.copy_tensors_to_quantized_params(batched_params, srcs)
+        torch.cuda.synchronize()
+
+        for reference, batched in zip(reference_params, batched_params):
+            for expected, actual in zip(self._raw_buffers(reference), self._raw_buffers(batched)):
+                assert torch.equal(expected, actual)
+
+    def test_falls_back_without_quantizer(self):
+        """A destination with no quantizer of its own still gets written."""
+        param = self._make_param(self.SHAPES[0])
+        param.data._quantizer = None
+        src = torch.randn(self.SHAPES[0], dtype=torch.bfloat16, device="cuda").view(-1)
+
+        fp8_utils.copy_tensors_to_quantized_params([param], [src])
+        torch.cuda.synchronize()
+
+        # A quantized copy of a non-zero source cannot be all zeros.
+        assert param.data._rowwise_data.any()
+
+    def test_empty_input(self):
+        """No params is a no-op rather than an error."""
+        fp8_utils.copy_tensors_to_quantized_params([], [])

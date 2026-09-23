@@ -14,9 +14,10 @@ from examples.post_training.modelopt.finetune import SFTDataset
 from megatron.core import mpu
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -43,18 +44,19 @@ def extract_feature(dataset, model, output_dir, idx_start, idx_end):
             torch.distributed.barrier()
 
 if __name__ == "__main__":
-    parse_and_validate_args(extra_args_provider=add_extract_args, args_defaults={
+    args = parse_and_validate_args(extra_args_provider=add_extract_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
         })
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()
     tokenizer = get_tokenizer()
     model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
 
-    load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
+    load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
     print_rank_0("Done loading checkpoint")
 
     unwrapped_model = unwrap_model(model)[0]

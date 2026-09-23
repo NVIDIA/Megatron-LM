@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from functools import partial
 
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
+from examples.mimo.training.batch import move_batch_to_cuda
+from examples.mimo.training.encoder_prefetch import PREFETCHED_FEATURES_KEY, PROJECTION_TIMER_KEY
 
 
 def loss_func(output_tensor: torch.Tensor, *, loss_mask: torch.Tensor):
@@ -37,39 +39,28 @@ def loss_func(output_tensor: torch.Tensor, *, loss_mask: torch.Tensor):
 
 
 def mimo_forward_step(data_iterator, model):
-    """Run a MIMO microbatch for the pipeline schedule.
+    """Run a raw-input or prefetched-feature MIMO microbatch for the pipeline schedule.
 
     On the last pipeline stage, the schedule passes ``output_tensor`` to the returned loss closure.
     """
     batch = next(data_iterator) if data_iterator is not None else {"input_ids": None}
-    batch = move_batch_to_cuda(batch)
+    prefetched = batch.pop(PREFETCHED_FEATURES_KEY, None)
+    projection_timer = batch.pop(PROJECTION_TIMER_KEY, None)
 
-    output_tensor, loss_mask = model(**batch)
-    return output_tensor, partial(loss_func, loss_mask=loss_mask)
+    if prefetched is None:
+        if projection_timer is not None:
+            raise RuntimeError("encoder prefetch timer has no prefetched features")
+        batch = move_batch_to_cuda(batch)
+        output_tensor, loss_mask = model(**batch)
+        return output_tensor, partial(loss_func, loss_mask=loss_mask)
 
+    if batch.get("modality_inputs"):
+        raise ValueError("prefetched features cannot be combined with raw modality inputs")
 
-def move_batch_to_cuda(value):
-    """Move tensor leaves, including PackedSeqParams tensor fields, to CUDA."""
-    if isinstance(value, torch.Tensor):
-        return value.cuda(non_blocking=True)
-    if isinstance(value, dict):
-        return {key: move_batch_to_cuda(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [move_batch_to_cuda(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(move_batch_to_cuda(item) for item in value)
-
-    if isinstance(value, PackedSeqParams):
-        for attr in (
-            "cu_seqlens_q",
-            "cu_seqlens_kv",
-            "cu_seqlens_q_padded",
-            "cu_seqlens_kv_padded",
-            "max_seqlen_q",
-            "max_seqlen_kv",
-        ):
-            sub = getattr(value, attr, None)
-            if isinstance(sub, torch.Tensor) and not sub.is_cuda:
-                setattr(value, attr, sub.cuda(non_blocking=True))
-        return value
-    return value
+    projection_context = projection_timer if projection_timer is not None else nullcontext()
+    with projection_context:
+        output_tensor = model._forward_encoders(
+            batch.get("input_ids"), modality_inputs=None, input_tensors=prefetched
+        )
+    # Encoder ranks never evaluate the language-model loss closure.
+    return output_tensor, partial(loss_func, loss_mask=None)
