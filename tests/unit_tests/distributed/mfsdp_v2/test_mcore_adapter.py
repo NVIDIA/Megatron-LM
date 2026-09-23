@@ -912,11 +912,9 @@ class TestMcoreAdapterHybrid:
         for group in groups:
             assert group.model_weight.placements == (Replicate(), expected_inner)
             assert group.main_weight.placements == (expected_outer, Shard(0))
-            # Intermediate gather destinations must reuse the persistent compute buffer.
-            for buffer in group._model_weight_sync_buffers:
-                assert buffer.local_buffer.untyped_storage().data_ptr() == (
-                    group.model_weight.local_buffer.untyped_storage().data_ptr()
-                )
+            assert group.post_optimizer_model_weight.local_buffer.untyped_storage().data_ptr() == (
+                group.model_weight.local_buffer.untyped_storage().data_ptr()
+            )
         output = model(
             hidden_states=torch.randn(
                 8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16

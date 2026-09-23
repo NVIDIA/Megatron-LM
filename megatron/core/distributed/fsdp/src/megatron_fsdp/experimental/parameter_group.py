@@ -98,7 +98,6 @@ class FsdpParameterGroup:
     model_weight: "DBuffer | QuantizedDBuffer"
     # Optimizer-layout representation of model_weight after an optimizer step.
     post_optimizer_model_weight: "DBuffer | QuantizedDBuffer"
-    _model_weight_sync_buffers: "tuple[DBuffer | QuantizedDBuffer, ...]"
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
@@ -263,17 +262,7 @@ class FsdpParameterGroup:
                         dtype=self.dtype,
                         device=self.main_weight.device,
                     )
-        # Hybrid ZeRO-2 keeps replicated model weights while its optimizer shards both
-        # axes. DBuffer views change one axis at a time, with sharded axes forming a
-        # suffix. Slice inner first, then outer; reverse this order when gathering.
-        sync_buffers = [self.model_weight]
-        sync_placements = list(model_weight_placements)
-        for axis in reversed(range(self.mesh.ndim)):
-            if sync_placements[axis] != main_weight_placements[axis]:
-                sync_placements[axis] = main_weight_placements[axis]
-                sync_buffers.append(sync_buffers[-1].view(sync_placements))
-        self._model_weight_sync_buffers = tuple(sync_buffers)
-        self.post_optimizer_model_weight = sync_buffers[-1]
+        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
         with self._symmetric_memory_context():
             if isinstance(self.model_weight, DBuffer):
@@ -388,10 +377,9 @@ class FsdpParameterGroup:
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
         if self._model_weight_is_stale:
-            for index in reversed(range(1, len(self._model_weight_sync_buffers))):
-                source = self._model_weight_sync_buffers[index]
-                destination = self._model_weight_sync_buffers[index - 1]
-                source.redistribute(destination.placements, out=destination)
+            self.post_optimizer_model_weight.redistribute(
+                self.model_weight.placements, out=self.model_weight
+            )
             self._model_weight_is_stale = False
 
         if self.model_weight.placements == self._unsharded_model_weight.placements:

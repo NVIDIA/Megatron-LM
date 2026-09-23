@@ -691,6 +691,43 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(dist
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
+@pytest.mark.parametrize("destination", ["allocated", "separate", "aliased", "redistribute"])
+def test_multi_axis_view_and_allgather(distributed_setup, destination):
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    replicated = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+    sharded = replicated.view([RowAtomic(), RowAtomic()])
+    expected = DBuffer.distribute_tensors(tensors, mesh, [RowAtomic(), RowAtomic()])
+    for index in range(len(tensors)):
+        torch.testing.assert_close(sharded.get_tensor_view(index), expected.get_tensor_view(index))
+    assert sharded.local_buffer.untyped_storage().data_ptr() == (
+        replicated.local_buffer.untyped_storage().data_ptr()
+    )
+    # Invalidate everything except this rank's optimizer shard to catch missing gathers.
+    saved = sharded.local_buffer.clone()
+    replicated.local_buffer.fill_(-1)
+    sharded.local_buffer.copy_(saved)
+    if destination == "redistribute":
+        result = sharded.redistribute([Replicate(), Replicate()], out=replicated)
+    else:
+        out = None
+        if destination == "aliased":
+            out = replicated
+        elif destination == "separate":
+            out = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+            out.local_buffer.fill_(-1)
+        # Accept a generator in reverse order; the implementation orders the collectives.
+        result = sharded.allgather((axis for axis in [1, 0]), out=out)
+        if out is not None:
+            assert result is out
+    _assert_dbuffer_local_tensors_close(result, tensors)
+    sliced = result.redistribute([RowAtomic(), RowAtomic()])
+    for index in range(len(tensors)):
+        torch.testing.assert_close(sliced.get_tensor_view(index), expected.get_tensor_view(index))
+
+
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -722,3 +759,30 @@ def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_
         == replicated_sharded_buffer.local_buffer.numel() // 2
     )
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
+
+
+@pytest.mark.parametrize("use_out", [False, True])
+def test_quantized_multi_axis_allgather(distributed_setup, use_out):
+    """Gather all four byte planes without requiring FP8 arithmetic."""
+    QuantizedDBuffer = pytest.importorskip(
+        "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer"
+    ).QuantizedDBuffer
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    replicated = QuantizedDBuffer.empty(
+        mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    expected = []
+    for plane in replicated.planes:
+        values = torch.arange(plane.local_buffer.numel(), device=distributed_setup.device) % 251
+        plane.local_buffer.copy_(values)
+        expected.append(plane.local_buffer.clone())
+    sharded = replicated.view([BlockAtomic(32), BlockAtomic(32)])
+    for plane, shard in zip(replicated.planes, sharded.planes):
+        saved = shard.local_buffer.clone()
+        plane.local_buffer.zero_()
+        shard.local_buffer.copy_(saved)
+    result = sharded.allgather((axis for axis in [1, 0]), out=replicated if use_out else None)
+    for plane, values in zip(result.planes, expected):
+        torch.testing.assert_close(plane.local_buffer, values, rtol=0, atol=0)

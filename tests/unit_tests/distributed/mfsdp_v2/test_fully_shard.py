@@ -77,10 +77,9 @@ def test_hybrid_zero2_gathers_optimizer_updates(distributed_setup, singleton_inn
             group.unshard_parameters()
             for name, parameter in model.named_parameters():
                 torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
-            for buffer in group._model_weight_sync_buffers:
-                assert buffer.local_buffer.untyped_storage().data_ptr() == (
-                    group.model_weight.local_buffer.untyped_storage().data_ptr()
-                )
+            assert group.post_optimizer_model_weight.local_buffer.untyped_storage().data_ptr() == (
+                group.model_weight.local_buffer.untyped_storage().data_ptr()
+            )
             group.reshard_parameters()
 
 
