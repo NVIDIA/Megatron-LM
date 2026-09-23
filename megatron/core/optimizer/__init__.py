@@ -830,14 +830,10 @@ def _get_megatron_emerging_optimizer(
     distopt_process_groups = None
     distopt_per_model_buffers = None
     use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
-    if use_separate_distributed_optimizer:
-        ddp_config = model_chunks[0].ddp_config
-        assert ddp_config.num_distributed_optimizer_instances == 1, (
-            "Layer-wise + DistributedOptimizer split path does not yet support "
-            "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
-        )
+    # NOTE:此拆分路径（耦合布局，use_layer_wise_param_layout=True）现在通过混合 ZeRO 支持
+    # num_distributed_optimizer_instances > 1：Muon（LayerWise）缓冲区在 intra dp_cp 组内分片
+    # （在 N 个副本之间冗余更新），而下方的同级 DistributedOptimizer 将标量（Adam/Lion）参数路由到
+    # 完整的 dp_cp 组，且 distributed_optimizer_instance_id=0（单一 owner 集合，因此 Adam 保持完整 ZeRO）。
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
@@ -927,10 +923,10 @@ def _get_megatron_emerging_optimizer(
                     param_groups=groups,
                     per_model_buffers=distopt_per_model_buffers,
                     model_parallel_group=distopt_process_groups['mp_group'],
-                    data_parallel_group=distopt_process_groups['intra_dp_cp_group'],
-                    data_parallel_group_gloo=distopt_process_groups['intra_dp_cp_group_gloo'],
+                    data_parallel_group=distopt_process_groups['dp_cp_group'],
+                    data_parallel_group_gloo=None,
                     data_parallel_group_idx=get_pg_rank(distopt_process_groups['mp_group']),
-                    intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
+                    intra_dist_opt_group=None,
                     distributed_optimizer_instance_id=0,
                     pg_collection=pg_collection,
                     skip_megatron_wrapping=False,

@@ -251,10 +251,17 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
+                # MoE (EP) Muon 矩阵：在 intra expert-DP 组内分片
+                # (大小为 expt_dp / N)，并在 N 个副本上冗余更新。
                 data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
-            else:
+            elif buffer_key.is_managed_by_layer_wise_optimizer:
+                # dense Muon 矩阵：在 intra dp_cp 组内分片
                 data_parallel_group = self.intra_dp_cp_group
+                scaling_factor = gradient_scaling_factor
+            else:
+                # Scalar (Adam/Lion) params：在完整 dp_cp 组上分片
+                data_parallel_group = self.dp_cp_group
                 scaling_factor = gradient_scaling_factor
 
             if not config.calculate_per_token_loss:
@@ -326,9 +333,14 @@ class DistributedDataParallel(_BaseDataParallel):
             assert (
                 self.ddp_config.use_distributed_optimizer
             ), 'Partial DistOpt cannot be used without DistOpt'
+            # 混合 ZeRO: 只有 buffer 保留 model-level, 
+            # num_distributed_optimizer_instances > 1 (Muon/LayerWise buffer) 的 bucket group 才做cross-replica inter all-reduce,
+            # 标量 (Adam) bucket group 已被烘焙成 N=1, 不能分配 inter group / communication stream
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
+                    if bucket_group.ddp_config.num_distributed_optimizer_instances <= 1:
+                        continue
                     bucket_group.inter_distributed_optimizer_instance_group = (
                         self.inter_dist_opt_group
                     )

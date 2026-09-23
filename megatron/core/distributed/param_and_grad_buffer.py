@@ -1139,6 +1139,15 @@ class _ParamAndGradBuffer:
         ):
             self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
 
+        # 混合 ZeRO: 标量 (非 LayerWise) buffer 在完整 dp_cp 组上保持全 ZeRO。
+        # 烘焙 num_distributed_optimizer_instances=1, 使其两段式梯度归约跳过cross-replica all-reduce,
+        # 只在完整 dp_cp 组上做一次 reduce-scatter; 而 Muon (LayerWise)
+        # buffer 保留model-lvel N (在 intra 组内分片并在 N 个副本上冗余更新)。
+        if not self._is_layer_wise_buffer:
+            self.ddp_config = dataclasses.replace(
+                self.ddp_config, num_distributed_optimizer_instances=1
+            )
+
         disable_grad_buffers_cpu_backup = self.ddp_config.disable_grad_buffers_cpu_backup
         disable_param_buffers_cpu_backup = (
             self.ddp_config.disable_param_buffers_cpu_backup
@@ -1858,32 +1867,48 @@ def partition_buckets(
             assert fp8_buffer is None
             fp8_buffer = buffer
 
-    # A bucket group performs a single collective type (reduce-scatter for DistOpt buffers,
-    # all-reduce otherwise), so buckets merged into one group must agree on the effective
-    # per-buffer ``use_distributed_optimizer``. The decoupled LayerWise layout
-    # (``use_layer_wise_param_layout=False``) gives LayerWise (Muon) buffers
-    # ``use_distributed_optimizer=False`` while sibling buffers keep True; the no-fp8 branch below
-    # keeps every bucket in its own group so they never mix, but the merging branches must assert
-    # consistency.
+    # 一个 bucket group 在单个DP组上执行单一集合通信类型（DistOpt buffer 为
+    # reduce-scatter，否则为 all-reduce），因此合并进同一 group 的 bucket 必须在三件事上
+    # 一致：DP组、每个 buffer 生效的 ``use_distributed_optimizer``、以及
+    # ``num_distributed_optimizer_instances``。decoupled LayerWise 布局
+    # (``use_layer_wise_param_layout=False``) 让 LayerWise (Muon) buffer 的
+    # ``use_distributed_optimizer=False``，而 sibling buffer 保持 True（同一DP组）；
+    # 混合 ZeRO 布局（``num_distributed_optimizer_instances > 1``）则额外把 Muon buffer 路由到
+    # intra dp_cp 组、把标量 (Adam) buffer 路由到完整 dp_cp 组。按这三项分组，使每个 group
+    # 的集合通信保持自洽。
     _ddp_config = buffers[0].ddp_config
 
-    # Authoritative per-buffer ``use_distributed_optimizer`` (False for decoupled LayerWise buffers,
-    # True for DistOpt siblings) so a bucket group's collective type matches its buffer's layout.
-    _param_to_buffer_distopt = {}
+    # 以每个buffer为准的 collective key，使bucket组的 collective 与其布局保持一致
+    _param_to_buffer = {}
     for buffer in buffers:
         for param in buffer.params:
-            _param_to_buffer_distopt[param] = buffer.ddp_config.use_distributed_optimizer
+           _param_to_buffer[param] = buffer
 
-    def _bucket_distopt(bucket):
-        """This bucket's effective ``use_distributed_optimizer``."""
+    def _collective_key(buffer):
+        """Hashable key: 决定一个 bucket group 的 collective 行为.
+        `id(data_parallel_group)` 用于区分完整的 dp_cp group 与 intra dp_cp group
+         (当 num_distributed_optimizer_instances > 1 时，二者是不同的对象).
+        """
+        return (
+            id(buffer.data_parallel_group),
+            buffer.ddp_config.use_distributed_optimizer,
+            buffer.ddp_config.num_distributed_optimizer_instances,
+        )
+
+    def _bucket_buffer(bucket):
+        """The buffer a bucket belongs to (buckets are per-buffer sub-ranges)."""
         if bucket.params_list:
-            distopt = _param_to_buffer_distopt.get(bucket.params_list[0], None)
-            if distopt is not None:
-                return distopt
-        return _ddp_config.use_distributed_optimizer
+            return _param_to_buffer.get(bucket.params_list[0], None)
+        return None
 
-    def _merged_use_distributed_optimizer(merge_buckets):
-        values = {_bucket_distopt(bucket) for bucket in merge_buckets}
+    def _bucket_collective_key(bucket):
+        buffer = _bucket_buffer(bucket)
+        if buffer is not None:
+            return _collective_key(buffer)
+        return _collective_key(buffers[0])
+
+    def _merged_collective_key(merge_buckets):
+        values = {_bucket_collective_key(bucket) for bucket in merge_buckets}
         assert len(values) == 1, (
             "Cannot merge buckets with differing effective use_distributed_optimizer into one "
             "bucket group. This happens when the decoupled LayerWise layout "
@@ -1893,40 +1918,32 @@ def partition_buckets(
         )
         return values.pop()
 
-    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True
-    # (e.g. disable_bucketing / non-first VPP chunks). A bucket group performs a single
-    # collective type, so when the decoupled LayerWise layout (use_layer_wise_param_layout=False)
-    # mixes LayerWise (all-reduce, non-DistOpt) and non-LayerWise (reduce-scatter, DistOpt)
-    # buffers in one chunk, we cannot
-    # merge them into a single group. Split by the effective per-bucket use_distributed_optimizer
-    # instead, preserving order. When all buckets agree (the non-decoupled case) this collapses
-    # to exactly one group, identical to the previous behavior.
+    # Case 1：如果 force_single_bucket_group 为 True，则将所有 bucket 放入单个 bucket group
+    # （例如 disable_bucketing / 非首个 VPP chunk）。一个 bucket group 在单个 data-parallel group 上
+    # 执行单一 collective 类型，因此按 collective key
+    # （data-parallel group + use_distributed_optimizer + num_distributed_optimizer_instances）
+    # 进行拆分，并保持顺序。当所有 buffer 都一致时（即非解耦、非混合 ZeRO 的情况），
+    # 这会坍缩为恰好一个 group，与之前的行为完全相同。
     if force_single_bucket_group:
-        data_parallel_group = buffers[0].data_parallel_group
-        data_parallel_world_size = buffers[0].data_parallel_world_size
-        ordered_distopt_values = []
-        buckets_by_distopt = {}
-        # buffer.ddp_config already carries the per-buffer use_distributed_optimizer.
-        ddp_config_by_distopt = {}
+        ordered_keys = []
+        buckets_by_key = {}
+        buffer_by_key = {}
         for buffer in buffers:
-            assert data_parallel_group == buffer.data_parallel_group
-            assert data_parallel_world_size == buffer.data_parallel_world_size
-            distopt = buffer.ddp_config.use_distributed_optimizer
-            ddp_config_by_distopt.setdefault(distopt, buffer.ddp_config)
-            for bucket in buffer.buckets:
-                if distopt not in buckets_by_distopt:
-                    buckets_by_distopt[distopt] = []
-                    ordered_distopt_values.append(distopt)
-                buckets_by_distopt[distopt].append(bucket)
+            key = _collective_key(buffer)
+            if key not in buckets_by_key:
+                buckets_by_key[key] = []
+                ordered_keys.append(key)
+                buffer_by_key[key] = buffer
+            buckets_by_key[key].extend(buffer.buckets)
 
         return [
             _ParamAndGradBucketGroup(
-                buckets_by_distopt[distopt],
-                ddp_config_by_distopt[distopt],
-                data_parallel_group,
-                data_parallel_world_size,
+                buckets_by_key[key],
+                buffer_by_key[key].ddp_config,
+                buffer_by_key[key].data_parallel_group,
+                buffer_by_key[key].data_parallel_world_size,
             )
-            for distopt in ordered_distopt_values
+            for key in ordered_keys
         ]
 
     if fp8_buffer is None:
@@ -1945,27 +1962,27 @@ def partition_buckets(
                 )
         return bucket_groups
     else:
-        # Case 3: merge non-fp8 buckets into the last fp8 group to aggregate comm. A bucket group
-        #         runs one collective type, so only non-fp8 buckets whose effective
-        #         use_distributed_optimizer matches the fp8 group's are merged in; buckets with a
-        #         different value (the decouple-LayerWise sibling buffers) get their own group(s).
-        #         buffer.ddp_config carries the per-buffer use_distributed_optimizer.
-        fp8_distopt = fp8_buffer.ddp_config.use_distributed_optimizer
-        matching_non_fp8_buckets = []  # merged into the fp8 group (same distopt)
-        # distopt value -> (list of buckets, representative ddp_config) for their own group(s)
-        differing_non_fp8_by_distopt = {}
-        ordered_differing_distopt_values = []
+        # Case 3：将非 fp8 bucket 合并到最后一个 fp8 group 中，以聚合通信。一个 bucket group
+        #       在单个 data-parallel group 上运行一种 collective 类型，因此只有那些 collective key
+        #       （data-parallel group + use_distributed_optimizer +
+        #       num_distributed_optimizer_instances）与 fp8 group 的 collective key 匹配的非 fp8 bucket
+        #       才会被合并进来；具有不同 key 的 bucket 会拥有自己的 group（一个或多个）。
+        fp8_key = _collective_key(fp8_buffer)
+        matching_non_fp8_buckets = []  # merged into the fp8 group (same collective key)
+        # collective key -> (list of buckets, representative buffer) for their own group(s)
+        differing_non_fp8_by_key = {}
+        ordered_differing_keys = []
         for buffer in buffers:
             if buffer.param_dtype != torch.uint8:
-                distopt = buffer.ddp_config.use_distributed_optimizer
+                key = _collective_key(buffer)
                 for bucket in buffer.buckets:
-                    if distopt == fp8_distopt:
+                    if key == fp8_key:
                         matching_non_fp8_buckets.append(bucket)
-                    elif distopt in differing_non_fp8_by_distopt:
-                        differing_non_fp8_by_distopt[distopt][0].append(bucket)
+                    elif key in differing_non_fp8_by_key:
+                        differing_non_fp8_by_key[key][0].append(bucket)
                     else:
-                        differing_non_fp8_by_distopt[distopt] = ([bucket], buffer.ddp_config)
-                        ordered_differing_distopt_values.append(distopt)
+                        differing_non_fp8_by_key[key] = ([bucket], buffer)
+                        ordered_differing_keys.append(key)
 
         bucket_groups = []
         for bucket in fp8_buffer.buckets:
@@ -1983,7 +2000,8 @@ def partition_buckets(
                             fp8_buffer.data_parallel_world_size,
                         )
                     )
-                    # Matching non-fp8 buckets share the fp8 distopt -> fp8_buffer.ddp_config.
+                    # Matching non-fp8 buckets share the fp8 collective key -> fp8_buffer's
+                    # ddp_config and data_parallel_group
                     for non_fp8_bucket in matching_non_fp8_buckets:
                         bucket_groups.append(
                             _ParamAndGradBucketGroup(
@@ -1993,28 +2011,26 @@ def partition_buckets(
                                 fp8_buffer.data_parallel_world_size,
                             )
                         )
-                    for distopt in ordered_differing_distopt_values:
-                        differing_buckets, differing_ddp_config = differing_non_fp8_by_distopt[
-                            distopt
-                        ]
+                    for key in ordered_differing_keys:
+                        differing_buckets, differing_buffer = differing_non_fp8_by_key[key]
                         for non_fp8_bucket in differing_buckets:
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    differing_ddp_config,
-                                    fp8_buffer.data_parallel_group,
-                                    fp8_buffer.data_parallel_world_size,
+                                    differing_buffer.ddp_config,
+                                    differing_buffer.data_parallel_group,
+                                    differing_buffer.data_parallel_world_size,
                                 )
                             )
                     continue  # Skip the default bucket group creation below
                 else:
-                    # Merge only the non-fp8 buckets whose use_distributed_optimizer matches.
+                    # Merge only the non-fp8 buckets whose collective key matches.
                     group_buckets = [bucket] + matching_non_fp8_buckets
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
-            # Merged buckets must share the fp8 group's effective use_distributed_optimizer.
-            assert _merged_use_distributed_optimizer(group_buckets) == fp8_distopt
+            # Merged buckets must share the fp8 group's collective key.
+            assert merged_collective_key(group_buckets) == fp8_key
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
@@ -2024,18 +2040,19 @@ def partition_buckets(
                 )
             )
 
-        # Route the differing non-fp8 buckets (decouple-LayerWise path) into their own group(s),
-        # one per distinct use_distributed_optimizer. Empty when all buckets share the fp8 group's
-        # value. The reduce_scatter path already emitted them above, so don't re-emit there.
+        # 将不同的非 fp8 bucket（解耦 LayerWise 或混合 ZeRO 的 sibling buffer）
+        # 路由到它们各自的 group 中，每个不同的 collective key 对应一个 group。当所有 bucket
+        # 共享 fp8 group 的 key 时为空。reduce_scatter 路径已在上面发出它们，因此不要
+        # 在那里重复发出。
         if not reduce_scatter_with_fp32_accumulation:
-            for distopt in ordered_differing_distopt_values:
-                differing_buckets, differing_ddp_config = differing_non_fp8_by_distopt[distopt]
+            for key in ordered_differing_keys:
+                differing_buckets, differing_buffer = differing_non_fp8[key]
                 bucket_groups.append(
                     _ParamAndGradBucketGroup(
                         differing_buckets,
-                        differing_ddp_config,
-                        fp8_buffer.data_parallel_group,
-                        fp8_buffer.data_parallel_world_size,
+                        differing_buffer.ddp_config,
+                        differing_buffer.data_parallel_group,
+                        differing_buffer.data_parallel_world_size,
                     )
                 )
         return bucket_groups

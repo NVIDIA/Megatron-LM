@@ -289,6 +289,12 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    muon_zero_parallelism: int = 2
+    """Muon (dense 矩阵) 参数的最大 ZeRO 分片组大小。0 = 不限制
+    设 Z >= 1 时: Muon 矩阵在 ``min(dp_cp, Z)`` 个 rank 内分片，并在 ``ceil(dp_cp / Z)``
+    个副本组上冗余计算 Muon 更新 (以计算换内存)。标量 (Adam/Lion) 参数保持全 ZeRO, 不受影响。"""
+
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

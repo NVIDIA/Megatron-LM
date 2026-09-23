@@ -184,6 +184,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         buffer_cursor = 0
         bucket_id = 0
         shard_imbalance_padding_numel = 0
+        shard_param_counts = [0] * dp_size
 
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
@@ -195,7 +196,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             shards 1..dp_size-1 so the embedding fits entirely within one
             shard (needed for the cross-stage tied-embedding all-reduce).
             """
-            nonlocal buffer_cursor, bucket_id, shard_imbalance_padding_numel
+            nonlocal buffer_cursor, bucket_id, shard_imbalance_padding_numel, shard_param_counts
             if not chunk_params:
                 return
 
@@ -237,6 +238,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         param_index_map[p] = (cursor, cursor + numel, bucket_id)
                     cursor += numel
                 shard_imbalance_padding_numel += padded_shard_size - shard_cursors[shard_id]
+                shard_param_counts[shard_id] += sum (
+                    1 for p, _ in shard_assignments[shard_id] if p is not None
+                )
             bucket_end_index = bucket_start_index + dp_size * padded_shard_size
             bucket_indices.append((bucket_start_index, bucket_end_index))
             per_bucket_numel_unpadded.append(sum(p.data.nelement() for p in chunk_params))
@@ -292,6 +296,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             f"Layerwise param layout: {len(params)} params, "
             f"{len(bucket_indices)} buckets, "
             f"dp_size={dp_size}, "
+            f"shard_param_counts={shard_param_counts}, "
             f"total_param_numel={total_param_numel}, "
             f"total_buffer_numel={total_buffer_numel}, "
             f"total_padding={total_padding} "
@@ -349,6 +354,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ddp_config.grad_reduce_in_fp32,
             merge_layerwise_fp8_grads=not getattr(ddp_config, 'use_layer_wise_param_layout', True),
         )
+        # 混合 ZeRO：LayerWise（Muon）缓冲区在 intra（partial-ZeRO）子组内分片
+        # （Size = full // num_distributed_optimizer_instances）；非 LayerWise（Adam）缓冲区保持
+        # 完整 DP 大小。N == 1 时 intra == full，相当于无操作。
+        num_dist_opt_instances = getattr(ddp_config, 'num_distributed_optimizer_instances', 1) or 1
+        intra_dp_world_size = data_parallel_world_size // num_dist_opt_instances
+        intra_expt_dp_world_size = (
+            expert_data_parallel_world_size // num_dist_opt_instances
+            if expert_data_parallel_world_size is not None
+            else None
+        )
+
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
@@ -357,12 +373,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if expert_data_parallel_world_size is not None
                     else data_parallel_world_size
                 )
+                layer_wise_dp_world_size = (
+                    intra_expt_dp_world_size
+                    if intra_expt_dp_world_size is not None
+                    else intra_dp_world_size
+                )
             else:
                 dp_world_size = data_parallel_world_size
+                layer_wise_dp_world_size = intra_dp_world_size
 
-            # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
-            # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
-            # get DistOpt's byte-level layout.
+            # 逐 buffer 分派：LayerWise（Muon）参数获得与分片对齐的 layer 大小，
+            # 位于 intra 子组内；非 LayerWise 参数（例如由 Adam 管理的 embeddings、biases）获得
+            # DistOpt 的字节级布局，其大小适配完整 DP 组。
             if buffer_key.is_managed_by_layer_wise_optimizer and decouple_ddp_layout:
                 # Decouple path (incl. FP8 param-gather): compact no-padding layout (DDP treats this
                 # buffer as non-DistOpt). Attach param_indices so DDP's consistency check passes.
@@ -376,10 +398,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 compute_per_buffer_layout = (
                     LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
                 )
+                layout_dp_world_size = layer_wise_dp_world_size
             else:
                 compute_per_buffer_layout = DistributedOptimizer._compute_per_buffer_param_layout
+                layout_dp_world_size = dp_world_size
             layouts[buffer_key] = compute_per_buffer_layout(
-                group_params, bucket_size, dp_world_size, ddp_config, param_indices
+                group_params, bucket_size, layout_dp_world_size, ddp_config, param_indices
             )
         return FullParamLayout(layouts=layouts)
 
@@ -587,14 +611,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             full_param_layouts: List of :class:`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
-        # Simplify when dp_cp group size is 1.
-        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        # 当（intra）dp_cp 组大小为 1 时进行简化。混合 ZeRO：Muon 矩阵在
+        # intra dp_cp 组内分片（大小 <= Z）；N == 1 使 intra == full，相当于无操作。
+        dp_cp_size = get_pg_size(self.pg_collection.intra_dp_cp)
         if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
+        expt_dp_size = get_pg_size(self.pg_collection.intra_expt_dp)
 
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
@@ -603,8 +628,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
-        dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
-        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
+        dp_cp_rank = get_pg_rank(self.pg_collection.intra_dp_cp)
+        expt_dp_rank = get_pg_rank(self.pg_collection.intra_expt_dp)
 
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
@@ -742,12 +767,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
-                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.expt_dp):
+                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.intra_expt_dp):
                     param_groups_this_rank[group_index].append(p)
                 self.expt_dp_params_list[expt_dp_loop[expt_dp_idx]].append(p)
                 expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
             else:
-                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.pg_collection.dp_cp):
+                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.pg_collection.intra_dp_cp):
                     param_groups_this_rank[group_index].append(p)
                 self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
                 dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
@@ -782,7 +807,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         continue
                     if self.dp_cp_params_list is not None:
                         bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.pg_collection.dp_cp))
+                            [] for _ in range(get_pg_size(self.pg_collection.intra_dp_cp))
                         ]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.dp_cp_params_list
@@ -802,7 +827,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         continue
                     if self.expt_dp_params_list is not None:
                         bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
+                            [] for _ in range(get_pg_size(self.pg_collection.intra_expt_dp))
                         ]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.expt_dp_params_list
@@ -953,9 +978,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 _allgather_helper(native, group)
 
         if self.dp_cp_params_list:
-            _dispatch(self.dp_cp_params_list, self.pg_collection.dp_cp)
+            _dispatch(self.dp_cp_params_list, self.pg_collection.intra_dp_cp)
         if self.expt_dp_params_list:
-            _dispatch(self.expt_dp_params_list, self.pg_collection.expt_dp)
+            _dispatch(self.expt_dp_params_list, self.pg_collection.intra_expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):
@@ -964,23 +989,38 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.dp_cp_params_list is None:
             return
         for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.intra_dp_cp, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
+                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.intra_dp_cp)
         if self.expt_dp_params_list is None:
             return
         for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.intra_expt_dp, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
+                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.intra_expt_dp)
+
+    def _grad_stats_parallel_group(self):
+        """Grad-norm / count-zeros reduction group.
+
+        在混合 ZeRO（num_distributed_optimizer_instances > 1）下，Muon 梯度由 N 个副本组
+        冗余持有，因此全局归约会将其重复计数 N 次。
+        改为在一个副本内（intra_dist_opt）进行归约。当 N == 1（或 intra 组不可用，
+        例如解耦路径）时，返回 None —— 即全局组 —— 与之前的行为一致。
+        """
+        if self.pg_collection is None:
+            return None
+        intra = getattr(self.pg_collection, 'intra_dist_opt', None)
+        inter = getattr(self.pg_collection, 'inter_dist_opt', None)
+        return intra if inter is not None else None
 
     @torch.no_grad()
     def get_grad_norm(self):
-        # similar to dist opt, always aggregate globally
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm()
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self._grad_stats_parallel_group()
+        )
         return grad_norm
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
@@ -1012,11 +1052,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     @torch.no_grad()
     def _get_grad_norm_for_group(self, grad_norm_group: str):
-        # similar to dist opt, always aggregate globally
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
-        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self._grad_stats_parallel_group()
+        )
         return grad_norm
 
     @torch.no_grad()
@@ -1026,7 +1067,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params += optimizer.get_parameters()
         return count_zeros_fp32(
             params,
-            grad_stats_parallel_group=None,
+            grad_stats_parallel_group=self._grad_stats_parallel_group(),
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
         )
 
@@ -1134,6 +1175,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             model_sharded_state_dict, is_loading, **kwargs
         )
 
+        # 混合 ZeRO：Muon 动量由 N 个副本组冗余持有。将跨副本索引编码到
+        # replica_id 的 DP 分量中（当 num_distributed_optimizer_instances == 1，
+        # 即固定 DP 场景时为 0），这样 N 份副本在保存时去重到主副本
+        # （inter_rank == 0），并在加载时重建。
+        inter_rank = 0
+        if self.pg_collection is not None and getattr(
+            self.pg_collection, 'inter_dist_opt', None
+        ) is not None:
+            inter_rank = get_pg_rank(self.pg_collection.inter_dist_opt)
+
         # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
             if hasattr(sh_base, 'replica_id'):
@@ -1141,7 +1192,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
                 ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
                 sh_base.replica_id = (
-                    0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
+                    inter_rank
+                    if isinstance(sh_base.replica_id, int)
+                    else (*sh_base.replica_id[:2], inter_rank)
                 )
 
         # later code assume list but chained optimizer fallback to non-list if there's only one
