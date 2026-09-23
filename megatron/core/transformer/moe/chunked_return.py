@@ -18,14 +18,11 @@ def _peer_order(
     rows: torch.Tensor, spans: tuple[tuple[tuple[int, int], ...], ...]
 ) -> torch.Tensor:
     """Map peer-major communication rows to expert-major input rows."""
-    order = torch.empty(rows.shape[0], dtype=torch.long, device=rows.device)
-    offset = 0
-    for peer_spans in spans:
-        for start, length in peer_spans:
-            if length:
-                torch.arange(start, start + length, out=order[offset:offset + length])
-                offset += length
-    assert offset == rows.shape[0]
+    base = torch.arange(rows.shape[0], device=rows.device)
+    order = torch.cat(
+        [base[start : start + length] for peer_spans in spans for start, length in peer_spans]
+    )
+    assert order.numel() == rows.shape[0]
     return order
 
 
