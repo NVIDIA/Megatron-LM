@@ -126,8 +126,11 @@ class _SchedulerHarness:
 
 
 class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
-    def __init__(self, loop, *, hybrid=False, available=0):
+    def __init__(self, loop, *, hybrid=False, available=0, extra_eos_token_id_set=()):
         self._loop = loop
+        # Ids a model declares beyond the request's own termination_id, e.g. nanov3p5's
+        # generation_config `[2, 11]`. Empty is the single-eos case.
+        self._extra_eos_token_id_set = frozenset(extra_eos_token_id_set)
         self._initialize_disaggregation_state()
         self.context = SimpleNamespace(
             block_size_tokens=4,
@@ -175,6 +178,12 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
 
     def get_request(self, request_id):
         return self.requests[request_id]
+
+    def _terminating_token_ids(self, request):
+        termination_id = request.sampling_params.termination_id
+        if termination_id is None or termination_id < 0:
+            return frozenset()
+        return self._extra_eos_token_id_set | {termination_id}
 
     def _check_stop_words_for_request_post_append(self, request):
         for stop_word_ids in request.stop_word_ids or []:
@@ -698,14 +707,28 @@ def test_transfer_polling_defers_batch_mutation_to_scheduling(handoff_loop):
 
 
 @pytest.mark.parametrize(
-    "num_tokens_to_generate, termination_id, stop_word_ids, expected_tokens",
-    [(0, -1, None, []), (1, -1, None, [55]), (3, 55, None, [55]), (3, -1, [[55]], [55])],
-    ids=["sequence-limit", "generation-limit", "termination-token", "stop-word"],
+    "num_tokens_to_generate, termination_id, stop_word_ids, extra_eos_token_id_set, expected_tokens",
+    [
+        (0, -1, None, (), []),
+        (1, -1, None, (), [55]),
+        (3, 55, None, (), [55]),
+        (3, -1, [[55]], (), [55]),
+        # Declared by the model's generation_config but not the request's
+        # termination_id: the imported prefill's token 55 must still stop here
+        # rather than resuming decode past it.
+        (3, 2, None, (2, 55), [55]),
+    ],
+    ids=["sequence-limit", "generation-limit", "termination-token", "stop-word", "declared-eos"],
 )
 def test_handoff_finishes_without_an_extra_decode_step(
-    handoff_loop, num_tokens_to_generate, termination_id, stop_word_ids, expected_tokens
+    handoff_loop,
+    num_tokens_to_generate,
+    termination_id,
+    stop_word_ids,
+    extra_eos_token_id_set,
+    expected_tokens,
 ):
-    engine = _HandoffHarness(handoff_loop)
+    engine = _HandoffHarness(handoff_loop, extra_eos_token_id_set=extra_eos_token_id_set)
     blocks = engine.context.kv_block_allocator.allocate_memory_blocks(2).tolist()
     request_future = handoff_loop.create_future()
     request = DynamicInferenceRequest(

@@ -2412,8 +2412,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
             num_stop_word_trim = 0
             num_stop_word_prompt_score_trim = 0
+            eos_mid_block_hit = False
             is_prefill = len(request.generated_tokens) == 0
             if request_id != consumed_chunked_prefill_request_id:
+                tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
+                    request, tokens, request_log_probs, top_n_logprobs, req_idx
+                )
+
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -2572,9 +2577,11 @@ class DynamicInferenceEngine(AbstractEngine):
                             handoff_ssm_slots_by_request.get(request_id)
                         )
                     finished_entry = self.requests[request_id]
-                elif stop_word_hit:
-                    # Stop word detected - mark for removal in next step's bookkeeping
-                    # Don't pop yet; let the next step handle it properly via callback
+                elif stop_word_hit or eos_mid_block_hit:
+                    # Stop word or mid-speculative-block EOS detected - mark for removal in
+                    # next step's bookkeeping. Don't pop yet; let the next step handle it
+                    # properly via callback. Both share this deferred-finish channel
+                    # because the context still has the request active at this point.
                     self.stop_word_finished_request_ids.add(request_id)
                     active_request_ids.append(request_id)
                 else:
@@ -2735,6 +2742,93 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
         return result
+
+    def _terminating_token_ids(self, request: DynamicInferenceRequest) -> frozenset:
+        """Token ids that end generation for this request.
+
+        The CPU-side counterpart of the controller's per-step tensor check, resolved
+        through the controller so every termination site shares one rule. Empty when
+        termination is disabled (`ignore_eos`).
+
+        Args:
+            request (DynamicInferenceRequest): Request to resolve ids for.
+
+        Returns:
+            frozenset: Terminating token ids, empty when termination is disabled.
+        """
+        return self.controller.terminating_token_ids(request.sampling_params.termination_id)
+
+    def _truncate_at_mid_block_eos(
+        self,
+        request: DynamicInferenceRequest,
+        tokens: list[int],
+        request_log_probs: Optional[list],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]],
+        req_idx: int,
+    ) -> Tuple[list, Optional[list], bool]:
+        """Drop everything a speculative step emitted after an EOS.
+
+        An EOS can land on an *accepted* speculative token rather than on the step's
+        last token, which is the only one the controller's termination check sees
+        (`sampled_tokens_cpu` is the target model's own sample at the last accepted
+        position). Accepted tokens are verified target tokens, not rolled-back drafts,
+        so an EOS among them is real and must end the request -- otherwise the rest of
+        the block, plus every later step, is emitted after EOS. This mirrors the
+        stop-word check, which truncates a stop sequence that ends mid-block.
+
+        Trailing log probs / top-n are trimmed to match, keeping them aligned with
+        `tokens`. `top_n_logprobs` is trimmed in place; log probs are returned.
+
+        Args:
+            request (DynamicInferenceRequest): Request the tokens belong to.
+            tokens (list[int]): Tokens emitted by this step, in order.
+            request_log_probs (Optional[list]): This step's log probs, or None.
+            top_n_logprobs (Optional[Dict]): Per-request top-n log probs, or None.
+            req_idx (int): This request's index into `top_n_logprobs`.
+
+        Returns:
+            Tuple[list, Optional[list], bool]: Truncated tokens, truncated log probs,
+            and whether an EOS was found (the caller defers the finish by a step).
+        """
+        eos_idx = self._find_mid_block_eos(request, tokens)
+        if eos_idx is None:
+            return tokens, request_log_probs, False
+
+        num_trim = len(tokens) - (eos_idx + 1)
+        if num_trim > 0:
+            if request_log_probs is not None:
+                request_log_probs = request_log_probs[:-num_trim]
+            if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_trim]
+        return tokens[: eos_idx + 1], request_log_probs, True
+
+    def _find_mid_block_eos(
+        self, request: DynamicInferenceRequest, tokens: list[int]
+    ) -> Optional[int]:
+        """Locate an EOS token inside a multi-token speculative step.
+
+        Only meaningful when a step emits more than one token, i.e. under speculative
+        decoding: the controller's termination check inspects just the step's last token,
+        so an EOS on an accepted draft position is otherwise missed and generation runs
+        past it. A single-token step was already checked by the controller, and a request
+        the controller has already finished does not reach here as unfinished.
+
+        Args:
+            request (DynamicInferenceRequest): Request the tokens belong to.
+            tokens (list[int]): Tokens emitted by this step, in order.
+
+        Returns:
+            Optional[int]: Index of the first EOS in `tokens`, or None if there is none.
+        """
+        if len(tokens) <= 1 or request.request_id in self.stop_word_being_finished_ids:
+            return None
+        terminating_ids = self._terminating_token_ids(request)
+        if not terminating_ids:
+            return None
+        for idx, token in enumerate(tokens):
+            if token in terminating_ids:
+                return idx
+        return None
 
     def _check_stop_words_for_request_post_append(
         self,
