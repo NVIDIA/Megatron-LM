@@ -38,6 +38,8 @@ The requested expert-backward extension was screened on H512 / 8192 tokens, BF16
 
 Both variants failed to lower the complete-step peak. A separate three-warmup/one-step two-rank probe put the 1410.2 / 1385.3 MiB peaks between the second layer's attention-output backward event (1213.3 / 1235.4 MiB peak so far) and the first layer's MoE postprocess backward event. The peak was already reached before the first layer's expert FC2 backward began on both ranks. The earlier attribution to grouped-expert backward was too broad; the data only localize the peak to the attention-side interval. A subsequent probe on GPUs 5–6 was invalidated when another workload filled GPU 6, so it is excluded. No process was terminated.
 
+Additional attention submodule hooks narrowed that interval: on both ranks the high-water mark was still 1213.3 / 1235.5 MiB at the second layer's attention-core output backward boundary, then reached 1410.2 / 1385.4 MiB by its QKV output backward boundary. The peak is therefore inside the attention-core backward interval, before QKV linear backward. These hooks are diagnostic and were disabled in timing runs.
+
 The v9 implementation creates the peer-order index with one contiguous range and one concatenation instead of launching a small range fill for every expert/peer span. It preserves the same communication plan and BF16 accumulation order. On GPUs 2 and 4 (GPU 4 also hosted an unrelated memory profiler), two reversed-order EP2 comparisons used H512, 8192 tokens, q=4096, five warmups and 20 complete optimizer steps. Speedup below is v5 time divided by v9 time; both arms had the same 1410.42 MiB complete-step allocated peak.
 
 | Return index construction | v5 step ms | v9 step ms | v9 speedup over v5 | v5 / v9 full-step peak |
