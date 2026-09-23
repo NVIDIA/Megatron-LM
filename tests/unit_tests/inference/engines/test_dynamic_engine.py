@@ -340,6 +340,36 @@ def test_build_vlm_request_rejects_expanded_prefix_longer_than_prompt():
         )
 
 
+@pytest.mark.parametrize(
+    ("stitched_tokens", "imgs_sizes", "expected", "found"),
+    [
+        ([10, 99, 99, 20, 7, 2, 30, 99, 99], [[2, 2], [3, 3]], 1, 2),
+        ([10, 99, 99, 20, 7, 2, 30, 99], [[2, 2]], 0, 1),
+    ],
+    ids=["preexpanded-suffix", "placeholder-without-new-media"],
+)
+def test_build_vlm_request_rejects_unexpected_placeholders_after_expanded_prefix(
+    stitched_tokens, imgs_sizes, expected, found
+):
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(4, 4))
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1, -1, -1], dtype=torch.int64
+    )
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6}
+
+    with pytest.raises(
+        ValueError, match=rf"Expected {expected} compact media placeholder\(s\) .* found {found}"
+    ):
+        _call_build_vlm_request(
+            engine,
+            torch.tensor(stitched_tokens, dtype=torch.int64),
+            media_tokens_preexpanded=False,
+            offload_params=stitching_metadata,
+            imgs_sizes=torch.tensor(imgs_sizes),
+        )
+    wrapper.expand_image_tokens.assert_not_called()
+
+
 def test_expanded_prefix_metadata_reports_every_missing_preparer_field():
     with pytest.raises(ValueError) as error:
         dynamic_engine._take_expanded_prefix_stitching_metadata({PREFIX_MEDIA_COUNT_FIELD: 1})
@@ -368,7 +398,7 @@ def test_expanded_prefix_metadata_validates_each_field(field, bad_value):
 
 def test_build_vlm_request_expands_only_new_suffix_media():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(4, 4))
-    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 11, 30, 42, 40], dtype=torch.int64)
+    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 11, 30, 99, 40], dtype=torch.int64)
     wrapper.expand_image_tokens.return_value = ([[30, -1, -1, 40]], [[None, 0, 1, None]])
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
         [-1, 0, 1, -1, -1, -1, -1], dtype=torch.int64
@@ -386,7 +416,7 @@ def test_build_vlm_request_expands_only_new_suffix_media():
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 7, 8, 11, 30, 99, 99, 40]
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, -1]
     wrapper.expand_image_tokens.assert_called_once()
-    assert wrapper.expand_image_tokens.call_args.args[0] == [[30, 42, 40]]
+    assert wrapper.expand_image_tokens.call_args.args[0] == [[30, 99, 40]]
     assert torch.equal(
         wrapper.expand_image_tokens.call_args.kwargs["imgs_sizes"], torch.tensor([[3, 3]])
     )
@@ -424,7 +454,7 @@ def test_build_vlm_request_offsets_suffix_embeddings_after_multiple_prefix_media
 
     request = _call_build_vlm_request(
         engine,
-        torch.tensor([10, 99, 99, 20, 99, 99, 21, 7, 2, 30, 42, 40], dtype=torch.int64),
+        torch.tensor([10, 99, 99, 20, 99, 99, 21, 7, 2, 30, 99, 40], dtype=torch.int64),
         media_tokens_preexpanded=False,
         offload_params=stitching_metadata,
         imgs_sizes=torch.tensor([[2, 2], [3, 3], [4, 4]]),

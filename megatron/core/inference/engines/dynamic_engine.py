@@ -2309,6 +2309,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     expansion_video_fps = suffix_media_metadata["video_fps"]
                     suffix_media_count = suffix_media_metadata["suffix_media_count"]
 
+                if prefix_tokens is not None:
+                    slice_placeholders = int((tokens == media_token_id).sum().item())
+                    if slice_placeholders != suffix_media_count:
+                        raise ValueError(
+                            f"Expected {suffix_media_count} compact media placeholder(s) after "
+                            f"the expanded prefix, found {slice_placeholders}."
+                        )
+
                 if suffix_media_count == 0:
                     # No multimodal data.
                     mask_tensor = torch.full_like(tokens, -1, dtype=torch.int64)
