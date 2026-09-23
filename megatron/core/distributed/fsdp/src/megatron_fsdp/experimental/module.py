@@ -27,10 +27,15 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .countdown import Countdown
+from .countdown import MultiplicityReadiness
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import (
+    FsdpParameter,
+    FsdpParameterGroup,
+    effective_dtype,
+    get_containing_parameter_group,
+)
 from .placement import BlockAtomic, Flat
 from .schedule import SchedulePolicy
 
@@ -174,7 +179,7 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
-    _trainable_parameter_countdown: Countdown
+    param_grad_readiness: MultiplicityReadiness
     _is_root: bool
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -233,12 +238,8 @@ class FsdpModule:
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
-        self._trainable_parameter_countdown = Countdown(
-            sum(
-                len(group.fsdp_parameters)
-                for group in self._parameter_groups
-                if group.requires_grad
-            )
+        self.param_grad_readiness = MultiplicityReadiness(
+            {p.fqns: 1 for p in self._trainable_fsdp_parameters()}
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
@@ -314,7 +315,7 @@ class FsdpModule:
                 trainable parameters have accumulated gradients.
         """
         module = cast(nn.Module, self)
-        if self._trainable_parameter_countdown.initial_value == 0:
+        if self.param_grad_readiness.expected_total == 0:
             module.register_full_backward_hook(
                 lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
                     cast(FsdpModule, hooked_module)
@@ -328,22 +329,28 @@ class FsdpModule:
         # before that when module inputs do not require grad.
         module_ref = ref(self)
 
-        def grad_hook(_: nn.Parameter) -> None:
-            module = module_ref()
-            if module is None:
-                return
-            if module._trainable_parameter_countdown.decrement():
-                post_backward_hook(module)
+        def make_grad_hook(fqns: tuple[str, ...]) -> Callable[[nn.Parameter], None]:
+            def hook(_: nn.Parameter) -> None:
+                module = module_ref()
+                if module is None:
+                    return
+                module.param_grad_readiness.mark(fqns)
+                if module.param_grad_readiness.is_complete():
+                    post_backward_hook(module)
+                    module.param_grad_readiness.reset()
+
+            return hook
 
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
                 parameter = fsdp_parameter.unsharded
+                per_param_grad_hook = make_grad_hook(fsdp_parameter.fqns)
                 # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
                 # gradients are materialized by ``backward_dw()``, not autograd.
                 if not getattr(parameter, "skip_backward_post_hook", False):
-                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    parameter.register_post_accumulate_grad_hook(per_param_grad_hook)
                     continue
                 if len(fsdp_parameter.fqns) > 1:
                     raise ValueError(
@@ -353,8 +360,15 @@ class FsdpModule:
                     )
                 parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
-                    lambda parameter=parameter: grad_hook(parameter)
+                    lambda parameter=parameter, hook=per_param_grad_hook: hook(parameter)
                 )
+
+    def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
+        """Iterate this module's trainable parameters in a stable order."""
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            yield from group.fsdp_parameters
 
     @staticmethod
     def _pre_load_state_dict(
