@@ -68,6 +68,18 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
+def _gtp_grad_fence():
+    """GTP's pre-DP-sync fence; no-op when GTP is unavailable (gtp_api guards its exports)."""
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import (
+            wait_for_gtp_grad_reduction_on_current_stream,
+        )
+
+        wait_for_gtp_grad_reduction_on_current_stream()
+
+
 class TestFP8Param:
 
     def setup_method(self, method):
@@ -446,6 +458,9 @@ class TestFP8Param:
             loss.backward()
 
             if args.overlap_grad_reduce:
+                # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
+                # grad sync and is what flushes an accumulated wgrad.
+                _gtp_grad_fence()
                 gpt_model[0].finish_grad_sync()
 
             for name, param in gpt_model[0].named_parameters():
@@ -760,6 +775,9 @@ class TestFP8Param:
             )
             output.mean().backward()
             if args.overlap_grad_reduce:
+                # Production order (finalize_model_grads): the GTP fence runs BEFORE the DP
+                # grad sync and is what flushes an accumulated wgrad.
+                _gtp_grad_fence()
                 model[0].finish_grad_sync()
             update_successful, _, _ = optimizer.step()
             assert update_successful

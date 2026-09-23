@@ -12,10 +12,12 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
+    _render_nemotron_vl_video_prompt,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
     dynamic_media_embedding_counts,
@@ -152,6 +154,97 @@ def test_dynamic_video_embedding_counts_group_one_placeholder_per_video():
     assert dynamic_media_replacement_counts(
         frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2
     ) == [504]
+    assert dynamic_media_replacement_counts(
+        frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2, aggregate_videos=False
+    ) == [252, 252]
+
+
+@pytest.mark.internal
+def test_nemotron_video_expansion_adds_timestamped_tubelet_wrappers():
+    wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    wrapper.multimodal_prompt_config = MultimodalPromptConfig(
+        video_spec=MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+    )
+    wrapper.model = SimpleNamespace(
+        image_token_index=-200,
+        dynamic_resolution=True,
+        patch_dim=16,
+        vision_model=SimpleNamespace(temporal_patch_dim=2),
+    )
+
+    class _Tokenizer:
+        def __init__(self):
+            self.rendered = None
+
+        def tokenize(self, text):
+            if text == "<img>":
+                return [77]
+            if text == "</img>":
+                return [78]
+            self.rendered = text
+            return [7, 77, 99, 78, 7, 77, 99, 78]
+
+    tokenizer = _Tokenizer()
+    expanded, masks = wrapper.expand_image_tokens(
+        [[11, 77, 99, 78, 12]],
+        imgs_sizes=torch.tensor([[32, 32]] * 4),
+        num_frames=torch.tensor([4]),
+        image_token_id=99,
+        tokenizer=tokenizer,
+        video_frame_indices=[[0, 30, 60, 90]],
+        video_fps=[29.97],
+    )
+
+    assert tokenizer.rendered == (
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
+        "<img><image></img>\n"
+        "Frame 3 sampled at 1.98 seconds and frame 4 sampled at 2.97 seconds: "
+        "<img><image></img>"
+    )
+    assert expanded == [[11, 7, 77, -1, 78, 7, 77, -1, 78, 12]]
+    assert masks == [[None, None, None, 0, None, None, None, 1, None, None]]
+
+
+@pytest.mark.internal
+def test_nemotron_video_prompt_supports_partial_final_tubelet():
+    prompt = _render_nemotron_vl_video_prompt(
+        MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        ),
+        frame_indices=[0, 30, 60],
+        fps=30.0,
+        temporal_patch_size=2,
+    )
+
+    assert prompt == (
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
+        "<img><image></img>\n"
+        "Frame 3 sampled at 1.98 seconds: <img><image></img>"
+    )
+
+
+@pytest.mark.internal
+def test_nemotron_temporal_prompt_can_omit_timestamps():
+    prompt = _render_nemotron_vl_video_prompt(
+        MediaPromptSpec(
+            model_token="<image>", prefix="<img>", suffix="</img>", expansion_mode="temporal_patch"
+        ),
+        frame_indices=[0, 30, 60, 90],
+        fps=30.0,
+        temporal_patch_size=2,
+    )
+
+    assert prompt == "<img><image></img>\n<img><image></img>"
 
 
 @pytest.mark.internal
@@ -160,6 +253,16 @@ def test_dynamic_video_embedding_counts_reject_misaligned_frames():
         dynamic_media_replacement_counts(
             [252] * 4, num_frames=torch.tensor([3]), temporal_patch_size=2
         )
+
+
+@pytest.mark.internal
+def test_super_video_geometry_has_32_tubelets_and_8192_embeddings():
+    counts = dynamic_media_replacement_counts(
+        [256] * 64, num_frames=torch.tensor([64]), temporal_patch_size=2, aggregate_videos=False
+    )
+
+    assert len(counts) == 32
+    assert sum(counts) == 8192
 
 
 @pytest.mark.internal
@@ -210,38 +313,6 @@ def test_vlm_wrapper_rejects_multiple_compact_markers_for_one_video():
             num_frames=torch.tensor([4]),
             image_token_id=99,
         )
-
-
-@pytest.mark.internal
-def test_vlm_and_omni_wrappers_expand_video_markers_consistently():
-    model = SimpleNamespace(
-        image_token_index=-200,
-        dynamic_resolution=True,
-        patch_dim=16,
-        _pixel_shuffle=True,
-        _conv_merging=False,
-        _drop_vision_class_token=True,
-        temporal_patch_dim=2,
-    )
-    model.vision_model = SimpleNamespace(temporal_patch_dim=2)
-
-    vlm_wrapper = object.__new__(VLMInferenceWrapper)
-    vlm_wrapper.model = SimpleNamespace(module=model)
-    omni_wrapper = object.__new__(NemotronOmniInferenceWrapper)
-    omni_wrapper.model = model
-
-    kwargs = {
-        "imgs_sizes": torch.tensor([[448, 576]] * 4),
-        "num_frames": torch.tensor([4]),
-        "image_token_id": 99,
-    }
-    vlm_expanded, vlm_masks = vlm_wrapper.expand_image_tokens([[11, 99, 12]], **kwargs)
-    omni_expanded, omni_masks = omni_wrapper.expand_image_tokens([[11, 99, 12]], **kwargs)
-
-    assert vlm_expanded == [[11] + [-1] * 504 + [12]]
-    assert omni_expanded == [[11] + [-1] * 504 + [12]]
-    assert vlm_masks == omni_masks
-    assert vlm_masks[0][1:-1] == list(range(504))
 
 
 @pytest.mark.internal

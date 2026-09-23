@@ -183,7 +183,7 @@ def test_router_observes_raw_logits_before_forced_benchmark_routing(monkeypatch)
     router.gating = lambda tensor: raw_logits
     routed_logits = []
 
-    def routing(logits, padding_mask=None):
+    def routing(logits, padding_mask=None, input_ids=None):
         routed_logits.append(logits)
         return logits, torch.ones_like(logits, dtype=torch.bool)
 
@@ -233,7 +233,7 @@ def test_router_observations_exclude_padding(
         raw_logits[padding_mask] = padding_value
     routed = []
 
-    def routing(logits, padding_mask=None):
+    def routing(logits, padding_mask=None, input_ids=None):
         routed.append((logits, padding_mask))
         return logits, torch.ones_like(logits, dtype=torch.bool)
 
@@ -281,7 +281,7 @@ def test_router_observes_normalized_configured_decision_scores():
         router._maintain_float32_expert_bias = lambda: None
         router.apply_input_jitter = lambda tensor: tensor
         router.gating = lambda tensor: raw_logits
-        router.routing = lambda logits, padding_mask=None: (
+        router.routing = lambda logits, padding_mask=None, input_ids=None: (
             logits,
             torch.ones_like(logits, dtype=torch.bool),
         )

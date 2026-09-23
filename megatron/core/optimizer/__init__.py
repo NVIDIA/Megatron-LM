@@ -1009,6 +1009,20 @@ def _get_megatron_emerging_optimizer(
     return ChainedOptimizer(results)
 
 
+def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> None:
+    """Release saved initializers after all local optimizer master weights are constructed.
+
+    Sharded optimizers only consume initializers for locally owned parameters. Sweep the
+    model as well so non-owned and frozen parameters do not retain their CPU copies.
+    """
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            getter_fn = getattr(param, 'get_high_precision_init_val', None)
+            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
+            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
+                clearer_fn()
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -1064,13 +1078,15 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
-        return _get_megatron_emerging_optimizer(
+        optimizer = _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
             config_overrides=config_overrides,
             pg_collection=pg_collection,
             param_group_process_group=param_group_process_group,
         )
+        _clear_high_precision_initializers(model_chunks)
+        return optimizer
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
@@ -1194,6 +1210,7 @@ def get_megatron_optimizer(
             optimizers.append(optimizer_part)
             model_chunk_offset += 1
 
+        _clear_high_precision_initializers(model_chunks)
         if len(optimizers) == 1:
             return optimizers[0]
 
@@ -1287,11 +1304,5 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    for model_chunk in model_chunks:
-        for param in model_chunk.parameters():
-            getter_fn = getattr(param, 'get_high_precision_init_val', None)
-            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
-            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
-                clearer_fn()
-
+    _clear_high_precision_initializers(model_chunks)
     return ChainedOptimizer(optimizers)

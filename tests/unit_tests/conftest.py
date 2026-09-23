@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,16 @@ def pytest_addoption(parser):
     )
 
 
+def pytest_runtest_logreport(report):
+    if report.failed:
+        rank = os.environ.get("RANK", "?")
+        print(
+            f"\n[rank {rank}] {report.nodeid} ({report.when})\n" f"{report.longreprtext}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 @pytest.fixture(autouse=True)
 def experimental(request):
     """Simple fixture setting the experimental flag [CPU | GPU]"""
@@ -52,13 +63,25 @@ def experimental(request):
 @pytest.fixture
 def run_config(monkeypatch):
     """Provide a config owner for isolated training-runtime consumers."""
-    from types import SimpleNamespace
-
+    from megatron.core.optimizer import OptimizerConfig
     from megatron.training import global_vars
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import (
+        CheckpointConfig,
+        LoggerConfig,
+        PretrainConfigContainer,
+        SchedulerConfig,
+        TrainingConfig,
+    )
 
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
-    container = SimpleNamespace(profiling=ProfilingConfig())
+    container = PretrainConfigContainer(
+        train=TrainingConfig(),
+        model=None,
+        optimizer=OptimizerConfig(),
+        scheduler=SchedulerConfig(),
+        logger=LoggerConfig(),
+        checkpoint=CheckpointConfig(),
+    )
     global_vars.set_run_config(container)
     return container
 

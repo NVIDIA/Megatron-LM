@@ -101,6 +101,38 @@ class TestParallelTransformerLayer:
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
 
+    @pytest.mark.parametrize("threshold, is_hash_layer", [(None, False), (0, False), (2, True)])
+    def test_function_moe_builder_receives_hash_layer_threshold(self, threshold, is_hash_layer):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+            moe_num_hash_layers=1,
+            hash_moe_vocab_size=32,
+            use_cpu_initialization=True,
+        )
+        moe_builder = get_moe_module_spec(use_te=False, num_experts=2, moe_grouped_gemm=False)
+
+        def build_moe(**kwargs):
+            return moe_builder(**kwargs)
+
+        submodules = TransformerLayerSubmodules(mlp=build_moe)
+        layer = TransformerLayer(
+            config,
+            submodules,
+            layer_number=2,
+            add_layer_offset=False,
+            hash_moe_layer_threshold=threshold,
+        )
+
+        assert layer.mlp.router.hash_moe_layer_threshold == threshold
+        assert layer.mlp.router.is_hash_layer is is_hash_layer
+
     def test_mtp_flag_is_forwarded_to_attention(self):
         """All attention builders receive the MTP-layer flag."""
         config = TransformerConfig(

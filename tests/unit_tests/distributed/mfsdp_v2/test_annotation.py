@@ -63,7 +63,7 @@ class TiedLM(nn.Module):
         return self.lm_head(self.embed_tokens(token_ids)).float().sum()
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -100,7 +100,7 @@ def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monke
     model = nn.Linear(4, 4, bias=False).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
@@ -131,8 +131,8 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-        fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
@@ -155,9 +155,9 @@ def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeyp
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-        fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
@@ -186,7 +186,7 @@ def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_se
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.ones(2, 4, device=distributed_setup.device, requires_grad=True)
     model(x).sum().backward()
@@ -210,9 +210,9 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-        fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
@@ -237,7 +237,7 @@ def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setu
     model = TiedLM()
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     token_ids = torch.arange(8, device=distributed_setup.device).reshape(2, 4)
     for _ in range(2):

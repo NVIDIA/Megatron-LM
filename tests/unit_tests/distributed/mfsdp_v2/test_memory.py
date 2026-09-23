@@ -17,7 +17,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class ElementwiseModel(nn.Module):
         return torch.relu(x + self.weight[0])
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -84,7 +84,7 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     dim = 4096
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
-    placements = _flat_placements()
+    placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=main_params_dtype)
     allocated_before = torch.cuda.memory_allocated(device)
     with fully_shard_context(device=device):
@@ -143,7 +143,7 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     dim = 4096
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
-    placements = _flat_placements()
+    placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(device=device, unify_communication_stream=unify_communication_stream):
         for layer in model.layers:
@@ -223,7 +223,7 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     peak_nbytes = torch.cuda.max_memory_allocated(device) - allocated_before_setup
     resting_nbytes = torch.cuda.memory_allocated(device) - allocated_before_setup
     assert parameter_group.model_weight.placements == (Replicate(),)
-    assert parameter_group.post_optimizer_model_weight.placements == (Flat(),)
+    assert parameter_group.post_optimizer_model_weight.placements == (RowAtomic(),)
 
     optimizer_state_nbytes = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
@@ -254,7 +254,7 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     allocated_before = torch.cuda.memory_allocated(device)
     model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
     output = model(x)
@@ -275,7 +275,7 @@ def test_fully_shard_returns_to_resting_memory(distributed_setup):
     dim = 4096
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
-    placements = _flat_placements()
+    placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(device=device):
         for layer in model.layers:
@@ -316,7 +316,7 @@ def test_fully_shard_returns_to_resting_memory(distributed_setup):
     [
         pytest.param(_zero1_placements, id="zero1"),
         pytest.param(_zero2_placements, id="zero2"),
-        pytest.param(_flat_placements, id="zero3"),
+        pytest.param(_default_placements, id="zero3"),
     ],
 )
 def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_factory):
