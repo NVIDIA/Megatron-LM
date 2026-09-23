@@ -2603,6 +2603,7 @@ class DSAttention(MegatronModule):
                     raise RuntimeError("Fused DSA attention did not produce a valid indexer loss.")
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
+                    raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                     reduce_group=indexer_reduce_group,
@@ -2690,6 +2691,7 @@ class DSAttention(MegatronModule):
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
+                    raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
                     reduce_group=indexer_reduce_group,
