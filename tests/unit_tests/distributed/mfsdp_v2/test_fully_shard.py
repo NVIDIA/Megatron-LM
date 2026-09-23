@@ -936,7 +936,7 @@ def test_fully_shard_shares_class_stream(distributed_setup):
 
     with fully_shard_context(device=device):
         for layer in layers:
-            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
 
     assert layers[0].get_stream() is layers[1].get_stream()
 
@@ -948,7 +948,7 @@ def test_fully_shard_keeps_instance_state_separate(distributed_setup):
     layers = [nn.Linear(4, 4, device=device) for _ in range(2)]
     for layer in layers:
         with fully_shard_context(device=device):
-            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
 
     assert type(layers[0]) is type(layers[1])
     assert layers[0].context is not layers[1].context
