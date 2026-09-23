@@ -1,31 +1,33 @@
 # Explicit source-to-test mappings
 
-`testmon_source_mapping.json` maps source directories to unit-test buckets that
+`testmon_source_mapping.yml` maps source directories to unit-test buckets that
 must run in full when those directories change. These mappings supplement
 Testmon for execution paths that coverage.py cannot reliably trace, such as
 CUDA autograd callbacks:
 
-```json
-{
-  "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental": {
-    "dgx_h100": ["tests/unit_tests/distributed/mfsdp_v2/**/*.py"],
-    "dgx_gb200": ["tests/unit_tests/**/*.py"]
-  }
-}
+```yaml
+mappings:
+  - source_dir: megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
+    test_buckets:
+      dgx_h100:
+        - tests/unit_tests/distributed/mfsdp_v2/**/*.py
 ```
 
-Keys are repository-relative directories without wildcards or trailing slashes.
-Each value maps recipe platforms (`dgx_h100` or `dgx_gb200`) to lists of exact
-`test_case` bucket names from that platform's unit-test recipe. Omit a platform
-when it needs no override. Add more entries or buckets to extend the mapping.
-A directory can require multiple buckets, and a bucket can depend on multiple
-directories.
+| Key | Meaning |
+| --- | --- |
+| `mappings` | List of source-directory rules. Use `[]` to configure no overrides. |
+| `source_dir` | Repository-relative source directory to watch recursively, without wildcards or a trailing slash. |
+| `test_buckets` | Hardware platforms and their buckets to run fully when the source directory changes. |
+| `dgx_h100` / `dgx_gb200` | Optional platform keys; each value is a list of exact `test_case` bucket names from that platform's unit-test recipe. |
 
-MFSDP v2 has a dedicated H100 bucket, but its Blackwell-specific tests run in
-GB200's shared `tests/unit_tests/**/*.py` bucket. The mapping therefore forces
-that whole GB200 bucket to run when experimental MFSDP sources change. This
-conservative choice also runs unrelated GB200 tests in the same bucket; it
-preserves coverage without adding a job. H100's shared bucket remains selective.
+Add another list entry for a new source directory, or add more buckets under a
+platform. A directory can require multiple buckets, and a bucket can depend on
+multiple directories. Each source directory must have a single entry.
+
+The example overrides only H100's MFSDP v2 bucket. GB200 is omitted, so its jobs
+keep their normal Testmon selection. Omitted platforms and empty bucket lists
+do not create an override or select a broader bucket automatically. This also
+means the mapping does not protect GB200 against missing trace dependencies.
 
 The shared baseline records paths and content hashes for each bucket's mapped
 source files, including subdirectories. An added, modified, deleted, or renamed
@@ -38,6 +40,11 @@ Comparison is against the actual cached baseline, rather than only the PR's
 base commit. This also covers changes already merged into `main` after that
 baseline was recorded. Unchanged mapped sources still allow Testmon selection.
 Mapping changes invalidate old baselines through the normal compatibility checks.
+
+Identity calculation uses PyYAML's safe loader. The CI action supplies the pinned
+parser with `uv run --no-project --with`, without synchronizing Megatron's project
+dependencies. Cache validation and publication do not need PyYAML. A parser setup
+failure takes the existing full-test fallback for selective runs.
 
 Python bytecode (`.pyc` and `.pyo`) and generated `__pycache__`, `.pytest_cache`,
 `.mypy_cache`, and `.ruff_cache` directories are excluded. Invalid mappings,

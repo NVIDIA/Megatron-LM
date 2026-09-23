@@ -91,6 +91,10 @@ def _snapshot(directory):
     }
 
 
+def _mapping_document(test_buckets, source=MAPPED_SOURCE):
+    return {"mappings": [{"source_dir": source, "test_buckets": test_buckets}]}
+
+
 def test_source_edits_preserve_identity(source_tree):
     before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     (source_tree / "megatron/core/ordinary.py").write_text("changed source")
@@ -98,7 +102,7 @@ def test_source_edits_preserve_identity(source_tree):
 
 
 def test_configured_source_mappings_target_existing_recipe_buckets():
-    mapping = json.loads((ROOT / cache.SOURCE_MAPPING_FILE).read_text())
+    document = yaml.safe_load((ROOT / cache.SOURCE_MAPPING_FILE).read_text())
     recipe_buckets = {}
     for platform in ("h100", "gb200"):
         recipe = yaml.safe_load(
@@ -107,8 +111,10 @@ def test_configured_source_mappings_target_existing_recipe_buckets():
         recipe_buckets[f"dgx_{platform}"] = {
             bucket for product in recipe["products"] for bucket in product["test_case"]
         }
-    assert mapping
-    for source, platforms in mapping.items():
+    assert document["mappings"]
+    for mapping in document["mappings"]:
+        source = mapping["source_dir"]
+        platforms = mapping["test_buckets"]
         assert (ROOT / source).is_dir(), source
         assert set(platforms) <= recipe_buckets.keys(), source
         for platform, buckets in platforms.items():
@@ -169,7 +175,8 @@ def test_unmapped_source_changes_preserve_mapped_bucket_identity(source_tree, ma
 @pytest.mark.parametrize(
     "platform,bucket,invalidated",
     [
-        ("dgx_gb200", "tests/unit_tests/**/*.py", True),
+        ("dgx_h100", MAPPED_BUCKET, True),
+        ("dgx_gb200", "tests/unit_tests/**/*.py", False),
         ("dgx_h100", "tests/unit_tests/**/*.py", False),
         ("dgx_gb200", "tests/unit_tests/generalized_tensor_parallel/**/*.py", False),
     ],
@@ -193,6 +200,32 @@ def test_mapped_source_change_only_invalidates_platform_bucket_owning_tests(
         assert consumer["compatibility"]["source_inputs"] == {}
         cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
     assert _snapshot(directory) == before
+
+
+def test_gb200_source_mapping_can_be_enabled_explicitly(tmp_path, source_tree, mapped_source):
+    bucket = "tests/unit_tests/**/*.py"
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
+        yaml.safe_dump(_mapping_document({"dgx_h100": [MAPPED_BUCKET], "dgx_gb200": [bucket]}))
+    )
+    producer = cache.cache_identity(source_tree, bucket, "dgx_gb200", IMAGE_ID)
+    assert producer["compatibility"]["source_inputs"]
+    directory = tmp_path / "assets_dir/testmon"
+    _create_generation(directory, producer)
+    (mapped_source / "module.py").write_text("def hook():\n    return False\n")
+    consumer = cache.cache_identity(source_tree, bucket, "dgx_gb200", IMAGE_ID)
+    with pytest.raises(ValueError, match="mapped source"):
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+
+
+def test_empty_platform_bucket_list_ignores_mapped_source_changes(source_tree, mapped_source):
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
+        yaml.safe_dump(_mapping_document({"dgx_h100": []}))
+    )
+    before = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    (mapped_source / "module.py").write_text("def hook():\n    return False\n")
+    after = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+    assert before == after
+    assert after["compatibility"]["source_inputs"] == {}
 
 
 @pytest.mark.parametrize("present", [False, True], ids=["missing-directory", "empty-directory"])
@@ -242,35 +275,79 @@ def test_generated_files_do_not_invalidate_mapped_source_baseline(
 @pytest.mark.parametrize(
     "mapping",
     [
-        "{",
-        "[]",
-        json.dumps({MAPPED_SOURCE: []}),
-        json.dumps({MAPPED_SOURCE: None}),
-        json.dumps({MAPPED_SOURCE: {}}),
-        json.dumps({MAPPED_SOURCE: {"unsupported_platform": [MAPPED_BUCKET]}}),
-        json.dumps({MAPPED_SOURCE: {"dgx_h100": []}}),
-        json.dumps({MAPPED_SOURCE: {"dgx_h100": None}}),
-        json.dumps({MAPPED_SOURCE: {"dgx_h100": MAPPED_BUCKET}}),
-        json.dumps({MAPPED_SOURCE: {"dgx_h100": [None]}}),
-        json.dumps({MAPPED_SOURCE: {"dgx_h100": ["outside/tests.py"]}}),
-        json.dumps({"/absolute/source": {"dgx_h100": [MAPPED_BUCKET]}}),
-        json.dumps({"../outside": {"dgx_h100": [MAPPED_BUCKET]}}),
-        json.dumps({"source/../outside": {"dgx_h100": [MAPPED_BUCKET]}}),
-        json.dumps({"./source": {"dgx_h100": [MAPPED_BUCKET]}}),
-        json.dumps({"source//nested": {"dgx_h100": [MAPPED_BUCKET]}}),
-        json.dumps({"source/**/*.py": {"dgx_h100": [MAPPED_BUCKET]}}),
+        None,
+        [],
+        {},
+        {"mappings": None},
+        {"mappings": {}},
+        {"mappings": [], "unexpected": True},
+        {"mappings": [None]},
+        {"mappings": [{"source_dir": MAPPED_SOURCE}]},
+        {"mappings": [{"source_dir": MAPPED_SOURCE, "test_buckets": {}, "unexpected": True}]},
+        _mapping_document([]),
+        _mapping_document(None),
+        _mapping_document({}),
+        _mapping_document({"unsupported_platform": [MAPPED_BUCKET]}),
+        _mapping_document({"dgx_h100": None}),
+        _mapping_document({"dgx_h100": MAPPED_BUCKET}),
+        _mapping_document({"dgx_h100": [None]}),
+        _mapping_document({"dgx_h100": ["outside/tests.py"]}),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source=None),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="/absolute/source"),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="../outside"),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="source/../outside"),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="./source"),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="source//nested"),
+        _mapping_document({"dgx_h100": [MAPPED_BUCKET]}, source="source/**/*.py"),
     ],
 )
 def test_invalid_source_mapping_rejects_identity(source_tree, mapping):
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(yaml.safe_dump(mapping))
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    ["mappings: [", "mappings: !unsupported []", "!!python/object/apply:builtins.eval ['1 + 1']"],
+)
+def test_invalid_or_unsafe_yaml_rejects_identity(source_tree, mapping):
     (source_tree / cache.SOURCE_MAPPING_FILE).write_text(mapping)
     with pytest.raises(ValueError):
         cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
 
 
+def test_duplicate_source_directory_rejects_identity(source_tree):
+    document = _mapping_document({"dgx_h100": [MAPPED_BUCKET]})
+    document["mappings"].append(
+        {"source_dir": MAPPED_SOURCE, "test_buckets": {"dgx_gb200": ["tests/unit_tests/**/*.py"]}}
+    )
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_missing_yaml_dependency_rejects_identity(source_tree, monkeypatch):
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_baseline_validation_and_finalization_do_not_require_yaml(mapped_generation, monkeypatch):
+    directory, identity = mapped_generation
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    before = _snapshot(directory)
+    cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
+    assert _snapshot(directory) == before
+    manifest = cache.finalize(directory, identity, "b" * 40, "456-1")
+    assert manifest["generation"] == "456-1"
+    cache.validate_cache(directory, identity, identity["cache_prefix"] + "456-1")
+
+
 def test_mapping_can_target_multiple_buckets_including_single_file(source_tree, mapped_source):
     single_file_bucket = "tests/unit_tests/distributed/mfsdp_v2/test_hooks.py"
     (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
-        json.dumps({MAPPED_SOURCE: {"dgx_h100": [MAPPED_BUCKET, single_file_bucket]}})
+        yaml.safe_dump(_mapping_document({"dgx_h100": [MAPPED_BUCKET, single_file_bucket]}))
     )
     wildcard = cache.cache_identity(source_tree, MAPPED_BUCKET, "dgx_h100", IMAGE_ID)
     single_file = cache.cache_identity(source_tree, single_file_bucket, "dgx_h100", IMAGE_ID)
@@ -509,6 +586,9 @@ def test_identity_without_image_diagnostics_preserves_usable_cache(
                 'sudo() { [[ "$*" == "rm -rf -- assets_dir/testmon" ]]; }',
                 'python() { [[ "$1" == "tests/unit_tests/testmon_cache.py" ]]; '
                 'shift; "$TEST_PYTHON" "$TESTMON_HELPER" "$@"; }',
+                'uv() { [[ "$1 $2 $3 $4 $5" == '
+                '"run --no-project --with pyyaml==6.0.3 python" ]] || return; '
+                'shift 5; python "$@"; }',
                 script,
             )
         ),

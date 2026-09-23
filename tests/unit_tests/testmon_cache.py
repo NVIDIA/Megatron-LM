@@ -25,7 +25,7 @@ TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
-SOURCE_MAPPING_FILE = "tests/unit_tests/testmon_source_mapping.json"
+SOURCE_MAPPING_FILE = "tests/unit_tests/testmon_source_mapping.yml"
 COMPATIBILITY_FILES = (
     ".github/actions/action.yml",
     ".github/workflows/_build_ci_container.yml",
@@ -105,7 +105,8 @@ def _digest(path: Path) -> str:
 
 def _validate_mapping_path(path: str) -> None:
     if (
-        not path
+        not isinstance(path, str)
+        or not path
         or PurePosixPath(path).is_absolute()
         or str(PurePosixPath(path)) != path
         or ".." in PurePosixPath(path).parts
@@ -116,17 +117,38 @@ def _validate_mapping_path(path: str) -> None:
 
 
 def _source_mapping(root: Path) -> dict[str, dict[str, list[str]]]:
-    mapping = _read_json(root / SOURCE_MAPPING_FILE)
-    for source, platforms in mapping.items():
+    # Only identity calculation needs YAML; restored-cache validation stays stdlib-only.
+    try:
+        import yaml
+    except ImportError as error:
+        raise ValueError("PyYAML is required to read Testmon source mappings") from error
+    try:
+        document = yaml.safe_load((root / SOURCE_MAPPING_FILE).read_text())
+    except yaml.YAMLError as error:
+        raise ValueError(f"invalid Testmon source mapping YAML: {error}") from error
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"mappings"}
+        or not isinstance(document["mappings"], list)
+    ):
+        raise ValueError("expected a Testmon mapping document with a mappings list")
+    mapping = {}
+    for entry in document["mappings"]:
+        if not isinstance(entry, dict) or set(entry) != {"source_dir", "test_buckets"}:
+            raise ValueError("expected source_dir and test_buckets in each Testmon mapping")
+        source = entry["source_dir"]
+        platforms = entry["test_buckets"]
         _validate_mapping_path(source)
         if source == "." or any(character in source for character in "*?[]"):
             raise ValueError(f"expected a source directory in Testmon mapping: {source!r}")
+        if source in mapping:
+            raise ValueError(f"duplicate Testmon source directory: {source!r}")
         if not isinstance(platforms, dict) or not platforms:
             raise ValueError(f"expected recipe platforms for mapped source: {source!r}")
         for recipe_platform, buckets in platforms.items():
             if recipe_platform not in RECIPE_PLATFORMS:
                 raise ValueError(f"unsupported mapped Testmon platform: {recipe_platform!r}")
-            if not isinstance(buckets, list) or not buckets:
+            if not isinstance(buckets, list):
                 raise ValueError(f"expected unit-test buckets for mapped source: {source!r}")
             for bucket in buckets:
                 if not isinstance(bucket, str):
@@ -134,6 +156,7 @@ def _source_mapping(root: Path) -> dict[str, dict[str, list[str]]]:
                 _validate_mapping_path(bucket)
                 if not bucket.startswith("tests/unit_tests/") or not bucket.endswith(".py"):
                     raise ValueError(f"invalid mapped unit-test bucket: {bucket!r}")
+        mapping[source] = platforms
     return mapping
 
 
@@ -335,7 +358,7 @@ def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Expose cache identity and validation to the host without Python dependencies."""
+    """Expose cache checks to the host; only identity calculation requires PyYAML."""
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     identity_parser = subparsers.add_parser("identity")

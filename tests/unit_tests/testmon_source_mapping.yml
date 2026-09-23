@@ -1,0 +1,10 @@
+# mappings: extra source dependencies that require full unit-test buckets.
+mappings:
+  # source_dir: repository-relative directory to watch, including subdirectories.
+  - source_dir: megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
+    # test_buckets: exact recipe test_case values, grouped by hardware platform.
+    # Omitted platforms (or empty lists) keep their normal Testmon selection.
+    test_buckets:
+      # dgx_h100: run this existing H100 bucket fully when source_dir changes.
+      dgx_h100:
+        - tests/unit_tests/distributed/mfsdp_v2/**/*.py
