@@ -225,16 +225,26 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     if hasattr(args, 'gdp_num_householder'):
         _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
-    _compare('experimental_attention_variant', default=None)
-    _compare('dsa_indexer_mode', default='standard')
-    _compare('dsa_simplified_use_learned_k', default=False)
-    _compare('dsa_simplified_indexer_disable_main_input_norm', default=False)
-    _compare('dsa_standard_indexer_use_main_input_norm', default=False)
-    _compare('dsa_indexer_n_heads', default=None)
-    _compare('dsa_indexer_head_dim', default=None)
-    _compare('dsa_indexer_topk', default=None)
-    _compare('dsa_indexer_use_hadamard', default=False)
-    if not getattr(args, 'no_load_optim', False) and not getattr(args, 'finetune', False):
+    load_optimizer = not getattr(args, 'no_load_optim', False) and not getattr(args, 'finetune', False)
+    # Dense checkpoints have no indexer architecture to compare during Phase 1 initialization.
+    # Keep the backbone checks and training progress while starting with a fresh optimizer.
+    initializing_dsa_indexer = (
+        not load_optimizer
+        and getattr(checkpoint_args, 'experimental_attention_variant', None) is None
+        and getattr(args, 'experimental_attention_variant', None) == 'dsa'
+        and getattr(args, 'dsa_train_indexer_only', False)
+    )
+    if not initializing_dsa_indexer:
+        _compare('experimental_attention_variant', default=None)
+        _compare('dsa_indexer_mode', default='standard')
+        _compare('dsa_simplified_use_learned_k', default=False)
+        _compare('dsa_simplified_indexer_disable_main_input_norm', default=False)
+        _compare('dsa_standard_indexer_use_main_input_norm', default=False)
+        _compare('dsa_indexer_n_heads', default=None)
+        _compare('dsa_indexer_head_dim', default=None)
+        _compare('dsa_indexer_topk', default=None)
+        _compare('dsa_indexer_use_hadamard', default=False)
+    if load_optimizer:
         def _dsa_trainability_mode(namespace):
             if getattr(namespace, 'dsa_train_indexer_only', False):
                 return 'indexer-only'
