@@ -7,6 +7,7 @@ import torch
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
+    _wgrad_gemm,
     copy_gtp_attributes,
     gtp_local_pad_zero_count,
     linear_with_frozen_weight,
@@ -418,3 +419,49 @@ def test_linear_fp32_output_matches_plain_te_general_gemm():
     )
 
     Utils.destroy_model_parallel()
+
+
+class TestWgradGemmAccumulate:
+    """``_wgrad_gemm(accumulate=True)`` adds into ``out`` instead of overwriting it.
+
+    This is what lets a weight consumed several times in one backward (MTP replays the block per
+    depth, and embedding/output_layer are shared across them) build its total wgrad in one buffer:
+    the first consume overwrites -- which doubles as the zero-fill -- and the rest accumulate.
+    Without it the caller needs a second full-size buffer, which at vocab scale is multiple GB.
+    """
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_overwrite_then_accumulate(self):
+        torch.manual_seed(1234)
+        tokens, out_features, in_features = 64, 32, 16
+        grad_output = torch.randn(tokens, out_features, dtype=torch.bfloat16, device="cuda")
+        total_input = torch.randn(tokens, in_features, dtype=torch.bfloat16, device="cuda")
+        # fp32 out from bf16 inputs is the real GTP case: main_grad is fp32 while the
+        # activations are bf16, which is why this path widens through the GEMM epilogue.
+        out = torch.full((out_features, in_features), 7.0, dtype=torch.float32, device="cuda")
+
+        # accumulate=False must overwrite, so the pre-existing 7.0 is gone.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=False)
+        first = out.clone()
+        assert not torch.allclose(first, torch.full_like(first, 7.0))
+
+        # accumulate=True over identical inputs must double it.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=True)
+        torch.testing.assert_close(out, first * 2, rtol=1e-5, atol=1e-5)
+
+        # A third accumulation keeps adding, so N consumes sum to N x.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=True)
+        torch.testing.assert_close(out, first * 3, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_default_is_overwrite(self):
+        """Default must stay overwrite - every existing caller relies on it."""
+        torch.manual_seed(1234)
+        grad_output = torch.randn(32, 16, dtype=torch.bfloat16, device="cuda")
+        total_input = torch.randn(32, 8, dtype=torch.bfloat16, device="cuda")
+        out = torch.zeros(16, 8, dtype=torch.float32, device="cuda")
+
+        _wgrad_gemm(out, grad_output, total_input)
+        once = out.clone()
+        _wgrad_gemm(out, grad_output, total_input)
+        torch.testing.assert_close(out, once, rtol=0, atol=0)

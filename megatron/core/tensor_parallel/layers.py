@@ -635,8 +635,12 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
-def _wgrad_gemm(out, grad_output, total_input):
+def _wgrad_gemm(out, grad_output, total_input, accumulate=False):
     """Weight-gradient GEMM into ``out``, which may be wider than the inputs (bf16 -> fp32).
+
+    ``accumulate=True`` adds into ``out`` rather than overwriting it, which lets a weight that is
+    consumed several times in one backward build its total wgrad in place -- no second buffer, and
+    the first consume (``accumulate=False``) doubles as the zero-fill.
 
     Returns ``out``, filled with the weight gradient.
     """
@@ -646,8 +650,17 @@ def _wgrad_gemm(out, grad_output, total_input):
     if te_general_gemm is not None:
         # torch.matmul cannot widen via out=, so TE's GEMM does the mixed-precision output.
         te_general_gemm(
-            total_input, grad_output, out_dtype=out.dtype, layout="NT", out=out, grad=True
+            total_input,
+            grad_output,
+            out_dtype=out.dtype,
+            layout="NT",
+            out=out,
+            grad=True,
+            accumulate=accumulate,
         )
+    elif accumulate:
+        # matmul rejects an out= of a different dtype, so land in the compute dtype and add.
+        out.add_(grad_output.t().matmul(total_input))
     else:
         # matmul rejects an out= of a different dtype, so land in the compute dtype and cast.
         out.copy_(grad_output.t().matmul(total_input))
@@ -849,12 +862,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             #
             # This branch widens the epilogue to main_grad's dtype, so the RS no longer rounds
             # across ranks before the fp32 accum sees the value.
-            grad_weight = _wgrad_gemm(sharded_weight.get_wgrad_tensor(), grad_output, total_input)
+            wgrad_buf = sharded_weight.get_wgrad_tensor()
+            grad_weight = _wgrad_gemm(
+                wgrad_buf,
+                grad_output,
+                total_input,
+                accumulate=sharded_weight.record_wgrad_consume(wgrad_buf),
+            )
         else:
             if ctx.gtp_remat_size > 1 and sharded_weight.use_zero_copy_wgrad(grad_output.dtype):
                 # GTP: write the wgrad straight into the reduce-scatter send buffer.
                 grad_weight = sharded_weight.get_wgrad_tensor()
-                torch.matmul(grad_output.t(), total_input, out=grad_weight)
+                # Consume the flag here too or this path never collapses; keep plain matmul
+                # otherwise, so the kernel is unchanged for every other GTP weight.
+                if sharded_weight.record_wgrad_consume(grad_weight):
+                    _wgrad_gemm(grad_weight, grad_output, total_input, accumulate=True)
+                else:
+                    torch.matmul(grad_output.t(), total_input, out=grad_weight)
             else:
                 grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None

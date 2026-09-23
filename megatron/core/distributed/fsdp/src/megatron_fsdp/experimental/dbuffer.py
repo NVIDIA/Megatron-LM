@@ -237,7 +237,7 @@ class DBuffer:
         """Return a storage-sharing buffer with supported ``placements``.
 
         Views preserve placements, relabel a full local buffer, or locally slice
-        one full local buffer to Flat. A view that changes a Partial placement is
+        one full local buffer to RowAtomic. A view that changes a Partial placement is
         only a storage destination: callers must populate it with a reduction
         before reading it.
         """
@@ -269,7 +269,7 @@ class DBuffer:
             return DBuffer.from_local(self.local_buffer, self.mesh, placements, self.layout)
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
-            "or a Replicate/Partial-to-Flat slice, "
+            "or a Replicate/Partial-to-RowAtomic slice, "
             f"got {self.placements!r} -> {placements!r}."
         )
 
@@ -382,8 +382,8 @@ class DBuffer:
         """Redistribute this buffer to ``new_placements``.
 
         This dispatcher supports the one-axis transitions:
-        Flat -> Replicate, Partial -> Replicate, Partial -> Flat,
-        Replicate -> Flat, and Replicate -> Partial. Other placement changes are
+        RowAtomic -> Replicate, Partial -> Replicate, Partial -> RowAtomic,
+        Replicate -> RowAtomic, and Replicate -> Partial. Other placement changes are
         intentionally unsupported.
         """
         new_placements = tuple(new_placements)
@@ -514,7 +514,7 @@ class DBuffer:
     def get_tensor_view(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
 
-        Flat placements shard dim 0, so the returned view preserves all
+        RowAtomic placements shard dim 0, so the returned view preserves all
         non-leading dimensions and only changes the leading dimension.
         """
         shape = self.layout.tensor_shapes[index]
@@ -538,7 +538,7 @@ class DBuffer:
         """Return logical tensor ``index`` as a DTensor."""
         local_tensor = self.get_tensor_view(index)
         tensor_shape = self.layout.tensor_shapes[index]
-        # Keep internal storage details (e.g. Flat and BlockAtomic) out of DTensor placements.
+        # Keep internal storage details (e.g. RowAtomic and BlockAtomic) out of DTensor placements.
         dtensor_placements = tuple(
             Shard(placement.dim) if isinstance(placement, Shard) else placement
             for placement in self.placements

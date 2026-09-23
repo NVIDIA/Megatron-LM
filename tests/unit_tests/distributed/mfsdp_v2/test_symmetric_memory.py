@@ -44,7 +44,7 @@ class TinyModel(nn.Module):
         return self.fc2(self.relu(self.fc1(x)))
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -69,13 +69,13 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
             fully_shard(
                 model.fc1,
                 mesh=mesh,
-                placements=_flat_placements(),
+                placements=_default_placements(),
                 mixed_precision_policy=mixed_precision_policy,
             )
             fully_shard(
                 model.fc2,
                 mesh=mesh,
-                placements=_flat_placements(),
+                placements=_default_placements(),
                 mixed_precision_policy=mixed_precision_policy,
             )
         optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
@@ -199,13 +199,13 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
         fully_shard(
             model.fc1,
             mesh=mesh,
-            placements=_flat_placements(),
+            placements=_default_placements(),
             mixed_precision_policy=mixed_precision_policy,
         )
         fully_shard(
             model.fc2,
             mesh=mesh,
-            placements=_flat_placements(),
+            placements=_default_placements(),
             mixed_precision_policy=mixed_precision_policy,
         )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
