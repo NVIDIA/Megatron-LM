@@ -183,6 +183,51 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
     }
 
 
+def test_cpu_resident_weight_export_stages_only_export_tensors(monkeypatch) -> None:
+    engine = _engine(
+        engine_config=_engine_config(param_offload=True, export_dtype="bfloat16")
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured["kwargs"] = kwargs
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+    to_calls = []
+    monkeypatch.setattr(engine, "to", lambda *args, **kwargs: to_calls.append((args, kwargs)))
+
+    weights, _ = engine.get_per_tensor_param()
+
+    assert list(weights) == []
+    assert to_calls == [(("cuda",), {"model": True, "optimizer": False, "grad": False})]
+    assert "staging_device" not in captured["kwargs"]
+
+    monkeypatch.setattr(engine, "to", lambda *args, **kwargs: pytest.fail("loaded full model"))
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.get_device_name", lambda: "cuda")
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.get_device_id", lambda: 3)
+    engine.handle = SimpleNamespace(_extras={"optimizer_backend": "fsdp2"})
+
+    weights, metadata = engine.get_per_tensor_param(cpu_resident=True)
+
+    assert list(weights) == []
+    assert metadata is None
+    assert captured["kwargs"]["cpu"] is False
+    assert captured["kwargs"]["buffer_max_size_bytes"] == 2 * 1024**3
+    assert captured["kwargs"]["staging_device"] == torch.device("cuda", 3)
+
+    for optimizer_backend in ("dist_opt", None):
+        engine.handle = SimpleNamespace(
+            _extras={"optimizer_backend": optimizer_backend}
+        )
+        with pytest.raises(NotImplementedError, match="yet"):
+            engine.get_per_tensor_param(cpu_resident=True)
+
+
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
     from verl_mlite.engine.mlite_engine import _build_lr_scheduler
 

@@ -375,7 +375,16 @@ class MegatronLiteEngine(BaseEngine):
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
-        if self.is_param_offload_enabled:
+        cpu_resident = bool(kwargs.pop("cpu_resident", False))
+        if cpu_resident and not self.is_param_offload_enabled:
+            raise RuntimeError("CPU-resident weight export requires parameter offload")
+        optimizer_backend = getattr(self.handle, "_extras", {}).get("optimizer_backend")
+        if cpu_resident and optimizer_backend != "fsdp2":
+            raise NotImplementedError(
+                f"CPU-resident weight export does not support the "
+                f"{optimizer_backend or 'unknown'} backend yet"
+            )
+        if self.is_param_offload_enabled and not cpu_resident:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
             aggressive_empty_cache(force_sync=True)
@@ -389,6 +398,10 @@ class MegatronLiteEngine(BaseEngine):
             buffer_max_size_bytes=2 * 1024**3,
             cpu=False,
         )
+        if cpu_resident:
+            export_kwargs["staging_device"] = torch.device(
+                get_device_name(), get_device_id()
+            )
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
