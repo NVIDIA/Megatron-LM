@@ -60,7 +60,7 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import _default_config_from_args, logger_args_snapshot
 from megatron.training.config import TokenizerConfig
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_run_config, get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -651,7 +651,6 @@ def save_checkpoint(
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    *, logger_config,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -831,7 +830,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                logger_args_snapshot(args, logger_config),
+                logger_args_snapshot(args),
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1076,11 +1075,12 @@ def save_checkpoint(
         if ckpt_type == CheckpointType.LOCAL:
 
             def iter_finalize_fn():
+                cfg = get_run_config()
                 print_rank_0(
                     f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully '
                     f'saved local checkpoint from iteration {iteration:7d}'
                 )
-                if logger_config.log_progress and args.async_save:
+                if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save,
                         f'Saved async local checkpoint\tIteration: {iteration}',
@@ -1114,6 +1114,7 @@ def save_checkpoint(
             gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
             def iter_finalize_fn():
+                cfg = get_run_config()
                 prev_iteration = 0
                 save_retain_interval = getattr(
                     args, 'save_retain_interval', None
@@ -1142,7 +1143,7 @@ def save_checkpoint(
                     )
                     config = _default_config_from_args(TokenizerConfig, args)
                     save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
-                if logger_config.log_progress and args.async_save:
+                if cfg.logger.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
@@ -1176,7 +1177,7 @@ def save_checkpoint(
                                     args=(
                                         args.save,
                                         prev_iteration,
-                                        logger_config.log_progress,
+                                        cfg.logger.log_progress,
                                         True,
                                         args.async_ckpt_cpu_priority,
                                         args.async_ckpt_io_priority,
@@ -1189,7 +1190,7 @@ def save_checkpoint(
                             else:
                                 th = threading.Thread(
                                     target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, logger_config.log_progress),
+                                    args=(args.save, prev_iteration, cfg.logger.log_progress),
                                 )
                                 th.start()
 
@@ -2825,7 +2826,7 @@ def load_checkpoint(
                 for m in model:
                     stack.enter_context(m.hide_loss_modules())
             load_kwargs['sharded_state_dict'] = generate_state_dict(
-                args,
+                logger_args_snapshot(args),
                 model,
                 gen_sd_optim,
                 gen_sd_opt_param_scheduler,
@@ -2922,7 +2923,7 @@ def load_checkpoint(
 
         try:
             state_dict = generate_state_dict(
-                args,
+                logger_args_snapshot(args),
                 model=model,
                 optimizer=gen_sd_optim,
                 opt_param_scheduler=gen_sd_opt_param_scheduler,

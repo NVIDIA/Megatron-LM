@@ -31,6 +31,7 @@ from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.argument_utils import logger_args_snapshot
 
 
 @dataclass(kw_only=True)
@@ -82,8 +83,6 @@ class _ModelOptBuilderMixin:
             pre_process,
             post_process,
             vp_stage,
-            log_max_attention_logit=self._model_config.transformer.log_max_attention_logit,
-            barrier_with_L1_time=self._model_config.transformer.barrier_with_L1_time,
             pg_collection=pg_collection,
         )
 
@@ -116,16 +115,12 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
         model._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
 
 
-def _load_teacher_model_config(
-    checkpoint_path: str, *, log_max_attention_logit: bool, barrier_with_L1_time: bool
-) -> Namespace:
+def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     """Reads teacher config from a file.
 
     The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
     should specify any model architecture settings which differ from the main student model's.
     The field names should match those returned by get_args() and not TransformerConfig.
-    Logging controls inherit the current run's owned policy unless explicitly
-    overridden in the teacher YAML, preserving the existing teacher precedence.
     """
     args = get_args()
 
@@ -142,9 +137,7 @@ def _load_teacher_model_config(
             )  # Useful for cases like QAD
             config_path = None
 
-    args_dict = vars(args).copy()
-    args_dict["log_max_attention_logit"] = log_max_attention_logit
-    args_dict["barrier_with_L1_time"] = barrier_with_L1_time
+    args_dict = vars(logger_args_snapshot(args))
 
     if config_path is not None:
         with open(config_path) as f:
@@ -273,8 +266,6 @@ def modelopt_gpt_hybrid_builder(
     config=None,
     pg_collection=None,
     *,
-    log_max_attention_logit: bool,
-    barrier_with_L1_time: bool,
     disable_moe_grouped_gemm: bool = False,
 ) -> MCoreGPTModel | MCoreHybridModel:
     """Builds the model.
@@ -302,9 +293,7 @@ def modelopt_gpt_hybrid_builder(
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    config = core_transformer_config_from_args(args)
-    config.log_max_attention_logit = log_max_attention_logit
-    config.barrier_with_L1_time = barrier_with_L1_time
+    config = core_transformer_config_from_args(logger_args_snapshot(args))
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:
@@ -507,11 +496,7 @@ def modelopt_gpt_hybrid_builder(
                 args.virtual_pipeline_model_parallel_size is None
             ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
-        teacher_config_raw = _load_teacher_model_config(
-            args.export_kd_teacher_load,
-            log_max_attention_logit=log_max_attention_logit,
-            barrier_with_L1_time=barrier_with_L1_time,
-        )
+        teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
         teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
 
         distill_cfg = mtd_mcore.setup_distillation_config(

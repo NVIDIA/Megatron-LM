@@ -3,7 +3,6 @@ from importlib.metadata import version
 import os
 from packaging.version import Version as PkgVersion
 import sys
-from functools import partial
 
 import torch
 
@@ -172,12 +171,12 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             sys.path.insert(0, './examples/multimodal')
             from examples.multimodal.model import model_provider
             from examples.multimodal.config import get_vision_model_config, get_vision_projection_config
-            self.model_provider = partial(model_provider, logger_config=self.logger_config)
+            self.model_provider = model_provider
             self.margs.model_type = ModelType.encoder_or_decoder
         elif self.md.model_type == 'BERT':
             from pretrain_bert import model_provider
             self.margs.model_type = ModelType.encoder_or_decoder
-            self.model_provider = partial(model_provider, logger_config=self.logger_config)
+            self.model_provider = model_provider
         else:
             raise Exception(f'unrecognized model type: {self.args.model_type}')
 

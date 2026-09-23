@@ -43,6 +43,7 @@ from megatron.training import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+from megatron.training.global_vars import get_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,6 @@ def initialize_megatron(
     seed_etp_group=None,
     skip_random_seed=False,
     skip_dependency_compilation=False,
-    *, logger_config,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -80,10 +80,10 @@ def initialize_megatron(
     args = get_args()
 
     # set logging level
-    setup_logging(logger_config=logger_config)
+    setup_logging()
 
     if args.async_save and args.use_persistent_ckpt_worker:
-        init_persistent_async_worker(args.rank, 'forkserver', logger_config=logger_config)
+        init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
     def state_save_func():
@@ -503,10 +503,10 @@ def _set_random_seed(
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
-def write_args_to_tensorboard(*, logger_config):
+def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     from megatron.training.argument_utils import logger_args_snapshot
-    args = logger_args_snapshot(get_args(), logger_config)
+    args = logger_args_snapshot(get_args())
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):
@@ -656,7 +656,7 @@ def _warmup_jit_function(tp_size=None):
     torch.cuda.empty_cache()
 
 
-def setup_logging(*, logger_config) -> None:
+def setup_logging() -> None:
     """Sets the default logging level based on cmdline args and env vars.
 
     Precedence:
@@ -666,12 +666,13 @@ def setup_logging(*, logger_config) -> None:
 
     Returns: None
     """
+    cfg = get_run_config()
     logging_level = None
     env_logging_level = os.getenv('MEGATRON_LOGGING_LEVEL', None)
     if env_logging_level is not None:
         logging_level = int(env_logging_level)
-    if logger_config.logging_level is not None:
-        logging_level = logger_config.logging_level
+    if cfg.logger.logging_level is not None:
+        logging_level = cfg.logger.logging_level
 
     if logging_level is not None:
         if is_rank0():

@@ -2,6 +2,7 @@
 import time, os
 
 from .global_vars import get_one_logger, get_args
+from megatron.training.global_vars import get_run_config
 
 _one_logger_utils_version = "1.2.0-mlm"
 
@@ -262,17 +263,18 @@ def on_save_checkpoint_start(async_save):
             return productive_metrics
 
             
-def on_pretrain_start(*, logger_config):
+def on_pretrain_start():
     """ Function to be called at the start of pretrain function to track E2E meta data
     """
+    cfg = get_run_config()
     args = get_args()
     one_logger = get_one_logger()
 
     if one_logger:
         with one_logger.get_context_manager():
             job_name = os.environ.get('SLURM_JOB_NAME', None)
-            app_tag_run_name =  job_name if not logger_config.app_tag_run_name else logger_config.app_tag_run_name
-            app_tag_run_version = logger_config.app_tag_run_version
+            app_tag_run_name =  job_name if not cfg.logger.app_tag_run_name else cfg.logger.app_tag_run_name
+            app_tag_run_version = cfg.logger.app_tag_run_version
             one_logger.store_set('app_tag_run_name', app_tag_run_name)
             one_logger.store_set('app_tag_run_version', app_tag_run_version)
             one_logger.store_set('train_throughput_per_gpu_max', 0.0)
@@ -290,7 +292,7 @@ def on_pretrain_start(*, logger_config):
                 'model_seq_length': args.seq_length,
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,
-                'is_log_throughput_enabled': logger_config.log_throughput,
+                'is_log_throughput_enabled': cfg.logger.log_throughput,
                 'app_run_type': 'training',
                 'summary_data_schema_version': '1.0.0',
                 'app_metrics_feature_tags': 'full',

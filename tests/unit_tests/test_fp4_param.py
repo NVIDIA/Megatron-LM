@@ -18,7 +18,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
-from megatron.training.argument_utils import logger_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -217,9 +216,7 @@ class TestFP4Param:
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
-                ModelType.encoder_or_decoder,
-                self.model_provider,
-                logger_config=logger_config_from_args(get_args()),
+                ModelType.encoder_or_decoder, self.model_provider
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -457,9 +454,7 @@ class TestFP4Param:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
         model_parallel_cuda_manual_seed(_SEED)
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder,
-            self.model_provider,
-            logger_config=logger_config_from_args(get_args()),
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(model) == 1
         return args, model, optimizer, opt_param_scheduler
@@ -526,14 +521,7 @@ class TestFP4Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
-            save_checkpoint(
-                3,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                0,
-                logger_config=logger_config_from_args(get_args()),
-            )
+            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
             self.cleanup_between_runs()

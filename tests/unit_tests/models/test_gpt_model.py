@@ -667,7 +667,7 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         ), "use_te_activation_func must be forwarded from config"
 
 
-def test_gpt_builder_forwards_rope_scaling_factor():
+def test_gpt_builder_forwards_rope_scaling_factor(run_config):
     """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
 
     Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
@@ -693,14 +693,7 @@ def test_gpt_builder_forwards_rope_scaling_factor():
     ):
         from gpt_builders import gpt_builder
 
-        gpt_builder(
-            mock_args,
-            pre_process=True,
-            post_process=True,
-            config=mock_config,
-            log_max_attention_logit=False,
-            barrier_with_L1_time=True,
-        )
+        gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
 
         mock_gpt_model.assert_called_once()
         _, call_kwargs = mock_gpt_model.call_args

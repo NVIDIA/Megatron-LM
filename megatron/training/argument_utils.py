@@ -611,14 +611,17 @@ def logger_config_from_args(args: Namespace) -> LoggerConfig:
     return config
 
 
-def logger_args_snapshot(args: Namespace, logger_config: LoggerConfig) -> Namespace:
+def logger_args_snapshot(args: Namespace) -> Namespace:
     """Project logging settings into detached checkpoint/metadata output."""
     from copy import copy, deepcopy
     from dataclasses import fields
 
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
     snapshot = copy(args)
-    for config_field in fields(logger_config):
-        setattr(snapshot, config_field.name, deepcopy(getattr(logger_config, config_field.name)))
+    for config_field in fields(cfg.logger):
+        setattr(snapshot, config_field.name, deepcopy(getattr(cfg.logger, config_field.name)))
     return snapshot
 
 
@@ -685,7 +688,7 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
 
 
 def inference_cfg_container_from_args(
-    args: Namespace, model_cfg=None
+    args: Namespace, model_cfg=None, *, build_model_config: bool = True
 ) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
@@ -698,8 +701,9 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
+        build_model_config: Leave the model unset for legacy model-provider entrypoints.
     """
-    if model_cfg is None:
+    if model_cfg is None and build_model_config:
         if getattr(args, "hybrid_layer_pattern", None) is not None:
             model_cfg = hybrid_config_from_args(args)
         else:

@@ -32,7 +32,7 @@ from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.training.utils import is_last_rank
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 
 def get_batch(data_iterator, image_token_index, img_seq_len):
@@ -391,13 +391,14 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args, logger_config=full_config.logger)
+    set_run_config(full_config)
+    initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         train_valid_test_dataloaders_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, logger_config=full_config.logger),
+        model_provider,
         process_non_loss_data_func=write_online_eval_to_tensorboard,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,

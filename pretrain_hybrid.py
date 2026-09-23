@@ -57,6 +57,7 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import (
     hybrid_config_from_args,
+    logger_args_snapshot,
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
@@ -65,7 +66,7 @@ from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from model_provider import model_provider
 
 try:
@@ -100,7 +101,7 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(logger_args_snapshot(args))
 
     if args.sequence_packing_scheduler is not None:
         (
@@ -363,7 +364,7 @@ def forward_step(data_iterator, model: HybridModel):
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(logger_args_snapshot(args))
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
@@ -567,7 +568,8 @@ if __name__ == "__main__":
     else:
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    initialize_runtime_services(args, logger_config=full_config.logger)
+    set_run_config(full_config)
+    initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,

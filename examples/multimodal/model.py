@@ -15,13 +15,13 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.utils import log_single_rank
+from megatron.training.argument_utils import logger_args_snapshot
 
 
 
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
     vp_stage=None, config=None, pg_collection=None,
-    *, logger_config,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -93,9 +93,12 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    base_config = config or core_transformer_config_from_args(get_args())
-    base_config.log_max_attention_logit = logger_config.log_max_attention_logit
-    base_config.barrier_with_L1_time = logger_config.barrier_with_L1_time
+    base_config = config or core_transformer_config_from_args(logger_args_snapshot(get_args()))
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
+    base_config.log_max_attention_logit = cfg.logger.log_max_attention_logit
+    base_config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = True

@@ -136,10 +136,11 @@ class TestTraining:
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
 
-    def test_params_norm_is_computed_only_when_it_can_be_logged(self):
+    def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
             log_params_norm=True, log_interval=20, tensorboard_dir=None, tensorboard_log_interval=1
         )
+        run_config.logger = args
 
         assert _should_compute_params_norm(args, iteration=1, is_first_iteration=True)
         assert _should_compute_params_norm(args, iteration=20, is_first_iteration=False)

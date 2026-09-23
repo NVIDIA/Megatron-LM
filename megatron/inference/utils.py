@@ -2,7 +2,6 @@
 
 import logging
 import warnings
-from functools import partial
 from argparse import ArgumentParser, Namespace
 from typing import Literal, Optional
 
@@ -28,7 +27,11 @@ from megatron.core.utils import log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    logger_args_snapshot,
+)
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
 
@@ -62,10 +65,16 @@ def get_model_builder(
     Returns:
         A :class:`ModelBuilder` instance bound to a config derived from ``args``.
     """
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        return GPTModelBuilder(gpt_config_from_args(args))
+        model_config = gpt_config_from_args(logger_args_snapshot(args))
+        model_config.transformer.log_max_attention_logit = cfg.logger.log_max_attention_logit
+        model_config.transformer.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
+        return GPTModelBuilder(model_config)
     if provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
@@ -73,11 +82,14 @@ def get_model_builder(
                 DeprecationWarning,
                 stacklevel=2,
             )
-        return HybridModelBuilder(hybrid_config_from_args(args))
+        model_config = hybrid_config_from_args(logger_args_snapshot(args))
+        model_config.transformer.log_max_attention_logit = cfg.logger.log_max_attention_logit
+        model_config.transformer.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
+        return HybridModelBuilder(model_config)
     raise ValueError(f"Invalid model provider {provider}")
 
 
-def get_model_for_inference(*, logger_config) -> MegatronModule:
+def get_model_for_inference() -> MegatronModule:
     """Initialize model and load checkpoint for inference."""
 
     args = get_args()
@@ -87,17 +99,12 @@ def get_model_for_inference(*, logger_config) -> MegatronModule:
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
         # care of running the modelopt-checkpoint auto-detection side effect.
-        model = _get_model(partial(modelopt_gpt_hybrid_builder,
-                                  log_max_attention_logit=logger_config.log_max_attention_logit,
-                                  barrier_with_L1_time=logger_config.barrier_with_L1_time),
-                           wrap_with_ddp=False)
+        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
     else:
         builder = get_model_builder(args)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = builder.build_distributed_models(
-            pg_collection=pg_collection, wrap_with_ddp=False,
-            log_max_attention_logit=logger_config.log_max_attention_logit,
-            barrier_with_L1_time=logger_config.barrier_with_L1_time,
+            pg_collection=pg_collection, wrap_with_ddp=False
         )
 
     # Load checkpoint.
@@ -365,9 +372,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     )
 
 
-def get_dynamic_inference_engine(model: MegatronModule) -> DynamicInferenceEngine:
+def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
     """Builds a `DynamicInferenceEngine`."""
     args = get_args()
+    if model is None:
+        model = get_model_for_inference()
     tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)

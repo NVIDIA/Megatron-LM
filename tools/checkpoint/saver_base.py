@@ -139,7 +139,6 @@ class MegatronCheckpointSaverBase:
         try:
             from megatron.training.global_vars import set_global_variables, get_args
             from megatron.core import mpu
-            from megatron.training.argument_utils import logger_config_from_args
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -148,7 +147,6 @@ class MegatronCheckpointSaverBase:
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
-        self.logger_config = logger_config_from_args(self.margs)
 
         if hasattr(self.md, 'consumed_train_samples'):
             self.margs.consumed_train_samples = self.md.consumed_train_samples
@@ -360,7 +358,7 @@ class MegatronCheckpointSaverBase:
                     save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
-                        tensor_rank=tp_rank, logger_config=self.logger_config)
+                        tensor_rank=tp_rank)
                     # release the uselese model parts
                     self.models[pp_rank][ep_rank][tp_rank] = None
 

@@ -30,7 +30,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -48,6 +48,7 @@ from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
@@ -128,10 +129,9 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    from megatron.training.argument_utils import logger_config_from_args
-    logger_config = logger_config_from_args(args)
-    initialize_runtime_services(args, logger_config=logger_config)
-    initialize_megatron(logger_config=logger_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -151,19 +151,12 @@ def main(model_type: str = "gpt"):
             # modelopt hooks have not been ported to the new ``ModelBuilder``
             # API yet. ``get_model`` also handles the modelopt-checkpoint
             # auto-detection side effect.
-            from functools import partial
-
-            model = get_model(partial(modelopt_gpt_hybrid_builder,
-                                      log_max_attention_logit=logger_config.log_max_attention_logit,
-                                      barrier_with_L1_time=logger_config.barrier_with_L1_time),
-                              wrap_with_ddp=False)
+            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
         else:
             builder = get_model_builder(args, provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             model = builder.build_distributed_models(
-                pg_collection=pg_collection, wrap_with_ddp=False,
-                log_max_attention_logit=logger_config.log_max_attention_logit,
-                barrier_with_L1_time=logger_config.barrier_with_L1_time,
+                pg_collection=pg_collection, wrap_with_ddp=False
             )
 
     if args.load is not None:

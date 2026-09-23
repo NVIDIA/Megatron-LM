@@ -20,6 +20,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.training.argument_utils import logger_args_snapshot
 
 # Canonical RADIO encoder module name (shared by the provider key + topology default).
 RADIO_ENCODER_MODULE_NAME = "radio_encoder"
@@ -67,7 +68,7 @@ def _base_config(args: argparse.Namespace) -> TransformerConfig:
     """Stock config from CLI args; the per-tower override helpers deepcopy this."""
     from megatron.training.argument_utils import core_transformer_config_from_args
 
-    return core_transformer_config_from_args(args)
+    return core_transformer_config_from_args(logger_args_snapshot(args))
 
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:

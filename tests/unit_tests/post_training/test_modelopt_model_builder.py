@@ -5,23 +5,12 @@
 from argparse import Namespace
 
 import model_provider as mp
-from megatron.training.config import LoggerConfig
 
 
 def _sentinel_builder(return_value, calls):
     """Create a builder stub that records invocation."""
 
-    def _builder(
-        args,
-        pre_process,
-        post_process,
-        vp_stage,
-        config=None,
-        pg_collection=None,
-        *,
-        log_max_attention_logit,
-        barrier_with_L1_time: bool,
-    ):
+    def _builder(args, pre_process, post_process, vp_stage, config=None, pg_collection=None):
         calls.append(
             {
                 "args": args,
@@ -30,8 +19,6 @@ def _sentinel_builder(return_value, calls):
                 "vp_stage": vp_stage,
                 "config": config,
                 "pg_collection": pg_collection,
-                "log_max_attention_logit": log_max_attention_logit,
-                "barrier_with_L1_time": barrier_with_L1_time,
             }
         )
         return return_value
@@ -65,7 +52,6 @@ def test_model_provider_switches_to_modelopt_builder(monkeypatch):
         vp_stage=1,
         config="cfg",
         pg_collection="pg",
-        logger_config=LoggerConfig(log_max_attention_logit=False),
     )
 
     assert returned is modelopt_result
@@ -77,8 +63,6 @@ def test_model_provider_switches_to_modelopt_builder(monkeypatch):
             "vp_stage": 1,
             "config": "cfg",
             "pg_collection": "pg",
-            "log_max_attention_logit": False,
-            "barrier_with_L1_time": True,
         }
     ]
     assert len(original_calls) == 0

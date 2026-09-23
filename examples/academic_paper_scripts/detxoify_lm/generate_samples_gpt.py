@@ -23,8 +23,10 @@ from megatron.core.models.gpt import GPTModel
 from typing import Union
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.argument_utils import logger_args_snapshot
 
 def model_provider(pre_process=True, post_process=True) -> GPTModel:
     """Builds the model.
@@ -40,7 +42,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(args)
+    config = core_transformer_config_from_args(logger_args_snapshot(args))
 
     if args.spec is None:
         if args.transformer_impl == 'local':
@@ -227,10 +229,9 @@ def main():
                                            'no_load_rng': True,
                                            'no_load_optim': True,
                                            'seq_length': 2048})
-    from megatron.training.argument_utils import logger_config_from_args
-    logger_config = logger_config_from_args(args)
-    initialize_runtime_services(args, logger_config=logger_config)
-    initialize_megatron(logger_config=logger_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)

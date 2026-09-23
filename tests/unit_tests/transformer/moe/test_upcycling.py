@@ -25,7 +25,6 @@ from megatron.core.utils import (
     is_te_min_version,
     unwrap_model,
 )
-from megatron.training.argument_utils import logger_config_from_args
 from megatron.training.argument_utils import gpt_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -197,7 +196,6 @@ class TestGPTModel:
             model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
-            logger_config=cfg_container.logger,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -229,8 +227,6 @@ class TestGPTModel:
             pg_collection=pg_collection,
             ddp_config=cfg_container.ddp,
             data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
-            log_max_attention_logit=False,
-            barrier_with_L1_time=True,
         )
 
         # Upcycle the dense model to the MoE model
@@ -270,9 +266,7 @@ class TestGPTModel:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            ModelType.encoder_or_decoder,
-            model_provider,
-            logger_config=logger_config_from_args(get_args()),
+            ModelType.encoder_or_decoder, model_provider
         )
         dense_model = unwrap_model(dense_model)
         set_bias_value(dense_model)
@@ -345,7 +339,6 @@ class TestGPTModel:
             model_provider,
             cfg_container=cfg_container,
             pg_collection=pg_collection,
-            logger_config=cfg_container.logger,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -377,8 +370,6 @@ class TestGPTModel:
             pg_collection=pg_collection,
             ddp_config=cfg_container.ddp,
             data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
-            log_max_attention_logit=False,
-            barrier_with_L1_time=True,
         )
 
         # Upcycle the dense model to the MoE model

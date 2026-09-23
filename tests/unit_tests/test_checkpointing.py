@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
-from dataclasses import fields
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -20,9 +19,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
-from megatron.training.argument_utils import logger_config_from_args
-from megatron.training.config import LoggerConfig
-from megatron.training.global_vars import get_args
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -393,7 +389,7 @@ def create_checkpoint(load_path, ckpt_format):
 
 
 @pytest.fixture
-def create_args():
+def create_args(run_config):
     """Setup dummy args."""
     args = SimpleNamespace()
     args.finetune = False
@@ -508,9 +504,6 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
     """Test save_checkpoint."""
     args = create_args
     args.ckpt_format = ckpt_format
-    logger_config = LoggerConfig(log_interval=17, otel_service_name="owned")
-    args.log_interval = 99
-    args.otel_service_name = "stale"
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
@@ -552,7 +545,6 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 cp_group=cp_group,
-                logger_config=logger_config,
             )
         assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
 
@@ -568,10 +560,6 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
-        state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
-        for field in fields(logger_config):
-            assert getattr(state["args"], field.name) == getattr(logger_config, field.name)
-        assert args.log_interval == 99 and args.otel_service_name == "stale"
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
@@ -603,12 +591,7 @@ def test_load_checkpoint(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration,
-            [model],
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            logger_config=logger_config_from_args(get_args()),
+            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
@@ -671,12 +654,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         num_floating_point_operations_so_far = 456
 
         save_checkpoint(
-            iteration,
-            [model],
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            logger_config=logger_config_from_args(get_args()),
+            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
@@ -739,14 +717,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
-            save_checkpoint(
-                iteration,
-                [model],
-                optimizer,
-                opt_param_scheduler,
-                num_fp_ops,
-                logger_config=logger_config_from_args(get_args()),
-            )
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
 
         second_job_mock_metadata = {
             **base_metadata,
@@ -762,14 +733,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             assert optimizer._called_metadata[-1] == first_job_mock_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
-            save_checkpoint(
-                iteration,
-                [model],
-                optimizer,
-                opt_param_scheduler,
-                num_fp_ops,
-                logger_config=logger_config_from_args(get_args()),
-            )
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
         assert optimizer._called_metadata == model._called_metadata

@@ -118,6 +118,7 @@ from megatron.rl.server.inference.inference_interface_server import InferenceInt
 from megatron.rl.types import KNOWN_ROLLOUT_STATUSES
 from megatron.training.global_vars import (
     get_args,
+    get_run_config,
     get_tensorboard_writer,
     get_tokenizer,
     get_wandb_writer,
@@ -409,13 +410,14 @@ def get_rl_runtime_state():
     return _rl_runtime_state
 
 
-def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer, *, logger_config):
+def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer):
     """Compute, log, and store RL token throughput metrics.
 
     Returns a string fragment to append to the training log line.
     Also logs metrics to wandb and stores them on RLRuntimeState for
     downstream consumers (e.g. RLProfiler).
     """
+    cfg = get_run_config()
     log_string = ''
     tokens_per_sec = None
     tokens_per_sec_per_gpu = None
@@ -496,7 +498,7 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
         log_string += f' avg_seq_len: {avg_seq_length:.1f} |'
         if wandb_writer is not None:
             wandb_writer.log({'throughput/avg_seq_length': avg_seq_length}, iteration)
-    elif logger_config.log_throughput:
+    elif cfg.logger.log_throughput:
         log_string += f' avg_seq_len: {args.seq_length} |'
 
     return log_string

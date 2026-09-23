@@ -20,9 +20,10 @@ from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 warnings.filterwarnings('ignore')
 
@@ -97,10 +98,9 @@ if __name__ == "__main__":
             'no_load_rng': True,
             'no_load_optim': True,
         })
-    from megatron.training.argument_utils import logger_config_from_args
-    logger_config = logger_config_from_args(args)
-    initialize_runtime_services(args, logger_config=logger_config)
-    initialize_megatron(logger_config=logger_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     check_arguments()
 
@@ -120,7 +120,7 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_hf_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder, logger_config=logger_config), wrap_with_ddp=False)
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
 
     report_current_memory_info()
 

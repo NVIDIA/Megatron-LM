@@ -100,12 +100,9 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
         model_type=ModelType.encoder_or_decoder,
-        model_provider_func=partial(
-            model_provider, hybrid_builder, logger_config=cfg_container.logger
-        ),
+        model_provider_func=partial(model_provider, hybrid_builder),
         cfg_container=cfg_container,
         pg_collection=pg_collection,
-        logger_config=cfg_container.logger,
     )
     return model, optimizer
 

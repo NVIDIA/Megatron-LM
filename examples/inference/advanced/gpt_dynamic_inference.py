@@ -51,7 +51,8 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -294,10 +295,9 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    from megatron.training.argument_utils import logger_config_from_args
-    logger_config = logger_config_from_args(args)
-    initialize_runtime_services(args, logger_config=logger_config)
-    initialize_megatron(logger_config=logger_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
@@ -329,7 +329,7 @@ def main():
         stop_words=args.stop_words,
     )
 
-    model = get_model_for_inference(logger_config=logger_config)
+    model = get_model_for_inference()
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)

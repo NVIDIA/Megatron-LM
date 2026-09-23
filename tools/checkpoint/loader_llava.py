@@ -94,15 +94,12 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         self.check_for_arg('kv_channels')
 
     def import_model_provider(self):
-        from functools import partial
-        from megatron.training.argument_utils import logger_config_from_args
-
         if self.args.megatron_path is not None:
             sys.path.insert(0, os.path.join(self.args.megatron_path, 'examples/multimodal'))
         else:
             sys.path.insert(0, './examples/multimodal')
         from examples.multimodal.model import model_provider
-        return partial(model_provider, logger_config=logger_config_from_args(self.margs))
+        return model_provider
 
     def build_checkpoint_metadata(self, true_vocab_size):
         """

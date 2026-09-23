@@ -30,7 +30,8 @@ from megatron.inference.utils import (
 )
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
@@ -104,10 +105,9 @@ def main():
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
-    from megatron.training.argument_utils import logger_config_from_args
-    logger_config = logger_config_from_args(args)
-    initialize_runtime_services(args, logger_config=logger_config)
-    initialize_megatron(logger_config=logger_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     args = get_args()
 
@@ -116,7 +116,7 @@ def main():
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)
-    model = get_model_for_inference(logger_config=logger_config)
+    model = get_model_for_inference()
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     try:

@@ -367,17 +367,14 @@ class BertEmbedder:
     '''Compute Bert embeddings, from a text dataset.'''
 
     def __init__(self, batch_size, max_bert_seq_length, embedder_type, warmup=True):
-        from megatron.training.argument_utils import logger_config_from_args
 
         args = get_args()
 
         assert args.output_bert_embeddings
 
-        logger_config = logger_config_from_args(args)
         self.models, optimizer, opt_param_scheduler = \
             setup_model_and_optimizer(ModelType.encoder_or_decoder,
-                                      partial(model_provider, logger_config=logger_config),
-                                      logger_config=logger_config)
+                                      model_provider)
         self.batch_size = batch_size
         self.max_bert_seq_length = max_bert_seq_length
 

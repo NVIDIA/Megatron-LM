@@ -738,9 +738,7 @@ class TestGPTModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = [Mock()]
         mock_compose.return_value = Mock(return_value=None)
 
-        self.builder.build_distributed_models(
-            self.pg, log_max_attention_logit=False, barrier_with_L1_time=True
-        )
+        self.builder.build_distributed_models(self.pg)
 
         assert mock_unimodal.called
 
@@ -752,9 +750,7 @@ class TestGPTModelBuilderBuildDistributedModels:
         # post_wrap hook returns None → original list kept
         mock_compose.return_value = Mock(return_value=None)
 
-        result = self.builder.build_distributed_models(
-            self.pg, log_max_attention_logit=False, barrier_with_L1_time=True
-        )
+        result = self.builder.build_distributed_models(self.pg)
 
         assert result is model_list
 
@@ -768,9 +764,7 @@ class TestGPTModelBuilderBuildDistributedModels:
 
         hook1 = Mock()
         self.config.pre_wrap_hooks = [hook1]
-        self.builder.build_distributed_models(
-            self.pg, log_max_attention_logit=False, barrier_with_L1_time=True
-        )
+        self.builder.build_distributed_models(self.pg)
 
         # First compose_hooks call must be with the pre_wrap_hooks list
         assert mock_compose.call_args_list[0] == call([hook1])
@@ -788,9 +782,7 @@ class TestGPTModelBuilderBuildDistributedModels:
         composed_post = Mock(return_value=wrapped_list)
         mock_compose.side_effect = [composed_pre, composed_post]
 
-        result = self.builder.build_distributed_models(
-            self.pg, log_max_attention_logit=False, barrier_with_L1_time=True
-        )
+        result = self.builder.build_distributed_models(self.pg)
 
         composed_post.assert_called_once_with(model_list)
         assert result is wrapped_list
@@ -802,9 +794,7 @@ class TestGPTModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = model_list
         mock_compose.return_value = Mock(return_value=None)
 
-        result = self.builder.build_distributed_models(
-            self.pg, log_max_attention_logit=False, barrier_with_L1_time=True
-        )
+        result = self.builder.build_distributed_models(self.pg)
 
         assert result is model_list
 
@@ -817,9 +807,7 @@ class TestGPTModelBuilderBuildDistributedModels:
         mock_unimodal.return_value = [Mock()]
         mock_compose.return_value = Mock(return_value=None)
 
-        self.builder.build_distributed_models(
-            self.pg, log_max_attention_logit=False, barrier_with_L1_time=True
-        )
+        self.builder.build_distributed_models(self.pg)
 
         args = mock_unimodal.call_args.args
         assert args[0] == self.builder.build_model

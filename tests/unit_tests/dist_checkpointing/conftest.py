@@ -13,6 +13,12 @@ def pytest_sessionfinish(session, exitstatus):
         session.exitstatus = 0
 
 
+@pytest.fixture(autouse=True)
+def checkpoint_run_config(run_config):
+    """Checkpoint-runtime tests use the run-owned logging policy."""
+    return run_config
+
+
 @pytest.fixture(scope='session', autouse=True)
 def disable_msc():
     MultiStorageClientFeature.disable()

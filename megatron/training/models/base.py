@@ -224,9 +224,6 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
-        *,
-        log_max_attention_logit: bool,
-        barrier_with_L1_time: bool,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 

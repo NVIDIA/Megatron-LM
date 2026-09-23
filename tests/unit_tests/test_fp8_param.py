@@ -20,7 +20,6 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
-from megatron.training.argument_utils import logger_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -284,10 +283,7 @@ class TestFP8Param:
             builder_cls = model_cfg.get_builder_cls()
             builder = builder_cls(model_cfg)
             gpt_model = builder.build_distributed_models(
-                pg_collection=pg_collection,
-                wrap_with_ddp=False,
-                log_max_attention_logit=False,
-                barrier_with_L1_time=True,
+                pg_collection=pg_collection, wrap_with_ddp=False
             )
             gpt_model[0].eval()
             optimizer = None
@@ -297,7 +293,6 @@ class TestFP8Param:
                 self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
-                logger_config=cfg_container.logger,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
         if getattr(args, "use_layer_wise_distributed_optimizer", False):
@@ -740,7 +735,6 @@ class TestFP8Param:
             self.model_provider,
             cfg_container=cfg_container,
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-            logger_config=cfg_container.logger,
         )
         assert len(model) == 1
         return args, model, optimizer, opt_param_scheduler
@@ -843,14 +837,7 @@ class TestFP8Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
-            save_checkpoint(
-                3,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                0,
-                logger_config=logger_config_from_args(get_args()),
-            )
+            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
             self.cleanup_between_runs()

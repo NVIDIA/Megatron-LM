@@ -42,7 +42,8 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, 
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def is_first_rank():
@@ -845,15 +846,14 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
-    from megatron.training.argument_utils import logger_config_from_args
-    logger_config = logger_config_from_args(args)
-    initialize_runtime_services(args, logger_config=logger_config)
-    initialize_megatron(logger_config=logger_config)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
+    initialize_megatron()
 
     args = get_args()
 
     def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
-        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder, logger_config=logger_config,
+        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
                               parallel_output=False)
 
     # Set up model and load checkpoint.

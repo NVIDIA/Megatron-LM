@@ -11,7 +11,6 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.training.argument_utils import logger_config_from_args
 from megatron.training.arguments import parse_args
 
 nvidia_resiliency_ext = pytest.importorskip(
@@ -136,7 +135,6 @@ class TestLocalCheckpointingReplication:
                 num_floating_point_operations_so_far,
                 checkpointing_context=self.checkpointing_context,
                 non_persistent_ckpt=True,
-                logger_config=logger_config_from_args(mock_args),
             )
             if async_save:
                 maybe_finalize_async_save(True)

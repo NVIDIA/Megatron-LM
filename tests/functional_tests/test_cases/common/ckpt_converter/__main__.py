@@ -22,7 +22,6 @@ from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDE
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.training.argument_utils import logger_config_from_args
 from megatron.training import get_args, get_tokenizer
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
@@ -223,7 +222,7 @@ class Pipeline:
 
     @staticmethod
     def build_model():
-        model_provider_func = partial(model_provider, gpt_builder, logger_config=logger_config_from_args(get_args()))
+        model_provider_func = partial(model_provider, gpt_builder)
         models = get_model(
             model_provider_func=model_provider_func, model_type=ModelType.encoder_or_decoder
         )
@@ -416,7 +415,6 @@ class Pipeline:
             optimizer=None,
             opt_param_scheduler=None,
             num_floating_point_operations_so_far=None,
-            logger_config=logger_config_from_args(get_args()),
         )
 
         return output_tensor, orig_input_ids
@@ -746,7 +744,7 @@ class LLaVAPipeline(Pipeline):
         from examples.multimodal.model import model_provider
 
         models = get_model(
-            model_provider_func=partial(model_provider, logger_config=logger_config_from_args(get_args())), model_type=ModelType.encoder_or_decoder
+            model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder
         )
         [m.eval() for m in models]
 

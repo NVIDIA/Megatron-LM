@@ -27,6 +27,7 @@ from tools.run_dynamic_text_generation_server import (
     add_text_generation_server_args,
     parse_args_and_detect_vlm,
 )
+from megatron.training.global_vars import get_run_config
 
 # pylint: disable=line-too-long
 
@@ -215,7 +216,7 @@ if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp8 optimizations
     # check for it.
     with torch.inference_mode():
-        args, is_vlm, logger_config = parse_args_and_detect_vlm(
+        args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
@@ -235,21 +236,20 @@ if __name__ == "__main__":
             ),
         )
 
-        if getattr(logger_config, 'moe_routing_trace_path', None):
+        cfg = get_run_config()
+        if cfg.logger.moe_routing_trace_path:
             rank = dist.get_rank()
             max_steps = getattr(args, 'moe_routing_trace_max_inference_steps', None) or 10**9
             init_moe_router_tracer(
-                output_dir=logger_config.moe_routing_trace_path,
+                output_dir=cfg.logger.moe_routing_trace_path,
                 max_steps=max_steps,
                 rank=rank,
-                capture_hidden_states=getattr(
-                    logger_config, 'moe_routing_trace_capture_hidden_states', False
-                ),
-                capture_logits=getattr(logger_config, 'moe_routing_trace_capture_logits', False),
-                dump_router_weights=getattr(logger_config, 'moe_routing_trace_dump_weights', False),
+                capture_hidden_states=cfg.logger.moe_routing_trace_capture_hidden_states,
+                capture_logits=cfg.logger.moe_routing_trace_capture_logits,
+                dump_router_weights=cfg.logger.moe_routing_trace_dump_weights,
             )
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm, logger_config=logger_config)
+        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
         model = engine.controller.inference_wrapped_model.model
 
         tracer = get_moe_router_tracer()

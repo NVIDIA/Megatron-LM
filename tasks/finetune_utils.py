@@ -7,7 +7,6 @@ import sys
 import torch
 
 from megatron.training import get_args
-from megatron.training.argument_utils import logger_config_from_args
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import print_rank_0
 from megatron.training import get_timers
@@ -22,6 +21,7 @@ from megatron.training.training import training_log
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.utils import calc_params_l2_norm
 from megatron.training.utils import check_adlr_autoresume_termination
+from megatron.training.global_vars import get_run_config
 
 
 def process_batch(batch):
@@ -146,8 +146,9 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
 
 
 def _train(model, optimizer, opt_param_scheduler, forward_step,
-           train_dataloader, valid_dataloader, end_of_epoch_callback, *, logger_config):
+           train_dataloader, valid_dataloader, end_of_epoch_callback):
     """Train the model."""
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
 
@@ -186,37 +187,33 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
             start_iteration = 0
 
             # Train for one step.
-            out = train_step(forward_step, batch, model, optimizer, opt_param_scheduler,
-                             logger_config=logger_config)
+            out = train_step(forward_step, batch, model, optimizer, opt_param_scheduler)
 
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
             iteration += 1
 
             # Logging.
             params_norm = None
-            if logger_config.log_params_norm:
+            if cfg.logger.log_params_norm:
                 params_norm = calc_params_l2_norm(model)
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
                                               iteration,
                                               optimizer.get_loss_scale().item(),
                                               report_memory_flag, skipped_iter,
-                                              grad_norm, params_norm, num_zeros_in_grad,
-                                              logger_config=logger_config)
+                                              grad_norm, params_norm, num_zeros_in_grad)
 
             # Autoresume
             if args.adlr_autoresume and \
                (iteration % args.adlr_autoresume_interval == 0):
                 check_adlr_autoresume_termination(iteration, model,
-                                                  optimizer, opt_param_scheduler,
-                                                  logger_config=logger_config)
+                                                  optimizer, opt_param_scheduler)
 
             # Checkpointing
             saved_checkpoint = False
             if args.save and args.save_interval and \
                iteration % args.save_interval == 0:
-                save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                                logger_config=logger_config)
+                save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
                 saved_checkpoint = True
 
             # Evaluation
@@ -225,21 +222,19 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
                 prefix = 'iteration {}'.format(iteration)
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
-                                           iteration, None, False, logger_config=logger_config)
+                                           iteration, None, False)
 
             # Exiting based on iterations
             if args.exit_interval and iteration % args.exit_interval == 0:
                 if not saved_checkpoint:
-                    save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                                    logger_config=logger_config)
+                    save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
                 torch.distributed.barrier()
                 print_rank_0('exiting program at iteration {}'.format(iteration))
                 sys.exit()
 
         # Checkpointing at the end of each epoch.
         if args.save:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
-                            logger_config=logger_config)
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
         # Callback at the end of each epoch.
         if end_of_epoch_callback is not None:
@@ -253,7 +248,6 @@ def finetune(train_valid_datasets_provider, model_provider,
              task_collate_fn=None):
     """Main finetune function used across all tasks."""
     args = get_args()
-    logger_config = logger_config_from_args(args)
     timers = get_timers()
 
     # Train and validation data loaders.
@@ -275,8 +269,7 @@ def finetune(train_valid_datasets_provider, model_provider,
 
     # Build model, optimizer and learning rate scheduler.
     timers('model and optimizer', log_level=0).start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_type, model_provider, logger_config=logger_config)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_type, model_provider)
     timers('model and optimizer').stop()
 
     # If pretrained checkpoint is provided and we have not trained for
@@ -305,8 +298,7 @@ def finetune(train_valid_datasets_provider, model_provider,
     # Finetune the model.
     if args.epochs > 0:
         _train(model, optimizer, opt_param_scheduler, forward_step,
-               train_dataloader, valid_dataloader, end_of_epoch_callback,
-               logger_config=logger_config)
+               train_dataloader, valid_dataloader, end_of_epoch_callback)
     # Or just evaluate.
     else:
         if end_of_epoch_callback is not None:

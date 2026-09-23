@@ -990,7 +990,7 @@ def create_pretrain_data_iterator(
     return iter([batch])
 
 
-def test_sequence_packing_batch_uses_context_parallel_batch_interface():
+def test_sequence_packing_batch_uses_context_parallel_batch_interface(run_config):
     tokens = torch.tensor([[1, 2]])
     labels = torch.tensor([[2, 3]])
     loss_mask = torch.ones(1, 2)

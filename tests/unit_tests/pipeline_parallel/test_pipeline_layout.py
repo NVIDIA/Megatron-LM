@@ -23,8 +23,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.argument_utils import logger_config_from_args
-from megatron.training.global_vars import get_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -213,7 +211,9 @@ def create_args():
         ),  # mtp in the second last stage with no other layers
     ],
 )
-def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp):
+def test_forward_vpp(
+    create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp, run_config
+):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     args = create_args
@@ -291,12 +291,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         args.save = ckpt_dir
         args.load = ckpt_dir
         save_checkpoint(
-            iteration,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            logger_config=logger_config_from_args(get_args()),
+            iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
         print(f"save checkpoint done")
 

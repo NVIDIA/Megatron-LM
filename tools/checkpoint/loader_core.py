@@ -54,17 +54,14 @@ class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
 
     def import_model_provider(self):
         """Return the correct model_provider function depending on GPT vs. BERT."""
-        from megatron.training.argument_utils import logger_config_from_args
-
-        logger_config = logger_config_from_args(self.margs)
         if self.args.model_type == 'GPT':
             from model_provider import model_provider
             from gpt_builders import gpt_builder
-            self.model_provider = partial(model_provider, gpt_builder, logger_config=logger_config)
-            return partial(model_provider, logger_config=logger_config)
+            self.model_provider = partial(model_provider, gpt_builder)
+            return model_provider
         elif self.args.model_type == 'BERT':
             from pretrain_bert import model_provider
-            return partial(model_provider, logger_config=logger_config)
+            return model_provider
         else:
             raise Exception(f"Unrecognized model type: {self.args.model_type}")
 

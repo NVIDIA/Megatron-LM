@@ -37,10 +37,10 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import logger_args_snapshot, pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from pretrain_gpt import loss_func
 
 
@@ -52,7 +52,6 @@ def model_provider(
     parallel_output=True,
     config=None,
     pg_collection=None,
-    *, logger_config,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -120,11 +119,14 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
     if config is None:
-        language_transformer_config = core_transformer_config_from_args(get_args())
+        language_transformer_config = core_transformer_config_from_args(logger_args_snapshot(get_args()))
     else:
         language_transformer_config = config
-    language_transformer_config.log_max_attention_logit = logger_config.log_max_attention_logit
-    language_transformer_config.barrier_with_L1_time = logger_config.barrier_with_L1_time
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
+    language_transformer_config.log_max_attention_logit = cfg.logger.log_max_attention_logit
+    language_transformer_config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
     else:
@@ -503,14 +505,15 @@ if __name__ == "__main__":
         extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
     full_config = pretrain_cfg_container_from_args(args)
-    initialize_runtime_services(args, logger_config=full_config.logger)
+    set_run_config(full_config)
+    initialize_runtime_services(args)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, logger_config=full_config.logger),
+        model_provider,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
     )
