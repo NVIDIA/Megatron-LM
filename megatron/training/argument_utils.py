@@ -611,20 +611,6 @@ def logger_config_from_args(args: Namespace) -> LoggerConfig:
     return config
 
 
-def logger_args_snapshot(args: Namespace) -> Namespace:
-    """Project logging settings into detached checkpoint/metadata output."""
-    from copy import copy, deepcopy
-    from dataclasses import fields
-
-    from megatron.training.global_vars import get_run_config
-
-    cfg = get_run_config()
-    snapshot = copy(args)
-    for config_field in fields(cfg.logger):
-        setattr(snapshot, config_field.name, deepcopy(getattr(cfg.logger, config_field.name)))
-    return snapshot
-
-
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config

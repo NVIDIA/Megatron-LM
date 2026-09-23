@@ -26,7 +26,6 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
-    logger_args_snapshot,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
@@ -51,7 +50,7 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
             recompute_granularity_from_args = args.recompute_granularity
             args.recompute_granularity = None
 
-        config = core_transformer_config_from_args(logger_args_snapshot(args))
+        config = core_transformer_config_from_args(args)
 
         if recompute_granularity_from_args is not None:
             config.recompute_granularity = recompute_granularity_from_args

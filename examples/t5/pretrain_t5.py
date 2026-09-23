@@ -27,7 +27,7 @@ from megatron.core.models.T5.t5_spec import (
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import logger_args_snapshot, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from pretrain_gpt import loss_func
@@ -91,7 +91,7 @@ def model_provider(
     args = get_args()
     
     if config is None:
-        config = core_transformer_config_from_args(logger_args_snapshot(args))
+        config = core_transformer_config_from_args(args)
     from megatron.training.global_vars import get_run_config
 
     cfg = get_run_config()

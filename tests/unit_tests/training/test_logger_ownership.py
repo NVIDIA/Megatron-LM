@@ -4,14 +4,14 @@
 
 import sys
 from argparse import ArgumentParser, Namespace
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from megatron.training import arguments, global_vars
-from megatron.training.argument_utils import logger_args_snapshot, logger_config_from_args
+from megatron.training.argument_utils import logger_config_from_args
 from megatron.training.async_utils import build_otel_worker_bootstrap
 from megatron.training.config import LoggerConfig
 from megatron.training.initialize import setup_logging, write_args_to_tensorboard
@@ -59,22 +59,15 @@ def test_cli_aliases_and_native_config_match(run_config):
     assert asdict(config) == asdict(expected)
 
 
-def test_normalization_and_snapshot_do_not_alias_or_mutate_args(run_config):
+def test_normalization_does_not_alias_or_mutate_args():
     args = Namespace(modules_to_filter=['module'], log_interval=7, iteration=12)
     config = logger_config_from_args(args)
     args.modules_to_filter.append('stale')
     assert config.modules_to_filter == ['module']
     config.log_interval = 11
-    run_config.logger = config
-    snapshot = logger_args_snapshot(args)
-    assert snapshot.log_interval == 11 and args.log_interval == 7
-    assert snapshot.iteration == args.iteration
+    assert args.log_interval == 7
     config.modules_to_filter.append('later')
-    assert snapshot.modules_to_filter == ['module']
-    for field in fields(config):
-        if hasattr(args, field.name):
-            delattr(args, field.name)
-    assert logger_args_snapshot(args).log_interval == 11
+    assert args.modules_to_filter == ['module', 'stale']
 
 
 @pytest.mark.parametrize('interval,valid', [(None, True), (20, True), (21, False)])
@@ -150,7 +143,7 @@ def test_timers_use_owned_settings(monkeypatch, run_config):
     factory.assert_called_once_with(2, 'all')
 
 
-def test_tensorboard_metadata_uses_snapshot(monkeypatch, run_config):
+def test_tensorboard_metadata_uses_config(monkeypatch, run_config):
     from megatron.training import initialize
 
     args = Namespace(iteration=13, log_interval=99)
@@ -160,6 +153,7 @@ def test_tensorboard_metadata_uses_snapshot(monkeypatch, run_config):
     run_config.logger = LoggerConfig(log_interval=17)
     write_args_to_tensorboard()
     writer.add_text.assert_any_call('log_interval', '17', global_step=13)
+    assert all(call.args != ('log_interval', '99') for call in writer.add_text.call_args_list)
     assert args.log_interval == 99
 
 

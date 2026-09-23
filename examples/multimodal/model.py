@@ -15,7 +15,6 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.utils import log_single_rank
-from megatron.training.argument_utils import logger_args_snapshot
 
 
 
@@ -93,7 +92,7 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    base_config = config or core_transformer_config_from_args(logger_args_snapshot(get_args()))
+    base_config = config or core_transformer_config_from_args(get_args())
     from megatron.training.global_vars import get_run_config
 
     cfg = get_run_config()

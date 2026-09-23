@@ -20,7 +20,6 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
-from megatron.training.argument_utils import logger_args_snapshot
 from megatron.training.global_vars import get_run_config
 
 
@@ -30,7 +29,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         if args.yaml_cfg is not None:
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
-            config = core_transformer_config_from_args(logger_args_snapshot(args))
+            config = core_transformer_config_from_args(args)
     cfg = get_run_config()
     config.log_max_attention_logit = cfg.logger.log_max_attention_logit
     config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time

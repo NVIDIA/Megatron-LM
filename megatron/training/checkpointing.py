@@ -58,7 +58,7 @@ from megatron.core.utils import (
     resolve_gtp_pad_for_alignment,
     unwrap_model,
 )
-from megatron.training.argument_utils import _default_config_from_args, logger_args_snapshot
+from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_run_config, get_tokenizer
 
@@ -830,7 +830,7 @@ def save_checkpoint(
             sharded_sd_metadata = None
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
             state_dict = generate_state_dict(
-                logger_args_snapshot(args),
+                args,
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -2826,7 +2826,7 @@ def load_checkpoint(
                 for m in model:
                     stack.enter_context(m.hide_loss_modules())
             load_kwargs['sharded_state_dict'] = generate_state_dict(
-                logger_args_snapshot(args),
+                args,
                 model,
                 gen_sd_optim,
                 gen_sd_opt_param_scheduler,
@@ -2923,7 +2923,7 @@ def load_checkpoint(
 
         try:
             state_dict = generate_state_dict(
-                logger_args_snapshot(args),
+                args,
                 model=model,
                 optimizer=gen_sd_optim,
                 opt_param_scheduler=gen_sd_opt_param_scheduler,

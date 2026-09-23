@@ -26,7 +26,6 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.argument_utils import logger_args_snapshot
 
 def model_provider(pre_process=True, post_process=True) -> GPTModel:
     """Builds the model.
@@ -42,7 +41,12 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     args = get_args()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(logger_args_snapshot(args))
+    config = core_transformer_config_from_args(args)
+    from megatron.training.global_vars import get_run_config
+
+    cfg = get_run_config()
+    config.log_max_attention_logit = cfg.logger.log_max_attention_logit
+    config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
 
     if args.spec is None:
         if args.transformer_impl == 'local':

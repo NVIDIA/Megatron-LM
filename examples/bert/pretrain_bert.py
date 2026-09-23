@@ -16,7 +16,7 @@ from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import logger_args_snapshot, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.core.transformer.spec_utils import import_module
@@ -35,7 +35,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
 
     args = get_args()
     if config is None:
-        config = core_transformer_config_from_args(logger_args_snapshot(args))
+        config = core_transformer_config_from_args(args)
     from megatron.training.global_vars import get_run_config
 
     cfg = get_run_config()

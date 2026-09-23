@@ -37,7 +37,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import logger_args_snapshot, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
@@ -119,7 +119,7 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
     if config is None:
-        language_transformer_config = core_transformer_config_from_args(logger_args_snapshot(get_args()))
+        language_transformer_config = core_transformer_config_from_args(get_args())
     else:
         language_transformer_config = config
     from megatron.training.global_vars import get_run_config

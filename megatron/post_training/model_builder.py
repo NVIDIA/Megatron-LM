@@ -29,9 +29,9 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import get_run_config
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
-from megatron.training.argument_utils import logger_args_snapshot
 
 
 @dataclass(kw_only=True)
@@ -137,7 +137,11 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
             )  # Useful for cases like QAD
             config_path = None
 
-    args_dict = vars(logger_args_snapshot(args))
+    cfg = get_run_config()
+    args_dict = vars(args).copy()
+    # Inherit the current run's logging policy before explicit teacher YAML overrides.
+    args_dict['log_max_attention_logit'] = cfg.logger.log_max_attention_logit
+    args_dict['barrier_with_L1_time'] = cfg.logger.barrier_with_L1_time
 
     if config_path is not None:
         with open(config_path) as f:
@@ -293,7 +297,10 @@ def modelopt_gpt_hybrid_builder(
     print_rank_0("building GPT model ...")
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
-    config = core_transformer_config_from_args(logger_args_snapshot(args))
+    config = core_transformer_config_from_args(args)
+    cfg = get_run_config()
+    config.log_max_attention_logit = cfg.logger.log_max_attention_logit
+    config.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
     if hasattr(args, 'enable_gpt_oss') and args.enable_gpt_oss:

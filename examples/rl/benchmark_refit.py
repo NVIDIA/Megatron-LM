@@ -26,7 +26,6 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.argument_utils import logger_args_snapshot
 
 
 def add_benchmark_args(parser):
@@ -67,7 +66,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=False,
     """Build the model."""
     args = get_args()
     if config is None:
-        config = core_transformer_config_from_args(logger_args_snapshot(args))
+        config = core_transformer_config_from_args(args)
 
     return gpt_builder(
         args=args,
@@ -248,7 +247,7 @@ def benchmark_collocated():
         use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
     )
 
-    dst_config = core_transformer_config_from_args(logger_args_snapshot(args))
+    dst_config = core_transformer_config_from_args(args)
     if args.num_experts:
         dst_config.expert_model_parallel_size = dst_ep
     dst_config.tensor_model_parallel_size = dst_tp
@@ -360,7 +359,7 @@ def benchmark_non_collocated():
     else:  # is_dst_rank
         # Build destination model
         print_rank_0("Building destination model...")
-        dst_config = core_transformer_config_from_args(logger_args_snapshot(args))
+        dst_config = core_transformer_config_from_args(args)
         if args.num_experts:
             dst_config.expert_model_parallel_size = dst_ep
         dst_config.tensor_model_parallel_size = dst_tp

@@ -30,7 +30,6 @@ from megatron.training import get_tokenizer, get_wandb_writer
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
-    logger_args_snapshot,
 )
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
@@ -71,7 +70,7 @@ def get_model_builder(
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        model_config = gpt_config_from_args(logger_args_snapshot(args))
+        model_config = gpt_config_from_args(args)
         model_config.transformer.log_max_attention_logit = cfg.logger.log_max_attention_logit
         model_config.transformer.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
         return GPTModelBuilder(model_config)
@@ -82,7 +81,7 @@ def get_model_builder(
                 DeprecationWarning,
                 stacklevel=2,
             )
-        model_config = hybrid_config_from_args(logger_args_snapshot(args))
+        model_config = hybrid_config_from_args(args)
         model_config.transformer.log_max_attention_logit = cfg.logger.log_max_attention_logit
         model_config.transformer.barrier_with_L1_time = cfg.logger.barrier_with_L1_time
         return HybridModelBuilder(model_config)
