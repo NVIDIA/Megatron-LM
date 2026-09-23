@@ -29,6 +29,7 @@ def _wrap_inner_optimizer(optimizer, **config_overrides):
         store_param_remainders=False,
         bf16=False,
         fp16=False,
+        fp8_recipe=None,
     )
     for name, value in config_overrides.items():
         setattr(wrapper.config, name, value)
@@ -102,7 +103,10 @@ def test_native_adam_restore_preserves_load_hooks_and_next_step(monkeypatch):
 
 
 def _make_te_wrapper(
-    store_param_remainders, param_dtypes=(torch.bfloat16, torch.float32), **overrides
+    store_param_remainders,
+    param_dtypes=(torch.bfloat16, torch.float32),
+    quantized_params=False,
+    **overrides,
 ):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA and Transformer Engine")
@@ -111,15 +115,26 @@ def _make_te_wrapper(
         torch.nn.Parameter(torch.linspace(-0.5, 0.5, 128, device="cuda", dtype=dtype))
         for dtype in param_dtypes
     ]
-    config = OptimizerConfig(
+    if quantized_params:
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
+
+        quantizer = Float8Quantizer(
+            scale=torch.ones(1, device="cuda"),
+            amax=torch.zeros(1, device="cuda"),
+            fp8_dtype=tex.DType.kFloat8E4M3,
+        )
+        params[0] = torch.nn.Parameter(quantizer(params[0].detach()))
+    config_kwargs = dict(
         optimizer="adam",
         lr=0.01,
         bf16=True,
         use_distributed_optimizer=True,
         use_precision_aware_optimizer=True,
         store_param_remainders=store_param_remainders,
-        **overrides,
     )
+    config_kwargs.update(overrides)
+    config = OptimizerConfig(**config_kwargs)
 
     def wrap(inner, config, grad_scaler, initialize, **kwargs):
         wrapper = _wrap_inner_optimizer(inner)
@@ -143,23 +158,115 @@ def _make_te_wrapper(
             ],
             pg_collection=SimpleNamespace(tp=None, expt_tp=None),
         )
-    assert type(wrapper.optimizer) is te_optimizers.FusedAdam
+    if not config.optimizer_cpu_offload:
+        assert type(wrapper.optimizer) is te_optimizers.FusedAdam
     return wrapper, params
 
 
 def _step_te(inner, params, step):
     for param in params:
-        param.decoupled_grad = (
-            torch.linspace(-0.2, 0.3, param.numel(), device=param.device) + step * 0.01
-        )
+        grad = torch.linspace(-0.2, 0.3, param.numel(), device=param.device) + step * 0.01
+        param.grad = grad.to(param.dtype)
+        param.decoupled_grad = grad
     inner.step()
 
 
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("master_weights", False),
+        ("exp_avg_dtype", torch.bfloat16),
+        ("exp_avg_sq_dtype", torch.float16),
+        ("master_weight_dtype", torch.float16),
+    ],
+)
+def test_reuse_guard_checks_actual_te_representation(monkeypatch, attribute, value):
+    """A downstream optimizer/config mismatch must not bypass TE's state conversion."""
+    wrapper, _ = _make_te_wrapper(False)
+    assert wrapper._can_reuse_precision_aware_checkpoint_state()
+    monkeypatch.setattr(wrapper.optimizer, attribute, value)
+    assert not wrapper._can_reuse_precision_aware_checkpoint_state()
+
+
+@pytest.mark.parametrize("hook_kind", ["pre", "post"])
+def test_reuse_guard_fails_closed_for_unknown_hook_registry(monkeypatch, hook_kind):
+    """A changed PyTorch hook registry must make the public loader authoritative."""
+    wrapper, _ = _make_te_wrapper(False)
+    monkeypatch.delattr(wrapper.optimizer, f"_optimizer_load_state_dict_{hook_kind}_hooks")
+    assert not wrapper._can_reuse_precision_aware_checkpoint_state()
+
+
+@pytest.mark.parametrize("excluded", ["ordinary_adam", "no_initializer", "fp8_primary"])
+def test_excluded_optimizer_preserves_public_loader_and_next_update(excluded):
+    """Excluded modes must retain both public-loader behavior and the next update."""
+    kwargs = {}
+    dtypes = (torch.bfloat16, torch.float32)
+    if excluded == "ordinary_adam":
+        kwargs = dict(bf16=False, use_precision_aware_optimizer=False)
+        dtypes = (torch.float32, torch.float32)
+    elif excluded == "fp8_primary":
+        kwargs = dict(fp8_recipe="delayed", quantized_params=True)
+    wrapper, params = _make_te_wrapper(False, param_dtypes=dtypes, **kwargs)
+    reference, reference_params = _make_te_wrapper(False, param_dtypes=dtypes, **kwargs)
+    for step in range(2):
+        _step_te(wrapper.optimizer, params, step)
+        _step_te(reference.optimizer, reference_params, step)
+    if excluded == "no_initializer":
+        wrapper.init_state_fn = None
+    assert not wrapper._can_reuse_precision_aware_checkpoint_state()
+    with patch.object(
+        wrapper.optimizer, "load_state_dict", wraps=wrapper.optimizer.load_state_dict
+    ) as load:
+        wrapper.load_state_dict(deepcopy(wrapper.state_dict()))
+        load.assert_called_once()
+    _step_te(wrapper.optimizer, params, 2)
+    _step_te(reference.optimizer, reference_params, 2)
+    for param, expected_param in zip(params, reference_params, strict=True):
+        torch.testing.assert_close(param, expected_param, rtol=0, atol=0)
+        actual = wrapper.optimizer.state[param]
+        expected = reference.optimizer.state[expected_param]
+        assert actual.keys() == expected.keys()
+        for name, value in actual.items():
+            torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+
+
+def test_cpu_offload_keeps_dummy_step_and_public_loader():
+    """HybridDeviceOptimizer initialization must not enter the TE-only bypass."""
+    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+    wrapper, _ = _make_te_wrapper(
+        False,
+        optimizer_cpu_offload=True,
+        optimizer_offload_fraction=1.0,
+        use_torch_optimizer_for_cpu_offload=True,
+    )
+    assert isinstance(wrapper.optimizer, HybridDeviceOptimizer)
+    assert not wrapper._can_reuse_precision_aware_checkpoint_state()
+    metadata = wrapper.state_dict()
+    assert not wrapper.optimizer.state
+    with (
+        patch.object(wrapper.optimizer, "dummy_step", wraps=wrapper.optimizer.dummy_step) as dummy,
+        patch.object(
+            wrapper.optimizer, "load_state_dict", wraps=wrapper.optimizer.load_state_dict
+        ) as load,
+        patch.object(wrapper, "_load_optimizer_param_groups_without_state") as bypass,
+    ):
+        wrapper.load_state_dict(deepcopy(metadata))
+    dummy.assert_called_once()
+    load.assert_called_once()
+    bypass.assert_not_called()
+    assert wrapper.optimizer.state
+
+
 @pytest.mark.parametrize("store_param_remainders", [False, True])
-def test_precision_aware_resume_reuses_live_state_and_preserves_next_update(store_param_remainders):
+@pytest.mark.parametrize("fp8_recipe", [None, "delayed"])
+def test_precision_aware_resume_reuses_live_state_and_preserves_next_update(
+    store_param_remainders, fp8_recipe
+):
     """An initialized resume must not replace TE storage or alter the next Adam update."""
-    resumed, params = _make_te_wrapper(store_param_remainders)
-    reference, reference_params = _make_te_wrapper(store_param_remainders)
+    # The training CLI supplies "delayed" even when FP8 is disabled.
+    resumed, params = _make_te_wrapper(store_param_remainders, fp8_recipe=fp8_recipe)
+    reference, reference_params = _make_te_wrapper(store_param_remainders, fp8_recipe=fp8_recipe)
     for step in range(3):
         _step_te(resumed.optimizer, params, step)
         _step_te(reference.optimizer, reference_params, step)
@@ -291,6 +398,7 @@ def test_optimizer_subclass_keeps_custom_load_behavior():
 
 def test_initializer_supports_legacy_te_one_argument_api(monkeypatch):
     """Exercise the production callback with TE's pre-2.1 call signature."""
+    monkeypatch.setattr("megatron.core.optimizer.is_te_min_version", lambda version: False)
     wrapper, params = _make_te_wrapper(False)
     modern_initialize = wrapper.optimizer.initialize_state
     calls = []
@@ -299,7 +407,6 @@ def test_initializer_supports_legacy_te_one_argument_api(monkeypatch):
         calls.append(param)
         modern_initialize(param, False)
 
-    monkeypatch.setattr("megatron.core.optimizer.is_te_min_version", lambda version: False)
     monkeypatch.setattr(wrapper.optimizer, "initialize_state", legacy_initialize)
     wrapper.init_state_fn(wrapper.optimizer, wrapper.config)
     assert len(calls) == len(params)
@@ -309,13 +416,18 @@ def test_initializer_supports_legacy_te_one_argument_api(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize(("dp_size", "resume_dp_size"), [(1, 1), (2, 2), (2, 1)])
 @pytest.mark.parametrize(
     ("sharding_type", "store_param_remainders"),
-    [("fully_reshardable", False), ("dp_reshardable", False), ("dp_reshardable", True)],
+    [
+        ("fully_reshardable", False),
+        ("dp_reshardable", False),
+        ("dp_reshardable", True),
+        ("dp_zero_gather_scatter", False),
+    ],
 )
 def test_precision_aware_dcp_round_trip(
-    tmp_path_dist_ckpt, dp_size, store_param_remainders, sharding_type
+    tmp_path_dist_ckpt, dp_size, resume_dp_size, store_param_remainders, sharding_type
 ):
     """A real sharded restore must preserve every Adam tensor and the next model update."""
     # fully_reshardable currently coalesces states into FP32 buffers and cannot
@@ -331,17 +443,25 @@ def test_precision_aware_dcp_round_trip(
     from tests.unit_tests.test_utilities import Utils
 
     world = Utils.world_size
+    rank = Utils.rank
+    tp_size = world // dp_size
+    reshard = dp_size != resume_dp_size
+    world_shrunk = False
     if world % dp_size:
         pytest.skip("test requires a world size divisible by the data parallel size")
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=world // dp_size, pipeline_model_parallel_size=1
+        tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=1
     )
 
     class TinyMixedModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.config = TransformerConfig(
-                num_layers=1, hidden_size=4, num_attention_heads=1, bf16=True
+                num_layers=1,
+                hidden_size=4 * tp_size,
+                num_attention_heads=tp_size,
+                tensor_model_parallel_size=tp_size,
+                bf16=True,
             )
             self.weight = torch.nn.Parameter(
                 torch.full((32, 32), 0.5, device="cuda", dtype=torch.bfloat16)
@@ -379,6 +499,9 @@ def test_precision_aware_dcp_round_trip(
             use_distributed_optimizer=True,
             use_precision_aware_optimizer=True,
             store_param_remainders=store_param_remainders,
+            # Keep the optimizer input identical across DP sizes; norm reductions
+            # used for clipping can round differently with another shard count.
+            clip_grad=0.0,
         )
         outer = get_megatron_optimizer(config, [ddp])
         child = outer.chained_optimizers[0] if isinstance(outer, ChainedOptimizer) else outer
@@ -392,24 +515,11 @@ def test_precision_aware_dcp_round_trip(
         ddp.finish_grad_sync()
         assert optimizer.step()[0]
 
-    def assert_equal_states(left, right):
-        for left_group, right_group in zip(
-            left.optimizer.param_groups, right.optimizer.param_groups
-        ):
-            for key in ("lr", "step", "betas", "eps", "weight_decay"):
-                assert left_group[key] == right_group[key]
-            for left_param, right_param in zip(left_group["params"], right_group["params"]):
-                for key in ("exp_avg", "exp_avg_sq", "master_param"):
-                    a = left.optimizer.get_unscaled_state(left_param, key)
-                    b = right.optimizer.get_unscaled_state(right_param, key)
-                    torch.testing.assert_close(a, b, rtol=0, atol=0)
-                    if key == "master_param":
-                        expected = (
-                            torch.int16
-                            if store_param_remainders and right_param.dtype == torch.bfloat16
-                            else torch.float32
-                        )
-                        assert b.dtype == expected
+    def group_metadata(inner):
+        return [
+            {key: group[key] for key in ("lr", "step", "betas", "eps", "weight_decay")}
+            for group in inner.optimizer.param_groups
+        ]
 
     try:
         raw_a, ddp_a, optim_a, inner_a = make_optimizer()
@@ -417,17 +527,42 @@ def test_precision_aware_dcp_round_trip(
         take_step(ddp_a, optim_a)
         checkpoint = (
             tmp_path_dist_ckpt
-            / f"resume-{sharding_type}-dp{dp_size}-remainder{store_param_remainders}"
+            / f"resume-{sharding_type}-dp{dp_size}-{resume_dp_size}-{store_param_remainders}"
         )
-        checkpoint.mkdir(exist_ok=True)
+        if torch.distributed.get_rank() == 0:
+            checkpoint.mkdir(exist_ok=True)
+        torch.distributed.barrier()
         metadata = {"distrib_optim_sharding_type": sharding_type}
         save(optim_a.sharded_state_dict(raw_a.sharded_state_dict(), metadata=metadata), checkpoint)
+        # Canonical CPU state remains comparable when optimizer shard sizes change.
+        expected_restore = deepcopy(inner_a.get_parameter_state_dp_zero())
+        expected_groups = deepcopy(group_metadata(inner_a))
+        model_at_save = deepcopy(raw_a.state_dict())
+        take_step(ddp_a, optim_a)
+        expected_next_state = deepcopy(inner_a.get_parameter_state_dp_zero())
+        expected_next_groups = deepcopy(group_metadata(inner_a))
+        expected_next_model = deepcopy(raw_a.state_dict())
+
+        if reshard:
+            # Shrink the actual world so TP/PP and model shard identities stay fixed.
+            # Ranks outside the resumed world rejoin in finally, before fixture cleanup.
+            Utils.destroy_model_parallel()
+            Utils.set_world_size(tp_size * resume_dp_size)
+            world_shrunk = True
+            if Utils.rank < 0:
+                return
+            torch.distributed.init_process_group(
+                "nccl",
+                init_method=f"file://{checkpoint / 'resume-rendezvous'}",
+                rank=rank,
+                world_size=Utils.world_size,
+            )
+            Utils.initialize_model_parallel(tp_size, 1)
 
         raw_b, ddp_b, optim_b, inner_b = make_optimizer()
         assert not inner_b.optimizer.state
-        with torch.no_grad():
-            for a, b in zip(raw_a.parameters(), raw_b.parameters()):
-                b.copy_(a)
+        assert inner_b.data_parallel_group.size() == resume_dp_size
+        raw_b.load_state_dict(model_at_save)
         target = optim_b.sharded_state_dict(
             raw_b.sharded_state_dict(), metadata=metadata, is_loading=True
         )
@@ -435,19 +570,52 @@ def test_precision_aware_dcp_round_trip(
             p: {k: v.data_ptr() for k, v in state.items()}
             for p, state in inner_b.optimizer.state.items()
         }
+        assert pointers and all(pointers.values())
         loaded, missing, unexpected = load(target, checkpoint, strict=StrictHandling.RETURN_ALL)
         assert not missing and not unexpected
         for param, state in inner_b.optimizer.state.items():
             assert {key: value.data_ptr() for key, value in state.items()} == pointers[param]
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
         optim_b.load_state_dict(loaded)
+        torch.cuda.synchronize()
+        transient = torch.cuda.max_memory_allocated() - allocated
+        largest_state = max(
+            value.numel() * value.element_size()
+            for state in inner_b.optimizer.state.values()
+            for value in state.values()
+        )
+        # Bound the final restore's transient storage, not fresh initialization.
+        # A per-tensor transfer is allowed; rebuilding a whole state copy is not.
+        assert transient <= largest_state, (transient, largest_state)
         for param, state in inner_b.optimizer.state.items():
             assert {key: value.data_ptr() for key, value in state.items()} == pointers[param]
-        assert_equal_states(inner_a, inner_b)
+        torch.testing.assert_close(
+            inner_b.get_parameter_state_dp_zero(), expected_restore, rtol=0, atol=0
+        )
+        assert group_metadata(inner_b) == expected_groups
+        for param, state in inner_b.optimizer.state.items():
+            expected_dtype = (
+                torch.int16
+                if store_param_remainders and param.dtype == torch.bfloat16
+                else torch.float32
+            )
+            assert state["master_param"].dtype == expected_dtype
 
-        take_step(ddp_a, optim_a)
         take_step(ddp_b, optim_b)
-        for a, b in zip(raw_a.parameters(), raw_b.parameters()):
-            torch.testing.assert_close(a, b, rtol=0, atol=0)
-        assert_equal_states(inner_a, inner_b)
+        torch.testing.assert_close(raw_b.state_dict(), expected_next_model, rtol=0, atol=0)
+        torch.testing.assert_close(
+            inner_b.get_parameter_state_dp_zero(), expected_next_state, rtol=0, atol=0
+        )
+        assert group_metadata(inner_b) == expected_next_groups
     finally:
         Utils.destroy_model_parallel()
+        if world_shrunk:
+            Utils.set_world_size(world, rank=rank)
+            torch.distributed.init_process_group(
+                "nccl",
+                init_method=f"file://{checkpoint / 'restore-world-rendezvous'}",
+                rank=rank,
+                world_size=world,
+            )
