@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Token dispatcher: AllToAll and DeepEP dispatch/combine."""
+"""Token dispatcher: AllToAll, DeepEP and HybridEP dispatch/combine."""
 
 from __future__ import annotations
 
@@ -20,6 +20,15 @@ except ImportError:
     deep_ep = None  # type: ignore
     EventHandle = None  # type: ignore
     EventOverlap = None  # type: ignore
+
+try:
+    from deep_ep import HybridEPBuffer  # pyright: ignore[reportMissingImports]
+except ImportError:
+    HybridEPBuffer = None  # type: ignore
+
+DISPATCH_BACKENDS = ("alltoall", "deepep", "hybridep")
+_HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
+_hybridep_buffers: dict[tuple, object] = {}
 
 
 def _hidden_bytes(hidden_size: int) -> int:
@@ -47,6 +56,33 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
         )
 
     return deep_ep.Buffer(group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes)
+
+
+def _get_hybridep_buffer(group: dist.ProcessGroup, hidden_size: int, num_local_experts: int, max_tokens: int):
+    if HybridEPBuffer is None:
+        raise RuntimeError("HybridEP buffer requested but deep_ep.HybridEPBuffer is not installed.")
+    key = (id(group), hidden_size, num_local_experts)
+    buf = _hybridep_buffers.get(key)
+    if buf is None:
+        buf = HybridEPBuffer(
+            group=group,
+            hidden_dim=hidden_size,
+            max_num_of_tokens_per_rank=max_tokens,
+            num_local_experts=num_local_experts,
+        )
+        _hybridep_buffers[key] = buf
+    return buf
+
+
+def _routing_tensors(
+    topk_scores: torch.Tensor, topk_indices: torch.Tensor, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    t = topk_indices.size(0)
+    routing_map = torch.zeros(t, num_experts, dtype=torch.bool, device=topk_indices.device)
+    routing_map.scatter_(1, topk_indices, True)
+    probs_2d = torch.zeros(t, num_experts, dtype=topk_scores.dtype, device=topk_indices.device)
+    probs_2d.scatter_add_(1, topk_indices, topk_scores)
+    return routing_map, probs_2d
 
 
 def _use_moe_permute_fusion() -> bool:
@@ -186,6 +222,64 @@ class _DeepEPCombine(torch.autograd.Function):
         return None, grad_rank_grouped, None, None, None
 
 
+class _HybridEPDispatch(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        buffer,
+        hidden_states: torch.Tensor,
+        routing_map: torch.Tensor | None,
+        topk_idx: torch.Tensor | None,
+        probs: torch.Tensor,
+        num_local_experts: int,
+        num_experts: int,
+        num_tokens_per_rank: int,
+    ):
+        if topk_idx is not None:
+            routing_kwargs = {"topk_idx": topk_idx, "num_of_experts": num_experts}
+        else:
+            routing_kwargs = {"routing_map": routing_map}
+        dispatched, dispatched_probs, _, tokens_per_expert, handle = buffer.dispatch_with_permute(
+            hidden=hidden_states,
+            probs=probs,
+            scaling_factor=None,
+            num_of_experts_per_rank=num_local_experts,
+            num_of_tokens_per_rank=num_tokens_per_rank,
+            **routing_kwargs,
+        )
+        ctx.buffer = buffer
+        ctx.handle = handle
+        return dispatched, dispatched_probs, tokens_per_expert, handle
+
+    @staticmethod
+    def backward(ctx, grad_hidden, grad_probs, grad_tokens_per_expert, grad_handle):
+        del grad_tokens_per_expert, grad_handle
+        combined_hidden, combined_probs = ctx.buffer.combine_with_unpermute(
+            hidden=grad_hidden, probs=grad_probs, handle=ctx.handle
+        )
+        return None, combined_hidden, None, None, combined_probs, None, None, None
+
+
+class _HybridEPCombine(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, buffer, expert_output: torch.Tensor, handle, num_permuted_tokens):
+        combined, _ = buffer.combine_with_unpermute(hidden=expert_output, handle=handle)
+        ctx.buffer = buffer
+        ctx.handle = handle
+        ctx.num_permuted_tokens = num_permuted_tokens
+        return combined
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        dispatched, _, _, _, _ = ctx.buffer.dispatch_with_permute(
+            hidden=grad_output,
+            scaling_factor=None,
+            handle=ctx.handle,
+            num_permuted_tokens=ctx.num_permuted_tokens,
+        )
+        return None, dispatched, None, None
+
+
 class TokenDispatcher:
 
     def __init__(
@@ -195,20 +289,37 @@ class TokenDispatcher:
         ps: ParallelState,
         *,
         use_deepep: bool = True,
+        dispatch_backend: str | None = None,
         moe_permute_fusion: bool | None = None,
+        hybridep_dense_routing: bool = True,
+        hybridep_max_tokens: int | None = None,
     ):
         self.ps = ps
         self.num_experts = num_experts
+        self.hidden_size = hidden_size
         self.ep_size = ps.ep_size
         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
         self.moe_permute_fusion = (
             _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
         )
 
-        self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
+        if dispatch_backend is None:
+            dispatch_backend = "deepep" if use_deepep else "alltoall"
+        if dispatch_backend not in DISPATCH_BACKENDS:
+            raise ValueError(f"dispatch_backend must be one of {DISPATCH_BACKENDS}, got {dispatch_backend!r}")
+        if dispatch_backend == "hybridep" and HybridEPBuffer is None:
+            raise RuntimeError("dispatch_backend='hybridep' requires deep_ep.HybridEPBuffer (DeepEP hybrid-ep branch).")
+        self.dispatch_backend = dispatch_backend
+        self.use_deepep = dispatch_backend == "deepep" and deep_ep is not None and ps.ep_size > 1
+        self.use_hybridep = dispatch_backend == "hybridep" and ps.ep_size > 1
         if self.use_deepep:
             assert ps.tp_ep_group is not None
             self.buffer = _build_deepep_buffer(ps.tp_ep_group, hidden_size)
+        # HybridEP dense routing needs int16 expert ids; duplicate experts per token are malformed there.
+        self.hybridep_dense_routing = hybridep_dense_routing and num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
+        self.hybridep_max_tokens = hybridep_max_tokens
+        self._hybridep_buffer = None
+        self._num_permuted_tokens = None
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
@@ -233,6 +344,8 @@ class TokenDispatcher:
             return self._dispatch_local(hidden_states, topk_scores, topk_indices)
         if self.use_deepep:
             return self._dispatch_deepep(hidden_states, topk_scores, topk_indices)
+        if self.use_hybridep:
+            return self._dispatch_hybridep(hidden_states, topk_scores, topk_indices)
         dispatched, tpe, sorted_scores = self._dispatch_alltoall(
             hidden_states, topk_scores, topk_indices
         )
@@ -243,6 +356,8 @@ class TokenDispatcher:
             return self._combine_local(expert_output)
         if self.use_deepep:
             return self._combine_deepep(expert_output)
+        if self.use_hybridep:
+            return self._combine_hybridep(expert_output)
         return self._combine_alltoall(expert_output)
 
     def submit_deepep_combine(
@@ -288,15 +403,8 @@ class TokenDispatcher:
         return state["combined"]
 
     def _dispatch_local(self, hidden_states, topk_scores, topk_indices):
-        t, h = hidden_states.shape
-        e = self.num_experts
-
-        routing_map = torch.zeros(t, e, dtype=torch.bool, device=hidden_states.device)
-        routing_map.scatter_(1, topk_indices, True)
+        routing_map, probs_2d = _routing_tensors(topk_scores, topk_indices, self.num_experts)
         num_out = int(routing_map.sum().item())
-
-        probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
-        probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,
@@ -324,21 +432,10 @@ class TokenDispatcher:
         return result
 
     def _dispatch_alltoall(self, hidden_states, topk_scores, topk_indices):
-        t, h = hidden_states.shape
         e = self.num_experts
-
-        routing_map = torch.zeros(t, e, dtype=torch.bool, device=hidden_states.device)
-        routing_map.scatter_(1, topk_indices, True)
-        # Use the actual number of routed (token, expert) pairs from routing_map
-        # rather than t * topk: hash routing (ds4) can map a token's topk slots to
-        # DUPLICATE experts, which scatter_ dedups, so t*topk would overcount and
-        # leave permuted.size(0) != sum(input_splits) (all-to-all split mismatch).
-        # Unique-topk routers (every other model) have routing_map.sum() == t*topk,
-        # so this is a no-op for them.
+        routing_map, probs_2d = _routing_tensors(topk_scores, topk_indices, e)
+        # routing_map.sum() (not t*topk): hash routing may repeat an expert within a token's top-k.
         num_out = int(routing_map.sum().item())
-
-        probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
-        probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,
@@ -417,6 +514,50 @@ class TokenDispatcher:
         self._combine_restore_idxs = None
         self._local_tpe_list = None
         return result
+
+    def _hybridep_group(self) -> dist.ProcessGroup:
+        group = self.ps.tp_ep_group if self.ps.tp_ep_group is not None else self.ps.ep_group
+        assert group is not None
+        return group
+
+    def _dispatch_hybridep(self, hidden_states, topk_scores, topk_indices):
+        group = self._hybridep_group()
+        t = hidden_states.size(0)
+        if self._hybridep_buffer is None:
+            self._hybridep_buffer = _get_hybridep_buffer(
+                group, self.hidden_size, self.num_local_experts, self.hybridep_max_tokens or t
+            )
+        routing_map, probs_2d = _routing_tensors(topk_scores, topk_indices, self.num_experts)
+        # HybridEP only supports fp32 probs (same cast as mcore _HybridEPManager.dispatch).
+        probs_2d = probs_2d.float()
+        topk_idx = topk_indices.to(torch.int16).contiguous() if self.hybridep_dense_routing else None
+        # Ranks in the group may hold different token counts; pass the group-wide max as slot count.
+        num_tokens_per_rank = torch.tensor([t], device=hidden_states.device, dtype=torch.long)
+        dist.all_reduce(num_tokens_per_rank, op=dist.ReduceOp.MAX, group=group)
+        dispatched, dispatched_probs, tokens_per_expert, handle = _HybridEPDispatch.apply(
+            self._hybridep_buffer,
+            hidden_states,
+            None if topk_idx is not None else routing_map,
+            topk_idx,
+            probs_2d,
+            self.num_local_experts,
+            self.num_experts,
+            int(num_tokens_per_rank.item()),
+        )
+        tokens_per_expert = tokens_per_expert.to(torch.int64)
+        self._handle = handle
+        self._num_permuted_tokens = tokens_per_expert.sum()
+        self._local_tpe_list = None
+        return dispatched, tokens_per_expert, dispatched_probs
+
+    def _combine_hybridep(self, expert_output):
+        combined = _HybridEPCombine.apply(
+            self._hybridep_buffer, expert_output, self._handle, self._num_permuted_tokens
+        )
+        self._handle = None
+        self._num_permuted_tokens = None
+        self._local_tpe_list = None
+        return combined
 
     def submit_deepep_dispatch(
         self, hidden_states, topk_scores, topk_indices, *, allocate_on_comm_stream: bool = False
