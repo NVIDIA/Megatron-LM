@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
+    CheckpointFunction,
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
@@ -351,6 +352,60 @@ def test_checkpoint_recompute_reenters_forward_fp8_autocast():
         y = checkpoint(record_and_scale, False, x)
         y.sum().backward()
         assert seen == [(False, None), (False, None)]
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+@pytest.mark.parametrize("fp8_enabled", [False, True])
+def test_checkpoint_backward_restores_fp8_state(fp8_enabled: bool) -> None:
+    """Exercise backward on the Python thread so coverage can trace FP8 state restoration."""
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    class CheckpointContext:
+        """Save inputs without routing through the autograd engine."""
+
+        def save_for_backward(self, *tensors):
+            """Provide the context interface used by CheckpointFunction.forward."""
+            self.saved_tensors = tensors
+
+    recipe = _fp8_recipe_or_skip("delayed") if fp8_enabled else None
+    Utils.initialize_model_parallel()
+    model_parallel_cuda_manual_seed(123)
+    try:
+        seen = []
+
+        def record_and_square(x):
+            enabled = FP8GlobalStateManager.is_fp8_enabled()
+            active_recipe = FP8GlobalStateManager.get_fp8_recipe() if enabled else None
+            seen.append((enabled, active_recipe, torch.is_grad_enabled()))
+            return x.square()
+
+        x = torch.arange(1, 9, dtype=torch.float32, device="cuda", requires_grad=True)
+        ctx = CheckpointContext()
+        with te.fp8_autocast(enabled=fp8_enabled, fp8_recipe=recipe):
+            output = CheckpointFunction.forward(ctx, record_and_square, False, x)
+        assert not FP8GlobalStateManager.is_fp8_enabled()
+
+        # CUDA autograd callbacks may run on C++ threads that coverage cannot trace.
+        # Call the same entry point directly, with the grad mode used by autograd.
+        grad_output = torch.full_like(output, 3.0)
+        with torch.no_grad():
+            grads = CheckpointFunction.backward(ctx, grad_output)
+
+        assert len(seen) == 2
+        for (enabled, active_recipe, grad_enabled), expected_grad_enabled in zip(
+            seen, (False, True)
+        ):
+            assert enabled == fp8_enabled
+            assert active_recipe is recipe
+            assert grad_enabled == expected_grad_enabled
+        assert not FP8GlobalStateManager.is_fp8_enabled()
+        assert grads[:2] == (None, None)
+        torch.testing.assert_close(output, x.square())
+        torch.testing.assert_close(grads[2], 2 * x * grad_output)
+        assert x.grad is None
     finally:
         Utils.destroy_model_parallel()
 
