@@ -22,10 +22,66 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.mark.parametrize("singleton_inner", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_hybrid_zero2_gathers_optimizer_updates(distributed_setup, singleton_inner, dtype):
+    """Reconstruct replicated weights from two-axis optimizer shards, on CPU or CUDA.
+
+    A nontrivial inner axis detects incorrect outer/inner gather ordering; a singleton
+    inner axis covers the expert-DP shape used when EP spans the entire inner domain.
+    """
+    world_size = distributed_setup.world_size
+    if world_size < 4 or world_size % 2:
+        pytest.skip("Requires an even world size of at least four.")
+    outer_size = world_size if singleton_inner else 2
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (outer_size, world_size // outer_size),
+        mesh_dim_names=("outer", "inner"),
+    )
+    model = nn.Linear(5, 7, device=distributed_setup.device, dtype=dtype)
+    parameters = dict(model.named_parameters())
+    group = FsdpParameterGroup(
+        model,
+        parameters,
+        mesh,
+        model_weight_placements=(Replicate(), Replicate()),
+        main_grad_placements=(Partial("avg"), Shard(0)),
+        main_weight_placements=(Shard(0), Shard(0)),
+        mixed_precision_policy=MixedPrecisionPolicy(),
+    )
+    # Padding and uneven parameter rows must survive both gather stages.
+    with torch.no_grad():
+        for step in range(3):
+            expected = {}
+            for index, (name, parameter) in enumerate(parameters.items()):
+                value = (
+                    torch.arange(
+                        parameter.numel(), device=distributed_setup.device, dtype=torch.float32
+                    ).view(parameter.shape)
+                    + step * 32
+                    + index
+                )
+                expected[name] = value.to(dtype)
+                group.main_weight.copy_from(index, value)
+            group.sync_model_weight_from_main_weight()
+            group.unshard_parameters()
+            for name, parameter in model.named_parameters():
+                torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+            for buffer in group._model_weight_sync_buffers:
+                assert buffer.local_buffer.untyped_storage().data_ptr() == (
+                    group.model_weight.local_buffer.untyped_storage().data_ptr()
+                )
+            group.reshard_parameters()
 
 
 class TinyModel(nn.Module):

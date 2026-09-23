@@ -790,10 +790,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
             if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
                 raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
-        if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
-            raise ValueError(
-                "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
-            )
         if (
             ddp_config.outer_dp_sharding_strategy != "no_shard"
             and ddp_config.num_distributed_optimizer_instances <= 1
@@ -941,8 +937,8 @@ def _build_expert_mesh_and_placements(
     pg_collection: ProcessGroupCollection,
     device_type: str,
 ) -> Tuple[DeviceMesh | None, Placements | None]:
-    """Build the expert-DP mesh and placements, or return neither when EP is disabled."""
-    if config.expert_model_parallel_size <= 1:
+    """Build expert placements for MoE models, including when EP has only one rank."""
+    if config.num_moe_experts is None:
         return None, None
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
