@@ -168,7 +168,7 @@ def _take_expanded_prefix_stitching_metadata(offload_params):
 
 
 def _prepend_expanded_multimodal_prefix(
-    suffix_tokens, suffix_mask, inference_wrapper, modality, metadata
+    suffix_tokens, suffix_mask, inference_wrapper, modality, metadata, requested_bos_token_id=None
 ):
     """Prepend exact prior model tokens to an expanded current-turn suffix."""
     eos_token_ids = metadata[PREFIX_EOS_TOKEN_ID_FIELD]
@@ -193,6 +193,13 @@ def _prepend_expanded_multimodal_prefix(
     # Expanded Prefix
     exact_prefix = torch.cat((previous_prompt, previous_generation))
     exact_prefix_mask = torch.cat((previous_prompt_mask, previous_generation_mask))
+    if requested_bos_token_id is not None:
+        # The chat endpoint applies add_BOS after extracting the compact suffix, so
+        # delayed stitching receives [BOS, boundary EOS, ...]. Remove the BOS and
+        # concatenate it to the full stitched sequence later.
+        if suffix_tokens.numel() and int(suffix_tokens[0].item()) == requested_bos_token_id:
+            suffix_tokens = suffix_tokens[1:]
+            suffix_mask = suffix_mask[1:]
     if exact_prefix.numel() and int(exact_prefix[-1].item()) in eos_token_ids:
         # Preserve the exact EOS emitted previously and remove the rendered
         # boundary EOS from the suffix. They can be different accepted EOS IDs.
@@ -213,8 +220,21 @@ def _prepend_expanded_multimodal_prefix(
     suffix_media_positions = suffix_mask >= 0
     suffix_mask[suffix_media_positions] += prefix_embedding_count
 
-    # Concatenate / prepend / stitch.
-    return (torch.cat((exact_prefix, suffix_tokens)), torch.cat((exact_prefix_mask, suffix_mask)))
+    # Concatenate / prepend / stitch once, adding BOS only if the exact prefix
+    # does not already contain it.
+    token_parts = [exact_prefix, suffix_tokens]
+    mask_parts = [exact_prefix_mask, suffix_mask]
+    if requested_bos_token_id is not None and (
+        exact_prefix.numel() == 0
+        # Check if the prefix already has the BOS token.
+        or int(exact_prefix[0].item()) != requested_bos_token_id
+    ):
+        # Insert the BOS token to the beginning of the sentence. Shift the media mask as well.
+        token_parts.insert(
+            0, torch.tensor([requested_bos_token_id], dtype=torch.int64, device=device)
+        )
+        mask_parts.insert(0, torch.tensor([-1], dtype=torch.int64, device=device))
+    return torch.cat(token_parts), torch.cat(mask_parts)
 
 
 def _slice_suffix_media_metadata(
@@ -2434,8 +2454,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if prefix_stitching_metadata is not None:
                 # Multi-Modal Prefix Stitching
+                requested_bos_token_id = None
+                if sampling_params is not None and sampling_params.add_BOS:
+                    bos_token_id = getattr(self.controller.tokenizer, "bos", None)
+                    if type(bos_token_id) is int:
+                        requested_bos_token_id = bos_token_id
                 tokens, mask_tensor = _prepend_expanded_multimodal_prefix(
-                    tokens, mask_tensor, inference_wrapper, modality, prefix_stitching_metadata
+                    tokens,
+                    mask_tensor,
+                    inference_wrapper,
+                    modality,
+                    prefix_stitching_metadata,
+                    requested_bos_token_id,
                 )
                 expected_embedding_count = int((mask_tensor >= 0).sum().item())
                 compact_prompt_tokens = None

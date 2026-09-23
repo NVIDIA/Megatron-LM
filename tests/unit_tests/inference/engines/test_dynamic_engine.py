@@ -177,15 +177,18 @@ def _call_build_vlm_request(
     media_cache_key=None,
     offload_params=None,
     imgs_sizes=None,
+    sampling_params=None,
 ):
     if imgs_sizes is None:
         imgs_sizes = torch.tensor([[2, 2]])
+    if sampling_params is None:
+        sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=0)
     with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
         return engine._build_vlm_request(
             request_id=1,
             prompt_str=None,
             tokens=tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            sampling_params=sampling_params,
             imgs=torch.ones(1, 2, 4),
             num_tiles=None,
             num_img_embeddings_per_tile=0,
@@ -318,6 +321,32 @@ def test_build_vlm_request_stitches_expanded_multimodal_prefix():
     assert request.media_tokens_preexpanded is True
     assert request.offload_params is None
     wrapper.expand_image_tokens.assert_not_called()
+
+
+def test_build_vlm_request_moves_requested_bos_before_stitched_prefix():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine.controller.tokenizer.bos = 1
+    suffix_tokens = torch.tensor([1, 2, 30, 40], dtype=torch.int64)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+    stitching_metadata = {
+        PREFIX_EOS_TOKEN_ID_FIELD: 2,
+        PREFIX_MEDIA_COUNT_FIELD: 1,
+        PREFIX_MODEL_PROMPT_TOKEN_IDS_FIELD: [10, 99, 99, 20],
+        PREFIX_MODEL_GENERATION_TOKEN_IDS_FIELD: [7, 8, 2],
+    }
+
+    request = _call_build_vlm_request(
+        engine,
+        suffix_tokens,
+        media_tokens_preexpanded=False,
+        offload_params=stitching_metadata,
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0, add_BOS=True),
+    )
+
+    assert request.prompt_tokens.tolist() == [1, 10, 99, 99, 20, 7, 8, 2, 30, 40]
+    assert request.image_token_mask.tolist() == [-1, -1, 0, 1, -1, -1, -1, -1, -1, -1]
 
 
 def test_expanded_prefix_metadata_reports_every_missing_preparer_field():
