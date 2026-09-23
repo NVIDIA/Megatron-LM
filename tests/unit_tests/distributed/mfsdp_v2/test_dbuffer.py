@@ -91,7 +91,7 @@ def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
 
 
 def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
-    """LCM packing fills row-aligned padding gaps on a 5-rank flat-sharded mesh."""
+    """LCM packing fills row-aligned padding gaps on a 5-rank mesh using RowAtomic."""
     if distributed_setup.world_size < 5:
         pytest.skip("LCM padding-gap layout test requires at least 5 ranks.")
 
@@ -440,7 +440,7 @@ def test_partial_allreduce_average(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-def test_partial_reduce_scatter_to_flat(distributed_setup):
+def test_partial_reduce_scatter_to_row_atomic(distributed_setup):
     """Partial buffers reduce-scatter into sharded buffers."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     rank_scale = float(distributed_setup.rank + 1)
@@ -471,7 +471,7 @@ def test_partial_reduce_scatter_to_flat(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
-def test_partial_reduce_scatter_to_flat_average(distributed_setup):
+def test_partial_reduce_scatter_to_row_atomic_average(distributed_setup):
     """Partial buffers can reduce-scatter with AVG."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     rank_scale = float(distributed_setup.rank + 1)
@@ -496,7 +496,7 @@ def test_partial_reduce_scatter_to_flat_average(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
-def test_partial_reduce_scatter_to_flat_average_without_symm_mem_detector(
+def test_partial_reduce_scatter_to_row_atomic_average_without_symm_mem_detector(
     distributed_setup, monkeypatch
 ):
     """Ordinary AVG remains available when PyTorch lacks the symmetric-memory detector."""
@@ -514,7 +514,7 @@ def test_partial_reduce_scatter_to_flat_average_without_symm_mem_detector(
     _assert_dbuffer_local_tensors_close(replicated_buffer, [expected])
 
 
-def test_symmetric_memory_partial_reduce_scatter_to_flat_average(distributed_setup):
+def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_average(distributed_setup):
     """Symmetric-memory reduce-scatter preserves AVG semantics."""
     device, world_size = distributed_setup.device, distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
@@ -540,7 +540,7 @@ def test_symmetric_memory_partial_reduce_scatter_to_flat_average(distributed_set
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
-def test_symmetric_memory_partial_reduce_scatter_to_flat_sum(distributed_setup):
+def test_symmetric_memory_partial_reduce_scatter_to_row_atomic_sum(distributed_setup):
     """Symmetric-memory reduce-scatter preserves explicit SUM semantics."""
     device, world_size = distributed_setup.device, distributed_setup.world_size
     mesh = init_device_mesh(device.type, (world_size,))
@@ -581,8 +581,8 @@ def test_get_dtensor_from_sharded_buffer(distributed_setup):
     assert dtensor.placements == (Shard(0),)
 
 
-def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
-    """A 2D mesh can replicate on one axis and flat-shard on the other."""
+def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup):
+    """A 2D mesh can replicate on one axis and use RowAtomic on the other."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
 
@@ -590,7 +590,7 @@ def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
     mesh = init_device_mesh(
         distributed_setup.device.type,
         (2, distributed_setup.world_size // 2),
-        mesh_dim_names=("replicate", "flat"),
+        mesh_dim_names=("replicate", "row_atomic"),
     )
 
     sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), RowAtomic()])
@@ -599,7 +599,7 @@ def test_2d_mesh_replicate_flat_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
+def test_2d_mesh_row_atomic_before_replicate_is_rejected(distributed_setup):
     """RowAtomic axes must be a suffix to keep every local buffer contiguous."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
@@ -607,7 +607,7 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
     mesh = init_device_mesh(
         distributed_setup.device.type,
         (2, distributed_setup.world_size // 2),
-        mesh_dim_names=("flat", "replicate"),
+        mesh_dim_names=("row_atomic", "replicate"),
     )
 
     with pytest.raises(ValueError, match="Shard placements must be a suffix"):
@@ -648,7 +648,7 @@ def test_2d_mesh_shards_across_all_ranks(distributed_setup):
         assert fully_sharded_buffer.get_tensor_view(index).is_contiguous()
 
 
-def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
+def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(distributed_setup):
     """Partial+RowAtomic reduce-scatter reduces the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
@@ -691,7 +691,7 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-def test_2d_mesh_replicate_flat_view_to_flat_flat(distributed_setup):
+def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")

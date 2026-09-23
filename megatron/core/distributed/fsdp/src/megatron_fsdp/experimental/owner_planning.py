@@ -38,9 +38,10 @@ def select_ge_2d_params(param: torch.Tensor) -> bool:
 class ParameterLayout:
     """How a single parameter's flat element range splits across the DP group.
 
-    MFSDP v2's all-`RowAtomic` layout gives each rank one contiguous global element range per parameter,
-    in rank order, so rank `r` holds `[offset, offset + count)` where `offset` is the sum of the
-    previous ranks' counts. A rank with `count == 0` holds no elements of this parameter.
+    MFSDP v2's all-`RowAtomic` layout gives each rank one contiguous global element range
+    per parameter, in rank order, so rank `r` holds `[offset, offset + count)` where `offset`
+    is the sum of the previous ranks' counts. A rank with `count == 0` holds no elements
+    of this parameter.
 
     Attributes:
         full_shape: The parameter's global shape.

@@ -54,8 +54,9 @@ _OPTIMIZER_STATE_KEY = "state"
 def _dbuffer_chunk_metadata(buffer: DBuffer, index: int) -> ChunkStorageMetadata:
     """Return the chunk of logical tensor ``index`` this rank holds in ``buffer``.
 
-    RowAtomic placements shard the flat buffer, and every logical tensor is row-aligned within it, so a
-    rank always owns whole dim-0 rows and the chunk is a dim-0 range of the global tensor.
+    RowAtomic placements shard the flat buffer, and every logical tensor is row-aligned
+    within it, so a rank always owns whole dim-0 rows and the chunk is a dim-0 range of the
+    global tensor.
 
     Args:
         buffer: Buffer holding the logical tensor.
