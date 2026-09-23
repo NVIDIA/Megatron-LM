@@ -20,10 +20,10 @@ BACKEND_LOSS_REL, LAYOUT_LOSS_REL, LAYER_COS = 1e-2, 5e-3, 0.999
 DENSE_GRAD_COS, EXPERT_GRAD_COS = 0.99, 0.95
 
 
-def _train_config(ps):
+def _train_config(ps, moe_dispatcher="alltoall"):
     return SimpleNamespace(
         tp=ps.tp_size, ep=ps.ep_size, etp=ps.etp_size, pp=ps.pp_size, cp=ps.cp_size, vpp=None,
-        moe_dispatcher="alltoall", fp8=False, recompute_modules=[], deterministic=True,
+        moe_dispatcher=moe_dispatcher, fp8=False, recompute_modules=[], deterministic=True,
     )
 
 
@@ -62,12 +62,12 @@ def _make_batch(cfg, seq_lens, seed=1234):
     return torch.randint(0, cfg.vocab_size, (total,), device="cuda"), torch.randint(0, cfg.vocab_size, (total,), device="cuda")
 
 
-def _build(cfg, ps, src, backend):
+def _build(cfg, ps, src, backend, moe_dispatcher="alltoall"):
     from megatron.lite.model.minimax_m3.lite.checkpoint import load_hf_weights
     from megatron.lite.model.minimax_m3.lite.model import MiniMaxM3Model
 
     torch.manual_seed(7)
-    model = MiniMaxM3Model(cfg, _train_config(ps), ps, msa_backend=backend).to(torch.bfloat16).cuda()
+    model = MiniMaxM3Model(cfg, _train_config(ps, moe_dispatcher), ps, msa_backend=backend).to(torch.bfloat16).cuda()
     load_hf_weights(model, src, cfg, ps)
     return model
 
@@ -179,7 +179,8 @@ def test_magi_cp1_matches_flex_cp1(magi_cfg, magi_source, magi_cp1, dist, grad_t
     torch.cuda.empty_cache()
 
 
-def _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, *, cp=1, ep=1, pp=1, tag="single"):
+def _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, *, cp=1, ep=1, pp=1, tag="single",
+                  moe_dispatcher="alltoall"):
     from megatron.lite.primitive.parallel import init_parallel
     from megatron.lite.runtime.contracts import ParallelConfig
 
@@ -188,12 +189,12 @@ def _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, *, cp=1, ep
         pytest.skip(f"world={world} incompatible with cp={cp} ep={ep} pp={pp}")
     ps = init_parallel(ParallelConfig(tp=1, ep=ep, pp=pp, cp=cp))
     ref = magi_cp1[tag]
-    model = _build(magi_cfg, ps, magi_source, "magi")
+    model = _build(magi_cfg, ps, magi_source, "magi", moe_dispatcher)
     w0 = grad_tools.indexer_weights(model)
     ctx = _magi_ctx(ps, magi_cfg, ref["seq_lens"])
     loss, layer_out = _run_magi(model, ps, ctx, ref["ids"], ref["labels"], dist)
     grad_tools.assert_indexer_frozen(model, w0)
-    case = f"cp{cp}_ep{ep}_pp{pp}_{tag}"
+    case = f"cp{cp}_ep{ep}_pp{pp}_{tag}_{moe_dispatcher}"
     loss_rel = _rel(loss, ref["loss"]) if loss is not None else 0.0
     layer_cos = {gi: _cos(h, ref["layer_out"][gi]) for gi, h in layer_out.items()}
     grads = grad_tools.grads_by_hf_name(model, magi_cfg, ps)
@@ -231,6 +232,11 @@ def test_magi_cp2_matches_cp1_packed_with_pad(magi_cfg, magi_source, magi_cp1, d
 
 def test_magi_ep2_matches_cp1_packed(magi_cfg, magi_source, magi_cp1, dist, grad_tools):
     _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, ep=2, tag="packed")
+
+
+def test_magi_ep2_hybridep_matches_cp1_packed(magi_cfg, magi_source, magi_cp1, dist, grad_tools):
+    pytest.importorskip("deep_ep")
+    _check_layout(magi_cfg, magi_source, magi_cp1, dist, grad_tools, ep=2, tag="packed", moe_dispatcher="hybridep")
 
 
 def test_magi_pp2_matches_cp1_single(magi_cfg, magi_source, magi_cp1, dist, grad_tools):

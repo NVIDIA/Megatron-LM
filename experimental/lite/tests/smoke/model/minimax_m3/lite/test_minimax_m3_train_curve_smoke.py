@@ -27,8 +27,8 @@ pytestmark = [
 
 S, STEPS, LR, CHUNK = 4096, 50, 1e-3, 512
 CURVE_REL = 1e-2
-_CASES = [("ep2", dict(tp=1, ep=2, etp=1, pp=1, cp=1)), ("pp2", dict(tp=1, ep=1, etp=1, pp=2, cp=1)),
-          ("cp2", dict(tp=1, ep=1, etp=1, pp=1, cp=2))]
+_CASES = [("ep2", dict(tp=1, ep=2, etp=1, pp=1, cp=1), "alltoall"), ("pp2", dict(tp=1, ep=1, etp=1, pp=2, cp=1), "alltoall"),
+          ("cp2", dict(tp=1, ep=1, etp=1, pp=1, cp=2), "alltoall"), ("ep2_hybridep", dict(tp=1, ep=2, etp=1, pp=1, cp=1), "hybridep")]
 
 
 def _deps(dist):
@@ -48,7 +48,7 @@ def _all_msa_config(magi_hf_kwargs):
     return cfg
 
 
-def _build_handle(cfg, src, parallel, *, load=True, deterministic=False):
+def _build_handle(cfg, src, parallel, *, load=True, deterministic=False, moe_dispatcher="alltoall"):
     from megatron.lite.model.minimax_m3.lite import protocol
     from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
     from megatron.lite.runtime.contracts.config import OptimizerConfig
@@ -60,6 +60,7 @@ def _build_handle(cfg, src, parallel, *, load=True, deterministic=False):
         optimizer_config=OptimizerConfig(optimizer="adam", lr=LR, weight_decay=0.1, clip_grad=1.0),
         deterministic=deterministic,
         magi_chunk_size=CHUNK,
+        moe_dispatcher=moe_dispatcher,
     )
     torch.manual_seed(1)
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
@@ -107,6 +108,9 @@ def _reset_parallel_state(ps):
 
     from megatron.core import parallel_state as mpu
 
+    from megatron.lite.primitive.modules.dispatcher import reset_hybridep_buffers
+
+    reset_hybridep_buffers()
     if mpu.is_initialized():
         mpu.destroy_model_parallel()
     gc.collect()
@@ -120,11 +124,11 @@ def _reset_parallel_state(ps):
     torch.cuda.empty_cache()
 
 
-def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, load=True, deterministic=False):
+def _train(cfg, src, parallel, *, steps=STEPS, seq_len=S, load=True, deterministic=False, moe_dispatcher="alltoall"):
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    handle = _build_handle(cfg, src, parallel, load=load, deterministic=deterministic)
+    handle = _build_handle(cfg, src, parallel, load=load, deterministic=deterministic, moe_dispatcher=moe_dispatcher)
     ps = handle._parallel_state
     w0 = _indexer_weights(handle)
     losses, norms, step_times = [], [], []
@@ -173,11 +177,13 @@ def baseline(magi_cfg, magi_source, dist):
     return losses
 
 
-@pytest.mark.parametrize("name,parallel", _CASES, ids=[c[0] for c in _CASES])
-def test_train_curve_tracks_dp_baseline(magi_cfg, magi_source, baseline, dist, name, parallel):
+@pytest.mark.parametrize("name,parallel,moe_dispatcher", _CASES, ids=[c[0] for c in _CASES])
+def test_train_curve_tracks_dp_baseline(magi_cfg, magi_source, baseline, dist, name, parallel, moe_dispatcher):
     from megatron.lite.runtime.contracts.config import ParallelConfig
 
-    losses, norms, st = _train(magi_cfg, magi_source, ParallelConfig(**parallel))
+    if moe_dispatcher == "hybridep":
+        pytest.importorskip("deep_ep")
+    losses, norms, st = _train(magi_cfg, magi_source, ParallelConfig(**parallel), moe_dispatcher=moe_dispatcher)
     mean_rel, tail_rel = _curve_delta(losses, baseline, dist)
     if dist.get_rank() == 0:
         print(f"train_curve {name}: loss[0]={losses[0]:.4f} loss[-1]={losses[-1]:.4f} | mean rel|delta| {mean_rel:.3e} "

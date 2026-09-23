@@ -74,6 +74,11 @@ def _get_hybridep_buffer(group: dist.ProcessGroup, hidden_size: int, num_local_e
     return buf
 
 
+def reset_hybridep_buffers() -> None:
+    """Drop cached HybridEP buffers (call after destroying the process groups they were built on)."""
+    _hybridep_buffers.clear()
+
+
 def _routing_tensors(
     topk_scores: torch.Tensor, topk_indices: torch.Tensor, num_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -727,4 +732,4 @@ class TokenDispatcher:
         return combined
 
 
-__all__ = ["TokenDispatcher"]
+__all__ = ["DISPATCH_BACKENDS", "TokenDispatcher", "reset_hybridep_buffers"]
