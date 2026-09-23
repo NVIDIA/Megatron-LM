@@ -55,7 +55,7 @@ class ImplConfig:
     optimizer: str | None = "dist_opt"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
-    use_deepep: bool = False
+    moe_dispatcher: str = "alltoall"  # alltoall | deepep | hybridep
     use_thd: bool = False
     cross_entropy_fusion: bool = False
     hf_path: str = ""
@@ -278,8 +278,10 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         # FA4 rejects a non-zero SM margin (Magi defaults to 4 when CUDA_DEVICE_MAX_CONNECTIONS > 1)
         os.environ.setdefault("MAGI_ATTENTION_FFA_FORWARD_SM_MARGIN", "0")
         os.environ.setdefault("MAGI_ATTENTION_FFA_BACKWARD_SM_MARGIN", "0")
-    if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
-        raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    if impl_cfg.moe_dispatcher not in ("alltoall", "deepep", "hybridep"):
+        raise ValueError(f"moe_dispatcher must be alltoall, deepep or hybridep, got {impl_cfg.moe_dispatcher!r}")
+    if impl_cfg.moe_dispatcher != "alltoall" and (p.etp is not None and p.etp > 1):
+        raise ValueError(f"moe_dispatcher={impl_cfg.moe_dispatcher!r} and etp>1 are mutually exclusive")
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
 
@@ -293,7 +295,7 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         pp=ps.pp_size,
         cp=ps.cp_size,
         vpp=vpp,
-        use_deepep=impl_cfg.use_deepep,
+        moe_dispatcher=impl_cfg.moe_dispatcher,
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,

@@ -115,7 +115,7 @@ class M3MoELayer(nn.Module):
         config: MiniMaxM3Config,
         ps: ParallelState,
         *,
-        use_deepep: bool = False,
+        moe_dispatcher: str = "alltoall",
         moe_act_recompute: bool = False,
         moe_permute_fusion: bool | None = None,
     ):
@@ -132,7 +132,7 @@ class M3MoELayer(nn.Module):
             config.num_experts,
             config.hidden_size,
             ps,
-            use_deepep=use_deepep,
+            dispatch_backend=moe_dispatcher,
             moe_permute_fusion=moe_permute_fusion,
         )
         self.shared_expert = M3SharedExpert(config, ps)
@@ -164,7 +164,7 @@ class MiniMaxM3Layer(nn.Module):
         layer_idx: int,
         *,
         msa_backend: str,
-        use_deepep: bool = False,
+        moe_dispatcher: str = "alltoall",
         moe_act_recompute: bool = False,
     ):
         super().__init__()
@@ -215,7 +215,7 @@ class MiniMaxM3Layer(nn.Module):
             self.moe: M3MoELayer | None = M3MoELayer(
                 config,
                 ps,
-                use_deepep=use_deepep,
+                moe_dispatcher=moe_dispatcher,
                 moe_act_recompute=moe_act_recompute,
                 moe_permute_fusion=True,
             )
@@ -287,7 +287,7 @@ class MiniMaxM3Model(nn.Module):
                     config,
                     ps,
                     idx,
-                    use_deepep=train_config.use_deepep,
+                    moe_dispatcher=train_config.moe_dispatcher,
                     moe_act_recompute=moe_act_recompute,
                     msa_backend=msa_backend,
                 )
