@@ -454,6 +454,13 @@ class TransformerConfig(ModelParallelConfig):
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
+    hca_aligned_backward: bool = False
+    """Use cuDNN's aligned HCA backward for GB300 BF16, 64K tokens, contiguous CP16,
+    128 heads, head dimension 512, and window/compression 128. Requires cuDNN Frontend
+    with ``aligned_hca_backward_wrapper``. Other eager layouts use stock backward.
+    Attention CUDA graphs require one padded sequence throughout replay and an eager
+    backward warmup. Changing packed boundaries during replay raises an error."""
+
     csa_compress_ratios: Optional[List[int]] = None
     """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]. A value of 0 is a
     sliding-window-only layer (no compressor / no top-k indexer; the 'W' hybrid layer symbol)."""
