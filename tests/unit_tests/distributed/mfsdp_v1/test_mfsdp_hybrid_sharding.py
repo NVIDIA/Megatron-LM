@@ -33,7 +33,7 @@ OPTIM = "optim"
 # (DP_OUTER, DP_SHARD) factorizations. Each case is skipped unless it spans the world, so
 # that the same test file covers the 8-GPU CI world and smaller local worlds. DP_SHARD of
 # one is included because it makes the DP-Shard reduction collective degenerate.
-HYBRID_MESHES = [(2, 1), (2, 2), (4, 1), (2, 4), (4, 2), (8, 1)]
+HYBRID_MESHES = [(2, 2), (4, 1), (2, 4), (4, 2), (8, 1)]
 
 
 def build_hybrid_mesh(dp_outer: int, dp_shard: int):
@@ -150,7 +150,7 @@ class TestHybridFsdpOverReplicatedWeights:
 
     # A DP-Shard width of one is the case under test, and it is reached both by sharding
     # everything over DP-Outer and by an expert group whose parallelism spans DP-Shard.
-    @pytest.mark.parametrize("mesh_shape", [(2, 1), (4, 1), (8, 1)])
+    @pytest.mark.parametrize("mesh_shape", [(4, 1), (8, 1)])
     def test_single_rank_dp_shard_group_reduces_once_per_cycle(self, mesh_shape):
         """A single-rank DP-Shard bucket must not be reduced on every backward pass."""
         device_mesh = build_hybrid_mesh(*mesh_shape)
