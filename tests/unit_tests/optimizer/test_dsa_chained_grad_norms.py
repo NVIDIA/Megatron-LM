@@ -91,3 +91,36 @@ def test_chained_dsa_split_norms_preserve_child_filtering(
         lambda grads, **kwargs: sum(grad.double().square().sum().item() for grad in grads) ** 0.5,
     )
     assert ChainedOptimizer(children).get_dsa_split_grad_norms() == pytest.approx((5.0, 13.0))
+
+
+@pytest.mark.parametrize('fsdp_parameter', [False, True])
+def test_chained_clipping_preserves_fsdp_decoupled_grad(monkeypatch, fsdp_parameter):
+    config = SimpleNamespace(
+        use_precision_aware_optimizer=True,
+        use_precision_aware_optimizer_no_fp8_or_ds_fp8=False,
+        dsa_separate_indexer_grad_clip=False,
+        clip_grad=1.0,
+        grad_norm_skip_threshold=float('inf'),
+        log_num_zeros_in_grad=False,
+    )
+    param = torch.nn.Parameter(torch.zeros(1))
+    param.__fsdp_param__ = fsdp_parameter
+    child = SimpleNamespace(
+        config=config,
+        param_groups=[{'params': [param]}],
+        get_parameters=lambda: [param],
+    )
+    chain = ChainedOptimizer([child])
+    monkeypatch.setattr(chain, 'prepare_grads', lambda: False)
+    monkeypatch.setattr(chain, 'get_grad_norm', lambda: 2.0)
+    monkeypatch.setattr(chain, '_compute_grad_norms_by_group', lambda: {})
+    monkeypatch.setattr(chain, 'step_with_ready_grads', lambda: True)
+    clipping_modes = []
+    monkeypatch.setattr(
+        optimizer_module,
+        'clip_grad_by_total_norm_fp32',
+        lambda params, **kwargs: clipping_modes.append(kwargs['use_decoupled_grad']),
+    )
+
+    assert chain.step() == (True, 2.0, None)
+    assert clipping_modes == [fsdp_parameter]
