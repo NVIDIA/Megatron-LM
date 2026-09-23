@@ -35,6 +35,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     new_nccl_ep_buffer,
     set_deepep_num_sms,
 )
+from megatron.core.transformer.moe.chunked_return import chunked_return
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -574,6 +575,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
             )
+            if self.config.moe_return_chunk_size:
+                self.return_max_peer_rows = num_global_tokens_per_expert.reshape(
+                    self.ep_size, self.ep_size, self.num_local_experts
+                ).sum(dim=2).max()
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
@@ -599,6 +604,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.num_experts
             )
             num_tokens_per_local_expert = num_local_tokens_per_expert
+            if self.config.moe_return_chunk_size:
+                self.return_max_peer_rows = num_local_tokens_per_expert.sum()
 
             # A synchronization is needed before the returns
             # to get the `num_tokens_per_local_expert` CPU value.
@@ -907,6 +914,35 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             output += shared_expert_output
         return output
 
+    def token_combine_to_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return expert rows directly to tokens without a full receive allocation.
+
+        This is a separate stage contract from ``token_combine``: callers must not
+        unpermute its result again. The existing metadata transfer supplies the
+        group-wide round count without another collective or device synchronization.
+        """
+        q = self.config.moe_return_chunk_size
+        rounds = (int(self.return_max_peer_rows) + q - 1) // q
+        if self.ep_size == 1:
+            sends = recvs = (hidden_states.shape[0],)
+        else:
+            sends = tuple(int(count) for count in self.output_splits)
+            recvs = tuple(int(count) for count in self.input_splits)
+        counts = self.num_global_tokens_per_local_expert.tolist()
+        spans = [[] for _ in range(self.ep_size)]
+        start = 0
+        for expert in range(self.num_local_experts):
+            for peer in range(self.ep_size):
+                length = counts[peer][expert]
+                spans[peer].append((start, length))
+                start += length
+        output = chunked_return(
+            hidden_states, self.reversed_local_input_permutation_mapping,
+            self.ep_group, sends, recvs, self.hidden_shape_before_permute[0], q, rounds,
+            tuple(tuple(peer_spans) for peer_spans in spans),
+        )
+        return output.view(self.hidden_shape)
+
     def _maybe_update_cuda_sync_point(self, point: str):
         """
         Update the CUDA sync point if the priority of the new point is higher than the current
@@ -944,6 +980,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     self.output_splits_tp = maybe_move_tensor_to_cpu(
                         self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
                     )
+                    if self.config.moe_return_chunk_size:
+                        self.return_max_peer_rows = maybe_move_tensor_to_cpu(
+                            self.return_max_peer_rows, record_stream=on_side_stream
+                        )
                     self.num_out_tokens = maybe_move_tensor_to_cpu(
                         self.num_out_tokens, record_stream=on_side_stream
                     )

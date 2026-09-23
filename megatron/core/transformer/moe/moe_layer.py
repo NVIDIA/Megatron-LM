@@ -590,7 +590,8 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        output = (expert_output if self.config.moe_return_chunk_size
+                  else self.token_dispatcher.combine_preprocess(expert_output))
 
         return output, mlp_bias
 
@@ -600,6 +601,8 @@ class MoELayer(BaseMoELayer):
         This method uses the token dispatcher to combine the outputs from different
         experts (e.g., via an All-to-All communication).
         """
+        if self.config.moe_return_chunk_size:
+            return self.token_dispatcher.token_combine_to_tokens(output)
         output = self.token_dispatcher.token_combine(output)
         return output
 
@@ -611,7 +614,8 @@ class MoELayer(BaseMoELayer):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
+        if not self.config.moe_return_chunk_size:
+            output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
