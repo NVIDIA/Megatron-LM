@@ -47,7 +47,7 @@ from megatron.core.transformer.hyper_connection import (
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import CrossLayerState, TransformerLayer
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
@@ -494,6 +494,7 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
+        cross_layer_state: CrossLayerState | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -516,6 +517,14 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if cross_layer_state is not None:
+            if (self.config.recompute_granularity is not None
+                    or self.config.cuda_graph_impl != "none"
+                    or packed_seq_params is not None or inference_context is not None
+                    or packed_seq_params_by_layout is not None
+                    or cp_layout_plan is not None or self.config.moe_shortcut_connection):
+                raise ValueError("External cross-layer state currently requires eager nonpacked training")
+
 
         if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
             raise NotImplementedError(
@@ -688,6 +697,8 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = input_ids
+                                if cross_layer_state is not None:
+                                    layer_kwargs["cross_layer_state"] = cross_layer_state
                                 hidden_states, _ = layer(**layer_kwargs)
                             elif layer_cp_metadata is not None:
                                 hidden_states = layer(

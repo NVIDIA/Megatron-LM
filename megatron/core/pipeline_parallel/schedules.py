@@ -14,6 +14,11 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.pipeline_payload import (
+    PipelinePayload,
+    backward_pipeline_payload,
+)
+from megatron.core.pipeline_parallel.typed_p2p_communication import TypedP2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -182,6 +187,10 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     - Dict[str, Tensor]: Recursively deallocates each value (for multi-module pipelines)
     '''
     if (out is None) or (not deallocate_pipeline_outputs):
+        return
+
+    if isinstance(out, PipelinePayload):
+        out.release_output()
         return
 
     # Handle dict format (multi-module pipelines)
@@ -551,6 +560,14 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
+
+    if isinstance(input_tensor, PipelinePayload) or isinstance(output_tensor, PipelinePayload):
+        gradients = backward_pipeline_payload(
+            input_tensor, output_tensor, output_tensor_grad, config.grad_scale_func
+        )
+        if config.timers is not None:
+            config.timers('backward-compute').stop()
+        return gradients
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -2244,6 +2261,9 @@ def forward_backward_pipelining_without_interleaving(
     else:
         raise ValueError("Provide both p2p_communicator and pg_collection, or neither")
 
+    if isinstance(p2p_communicator, TypedP2PCommunicator) and forward_only:
+        raise ValueError("Typed pipeline boundaries currently support training only")
+
     if is_multimodule:
         p2p_communicator.set_forward_only(forward_only)
 
@@ -2532,5 +2552,8 @@ def forward_backward_pipelining_without_interleaving(
 
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
+
+    if isinstance(p2p_communicator, TypedP2PCommunicator):
+        p2p_communicator.finish()
 
     return forward_data_store

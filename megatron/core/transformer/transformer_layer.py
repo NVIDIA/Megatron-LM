@@ -221,6 +221,14 @@ def get_transformer_layer_offset(
     return offset
 
 
+class CrossLayerState(Protocol):
+    """Caller-owned tensor state for a single microbatch's attention consumers."""
+
+    def attention_kwargs(self, layer_number: int) -> dict[str, Tensor]:
+        """Return tensor arguments understood by the participating attention layer."""
+        ...
+
+
 class MlpInterface(Protocol):
     """Interface for MLP implementations in the transformer layer."""
 
@@ -746,6 +754,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        cross_layer_state: CrossLayerState | None = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -801,6 +810,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **(cross_layer_state.attention_kwargs(self.layer_number)
+                   if cross_layer_state is not None else {}),
             )
         nvtx_range_pop(suffix="self_attention")
 
