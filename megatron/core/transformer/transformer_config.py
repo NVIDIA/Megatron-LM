@@ -386,15 +386,10 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
 
-    dsa_gqa_backend: Optional[
-        Literal['reference', 'triton-min-memory', 'torch-min-memory', 'cute']
-    ] = None
-    """DSA-over-GQA implementation. None preserves the legacy selector's value."""
-
-    dsa_min_memory_backend: Literal[
-        'reference', 'triton-min-memory', 'torch-min-memory', 'cute'
-    ] = 'reference'
-    """Compatibility alias for dsa_gqa_backend, normalized during configuration initialization."""
+    dsa_gqa_backend: Literal['reference', 'triton-min-memory', 'torch-min-memory', 'cute'] = (
+        'reference'
+    )
+    """DSA-over-GQA implementation."""
 
     dsa_min_memory_profile: bool = False
     """Whether to print per-layer DSA min-memory forward/backward timing breakdowns."""
@@ -1678,11 +1673,6 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         self._validate_cp_layouts()
 
-        # Resolve the old selector once, retaining existing launch/checkpoint arguments.
-        if self.dsa_gqa_backend is None:
-            self.dsa_gqa_backend = self.dsa_min_memory_backend
-        elif self.dsa_min_memory_backend not in ('reference', self.dsa_gqa_backend):
-            raise ValueError("dsa_gqa_backend conflicts with the legacy dsa_min_memory_backend.")
         if self.dsa_gqa_backend not in (
             'reference',
             'triton-min-memory',
@@ -1690,7 +1680,6 @@ class TransformerConfig(ModelParallelConfig):
             'cute',
         ):
             raise ValueError("Unsupported dsa_gqa_backend.")
-        self.dsa_min_memory_backend = self.dsa_gqa_backend
         if self.dsa_gqa_backend == 'cute' and self.experimental_attention_variant != 'dsa':
             raise ValueError("The CuTe GQA backend requires experimental_attention_variant='dsa'.")
 
@@ -3813,7 +3802,7 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_train_main_only has no selected-score KL backward; do not set "
                     "dsa_kernel_cache_selected_scores."
                 )
-            min_memory_dsa_backend = self.dsa_min_memory_backend in (
+            min_memory_dsa_backend = self.dsa_gqa_backend in (
                 'triton-min-memory',
                 'torch-min-memory',
             )
@@ -3826,15 +3815,6 @@ class TransformerConfig(ModelParallelConfig):
                 and not dense_dsa_warmup
                 and not self.dsa_indexer_use_sparse_loss
             )
-            assert self.dsa_min_memory_backend in (
-                'reference',
-                'triton-min-memory',
-                'torch-min-memory',
-                'cute',
-            ), (
-                "dsa_gqa_backend must be 'reference', 'triton-min-memory', "
-                "'torch-min-memory', or 'cute'."
-            )
             assert (
                 self.dsa_min_memory_profile_rank >= -1
             ), "dsa_min_memory_profile_rank must be -1 or a non-negative global rank."
@@ -3846,16 +3826,16 @@ class TransformerConfig(ModelParallelConfig):
             ), "dsa_kernel_key_block_size must be a positive integer when set."
             assert (
                 not self.dsa_kernel_cache_routing or min_memory_dsa_backend
-            ), "dsa_kernel_cache_routing requires a min-memory dsa_min_memory_backend."
+            ), "dsa_kernel_cache_routing requires a min-memory dsa_gqa_backend."
             assert (
                 not self.dsa_kernel_cache_indexer_k or min_memory_dsa_backend
-            ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_min_memory_backend."
+            ), "dsa_kernel_cache_indexer_k requires a min-memory dsa_gqa_backend."
             assert not self.dsa_kernel_cache_selected_scores or min_memory_dsa_backend, (
-                "dsa_kernel_cache_selected_scores requires " "a min-memory dsa_min_memory_backend."
+                "dsa_kernel_cache_selected_scores requires " "a min-memory dsa_gqa_backend."
             )
             assert (
                 not dense_dsa_warmup or min_memory_dsa_backend
-            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_min_memory_backend."
+            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_gqa_backend."
             assert (
                 not self.dsa_indexer_sparse_loss_use_topk_only or self.dsa_indexer_use_sparse_loss
             ), "dsa_indexer_sparse_loss_use_topk_only requires dsa_indexer_use_sparse_loss."
@@ -3875,7 +3855,7 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
                 assert not self.dsa_sparse_attention_use_gather, (
-                    "min-memory dsa_min_memory_backend bypasses the reference gather backend; "
+                    "min-memory dsa_gqa_backend bypasses the reference gather backend; "
                     "leave dsa_sparse_attention_use_gather for legacy/reference paths."
                 )
                 if skip_dsa:
@@ -3905,16 +3885,14 @@ class TransformerConfig(ModelParallelConfig):
                 else:
                     assert (
                         self.dsa_indexer_loss_coeff or 0.0
-                    ) > 0.0, (
-                        "min-memory dsa_min_memory_backend requires dsa_indexer_loss_coeff > 0."
-                    )
+                    ) > 0.0, "min-memory dsa_gqa_backend requires dsa_indexer_loss_coeff > 0."
                     if sparse_fwd_dense_loss:
                         assert not self.dsa_kernel_cache_selected_scores, (
                             "Sparse-forward dense-loss mode has no selected scores; do not set "
                             "dsa_kernel_cache_selected_scores."
                         )
                 assert skip_dsa or simplified_indexer or self.dsa_indexer_use_hadamard, (
-                    "min-memory dsa_min_memory_backend requires "
+                    "min-memory dsa_gqa_backend requires "
                     "dsa_indexer_use_hadamard for the standard DeepSeek indexer."
                 )
             if self.context_parallel_size > 1:

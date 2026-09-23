@@ -65,7 +65,7 @@ def test_dense_checkpoint_can_initialize_indexer_without_finetuning(
         saved.dsa_indexer_n_heads = 8
         saved.dsa_indexer_head_dim = 64
         saved.dsa_indexer_topk = 2048
-    runtime.dsa_gqa_backend = runtime.dsa_min_memory_backend = backend
+    runtime.dsa_gqa_backend = backend
     saved.consumed_train_samples = 592
     saved.consumed_valid_samples = 32
     saved.skipped_train_samples = 16
@@ -88,7 +88,7 @@ def test_dense_checkpoint_can_initialize_indexer_without_finetuning(
     assert restored.dsa_indexer_n_heads == 1
     assert restored.dsa_indexer_head_dim == 128
     assert restored.dsa_indexer_topk == 512
-    assert restored.dsa_gqa_backend == restored.dsa_min_memory_backend == backend
+    assert restored.dsa_gqa_backend == backend
     assert vars(saved) == saved_before
 
 

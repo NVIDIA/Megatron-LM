@@ -319,7 +319,7 @@ def test_transformer_config_accepts_min_memory_backend():
             dsa_simplified_use_learned_k=True,
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend=backend,
+            dsa_gqa_backend=backend,
             dsa_kernel_cache_routing=True,
             dsa_kernel_cache_indexer_k=True,
             dsa_kernel_cache_selected_scores=True,
@@ -332,7 +332,7 @@ def test_transformer_config_accepts_min_memory_backend():
             dsa_min_memory_profile_rank=-1,
         )
 
-        assert config.dsa_min_memory_backend == backend
+        assert config.dsa_gqa_backend == backend
         assert config.dsa_kernel_query_block_size == 256
         assert config.dsa_kernel_key_block_size == 1024
         assert config.dsa_kernel_cache_routing
@@ -481,7 +481,7 @@ def test_transformer_config_accepts_simplified_dsa_and_derives_shape():
         add_bias_linear=False,
         dsa_indexer_mode="simplified",
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="torch-min-memory",
+        dsa_gqa_backend="torch-min-memory",
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
     )
@@ -504,7 +504,7 @@ def test_transformer_config_accepts_simplified_learned_k_with_independent_dimens
         dsa_simplified_use_learned_k=True,
         dsa_indexer_head_dim=6,
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="torch-min-memory",
+        dsa_gqa_backend="torch-min-memory",
         dsa_kernel_cache_indexer_k=True,
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
@@ -532,7 +532,7 @@ def test_simplified_main_q_reset_requires_main_attention_dimension_with_learned_
             dsa_indexer_topk=4,
             dsa_indexer_reset_method="main-q-mean-rescaled",
             dsa_reset_indexer_on_load=True,
-            dsa_min_memory_backend="torch-min-memory",
+            dsa_gqa_backend="torch-min-memory",
             dsa_indexer_loss_coeff=0.1,
             dsa_indexer_use_sparse_loss=True,
         )
@@ -841,7 +841,7 @@ def test_simplified_indexer_accepts_internal_tp_group_rewrite(monkeypatch):
         add_bias_linear=False,
         dsa_indexer_mode="simplified",
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="torch-min-memory",
+        dsa_gqa_backend="torch-min-memory",
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
     )
@@ -886,7 +886,7 @@ def test_simplified_learned_k_builds_replicated_independent_projection(monkeypat
         dsa_simplified_use_learned_k=True,
         dsa_indexer_head_dim=6,
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="torch-min-memory",
+        dsa_gqa_backend="torch-min-memory",
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
     )
@@ -932,7 +932,7 @@ def test_simplified_indexer_rope_matches_model_rotary_config(monkeypatch):
         add_bias_linear=False,
         dsa_indexer_mode="simplified",
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="torch-min-memory",
+        dsa_gqa_backend="torch-min-memory",
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
     )
@@ -973,7 +973,7 @@ def test_transformer_config_rejects_incompatible_simplified_dsa_options(kwargs, 
         add_bias_linear=False,
         dsa_indexer_mode="simplified",
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="torch-min-memory",
+        dsa_gqa_backend="torch-min-memory",
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
     )
@@ -1991,7 +1991,7 @@ def test_transformer_config_min_memory_accepts_sparse_loss_without_topk_only_fla
         dsa_indexer_mode="simplified",
         add_bias_linear=False,
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="triton-min-memory",
+        dsa_gqa_backend="triton-min-memory",
         dsa_indexer_loss_coeff=0.1,
         dsa_indexer_use_sparse_loss=True,
     )
@@ -2012,7 +2012,7 @@ def test_transformer_config_accepts_dsa_train_main_only(backend):
         dsa_indexer_mode="simplified",
         add_bias_linear=False,
         dsa_indexer_topk=4,
-        dsa_min_memory_backend=backend,
+        dsa_gqa_backend=backend,
         dsa_indexer_loss_coeff=0.0,
         dsa_train_main_only=True,
     )
@@ -2045,7 +2045,7 @@ def test_transformer_config_rejects_incompatible_dsa_train_main_only_modes(overr
         dsa_indexer_n_heads=2,
         dsa_indexer_head_dim=8,
         dsa_indexer_topk=4,
-        dsa_min_memory_backend="triton-min-memory",
+        dsa_gqa_backend="triton-min-memory",
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_hadamard=True,
         dsa_train_main_only=True,
@@ -2068,7 +2068,7 @@ def test_transformer_config_accepts_dense_warmup_min_memory_backend():
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend=backend,
+            dsa_gqa_backend=backend,
             dsa_fwd_use_dense_attn=True,
             dsa_indexer_loss_coeff=0.1,
         )
@@ -2089,7 +2089,7 @@ def test_transformer_config_dense_warmup_rejects_sparse_loss_and_caches():
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend="triton-min-memory",
+            dsa_gqa_backend="triton-min-memory",
             dsa_fwd_use_dense_attn=True,
             dsa_indexer_loss_coeff=0.1,
             dsa_indexer_use_sparse_loss=True,
@@ -2106,7 +2106,7 @@ def test_transformer_config_dense_warmup_rejects_sparse_loss_and_caches():
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend="triton-min-memory",
+            dsa_gqa_backend="triton-min-memory",
             dsa_fwd_use_dense_attn=True,
             dsa_indexer_loss_coeff=0.1,
             dsa_kernel_cache_routing=True,
@@ -2125,7 +2125,7 @@ def test_transformer_config_dense_warmup_requires_min_memory_backend():
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend="reference",
+            dsa_gqa_backend="reference",
             dsa_fwd_use_dense_attn=True,
             dsa_indexer_loss_coeff=0.1,
         )
@@ -2143,7 +2143,7 @@ def test_transformer_config_dense_warmup_requires_positive_loss_coeff_and_dsa_va
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend="triton-min-memory",
+            dsa_gqa_backend="triton-min-memory",
             dsa_fwd_use_dense_attn=True,
             dsa_indexer_loss_coeff=0.0,
         )
@@ -2181,7 +2181,7 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
     for backend in ("torch-min-memory", "triton-min-memory"):
         core = SimpleNamespace(
             config=SimpleNamespace(
-                dsa_min_memory_backend=backend,
+                dsa_gqa_backend=backend,
                 dsa_sparse_attention_use_gather=False,
                 dsa_indexer_use_sparse_loss=True,
                 dsa_indexer_use_hadamard=True,
@@ -2248,7 +2248,7 @@ def test_min_memory_simplified_no_norm_discards_supplied_norm(monkeypatch, learn
     )
     core = SimpleNamespace(
         config=SimpleNamespace(
-            dsa_min_memory_backend="triton-min-memory",
+            dsa_gqa_backend="triton-min-memory",
             dsa_indexer_mode="simplified",
             dsa_simplified_use_learned_k=learned_k,
             dsa_simplified_indexer_disable_main_input_norm=True,
@@ -2322,7 +2322,7 @@ def test_reference_train_main_only_routes_without_constructing_indexer_loss(monk
     core = SimpleNamespace(
         config=SimpleNamespace(
             sequence_parallel=False,
-            dsa_min_memory_backend="reference",
+            dsa_gqa_backend="reference",
             dsa_fwd_skip_dsa=False,
             dsa_indexer_mode="standard",
             dsa_sparse_attention_use_gather=False,
@@ -2362,7 +2362,7 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
 
     core = SimpleNamespace(
         config=SimpleNamespace(
-            dsa_min_memory_backend="triton-min-memory",
+            dsa_gqa_backend="triton-min-memory",
             dsa_fwd_use_dense_attn=True,
             dsa_sparse_attention_use_gather=False,
             dsa_indexer_use_sparse_loss=False,
@@ -2416,7 +2416,7 @@ def test_transformer_config_cache_routing_requires_min_memory_backend():
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend="reference",
+            dsa_gqa_backend="reference",
             dsa_indexer_loss_coeff=0.1,
             dsa_kernel_cache_routing=True,
         )
@@ -2438,7 +2438,7 @@ def test_transformer_config_optional_kernel_caches_require_min_memory_backend(ca
             dsa_simplified_use_learned_k=True,
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend="reference",
+            dsa_gqa_backend="reference",
             dsa_indexer_loss_coeff=0.1,
             **{cache_flag: True},
         )
@@ -2925,7 +2925,7 @@ def test_transformer_config_accepts_min_memory_sparse_forward_dense_loss():
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend=backend,
+            dsa_gqa_backend=backend,
             dsa_indexer_loss_coeff=0.1,
         )
 
@@ -2945,7 +2945,7 @@ def test_transformer_config_sparse_forward_dense_loss_rejects_selected_score_cac
             dsa_indexer_mode="simplified",
             add_bias_linear=False,
             dsa_indexer_topk=4,
-            dsa_min_memory_backend="triton-min-memory",
+            dsa_gqa_backend="triton-min-memory",
             dsa_indexer_loss_coeff=0.1,
             dsa_kernel_cache_selected_scores=True,
         )
