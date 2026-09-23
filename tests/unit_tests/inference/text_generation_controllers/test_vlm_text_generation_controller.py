@@ -12,10 +12,12 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
+    _render_nemotron_vl_video_prompt,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
     dynamic_media_embedding_counts,
@@ -152,6 +154,97 @@ def test_dynamic_video_embedding_counts_group_one_placeholder_per_video():
     assert dynamic_media_replacement_counts(
         frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2
     ) == [504]
+    assert dynamic_media_replacement_counts(
+        frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2, aggregate_videos=False
+    ) == [252, 252]
+
+
+@pytest.mark.internal
+def test_nemotron_video_expansion_adds_timestamped_tubelet_wrappers():
+    wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    wrapper.multimodal_prompt_config = MultimodalPromptConfig(
+        video_spec=MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+    )
+    wrapper.model = SimpleNamespace(
+        image_token_index=-200,
+        dynamic_resolution=True,
+        patch_dim=16,
+        vision_model=SimpleNamespace(temporal_patch_dim=2),
+    )
+
+    class _Tokenizer:
+        def __init__(self):
+            self.rendered = None
+
+        def tokenize(self, text):
+            if text == "<img>":
+                return [77]
+            if text == "</img>":
+                return [78]
+            self.rendered = text
+            return [7, 77, 99, 78, 7, 77, 99, 78]
+
+    tokenizer = _Tokenizer()
+    expanded, masks = wrapper.expand_image_tokens(
+        [[11, 77, 99, 78, 12]],
+        imgs_sizes=torch.tensor([[32, 32]] * 4),
+        num_frames=torch.tensor([4]),
+        image_token_id=99,
+        tokenizer=tokenizer,
+        video_frame_indices=[[0, 30, 60, 90]],
+        video_fps=[29.97],
+    )
+
+    assert tokenizer.rendered == (
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
+        "<img><image></img>\n"
+        "Frame 3 sampled at 1.98 seconds and frame 4 sampled at 2.97 seconds: "
+        "<img><image></img>"
+    )
+    assert expanded == [[11, 7, 77, -1, 78, 7, 77, -1, 78, 12]]
+    assert masks == [[None, None, None, 0, None, None, None, 1, None, None]]
+
+
+@pytest.mark.internal
+def test_nemotron_video_prompt_supports_partial_final_tubelet():
+    prompt = _render_nemotron_vl_video_prompt(
+        MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        ),
+        frame_indices=[0, 30, 60],
+        fps=30.0,
+        temporal_patch_size=2,
+    )
+
+    assert prompt == (
+        "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
+        "<img><image></img>\n"
+        "Frame 3 sampled at 1.98 seconds: <img><image></img>"
+    )
+
+
+@pytest.mark.internal
+def test_nemotron_temporal_prompt_can_omit_timestamps():
+    prompt = _render_nemotron_vl_video_prompt(
+        MediaPromptSpec(
+            model_token="<image>", prefix="<img>", suffix="</img>", expansion_mode="temporal_patch"
+        ),
+        frame_indices=[0, 30, 60, 90],
+        fps=30.0,
+        temporal_patch_size=2,
+    )
+
+    assert prompt == "<img><image></img>\n<img><image></img>"
 
 
 @pytest.mark.internal
@@ -160,6 +253,16 @@ def test_dynamic_video_embedding_counts_reject_misaligned_frames():
         dynamic_media_replacement_counts(
             [252] * 4, num_frames=torch.tensor([3]), temporal_patch_size=2
         )
+
+
+@pytest.mark.internal
+def test_super_video_geometry_has_32_tubelets_and_8192_embeddings():
+    counts = dynamic_media_replacement_counts(
+        [256] * 64, num_frames=torch.tensor([64]), temporal_patch_size=2, aggregate_videos=False
+    )
+
+    assert len(counts) == 32
+    assert sum(counts) == 8192
 
 
 @pytest.mark.internal
@@ -213,35 +316,121 @@ def test_vlm_wrapper_rejects_multiple_compact_markers_for_one_video():
 
 
 @pytest.mark.internal
-def test_vlm_and_omni_wrappers_expand_video_markers_consistently():
+def test_omni_text_forward_does_not_treat_generated_image_token_as_media():
+    """A decode token matching the image-token ID has no projected feature."""
+    tokens = torch.tensor([[18]])
+    position_ids = torch.tensor([[7]])
+    language_embeddings = torch.empty((1, 1, 8))
+    output = torch.empty((1, 1, 16))
+    language_model = mock.Mock(return_value=output)
+    language_model.embedding = mock.Mock(return_value=language_embeddings)
     model = SimpleNamespace(
-        image_token_index=-200,
-        dynamic_resolution=True,
-        patch_dim=16,
-        _pixel_shuffle=True,
-        _conv_merging=False,
-        _drop_vision_class_token=True,
-        temporal_patch_dim=2,
+        image_token_index=18, language_model=language_model, sequence_parallel_lm=False
     )
-    model.vision_model = SimpleNamespace(temporal_patch_dim=2)
+    wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    wrapper.model = model
+    wrapper.inference_context = mock.sentinel.inference_context
 
-    vlm_wrapper = object.__new__(VLMInferenceWrapper)
-    vlm_wrapper.model = SimpleNamespace(module=model)
-    omni_wrapper = object.__new__(NemotronOmniInferenceWrapper)
-    omni_wrapper.model = model
+    result = wrapper._forward(
+        {"tokens": tokens, "position_ids": position_ids, "attention_mask": None}
+    )
 
-    kwargs = {
-        "imgs_sizes": torch.tensor([[448, 576]] * 4),
-        "num_frames": torch.tensor([4]),
-        "image_token_id": 99,
+    assert result is output
+    assert language_model.embedding.call_args.kwargs["input_ids"] is tokens
+    language_model.assert_called_once()
+
+
+@pytest.mark.internal
+def test_omni_raw_image_forward_calls_full_model():
+    """Manually supplied raw images use NemotronOmniModel.forward."""
+    tokens = torch.tensor([[7, 18, 9]])
+    position_ids = torch.tensor([[0, 1, 2]])
+    images = torch.empty((1, 3, 16, 16))
+    imgs_sizes = torch.tensor([[16, 16]])
+    output = torch.empty((1, 3, 16))
+    wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    wrapper.model = mock.Mock(return_value=(output, None))
+    wrapper.inference_context = mock.sentinel.inference_context
+
+    result = wrapper._forward(
+        {
+            "tokens": tokens,
+            "position_ids": position_ids,
+            "attention_mask": None,
+            "images": images,
+            "imgs_sizes": imgs_sizes,
+        }
+    )
+
+    assert result is output
+    call_kwargs = wrapper.model.call_args.kwargs
+    assert call_kwargs["images"] is images
+    assert call_kwargs["input_ids"] is tokens
+    assert call_kwargs["imgs_sizes"] is imgs_sizes
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("wrapper_cls", [VLMInferenceWrapper, NemotronOmniInferenceWrapper])
+def test_image_token_mask_takes_precedence_over_raw_images(wrapper_cls):
+    """A dynamic media mask selects the LM-only path even when raw images are present."""
+    tokens = torch.tensor([[7, -200, 9]])
+    position_ids = torch.tensor([[0, 1, 2]])
+    images = torch.empty((1, 3, 16, 16))
+    output = torch.empty((1, 3, 16))
+    wrapper = object.__new__(wrapper_cls)
+    wrapper.model = mock.Mock()
+    wrapper.inference_context = mock.sentinel.inference_context
+    wrapper._forward_dynamic = mock.Mock(return_value=output)
+
+    inference_input = {
+        "tokens": tokens,
+        "position_ids": position_ids,
+        "attention_mask": None,
+        "images": images,
+        "num_tiles": torch.tensor([1]),
+        "image_token_mask": torch.tensor([[-1, 0, -1]]),
+        "image_embeddings": torch.empty((1, 1, 16)),
     }
-    vlm_expanded, vlm_masks = vlm_wrapper.expand_image_tokens([[11, 99, 12]], **kwargs)
-    omni_expanded, omni_masks = omni_wrapper.expand_image_tokens([[11, 99, 12]], **kwargs)
+    result = wrapper._forward(inference_input)
 
-    assert vlm_expanded == [[11] + [-1] * 504 + [12]]
-    assert omni_expanded == [[11] + [-1] * 504 + [12]]
-    assert vlm_masks == omni_masks
-    assert vlm_masks[0][1:-1] == list(range(504))
+    assert result is output
+    wrapper._forward_dynamic.assert_called_once_with(inference_input)
+    wrapper.model.assert_not_called()
+
+
+@pytest.mark.internal
+def test_llava_text_forward_embeds_generated_image_token_as_text():
+    """Media-free decode must not replace a generated image-token ID with token 0."""
+    tokens = torch.tensor([[18]])
+    position_ids = torch.tensor([[7]])
+    language_embeddings = torch.empty((1, 1, 8))
+    output = torch.empty((1, 1, 16))
+    embedding = mock.Mock(return_value=language_embeddings)
+    model = SimpleNamespace(
+        image_token_index=18,
+        language_model=SimpleNamespace(embedding=embedding),
+        forward_lm_only=mock.Mock(return_value=output),
+    )
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = model
+    wrapper.inference_context = mock.sentinel.inference_context
+    wrapper.pp_group = None
+    wrapper._recv_only_vision_embeds = False
+
+    with mock.patch(
+        "megatron.core.inference.model_inference_wrappers.multimodal."
+        "vlm_inference_wrapper.is_pipeline_first_stage",
+        return_value=True,
+    ):
+        result = wrapper._forward(
+            {"tokens": tokens, "position_ids": position_ids, "attention_mask": None}
+        )
+
+    assert result is output
+    embedded_input_ids = embedding.call_args.kwargs["input_ids"]
+    assert torch.equal(embedded_input_ids, tokens)
+    assert embedded_input_ids is not tokens
+    model.forward_lm_only.assert_called_once()
 
 
 class TestVLMTextGenerationController:

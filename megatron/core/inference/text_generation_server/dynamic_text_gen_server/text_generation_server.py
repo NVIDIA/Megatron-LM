@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
+# The policy worker is a live Ray/CUDA process with background threads by the
+# time it starts HTTP replicas. Forking it copies locks and runtime state
+# without the threads that own them, which can leave a child alive but unable
+# to make progress. Every frontend must therefore start from a clean interpreter.
+_SERVER_PROCESS_CONTEXT = mp.get_context("spawn")
 
 
 @contextmanager
@@ -304,7 +309,7 @@ def start_text_gen_server(
         server_port = _reserve_port(hostname)
 
     for i in range(num_replicas):
-        p = mp.Process(
+        p = _SERVER_PROCESS_CONTEXT.Process(
             target=_server_process_worker,
             args=(
                 coordinator_addr,

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
+from unittest import mock
 
 import msgpack
 import numpy as np
@@ -13,10 +14,13 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     FinishedRequestRecord,
     InferenceRequest,
+    OffloadedRequestPayload,
     Status,
     compute_block_hashes_batched,
+    compute_media_cache_key,
     deserialize_ndarray,
     deserialize_tensor,
+    prepare_multimodal_data,
     resolve_multimodal_data_for_engine,
     serialize_multimodal_data,
     serialize_ndarray,
@@ -36,13 +40,68 @@ def _make_dynamic_request(**kwargs):
     return DynamicInferenceRequest(**defaults)
 
 
+@pytest.mark.parametrize(
+    "tensor",
+    [
+        pytest.param(torch.tensor(3.25, dtype=torch.float32), id="scalar-fp32"),
+        pytest.param(torch.arange(6, dtype=torch.float16).reshape(2, 3), id="fp16"),
+        pytest.param(torch.arange(6, dtype=torch.bfloat16).reshape(2, 3), id="bf16"),
+        pytest.param(torch.arange(6, dtype=torch.int64).reshape(2, 3), id="int64"),
+        pytest.param(torch.tensor([[True, False], [False, True]]), id="bool"),
+        pytest.param(torch.empty((0, 3), dtype=torch.float32), id="empty"),
+        pytest.param(torch.arange(12, dtype=torch.float32).reshape(3, 4).T, id="noncontiguous"),
+    ],
+)
+def test_tensor_binary_serialization_round_trip(tensor):
+    serialized = serialize_tensor(tensor)
+    restored = deserialize_tensor(msgpack.unpackb(msgpack.packb(serialized), raw=False))
+
+    assert set(serialized) == {"dtype", "shape", "data"}
+    assert isinstance(serialized["data"], bytes)
+    assert restored.device.type == "cpu"
+    assert restored.dtype == tensor.dtype
+    assert restored.shape == tensor.shape
+    assert torch.equal(restored, tensor.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tensor_binary_serialization_round_trip_from_cuda():
+    tensor = torch.arange(12, device="cuda", dtype=torch.float32).reshape(3, 4).T
+
+    restored = deserialize_tensor(serialize_tensor(tensor))
+
+    assert restored.device.type == "cpu"
+    assert restored.dtype == tensor.dtype
+    assert restored.shape == tensor.shape
+    assert torch.equal(restored, tensor.cpu())
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ({"dtype": "torch.not_a_dtype", "shape": [1], "data": b"\0"}, "Unsupported"),
+        ({"dtype": "torch.float32", "shape": [-1], "data": b""}, "non-negative"),
+        ({"dtype": "torch.float32", "shape": [2], "data": b"\0" * 4}, "expected 8"),
+        ({"dtype": "torch.float32", "shape": [1], "data": "not-bytes"}, "must be bytes"),
+        ({"dtype": "torch.float32", "shape": [1]}, "exactly dtype, shape, and data"),
+        ({"dtype": "torch.float32", "shape": "1", "data": b"\0" * 4}, "list or tuple"),
+        ({"dtype": "torch.float32", "shape": [True], "data": b"\0" * 4}, "only integers"),
+        ({"dtype": "torch.float32", "shape": [1.0], "data": b"\0" * 4}, "only integers"),
+        ({"dtype": "torch.float32", "shape": ["1"], "data": b"\0" * 4}, "only integers"),
+    ],
+)
+def test_tensor_binary_deserialization_rejects_malformed_payload(payload, error):
+    with pytest.raises((TypeError, ValueError), match=error):
+        deserialize_tensor(payload)
+
+
 def test_serialization_helpers_round_trip():
     """serialize_tensor / serialize_ndarray pair with their deserialize inverses;
-    unwrap_serialized_tensors replaces ('tensor', list) sentinels in place and
+    unwrap_serialized_tensors replaces ('tensor', payload) sentinels in place and
     leaves other wrappers untouched. The wrapper protocol is the contract every
     higher-level serialize() call depends on."""
-    t = torch.tensor([4, 5, 6, 7])
-    assert deserialize_tensor(serialize_tensor(t)).tolist() == [4, 5, 6, 7]
+    # Requests serialized by older clients remain readable.
+    assert deserialize_tensor([4, 5, 6, 7]).tolist() == [4, 5, 6, 7]
 
     arr = np.array([[1.5, 2.5], [3.5, 4.5]], dtype=np.float64)
     arr_out = deserialize_ndarray(serialize_ndarray(arr))
@@ -59,6 +118,22 @@ def test_serialization_helpers_round_trip():
     assert out["b"] == "plain"
     assert out["c"] == ("ndarray", {"data": [], "dtype": "int32"})
 
+    binary_tensor = torch.tensor([4, 5, 6], dtype=torch.int64)
+    out = unwrap_serialized_tensors({"tokens": ("tensor", serialize_tensor(binary_tensor))})
+    assert out["tokens"] == [4, 5, 6]
+
+
+def test_prepared_multimodal_data_protects_computed_identity():
+    prepared = prepare_multimodal_data({"image": [b"image"]})
+    wire = serialize_multimodal_data(prepared)
+    expected_key = wire["media_cache_key"]
+    wire["media_cache_key"] = "forged"
+    wire["image"].append(b"different-image")
+
+    fresh_wire = serialize_multimodal_data(prepared)
+    assert fresh_wire["media_cache_key"] == expected_key
+    assert fresh_wire["image"] == [b"image"]
+
 
 def test_preexpanded_multimodal_request_round_trip():
     media = {
@@ -71,8 +146,27 @@ def test_preexpanded_multimodal_request_round_trip():
 
     resolved = resolve_multimodal_data_for_engine(wire)
     assert resolved["media_tokens_preexpanded"] is True
+    assert resolved["media_cache_key"] == wire["media_cache_key"]
     assert torch.equal(resolved["imgs"], media["image"]["imgs"])
     assert torch.equal(resolved["imgs_sizes"], media["image"]["imgs_sizes"])
+
+
+def test_preprocessed_video_timing_metadata_round_trip():
+    media = {
+        "video": {
+            "imgs": torch.ones(1, 2, 4),
+            "imgs_sizes": torch.tensor([[2, 2], [2, 2]]),
+            "num_frames": torch.tensor([2]),
+            "video_frame_indices": [[3, 7]],
+            "video_fps": [29.97],
+        }
+    }
+
+    wire = serialize_multimodal_data(media)
+    resolved = resolve_multimodal_data_for_engine(wire)
+
+    assert resolved["video_frame_indices"] == [[3, 7]]
+    assert resolved["video_fps"] == [29.97]
 
 
 def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
@@ -119,6 +213,20 @@ def test_multimodal_serialization_generates_stable_content_keys():
     assert tensor_a["media_cache_key"] != tensor_c["media_cache_key"]
 
 
+def test_prepared_multimodal_data_reuses_computed_content_key():
+    with mock.patch(
+        "megatron.core.inference.inference_request.compute_media_cache_key",
+        wraps=compute_media_cache_key,
+    ) as compute_key:
+        prepared = prepare_multimodal_data({"image": [b"same-image"]})
+        first = serialize_multimodal_data(prepared)
+        second = serialize_multimodal_data(prepared)
+
+    assert first == second
+    assert first is not second
+    assert compute_key.call_count == 1
+
+
 def test_multimodal_serialization_rejects_user_media_cache_key():
     with pytest.raises(ValueError, match="computed automatically"):
         serialize_multimodal_data({"image": [b"image"], "media_cache_key": "user-provided"})
@@ -161,7 +269,7 @@ def test_inference_parameters_alias_warns_and_copies():
 
 def test_inference_request_serialize_round_trip_through_msgpack():
     """The full serialize → msgpack → deserialize cycle: tensor fields are
-    wrapped as ('tensor', list), msgpack converts the tuple to a list, and
+    wrapped as ('tensor', payload), msgpack converts the tuple to a list, and
     _post_deserialize reconstructs the tensor. Same for ndarray fields on
     DynamicInferenceRequest. status=None must pass through. This is the only
     serialization contract callers actually depend on; the wrapper details
@@ -455,17 +563,20 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
 @pytest.mark.parametrize(
     (
         "return_prompt_tokens",
+        "payload_offloaded",
         "expected_prompt_field",
         "expected_compact_prompt_field",
         "expected_remaining_prompt_field",
     ),
     [
-        (False, None, None, None),  # default: prompt state dropped from payload
-        (True, ("tensor", [1, 2, 3, 4]), ("tensor", [1, 99, 4]), ("tensor", [1, 2, 3, 4])),
+        (False, False, None, None, None),  # default: prompt state dropped from payload
+        (True, False, [1, 2, 3, 4], [1, 99, 4], [1, 2, 3, 4]),  # opt-in: prompt state preserved
+        (True, True, None, None, None),  # offload drops the prompt even when opted in
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
     return_prompt_tokens,
+    payload_offloaded,
     expected_prompt_field,
     expected_compact_prompt_field,
     expected_remaining_prompt_field,
@@ -473,7 +584,8 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
     prompt_tokens tensor from the wire payload unless
-    SamplingParams.return_prompt_tokens is True. This is the load-bearing
+    SamplingParams.return_prompt_tokens is True. Payload offload always drops
+    them: the stager already holds the prompt ids. This is the load-bearing
     wire-cost optimization for long agentic-RL prompts. The same call must
     (a) leave self.prompt_tokens intact on the local instance — the drop is
     wire-only — and (b) keep the routing_indices shape check honest, which
@@ -494,20 +606,41 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
         routing_indices=routing,
     )
 
-    obj = req.serialize()
+    obj = req.serialize(payload_offloaded=payload_offloaded)
+    unwrapped_obj = unwrap_serialized_tensors(obj)
 
     # prompt_length is always populated (independent of the drop).
     assert obj["prompt_length"] == 4
-    # Payload either preserves the tensor wrapper or drops it (present but None).
-    assert obj["prompt_tokens"] == expected_prompt_field
-    assert obj["compact_prompt_tokens"] == expected_compact_prompt_field
-    assert obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
+    # Payload either preserves the serialized tensor values or drops them (present but None).
+    assert unwrapped_obj["prompt_tokens"] == expected_prompt_field
+    assert unwrapped_obj["compact_prompt_tokens"] == expected_compact_prompt_field
+    assert unwrapped_obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
+    assert obj["payload_offloaded"] is payload_offloaded
     # Local instance is unaffected — the drop is wire-only.
     assert req.prompt_tokens is prompt
     assert req.compact_prompt_tokens is compact_prompt
-    # routing_indices survives the drop path (shape check would have crashed on
-    # the temporarily-None self.prompt_tokens if the fix used self.prompt_tokens).
-    assert isinstance(obj["routing_indices"], tuple) and obj["routing_indices"][0] == "ndarray"
+    # routing_indices survives the prompt-only drop path, but payload offload strips it.
+    # The former's shape check would crash if it used temporarily-None self.prompt_tokens.
+    if payload_offloaded:
+        assert obj["routing_indices"] is None
+    else:
+        assert isinstance(obj["routing_indices"], tuple)
+        assert obj["routing_indices"][0] == "ndarray"
+
+
+def test_dynamic_inference_request_serialize_without_sampling_params_drops_prompt():
+    """With sampling_params=None nothing can opt in to return_prompt_tokens, so the
+    prompt tensors stay off the wire (prompt_length is still reported)."""
+    prompt = torch.tensor([1, 2, 3, 4])
+    req = _make_dynamic_request(prompt_tokens=prompt, sampling_params=None)
+
+    obj = req.serialize()
+
+    assert obj["prompt_length"] == 4
+    assert obj["prompt_tokens"] is None
+    assert obj["remaining_prompt_tokens"] is None
+    assert obj["payload_offloaded"] is False
+    assert req.prompt_tokens is prompt
 
 
 def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(monkeypatch):
@@ -699,3 +832,70 @@ def test_supplied_block_hashes_are_not_re_salted():
         block_hash_salt="w9",
     )
     assert request.precomputed_block_hashes == [11, 22]
+
+
+def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
+    admission = {"rollout_id": "r0", "model_call_id": "c1"}
+    request = _make_dynamic_request(
+        uid="chatcmpl-fixed", offload_params={"ng_capture": admission}, generated_tokens=[10]
+    )
+    request.generated_log_probs = [-0.25]
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    merged = record.merge()
+
+    assert merged.uid == "chatcmpl-fixed"
+    assert merged.offload_params == {"ng_capture": admission}
+
+    serialized = merged.serialize(
+        payload_offloaded=True,
+        payload_stage_metadata={"ng_commit_coords": {"staging_key": "r0/c1"}},
+    )
+    assert serialized["uid"] == "chatcmpl-fixed"
+    assert "offload_params" not in serialized
+    assert serialized["generated_log_probs"] is None
+    assert serialized["payload_offloaded"] is True
+    assert serialized["payload_stage_metadata"] == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+    round_trip = DynamicInferenceRequest.deserialize(unwrap_serialized_tensors(serialized))
+    assert round_trip.payload_offloaded is True
+    assert round_trip.payload_stage_metadata == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+
+
+def test_offloaded_request_payload_and_serialize():
+    """The payload copies a finished request's per-token data as plain host-side lists;
+    serialize(payload_offloaded=True) drops that data from the wire, marks the reply, and
+    restores local state; defaults are unchanged."""
+    routing = np.array([[1], [2], [3], [4]])  # total_tokens - 1 rows
+
+    def make_request():
+        req = DynamicInferenceRequest(
+            request_id=7,
+            prompt_tokens=torch.tensor([1, 2, 3]),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+            generated_tokens=[10, 11],
+        )
+        req.generated_log_probs = [-0.5, -0.25]
+        req.prompt_log_probs = torch.tensor([-1.0, -2.0])
+        req.routing_indices = routing
+        return req
+
+    req = make_request()
+    payload = OffloadedRequestPayload.from_request(req)
+    assert payload.prompt_token_ids == [1, 2, 3]
+    assert payload.generated_token_ids == [10, 11]
+    assert payload.generated_log_probs == [-0.5, -0.25]
+    assert payload.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
+    assert payload.routing_indices is routing
+
+    obj = req.serialize(payload_offloaded=True)
+    assert obj["payload_offloaded"] is True
+    assert obj["generated_log_probs"] is None
+    assert obj["prompt_log_probs"] is None and obj["routing_indices"] is None
+    assert obj["generated_tokens"] == [10, 11]  # token ids stay: they are the response
+    # The drop is wire-only: local state is restored after the send.
+    assert req.generated_log_probs == [-0.5, -0.25] and req.routing_indices is routing
+
+    obj = make_request().serialize()
+    assert obj["payload_offloaded"] is False
+    assert obj["generated_log_probs"] == [-0.5, -0.25]
+    assert obj["routing_indices"][0] == "ndarray"
