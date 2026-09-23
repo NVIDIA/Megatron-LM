@@ -75,3 +75,14 @@ The subsequent v14 single-round path launches the NCCL exchange asynchronously, 
 | Pair 4, v14 then native | 19.371 ms | 18.593 ms | 1.042× | 594.21 / 594.27 MiB |
 
 Four pairs favored v14 and one was effectively tied. The large absolute-time swings reflect intermittent load from the instance's existing inference service, so this is a supplementary local-backend result rather than the requested TE/5090 acceptance result. The 8×RTX 5090 host remained unreachable over SSH when these runs completed; no process was stopped and no environment was updated.
+
+The 8×RTX 5090 host later became available. The original Transformer Engine grouped-expert path completed two reversed-order EP2 comparisons on GPUs 0 and 7, with five warmups and 20 measured full optimizer steps per launch. Each time below is the median of the slower rank. The v14 return used one round (q equals tokens × top-k). A launch guard required at least 12 GiB free on each selected GPU, and subsequent runs capped the PyTorch allocator to 25% of each GPU; the H512 pair-0 native launch preceded the cap. The guard was separately checked to reject a launch before starting workers when its threshold was unmet.
+
+| 2-layer GPT, BF16, E16, top-k4, EP2 | Launch order | Native step | v14 step | Native / v14 speedup | Native / v14 peak allocated |
+|---|---|---:|---:|---:|---:|
+| H512, 8192 tokens, q=32768, pair 0 | Native → v14 | 63.44 ms | 62.48 ms | 1.015× | 1410.16 / 1410.42 MiB |
+| H512, 8192 tokens, q=32768, pair 1 | v14 → native | 64.43 ms | 65.21 ms | 0.988× | 1410.16 / 1410.42 MiB |
+| H1024, 4096 tokens, q=16384, pair 0 | v14 → native | 63.26 ms | 59.88 ms | 1.056× | 2296.59 / 2323.10 MiB |
+| H1024, 4096 tokens, q=16384, pair 1 | Native → v14 | 62.16 ms | 60.87 ms | 1.021× | 2296.55 / 2323.03 MiB |
+
+All eight EP2 training launches passed. The H512 shape was mixed across pairs; the H1024 shape was faster in both orders but used about 26.5 MiB more allocated memory at the complete-step peak. Thus v14 meets the requested speed criterion on the H1024 shape, not the earlier full-step memory objective. In a separate fixed-route, deterministic H1024 comparison over 20 complete steps, native and v14 had identical initial weights, routes, every loss, first gradients and final parameters on both ranks (zero absolute and relative error). Temporary gradient and parameter snapshots were deleted after comparison. The 5090 jobs run directly in the existing `0z5a` Python environment, not in Docker; a Docker host-RAM limit cannot constrain their CUDA memory. The separate Vast test instance is an unprivileged container whose cgroup limit cannot be changed from inside it.
