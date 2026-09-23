@@ -946,11 +946,7 @@ def test_backward_topk_widths_collapse_to_aligned_buckets(topk_length):
         _run_aligned_topk_fwd_bwd(recorder, topk_length, width)
     assert len(recorder.calls) == 3
     seen_widths = [t.shape[-1] for t in recorder.calls]
-    assert seen_widths == [
-        expected,
-        expected,
-        expected,
-    ], (
+    assert seen_widths == [expected, expected, expected], (
         f"backward topk widths must collapse to {_get_topk_alignment()}-aligned "
         f"stable buckets, got {seen_widths}"
     )
