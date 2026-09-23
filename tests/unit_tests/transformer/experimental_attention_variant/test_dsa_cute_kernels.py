@@ -68,16 +68,9 @@ def test_cute_configuration_rejects_invalid_loss_coefficient(coefficient):
         _config(dsa_indexer_loss_coeff=coefficient)
 
 
-@pytest.mark.parametrize("backend", ["reference", "torch-min-memory", "triton-min-memory", "cute"])
-def test_backend_compatibility_alias_normalizes_once(backend):
-    config = _config(dsa_gqa_backend=None, dsa_min_memory_backend=backend)
-    assert config.dsa_gqa_backend == backend
-    assert config.dsa_min_memory_backend == backend
-
-
-def test_conflicting_backend_aliases_fail_instead_of_choosing_silently():
-    with pytest.raises((ValueError, AssertionError), match="conflict|disagree|same"):
-        _config(dsa_gqa_backend="cute", dsa_min_memory_backend="torch-min-memory")
+def test_dsa_gqa_backend_defaults_to_reference():
+    config = TransformerConfig(num_layers=1, hidden_size=32, num_attention_heads=4)
+    assert config.dsa_gqa_backend == "reference"
 
 
 @pytest.mark.parametrize("backend", ["reference", "torch-min-memory", "triton-min-memory"])
@@ -87,53 +80,45 @@ def test_simplified_learned_indexer_does_not_require_cute(backend):
     assert config.dsa_gqa_backend == backend
 
 
-@pytest.mark.parametrize("flag", ["--dsa-gqa-backend", "--dsa-min-memory-backend"])
 @pytest.mark.parametrize("backend", ["reference", "torch-min-memory", "triton-min-memory", "cute"])
-def test_cute_backend_cli_aliases_reach_configuration(flag, backend):
+def test_dsa_gqa_backend_cli_reaches_configuration(backend):
     from argparse import ArgumentParser
 
     from megatron.training.arguments import _add_network_size_args
 
     parser = _add_network_size_args(ArgumentParser(exit_on_error=False))
     defaults = parser.parse_args([])
-    assert defaults.dsa_gqa_backend is None
-    assert defaults.dsa_min_memory_backend == "reference"
-    parsed = parser.parse_args([flag, backend])
-    config = _config(
-        dsa_gqa_backend=parsed.dsa_gqa_backend, dsa_min_memory_backend=parsed.dsa_min_memory_backend
-    )
-    assert config.dsa_gqa_backend == config.dsa_min_memory_backend == backend
+    assert defaults.dsa_gqa_backend == "reference"
+    parsed = parser.parse_args(["--dsa-gqa-backend", backend])
+    config = _config(dsa_gqa_backend=parsed.dsa_gqa_backend)
+    assert config.dsa_gqa_backend == backend
 
 
-@pytest.mark.parametrize("flag", ["--dsa-gqa-backend", "--dsa-min-memory-backend"])
-def test_cute_backend_cli_rejects_unknown_choice(flag):
+def test_dsa_gqa_backend_cli_rejects_unknown_choice():
     from argparse import ArgumentError, ArgumentParser
 
     from megatron.training.arguments import _add_network_size_args
 
     parser = _add_network_size_args(ArgumentParser(exit_on_error=False))
     with pytest.raises(ArgumentError, match="invalid choice"):
-        parser.parse_args([flag, "unknown"])
+        parser.parse_args(["--dsa-gqa-backend", "unknown"])
 
 
 @pytest.mark.parametrize(
-    "saved_backend,runtime_backend,legacy_checkpoint",
+    "saved_backend,runtime_backend",
     [
-        ("reference", "cute", False),
-        ("triton-min-memory", "cute", False),
-        ("triton-min-memory", "cute", True),
-        ("cute", "reference", False),
-        ("cute", "triton-min-memory", False),
+        ("reference", "cute"),
+        ("triton-min-memory", "cute"),
+        ("cute", "reference"),
+        ("cute", "triton-min-memory"),
     ],
 )
 def test_cute_checkpoint_restores_architecture_without_overriding_backend(
-    monkeypatch, saved_backend, runtime_backend, legacy_checkpoint
+    monkeypatch, saved_backend, runtime_backend
 ):
     from megatron.training import checkpointing
 
     saved_args = SimpleNamespace(**vars(_config(dsa_gqa_backend=saved_backend)))
-    if legacy_checkpoint:
-        del saved_args.dsa_gqa_backend
     runtime_args = SimpleNamespace(**vars(_config(dsa_gqa_backend=runtime_backend)))
     runtime_args.__dict__.update(
         load="checkpoint",
@@ -163,7 +148,7 @@ def test_cute_checkpoint_restores_architecture_without_overriding_backend(
     restored, _ = checkpointing.load_args_from_checkpoint(runtime_args)
     assert restored.dsa_indexer_head_dim == 128
     assert restored.dsa_indexer_topk == 512
-    assert restored.dsa_gqa_backend == restored.dsa_min_memory_backend == runtime_backend
+    assert restored.dsa_gqa_backend == runtime_backend
     checkpointing.check_checkpoint_args(saved_args)
     restored.dsa_indexer_head_dim = 64
     with pytest.raises(AssertionError, match="dsa_indexer_head_dim"):
