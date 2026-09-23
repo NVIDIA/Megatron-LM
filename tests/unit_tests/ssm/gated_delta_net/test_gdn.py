@@ -519,6 +519,11 @@ class TestGatedDeltaNet:
             ), f"Grad not reproducible for {name} ({rank=})"
 
     def test_module_construction(self):
+        # The default GDN projection fuses its norm and has no separate input to save.
+        self.gdn.set_for_recompute_input_layernorm()
+        assert not hasattr(self.gdn.in_proj, "save_original_input")
+        assert not self.gdn.out_proj.save_original_input
+
         gdn = self.gdn
         assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
         assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
