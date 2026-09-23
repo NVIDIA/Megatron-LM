@@ -7,7 +7,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     fused_qk_topk_chunked,
@@ -28,7 +31,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     compute_gqa_dsa_indexer_loss,
     unfused_grouped_dsa_fn,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import dsa_stack_spec
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import (
+    dsa_stack_spec,
+    gdp_dsa_stack_spec,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
@@ -157,6 +163,29 @@ def test_dsa_stack_spec_does_not_mutate_upstream_hybrid_spec():
     """The spec is derived by deep copy; upstream's shared spec must be untouched."""
     upstream_module = hybrid_stack_spec.submodules.attention_layer.submodules.self_attention.module
     assert upstream_module is not DSGroupedSelfAttention
+
+
+def test_gdp_dsa_stack_spec_uses_dsa_grouped_self_attention():
+    module = gdp_dsa_stack_spec.submodules.attention_layer.submodules.self_attention.module
+    assert module is DSGroupedSelfAttention
+
+
+def test_gdp_dsa_stack_spec_does_not_mutate_upstream_gdp_spec():
+    """gated_delta_product_stack_spec shares hybrid_stack_spec's attention_layer object.
+
+    Deriving either DSA stack therefore has to deep copy first, or swapping the module on one
+    would swap it on the other and on upstream's spec as well.
+    """
+    upstream = gated_delta_product_stack_spec.submodules.attention_layer
+    assert upstream.submodules.self_attention.module is not DSGroupedSelfAttention
+
+
+def test_the_two_dsa_stacks_keep_their_own_mamba_mixers():
+    """Only the attention layer is DSA's to change; the mixers are what distinguish the stacks."""
+    assert (
+        gdp_dsa_stack_spec.submodules.mamba_layer
+        != dsa_stack_spec.submodules.mamba_layer
+    )
 
 
 def _causal_mask(seqlen: int, device: torch.device):
