@@ -190,6 +190,7 @@ def setup_model_and_optimizer(
     optimizer_state_offload_fraction=1.0,
     use_precision_aware_optimizer=False,
     initialize_optimizer_state=True,
+    optimizer_config_kwargs=None,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -225,6 +226,7 @@ def setup_model_and_optimizer(
             )
         )
 
+    optimizer_config_kwargs = optimizer_config_kwargs or {}
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
@@ -235,6 +237,7 @@ def setup_model_and_optimizer(
         optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
         optimizer_state_offload_fraction=optimizer_state_offload_fraction,
         use_precision_aware_optimizer=use_precision_aware_optimizer,
+        **optimizer_config_kwargs,
     )
 
     if optimizer_type in ('muon', 'dist_muon'):
