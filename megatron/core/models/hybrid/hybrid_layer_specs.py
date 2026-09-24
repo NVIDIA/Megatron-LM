@@ -83,6 +83,12 @@ moe = get_moe_module_spec(
     moe_grouped_gemm=True,
 )
 
+moe_no_grouped_gemm = get_moe_module_spec(
+    use_te=True,
+    num_experts=8,  # Can be any positive integer (must not be None).
+    moe_grouped_gemm=False,
+)
+
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
 
@@ -355,6 +361,20 @@ hybrid_stack_spec = ModuleSpec(
             ),
         ),
         mtp_block_spec=_hybrid_mtp_block_spec,
+    ),
+)
+
+
+hybrid_stack_spec_no_moe_grouped_gemm = ModuleSpec(
+    module=hybrid_stack_spec.module,
+    submodules=replace(
+        hybrid_stack_spec.submodules,
+        moe_layer=replace(
+            hybrid_stack_spec.submodules.moe_layer,
+            submodules=replace(
+                hybrid_stack_spec.submodules.moe_layer.submodules, mlp=moe_no_grouped_gemm
+            ),
+        ),
     ),
 )
 
@@ -636,6 +656,7 @@ wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybr
 
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
+mamba_stack_spec_no_moe_grouped_gemm = hybrid_stack_spec_no_moe_grouped_gemm
 mamba_inference_stack_spec = hybrid_inference_stack_spec
 gdp_stack_spec = gated_delta_product_stack_spec
 gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
