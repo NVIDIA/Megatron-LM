@@ -26,6 +26,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -268,6 +269,17 @@ def get_param_state_dp_zero(optimizer):
     else:
         optim_param_state_A = optimizer.get_parameter_state_dp_zero(use_gloo_comm=False)
     return optim_param_state_A
+
+
+def step_hybrid_device_optimizer(optimizer, num_steps):
+    hybrid_optimizer = optimizer.optimizer
+    assert isinstance(hybrid_optimizer, HybridDeviceOptimizer)
+    for _ in range(num_steps):
+        for group in hybrid_optimizer.param_groups:
+            for param in group['params']:
+                param.grad = torch.ones_like(param)
+        hybrid_optimizer.step()
+        hybrid_optimizer.zero_grad()
 
 
 class TestOptimizer:
@@ -605,6 +617,62 @@ class TestDistributedOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    def test_hdo_dp_reshardable_preserves_step(self, tmp_path_dist_ckpt):
+        """HDO restores its canonical step without copying the local template value."""
+        tp_pp = (4, 1)
+        optimizer_config_kwargs = {
+            'optimizer_cpu_offload': True,
+            'optimizer_offload_fraction': 1.0,
+            'overlap_cpu_optimizer_d2h_h2d': False,
+            'lr': 1.0e-4,
+        }
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        Utils.initialize_model_parallel(*tp_pp, order='tp-pp-dp')
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_hdo_dp_reshardable_preserves_step', sync=True
+        ) as ckpt_dir:
+            model_a, optimizer_a = setup_model_and_optimizer(
+                seed=2,
+                tp=tp_pp[0],
+                pp=tp_pp[1],
+                initialize_optimizer_state=False,
+                optimizer_config_kwargs=optimizer_config_kwargs,
+            )
+            step_hybrid_device_optimizer(optimizer_a, num_steps=3)
+
+            model_sharded_state = model_a[0].sharded_state_dict()
+            optimizer_sharded_state = optimizer_a.sharded_state_dict(
+                model_sharded_state, metadata=metadata
+            )
+            save(optimizer_sharded_state, ckpt_dir)
+
+            model_b, optimizer_b = setup_model_and_optimizer(
+                seed=3,
+                tp=tp_pp[0],
+                pp=tp_pp[1],
+                initialize_optimizer_state=False,
+                optimizer_config_kwargs=optimizer_config_kwargs,
+            )
+            step_hybrid_device_optimizer(optimizer_b, num_steps=1)
+
+            model_sharded_state = model_b[0].sharded_state_dict()
+            load_template = optimizer_b.sharded_state_dict(
+                model_sharded_state, metadata=metadata, is_loading=True
+            )
+            loaded_state = load(load_template, ckpt_dir)
+            loaded_group_steps = {
+                group['step'] for group in loaded_state['optimizer']['param_groups']
+            }
+            assert loaded_group_steps == {3}
+            optimizer_b.load_state_dict(loaded_state)
+
+            loaded_steps = {state['step'].item() for state in optimizer_b.optimizer.state.values()}
+            assert loaded_steps == {3}
 
     @pytest.mark.parametrize(
         ("source_offload", "destination_offload"), [(False, True), (True, False)]
