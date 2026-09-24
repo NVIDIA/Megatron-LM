@@ -1868,47 +1868,6 @@ def _clear_dsa_indexer_optimizer_state(model, optimizer) -> int:
     return cleared
 
 
-def _reset_dsa_indexer_optimizer_group_steps(optimizer) -> int:
-    """Reset group-level optimizer clocks for freshly reset DSA indexers.
-
-    TE and Apex FusedAdam keep ``step`` on parameter groups rather than in each
-    parameter's state. Indexer groups are deliberately separate from backbone
-    groups, so their clocks can be reset without changing backbone bias
-    correction.
-    """
-    if optimizer is None or getattr(optimizer, "is_stub_optimizer", False):
-        return 0
-    if hasattr(optimizer, "chained_optimizers"):
-        return sum(
-            _reset_dsa_indexer_optimizer_group_steps(child_optimizer)
-            for child_optimizer in optimizer.chained_optimizers
-        )
-
-    torch_optimizer = getattr(optimizer, "optimizer", None)
-    param_groups = getattr(torch_optimizer, "param_groups", None)
-    if param_groups is None:
-        return 0
-
-    optimizer_module = type(torch_optimizer).__module__
-    uses_group_step = optimizer_module.startswith(("transformer_engine", "apex")) or any(
-        "step" in param_group for param_group in param_groups
-    )
-    if not uses_group_step:
-        return 0
-
-    reset = 0
-    for param_group in param_groups:
-        if not param_group.get("is_dsa_indexer", False):
-            continue
-        step = param_group.get("step")
-        if torch.is_tensor(step):
-            step.zero_()
-        else:
-            param_group["step"] = 0
-        reset += 1
-    return reset
-
-
 @torch.no_grad()
 def _reload_dsa_indexer_optimizer_params(model, optimizer) -> int:
     """Refresh only optimizer-owned indexer weights after an in-place model reset."""
@@ -2029,10 +1988,6 @@ def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args):
     cleared_state_count = (
         0 if not optimizer_state_loaded else _clear_dsa_indexer_optimizer_state(model, optimizer)
     )
-    reset_group_step_count = (
-        0 if not optimizer_state_loaded else _reset_dsa_indexer_optimizer_group_steps(optimizer)
-    )
-
     param_groups = getattr(optimizer, "param_groups", None)
     indexer_lr = get_indexer_lr_for_logging(param_groups) if param_groups else None
 
@@ -2041,8 +1996,7 @@ def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args):
         f"{reset_count} local indexer modules ({global_reset_count} across ranks) "
         f"{reset_description}; refreshed {optimizer_refresh_description}; "
         "cleared optimizer state for "
-        f"{cleared_state_count} indexer tensors and reset "
-        f"{reset_group_step_count} indexer optimizer group steps; indexer_lr={indexer_lr}."
+        f"{cleared_state_count} indexer tensors; indexer_lr={indexer_lr}."
     )
 
 

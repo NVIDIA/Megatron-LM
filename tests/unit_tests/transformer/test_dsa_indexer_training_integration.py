@@ -265,7 +265,6 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
     attention = _FakeAttention()
     optimizer = _FakeOptimizer()
     clear_calls = []
-    group_step_reset_calls = []
     refresh_calls = []
     monkeypatch.setattr(
         training,
@@ -276,11 +275,6 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
         training,
         "_reload_dsa_indexer_optimizer_params",
         lambda model, optimizer: refresh_calls.append((model, optimizer)) or 1,
-    )
-    monkeypatch.setattr(
-        training,
-        "_reset_dsa_indexer_optimizer_group_steps",
-        lambda optimizer: group_step_reset_calls.append(optimizer) or 1,
     )
     monkeypatch.setattr(training, "_broadcast_dsa_indexer_params", lambda model: None)
     args = SimpleNamespace(
@@ -299,7 +293,6 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
     assert optimizer.reload_count == 0
     assert len(refresh_calls) == 1
     assert len(clear_calls) == (0 if no_load_optim else 1)
-    assert len(group_step_reset_calls) == (0 if no_load_optim else 1)
 
 
 def test_dsa_reset_on_load_only_initializes_at_the_start_of_a_run():
@@ -425,34 +418,6 @@ def test_dsa_indexer_optimizer_refresh_preserves_backbone_master_weights(monkeyp
     assert training._reload_dsa_indexer_optimizer_params([model], optimizer) == 1
     torch.testing.assert_close(indexer_master, model.indexer.weight.float())
     torch.testing.assert_close(backbone_master, torch.full_like(backbone_master, 17.0))
-
-
-def test_dsa_indexer_optimizer_group_step_reset_preserves_backbone_clock():
-    import megatron.training.training as training
-
-    backbone_group = {"params": [object()], "is_dsa_indexer": False, "step": 123}
-    indexer_weight_group = {"params": [object()], "is_dsa_indexer": True, "step": 123}
-    indexer_bias_step = torch.tensor(123.0)
-    indexer_bias_group = {"params": [object()], "is_dsa_indexer": True, "step": indexer_bias_step}
-    empty_indexer_group = {"params": [], "is_dsa_indexer": True}
-    optimizer = SimpleNamespace(
-        is_stub_optimizer=False,
-        optimizer=SimpleNamespace(
-            param_groups=[
-                backbone_group,
-                indexer_weight_group,
-                indexer_bias_group,
-                empty_indexer_group,
-            ]
-        ),
-    )
-
-    assert training._reset_dsa_indexer_optimizer_group_steps(optimizer) == 3
-    assert backbone_group["step"] == 123
-    assert indexer_weight_group["step"] == 0
-    assert indexer_bias_group["step"] is indexer_bias_step
-    assert indexer_bias_group["step"].item() == 0.0
-    assert empty_indexer_group["step"] == 0
 
 
 def test_dsa_indexer_optimizer_refresh_copies_only_owned_distributed_shard(monkeypatch):
