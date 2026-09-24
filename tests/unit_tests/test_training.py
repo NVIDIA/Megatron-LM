@@ -121,6 +121,51 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     assert _get_indexer_logging_layer_counts(args) == (6, 3)
 
 
+@pytest.mark.parametrize("backend", ["reference", "torch-min-memory", "triton-min-memory", "cute"])
+@pytest.mark.parametrize("repeated_mtp,expected_count", [(False, 4), (True, 3)])
+def test_indexer_logging_counts_gqa_attention_positions_independently_of_backend(
+    backend, repeated_mtp, expected_count
+):
+    args = SimpleNamespace(
+        num_layers=6,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=repeated_mtp,
+        hybrid_layer_pattern="M*E|M*E/*E/*E",
+        csa_compress_ratios=None,
+        experimental_attention_variant="dsa",
+        multi_latent_attention=False,
+        dsa_gqa_backend=backend,
+    )
+    assert _get_indexer_logging_layer_counts(args) == (8, expected_count)
+
+
+@pytest.mark.parametrize("pattern,expected_count", [("M*E|M*E", 2), ("MEMEME", 0)])
+def test_indexer_logging_gqa_without_mtp(pattern, expected_count):
+    args = SimpleNamespace(
+        num_layers=6,
+        mtp_num_layers=None,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern=pattern,
+        csa_compress_ratios=None,
+        experimental_attention_variant="dsa",
+        multi_latent_attention=False,
+    )
+    assert _get_indexer_logging_layer_counts(args) == (6, expected_count)
+
+
+def test_indexer_logging_preserves_non_gqa_default():
+    args = SimpleNamespace(
+        num_layers=6,
+        mtp_num_layers=None,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern="M*E|M*E",
+        csa_compress_ratios=None,
+        experimental_attention_variant="dsa",
+        multi_latent_attention=True,
+    )
+    assert _get_indexer_logging_layer_counts(args) == (6, None)
+
+
 class TestTraining:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
