@@ -247,8 +247,6 @@ class DBuffer:
             )
 
         _validate_placements(placements)
-        if self.placements == placements:
-            return self
         for source, destination in zip(self.placements, placements):
             if source == destination:
                 continue
@@ -261,10 +259,24 @@ class DBuffer:
                 "or a Replicate/Partial-to-Shard slice on each axis, "
                 f"got {self.placements!r} -> {placements!r}."
             )
+        view = self._view_storage(placements)
+        if view is None:
+            raise RuntimeError("DBuffer view is not contained in its source local buffer.")
+        return view
+
+    def _view_storage(self, placements: Iterable[Placement]) -> "DBuffer | None":
+        """View a contained storage range as a collective destination, or return None.
+
+        Unlike ``view``, this may relabel Replicate to Partial: the collective
+        populates the destination before its values are read.
+        """
+        placements = tuple(placements)
+        if self.placements == placements:
+            return self
         offset, local_numel = self.layout.get_local_range(self.mesh, placements)
         local_offset = offset - self.offset
         if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
-            raise RuntimeError("DBuffer view is not contained in its source local buffer.")
+            return None
         return DBuffer.from_local(
             self.local_buffer.narrow(0, local_offset, local_numel),
             self.mesh,
@@ -380,9 +392,10 @@ class DBuffer:
     ) -> "DBuffer":
         """Apply placement transitions one axis at a time.
 
-        Remove shards outer-to-inner and add shards inner-to-outer so sharded
-        axes remain a suffix throughout. Gather destinations share the final
-        output allocation; shrinking reductions may need intermediate buffers.
+        Remove shards outer-to-inner, then add shards inner-to-outer so sharded
+        axes remain a suffix throughout. Collectives reuse a contained range of
+        the final output or an intermediate buffer, preserving the input unless
+        the caller supplies an output that aliases it.
         Allocate the destination when ``out`` is omitted; use ``view`` to alias storage.
         """
         new_placements = tuple(new_placements)
@@ -394,21 +407,30 @@ class DBuffer:
         _validate_placements(new_placements)
         out = self._create_or_validate_out(out, placements=new_placements)
 
-        transitions = list(enumerate(zip(self.placements, new_placements)))
-        if any(
-            not isinstance(old, Shard) and isinstance(new, Shard) for _, (old, new) in transitions
-        ):
-            transitions.reverse()
+        # Process non-sharded destinations first, then sharded destinations in
+        # reverse order. Both endpoints must satisfy the sharded-suffix invariant.
+        axes = [axis for axis, new in enumerate(new_placements) if not isinstance(new, Shard)]
+        axes += [
+            axis
+            for axis in reversed(range(self.mesh.ndim))
+            if isinstance(new_placements[axis], Shard)
+        ]
 
         result = self
-        for axis, (old, new) in transitions:
+        for axis in axes:
+            old, new = self.placements[axis], new_placements[axis]
             if old == new:
                 continue
             placements = list(result.placements)
             placements[axis] = new
-            step_out = out if tuple(placements) == new_placements else None
+            step_out = out._view_storage(placements)
+            if (
+                step_out is None
+                and result.local_buffer.untyped_storage() is not self.local_buffer.untyped_storage()
+            ):
+                step_out = result._view_storage(placements)
             if isinstance(old, Shard) and isinstance(new, Replicate):
-                result = result.allgather(axis, out=out.view(placements))
+                result = result.allgather(axis, out=step_out)
             elif isinstance(old, Partial) and isinstance(new, Replicate):
                 result = result.allreduce(axis, out=step_out)
             elif isinstance(old, Partial) and isinstance(new, Shard):

@@ -766,6 +766,61 @@ def test_multi_axis_redistribute_reductions(
         torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
 
 
+@pytest.mark.parametrize("collective", ["allgather", "allreduce", "reduce_scatter"])
+def test_multi_axis_redistribute_reuses_storage(distributed_setup, monkeypatch, collective):
+    """Reuse final/scratch storage across three collectives without modifying the input."""
+    if distributed_setup.world_size % 4:
+        pytest.skip("Requires a world size divisible by four.")
+    mesh = init_device_mesh(
+        distributed_setup.device.type, (2, 2, distributed_setup.world_size // 4)
+    )
+    old_placements = [RowAtomic()] * 3 if collective == "allgather" else [Partial()] * 3
+    new_placements = [RowAtomic()] * 3 if collective == "reduce_scatter" else [Replicate()] * 3
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    local_scale = 1 if collective == "allgather" else distributed_setup.rank + 1
+    reduced_scale = (
+        1
+        if collective == "allgather"
+        else distributed_setup.world_size * (distributed_setup.world_size + 1) // 2
+    )
+    source = DBuffer.distribute_tensors(
+        [tensor * local_scale for tensor in tensors], mesh, old_placements
+    )
+    original = source.local_buffer.clone()
+    expected = DBuffer.distribute_tensors(
+        [tensor * reduced_scale for tensor in tensors], mesh, new_placements
+    )
+    out = DBuffer(mesh, new_placements, source.layout, source.dtype, source.device)
+    calls = []
+    original_collective = getattr(DBuffer, collective)
+
+    def record(buffer, axis, *args, out=None):
+        result = original_collective(buffer, axis, *args, out=out)
+        calls.append(
+            (
+                buffer.local_buffer.untyped_storage().data_ptr(),
+                result.local_buffer.untyped_storage().data_ptr(),
+                out is not None,
+            )
+        )
+        return result
+
+    monkeypatch.setattr(DBuffer, collective, record)
+    assert source.redistribute(new_placements, out=out) is out
+    assert len(calls) == 3
+    out_ptr = out.local_buffer.untyped_storage().data_ptr()
+    if collective == "reduce_scatter":
+        assert not calls[0][2]  # The first intermediate is larger than the final output.
+        assert calls[1][0] == calls[1][1] == calls[0][1]  # Reuse that scratch in place.
+        assert calls[1][2]
+        assert calls[2][1] == out_ptr
+    else:
+        assert all(output_ptr == out_ptr and supplied for _, output_ptr, supplied in calls)
+    torch.testing.assert_close(source.local_buffer, original, equal_nan=True)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(out.get_tensor_view(index), expected.get_tensor_view(index))
+
+
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
