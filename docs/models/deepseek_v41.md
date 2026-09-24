@@ -48,3 +48,7 @@ Run focused tests with `NVIDIA_TF32_OVERRIDE=0 uv run python -m torch.distribute
 Trainable V4.1 Engram uses compressed-token hashing, distinct-prime buckets and context-aware mHC gates before attention. The obsolete short convolution is omitted. Supply the released tokenizer or a matching compressed token map before model construction. Row-sharded lookup and its parity tests are adapted from [#7231](https://github.com/NVIDIA/Megatron-LM/pull/7231), by Li Tao: variable-size all-to-all supports duplicate rows, empty peer splits and uneven tables without replicating the table. Checkpoints retain exact logical rows. Shard initialization preserves replicated RNG state. Run the distributed lookup tests with two or four torchrun ranks: `tests/unit_tests/models/test_engram_distributed_embedding.py`.
 
 Disable `vision_config` and `dspark_config` for this text-plus-Engram composition.
+
+The optional [cuDNN Engram gate](engram_cudnn.md) targets BF16 H5120/four-stream
+training on SM100. It is opt-in and requires the source-pinned FE build documented
+there; the default remains the native gate.

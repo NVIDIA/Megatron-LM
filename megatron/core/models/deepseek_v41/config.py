@@ -3,7 +3,7 @@
 """Map the released Hugging Face architecture to Megatron's HybridModel."""
 
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -113,6 +113,24 @@ class DeepSeekV41Config(MLATransformerConfig):
 
     dspark_config: DSparkConfig | None = None
     """Separately supervised draft model; None omits the DSpark training objective."""
+
+    engram_gate_backend: Literal["native", "cudnn"] = "native"
+    """Floating Engram gate provider; cuDNN supports SM100 BF16 H5120/four streams."""
+
+    def __post_init__(self):
+        """Validate the optional gate provider without importing cuDNN or touching CUDA."""
+        super().__post_init__()
+        if self.engram_gate_backend not in ("native", "cudnn"):
+            raise ValueError("engram_gate_backend must be 'native' or 'cudnn'")
+        if self.engram_gate_backend == "cudnn":
+            if (
+                self.hidden_size != 5120
+                or self.mhc_num_residual_streams != 4
+                or self.params_dtype != torch.bfloat16
+            ):
+                raise ValueError("cuDNN Engram requires BF16, hidden size 5120 and four streams")
+            if self.fp8 or self.fp4 or self.cuda_graph_impl != "none":
+                raise ValueError("cuDNN Engram currently requires unquantized eager execution")
 
     @classmethod
     def from_hf(cls, hf: dict[str, Any], **overrides) -> "DeepSeekV41Config":
