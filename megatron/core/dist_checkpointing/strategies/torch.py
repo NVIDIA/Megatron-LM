@@ -292,12 +292,17 @@ def mcore_to_pyt_state_dict(
                 if sh_ten.allow_shape_mismatch and is_loading:
                     sh_ten.data.zero_()
 
-        is_pre_mcore_014_sh_ten = (
-            sh_tens[0].prepend_axis_num or sh_tens[0].flattened_range is not None
-        )
-        if (
-            not is_pre_mcore_014_sh_ten or not sh_tens[0].has_regular_grid
-        ) and is_torch_min_version("2.6a0"):
+        # Only tensors with a `flattened_range` need the torch ShardedTensor translation
+        # (`sharded_tensor_to_torch_sharded_tensor`, which lists every fragment of the global
+        # tensor and lets torch validate them: quadratic in the fragment count for tensors sharded
+        # along more than one axis, e.g. 512 x EGTP fragments per grouped-expert weight). Regular
+        # tensors with prepended axes (grouped MoE experts) take the `_Checkpointable` path like
+        # every other tensor; `CheckpointableShardedTensor` describes the chunk with the prepended
+        # singleton axes, so the checkpoint layout is identical to the legacy translation.
+        has_flattened_range = sh_tens[0].flattened_range is not None
+        if (not has_flattened_range or not sh_tens[0].has_regular_grid) and is_torch_min_version(
+            "2.6a0"
+        ):
             assert sh_tens[0].flattened_range is None
             if len(sh_tens) > 1:
                 return LocalShardsContainer(
