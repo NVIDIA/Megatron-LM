@@ -1666,20 +1666,23 @@ def pretrain(
 
     set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
 
+    # MIMO hands a per-module collection, which holds one ProcessGroupCollection
+    # per module and has no tp of its own. The cross-entropy warmup is vocab
+    # parallel, so it belongs to the language model's tensor-parallel group;
+    # a rank carrying only encoders warms its own module's shapes instead.
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
-        # Encoder-only ranks have no language-model kernels or TP group to warm up.
-        warmup_tp_group = (
-            pg_collection.get_language_model_collection().tp
+        warmup_pg_collection = (
+            pg_collection.get_language_model_collection()
             if pg_collection.has_language_model()
-            else None
+            else next(iter(pg_collection))
         )
+        warmup_tp_group = warmup_pg_collection.tp
+    elif pg_collection is not None:
+        warmup_tp_group = pg_collection.tp
     else:
-        warmup_tp_group = (
-            pg_collection.tp if pg_collection is not None else mpu.get_tensor_model_parallel_group()
-        )
-    if warmup_tp_group is not None:
-        warmup_training_kernels(args, warmup_tp_group)
-        print_rank_0("Finished training-kernel warmup.")
+        warmup_tp_group = mpu.get_tensor_model_parallel_group()
+    warmup_training_kernels(args, warmup_tp_group)
+    print_rank_0("Finished training-kernel warmup.")
 
     timestamp_after_set_jit_fusion_options = time.time()
 
