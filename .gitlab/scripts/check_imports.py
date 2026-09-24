@@ -56,6 +56,17 @@ class ImportChecker:
         if current_dir not in sys.path:
             sys.path.insert(0, current_dir)
 
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.exceptions import (
+            OptionalDependencyUnavailable as FSDPOptionalDependencyUnavailable,
+        )
+        from megatron.core.exceptions import OptionalDependencyUnavailable
+
+        # MFSDP is also distributed independently, so it owns its exception type.
+        self.optional_dependency_errors = (
+            OptionalDependencyUnavailable,
+            FSDPOptionalDependencyUnavailable,
+        )
+
     def should_skip_module(self, module_name: str) -> bool:
         """Check if a module should be skipped."""
         for pattern in self.skip_patterns:
@@ -108,17 +119,15 @@ class ImportChecker:
             status can be: "success", "graceful", or "failed"
         """
         try:
-            if module_name in sys.modules:
-                del sys.modules[module_name]
-
+            # Keep normal import caching: reloading an exception's defining module
+            # would replace its class and break subsequent type-based handling.
             importlib.import_module(module_name)
             return "success", ""
 
+        except self.optional_dependency_errors as exc:
+            return "graceful", str(exc)
         except Exception:
-            tb = traceback.format_exc()
-            if "UnavailableError" in tb:
-                return "graceful", "UnavailableError detected during import"
-            return "failed", f"{str(tb)}"
+            return "failed", traceback.format_exc()
 
     def check_all_imports(self):
         """Check imports for all discovered modules."""

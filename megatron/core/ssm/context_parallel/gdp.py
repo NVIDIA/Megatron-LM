@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import torch
 
+from megatron.core.exceptions import OptionalDependencyUnavailable
+
 try:
     import triton
     from fla.ops.common.chunk_delta_h import (
@@ -35,8 +37,8 @@ try:
     from fla.ops.utils.index import prepare_chunk_indices
     from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard, tensor_cache
 except ImportError as exc:
-    # The caller guards this optional backend; this marker handles direct imports in CI.
-    raise ImportError("UnavailableError: FLA GDP chunkwise CP backend is unavailable") from exc
+    # The caller guards this optional backend; CI also imports it directly.
+    raise OptionalDependencyUnavailable("FLA GDP chunkwise CP backend is unavailable") from exc
 
 from megatron.core.ssm.context_parallel.chunkwise import (
     CPBackwardPackedSummary,

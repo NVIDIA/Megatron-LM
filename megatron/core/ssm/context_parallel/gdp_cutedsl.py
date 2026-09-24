@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import torch
 
+from megatron.core.exceptions import OptionalDependencyUnavailable
+
 try:
     from gdp_attn import cp_backward_apply as cutedsl_cp_backward_apply
     from gdp_attn import cp_backward_prepare as cutedsl_cp_backward_prepare
@@ -22,8 +24,8 @@ try:
         GdpCpSavedContext,
     )
 except ImportError as exc:
-    # The caller guards this optional backend; this marker handles direct imports in CI.
-    raise ImportError("UnavailableError: CuTeDSL GDP chunkwise CP backend is unavailable") from exc
+    # The caller guards this optional backend; CI also imports it directly.
+    raise OptionalDependencyUnavailable("CuTeDSL GDP chunkwise CP backend is unavailable") from exc
 
 from megatron.core.ssm.context_parallel.chunkwise import (
     CPBackwardPackedSummary,

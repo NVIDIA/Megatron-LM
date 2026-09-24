@@ -21,12 +21,14 @@ import torch.nn.functional as F
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
+from ..exceptions import OptionalDependencyUnavailable
+
 try:
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 except ImportError as exc:
-    raise ImportError(
-        "UnavailableError: QuantizedDBuffer requires Transformer Engine MXFP8 support"
+    raise OptionalDependencyUnavailable(
+        "QuantizedDBuffer requires Transformer Engine MXFP8 support"
     ) from exc
 
 from .dbuffer import DBuffer
