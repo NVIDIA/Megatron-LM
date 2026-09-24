@@ -396,6 +396,7 @@ class DBuffer:
         Remove shards outer-to-inner and add shards inner-to-outer so sharded
         axes remain a suffix throughout. Gather destinations share the final
         output allocation; shrinking reductions may need intermediate buffers.
+        Allocate the destination when ``out`` is omitted; use ``view`` to alias storage.
         """
         new_placements = tuple(new_placements)
         if len(new_placements) != self.mesh.ndim:
@@ -404,6 +405,7 @@ class DBuffer:
                 f"{len(new_placements)}."
             )
         _validate_placements(new_placements)
+        out = self._create_or_validate_out(out, placements=new_placements)
         # Fuse pure gather redistributions; other transitions use the per-axis dispatcher.
         if self.placements != new_placements and all(
             old == new or (isinstance(old, Shard) and isinstance(new, Replicate))
@@ -415,8 +417,6 @@ class DBuffer:
                 if old != new
             ]
             return self.allgather(axes, out=out)
-        if out is not None:
-            self._create_or_validate_out(out, placements=new_placements)
 
         transitions = list(enumerate(zip(self.placements, new_placements)))
         if any(
@@ -432,7 +432,6 @@ class DBuffer:
             placements[axis] = new
             step_out = out if tuple(placements) == new_placements else None
             if isinstance(old, Shard) and isinstance(new, Replicate):
-                out = self._create_or_validate_out(out, placements=new_placements)
                 result = result.allgather(axis, out=out.view(placements))
             elif isinstance(old, Partial) and isinstance(new, Replicate):
                 result = result.allreduce(axis, out=step_out)
@@ -453,8 +452,6 @@ class DBuffer:
                     f"Unsupported DBuffer placement transition on axis {axis}: {old!r} -> {new!r}."
                 )
 
-        if out is None:
-            return result
         if result is not out:
             out.local_buffer.copy_(result.local_buffer)
         return out

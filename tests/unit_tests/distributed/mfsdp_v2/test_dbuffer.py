@@ -764,6 +764,7 @@ def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes):
 @pytest.mark.parametrize(
     "old_placements,new_placements",
     [
+        ([RowAtomic(), RowAtomic()], [RowAtomic(), RowAtomic()]),
         ([Partial(), Partial()], [Replicate(), Replicate()]),
         ([Partial(), Partial()], [RowAtomic(), RowAtomic()]),
         ([Partial(), Partial()], [Replicate(), RowAtomic()]),
