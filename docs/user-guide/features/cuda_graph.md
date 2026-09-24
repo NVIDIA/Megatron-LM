@@ -140,6 +140,66 @@ The split does not support cross-attention or fine-grained offloading of `qkv_li
 `core_attn`, and `attn_proj`. Hybrid wrappers must not combine attention and MLP in the same
 inner layer. Graph capacities and the attention backend's existing THD/CP constraints still apply.
 
+### Chunk granularity (`--cuda-graph-granularity chunk`)
+
+`--cuda-graph-granularity chunk` changes the callable handed to `make_graphed_callables()` from
+each transformer layer to the whole decoder block of every PP/VPP model chunk: one forward graph
+and one backward graph per model chunk and microbatch slot. Activation recompute (including
+`--recompute-granularity full`), MoE dispatch/combine and the hyper-connection residual streams are
+recorded inside the graph, so a training step launches one graph per chunk and pass instead of one
+per layer. On the last pipeline stage of packed-sequence (THD) runs the post-process (MTP block,
+LM head and loss) is captured as a second callable of that chunk, in the same schedule order, so it
+shares the graph memory pool with the decoder graphs. With `--optimizer-cuda-graph` the optimizer
+step graph is captured into that same pool.
+
+```bash
+--cuda-graph-impl transformer_engine \
+--cuda-graph-granularity chunk \
+--cuda-graph-warmup-steps 2 \
+# packed sequences: static shapes and a capture bound on the packed microbatch count
+--pad-packed-seq-alignment max --thd-max-packed-sequences <N> --cuda-graph-dynamic-microbatches \
+# optional: optimizer step in the same graph memory pool (optimizer state must stay on the GPU)
+--optimizer-cuda-graph
+```
+
+Requirements: `--cuda-graph-modules` must be empty; MoE layers need static token shapes (drop-padding
+MoE, the HybridEP flex dispatcher with `--moe-expert-rank-capacity-factor`, or a MoE megakernel
+backend); `--overlap-moe-expert-parallel-comm` and `--delay-wgrad-compute` are not supported.
+`--fine-grained-activation-offloading` runs in a whole-block capture mode: the D2H/H2D copies are captured into each
+slot's graphs with static pinned host buffers and no cross-slot prefetch, so any number of live slots can replay. Because a
+slot's graphs are self-contained, the copies that eager overlaps with the *next* microbatch (the last groups' D2H at the end
+of a forward, the first group's reload at the start of a backward) cannot be hidden the same way, so the copies cost more
+step time than in eager. `--fine-grained-offloading-graph-keep-last-group` keeps the last group of every offload module
+resident per slot to avoid the synchronous reload at the price of part of the memory saving (DSv4 proxy, five offload
+modules, chunk graphs without offload as the reference: 2.35 s/step and -5.3 GB without the flag, 1.55 s/step and -1.7 GB
+with it).
+`--dsa-cp-balance-indexer` works in its graph-dynamic mode: the per-pack route pair becomes two
+static inputs of the block graph (refreshed per replay like `cu_seqlens`). `--moe-paged-stash`
+works in a runtime-keyed mode: each MoE layer stashes its own activations after its forward and
+reloads them right before its own backward (no cross-layer prefetch; GPU pages only by default),
+so the captured graphs do not depend on the recorded pipeline order; it needs TE >= 2.19 and
+`--cuda-graph-warmup-steps >= 2`. Full recompute inside the captured block requires
+`hidden_dropout=0`, `attention_dropout=0` and no router input jitter: the recompute runs inside the
+backward graph, where the RNG state cannot be rewound. `--moe-router-force-load-balancing` is not
+rejected but its random router logits are drawn again in the captured recompute, so that combination
+is for throughput measurements only, not for numerical comparisons (the code warns). Re-entrant
+activation checkpoints — the
+`tensor_parallel.checkpoint` / `te_checkpoint` sites: full recompute, the MTP block, `mlp` / `moe` /
+`shared_experts`, `core_attn` and the GDN / KDA core (`gdn`) — always use Transformer Engine's checkpoint
+inside a chunk capture, because Megatron's `tensor_parallel.checkpoint` runs the function without a
+checkpoint node while a graph is warmed up or captured and would silently keep the activations resident.
+Recompute built on `CheckpointWithoutOutput` (`layernorm`, `moe_act`, `mla_up_proj`, `gdn_norm_out`,
+`mhc`) keeps its own hook mechanism, which registers the recompute inside the capture as is.
+
+**DSA compact-indexer workspace.** With CUDA graphs the fused compact DSA indexer (`--dsa-kernel-backend cudnn`,
+`--dsa-indexer-precision mxfp8`) keeps a persistent workspace per static geometry: the MXFP8 q/k quantization
+destinations, packed scales and candidate offsets have to be prepared in eager warm-up because their sizing
+synchronises with the host. By default all CSA layers built from one model config share one workspace per geometry
+and balanced-indexer slot (`dsa_compact_indexer_workspace_sharing`); the layers of a graph run serially and nothing in
+the workspace outlives the indexer dispatch that fills it, so sharing removes only duplicates (one workspace per layer
+costs ~7 GiB per rank on DSv4 at 16K tokens per rank). `--no-dsa-compact-indexer-workspace-sharing` restores
+per-layer workspaces.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)

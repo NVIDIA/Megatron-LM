@@ -183,8 +183,14 @@ def clip_grad_by_total_norm_fp32(
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
+        # The kernel reads a float32 scale. A float64 coefficient (ChainedOptimizer combines
+        # its optimizers' norms in float64 on the device) is rounded here, once, exactly as a
+        # Python float is when it is passed to the float-scalar kernel below.
         multi_tensor_applier(
-            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+            multi_tensor_scale_tensor_impl,
+            dummy_overflow_buf,
+            [grads, grads],
+            clip_coeff.to(torch.float32),
         )
     elif clip_coeff < 1.0:
         multi_tensor_applier(

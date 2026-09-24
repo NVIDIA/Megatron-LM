@@ -915,6 +915,9 @@ class TestCompressedSparseAttentionCompressed:
         ).cuda()
         previous_cuda_graph_impl = csa.config.cuda_graph_impl
         csa.config.cuda_graph_impl = "local"
+        # per-layer workspace ownership is what this test checks: opt out of cross-layer sharing
+        previous_sharing = csa.config.dsa_compact_indexer_workspace_sharing
+        csa.config.dsa_compact_indexer_workspace_sharing = False
         q = torch.empty(8, 1, 64, 128, dtype=torch.bfloat16, device="cuda")
         k = torch.empty(2, 1, 128, dtype=torch.bfloat16, device="cuda")
         workspace = MagicMock()
@@ -947,6 +950,7 @@ class TestCompressedSparseAttentionCompressed:
             workspace.matches_shape.assert_called_once()
         finally:
             csa.config.cuda_graph_impl = previous_cuda_graph_impl
+            csa.config.dsa_compact_indexer_workspace_sharing = previous_sharing
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward(self, compress_ratio):
@@ -1975,6 +1979,81 @@ class TestCompressedSparseAttentionThd:
             compress_ratio=compress_ratio,
         ).cuda()
 
+    def test_shared_compact_workspace_serves_capture_of_another_layer(self):
+        """With sharing (default) a layer's capture reuses the compact-indexer workspace that
+        another layer of the same model warmed up (one persistent workspace per geometry
+        instead of one per layer)."""
+        assert self.config.dsa_compact_indexer_workspace_sharing is True
+        saved_impl = getattr(self.config, "cuda_graph_impl", None)
+        self.config.cuda_graph_impl = "local"
+
+        def compact_workspace(layer):
+            q = torch.empty(64, 8, 128, dtype=torch.bfloat16, device="cuda")
+            k = torch.empty(16, 128, dtype=torch.bfloat16, device="cuda")
+            return layer._get_thd_compact_indexer_workspace(
+                q,
+                k,
+                topk=8,
+                ratio=4,
+                cu_seqlens_q=torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda"),
+                cu_seqlens_k=torch.tensor([0, 8, 16], dtype=torch.int32, device="cuda"),
+                max_seqlen_q=64,
+                max_seqlen_k=8,
+            )
+
+        try:
+            # Layers 1 and 3 of the template are the ratio-4 CSA layers.
+            layer_a, layer_b = (
+                CompressedSparseAttention(
+                    config=self.config,
+                    submodules=_make_csa_submodules(),
+                    layer_number=layer_number,
+                    attn_mask_type=AttnMaskType.causal,
+                    attention_type='self',
+                    pg_collection=self.pg_collection,
+                    rotary_pos_emb=self.rotary_pos_emb,
+                    compress_ratio=4,
+                ).cuda()
+                for layer_number in (1, 3)
+            )
+            workspace = MagicMock()
+            workspace.matches.return_value = True
+            with (
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "thd_compact_indexer_available",
+                    return_value=True,
+                ),
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "prepare_thd_compact_indexer_workspace",
+                    return_value=workspace,
+                ) as prepare,
+                patch.object(
+                    torch.cuda, "is_current_stream_capturing", side_effect=[False, True, True]
+                ),
+            ):
+                assert compact_workspace(layer_a) is workspace  # eager warm-up on layer A
+                assert compact_workspace(layer_b) is workspace  # capture on B: no own warm-up
+                assert compact_workspace(layer_a) is workspace  # capture on A
+            prepare.assert_called_once()
+            assert (
+                layer_a._thd_compact_indexer_workspaces is layer_b._thd_compact_indexer_workspaces
+            )
+            assert layer_a._thd_compact_indexer_workspaces == [workspace]
+            assert layer_a._active_thd_compact_indexer_workspace is workspace
+            assert layer_b._active_thd_compact_indexer_workspace is workspace
+            # The balanced-indexer slots are shared the same way.
+            assert (
+                layer_a._balanced_thd_compact_indexer_workspaces
+                is layer_b._balanced_thd_compact_indexer_workspaces
+            )
+        finally:
+            # The shared store hangs off the class-scoped config: drop the mocked workspace so
+            # the other tests of this class start from an empty store.
+            self.config.__dict__.pop("_compact_indexer_workspace_stores", None)
+            self.config.cuda_graph_impl = saved_impl
+
     def _make_thd_inputs(self, seg_lens):
         """Build a ``(query, key, value, x, qr, packed_seq_params)``
         tuple for a multi-segment THD batch of given segment lengths.
@@ -1996,6 +2075,9 @@ class TestCompressedSparseAttentionThd:
         csa = self._build_csa(compress_ratio=4)
         previous_cuda_graph_impl = csa.config.cuda_graph_impl
         csa.config.cuda_graph_impl = "local"
+        # per-layer workspace ownership is what this test checks: opt out of cross-layer sharing
+        previous_sharing = csa.config.dsa_compact_indexer_workspace_sharing
+        csa.config.dsa_compact_indexer_workspace_sharing = False
         q = torch.empty(64, 64, 128, dtype=torch.bfloat16, device="cuda")
         k = torch.empty(16, 128, dtype=torch.bfloat16, device="cuda")
         cu_q_variants = [
@@ -2058,6 +2140,7 @@ class TestCompressedSparseAttentionThd:
             )
         finally:
             csa.config.cuda_graph_impl = previous_cuda_graph_impl
+            csa.config.dsa_compact_indexer_workspace_sharing = previous_sharing
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_thd_compact_workspace_capture_requires_matching_warmup(self):
@@ -2065,6 +2148,9 @@ class TestCompressedSparseAttentionThd:
         csa = self._build_csa(compress_ratio=4)
         previous_cuda_graph_impl = csa.config.cuda_graph_impl
         csa.config.cuda_graph_impl = "local"
+        # per-layer workspace ownership is what this test checks: opt out of cross-layer sharing
+        previous_sharing = csa.config.dsa_compact_indexer_workspace_sharing
+        csa.config.dsa_compact_indexer_workspace_sharing = False
         q = torch.empty(8, 64, 128, dtype=torch.bfloat16, device="cuda")
         k = torch.empty(2, 128, dtype=torch.bfloat16, device="cuda")
         cu_q = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
@@ -2092,6 +2178,7 @@ class TestCompressedSparseAttentionThd:
                     )
         finally:
             csa.config.cuda_graph_impl = previous_cuda_graph_impl
+            csa.config.dsa_compact_indexer_workspace_sharing = previous_sharing
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_thd_compact_workspace_unavailable_keeps_dense_fallback(self):

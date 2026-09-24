@@ -207,7 +207,9 @@ class GatedDeltaNet(_GDNBase):
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            assert torch.cuda.is_current_stream_capturing() or torch.equal(
+                cu_seqlens_q, cu_seqlens_kv
+            ), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
@@ -269,7 +271,12 @@ class GatedDeltaNet(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+            # import here to avoid circular import (recompute imports TransformerLayer)
+            from megatron.core.recompute import checkpoint_activations
+
+            out, out_bias = checkpoint_activations(
+                self.config, _checkpointed_compute, False, self.pg_collection.tp, hidden_states
+            )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,

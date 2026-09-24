@@ -7,7 +7,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_layer_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -16,6 +16,44 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import te_checkpoint
 else:
     te_checkpoint = None
+
+
+def use_te_checkpoint(config) -> bool:
+    """Whether activation checkpointing goes through Transformer Engine's ``checkpoint``.
+
+    TE's checkpoint is used under FP8/FP4 — ``tensor_parallel.checkpoint`` recomputes outside the
+    FP8 autocast, so a TE module in the region would recompute in BF16 (or dequantize FP8
+    parameters and lose their ``main_grad``), whereas TE's checkpoint re-enters the recorded FP8
+    state — and under chunk-granularity Transformer Engine CUDA graphs for any precision: the
+    captured block contains the checkpointed forward and its recompute as one unit, whereas
+    ``tensor_parallel.checkpoint`` runs the forward without a checkpoint node during graph warm-up
+    and capture, which would keep every activation of the block alive inside the graph.
+    """
+    if config.fp8 or config.fp4:
+        return True
+    return (
+        te_checkpoint is not None
+        and config.cuda_graph_impl == "transformer_engine"
+        and getattr(config, "cuda_graph_granularity", "layer") == "chunk"
+    )
+
+
+def checkpoint_activations(config, function, distribute_saved_activations, tp_group, *args):
+    """Activation checkpoint of ``function(*args)`` through the backend ``use_te_checkpoint``
+    selects — the same policy as the block-level recompute, for the sites that used
+    ``tensor_parallel.checkpoint`` unconditionally (``core_attn``, the absorbed-MLA core, the GDN /
+    KDA core). Like mcore's checkpoint, TE's saves tensor arguments only and restores the RNG
+    tracker state for the recompute.
+    """
+    if use_te_checkpoint(config):
+        return te_checkpoint(
+            function,
+            distribute_saved_activations,
+            tensor_parallel.random.get_cuda_rng_tracker,
+            tp_group,
+            *args,
+        )
+    return tensor_parallel.checkpoint(function, distribute_saved_activations, *args)
 
 
 def checkpointed_forward(
@@ -80,8 +118,10 @@ def checkpointed_forward(
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
                     if self.config.fp8:
-                        inner_quantization_context = get_fp8_context(
-                            self.config, layer.layer_number - 1
+                        inner_quantization_context = get_layer_fp8_context(
+                            self.config,
+                            layer.layer_number - 1,
+                            is_mtp_layer=getattr(self, "is_mtp_layer", False),
                         )
                     # TODO: check if fp4 is supported in this case
                     elif self.config.fp4:
@@ -144,9 +184,9 @@ def checkpointed_forward(
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
         args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
         if use_checkpoint:
-            # Precision-aware activation checkpoint: TE under FP8/FP4,
-            # tensor_parallel under BF16/FP16/FP32.
-            if self.config.fp8 or self.config.fp4:
+            # Precision-aware activation checkpoint: TE under FP8/FP4 and inside chunk CUDA
+            # graph captures, tensor_parallel under BF16/FP16/FP32 otherwise.
+            if use_te_checkpoint(self.config):
                 hidden_states, context = te_checkpoint(
                     cf,
                     self.config.distribute_saved_activations,
@@ -182,13 +222,13 @@ def checkpointed_forward(
             layer_idx += self.config.recompute_num_layers
     elif self.config.recompute_method == 'block':
         # Checkpoint the input activation of only a set number of individual
-        # layers and skip the rest. Need at least one input tensor with
-        # gradient computation for the re-entrant autograd engine, so under
-        # FP8/FP4 we skip checkpointing while hidden_states.requires_grad
-        # is False (these slots get pushed past the recompute window).
+        # layers and skip the rest. TE's re-entrant checkpoint needs at least one
+        # input tensor with gradient computation, so wherever it is the backend we
+        # skip checkpointing while hidden_states.requires_grad is False (these
+        # slots get pushed past the recompute window).
         recompute_skip_num_layers = 0
         for layer_idx in range(self.num_layers_per_pipeline_rank):
-            if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
+            if use_te_checkpoint(self.config) and not hidden_states.requires_grad:
                 recompute_skip_num_layers += 1
             use_checkpoint = (
                 layer_idx >= recompute_skip_num_layers

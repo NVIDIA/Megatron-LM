@@ -607,7 +607,10 @@ class MoELayer(BaseMoELayer):
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:
-                if self.config.fp8 or self.config.fp4:
+                # import here to avoid circular import
+                from megatron.core.recompute import use_te_checkpoint
+
+                if use_te_checkpoint(self.config):
                     shared_expert_output = te_checkpoint(
                         apply_module(self.shared_experts),
                         False,
@@ -817,7 +820,10 @@ class MoELayer(BaseMoELayer):
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
             if self.moe_layer_recompute and self.training:
-                if self.config.fp8 or self.config.fp4:
+                # import here to avoid circular import
+                from megatron.core.recompute import use_te_checkpoint
+
+                if use_te_checkpoint(self.config):
                     output = te_checkpoint(
                         megakernel_forward,
                         False,
@@ -885,7 +891,10 @@ class MoELayer(BaseMoELayer):
             return output, mlp_bias
 
         if self.moe_layer_recompute and self.training:
-            if self.config.fp8 or self.config.fp4:
+            # import here to avoid circular import
+            from megatron.core.recompute import use_te_checkpoint
+
+            if use_te_checkpoint(self.config):
                 outputs = te_checkpoint(
                     custom_forward,
                     False,

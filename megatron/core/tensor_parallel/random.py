@@ -754,7 +754,11 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+    from megatron.core.utils import with_current_cuda_device
+
+    return CheckpointFunction.apply(
+        with_current_cuda_device(function), distribute_saved_activations, *args
+    )
 
 
 def _save_args_to_ctx(ctx, args):
