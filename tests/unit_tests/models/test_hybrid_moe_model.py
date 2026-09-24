@@ -27,6 +27,7 @@ from megatron.training.global_vars import (
 from tests.unit_tests.test_utilities import Utils
 
 GOLDEN_CONFIG: Dict[str, Any] = {
+    "keep_mtp_in_bf16": False,
     "_cpu_offloading_context": None,
     "account_for_embedding_in_pipeline_split": False,
     "account_for_loss_in_pipeline_split": False,
@@ -35,6 +36,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "activation_func_fp8_input_store": False,
     "activation_func_tanh_clamp_scale": None,
     "activation_func_tanh_clamp_scale_linear": None,
+    "hash_moe_vocab_size": 131072,
     "add_bias_linear": False,
     "add_qkv_bias": False,
     "apply_query_key_layer_scaling": False,
@@ -180,6 +182,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,
     "linear_num_value_heads": 32,
+    "gdn_pre_gated_delta_rule_fusion": False,
+    "gdn_gated_output_norm_fusion": False,
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
@@ -219,6 +223,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_use_norm_before_up_proj": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_num_hash_layers": 0,
     "moe_ncclep_zero_copy": False,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
@@ -351,6 +356,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,
     "window_size": None,
+    "wide_residual": None,
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],

@@ -8,6 +8,8 @@
 * ``vocab_parallel_cross_entropy``: the unfused path deterministic mode relies on.
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
   with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
+* ``ColumnParallelLinear`` with BF16 inputs and FP32 output: Transformer Engine
+  ``general_gemm`` forward plus the corresponding input- and weight-gradient paths.
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
   (causal and padding CUDA kernels).
 """
@@ -18,6 +20,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fusions import fused_layer_norm
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
@@ -144,6 +147,28 @@ class TestTensorParallelLayers:
             what=f"{layer} linear[fusion={grad_accum_fusion}]",
         )
 
+    @pytest.mark.skipif(
+        te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+    )
+    def test_column_parallel_linear_fp32_output_replays(self):
+        """Replay the mixed-output GEMM used by FP32 language-model logits."""
+        seeded()
+        config = _config(hidden_size=512, num_attention_heads=8)
+        module = ColumnParallelLinear(
+            512,
+            1024,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            output_dtype=torch.float32,
+        ).cuda()
+        x = torch.randn(2048, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        outputs, _ = assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
+        )
+        assert outputs["out[0]"].dtype is torch.float32
+
 
 # --- apex fused layer norm ------------------------------------------------------------------
 
@@ -207,4 +232,33 @@ def test_fused_scale_mask_softmax_replays(mask_type):
         (scores,),
         replays=3,
         what=f"FusedScaleMaskSoftmax[{mask_type.name}]",
+    )
+
+
+@pytest.mark.parametrize("with_caller_mask", [False, True], ids=["swa", "swa+padding"])
+def test_sliding_window_softmax_torch_path_replays(with_caller_mask):
+    """The torch fallback path behind ``window_size``: the sliding-window mask alone, and
+    composed with a caller-provided padding mask (which used to be silently discarded).
+    ``window_size`` never routes to the apex kernel, so this covers ``forward_torch_softmax``
+    for both fwd and bwd, with and without the composed mask."""
+    seeded()
+    module = FusedScaleMaskSoftmax(
+        input_in_fp16=False,
+        input_in_bf16=True,
+        attn_mask_type=AttnMaskType.causal,
+        scaled_masked_softmax_fusion=False,
+        mask_func=attention_mask_func,
+        softmax_in_fp32=True,
+        scale=None,
+        window_size=(128, 0),
+    )
+    b, np_, sq, sk = 2, 8, 512, 512
+    scores = torch.randn(b, np_, sq, sk, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mask = (torch.rand(b, 1, sq, sk, device="cuda") < 0.2) if with_caller_mask else None
+    assert not module.is_kernel_available(mask, b, np_, sq, sk), "expected the torch path"
+    assert_replays_bit_exact(
+        lambda s: module(s, mask),
+        (scores,),
+        replays=3,
+        what=f"FusedScaleMaskSoftmax[torch, swa{'+padding' if with_caller_mask else ''}]",
     )

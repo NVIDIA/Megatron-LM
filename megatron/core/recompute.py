@@ -13,6 +13,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -123,6 +124,7 @@ def checkpointed_forward(
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
+    input_ids: Optional[Tensor] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -135,6 +137,7 @@ def checkpointed_forward(
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
+        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -192,6 +195,7 @@ def checkpointed_forward(
             rotary_pos_emb_local,
             rotary_pos_emb_global,
             padding_mask=None,
+            input_ids=None,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -208,6 +212,8 @@ def checkpointed_forward(
                     hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                         index, hidden_states
                     )
+                # Keep both residuals in the layer's layout, inside the CP conversions.
+                residual_accumulator = hidden_states
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -239,11 +245,27 @@ def checkpointed_forward(
                     packed_seq_params=layer_packed_seq_params,
                     padding_mask=padding_mask,
                 )
+                inner_layer = getattr(layer, "inner_layer", layer)
+                router = getattr(getattr(inner_layer, "mlp", None), "router", None)
+                if input_ids is not None and getattr(router, "is_hash_layer", False):
+                    layer_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
+                    elif isinstance(getattr(layer, "inner_layer", None), TransformerLayer):
+                        # Hybrid mHC wrappers accept the TransformerLayer execution inputs,
+                        # including hash-routing token IDs, but not cross-attention-only kwargs.
+                        for k in ("context", "context_mask", "attention_bias"):
+                            layer_kwargs.pop(k, None)
+                        hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
-                        for k in ("context", "context_mask", "attention_bias", "padding_mask"):
+                        for k in (
+                            "context",
+                            "context_mask",
+                            "attention_bias",
+                            "padding_mask",
+                            "input_ids",
+                        ):
                             layer_kwargs.pop(k, None)
                         if (
                             packed_sequence_cp_metadata is not None
@@ -259,6 +281,7 @@ def checkpointed_forward(
                 # Some layer paths may still return a tuple (defensive).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+                observe_layer_residuals(layer, residual_accumulator, hidden_states)
                 if cp_layout_state is not None:
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
@@ -269,7 +292,15 @@ def checkpointed_forward(
         nonlocal hidden_states, context
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+        args = (
+          hidden_states, 
+          attention_mask, 
+          context, 
+          context_mask, 
+          *rotary_pos_emb, 
+          padding_mask,
+          input_ids,
+        )
         if (
             offload_scheduler is not None
             and use_checkpoint
@@ -289,9 +320,7 @@ def checkpointed_forward(
                         *args,
                     )
                 else:
-                    hidden_states, context = tensor_parallel.checkpoint(
-                        cf, self.config.distribute_saved_activations, *args
-                    )
+                    hidden_states, context = cf(*args)
             else:
                 # Note: original block-branch no-checkpoint path omitted padding_mask
                 # (relied on its default=None); restored here for consistency.

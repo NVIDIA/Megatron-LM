@@ -774,7 +774,10 @@ class InferenceStateHandoffMixin:
         ssm_meta = handoff.kv_meta.get("ssm") if isinstance(handoff.kv_meta, dict) else None
         continuation_block_count = (
             additional_decode_blocks(
-                len(handoff.prompt), len(resume_tokens), self.context.block_size_tokens
+                len(handoff.prompt),
+                len(resume_tokens),
+                self.context.block_size_tokens,
+                mtp_kv_cache=getattr(self.context, "enable_mtp_kv_cache", False),
             )
             if resume_tokens
             else 0
@@ -1007,7 +1010,10 @@ class InferenceStateHandoffMixin:
                 stop_word_hit = False
                 if request.stop_word_ids:
                     stop_word_hit, _, _ = self._check_stop_words_for_request_post_append(request)
-                if first_token == request.sampling_params.termination_id or stop_word_hit:
+                # Match on every model-declared EOS, not just the request's single
+                # termination_id, so an imported prefill that already produced e.g.
+                # `<|im_end|>` stops here instead of resuming decode past it.
+                if first_token in self._terminating_token_ids(request) or stop_word_hit:
                     request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
 
             request.num_cached_tokens = len(pending.prompt)

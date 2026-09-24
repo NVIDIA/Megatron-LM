@@ -237,7 +237,7 @@ class DBuffer:
         """Return a storage-sharing buffer with supported ``placements``.
 
         Views preserve placements, relabel a full local buffer, or locally slice
-        one full local buffer to Flat. A view that changes a Partial placement is
+        one full local buffer to RowAtomic. A view that changes a Partial placement is
         only a storage destination: callers must populate it with a reduction
         before reading it.
         """
@@ -269,7 +269,7 @@ class DBuffer:
             return DBuffer.from_local(self.local_buffer, self.mesh, placements, self.layout)
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
-            "or a Replicate/Partial-to-Flat slice, "
+            "or a Replicate/Partial-to-RowAtomic slice, "
             f"got {self.placements!r} -> {placements!r}."
         )
 
@@ -294,7 +294,7 @@ class DBuffer:
             A DBuffer whose real local storage matches ``placements``. Ranges
             corresponding to meta tensors are left uninitialized.
         """
-        tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
+        tensors = tuple(tensors)
         if not tensors:
             raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
 
@@ -312,20 +312,26 @@ class DBuffer:
             device=mesh.device_type,
             block_size=block_size,
         )
-        # Only logical tensor ranges are initialized. Padding and layout gaps are not
-        # observable through get_tensor_view() and can remain unspecified.
         for index, tensor in enumerate(tensors):
-            owned_range = buffer._get_owned_range(index)
-            if owned_range is None or tensor.is_meta:
-                continue
-
-            source_slice = tensor.view(-1).narrow(
-                0, owned_range.tensor_relative_offset, owned_range.numel
-            )
-            buffer.local_buffer.narrow(
-                0, owned_range.buffer_relative_offset, owned_range.numel
-            ).copy_(source_slice)
+            buffer.copy_from(index, tensor)
         return buffer
+
+    def copy_from(self, index: int, tensor: torch.Tensor) -> None:
+        """Copy a full logical tensor's local owned range into this buffer.
+
+        Meta tensors leave their owned range unspecified. Padding and layout gaps
+        are not observable through ``get_tensor_view()`` and remain unspecified.
+        """
+        owned_range = self._get_owned_range(index)
+        if owned_range is None or tensor.is_meta:
+            return
+        tensor = tensor.detach().contiguous()
+        source_slice = tensor.view(-1).narrow(
+            0, owned_range.tensor_relative_offset, owned_range.numel
+        )
+        self.local_buffer.narrow(0, owned_range.buffer_relative_offset, owned_range.numel).copy_(
+            source_slice
+        )
 
     def _create_or_validate_out(
         self,
@@ -376,8 +382,8 @@ class DBuffer:
         """Redistribute this buffer to ``new_placements``.
 
         This dispatcher supports the one-axis transitions:
-        Flat -> Replicate, Partial -> Replicate, Partial -> Flat,
-        Replicate -> Flat, and Replicate -> Partial. Other placement changes are
+        RowAtomic -> Replicate, Partial -> Replicate, Partial -> RowAtomic,
+        Replicate -> RowAtomic, and Replicate -> Partial. Other placement changes are
         intentionally unsupported.
         """
         new_placements = tuple(new_placements)
@@ -508,7 +514,7 @@ class DBuffer:
     def get_tensor_view(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
 
-        Flat placements shard dim 0, so the returned view preserves all
+        RowAtomic placements shard dim 0, so the returned view preserves all
         non-leading dimensions and only changes the leading dimension.
         """
         shape = self.layout.tensor_shapes[index]
@@ -532,7 +538,7 @@ class DBuffer:
         """Return logical tensor ``index`` as a DTensor."""
         local_tensor = self.get_tensor_view(index)
         tensor_shape = self.layout.tensor_shapes[index]
-        # Keep internal storage details (e.g. Flat and BlockAtomic) out of DTensor placements.
+        # Keep internal storage details (e.g. RowAtomic and BlockAtomic) out of DTensor placements.
         dtensor_placements = tuple(
             Shard(placement.dim) if isinstance(placement, Shard) else placement
             for placement in self.placements
