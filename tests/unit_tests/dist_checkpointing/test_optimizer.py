@@ -671,9 +671,7 @@ class TestDistributedOptimizer:
             assert loaded_group_steps == {3}
             optimizer_b.load_state_dict(loaded_state)
 
-            loaded_steps = {
-                state['step'].item() for state in optimizer_b.optimizer.state.values()
-            }
+            loaded_steps = {state['step'].item() for state in optimizer_b.optimizer.state.values()}
             assert loaded_steps == {3}
 
     @pytest.mark.parametrize(
