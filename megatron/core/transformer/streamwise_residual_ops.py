@@ -7,6 +7,11 @@ controller logits directly. Those kernels form sigmoid factors in registers and
 compute controller gradients from per-program partials, avoiding both dense slot
 maps and a second activation-reading GEMM/BMM in backward.
 
+Controller nonlinearities and streamwise arithmetic use at least FP32 precision.
+BF16 and FP16 activations are promoted on load, and results are rounded only when
+stored in the requested activation dtype. The native fallback follows the same
+contract one stream at a time; FP64 inputs retain FP64 arithmetic for gradcheck.
+
 ``BATCH`` is a runtime kernel argument rather than a ``tl.constexpr``: it is only
 compared against to mask the tail, so specializing on it buys nothing and would
 force a separate JIT compile per token count. Dynamic-batching inference captures
@@ -37,6 +42,17 @@ _STREAMWISE_MAX_STREAMS = 16
 _STREAMWISE_MAX_REDUCTION_BLOCK = 16_384
 _STREAMWISE_TRITON_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _STREAMWISE_OUTPUT_DTYPES = (*_STREAMWISE_TRITON_DTYPES, torch.float64)
+
+
+def _resolve_streamwise_output_dtype(
+    input_dtype: torch.dtype, output_dtype: torch.dtype | None
+) -> torch.dtype:
+    """Resolve and validate the dtype used to store a streamwise read."""
+
+    resolved = input_dtype if output_dtype is None else output_dtype
+    if resolved not in _STREAMWISE_OUTPUT_DTYPES:
+        raise TypeError(f"output_dtype must be a floating-point activation dtype, got {resolved}.")
+    return resolved
 
 
 def _flatten_leading(tensor: Tensor) -> tuple[Tensor, torch.Size]:
@@ -108,6 +124,17 @@ def _validate_raw_write_inputs(
         )
     if branch_update.device != residual_stream.device:
         raise ValueError("branch_update and residual_stream must be on the same device.")
+    _validate_write_dtypes(residual_stream, branch_update)
+    if retention_logits is not None:
+        _validate_logits(retention_logits, num_streams, tensor_name="retention_logits")
+        if retention_logits.device != residual_stream.device:
+            raise ValueError("retention_logits and residual_stream must be on the same device.")
+    return stream_width
+
+
+def _validate_write_dtypes(residual_stream: Tensor, branch_update: Tensor) -> None:
+    """Validate same-dtype writes and lower-precision updates to an FP32 stream."""
+
     mixed_fp32_residual = residual_stream.dtype == torch.float32 and branch_update.dtype in (
         torch.bfloat16,
         torch.float16,
@@ -117,11 +144,6 @@ def _validate_raw_write_inputs(
             "branch_update must either match residual_stream dtype or use bfloat16/float16 "
             "with a float32 residual stream."
         )
-    if retention_logits is not None:
-        _validate_logits(retention_logits, num_streams, tensor_name="retention_logits")
-        if retention_logits.device != residual_stream.device:
-            raise ValueError("retention_logits and residual_stream must be on the same device.")
-    return stream_width
 
 
 def _can_use_streamwise_triton(
@@ -207,12 +229,7 @@ if HAVE_STREAMWISE_TRITON:
                 other=0.0,
             )
             factor = tl.sigmoid(tl.load(READ_LOGITS + stream).to(tl.float32))
-            factor = factor.to(value.dtype).to(tl.float32)
             output += factor * value.to(tl.float32)
-        # Preserve the original read's terminal rounding before converting to an independently
-        # requested output dtype. For an FP32 residual stream this rounds in FP32 before the
-        # branch-width result is stored in BF16 or FP16.
-        output = output.to(X.dtype.element_ty)
         tl.store(
             OUT + offsets_batch[:, None] * STREAM_WIDTH + offsets_width[None, :], output, mask=mask
         )
@@ -245,9 +262,7 @@ if HAVE_STREAMWISE_TRITON:
             mask=mask,
             other=0.0,
         )
-        # Match the backward of an explicit cast after a same-dtype read: first convert the
-        # incoming gradient to the read input dtype, then accumulate in FP32.
-        grad_output_fp32 = grad_output.to(X.dtype.element_ty).to(tl.float32)
+        grad_output_fp32 = grad_output.to(tl.float32)
 
         for stream in tl.static_range(0, NUM_STREAMS):
             offset = (
@@ -257,8 +272,7 @@ if HAVE_STREAMWISE_TRITON:
             )
             value = tl.load(X + offset, mask=mask, other=0.0)
             sigmoid = tl.sigmoid(tl.load(READ_LOGITS + stream).to(tl.float32))
-            factor = sigmoid.to(value.dtype).to(tl.float32)
-            tl.store(GRAD_X + offset, factor * grad_output_fp32, mask=mask)
+            tl.store(GRAD_X + offset, sigmoid * grad_output_fp32, mask=mask)
 
             derivative = sigmoid * (1.0 - sigmoid)
             partial = tl.sum(value.to(tl.float32) * grad_output_fp32) * derivative
@@ -291,7 +305,7 @@ if HAVE_STREAMWISE_TRITON:
             mask=mask,
             other=0.0,
         )
-        update_fp32 = update.to(RESIDUAL.dtype.element_ty).to(tl.float32)
+        update_fp32 = update.to(tl.float32)
 
         for stream in tl.static_range(0, NUM_STREAMS):
             offset = (
@@ -301,11 +315,10 @@ if HAVE_STREAMWISE_TRITON:
             )
             residual = tl.load(RESIDUAL + offset, mask=mask, other=0.0)
             write = 2.0 * tl.sigmoid(tl.load(WRITE_LOGITS + stream).to(tl.float32))
-            write = write.to(RESIDUAL.dtype.element_ty).to(tl.float32)
             output = write * update_fp32
             if HAS_RETENTION:
                 forget = tl.sigmoid(-tl.load(RETENTION_LOGITS + stream).to(tl.float32))
-                retention = (1.0 - MAX_FORGET * forget).to(residual.dtype).to(tl.float32)
+                retention = 1.0 - MAX_FORGET * forget
                 output += retention * residual.to(tl.float32)
             else:
                 output += residual.to(tl.float32)
@@ -345,7 +358,7 @@ if HAVE_STREAMWISE_TRITON:
             mask=mask,
             other=0.0,
         )
-        update_fp32 = update.to(GRAD_OUT.dtype.element_ty).to(tl.float32)
+        update_fp32 = update.to(tl.float32)
         grad_update = tl.zeros((BLOCK_BATCH, BLOCK_WIDTH), tl.float32)
 
         for stream in tl.static_range(0, NUM_STREAMS):
@@ -357,7 +370,7 @@ if HAVE_STREAMWISE_TRITON:
             grad_output = tl.load(GRAD_OUT + offset, mask=mask, other=0.0)
             grad_output_fp32 = grad_output.to(tl.float32)
             write_sigmoid = tl.sigmoid(tl.load(WRITE_LOGITS + stream).to(tl.float32))
-            write = (2.0 * write_sigmoid).to(GRAD_OUT.dtype.element_ty).to(tl.float32)
+            write = 2.0 * write_sigmoid
             grad_update += write * grad_output_fp32
 
             write_derivative = 2.0 * write_sigmoid * (1.0 - write_sigmoid)
@@ -367,7 +380,7 @@ if HAVE_STREAMWISE_TRITON:
             if HAS_RETENTION:
                 residual = tl.load(RESIDUAL + offset, mask=mask, other=0.0)
                 forget = tl.sigmoid(-tl.load(RETENTION_LOGITS + stream).to(tl.float32))
-                retention = (1.0 - MAX_FORGET * forget).to(grad_output.dtype).to(tl.float32)
+                retention = 1.0 - MAX_FORGET * forget
                 tl.store(GRAD_RESIDUAL + offset, retention * grad_output_fp32, mask=mask)
                 retention_derivative = MAX_FORGET * forget * (1.0 - forget)
                 retention_partial = (
@@ -435,25 +448,40 @@ def _validate_factors(factors: Tensor, *, factor_name: str) -> int:
     return factors.numel()
 
 
-def _broadcast_factors(factors: Tensor, streams: Tensor) -> Tensor:
-    """Cast and view stream factors for broadcasting over leading and hidden dimensions."""
+def _streamwise_accumulation_dtype(*tensors: Tensor) -> torch.dtype:
+    """Use FP32 arithmetic except when a native reference input requests FP64."""
 
-    shape = (1,) * (streams.ndim - 2) + (factors.numel(), 1)
-    return factors.to(device=streams.device, dtype=streams.dtype).view(shape)
+    return (
+        torch.float64 if any(tensor.dtype == torch.float64 for tensor in tensors) else torch.float32
+    )
 
 
-def streamwise_read(hidden_states: Tensor, read_factors: Tensor) -> Tensor:
+def streamwise_read(
+    hidden_states: Tensor, read_factors: Tensor, *, output_dtype: torch.dtype | None = None
+) -> Tensor:
     """Read ``K`` full-width streams into one branch-width activation.
 
     Given ``hidden_states[..., k, :] = X_k`` and one scalar ``c_k`` per stream,
-    this computes ``sum_k c_k X_k``. Native autograd supplies activation and
-    factor gradients without constructing a masked slot-mixing matrix.
+    this computes ``sum_k c_k X_k`` in at least FP32 and rounds only the returned
+    activation. Native autograd supplies activation and factor gradients without
+    constructing a masked slot-mixing matrix.
     """
 
     num_streams = _validate_factors(read_factors, factor_name="read_factors")
     streams = _view_streams(hidden_states, num_streams, tensor_name="hidden_states")
-    factors = read_factors.to(device=hidden_states.device, dtype=hidden_states.dtype)
-    return torch.matmul(factors, streams)
+    resolved_output_dtype = _resolve_streamwise_output_dtype(hidden_states.dtype, output_dtype)
+    accumulation_dtype = _streamwise_accumulation_dtype(hidden_states, read_factors)
+    factors = read_factors.to(device=hidden_states.device, dtype=accumulation_dtype)
+    output = torch.zeros(
+        *streams.shape[:-2],
+        streams.shape[-1],
+        device=hidden_states.device,
+        dtype=accumulation_dtype,
+    )
+    factor_shape = (1,) * output.ndim
+    for stream_index in range(num_streams):
+        output.addcmul_(streams[..., stream_index, :], factors[stream_index].reshape(factor_shape))
+    return output.to(dtype=resolved_output_dtype)
 
 
 def streamwise_writeback(
@@ -466,9 +494,10 @@ def streamwise_writeback(
     """Write one branch update independently into ``K`` full-width streams.
 
     For stream ``k``, this computes ``Y_k = gamma_k X_k + w_k U``. Omitting
-    ``retention_factors`` gives identity carry, ``gamma_k = 1``. The returned
-    tensor owns the only full-width output allocation; no expanded update tensor
-    or masked slot map is materialized.
+    ``retention_factors`` gives identity carry, ``gamma_k = 1``. Each stream is
+    computed in at least FP32 and rounded into the returned residual dtype. The
+    returned tensor owns the only full-width output allocation; no expanded
+    update tensor or masked slot map is materialized.
     """
 
     num_streams = _validate_factors(write_factors, factor_name="write_factors")
@@ -481,23 +510,35 @@ def streamwise_writeback(
         )
     if branch_update.device != residual_stream.device:
         raise ValueError("branch_update and residual_stream must be on the same device.")
-    if branch_update.dtype != residual_stream.dtype:
-        raise ValueError("branch_update and residual_stream must have the same dtype.")
+    _validate_write_dtypes(residual_stream, branch_update)
 
-    write = _broadcast_factors(write_factors, streams)
-    update = branch_update.unsqueeze(-2)
-    if retention_factors is None:
-        output = torch.addcmul(streams, update, write)
-    else:
+    accumulation_inputs = [residual_stream, branch_update, write_factors]
+    if retention_factors is not None:
         retention_streams = _validate_factors(retention_factors, factor_name="retention_factors")
         if retention_streams != num_streams:
             raise ValueError(
                 "retention_factors and write_factors must describe the same number of streams, "
                 f"got {retention_streams} and {num_streams}."
             )
-        output = streams * _broadcast_factors(retention_factors, streams)
-        output.addcmul_(update, write)
+        accumulation_inputs.append(retention_factors)
 
+    accumulation_dtype = _streamwise_accumulation_dtype(*accumulation_inputs)
+    write = write_factors.to(device=residual_stream.device, dtype=accumulation_dtype)
+    retention = (
+        None
+        if retention_factors is None
+        else retention_factors.to(device=residual_stream.device, dtype=accumulation_dtype)
+    )
+    output = torch.empty_like(streams)
+    factor_shape = (1,) * branch_update.ndim
+    for stream_index in range(num_streams):
+        carry = streams[..., stream_index, :]
+        if retention is not None:
+            carry = carry * retention[stream_index].reshape(factor_shape)
+        stream_output = torch.addcmul(
+            carry, branch_update, write[stream_index].reshape(factor_shape)
+        )
+        output[..., stream_index, :].copy_(stream_output)
     return output.flatten(-2)
 
 
@@ -811,12 +852,7 @@ def streamwise_sigmoid_read(
     """
 
     stream_width = _validate_raw_read_inputs(hidden_states, read_logits, num_streams)
-    resolved_output_dtype = hidden_states.dtype if output_dtype is None else output_dtype
-    if resolved_output_dtype not in _STREAMWISE_OUTPUT_DTYPES:
-        raise TypeError(
-            "output_dtype must be a floating-point activation dtype, got "
-            f"{resolved_output_dtype}."
-        )
+    resolved_output_dtype = _resolve_streamwise_output_dtype(hidden_states.dtype, output_dtype)
     needs_backward = _streamwise_autograd_needed(hidden_states, read_logits)
     inference_forward = _streamwise_inference_forward(hidden_states, read_logits)
     if _can_use_streamwise_triton(
@@ -836,7 +872,7 @@ def streamwise_sigmoid_read(
         )
 
     read_factors = torch.sigmoid(read_logits[:num_streams].float())
-    return streamwise_read(hidden_states, read_factors).to(dtype=resolved_output_dtype)
+    return streamwise_read(hidden_states, read_factors, output_dtype=resolved_output_dtype)
 
 
 def streamwise_sigmoid_writeback(
@@ -907,8 +943,5 @@ def streamwise_sigmoid_writeback(
         active_retention_logits = retention_logits[:num_streams].float()
         retention_factors = 1.0 - retention_max_forget * torch.sigmoid(-active_retention_logits)
     return streamwise_writeback(
-        residual_stream,
-        branch_update.to(dtype=residual_stream.dtype),
-        write_factors,
-        retention_factors=retention_factors,
+        residual_stream, branch_update, write_factors, retention_factors=retention_factors
     )
