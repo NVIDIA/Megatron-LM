@@ -652,11 +652,13 @@ def convert_checkpoint(
                 split_tensors = {new_key: value}
 
             # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes)
-            for key, value in list(split_tensors.items()):
-                if is_swiglu_key(key):
-                    swiglu_w_and_v = split_swiglu_weight(key, value)
+            # Bind to distinct names: `key`/`value` are the outer while-loop's variables
+            # and are still needed below for the param-group lookup.
+            for _skey, _sval in list(split_tensors.items()):
+                if is_swiglu_key(_skey):
+                    swiglu_w_and_v = split_swiglu_weight(_skey, _sval)
                     split_tensors.update(swiglu_w_and_v)
-                    del split_tensors[key]
+                    del split_tensors[_skey]
                     _swiglu_split_count += 1
 
             fsdp_dtensor_state_dict.update(split_tensors)
