@@ -31,7 +31,7 @@ except ImportError as exc:
 
 from .dbuffer import DBuffer
 from .layout import GlobalLayout, Shape
-from .placement import BlockAtomic, Flat
+from .placement import BlockAtomic, RowAtomic
 
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
 # TODO: Support quantizing only rowwise or columnwise data, allocating and
@@ -75,14 +75,14 @@ def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
 
 
 def _block_atomic_to_flat(placements: Iterable[Placement]) -> tuple[Placement, ...]:
-    """Replace BlockAtomic placements with Flat for coordinates measured in blocks.
+    """Replace BlockAtomic placements with RowAtomic for coordinates measured in blocks.
 
     For example, one MXFP8 columnwise scale row represents a 32-row weight
-    block, so Flat preserves the shard boundaries of BlockAtomic(32).
+    block, so RowAtomic preserves the shard boundaries of BlockAtomic(32).
     """
     placements = tuple(placements)
     return tuple(
-        Flat() if isinstance(placement, BlockAtomic) else placement for placement in placements
+        RowAtomic() if isinstance(placement, BlockAtomic) else placement for placement in placements
     )
 
 

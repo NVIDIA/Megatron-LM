@@ -88,8 +88,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
-        if len(model_chunks) != 1:
-            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
+        # Multiple model chunks are allowed: VPP shares a single FsdpContext across
+        # chunks, and FullyShardedOptimizer optimizes every chunk's parameters
+        # together (self.model_chunks is iterated in zero_grad / get_parameters).
+        if not model_chunks:
+            raise ValueError("MFSDP v2 requires at least one model chunk.")
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
         if config.loss_scale is not None:

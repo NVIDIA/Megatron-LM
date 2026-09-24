@@ -24,7 +24,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     reset_hybrid_ep_buffer,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     _DeepepManager,
@@ -43,6 +43,20 @@ from tests.unit_tests.test_utilities import (
     is_nccl_ep_zero_copy_available,
     is_op_fuser_available,
 )
+
+
+def test_pad_routing_map_does_not_modify_input():
+    routing_map = torch.tensor(
+        [[True, False], [False, True], [False, False], [False, False]], dtype=torch.bool
+    )
+    original = routing_map.clone()
+    original_version = routing_map._version
+
+    padded = pad_routing_map(routing_map, pad_multiple=2)
+
+    assert torch.equal(routing_map, original)
+    assert routing_map._version == original_version
+    assert torch.equal(padded.sum(dim=0), torch.tensor([2, 2]))
 
 
 def token_permutation(token_dispatcher, hidden_states, probs, indices):
