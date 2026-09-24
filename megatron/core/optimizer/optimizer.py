@@ -2219,7 +2219,6 @@ class ChainedOptimizer(MegatronOptimizer):
                 optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                 or use_fsdp_decoupled_grad
             )
-            use_decoupled_grad = optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
             if optimizer.config.dsa_indexer_clip_grad is not None:
                 indexer_clip_grad = optimizer.config.dsa_indexer_clip_grad
                 indexer_params, non_indexer_params = optimizer.get_dsa_split_parameters()
