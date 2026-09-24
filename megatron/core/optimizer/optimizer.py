@@ -906,8 +906,10 @@ def _backfill_gtp_sharded_param_map(
 
     WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
     matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
-    Distributed Adam uses its own ``DistributedOptimizer.sharded_state_dict`` (flat-buffer path)
-    and is unaffected.
+    Distributed Adam's ``dp_reshardable`` format uses a separate flat-buffer path and is
+    unaffected by these identity mismatches. Its model-space formats resolve explicit
+    optimizer companions and dequantized source identities in ``DistributedOptimizer``;
+    only GTP parameters without source-bound metadata are rejected up front.
 
     No-op when GTP is unavailable or when every param already matched.
     """

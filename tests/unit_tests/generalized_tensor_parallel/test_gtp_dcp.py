@@ -15,6 +15,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -34,17 +35,22 @@ from megatron.core.dist_checkpointing.mapping import (  # noqa: E402
 )
 from megatron.core.extensions.transformer_engine import (  # noqa: E402
     TELayerNormColumnParallelLinear,
+    TENorm,
     TERowParallelLinear,
 )
 from megatron.core.fp8_utils import is_float8tensor  # noqa: E402
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add  # noqa: E402
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer  # noqa: E402
 from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
+from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN_FLA  # noqa: E402
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules  # noqa: E402
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules  # noqa: E402
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp_remat,
+    reset_gtp_state,
     update_gtp_config,
     wrap_module_params_gtp,
 )
@@ -53,6 +59,7 @@ from megatron.core.tensor_parallel.gtp_api import (  # noqa: E402
     dequantize_gtp_native_fp8,
     gtp_native_fp8_load_context,
     gtp_remat_shard_dim0,
+    is_gtp_param,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
@@ -1402,6 +1409,188 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
         GTPShardedParam._chain_state.clear()
 
 
+def _worker_fused_projection_checkpoint(world_size, *, kind, native_fp8=False):
+    """Real fused projections preserve TP sections and padded GTP shards, including native FP8."""
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    model_parallel_cuda_manual_seed(42)
+    original_pad = GTP_CONFIG.pad_for_alignment
+    update_gtp_config(pad_for_alignment=32 if native_fp8 else 16)
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'gtp_remat', 'dp_cp']
+        )
+        assert pg.tp.size() == pg.gtp_remat.size() == 2
+        assert pg.dp_cp.size() == world_size // 4
+        config_args = dict(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            normalization='RMSNorm',
+            layernorm_zero_centered_gamma=False,
+            activation_func=F.silu,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=1,
+            transformer_impl='transformer_engine',
+            fp8='e4m3' if native_fp8 else None,
+            fp8_recipe='mxfp8',
+            fp8_param=native_fp8,
+        )
+        tp_rank, gtp_rank = dist.get_rank(pg.tp), dist.get_rank(pg.gtp_remat)
+        if kind == 'gdn':
+            config = TransformerConfig(
+                **config_args,
+                linear_conv_kernel_dim=4,
+                linear_key_head_dim=64,
+                linear_value_head_dim=64,
+                linear_num_key_heads=4,
+                linear_num_value_heads=16 if native_fp8 else 8,
+                experimental_attention_variant='gated_delta_net',
+                linear_attention_freq=[1],
+            )
+            model = GatedDeltaNet(
+                config,
+                GatedDeltaNetSubmodules(
+                    in_proj=TELayerNormColumnParallelLinear,
+                    out_norm=TENorm,
+                    out_proj=TERowParallelLinear,
+                ),
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                pg_collection=pg,
+            ).cuda()
+            weight, key = model.in_proj.weight, 'in_proj.weight'
+            sizes = [128, 128, 512, 512, 8, 8] if native_fp8 else [128, 128, 256, 256, 4, 4]
+            names = ['query', 'key', 'value', 'z', 'beta', 'alpha']
+            expected_parts = [
+                (f'{kind}.{key}.{name}', size, 2 * size, tp_rank * size)
+                for name, size in zip(names, sizes)
+            ]
+        else:
+            from megatron.core.transformer.mlp import MLP, MLPSubmodules
+
+            config = TransformerConfig(
+                **config_args, ffn_hidden_size=776, gated_linear_unit=True, add_bias_linear=False
+            )
+            model = MLP(
+                config,
+                MLPSubmodules(
+                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                ),
+                tp_group=pg.tp,
+                pg_collection=pg,
+            ).cuda()
+            weight, key = model.linear_fc1.weight, 'linear_fc1.weight'
+            expected_parts = [
+                (f'{kind}.{key}', 388, 1552, rank * 388) for rank in (tp_rank, tp_rank + 2)
+            ]
+            # Seed TP-local logical rows independently of the checkpoint factories.
+            logical_weight = (
+                torch.randn(
+                    776,
+                    config.hidden_size,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                    generator=torch.Generator(device=weight.device).manual_seed(1234 + tp_rank),
+                )
+                * 0.02
+            )
+            with torch.no_grad():
+                weight.copy_(F.pad(logical_weight, (0, 0, 0, 24)).chunk(2)[gtp_rank])
+        assert is_gtp_param(weight)
+        assert is_float8tensor(weight) == native_fp8
+        expected_weight = dequantize_gtp_native_fp8(weight) if native_fp8 else weight.detach()
+        sharded_sd = model.sharded_state_dict(prefix=f'{kind}.', metadata={'dp_cp_group': pg.dp_cp})
+        factory = sharded_sd[f'{kind}.{key}']
+        assert isinstance(factory, ShardedTensorFactory)
+
+        # Source-bound companions let model-space optimizer formats pass the early guard.
+        optimizer = SimpleNamespace(
+            ddp_config=SimpleNamespace(use_megatron_fsdp=False),
+            buffers=[SimpleNamespace(param_index_map={weight: None})],
+            state_dict=mock.Mock(side_effect=RuntimeError("optimizer state reached")),
+        )
+        assert factory.for_optimizer().data is weight
+        for sharding_type in ('fully_reshardable', 'fully_sharded_model_space', 'dp_reshardable'):
+            with pytest.raises(RuntimeError, match="optimizer state reached"):
+                DistributedOptimizer.sharded_state_dict(
+                    optimizer, sharded_sd, metadata={'distrib_optim_sharding_type': sharding_type}
+                )
+        optimizer.state_dict.reset_mock()
+        # An unbound gathered tensor must still fail before optimizer state or collectives.
+        with mock.patch.object(factory, 'optimizer_factory', None):
+            for sharding_type in ('fully_reshardable', 'fully_sharded_model_space'):
+                with pytest.raises(NotImplementedError, match="requires source-bound"):
+                    DistributedOptimizer.sharded_state_dict(
+                        optimizer,
+                        sharded_sd,
+                        metadata={'distrib_optim_sharding_type': sharding_type},
+                    )
+        optimizer.state_dict.assert_not_called()
+
+        logical_rows, pad_rows = (1296, 48) if native_fp8 else (776, 24)
+        assert tuple(factory.data.shape) == (logical_rows, config.hidden_size)
+        assert factory.data.dtype == torch.bfloat16 and not is_float8tensor(factory.data)
+        parts = factory.build()
+        assert len(parts) == len(expected_parts)
+        for part, (part_key, local_rows, global_rows, offset) in zip(parts, expected_parts):
+            assert part.key == part_key
+            assert tuple(part.local_shape) == (local_rows, config.hidden_size)
+            assert tuple(part.global_shape) == (global_rows, config.hidden_size)
+            assert tuple(part.global_offset) == (offset, 0)
+            assert part.replica_id == (0, gtp_rank, dist.get_rank(pg.dp_cp))
+
+        # Merge reconstructs this rank's contiguous physical rows and zeroes alignment padding.
+        merged = factory.merge_fn([part.data for part in parts])
+        assert tuple(merged.shape) == tuple(weight.shape)
+        assert weight.pad_length == pad_rows
+        valid_rows = merged.shape[0] - (pad_rows if gtp_rank == pg.gtp_remat.size() - 1 else 0)
+        torch.testing.assert_close(
+            merged[:valid_rows], expected_weight[:valid_rows], rtol=0, atol=0
+        )
+        assert torch.count_nonzero(merged[valid_rows:]) == 0
+
+        if native_fp8:
+            # Clear live storage so a no-op load cannot pass the roundtrip check.
+            assert torch.count_nonzero(merged) > 0
+            with torch.no_grad(), gtp_native_fp8_load_context(model):
+                weight.copy_(torch.zeros_like(merged))
+            assert torch.count_nonzero(dequantize_gtp_native_fp8(weight)) == 0
+            with gtp_native_fp8_load_context(model):
+                model.load_state_dict({key: merged}, strict=False)
+            assert is_float8tensor(weight) and is_gtp_param(weight)
+            restored = dequantize_gtp_native_fp8(weight)
+            error = (restored - merged).abs().max() / merged.abs().max().clamp_min(1e-6)
+            assert error < 0.2  # MXFP8 requantization is lossy.
+        elif kind == 'swiglu':
+            # One real forward checks that restored gate/up rows need no runtime permutation.
+            with torch.no_grad():
+                weight.zero_()
+                model.load_state_dict({key: merged}, strict=False)
+                inputs = torch.randn(
+                    8, 2, config.hidden_size, device=weight.device, dtype=weight.dtype
+                )
+                actual, _ = model.linear_fc1(inputs)
+                normalized = F.rms_norm(
+                    inputs.float(),
+                    (config.hidden_size,),
+                    model.linear_fc1.layer_norm_weight.float(),
+                    config.layernorm_epsilon,
+                ).to(inputs.dtype)
+                expected = F.linear(normalized, logical_weight)
+                torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    finally:
+        update_gtp_config(pad_for_alignment=original_pad)
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+        reset_gtp_state()
+
+
 def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt_base):
     """Save->load roundtrip: save and load must use the gtp_remat-INCLUSIVE replica group.
 
@@ -1939,6 +2128,27 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
         update_gtp_config(pad_for_alignment=orig_pad)
         ps.initialize_model_parallel()
         GTPShardedParam._chain_state.clear()
+
+
+class TestGtpFc1SwigluDcp:
+    def test_fc1_swiglu_checkpoint(self):
+        world_size = dist.get_world_size()
+        if world_size not in (4, 8):
+            pytest.skip(f"Requires world_size=4 or 8, got {world_size}")
+        _worker_fused_projection_checkpoint(world_size, kind='swiglu')
+
+
+@pytest.mark.skipif(not HAVE_GDN_FLA, reason="FLA is not installed.")
+class TestGtpGdnDcp:
+    @pytest.mark.parametrize('native_fp8', [False, True], ids=['bf16', 'native_fp8'])
+    def test_gdn_inproj_checkpoint(self, native_fp8):
+        world_size = dist.get_world_size()
+        if world_size not in (4, 8):
+            pytest.skip(f"Requires world_size=4 or 8, got {world_size}")
+        if native_fp8:
+            _requires_mxfp8()
+        with fp8_model_init(enabled=native_fp8, recipe=MXFP8BlockScaling()):
+            _worker_fused_projection_checkpoint(world_size, kind='gdn', native_fp8=native_fp8)
 
 
 @pytest.mark.run_only_on_devices_with_compute_capability(compute_capability=(10, 0))
