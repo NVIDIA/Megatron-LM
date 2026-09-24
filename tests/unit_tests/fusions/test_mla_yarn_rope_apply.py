@@ -16,25 +16,22 @@ from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
+    import triton
+
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as fused_mla_rope_module
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_apply_mla_rope_for_q,
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
     )
-except Exception:
+except ImportError:
+    triton = None
+    fused_mla_rope_module = None
     fused_apply_mla_rope_for_q = None
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
     fused_mla_rope_out_of_place = None
-
-try:
-    import triton
-
-    from megatron.core.fusions import fused_mla_yarn_rope_apply as fused_mla_rope_module
-except Exception:
-    triton = None
-    fused_mla_rope_module = None
 
 
 def dtype_tols(dtype):
@@ -431,20 +428,13 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False, num_h
 # BLOCK_H does not divide leaves the final program covering head rows that do not exist. BLOCK_H is
 # autotuned over {1, 2, ..., 128} and the tuner may pick a divisor, so an awkward head count is not
 # enough on its own -- a run can pass without the partial block ever being built. The tests below
-# pin BLOCK_H instead.
+# pin BLOCK_H instead, and each one spells out the head count and the head-block size it needs.
 # -------------------------------------------------------------------------------------------------
-
-# Deliberately not a power of two.
-PARTIAL_HEADS = 12
-# 12 % 8 == 4: the second of two programs covers four head rows it does not own.
-BLOCK_H_PARTIAL = 8
-# 12 % 4 == 0: every program is full. Same arithmetic, no partial block.
-BLOCK_H_EXACT = 4
 
 
 @contextlib.contextmanager
 def _pinned_block_h(block_h):
-    """Leave every autotuned kernel in the module exactly one BLOCK_H to choose from."""
+    """Leave every autotuned kernel one BLOCK_H (the head-block size) to choose from."""
     kernels = [
         fused_mla_rope_module._mla_rope_fwd_inplace_kernel,
         fused_mla_rope_module._mla_rope_bwd_inplace_kernel,
@@ -474,7 +464,7 @@ def _thd_rope_tables(cu_seqlens_list, emb_dim, dtype):
     return cos, sin, cu_seqlens
 
 
-def _run_kv_split_once(block_h, remove_interleaving, num_heads=PARTIAL_HEADS, seed=1234):
+def _run_kv_split_once(block_h, remove_interleaving, num_heads, seed=1234):
     """One seeded forward and backward of the KV-split path at a pinned BLOCK_H.
 
     Returns the four tensors whose values must not depend on the tiling: both forward outputs, the
@@ -523,20 +513,24 @@ class TestFusedMLARopePartialHeadBlock:
     @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
     @pytest.mark.parametrize("inverse", [False, True])
     def test_inplace_matches_unfused_reference(self, input_format, inverse, remove_interleaving):
-        with _pinned_block_h(BLOCK_H_PARTIAL):
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
+        with _pinned_block_h(block_heads_partial):
             _test_fused_mla_rope_inplace(
                 input_format,
                 inverse=inverse,
                 remove_interleaving=remove_interleaving,
-                num_heads=PARTIAL_HEADS,
+                num_heads=num_heads,
             )
 
     @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
     def test_kv_split_matches_unfused_reference(self, input_format, remove_interleaving):
         """Covers the forward outputs, the kv gradient and the k_pos_emb (``dEMB``) gradient."""
-        with _pinned_block_h(BLOCK_H_PARTIAL):
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
+        with _pinned_block_h(block_heads_partial):
             _test_fused_mla_rope_kv_split(
-                input_format, remove_interleaving=remove_interleaving, num_heads=PARTIAL_HEADS
+                input_format, remove_interleaving=remove_interleaving, num_heads=num_heads
             )
 
     def test_kv_split_result_does_not_depend_on_block_size(self, remove_interleaving):
@@ -546,8 +540,11 @@ class TestFusedMLARopePartialHeadBlock:
         tolerance-based comparisons above: a lane that a mask should have excluded shows up as a
         difference between two block sizes whatever value the hardware happened to give it.
         """
-        partial = _run_kv_split_once(BLOCK_H_PARTIAL, remove_interleaving)
-        exact = _run_kv_split_once(BLOCK_H_EXACT, remove_interleaving)
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
+        block_heads_exact = 4  # 12 % 4 == 0: every program is full. Same arithmetic, no partial.
+        partial = _run_kv_split_once(block_heads_partial, remove_interleaving, num_heads)
+        exact = _run_kv_split_once(block_heads_exact, remove_interleaving, num_heads)
         for name, from_partial, from_exact in zip(("k", "v", "d_kv", "d_emb"), partial, exact):
             torch.testing.assert_close(
                 from_partial,
@@ -564,6 +561,8 @@ class TestFusedMLARopePartialHeadBlock:
         but does not own are the next token's leading heads -- and, for the last token, memory past
         the end of the tensor. The poisoned tail is where an unmasked store lands.
         """
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
         nope_dim = 128
         emb_dim = 64
         dtype = torch.bfloat16
@@ -574,15 +573,13 @@ class TestFusedMLARopePartialHeadBlock:
         # One guard token row already exceeds the four head rows the partial block over-covers.
         guard_rows = 2
         buffer = torch.randn(
-            (total_seqlen + guard_rows, PARTIAL_HEADS, nope_dim + emb_dim),
-            dtype=dtype,
-            device="cuda",
+            (total_seqlen + guard_rows, num_heads, nope_dim + emb_dim), dtype=dtype, device="cuda"
         )
         guard_before = buffer[total_seqlen:].clone()
         rotated = buffer[:total_seqlen]
         assert rotated.stride() == buffer.stride()
 
-        with _pinned_block_h(BLOCK_H_PARTIAL), torch.no_grad():
+        with _pinned_block_h(block_heads_partial), torch.no_grad():
             fused_mla_rope_inplace(
                 rotated,
                 cos,
@@ -596,7 +593,7 @@ class TestFusedMLARopePartialHeadBlock:
         overflow = int((buffer[total_seqlen:] != guard_before).sum())
         assert overflow == 0, (
             f"{overflow} element(s) written past the end of the tensor: the partial final head "
-            f"block (head_num={PARTIAL_HEADS}, BLOCK_H={BLOCK_H_PARTIAL}) stored to head rows it "
+            f"block (head_num={num_heads}, BLOCK_H={block_heads_partial}) stored to head rows it "
             f"does not own"
         )
 

@@ -37,12 +37,14 @@ except ImportError:
     HAVE_TRITON = False
 
 try:
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as fused_mla_rope_module
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
     )
 except ImportError:
+    fused_mla_rope_module = None
     fused_mla_rope_inplace = fused_mla_rope_kv_split = fused_mla_rope_out_of_place = None
 
 pytestmark = pytest.mark.skipif(
@@ -164,35 +166,22 @@ def _yarn_cos_sin(emb_dim, seqlen, dtype):
     return (torch.cos(freqs) * mscale).to(dtype), (torch.sin(freqs) * mscale).to(dtype)
 
 
-# Every MLA RoPE kernel is launched over ``cdiv(head_num, BLOCK_H)`` head programs, so a head count
-# that ``BLOCK_H`` does not divide leaves the final program covering head rows that do not exist.
-# 32 -- the only count these tests used -- is divisible by every ``BLOCK_H`` in the autotune list
-# that does not collapse the grid to a single program, so the partial final block was never built
-# here at all. 12 builds it.
-PARTIAL_BLOCK_HEADS = 12
-
-# The two tilings compared below: 12 % 8 leaves a partial final block, 12 % 4 does not.
-_BLOCK_H_PAIR = (8, 4)
-
-
 @contextlib.contextmanager
 def _pinned_block_h(block_h):
-    """Leave every autotuned MLA RoPE kernel one ``BLOCK_H`` to choose from.
+    """Leave every autotuned MLA RoPE kernel one ``BLOCK_H`` (head-block size) to choose from.
 
     ``BLOCK_H`` is chosen by timing, so it is not an input the caller controls. The replay tests
-    above cannot vary it -- Triton caches the tuned config, so every replay reuses whatever the
+    below cannot vary it -- Triton caches the tuned config, so every replay reuses whatever the
     first call picked -- which is exactly why a result that moves with the tiling can look stable
     under replay and still move from run to run in a real job.
     """
-    from megatron.core.fusions import fused_mla_yarn_rope_apply as mla
-
     kernels = [
-        mla._mla_rope_fwd_inplace_kernel,
-        mla._mla_rope_bwd_inplace_kernel,
-        mla._mla_rope_fwd_kv_split_kernel,
-        mla._mla_rope_bwd_kv_split_kernel,
+        fused_mla_rope_module._mla_rope_fwd_inplace_kernel,
+        fused_mla_rope_module._mla_rope_bwd_inplace_kernel,
+        fused_mla_rope_module._mla_rope_fwd_kv_split_kernel,
+        fused_mla_rope_module._mla_rope_bwd_kv_split_kernel,
     ]
-    saved = [(k, k.configs, k.cache) for k in kernels]
+    saved = [(kernel, kernel.configs, kernel.cache) for kernel in kernels]
     try:
         for kernel in kernels:
             kernel.configs = [triton.Config({"BLOCK_H": block_h})]
@@ -204,10 +193,13 @@ def _pinned_block_h(block_h):
             kernel.cache = cache
 
 
+# Every kernel here is launched over ``cdiv(head_num, BLOCK_H)`` head programs. 12 heads at the
+# autotuned ``BLOCK_H=8`` leaves a final program covering four head rows that do not exist; 32 --
+# the only count these tests used -- never leaves one while more than one program is launched.
 @pytest.mark.skipif(fused_mla_rope_out_of_place is None, reason="fused MLA RoPE unavailable")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("variant", ["out_of_place", "inplace"])
-@pytest.mark.parametrize("heads", [32, PARTIAL_BLOCK_HEADS])
+@pytest.mark.parametrize("heads", [32, 12])
 def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
     seeded()
     nope_dim, emb_dim = 128, 64
@@ -231,9 +223,12 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
     assert_replays_bit_exact(run, (t,), replays=3, what=f"fused_mla_rope_{variant}[{layout}]")
 
 
+# Every kernel here is launched over ``cdiv(head_num, BLOCK_H)`` head programs. 12 heads at the
+# autotuned ``BLOCK_H=8`` leaves a final program covering four head rows that do not exist; 32 --
+# the only count these tests used -- never leaves one while more than one program is launched.
 @pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
-@pytest.mark.parametrize("heads", [32, PARTIAL_BLOCK_HEADS])
+@pytest.mark.parametrize("heads", [32, 12])
 def test_fused_mla_rope_kv_split_replays_fwd_bwd(layout, heads):
     seeded()
     k_dim, v_dim, emb_dim = 128, 128, 64
@@ -273,7 +268,12 @@ def test_fused_mla_rope_is_independent_of_block_h(path):
     tuner rather than through a reduction order, and invisible to a replay that reuses one config.
     """
     seeded()
-    heads, nope_dim, k_dim, v_dim, emb_dim = PARTIAL_BLOCK_HEADS, 128, 128, 128, 64
+    # 12 % 8 == 4: the second of two head programs covers four head rows that do not exist.
+    # 12 % 4 == 0: every program is full. Same arithmetic, so the two must agree bit for bit.
+    heads = 12
+    block_heads_partial = 8
+    block_heads_exact = 4
+    nope_dim, k_dim, v_dim, emb_dim = 128, 128, 128, 64
     dtype = torch.bfloat16
     bounds = [0, 1000, 1500, 2048, 4096]
     seqlen = max(b - a for a, b in zip(bounds, bounds[1:]))
@@ -310,7 +310,7 @@ def test_fused_mla_rope_is_independent_of_block_h(path):
             return [k_out.detach(), v_out.detach(), kv.grad, k_pos_emb.grad]
 
     results = []
-    for block_h in _BLOCK_H_PAIR:
+    for block_h in (block_heads_partial, block_heads_exact):
         with _pinned_block_h(block_h):
             results.append(run())
 
@@ -323,7 +323,7 @@ def test_fused_mla_rope_is_independent_of_block_h(path):
             atol=0,
             msg=lambda m, i=i: (
                 f"fused_mla_rope_{path} output {i} differs between "
-                f"BLOCK_H={_BLOCK_H_PAIR[0]} and BLOCK_H={_BLOCK_H_PAIR[1]}: {m}"
+                f"BLOCK_H={block_heads_partial} and BLOCK_H={block_heads_exact}: {m}"
             ),
         )
 
