@@ -2355,21 +2355,25 @@ def get_batch_on_this_tp_rank(
             torch.distributed.broadcast(item, broadcast_src_rank, group=broadcast_group)
 
     if tp_rank == 0:
+        # Dataset validity is optional and may still be on the CPU in callers
+        # using the original batch schema. Normalize it at this shared boundary.
+        if batch.get('padding_mask') is not None:
+            batch['padding_mask'] = batch['padding_mask'].cuda(non_blocking=True)
 
-        def _broadcast_cu_seqlens(cu_seqlens):
+        def _broadcast_packed_tensor(tensor, dtype=torch.int32):
             dev = torch.cuda.current_device()
-            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
+            n = 0 if tensor is None else int(tensor.numel())
             n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
             _broadcast(n_tensor)
 
             if n > 0:
                 assert isinstance(
-                    cu_seqlens, torch.Tensor
-                ), f"Expected cu_seqlens to be a torch.Tensor, got {type(cu_seqlens)}"
+                    tensor, torch.Tensor
+                ), f"Expected packed metadata to be a torch.Tensor, got {type(tensor)}"
                 assert (
-                    cu_seqlens.dtype == torch.int32
-                ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
-                _broadcast(cu_seqlens)
+                    tensor.dtype == dtype
+                ), f"Expected packed metadata dtype {dtype}, got {tensor.dtype}"
+                _broadcast(tensor)
 
         if is_hybrid_cp:
             hybrid_cp_seq_length = torch.tensor(
@@ -2383,10 +2387,10 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['loss_mask'])
             _broadcast(batch['position_ids'])
             if has_cu_seqlens or is_hybrid_cp:
-                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast_packed_tensor(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
-                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                    _broadcast_packed_tensor(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
             if is_hybrid_cp:
@@ -2399,10 +2403,10 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
             if has_cu_seqlens:
-                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast_packed_tensor(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
-                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                    _broadcast_packed_tensor(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
@@ -2413,10 +2417,10 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             if has_cu_seqlens:
-                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast_packed_tensor(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
-                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                    _broadcast_packed_tensor(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
@@ -2428,10 +2432,15 @@ def get_batch_on_this_tp_rank(
             batch["position_ids"] = None
             batch["attention_mask"] = None
 
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
+            _broadcast_packed_tensor(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
             if cp_size > 1:
-                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                _broadcast_packed_tensor(batch['cu_seqlens_padded'])
+
+        # Optional row validity follows packed metadata on every PP stage. Reuse the
+        # length-prefixed protocol and avoid an extra launch when no TP peer exists.
+        if (has_cu_seqlens or is_hybrid_cp) and broadcast_group.size() > 1:
+            _broadcast_packed_tensor(batch.get('padding_mask'), dtype=torch.bool)
 
     else:
         if is_hybrid_cp:
@@ -2467,7 +2476,7 @@ def get_batch_on_this_tp_rank(
         if is_hybrid_cp:
             local_cp_size = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
 
-        def _broadcast_cu_seqlens():
+        def _broadcast_packed_tensor(dtype=torch.int32):
             dev = torch.cuda.current_device()
 
             n = torch.empty((), dtype=torch.int64, device=dev)
@@ -2482,21 +2491,12 @@ def get_batch_on_this_tp_rank(
             # the 2-D layout so flatten_batch_for_packed_sequences can merge
             # samples correctly when micro_batch_size > 1.
             assert n % micro_batch_size == 0, (
-                f"cu_seqlens numel ({n}) is not divisible by "
+                f"Packed metadata numel ({n}) is not divisible by "
                 f"micro_batch_size ({micro_batch_size})"
             )
-            cu_seqlens = torch.empty(
-                (micro_batch_size, n // micro_batch_size), dtype=torch.int32, device=dev
-            )
-            _broadcast(cu_seqlens)
-            assert cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == micro_batch_size, (
-                f"Expected cu_seqlens shape ({micro_batch_size}, "
-                f"{n // micro_batch_size}), got {tuple(cu_seqlens.shape)}"
-            )
-            assert (
-                cu_seqlens.dtype == torch.int32
-            ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
-            return cu_seqlens
+            tensor = torch.empty((micro_batch_size, n // micro_batch_size), dtype=dtype, device=dev)
+            _broadcast(tensor)
+            return tensor
 
         if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(tokens)
@@ -2504,10 +2504,10 @@ def get_batch_on_this_tp_rank(
             _broadcast(loss_mask)
             _broadcast(position_ids)
             if has_cu_seqlens or is_hybrid_cp:
-                cu_seqlens = _broadcast_cu_seqlens()
+                cu_seqlens = _broadcast_packed_tensor()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
-                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                    cu_seqlens_padded = _broadcast_packed_tensor()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
             if is_hybrid_cp:
@@ -2520,10 +2520,10 @@ def get_batch_on_this_tp_rank(
             _broadcast(tokens)
             _broadcast(position_ids)
             if has_cu_seqlens:
-                cu_seqlens = _broadcast_cu_seqlens()
+                cu_seqlens = _broadcast_packed_tensor()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
-                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                    cu_seqlens_padded = _broadcast_packed_tensor()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
@@ -2534,10 +2534,10 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             if has_cu_seqlens:
-                cu_seqlens = _broadcast_cu_seqlens()
+                cu_seqlens = _broadcast_packed_tensor()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
-                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                    cu_seqlens_padded = _broadcast_packed_tensor()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
@@ -2548,10 +2548,14 @@ def get_batch_on_this_tp_rank(
             loss_mask = None
             position_ids = None
 
-            cu_seqlens = _broadcast_cu_seqlens()
+            cu_seqlens = _broadcast_packed_tensor()
             _broadcast(max_seqlen)
             if cp_size > 1:
-                cu_seqlens_padded = _broadcast_cu_seqlens()
+                cu_seqlens_padded = _broadcast_packed_tensor()
+
+        padding_mask = None
+        if has_cu_seqlens or is_hybrid_cp:
+            padding_mask = _broadcast_packed_tensor(dtype=torch.bool)
 
         batch = {
             'tokens': tokens,
@@ -2564,6 +2568,7 @@ def get_batch_on_this_tp_rank(
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
             'hybrid_cp_group': None,
+            'padding_mask': padding_mask,
         }
 
     return batch
@@ -2583,7 +2588,7 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
     sub-sequence (document) using Transformer Engine's
     ``thd_get_partitioned_indices``. Each document length must be
     divisible by ``2 * cp_size``. Sequence-dimension tensors (tokens,
-    labels, loss_mask, position_ids) are index-selected to this CP
+    labels, loss_mask, position_ids, padding_mask) are index-selected to this CP
     rank's partition; metadata keys (cu_seqlens, cu_seqlens_padded,
     max_seqlen, etc.) are left unchanged.
 
@@ -2609,15 +2614,15 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
-            (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
+        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask')
+        sequence_tensor = next(
+            (batch.get(key) for key in SEQUENCE_KEYS if batch.get(key) is not None), None
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
+        if sequence_tensor is None:
+            return batch
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_for_te, sequence_tensor.size(1), cp_size, cp_rank
+        )
         for key in SEQUENCE_KEYS:
             if batch.get(key) is not None:
                 batch[key] = batch[key].index_select(1, index)
@@ -2759,7 +2764,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
         return batch
 
     seq_length = None
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         if batch.get(key) is not None:
             seq_length = batch[key].shape[1]
             break
@@ -2774,7 +2779,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     if batch.get('max_seqlen') is not None:
         batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
 
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask'):
         if batch.get(key) is not None:
             batch[key] = batch[key].reshape(1, -1)
 

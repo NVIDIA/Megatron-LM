@@ -6,6 +6,44 @@ import torch.distributed as dist
 from torch import Tensor
 
 
+def build_thd_padding_mask(
+    cu_seqlens: Tensor,
+    cu_seqlens_padded: Tensor | None = None,
+    physical_token_count: int | None = None,
+) -> Tensor:
+    """Return a 1D mask with true entries for physical THD padding rows.
+
+    ``cu_seqlens`` must retain logical token lengths; ``cu_seqlens_padded`` gives
+    physical document offsets. If padding has already been folded into both sets of
+    lengths, the producer must preserve its original mask instead. A host-known
+    physical extent avoids reading the final cumulative length back from the device.
+    """
+    if cu_seqlens_padded is None:
+        cu_seqlens_padded = cu_seqlens
+    assert cu_seqlens.dim() == cu_seqlens_padded.dim() == 1
+    assert cu_seqlens.numel() == cu_seqlens_padded.numel()
+
+    if physical_token_count is None:
+        physical_token_count = int(cu_seqlens_padded[-1].item())
+    elif (
+        cu_seqlens_padded.device.type == "cpu"
+        and int(cu_seqlens_padded[-1]) != physical_token_count
+    ):
+        raise ValueError("Packed THD physical token count disagrees with cumulative lengths")
+    if physical_token_count == 0:
+        return torch.empty((0,), dtype=torch.bool, device=cu_seqlens.device)
+    if cu_seqlens.numel() <= 1:
+        return torch.ones((physical_token_count,), dtype=torch.bool, device=cu_seqlens.device)
+
+    positions = torch.arange(
+        physical_token_count, dtype=cu_seqlens_padded.dtype, device=cu_seqlens_padded.device
+    )
+    sequence_ids = torch.searchsorted(cu_seqlens_padded[1:].contiguous(), positions, right=True)
+    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).clamp(min=0)
+    valid_ends = cu_seqlens_padded[:-1] + valid_lengths
+    return positions >= valid_ends[sequence_ids]
+
+
 @dataclass
 class PackedSeqParams:
     '''
@@ -32,6 +70,9 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
     cp_scatter_cache: object = None
+    # True only for local THD rows containing real tokens. Sparse backends need this separately
+    # because the primary cumulative lengths may describe a physically padded layout.
+    real_token_mask_q: Tensor = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

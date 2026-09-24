@@ -165,16 +165,25 @@ def build_zigzag_cp_local_positions(
 def build_zigzag_allgather_cp_key_reorder(
     sq: int, cp_size: int, device: torch.device
 ) -> torch.Tensor:
-    """Build gathered-KV reorder index for non-packed zigzag allgather CP."""
-    global_seq_len = sq * cp_size
-    gathered_key_positions = torch.cat(
-        [
-            build_zigzag_cp_local_positions(global_seq_len, cp_size, rank, device)
-            for rank in range(cp_size)
-        ],
-        dim=0,
-    )
-    return torch.argsort(gathered_key_positions)
+    """Restore globally ordered keys from rank-major, non-packed zigzag CP shards.
+
+    Each rank contributes its front chunk followed by its mirrored back chunk.
+    Invert this chunk permutation directly, without constructing and sorting
+    every rank's token positions.
+    """
+    if cp_size < 1 or sq < 0:
+        raise ValueError("Zigzag CP requires a positive CP size and nonnegative local rows")
+    if cp_size == 1:
+        return torch.arange(sq, device=device, dtype=torch.int64)
+    if sq % 2:
+        raise ValueError("Zigzag CP requires even local rows for CP > 1")
+
+    half = sq // 2
+    global_chunks = torch.arange(2 * cp_size, device=device, dtype=torch.int64)
+    source_ranks = torch.minimum(global_chunks, 2 * cp_size - 1 - global_chunks)
+    source_starts = source_ranks * sq + (global_chunks >= cp_size).to(torch.int64) * half
+    offsets = torch.arange(half, device=device, dtype=torch.int64)
+    return (source_starts[:, None] + offsets[None, :]).reshape(-1)
 
 
 def get_cp_positions_from_layout(

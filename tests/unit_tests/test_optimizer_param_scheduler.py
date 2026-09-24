@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
+    get_indexer_lr_for_logging,
 )
 
 
@@ -348,3 +350,74 @@ class TestGetCanonicalLrForLogging:
         """lr=0.0 is a legitimate value, not to be confused with None."""
         param_groups = [{'lr': 0.0, 'default_config': True}]
         assert get_canonical_lr_for_logging(param_groups) == 0.0
+
+    def test_skips_indexer_default_group(self):
+        param_groups = [
+            {'lr': 0.002, 'default_config': True, 'is_dsa_indexer': True},
+            {'lr': 0.05, 'default_config': True, 'is_dsa_indexer': False},
+        ]
+        assert get_canonical_lr_for_logging(param_groups) == 0.05
+
+
+def test_get_indexer_lr_for_logging_uses_first_indexer_group():
+    param_groups = [
+        {'lr': 0.05, 'default_config': True},
+        {'lr': 0.003, 'is_dsa_indexer': True, 'wd_mult': 1.0},
+        {'lr': 0.004, 'is_dsa_indexer': True, 'wd_mult': 0.0},
+    ]
+    assert get_indexer_lr_for_logging(param_groups) == 0.003
+    assert get_indexer_lr_for_logging(param_groups[:1]) is None
+
+
+@pytest.mark.parametrize(
+    "scheduler_samples, expected_scale",
+    [(50, 0.0), (100, 0.0), (150, 0.25), (300, 1.0), (400, 1.0)],
+)
+def test_dsa_indexer_activation_warmup_scales_every_indexer_group_only(
+    scheduler_samples, expected_scale
+):
+    from megatron.training.training import _apply_dsa_indexer_lr_warmup
+
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {'lr': 0.07, 'scheduled_lr': 0.07, 'is_dsa_indexer': False},
+            {'lr': -1.0, 'scheduled_lr': 0.02, 'is_dsa_indexer': True, 'wd_mult': 1.0},
+            {'lr': -1.0, 'scheduled_lr': 0.03, 'is_dsa_indexer': True, 'wd_mult': 0.0},
+        ]
+    )
+
+    class Scheduler:
+        num_steps = scheduler_samples
+
+        @staticmethod
+        def get_lr(param_group):
+            return param_group['scheduled_lr']
+
+    args = SimpleNamespace(
+        dsa_indexer_activation_start_samples=100,
+        dsa_indexer_activation_warmup_samples=200,
+        consumed_train_samples=999,
+    )
+    logged_lr = _apply_dsa_indexer_lr_warmup(args, optimizer, Scheduler())
+
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(0.07)
+    assert optimizer.param_groups[1]['lr'] == pytest.approx(0.02 * expected_scale)
+    assert optimizer.param_groups[2]['lr'] == pytest.approx(0.03 * expected_scale)
+    assert logged_lr == pytest.approx(0.02 * expected_scale)
+
+
+def test_dsa_indexer_activation_zero_warmup_immediately_uses_scheduled_lr():
+    from megatron.training.training import _apply_dsa_indexer_lr_warmup
+
+    optimizer = SimpleNamespace(
+        param_groups=[{'lr': 0.0, 'scheduled_lr': 0.025, 'is_dsa_indexer': True}]
+    )
+    scheduler = SimpleNamespace(num_steps=10, get_lr=lambda group: group['scheduled_lr'])
+    args = SimpleNamespace(
+        dsa_indexer_activation_start_samples=10,
+        dsa_indexer_activation_warmup_samples=0,
+        consumed_train_samples=10,
+    )
+
+    assert _apply_dsa_indexer_lr_warmup(args, optimizer, scheduler) == pytest.approx(0.025)
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(0.025)

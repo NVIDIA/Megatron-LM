@@ -1502,12 +1502,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        return_layernorm_output: bool = False,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
             pg_collection (ProcessGroupCollection | None): process groups used by this layer.
                 Falls back to the MPU global process groups when not given.
+            return_layernorm_output (bool): Append the normalized input to the forward result.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1535,8 +1537,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
         # tell TE to not return the bias, and return None
-        # ourselves. This way our forward always returns two values
-        # and we don't have to deal with the zero length Tensor.
+        # ourselves. The first two forward results always remain output and bias;
+        # requesting the normalized input appends a third result.
         self.te_return_bias = skip_bias_add and bias
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
@@ -1641,7 +1643,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode="column",
-                return_layernorm_output=False,
+                return_layernorm_output=return_layernorm_output,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
@@ -1707,11 +1709,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         self.is_first_microbatch = False
 
-        # TE only returns a tuple when return_bias is True, otherwise
-        # it returns a single Tensor, we always want to return two
-        # values regardless of the arguments.
+        # Keep the ordinary (output, bias) interface and append the normalized
+        # input only when explicitly requested by the caller.
         if self.te_return_bias:
             return out
+        if self.return_layernorm_output:
+            output, layernorm_output = out
+            return output, None, layernorm_output
         return out, None
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -2335,6 +2339,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+        self.kept_packed_seq_params.discard("real_token_mask_q")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")

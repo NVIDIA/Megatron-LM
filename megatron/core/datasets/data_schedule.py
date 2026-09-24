@@ -16,7 +16,7 @@ from megatron.core.datasets.data_schedule_utils import (
     get_batch_and_global_seqlens,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, build_thd_padding_mask
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
@@ -29,32 +29,6 @@ try:
 except ImportError:
     # TE isn't installed or the torch wrapper is missing
     tex = None
-
-
-def _build_thd_padding_mask(
-    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
-) -> torch.Tensor:
-    """Build a 1D THD padding mask from scheduler sequence metadata."""
-    assert cu_seqlens.dim() == 1
-    assert cu_seqlens_padded.dim() == 1
-    assert cu_seqlens.numel() == cu_seqlens_padded.numel()
-
-    total_tokens = int(cu_seqlens_padded[-1].item())
-    if total_tokens == 0:
-        return torch.empty((0,), dtype=torch.bool, device=cu_seqlens.device)
-
-    num_sequences = cu_seqlens.numel() - 1
-    if num_sequences <= 0:
-        return torch.ones((total_tokens,), dtype=torch.bool, device=cu_seqlens.device)
-
-    positions = torch.arange(
-        total_tokens, dtype=cu_seqlens_padded.dtype, device=cu_seqlens_padded.device
-    )
-    seq_indices = torch.searchsorted(cu_seqlens_padded[1:].contiguous(), positions, right=True)
-
-    valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).clamp(min=0)
-    valid_ends = cu_seqlens_padded[:-1] + valid_lengths
-    return positions >= valid_ends[seq_indices]
 
 
 def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tensor) -> None:
@@ -799,7 +773,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
     if is_tp_rank_0:
-        batch['padding_mask'] = _build_thd_padding_mask(
+        batch['padding_mask'] = build_thd_padding_mask(
             batch['cu_seqlens'], batch['cu_seqlens_padded']
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
@@ -919,6 +893,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
+        real_token_mask_q=(~padding_mask.squeeze(0)).contiguous(),
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.

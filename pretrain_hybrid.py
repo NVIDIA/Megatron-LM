@@ -28,8 +28,9 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -188,6 +189,27 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch = flatten_batch_for_packed_sequences(batch)
 
+    # This path has a fixed-size pretraining batch. Use tensor shapes when present;
+    # intermediate PP stages have metadata only. Preserve producer-supplied masks:
+    # cumulative lengths may already include storage padding. The variable-packing
+    # scheduler returns above, and hybrid CP determines its extent dynamically.
+    # Legacy SFT without explicit validity cannot reconstruct it from physical lengths.
+    physical_token_count = None
+    if has_cu_seqlens and not is_sft and not is_hybrid_cp:
+        sequence_tensor = next(
+            (
+                batch[key]
+                for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'padding_mask')
+                if batch.get(key) is not None
+            ),
+            None,
+        )
+        physical_token_count = (
+            sequence_tensor.size(1)
+            if sequence_tensor is not None
+            else args.micro_batch_size * args.seq_length
+        )
+
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
         batch = {
@@ -195,6 +217,7 @@ def get_batch(data_iterator, vp_stage=None):
             'cu_seqlens': batch['cu_seqlens'],
             'cu_seqlens_padded': batch['cu_seqlens_padded'],
             'max_seqlen': batch['max_seqlen'],
+            'padding_mask': batch.get('padding_mask'),
         }
 
     additional_layouts = set()
@@ -216,6 +239,8 @@ def get_batch(data_iterator, vp_stage=None):
             else None
         ),
         tokens_per_sample=args.seq_length,
+        physical_token_count=physical_token_count,
+        local_token_alignment=(get_fp8_align_size(config.fp8_recipe) if config.fp8 else 1),
     )
 
 

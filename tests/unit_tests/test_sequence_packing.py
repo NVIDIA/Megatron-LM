@@ -9,11 +9,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
-    _build_thd_padding_mask,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.packed_seq_params import build_thd_padding_mask
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -23,7 +23,7 @@ def test_scheduler_thd_padding_mask_from_cu_seqlens():
     cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
     cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
 
-    padding_mask = _build_thd_padding_mask(cu_seqlens, cu_seqlens_padded)
+    padding_mask = build_thd_padding_mask(cu_seqlens, cu_seqlens_padded)
 
     assert torch.equal(
         padding_mask, torch.tensor([False, False, False, True, False, False, True, True])

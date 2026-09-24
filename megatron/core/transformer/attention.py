@@ -62,7 +62,9 @@ except ImportError:
     rearrange = None
 
 try:
-    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
+        _flash_attn_forward,
+    )
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
@@ -73,7 +75,9 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            _flash_attn_forward,
+        )
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -138,8 +142,8 @@ except ImportError:
 class LinearQkvInterface(Protocol):
     """Interface for linear_qkv modules."""
 
-    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
-        """Applies linear_qkv."""
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object] | tuple[Tensor, object, Tensor]:
+        """Apply the projection, optionally also returning its normalized input."""
         ...
 
     def backward_dw(self) -> None:
@@ -447,6 +451,28 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _needs_qkv_layernorm_output(self) -> bool:
+        """Whether a variant consumes the normalized input from the QKV projection."""
+        return False
+
+    def _get_core_attention_extra_kwargs(
+        self,
+        hidden_states: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]],
+        rotary_pos_cos: Optional[Tensor],
+        rotary_pos_sin: Optional[Tensor],
+        rotary_pos_cos_sin: Optional[Tensor],
+        attn_mask_type: AttnMaskType,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> dict:
+        """Hook for attention variants that need extra inputs in core attention."""
+        return {}
+
     def _checkpointed_attention_forward(
         self,
         query,
@@ -750,9 +776,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         output_gate: bool = False,
         split_qkv: bool = True,
     ) -> (
-        tuple[Tensor, Tensor, Tensor, Tensor]
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
         | tuple[Tensor, list[int]]
+        | tuple[Tensor, list[int], Tensor]
     ):
         """
         This method needs to be implemented based on whether the derived class
@@ -1334,6 +1362,25 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         return output_total
 
+    def _dynamic_core_attention_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: BaseInferenceContext,
+        block_table: Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        **kwargs,
+    ) -> Tensor:
+        """Hook for attention variants that need a custom dynamic-batching path."""
+        raise NotImplementedError(
+            "Dynamic batching is not supported for attention variants that require extra "
+            "core-attention kwargs."
+        )
+
     def supports_two_stage_attention(self) -> bool:
         """Specialized attention subclasses retain their atomic forward path."""
         return type(self).forward is Attention.forward
@@ -1459,6 +1506,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
+        core_attention_hidden_states = hidden_states
+        if self._needs_qkv_layernorm_output():
+            qkv_output, core_attention_hidden_states = qkv_output[:-1], qkv_output[-1]
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
@@ -1628,10 +1678,27 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # ==================================
 
         nvtx_range_push(suffix="core_attention")
+        core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
+            hidden_states=core_attention_hidden_states,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attn_mask_type=attn_mask_type,
+            packed_seq_params=packed_seq_params,
+        )
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
         if self.checkpoint_core_attention and self.training:
+            # Upstream _checkpointed_attention_forward now threads tensor-valued
+            # core-attention kwargs (e.g. DSA's x/qr) through the checkpoint, so the
+            # variant no longer has to opt out of checkpointing.
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -1640,6 +1707,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -1653,33 +1721,48 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
                     )
 
             else:
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                if core_attention_extra_kwargs:
+                    core_attn_out = self._dynamic_core_attention_forward(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        inference_context,
+                        block_table,
+                        attn_mask_type,
+                        attention_bias,
+                        packed_seq_params,
+                        **core_attention_extra_kwargs,
+                    )
+                else:
+                    # Dynamic batching attention kernel.
+                    q, k, v = (query, key, value)
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                    softmax_offset=self._get_inference_softmax_offset(),
-                )
-                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                        softmax_offset=self._get_inference_softmax_offset(),
+                    )
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
-                # Clear the outputs for padding tokens when using quantization scales
-                # to avoid corrupting amax calculations
-                if is_using_quantization_scales(self.config):
-                    core_attn_out[inference_context.padding_slice] = 0.0
+                    # Clear the outputs for padding tokens when using quantization scales
+                    # to avoid corrupting amax calculations
+                    if is_using_quantization_scales(self.config):
+                        core_attn_out[inference_context.padding_slice] = 0.0
 
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]
@@ -1776,6 +1859,9 @@ class SelfAttention(Attention):
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
+        qkv_kwargs = {}
+        if self._needs_qkv_layernorm_output():
+            qkv_kwargs["return_layernorm_output"] = True
         self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.linear_qkv_out_dim,
@@ -1789,6 +1875,7 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
             pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
+            **qkv_kwargs,
         )
 
         # Resolve which norm class to use for Q and K.
@@ -1915,18 +2002,25 @@ class SelfAttention(Attention):
         output_gate: bool = False,
         split_qkv: bool = True,
     ) -> (
-        tuple[Tensor, Tensor, Tensor, Tensor]
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor, Tensor]
         | tuple[Tensor, Tensor, Tensor]
         | tuple[Tensor, list[int]]
+        | tuple[Tensor, list[int], Tensor]
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
+        Variants requesting the QKV layernorm output receive it as the final item.
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        projection_output = apply_module(self.linear_qkv)(hidden_states)
+        if self._needs_qkv_layernorm_output():
+            mixed_qkv, _, layernorm_output = projection_output
+        else:
+            mixed_qkv, _ = projection_output
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
@@ -1994,6 +2088,8 @@ class SelfAttention(Attention):
 
             # Return unsplit mixed_qkv and split_arg_list
             if not split_qkv:
+                if self._needs_qkv_layernorm_output():
+                    return mixed_qkv, split_arg_list, layernorm_output
                 return mixed_qkv, split_arg_list
 
             if SplitAlongDim is not None:
@@ -2036,9 +2132,12 @@ class SelfAttention(Attention):
                     self.world_size // self.config.num_query_groups
                 )
                 gate = gate[:, :, idx * size : (idx + 1) * size, :]
-            return query, key, value, gate
-
-        return query, key, value
+            qkv_output = (query, key, value, gate)
+        else:
+            qkv_output = (query, key, value)
+        if self._needs_qkv_layernorm_output():
+            return (*qkv_output, layernorm_output)
+        return qkv_output
 
     def backward_dw(self) -> None:
         """Execute weight update operations"""
