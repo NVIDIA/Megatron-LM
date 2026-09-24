@@ -30,8 +30,8 @@ except ImportError as exc:
     ) from exc
 
 from .dbuffer import DBuffer
-from .layout import GlobalLayout
-from .placement import BlockAtomic, Flat
+from .layout import GlobalLayout, Shape
+from .placement import BlockAtomic, RowAtomic
 
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
 # TODO: Support quantizing only rowwise or columnwise data, allocating and
@@ -75,14 +75,14 @@ def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
 
 
 def _block_atomic_to_flat(placements: Iterable[Placement]) -> tuple[Placement, ...]:
-    """Replace BlockAtomic placements with Flat for coordinates measured in blocks.
+    """Replace BlockAtomic placements with RowAtomic for coordinates measured in blocks.
 
     For example, one MXFP8 columnwise scale row represents a 32-row weight
-    block, so Flat preserves the shard boundaries of BlockAtomic(32).
+    block, so RowAtomic preserves the shard boundaries of BlockAtomic(32).
     """
     placements = tuple(placements)
     return tuple(
-        Flat() if isinstance(placement, BlockAtomic) else placement for placement in placements
+        RowAtomic() if isinstance(placement, BlockAtomic) else placement for placement in placements
     )
 
 
@@ -124,10 +124,13 @@ class QuantizedDBuffer:
         self,
         mesh: DeviceMesh,
         placements: Iterable[Placement],
-        tensor_shapes: Iterable[torch.Size],
+        layout: GlobalLayout,
         device: torch.device | str,
     ) -> None:
-        tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
+        """Allocate MXFP8 data and scale planes from a shared weight layout."""
+        if layout.block_size != _MXFP8_BLOCK_SIZE:
+            raise ValueError(f"QuantizedDBuffer requires block size {_MXFP8_BLOCK_SIZE}.")
+        tensor_shapes = layout.tensor_shapes
         if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
             raise ValueError("QuantizedDBuffer requires one or more 2D MXFP8 tensor shapes.")
         if any(
@@ -137,22 +140,32 @@ class QuantizedDBuffer:
                 f"QuantizedDBuffer requires dimensions divisible by {_MXFP8_BLOCK_SIZE}."
             )
         placements = tuple(placements)
-        self.rowwise_data = DBuffer.empty(
-            mesh, placements, tensor_shapes, torch.uint8, device, block_size=_MXFP8_BLOCK_SIZE
-        )
-        self.columnwise_data = DBuffer(
-            mesh, placements, self.rowwise_data.layout, torch.uint8, device
-        )
+        self.rowwise_data = DBuffer(mesh, placements, layout, torch.uint8, device)
+        self.columnwise_data = DBuffer(mesh, placements, layout, torch.uint8, device)
         self.rowwise_scale = DBuffer(
-            mesh, placements, _rowwise_scale_layout(self.rowwise_data.layout), torch.uint8, device
+            mesh, placements, _rowwise_scale_layout(layout), torch.uint8, device
         )
         self.columnwise_scale = DBuffer(
             mesh,
             _block_atomic_to_flat(placements),
-            _columnwise_scale_layout(self.rowwise_data.layout),
+            _columnwise_scale_layout(layout),
             torch.uint8,
             device,
         )
+
+    @classmethod
+    def empty(
+        cls,
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        tensor_shapes: Iterable[Shape],
+        device: torch.device | str,
+    ) -> "QuantizedDBuffer":
+        """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
+        layout = GlobalLayout.build(
+            tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
+        )
+        return cls(mesh, placements, layout, device)
 
     @property
     def mesh(self) -> DeviceMesh:

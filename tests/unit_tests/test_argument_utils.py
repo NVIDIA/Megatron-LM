@@ -5,6 +5,7 @@ import sys
 import types
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
@@ -24,6 +26,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
 @dataclass
@@ -54,6 +57,7 @@ class CapturingTransformerConfig:
     """Minimal config that records kwargs produced by core_transformer_config_from_args."""
 
     moe_use_norm_before_up_proj: bool = False
+    hash_moe_vocab_size: int | None = None
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -91,6 +95,92 @@ def test_moe_norm_flag_reaches_transformer_config():
     )
 
     assert config.moe_use_norm_before_up_proj is True
+
+
+@pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
+def test_hash_moe_vocab_is_initialized_before_config_conversion(
+    monkeypatch, explicit_hash_vocab_size
+):
+    from megatron.training import global_vars
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.params_dtype = torch.float32
+    args.moe_num_hash_layers = 1
+    args.hash_moe_vocab_size = explicit_hash_vocab_size
+    args.vocab_size = 100000
+    args.padded_vocab_size = 100352
+    tokenizer = SimpleNamespace(vocab_size=100003)
+    monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
+    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
+
+    global_vars._build_tokenizer(args)
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    expected = 100003 if explicit_hash_vocab_size is None else explicit_hash_vocab_size
+    assert config.hash_moe_vocab_size == expected
+    assert args.hash_moe_vocab_size == expected
+    assert args.vocab_size == 100000
+    assert args.padded_vocab_size == 100352
+
+
+# ---------------------------------------------------------------------------
+# Tests for the Megatron-FSDP v2 pipeline-output dealloc opt-out
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fsdp_kwargs, expected",
+    [
+        ({}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 1}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
+    ],
+)
+def test_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+    """The Python-args path keeps the pseudo-free on except for Megatron-FSDP v2."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    # params_dtype has no CLI flag of its own; validate_args normally derives it.
+    args.params_dtype = torch.float32
+    for name, value in fsdp_kwargs.items():
+        setattr(args, name, value)
+
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    assert config.deallocate_pipeline_outputs is expected
+
+
+@pytest.mark.parametrize(
+    "fsdp_kwargs, expected",
+    [
+        ({}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 1}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
+    ],
+)
+def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+    """The YAML path reads the FSDP flags from the outer namespace before rebinding."""
+    language_model = Namespace(
+        **vars(TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4))
+    )
+    language_model.params_dtype = torch.float32
+    language_model.activation_func = "gelu"
+    language_model.embedding_init_method = "xavier_uniform"
+
+    # ``core_transformer_config_from_yaml`` merges the ``language_model`` and
+    # ``model_parallel`` sections, and this fixture already carries every
+    # TransformerConfig field in ``language_model``; repeating one here raises
+    # ``TypeError: got multiple values for keyword argument``.
+    args = SimpleNamespace(
+        language_model=language_model, model_parallel=SimpleNamespace(), **fsdp_kwargs
+    )
+
+    config = core_transformer_config_from_yaml(args)
+
+    assert config.deallocate_pipeline_outputs is expected
 
 
 def test_moe_norm_flag_requires_latent_size(monkeypatch):

@@ -64,6 +64,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         hidden_dropout: float | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         vp_stage: int | None = None,
+        name: str | None = None,
     ):
         # Temporarily replace attention with IdentityOp,
         # This is a temporary workaround for the test until we have a better interface
@@ -82,6 +83,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            name=name,
         )
 
         assert (
@@ -167,15 +169,22 @@ def _gpt_te_layer_spec_with_hetro_pgs(
 ):
 
     def build_mlp(
-        config: TransformerConfig, pg_collection: ProcessGroupCollection, is_mtp_layer: bool
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        name: str | None = None,
+        hash_moe_layer_threshold: int | None = None,
     ):
-        del pg_collection, is_mtp_layer
-        return MLP(
-            config,
+        del pg_collection
+        return MLP.as_mlp_submodule(
+            config=config,
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
             ),
-            tp_group=mlp_pg_collection.tp,
+            pg_collection=mlp_pg_collection,
+            is_mtp_layer=is_mtp_layer,
+            name=name,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
 
     return ModuleSpec(

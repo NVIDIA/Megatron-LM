@@ -44,6 +44,9 @@ from .common import (
     abort_requests,
     attach_stage_metadata,
     collect_stage_metadata,
+    generation_config_sampling_defaults,
+    log_sampling_defaults_once,
+    resolve_sampling_default,
     validate_offload_params,
 )
 
@@ -426,7 +429,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
     return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
-def _sanitize_messages_for_template(messages):
+def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
     This only normalizes tool-call argument payloads inside each message:
@@ -444,7 +447,11 @@ def _sanitize_messages_for_template(messages):
     if not isinstance(messages, list):
         return messages
     sanitized = []
-    for message in messages:
+    media_modalities_by_message = {}
+    for _sentinel, modality, message_index in media_slots:
+        media_modalities_by_message.setdefault(message_index, set()).add(modality)
+
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             sanitized.append(message)
             continue
@@ -462,7 +469,21 @@ def _sanitize_messages_for_template(messages):
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
-            msg_copy["content"] = "".join(text_chunks)
+            separator = ""
+            message_modalities = media_modalities_by_message.get(message_index, set())
+            if message_modalities:
+                if prompt_config is None:
+                    raise ValueError("Media content normalization requires a prompt config.")
+                separators = {
+                    prompt_config.get_spec(modality).content_part_separator
+                    for modality in message_modalities
+                }
+                if len(separators) != 1:
+                    raise ValueError(
+                        "Media types in one message must use the same content-part separator."
+                    )
+                separator = separators.pop()
+            msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:
@@ -827,7 +848,7 @@ try:
             multi_modal_data = {"image": image_bytes_list}
         elif video_bytes_list:
             multi_modal_data = {"video": video_bytes_list}
-        template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
         template_tools = _sanitize_tools_for_template(tools)
 
         # The exact tokens of the previous turn can come from one of two places, never both:
@@ -1017,13 +1038,37 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
+            # For a field the request omits: an explicitly configured server default
+            # wins, then the model's generation_config.json, then the previous
+            # hardcoded fallback.
+            gen_defaults = generation_config_sampling_defaults(tokenizer)
+            cfg = current_app.config
             temperature = float(
                 _get_non_none(
-                    req, "temperature", current_app.config.get('default_temperature', 1.0)
+                    req,
+                    "temperature",
+                    resolve_sampling_default(
+                        cfg, gen_defaults, "temperature", 'default_temperature', 1.0
+                    ),
                 )
             )
-            top_p = float(_get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0)))
-            top_k = int(_get_non_none(req, "top_k", current_app.config.get('default_top_k', 0)))
+            top_p = float(
+                _get_non_none(
+                    req,
+                    "top_p",
+                    resolve_sampling_default(cfg, gen_defaults, "top_p", 'default_top_p', 1.0),
+                )
+            )
+            top_k = int(
+                _get_non_none(
+                    req,
+                    "top_k",
+                    resolve_sampling_default(cfg, gen_defaults, "top_k", 'default_top_k', 0),
+                )
+            )
+            log_sampling_defaults_once(
+                tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
+            )
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:

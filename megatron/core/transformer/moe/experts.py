@@ -96,6 +96,32 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
 logger = logging.getLogger(__name__)
 
 
+def _te_supports_scaled_tanh_srelu() -> bool:
+    """Whether the installed TE provides ``ScaledTanhSReLU`` accepting ``tanh_clamp_scale``.
+
+    Checked by capability rather than version so it works against a development TE, and not
+    cached because tests swap the TE module out.
+    """
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch.ops import ScaledTanhSReLU
+    except ImportError:
+        return False
+    return "tanh_clamp_scale" in inspect.signature(ScaledTanhSReLU).parameters
+
+
+def _require_te_tanh_clamp_support(config) -> None:
+    """Raise an actionable error if the op fuser is asked to clamp and the installed TE cannot."""
+    if config.activation_func_tanh_clamp_scale is None or _te_supports_scaled_tanh_srelu():
+        return
+    raise RuntimeError(
+        "activation_func_tanh_clamp_scale with use_transformer_engine_op_fuser requires a "
+        "Transformer Engine providing ops.ScaledTanhSReLU(tanh_clamp_scale=...). Upgrade "
+        "Transformer Engine, or unset use_transformer_engine_op_fuser to use the unfused path."
+    )
+
+
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
@@ -287,6 +313,7 @@ class TEGroupedMLP(MegatronModule):
         )
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
+            _require_te_tanh_clamp_support(self.config)
             assert (
                 self._is_fused_impl_supported()
             ), "Fused GroupedMLP is not supported for this configuration."
@@ -474,9 +501,6 @@ class TEGroupedMLP(MegatronModule):
             return False  # Tensor parallelism is not supported
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
-        if self.config.activation_func_tanh_clamp_scale is not None:
-            # TanH clamp is not supported.
-            return False
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
@@ -503,6 +527,12 @@ class TEGroupedMLP(MegatronModule):
         )
         if not (use_glu_fusion or use_srelu_fusion):
             return False
+        if self.config.activation_func_tanh_clamp_scale is not None:
+            # Only non-gated squared ReLU can be soft-clamped on the fused path, and only when TE
+            # provides ScaledTanhSReLU. A clamped gated activation is SiTU-GLU, which the fused GLU
+            # path does not implement. Returning False selects the unfused (clamped) path.
+            if not use_srelu_fusion or not _te_supports_scaled_tanh_srelu():
+                return False
         if self.config.activation_func == F.silu:
             if self.config.activation_func_clamp_value is not None:
                 if not is_te_min_version("2.17.0.dev0"):
@@ -680,15 +710,16 @@ class TEGroupedMLP(MegatronModule):
             and self.config.use_fused_weighted_squared_relu
             and not self.config.gated_linear_unit
         ):
-            if (
-                "activation_recompute_in_mlp"
-                in inspect.signature(te.pytorch.ops.ScaledSReLU).parameters
-            ):
-                op = te.pytorch.ops.ScaledSReLU(
-                    activation_recompute_in_mlp=activation_recompute_in_mlp
-                )
+            clamp_scale = self.config.activation_func_tanh_clamp_scale
+            if clamp_scale is not None:
+                srelu_cls = te.pytorch.ops.ScaledTanhSReLU
+                kwargs = {"tanh_clamp_scale": clamp_scale}
             else:
-                op = te.pytorch.ops.ScaledSReLU()
+                srelu_cls = te.pytorch.ops.ScaledSReLU
+                kwargs = {}
+            if "activation_recompute_in_mlp" in inspect.signature(srelu_cls).parameters:
+                kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+            op = srelu_cls(**kwargs)
         else:
             raise RuntimeError(
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "

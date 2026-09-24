@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 
+from megatron.core.config import set_experimental_flag
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
@@ -30,11 +31,11 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training import global_vars
 from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
     ArgumentGroupFactory,
     core_transformer_config_from_args,
 )
-from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
@@ -86,6 +87,11 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     return parser
 
 def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False, args_defaults={}):
+    """Prepare and register CLI inputs without constructing runtime services.
+
+    Checkpoint overrides and validation precede config construction. Callers
+    initialize runtime services explicitly after preparing their configuration.
+    """
     args = parse_args(extra_args_provider, ignore_unknown_args)
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
@@ -107,9 +113,12 @@ def parse_and_validate_args(extra_args_provider=None, ignore_unknown_args=False,
     else:
         validate_args(args, args_defaults)
 
-    # set global args, build tokenizer, and set adlr-autoresume,
-    # tensorboard-writer, and timers.
-    set_global_variables(args)
+    global_vars._ensure_var_is_not_initialized(global_vars._GLOBAL_ARGS, 'args')
+    global_vars.set_args(args)
+    # Model config construction can use experimental features. Enabling the
+    # feature gate does not construct any runtime services.
+    if args.enable_experimental:
+        set_experimental_flag(True)
 
     return args
 
@@ -1792,6 +1801,15 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
+    # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
+    # sgd/adam that block is skipped entirely, which would silently ignore the
+    # mode — the one case where the loud failure matters most.
+    if getattr(args, 'muon_tp_mode', 'duplicated') == 'layer_sharded':
+        assert args.optimizer in ('muon', 'dist_muon'), (
+            f"--muon-tp-mode layer_sharded is only supported with --optimizer muon "
+            f"(got --optimizer {args.optimizer}). Other optimizers, including "
+            "adaptive_muon, do not implement layer sharding."
+        )
     if args.optimizer not in ('sgd', 'adam'):
         if args.optimizer == 'dist_muon':
             warn_rank_0(
@@ -1808,6 +1826,20 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+
+        if args.muon_tp_mode == 'layer_sharded':
+            # optimizer == 'muon' is already guaranteed by the hoisted assert above.
+            # Note: making layer sharding a tp_mode also removed the old
+            # "--muon-tp-mode is ignored under layer sharding" ambiguity — the
+            # two can no longer be set at the same time.
+            assert args.use_layer_wise_distributed_optimizer, (
+                "--muon-tp-mode layer_sharded requires the layer-wise distributed "
+                "optimizer path (--optimizer muon with --use-distributed-optimizer)."
+            )
+            assert not args.muon_split_qkv, (
+                "--muon-tp-mode layer_sharded does not implement split-QKV "
+                "Newton-Schulz yet; pass --muon-no-split-qkv."
+            )
 
     assert not (
         args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
@@ -2470,6 +2502,7 @@ def _add_network_size_args(parser):
         "barrier_with_L1_time",
         # args uses same var with a different name
         "num_moe_experts",
+        "hash_moe_vocab_size",
         "fp8_param",
         "fp4_param",
         # incompatible defaults in dataclass
@@ -2770,16 +2803,37 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
-                       choices=['blockwise', 'duplicated', 'distributed', 'auto'],
+                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
+                                'layer_sharded'],
                        help='How to perform NS calculation for tensor model parallel weights. '
                        'blockwise orthogonalizes each shard on its own, so the update rule '
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results; auto '
                        'select between duplicated and distributed mode per-weight for '
-                       'dense weights.')
+                       'dense weights; layer_sharded assigns each 2D weight one NS home '
+                       'rank in the (gtp_remat x tp) domain and routes the shards there '
+                       'with all_to_all (same math as duplicated, no redundant NS); '
+                       'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
+                       'OptimizerConfig.muon_tp_mode.')
+    group.add_argument('--muon-ns-batch-size', type=int, default=1,
+                       help='Max number of same-shape matrices fused into one batched '
+                       'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
+                       'The default of 1 keeps the bit-exact per-matrix path; raise '
+                       '(e.g. to 32) to cut kernel launches on MoE expert homes at '
+                       'the cost of bitwise parity (baddbmm vs addmm rounding).')
     group.add_argument('--muon-use-syrk', action='store_true',
-                       help='Use the Triton SYRK kernel for the Gram matrix '
-                       'in Newton-Schulz iteration.')
+                       help='Use the Triton SYRK kernel for the symmetric-output '
+                       'Newton-Schulz GEMMs in Muon (~1/3 off '
+                       'NS FLOPs for near-square matrices). Takes effect only with '
+                       '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
+                       'layer_sharded, unmet Triton/SM/emerging-optimizers '
+                       'requirements are rejected at startup.')
+    group.add_argument('--muon-no-concurrent-groups', action='store_false',
+                       dest='muon_concurrent_groups',
+                       help='Serialize param groups on one CUDA stream under '
+                       '--muon-tp-mode layer_sharded instead of overlapping one group\'s '
+                       'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
+                       'when the concurrent transient buffers push peak memory too high.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',

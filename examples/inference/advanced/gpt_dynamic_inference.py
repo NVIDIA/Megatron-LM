@@ -51,6 +51,7 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.global_vars import initialize_runtime_services
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -293,6 +294,7 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     # Start Nsight profiler.
