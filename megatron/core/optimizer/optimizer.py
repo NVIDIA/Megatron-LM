@@ -182,6 +182,8 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
+    if hasattr(source, 'is_word_embedding_parameter'):
+        destination.is_word_embedding_parameter = source.is_word_embedding_parameter
 
 
 class MegatronOptimizer(ABC):
@@ -824,6 +826,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
+        if not self.is_stub_optimizer:
+            self._post_optimizer_step()
+
         # Update params from main params.
         if timers is not None:
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
@@ -848,6 +853,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params').stop()
 
         return True
+
+    def _post_optimizer_step(self) -> None:
+        """Apply transforms to updated main parameters before staging model copies."""
+        pass
 
     @torch.no_grad()
     def step(self):

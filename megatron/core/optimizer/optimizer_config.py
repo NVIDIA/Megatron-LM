@@ -163,6 +163,14 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     """Weight decay coefficient for L2 regularization."""
 
+    embedding_min_norm: Optional[float] = None
+    """Trigger threshold for input word-embedding row L2 norms after an optimizer update.
+
+    Rows with nonzero norms below this value are rescaled to twice this value. Disabled when
+    ``None`` and requires the distributed optimizer. Exact-zero rows are left unchanged because
+    they have no direction along which to rescale.
+    """
+
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
@@ -426,6 +434,14 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.embedding_min_norm is not None and (
+            not math.isfinite(self.embedding_min_norm) or self.embedding_min_norm <= 0.0
+        ):
+            raise ValueError("embedding_min_norm must be a finite positive value")
+
+        if self.embedding_min_norm is not None and self.optimizer_cuda_graph:
+            raise ValueError("embedding_min_norm is not supported with optimizer_cuda_graph")
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
