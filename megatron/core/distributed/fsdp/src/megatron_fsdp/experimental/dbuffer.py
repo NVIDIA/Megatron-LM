@@ -460,10 +460,6 @@ class DBuffer:
         Intermediate destinations are views into the final output allocation.
         """
         axes = (mesh_axis,) if isinstance(mesh_axis, int) else tuple(mesh_axis)
-        if any(axis < -self.mesh.ndim or axis >= self.mesh.ndim for axis in axes):
-            raise ValueError(
-                f"All-gather axes {axes} are out of bounds for {self.mesh.ndim}D mesh."
-            )
         axes = tuple(sorted(axis % self.mesh.ndim for axis in axes))
         if len(set(axes)) != len(axes):
             raise ValueError(f"All-gather axes must be distinct, got {axes}.")
