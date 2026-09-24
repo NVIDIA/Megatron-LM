@@ -1048,11 +1048,13 @@ def _run_compiled_launch(
     compiled = _COMPILED_LAUNCH_CACHE.get(key)
     if compiled is None:
         cap = torch.cuda.get_device_capability()
-        arch = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a"}.get(cap)
+        arch = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}.get(
+            cap
+        )
         if arch is None:
             raise RuntimeError(
                 f"Unsupported GPU compute capability {cap} for CSA CP CuTe kernels; "
-                "supported architectures: sm_90a, sm_100a, sm_103a."
+                "supported architectures: sm_90a, sm_100a, sm_103a, sm_107a."
             )
         cute_tensor_args = []
         for tensor in tensor_args:

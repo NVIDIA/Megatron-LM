@@ -55,6 +55,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety i
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
+from .aligned_hca import aligned_hca_backward
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
 
 # ---------------------------------------------------------------------------
@@ -1508,6 +1509,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         indexer_topk: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
         out_rope: Optional[OutputRopeParams] = None,
+        hca_cp_rank: Optional[int] = None,
+        hca_cp_size: int = 16,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _csa_fwd_flash_mla(
@@ -1535,6 +1538,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
         ctx.out_rope = out_rope
+        ctx.hca_cp_rank = hca_cp_rank
+        ctx.hca_cp_size = hca_cp_size
         return out, lse, lse_indexer
 
     @staticmethod
@@ -1552,19 +1557,32 @@ class CSASparseAttnFunc(torch.autograd.Function):
 
         out, dO = _undo_output_rope_for_backward(ctx.out_rope, out, dO)
 
-        result = _DSA.sparse_attention_backward_wrapper(
-            q,
-            kv,
-            out,
-            dO,
-            lse,
-            attn_sink,
-            topk_idxs,
-            softmax_scale=ctx.softmax_scale,
-            topk_length=ctx.topk_length,
-        )
+        if ctx.hca_cp_rank is not None:
+            result = aligned_hca_backward(
+                q,
+                kv,
+                out,
+                dO,
+                lse,
+                attn_sink,
+                cp_rank=ctx.hca_cp_rank,
+                cp_size=ctx.hca_cp_size,
+                softmax_scale=ctx.softmax_scale,
+            )
+        else:
+            result = _DSA.sparse_attention_backward_wrapper(
+                q,
+                kv,
+                out,
+                dO,
+                lse,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=ctx.softmax_scale,
+                topk_length=ctx.topk_length,
+            )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -1578,6 +1596,8 @@ def csa_sparse_attn(
     is_thd: bool = False,
     kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
     out_rope: Optional[OutputRopeParams] = None,
+    hca_cp_rank: Optional[int] = None,
+    hca_cp_size: int = 16,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -1615,6 +1635,7 @@ def csa_sparse_attn(
             the Function, in place on the tensor it saves for backward, and
             undone there before the cuDNN backward. Saves one full O buffer
             per layer against rotating the returned tensor out of place.
+        hca_cp_rank: CP rank for an aligned HCA layout validated by the caller.
 
     Returns:
         SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16,
@@ -1654,6 +1675,8 @@ def csa_sparse_attn(
         indexer_topk,
         kv_reconstruction_parts,
         out_rope,
+        hca_cp_rank,
+        hca_cp_size,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
