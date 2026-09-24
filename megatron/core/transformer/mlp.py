@@ -26,6 +26,11 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import gtp_api
+from megatron.core.tensor_parallel.gtp_utils import (
+    _gtp_gather_rows_for_save,
+    _gtp_slice_rows_on_load,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -402,13 +407,33 @@ class MLP(MegatronModule):
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
-                        sub_sd[k] = apply_swiglu_sharded_factory(
+                        weight = getattr(module, "weight", None)
+                        is_gtp_fc1 = (
+                            k == f"{prefix}{name}.weight"
+                            and gtp_api.HAVE_GTP
+                            and gtp_api.is_gtp_param(weight)
+                        )
+                        if is_gtp_fc1:
+                            # Gather before splitting gate/up: a contiguous GTP shard may
+                            # cross that boundary. Loading restores the same row layout
+                            # consumed by the runtime all-gather.
+                            v = _gtp_gather_rows_for_save(
+                                v,
+                                k,
+                                weight,
+                                weight._unsharded_shape[0],
+                                self.tp_group,
+                                metadata['dp_cp_group'],
+                                sharded_offsets,
+                            )
+                        v = apply_swiglu_sharded_factory(
                             v,
                             sharded_offsets,
                             singleton_local_shards,
                             tp_group=self.tp_group,
                             dp_group=metadata['dp_cp_group'],
                         )
+                        sub_sd[k] = _gtp_slice_rows_on_load(v, weight) if is_gtp_fc1 else v
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 

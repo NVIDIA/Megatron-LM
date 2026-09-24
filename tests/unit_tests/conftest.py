@@ -79,6 +79,27 @@ def cleanup():
         torch.distributed.destroy_process_group()
 
 
+@pytest.fixture(scope="session")
+def cpu_default_process_group():
+    """Reuse WORLD for CPU tests, creating Gloo once per session to avoid stale peers.
+
+    Borrow existing groups (including NCCL); consumers own explicit Gloo subgroups
+    for CPU tensors. Destroy WORLD only if we created it and it was not replaced.
+    """
+    created_default = not torch.distributed.is_initialized()
+    if created_default:
+        torch.distributed.init_process_group(backend='gloo')
+    default_group = torch.distributed.group.WORLD
+    yield default_group
+    # Do not destroy a borrowed WORLD or a replacement installed by another owner.
+    if (
+        created_default
+        and torch.distributed.is_initialized()
+        and torch.distributed.group.WORLD is default_group
+    ):
+        torch.distributed.destroy_process_group(default_group)
+
+
 @pytest.fixture(scope="function", autouse=True)
 def set_env():
     if is_te_min_version("1.3"):
