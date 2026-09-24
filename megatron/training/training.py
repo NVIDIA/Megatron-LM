@@ -1421,7 +1421,12 @@ def num_floating_point_operations(
                 spec_parts.extend(_split_spec_part(part))
         if not spec_parts:
             return False
-        return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
+        return spec_parts[-1] in {
+            'gdp_stack_spec',
+            'gated_delta_product_stack_spec',
+            # DSA over GQA derived from the GDP stack: same GDP mixers, so the same FLOPs.
+            'gdp_dsa_stack_spec',
+        }
 
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
