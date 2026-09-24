@@ -115,9 +115,28 @@ def test_validate_cyclic_dataloader_resume_uses_effective_dp_size():
         gtp_weight_remat_size=1,
         finetune=False,
     )
-    checkpoint_args = SimpleNamespace(data_parallel_size=4, gtp_weight_remat_size=2)
+    checkpoint_args = SimpleNamespace(
+        dataloader_data_parallel_size=8,
+        dataloader_data_sharding=True,
+    )
 
     _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
+
+
+def test_validate_cyclic_dataloader_resume_rejects_sharding_mode_change():
+    args = SimpleNamespace(
+        dataloader_type='cyclic',
+        data_sharding=True,
+        data_parallel_size=4,
+        finetune=False,
+    )
+    checkpoint_args = SimpleNamespace(
+        dataloader_data_parallel_size=4,
+        dataloader_data_sharding=False,
+    )
+
+    with pytest.raises(RuntimeError, match='unsharded checkpoint'):
+        _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):

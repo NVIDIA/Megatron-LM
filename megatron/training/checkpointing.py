@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -201,9 +202,15 @@ def _validate_cyclic_dataloader_resume(args, checkpoint_args, release):
     if not getattr(args, 'data_sharding', False):
         return
 
-    checkpoint_dp = getattr(checkpoint_args, 'data_parallel_size', 0) * getattr(
-        checkpoint_args, 'gtp_weight_remat_size', 1
-    )
+    checkpoint_sharding = getattr(checkpoint_args, 'dataloader_data_sharding', None)
+    if checkpoint_sharding is not None and not checkpoint_sharding:
+        raise RuntimeError('Cannot resume a sharded cyclic dataloader from an unsharded checkpoint.')
+
+    checkpoint_dp = getattr(checkpoint_args, 'dataloader_data_parallel_size', None)
+    if checkpoint_dp is None:
+        checkpoint_dp = getattr(checkpoint_args, 'data_parallel_size', 0) * getattr(
+            checkpoint_args, 'gtp_weight_remat_size', 1
+        )
     run_dp = getattr(args, 'data_parallel_size', 0) * getattr(args, 'gtp_weight_remat_size', 1)
     if checkpoint_dp > 0 and run_dp > 0 and checkpoint_dp != run_dp:
         raise RuntimeError(
@@ -1692,7 +1699,12 @@ def generate_state_dict(
 
     # Arguments, iteration, and model.
     state_dict = {}
-    state_dict['args'] = args
+    checkpoint_args = copy.copy(args)
+    checkpoint_args.dataloader_data_parallel_size = args.data_parallel_size * getattr(
+        args, 'gtp_weight_remat_size', 1
+    )
+    checkpoint_args.dataloader_data_sharding = getattr(args, 'data_sharding', False)
+    state_dict['args'] = checkpoint_args
     state_dict['checkpoint_version'] = 3.0
     if iteration is not None:
         state_dict['iteration'] = iteration
