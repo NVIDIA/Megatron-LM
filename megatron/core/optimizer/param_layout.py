@@ -84,12 +84,8 @@ def resolve_buffer_dp_world_size(
             return expert_data_parallel_world_size
         return data_parallel_world_size
     if buffer_key.excludes_cp_from_bucket:
-        divisors = {getattr(p, 'gtp_bucket_dp_divisor', 1) for p in params}
-        assert len(divisors) == 1, (
-            f"buffer mixes GTP params with different CP divisors {sorted(divisors)}; they would "
-            "need different DP groups and must not share a buffer."
-        )
-        divisor = divisors.pop()
+        # All folded params share one divisor (the CP size): folding is all-or-nothing.
+        divisor = params[0].gtp_bucket_dp_divisor
         assert (
             data_parallel_world_size % divisor == 0
         ), f"DP world size {data_parallel_world_size} not divisible by CP divisor {divisor}."

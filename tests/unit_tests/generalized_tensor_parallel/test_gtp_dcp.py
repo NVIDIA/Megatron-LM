@@ -1248,6 +1248,37 @@ def _worker_gtp_cp_sharded_save_load_roundtrip(rank, world_size, ckpt_base, fold
         GTPShardedParam._chain_state = {}
 
 
+def _cp_gtp_moe_model_and_optimizer(cp_size, fold_cp, seed):
+    """Small TE MoE model + DistributedOptimizer (adam) for CP x GTP_remat ckpt tests."""
+    from functools import partial
+
+    from megatron.core.transformer.enums import AttnBackend
+    from tests.unit_tests.dist_checkpointing import setup_model_and_optimizer
+    from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
+
+    moe_cfg = dict(
+        hidden_size=64,
+        num_attention_heads=8,
+        kv_channels=8,
+        ffn_hidden_size=128,
+        use_cpu_initialization=False,
+        # conftest pins NVTE_FLASH_ATTN=0; AttnBackend.auto requires it unset or 1.
+        attention_backend=AttnBackend.unfused,
+        gtp_remat_fold_cp=fold_cp,
+    )
+    return setup_model_and_optimizer(
+        seed=seed,
+        tp=1,
+        pp=1,
+        cp=cp_size,
+        bf16=True,
+        dist_opt=True,
+        use_param_layout=True,
+        initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
+        optimizer='adam',
+    )
+
+
 def _worker_dp_reshardable_cp_gtp_roundtrip(
     rank, world_size, ckpt_base, cp_size, gtp_remat_size, fold_cp=False
 ):
@@ -1260,13 +1291,9 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(
     SAME (one winning rank's) value -- a plain resave-equality check can't tell the two apart
     since the corruption is consistent across both saves.
     """
-    from functools import partial
-
     from megatron.core.dist_checkpointing import load, save
     from megatron.core.dist_checkpointing.dict_utils import nested_values
-    from megatron.core.transformer.enums import AttnBackend
-    from tests.unit_tests.dist_checkpointing import TempNamedDir, setup_model_and_optimizer
-    from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
@@ -1277,29 +1304,9 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(
         gtp_remat_fold_cp=fold_cp,
     )
     try:
-        moe_cfg = dict(
-            hidden_size=64,
-            num_attention_heads=8,
-            kv_channels=8,
-            ffn_hidden_size=128,
-            use_cpu_initialization=False,
-            # conftest pins NVTE_FLASH_ATTN=0; AttnBackend.auto requires it unset or 1.
-            attention_backend=AttnBackend.unfused,
-            gtp_remat_fold_cp=fold_cp,
-        )
         meta = {'distrib_optim_sharding_type': 'dp_reshardable'}
         with TempNamedDir(ckpt_base / 'dp_reshardable_cp_gtp', sync=True) as ckpt_dir:
-            model_A, optimizer_A = setup_model_and_optimizer(
-                seed=2,
-                tp=1,
-                pp=1,
-                cp=cp_size,
-                bf16=True,
-                dist_opt=True,
-                use_param_layout=True,
-                initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
-                optimizer='adam',
-            )
+            model_A, optimizer_A = _cp_gtp_moe_model_and_optimizer(cp_size, fold_cp, seed=2)
             model_sd_A = model_A[0].sharded_state_dict()
             optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=meta)
 
@@ -1321,17 +1328,7 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(
 
             save(optim_sd_A, ckpt_dir)
 
-            model_B, optimizer_B = setup_model_and_optimizer(
-                seed=3,
-                tp=1,
-                pp=1,
-                cp=cp_size,
-                bf16=True,
-                dist_opt=True,
-                use_param_layout=True,
-                initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
-                optimizer='adam',
-            )
+            model_B, optimizer_B = _cp_gtp_moe_model_and_optimizer(cp_size, fold_cp, seed=3)
             model_sd_B = model_B[0].sharded_state_dict()
             load_sharded_sd = optimizer_B.sharded_state_dict(
                 model_sd_B, is_loading=True, metadata=meta
@@ -1365,12 +1362,6 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(
 def _worker_fully_reshardable_rejects_cp_folded_gtp(rank, world_size, port):
     """fully_reshardable must reject CP-folded GTP buffers at save time with a clear error.
     world=4 -> tp1*cp2*gtp2*dp1 (fully folded)."""
-    from functools import partial
-
-    from megatron.core.transformer.enums import AttnBackend
-    from tests.unit_tests.dist_checkpointing import setup_model_and_optimizer
-    from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
-
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1,
@@ -1380,30 +1371,10 @@ def _worker_fully_reshardable_rejects_cp_folded_gtp(rank, world_size, port):
         gtp_remat_fold_cp=True,
     )
     try:
-        moe_cfg = dict(
-            hidden_size=64,
-            num_attention_heads=8,
-            kv_channels=8,
-            ffn_hidden_size=128,
-            use_cpu_initialization=False,
-            attention_backend=AttnBackend.unfused,
-            gtp_remat_fold_cp=True,
-        )
+        model, optimizer = _cp_gtp_moe_model_and_optimizer(cp_size=2, fold_cp=True, seed=2)
         meta = {'distrib_optim_sharding_type': 'fully_reshardable'}
-        model, optimizer = setup_model_and_optimizer(
-            seed=2,
-            tp=1,
-            pp=1,
-            cp=2,
-            bf16=True,
-            dist_opt=True,
-            use_param_layout=True,
-            initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
-            optimizer='adam',
-        )
-        model_sd = model[0].sharded_state_dict()
         with pytest.raises(AssertionError, match='does not support CP-folded GTP weights'):
-            optimizer.sharded_state_dict(model_sd, metadata=meta)
+            optimizer.sharded_state_dict(model[0].sharded_state_dict(), metadata=meta)
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()

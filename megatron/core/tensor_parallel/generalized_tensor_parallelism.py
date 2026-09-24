@@ -668,10 +668,7 @@ def _gtp_folded_cp_size(gtp_remat_group):
         return 1
     if gtp_remat_group is not parallel_state.get_gtp_weight_remat_group(check_initialized=False):
         return 1
-    size_no_cp = parallel_state.get_gtp_weight_remat_size_no_cp()
-    if size_no_cp <= 0:
-        return 1
-    return gtp_remat_group.size() // size_no_cp
+    return gtp_remat_group.size() // parallel_state.get_gtp_weight_remat_group_no_cp().size()
 
 
 def _gtp_attach_attrs(
@@ -2901,17 +2898,12 @@ def gtp_replica_rank(param, explicit_group=None):
         return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 0  # single-process save: this rank is the only replica.
-    if is_expert:
-        needed_group = '`expt_dp`'
-    elif getattr(param, 'excludes_cp_from_bucket', False):
-        needed_group = '`dp` (this weight folds CP into its sharding group)'
-    else:
-        needed_group = '`dp_cp`'
     raise RuntimeError(
         "GTP distributed checkpointing needs the gtp_remat-excluded replica group to elect a "
         "shard writer, but parallel_state is not initialized and the param carries no "
-        f"gtp_replica_group. Pass a pg_collection containing {needed_group} when building the "
-        "model (it is stamped onto GTP params at wrap time)."
+        "gtp_replica_group. Pass a pg_collection containing `dp_cp` (`dp` if CP-folded, "
+        "`expt_dp` for experts) when building the model (it is stamped onto GTP params at wrap "
+        "time)."
     )
 
 

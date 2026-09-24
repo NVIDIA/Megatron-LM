@@ -30,9 +30,8 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
-# CP-free GTP_remat group/degree; see get_gtp_weight_remat_group_no_cp.
+# CP-free GTP_remat group; see get_gtp_weight_remat_group_no_cp.
 _GTP_WEIGHT_REMAT_GROUP_NO_CP = None
-_GTP_WEIGHT_REMAT_SIZE_NO_CP = 1
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -941,7 +940,7 @@ def initialize_model_parallel(
     # Build the generalized tensor parallel group: the axis a GTP weight is sharded over.
     # With gtp_remat_fold_cp, CP is FOLDED IN (group = cp x gtp_remat), so a CP rank's partial
     # wgrad is summed by this group's reduce-scatter, keeping weight-sharding callers CP-unaware.
-    # `config.gtp_weight_remat_size` stays CP-FREE (see get_gtp_weight_remat_size_no_cp); see
+    # `config.gtp_weight_remat_size` stays CP-FREE (see get_gtp_weight_remat_world_size); see
     # also BufferKey.excludes_cp_from_bucket and gtp_replica_rank for the consequences.
     global _GTP_WEIGHT_REMAT_GROUP
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
@@ -966,8 +965,6 @@ def initialize_model_parallel(
 
     # CP-free axis for consumers that must not see CP (get_gtp_weight_remat_group_no_cp).
     global _GTP_WEIGHT_REMAT_GROUP_NO_CP
-    global _GTP_WEIGHT_REMAT_SIZE_NO_CP
-    _GTP_WEIGHT_REMAT_SIZE_NO_CP = gtp_remat_size
     if fold_cp:
         for gtp_no_cp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
             group = create_group(
@@ -1783,12 +1780,6 @@ def get_gtp_weight_remat_group_no_cp(check_initialized=True):
     return _GTP_WEIGHT_REMAT_GROUP_NO_CP
 
 
-def get_gtp_weight_remat_size_no_cp():
-    """Return the CP-FREE GTP_remat degree (``config.gtp_weight_remat_size``); the group itself
-    may fold CP in, so use this for global-batch accounting where CP must not be counted."""
-    return _GTP_WEIGHT_REMAT_SIZE_NO_CP
-
-
 def get_gtp_weight_remat_global_ranks(check_initialized=True):
     """Get all global ranks of the parameter-sharding group that the caller rank belongs to."""
     if check_initialized:
@@ -2582,9 +2573,6 @@ def destroy_model_parallel():
 
     global _GTP_WEIGHT_REMAT_GROUP_NO_CP
     _GTP_WEIGHT_REMAT_GROUP_NO_CP = None
-
-    global _GTP_WEIGHT_REMAT_SIZE_NO_CP
-    _GTP_WEIGHT_REMAT_SIZE_NO_CP = 1
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None

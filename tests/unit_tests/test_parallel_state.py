@@ -100,7 +100,7 @@ def test_initialize_model_parallel_with_cp_and_gtp_remat(fold):
     # The CP-free axis survives only for the replicated-grad AVG, whose params already had CP
     # reduced by their ordinary dp_cp bucket.
     assert group_ranks(ps.get_gtp_weight_remat_group_no_cp()) == expected_group('gtp_remat')
-    assert ps.get_gtp_weight_remat_size_no_cp() == gtp_remat_size
+    assert ps.get_gtp_weight_remat_world_size() == gtp_remat_size
     assert group_ranks(ps.get_data_parallel_group(with_gtp_remat=False)) == expected_group('dp')
     assert group_ranks(
         ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False)
@@ -129,7 +129,7 @@ def test_gtp_remat_fold_cp_at_gtp1(fold):
     cp_ranks = group_ranks(ps.get_context_parallel_group())
     gtp_ranks = group_ranks(ps.get_gtp_weight_remat_group())
     assert gtp_ranks == (cp_ranks if fold else [torch.distributed.get_rank()])
-    assert ps.get_gtp_weight_remat_size_no_cp() == 1
+    assert ps.get_gtp_weight_remat_world_size() == 1
     assert ps.get_gtp_weight_remat_group_no_cp().size() == 1
 
     Utils.destroy_model_parallel()

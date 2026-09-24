@@ -248,13 +248,13 @@ class DistributedDataParallel(_BaseDataParallel):
         )
 
         # Compute gradient scaling factors.
+        gradient_scaling_factor_no_cp = 1.0
         if config.calculate_per_token_loss:
             assert (
                 not self.ddp_config.average_in_collective
             ), "Cannot average in collective when calculating per-token loss!"
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
-            gradient_scaling_factor_no_cp = 1.0
         else:
             expert_gtp_correction = (
                 config.expert_gtp_weight_remat_size / config.gtp_weight_remat_size
@@ -289,9 +289,6 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
-                # Unreachable: excludes_cp_from_bucket requires GTP, which requires
-                # average_in_collective=False. Set for completeness only.
-                gradient_scaling_factor_no_cp = 1.0
             else:
                 data_parallel_world_size = self.dp_cp_group.size()
 
