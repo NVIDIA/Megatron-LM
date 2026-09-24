@@ -386,6 +386,37 @@ def test_dsa_train_indexer_only_freezes_exactly_indexer_submodule_parameters(mon
         assert param.requires_grad == name.startswith("block.indexer.")
 
 
+def test_dsa_train_indexer_only_freezes_moe_router_expert_bias(monkeypatch):
+    """The router's expert_bias is a buffer, so requires_grad does not reach it.
+
+    finalize_model_grads rewrites it every step from observed token counts for load balancing,
+    and only frozen_expert_bias stops that. Without this the backbone's routing keeps moving
+    while the run is meant to train the indexer alone.
+    """
+    import megatron.training.training as training
+
+    class _Router(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.frozen_expert_bias = False
+            self.register_buffer("expert_bias", torch.zeros(4))
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = torch.nn.Module()
+            self.block.indexer = torch.nn.Linear(3, 2)
+            self.block.mlp = torch.nn.Module()
+            self.block.mlp.router = _Router()
+
+    model = _Model()
+    monkeypatch.setattr(training, "_global_dsa_indexer_reset_count", lambda count: count)
+
+    training._freeze_non_dsa_indexer_parameters([model])
+
+    assert model.block.mlp.router.frozen_expert_bias is True
+
+
 def test_dsa_indexer_optimizer_refresh_preserves_backbone_master_weights(monkeypatch):
     import megatron.training.training as training
 
