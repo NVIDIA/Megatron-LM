@@ -4,6 +4,7 @@ import io
 import pickle
 import threading
 from argparse import Namespace
+from collections import defaultdict
 from io import BytesIO
 from pathlib import PosixPath
 from signal import Signals
@@ -27,6 +28,8 @@ from megatron.core.transformer.enums import (
 )
 
 SAFE_GLOBALS = [
+    dict,
+    defaultdict,
     SimpleNamespace,
     PosixPath,
     _reconstruct,
@@ -45,6 +48,7 @@ SAFE_GLOBALS = [
     RerunState,
     BytesIO,
     Signals,
+    torch.optim.AdamW,
     torch._C.Generator,  # Needed for torch ckpt format loading after weights_only default change
 ]
 

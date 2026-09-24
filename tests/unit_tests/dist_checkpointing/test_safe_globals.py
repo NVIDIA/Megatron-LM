@@ -9,6 +9,7 @@ from pickle import UnpicklingError
 import pytest
 import torch
 
+from megatron.core.dist_checkpointing.strategies.common import COMMON_STATE_FNAME, load_common
 from megatron.core.safe_globals import SafeUnpickler
 from megatron.core.utils import is_torch_min_version
 
@@ -32,6 +33,15 @@ class TestSafeGlobals:
             torch.distributed.barrier()
 
         torch.load(ckpt_path)
+
+    @pytest.mark.skipif(not is_torch_min_version("2.6a0"), reason="PyTorch 2.6 is required")
+    def test_legacy_adamw_optimizer(self, tmp_path):
+        optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+        torch.save({"optimizer": optimizer}, tmp_path / COMMON_STATE_FNAME)
+
+        state_dict = load_common(tmp_path)
+
+        assert isinstance(state_dict["optimizer"], torch.optim.AdamW)
 
     @pytest.mark.skipif(not is_torch_min_version("2.6a0"), reason="PyTorch 2.6 is required")
     def test_unsafe_globals(self, tmp_path_dist_ckpt):
