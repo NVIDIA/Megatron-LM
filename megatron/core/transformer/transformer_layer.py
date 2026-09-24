@@ -484,6 +484,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
+        # Batch-first shape of the padding_mask input reserved by the TE CUDA graph of this layer;
+        # set in get_layer_static_inputs at capture, None when the graph has no such input.
+        self._cuda_graph_padding_mask_shape: Optional[tuple[int, ...]] = None
         if self.config.recompute_granularity == 'selective':
             assert self.config.recompute_modules is not None
             if "layernorm" in self.config.recompute_modules:
@@ -1529,7 +1532,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             or CudaGraphModule.moe_router in self.config.cuda_graph_modules
         )
 
-    def _te_cuda_graph_padding_mask(self, kwargs, reference: Tensor):
+    def _te_cuda_graph_padding_mask(
+        self, padding_mask: Optional[Tensor], device: torch.device
+    ) -> Optional[Tensor]:
         """Reconcile the replay padding_mask with the graph's captured input set.
 
         Returns the mask to pass to the graph: the caller's mask, an all-False mask when the graph
@@ -1537,8 +1542,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         no such input. Raises when a mask is passed to a graph captured without one, since the
         graph would silently ignore it and diverge from eager execution.
         """
-        padding_mask = kwargs.get("padding_mask")
-        graph_mask_shape = getattr(self, "_cuda_graph_padding_mask_shape", None)
+        graph_mask_shape = self._cuda_graph_padding_mask_shape
         if graph_mask_shape is None:
             if padding_mask is not None and self._moe_router_in_cuda_graph():
                 raise RuntimeError(
@@ -1549,7 +1553,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 )
             return None
         if padding_mask is None:
-            padding_mask = torch.zeros(graph_mask_shape, dtype=torch.bool, device=reference.device)
+            padding_mask = torch.zeros(graph_mask_shape, dtype=torch.bool, device=device)
         return padding_mask
 
     def _get_submodules_under_cudagraphs(self):
@@ -1686,8 +1690,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
         graph_kwargs = {k: v for k, v in kwargs.items() if k != "padding_mask"}
+        hidden_states = args[0] if args else kwargs["hidden_states"]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
-            kwargs, args[0] if args else kwargs["hidden_states"]
+            kwargs.get("padding_mask"), hidden_states.device
         )
         if graph_padding_mask is not None:
             graph_kwargs["padding_mask"] = graph_padding_mask
