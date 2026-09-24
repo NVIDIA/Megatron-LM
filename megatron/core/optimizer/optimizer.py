@@ -673,97 +673,6 @@ class MegatronOptimizer(ABC):
             param_state['step'] = copy.deepcopy(step)
 
     @staticmethod
-    def _move_per_param_steps_to_param_groups(state_dict: Dict) -> None:
-        """Move non-shardable per-parameter clocks to their logical groups.
-
-        Every group in a bucket must agree. Upstream asserted one clock across the whole
-        optimizer, which caught any accidental desynchronization; a per-group check would catch
-        almost none of it, because the parameters within a group always step together. Asserting
-        per bucket keeps that protection everywhere except the one place divergence is intended:
-        a reset DSA indexer runs its own clock while the backbone continues.
-        """
-        bucket_steps: Dict[bool, Any] = {}
-        for group_idx, param_group in enumerate(state_dict['param_groups']):
-            group_step = None
-            group_step_value = None
-            for param_idx in param_group['params']:
-                param_state = state_dict['state'].get(param_idx, {})
-                param_step = param_state.get('step')
-                if param_step is None:
-                    continue
-                param_step_value = param_step.item() if torch.is_tensor(param_step) else param_step
-                if group_step is None:
-                    group_step = param_step
-                    group_step_value = param_step_value
-                elif group_step_value != param_step_value:
-                    raise ValueError(
-                        "The optimizer step differs within parameter group "
-                        f"{group_idx}: {group_step_value} vs {param_step_value}."
-                    )
-            if group_step is None:
-                continue
-            # Groups holding no local parameters never advanced a clock, so they cannot
-            # contradict one that did; only groups that reported a step take part.
-            bucket = bool(param_group.get('is_dsa_indexer', False))
-            known_value = bucket_steps.setdefault(bucket, group_step_value)
-            if known_value != group_step_value:
-                raise ValueError(
-                    "The optimizer step differs within one parameter bucket: "
-                    f"is_dsa_indexer={bucket}, group={group_idx}, "
-                    f"{known_value} vs {group_step_value}."
-                )
-            param_group['step'] = copy.deepcopy(group_step)
-
-    @staticmethod
-    def _restore_param_group_steps(state_dict: Dict) -> None:
-        """Restore per-parameter clocks from group metadata after sharded load."""
-        for param_group in state_dict['param_groups']:
-            if 'step' not in param_group:
-                continue
-            step = param_group['step']
-            for param_idx in param_group['params']:
-                if param_idx in state_dict['state']:
-                    state_dict['state'][param_idx]['step'] = copy.deepcopy(step)
-
-    def offload_to_cpu(self):
-        """Function used for RL training.
-        Move optimizer state tensors to CPU to free GPU memory during inference."""
-        if getattr(self, 'optimizer', None) is not None and not getattr(
-            self, 'is_stub_optimizer', False
-        ):
-            log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
-            # Move all optimizer tensors to CPU while keeping the optimizer instance
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and p.is_cuda:
-                        p.data = p.data.cpu()
-
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and v.is_cuda:
-                        state_dict[k] = v.cpu()
-
-            torch.cuda.empty_cache()
-
-    def restore_from_cpu(self):
-        """Function used for RL training.
-        Restore optimizer state tensors from CPU back to GPU for training."""
-        if getattr(self, 'optimizer', None) is not None and not getattr(
-            self, 'is_stub_optimizer', False
-        ):
-            log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
-            # Move all optimizer tensors back to GPU
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and not p.is_cuda:
-                        p.data = p.data.cuda()
-
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and not v.is_cuda:
-                        state_dict[k] = v.cuda()
-
-    @staticmethod
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
@@ -1407,11 +1316,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             )
         ]
 
-        try:
-            common_step = self._extract_common_per_param_step(state_dict['optimizer'])
-        except ValueError:
-            common_step = None
-            self._move_per_param_steps_to_param_groups(state_dict['optimizer'])
+        step = self._extract_common_per_param_step(state_dict['optimizer'])
 
         # Convert regular optimizer state
         # all optimizer parameters passed to optim_state_to_sharding_state are
@@ -1433,8 +1338,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
-        else:
-            self._restore_param_group_steps(state_dict[optimizer_key])
 
         # Filter and reorder param groups to match current optimizer
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
@@ -1588,8 +1491,6 @@ class FP32Optimizer(MegatronOptimizer):
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
-        else:
-            self._restore_param_group_steps(state_dict)
 
         # Filter and reorder param groups to match current optimizer
         state_dict['param_groups'] = self._filter_and_reorder_param_groups(
@@ -1610,11 +1511,7 @@ class FP32Optimizer(MegatronOptimizer):
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, self.get_parameters()
         )
-        try:
-            common_step = self._extract_common_per_param_step(state_dict)
-        except ValueError:
-            common_step = None
-            self._move_per_param_steps_to_param_groups(state_dict)
+        step = self._extract_common_per_param_step(state_dict)
 
         # all optimizer parameters passed to optim_state_to_sharding_state are
         # expected to have the same shape as the model parameters,
@@ -2336,12 +2233,9 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def _synchronize_steps(self):
         """
-        Synchronize optimizer steps within backbone and DSA-indexer buckets.
-
+        Synchronize the step of all optimizers.
         TE FusedAdam will not accumulate "step" for empty param groups,
-        so we align empty groups before saving and after loading. A reset DSA
-        indexer intentionally has a fresh clock, which must remain independent
-        from the loaded backbone clock.
+        so we need to align the step across param groups before saving and after loading.
         """
 
         # Go through the ``param_groups`` property rather than ``.optimizer``: a
@@ -2350,28 +2244,20 @@ class ChainedOptimizer(MegatronOptimizer):
         # mixes optimizers, muon plus AdamW for instance, and ``.optimizer`` asserts on
         # those. The property aggregates the same param_group dicts, so the writes below
         # still land on the real groups.
-        steps_by_dsa_bucket = {False: set(), True: set()}
+        steps = []
         for optimizer in self.chained_optimizers:
             for param_group in optimizer.param_groups:
                 if len(param_group['params']) > 0 and 'step' in param_group:
-                    bucket = bool(param_group.get('is_dsa_indexer', False))
-                    steps_by_dsa_bucket[bucket].add(int(param_group['step']))
-        for bucket, steps in steps_by_dsa_bucket.items():
-            assert len(steps) <= 1, f"is_dsa_indexer={bucket}, steps={steps}"
-
-        synchronized_steps = {
-            bucket: next(iter(steps)) if steps else None
-            for bucket, steps in steps_by_dsa_bucket.items()
-        }
+                    steps.append(param_group['step'])
+        steps = list(set(steps))
+        assert len(steps) <= 1, f"steps: {steps}"
+        step = steps[0] if len(steps) == 1 else None
         for optimizer in self.chained_optimizers:
-            for param_group in optimizer.optimizer.param_groups:
-                bucket = bool(param_group.get('is_dsa_indexer', False))
-                step = synchronized_steps[bucket]
-                if step is not None:
-                    if 'step' in param_group or len(param_group['params']) == 0:
-                        param_group['step'] = step
+            for param_group in optimizer.param_groups:
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    param_group['step'] = step
 
-        return synchronized_steps
+        return step
 
     def offload_to_cpu(self):
         """Move optimizer state to CPU to free GPU memory during inference."""
