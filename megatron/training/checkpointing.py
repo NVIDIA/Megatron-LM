@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -190,6 +191,32 @@ def get_loaded_iteration():
     """Get the iteration that was loaded from checkpoint, or None if no checkpoint was loaded."""
     global _LOADED_ITERATION
     return _LOADED_ITERATION
+
+
+def _validate_cyclic_dataloader_resume(args, checkpoint_args, release):
+    """Reject sharded cyclic resumes whose sampler state cannot be remapped safely."""
+    if release or getattr(args, 'finetune', False):
+        return
+    if getattr(args, 'dataloader_type', None) != 'cyclic':
+        return
+    if not getattr(args, 'data_sharding', False):
+        return
+
+    checkpoint_sharding = getattr(checkpoint_args, 'dataloader_data_sharding', None)
+    if checkpoint_sharding is not None and not checkpoint_sharding:
+        raise RuntimeError('Cannot resume a sharded cyclic dataloader from an unsharded checkpoint.')
+
+    checkpoint_dp = getattr(checkpoint_args, 'dataloader_data_parallel_size', None)
+    if checkpoint_dp is None:
+        checkpoint_dp = getattr(checkpoint_args, 'data_parallel_size', 0) * getattr(
+            checkpoint_args, 'gtp_weight_remat_size', 1
+        )
+    run_dp = getattr(args, 'data_parallel_size', 0) * getattr(args, 'gtp_weight_remat_size', 1)
+    if checkpoint_dp > 0 and run_dp > 0 and checkpoint_dp != run_dp:
+        raise RuntimeError(
+            'Cannot resume a sharded cyclic dataloader with a different '
+            f'data-parallel size ({checkpoint_dp} from the checkpoint vs. {run_dp} for this run).'
+        )
 
 
 def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
@@ -1672,7 +1699,12 @@ def generate_state_dict(
 
     # Arguments, iteration, and model.
     state_dict = {}
-    state_dict['args'] = args
+    checkpoint_args = copy.copy(args)
+    checkpoint_args.dataloader_data_parallel_size = args.data_parallel_size * getattr(
+        args, 'gtp_weight_remat_size', 1
+    )
+    checkpoint_args.dataloader_data_sharding = getattr(args, 'data_sharding', False)
+    state_dict['args'] = checkpoint_args
     state_dict['checkpoint_version'] = 3.0
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -3009,6 +3041,7 @@ def load_checkpoint(
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
+        _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
         # A GPT block is split into separate attention and MLP positions in
         # HybridModel, so num_layers intentionally differs even for an
         # architecture-preserving load. Keep every other resume-time argument

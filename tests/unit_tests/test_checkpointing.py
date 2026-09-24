@@ -23,6 +23,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _validate_cyclic_dataloader_resume,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -74,6 +75,68 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@pytest.mark.parametrize(
+    'dataloader_type,data_sharding,finetune,release,checkpoint_dp,run_dp,raises',
+    [
+        ('cyclic', True, False, False, 4, 8, True),
+        ('cyclic', True, False, False, 4, 4, False),
+        ('cyclic', True, False, False, 0, 8, False),
+        ('cyclic', False, False, False, 4, 8, False),
+        ('single', True, False, False, 4, 8, False),
+        ('cyclic', True, True, False, 4, 8, False),
+        ('cyclic', True, False, True, 4, 8, False),
+    ],
+)
+def test_validate_cyclic_dataloader_resume(
+    dataloader_type, data_sharding, finetune, release, checkpoint_dp, run_dp, raises
+):
+    args = SimpleNamespace(
+        dataloader_type=dataloader_type,
+        data_sharding=data_sharding,
+        data_parallel_size=run_dp,
+        finetune=finetune,
+    )
+    checkpoint_args = SimpleNamespace(data_parallel_size=checkpoint_dp)
+
+    if raises:
+        with pytest.raises(RuntimeError, match='different data-parallel size'):
+            _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
+    else:
+        _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
+
+
+def test_validate_cyclic_dataloader_resume_uses_effective_dp_size():
+    args = SimpleNamespace(
+        dataloader_type='cyclic',
+        data_sharding=True,
+        data_parallel_size=8,
+        gtp_weight_remat_size=1,
+        finetune=False,
+    )
+    checkpoint_args = SimpleNamespace(
+        dataloader_data_parallel_size=8,
+        dataloader_data_sharding=True,
+    )
+
+    _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
+
+
+def test_validate_cyclic_dataloader_resume_rejects_sharding_mode_change():
+    args = SimpleNamespace(
+        dataloader_type='cyclic',
+        data_sharding=True,
+        data_parallel_size=4,
+        finetune=False,
+    )
+    checkpoint_args = SimpleNamespace(
+        dataloader_data_parallel_size=4,
+        dataloader_data_sharding=False,
+    )
+
+    with pytest.raises(RuntimeError, match='unsharded checkpoint'):
+        _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
