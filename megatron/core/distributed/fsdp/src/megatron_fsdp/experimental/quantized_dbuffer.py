@@ -21,12 +21,16 @@ import torch.nn.functional as F
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
-from ..exceptions import OptionalDependencyUnavailable
-
 try:
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 except ImportError as exc:
+    try:
+        from megatron.core.exceptions import OptionalDependencyUnavailable
+    except ImportError:
+        # Standalone MFSDP does not require Megatron Core.
+        OptionalDependencyUnavailable = ImportError
+
     raise OptionalDependencyUnavailable(
         "QuantizedDBuffer requires Transformer Engine MXFP8 support"
     ) from exc

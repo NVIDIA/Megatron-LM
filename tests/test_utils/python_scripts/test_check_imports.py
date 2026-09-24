@@ -18,12 +18,9 @@ def checker():
     return module.ImportChecker()
 
 
-@pytest.mark.parametrize(
-    'exception_module',
-    ['megatron.core.exceptions', 'megatron.core.distributed.fsdp.src.megatron_fsdp.exceptions'],
-)
-def test_optional_dependency_failure_is_graceful(checker, tmp_path, monkeypatch, exception_module):
-    """Both packages' explicit exceptions work even after checking their defining modules."""
+def test_optional_dependency_failure_is_graceful(checker, tmp_path, monkeypatch):
+    """The explicit exception works even after checking its defining module."""
+    exception_module = 'megatron.core.exceptions'
     assert checker.import_module(exception_module) == ('success', '')
     (tmp_path / 'optional_backend.py').write_text(
         f'from {exception_module} import OptionalDependencyUnavailable\n'
