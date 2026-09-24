@@ -1104,6 +1104,18 @@ def forward_backward_pipelining_with_interleaving(
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
+    typed_boundaries = isinstance(p2p_communicator, TypedP2PCommunicator)
+    if typed_boundaries and (forward_only or config.overlap_p2p_comm):
+        raise ValueError(
+            "Typed VPP boundaries currently support training without overlapping p2p communication"
+        )
+
+    def p2p_call(method, *args, typed_kwargs=None, **kwargs):
+        """Call a communicator method with VPP chunk IDs when typed boundaries are active."""
+        if typed_boundaries and typed_kwargs:
+            kwargs.update(typed_kwargs)
+        return getattr(p2p_communicator, method)(*args, **kwargs)
+
     # Needed only when gradients are finalized in M-Core
     if config.finalize_model_grads_func is not None and not forward_only:
         # vp is ignored for clear_embedding_activation_buffer
@@ -1559,9 +1571,10 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run warmup forward passes.
     nvtx_range_push(suffix="warmup")
+    recv_is_first_stage = _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
     input_tensors[0].append(
-        p2p_communicator.recv_forward(
-            tensor_shape, _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
+        p2p_call(
+            "recv_forward", tensor_shape, recv_is_first_stage, typed_kwargs={"recv_chunk_id": 0}
         )
     )
 
@@ -1659,19 +1672,31 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                input_tensor, output_tensor_grad = (
-                    p2p_communicator.send_forward_backward_recv_forward_backward(
-                        output_tensor,
-                        input_tensor_grad,
-                        recv_prev=recv_prev,
-                        recv_next=recv_next,
-                        tensor_shape=tensor_shape,
-                    )
+                input_tensor, output_tensor_grad = p2p_call(
+                    "send_forward_backward_recv_forward_backward",
+                    output_tensor,
+                    input_tensor_grad,
+                    recv_prev=recv_prev,
+                    recv_next=recv_next,
+                    tensor_shape=tensor_shape,
+                    typed_kwargs={
+                        "send_forward_chunk_id": cur_model_chunk_id,
+                        "send_backward_chunk_id": cur_model_chunk_id,
+                        "recv_forward_chunk_id": next_forward_model_chunk_id,
+                        "recv_backward_chunk_id": num_model_chunks - 1,
+                    },
                 )
                 output_tensor_grads[num_model_chunks - 1].append(output_tensor_grad)
             else:
-                input_tensor = p2p_communicator.send_forward_recv_forward(
-                    output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape
+                input_tensor = p2p_call(
+                    "send_forward_recv_forward",
+                    output_tensor,
+                    recv_prev=recv_prev,
+                    tensor_shape=tensor_shape,
+                    typed_kwargs={
+                        "send_chunk_id": cur_model_chunk_id,
+                        "recv_chunk_id": next_forward_model_chunk_id,
+                    },
                 )
             if recv_prev:
                 input_tensors[next_forward_model_chunk_id].append(input_tensor)
@@ -1949,14 +1974,19 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            input_tensor, output_tensor_grad = (
-                p2p_communicator.send_forward_backward_recv_forward_backward(
-                    output_tensor,
-                    input_tensor_grad,
-                    recv_prev=recv_prev,
-                    recv_next=recv_next,
-                    tensor_shape=tensor_shape,
-                )
+            input_tensor, output_tensor_grad = p2p_call(
+                "send_forward_backward_recv_forward_backward",
+                output_tensor,
+                input_tensor_grad,
+                recv_prev=recv_prev,
+                recv_next=recv_next,
+                tensor_shape=tensor_shape,
+                typed_kwargs={
+                    "send_forward_chunk_id": forward_model_chunk_id,
+                    "send_backward_chunk_id": backward_model_chunk_id,
+                    "recv_forward_chunk_id": next_forward_model_chunk_id,
+                    "recv_backward_chunk_id": next_backward_model_chunk_id,
+                },
             )
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
             # Put input_tensor and output_tensor_grad in data structures in the
@@ -1979,11 +2009,13 @@ def forward_backward_pipelining_with_interleaving(
 
         if are_all_microbatches_in_warmup:
             output_tensor_grads[num_model_chunks - 1].append(
-                p2p_communicator.recv_backward(
+                p2p_call(
+                    "recv_backward",
                     tensor_shape,
                     is_last_stage=(
                         _is_vp_last_stage(vp_stage=curr_vp_stage) and is_pp_last_stage(pp_group)
                     ),
+                    typed_kwargs={"recv_chunk_id": curr_vp_stage},
                 )
             )
         for k in range(num_microbatches_remaining, total_num_microbatches):
@@ -2068,8 +2100,15 @@ def forward_backward_pipelining_with_interleaving(
                     bwd_recv_buffer[(k + 1) % bwd_recv_buffer_size] = None
 
             else:
-                output_tensor_grad = p2p_communicator.send_backward_recv_backward(
-                    input_tensor_grad, recv_next=recv_next, tensor_shape=tensor_shape
+                output_tensor_grad = p2p_call(
+                    "send_backward_recv_backward",
+                    input_tensor_grad,
+                    recv_next=recv_next,
+                    tensor_shape=tensor_shape,
+                    typed_kwargs={
+                        "send_chunk_id": cur_model_chunk_id,
+                        "recv_chunk_id": next_backward_model_chunk_id,
+                    },
                 )
 
                 if recv_next:
@@ -2126,6 +2165,9 @@ def forward_backward_pipelining_with_interleaving(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
+
+    if typed_boundaries:
+        p2p_communicator.finish()
 
     return forward_data_store
 
