@@ -32,6 +32,7 @@ from megatron.core.transformer.enums import (
     LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -1289,6 +1290,16 @@ class TransformerConfig(ModelParallelConfig):
     If None, all layers in the transformer block share a single recompute block.
 
     Must be a positive integer when set."""
+
+    ####################
+    # Wide Residual Configuration
+    ####################
+    wide_residual: Optional[WideResidualConfig] = None
+    """Optional streamwise wide-residual architecture configuration.
+
+    When set, the model carries ``num_streams * hidden_size`` features between
+    layers while attention and MLP branches continue to operate at ``hidden_size``.
+    """
 
     ####################
     # miscellaneous
