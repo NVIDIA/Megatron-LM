@@ -26,7 +26,6 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -434,8 +433,11 @@ class DBuffer:
             out.local_buffer.copy_(view.local_buffer)
             return out
 
-        axis = changed_mesh_axis(self.placements, new_placements)
-        assert axis is not None
+        if len(changed_axes) != 1:
+            raise NotImplementedError(
+                "Only Shard <-> Replicate redistribution supports multiple changed axes."
+            )
+        axis = changed_axes[0]
         old_placement = self.placements[axis]
         new_placement = new_placements[axis]
         if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
