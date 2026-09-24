@@ -414,6 +414,9 @@ class MegatronPretrainingRandomSampler:
     def _iter_without_data_sharding(self):
         """Yield a DP-independent permutation, including samples across epoch tails."""
         epoch_size = (self.total_samples // self.micro_batch_size) * self.micro_batch_size
+        self.epoch = self.consumed_samples // epoch_size
+        if isinstance(self.dataset, RandomSeedDataset):
+            self.dataset.set_epoch(self.epoch)
         current_epoch_samples = self.consumed_samples % epoch_size
         remaining = epoch_size - current_epoch_samples
         num_micro_batches = self.global_batch_size // self.micro_batch_times_data_parallel_size
