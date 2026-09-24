@@ -408,7 +408,13 @@ class DBuffer:
             isinstance(self.placements[axis], Shard) and isinstance(new_placements[axis], Replicate)
             for axis in changed_axes
         ):
-            return self.allgather(changed_axes, out=out)
+            out = self._create_or_validate_out(out, placements=new_placements)
+            source = self
+            placements = list(self.placements)
+            for axis in changed_axes:
+                placements[axis] = Replicate()
+                source = source.allgather(axis, out=out.view(placements))
+            return out
         if all(
             isinstance(self.placements[axis], Replicate) and isinstance(new_placements[axis], Shard)
             for axis in changed_axes
@@ -451,41 +457,26 @@ class DBuffer:
             f"{axis}: {old_placement!r} -> {new_placement!r}."
         )
 
-    def allgather(
-        self, mesh_axis: int | Iterable[int], *, out: "DBuffer | None" = None
-    ) -> "DBuffer":
-        """Gather one or more sharded axes into Replicate placements.
-
-        Axes are gathered in mesh order to preserve the contiguous shard layout.
-        Intermediate destinations are views into the final output allocation.
-        """
-        axes = (mesh_axis,) if isinstance(mesh_axis, int) else tuple(mesh_axis)
-        axes = tuple(sorted(axis % self.mesh.ndim for axis in axes))
-        if len(set(axes)) != len(axes):
-            raise ValueError(f"All-gather axes must be distinct, got {axes}.")
-        placements = list(self.placements)
-        for axis in axes:
-            if not isinstance(placements[axis], Shard):
-                raise ValueError(f"allgather() requires a Shard placement on axis {axis}.")
-            placements[axis] = Replicate()
-        _validate_placements(placements)
-        if not axes:
-            return self.redistribute(placements, out=out)
-        out = self._create_or_validate_out(out, placements=placements)
-        source = self
-        placements = list(self.placements)
-        for axis in axes:
-            placements[axis] = Replicate()
-            destination = out.view(placements)
-            # Registration is scoped to the collective's process group.
-            if destination.is_symmetric_memory:
-                destination.rendezvous(axis)
-            dist.all_gather_into_tensor(
-                output_tensor=destination.local_buffer,
-                input_tensor=source.local_buffer,
-                group=self.mesh.get_group(axis),
+    def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
+        """All-gather a sharded axis into Replicate placement."""
+        if not isinstance(self.placements[mesh_axis], Shard):
+            raise ValueError(
+                f"allgather() currently requires a Shard placement on axis {mesh_axis!r}."
             )
-            source = destination
+
+        placements = list(self.placements)
+        placements[mesh_axis] = Replicate()
+        _validate_placements(placements)
+        out = self._create_or_validate_out(out, placements=placements)
+        # Symmetric-memory registration is scoped to the collective's process
+        # group, so rendezvous the output on the same mesh axis as the all-gather.
+        if out.is_symmetric_memory:
+            out.rendezvous(mesh_axis)
+        dist.all_gather_into_tensor(
+            output_tensor=out.local_buffer,
+            input_tensor=self.local_buffer,
+            group=self.mesh.get_group(mesh_axis),
+        )
         return out
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":

@@ -691,8 +691,8 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(dist
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-@pytest.mark.parametrize("destination", ["allocated", "separate", "aliased", "redistribute"])
-def test_multi_axis_view_and_allgather(distributed_setup, destination):
+@pytest.mark.parametrize("destination", ["allocated", "separate", "aliased"])
+def test_multi_axis_view_and_redistribute(distributed_setup, destination):
     if distributed_setup.world_size % 2:
         pytest.skip("Requires an even world size.")
     mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
@@ -709,19 +709,15 @@ def test_multi_axis_view_and_allgather(distributed_setup, destination):
     saved = sharded.local_buffer.clone()
     replicated.local_buffer.fill_(-1)
     sharded.local_buffer.copy_(saved)
-    if destination == "redistribute":
-        result = sharded.redistribute([Replicate(), Replicate()], out=replicated)
-    else:
-        out = None
-        if destination == "aliased":
-            out = replicated
-        elif destination == "separate":
-            out = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
-            out.local_buffer.fill_(-1)
-        # Accept a generator in reverse order; the implementation orders the collectives.
-        result = sharded.allgather((axis for axis in [1, 0]), out=out)
-        if out is not None:
-            assert result is out
+    out = None
+    if destination == "aliased":
+        out = replicated
+    elif destination == "separate":
+        out = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+        out.local_buffer.fill_(-1)
+    result = sharded.redistribute([Replicate(), Replicate()], out=out)
+    if out is not None:
+        assert result is out
     _assert_dbuffer_local_tensors_close(result, tensors)
     sliced = result.redistribute([RowAtomic(), RowAtomic()])
     for index in range(len(tensors)):
@@ -762,7 +758,7 @@ def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_
 
 
 @pytest.mark.parametrize("use_out", [False, True])
-def test_quantized_multi_axis_allgather(distributed_setup, use_out):
+def test_quantized_multi_axis_redistribute(distributed_setup, use_out):
     """Gather all four byte planes without requiring FP8 arithmetic."""
     QuantizedDBuffer = pytest.importorskip(
         "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer"
@@ -783,6 +779,6 @@ def test_quantized_multi_axis_allgather(distributed_setup, use_out):
         saved = shard.local_buffer.clone()
         plane.local_buffer.zero_()
         shard.local_buffer.copy_(saved)
-    result = sharded.allgather((axis for axis in [1, 0]), out=replicated if use_out else None)
+    result = sharded.redistribute([Replicate(), Replicate()], out=replicated if use_out else None)
     for plane, values in zip(result.planes, expected):
         torch.testing.assert_close(plane.local_buffer, values, rtol=0, atol=0)
