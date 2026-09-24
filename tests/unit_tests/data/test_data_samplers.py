@@ -7,6 +7,7 @@ build_train_valid_test_data_iterators. Nothing between the restore and the first
 the default CPU generator -- except, on the pre-fix code, iterator creation itself.
 """
 
+from collections import Counter
 from types import SimpleNamespace
 
 import torch
@@ -83,3 +84,40 @@ class TestDataLoaderResume:
             "building the data iterators moved the CPU RNG off the state load_checkpoint "
             "restored, so the resumed run diverges from the run that saved"
         )
+
+
+def test_cyclic_sampler_no_sharding_preserves_samples_after_dp_change():
+    dataset_size, micro_batch_size, global_batch_size, steps = 250, 2, 16, 32
+
+    def draws(dp_before, dp_after, resume_step):
+        drawn = []
+        for dp, lo, hi in ((dp_before, 0, resume_step), (dp_after, resume_step, steps)):
+            grad_accumulation = global_batch_size // (micro_batch_size * dp)
+            samplers = [
+                data_samplers.MegatronPretrainingRandomSampler(
+                    torch.arange(dataset_size),
+                    total_samples=dataset_size,
+                    consumed_samples=lo * global_batch_size,
+                    micro_batch_size=micro_batch_size,
+                    data_parallel_rank=rank,
+                    data_parallel_size=dp,
+                    data_sharding=False,
+                    global_batch_size=global_batch_size,
+                )
+                for rank in range(dp)
+            ]
+            iterators = [iter(sampler) for sampler in samplers]
+            for _ in range(lo, hi):
+                for rank in range(dp):
+                    for _ in range(grad_accumulation):
+                        try:
+                            drawn.extend(next(iterators[rank]))
+                        except StopIteration:
+                            iterators[rank] = iter(samplers[rank])
+                            drawn.extend(next(iterators[rank]))
+        return Counter(drawn)
+
+    for dp_before, dp_after, resume_step in ((1, 8, 15), (8, 1, 15), (1, 2, 7)):
+        reference = draws(dp_before, dp_before, 0)
+        resumed = draws(dp_before, dp_after, resume_step)
+        assert resumed == reference
