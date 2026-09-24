@@ -104,6 +104,13 @@ C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="cudnn_engram_gate",
+        sources=("megatron/core/fusions/cudnn_engram.py",),
+        tests=(K + "test_cudnn_engram.py",),
+        kind="dispatch",
+        notes="cuDNN saved-state BF16 gate; fixed-order weight reduction and q/k product-rule gradients.",
+    ),
+    KernelEntry(
         name="engram_embedding",
         sources=("megatron/core/models/engram/distributed_embedding.py",),
         tests=(K + "test_deepseek_v41_kernels.py",),

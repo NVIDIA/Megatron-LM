@@ -89,6 +89,11 @@ class Engram(MegatronModule):
         self.hash_index = layout.layer_ids.index(layer_idx)
         self.n = config.mhc_num_residual_streams
         self.hidden_size = config.hidden_size
+        self._cudnn_gate = None
+        if config.engram_gate_backend == "cudnn":
+            from megatron.core.fusions.cudnn_engram import CudnnEngramGate
+
+            self._cudnn_gate = CudnnEngramGate(config.layernorm_epsilon)
         self.embed = EngramEmbedding(
             config, layout.num_embeddings[self.hash_index], layout.head_dim, pg_collection
         )
@@ -107,6 +112,8 @@ class Engram(MegatronModule):
         """Preserve FP32 gating arithmetic and the reference signed-square-root gate."""
         addresses = hash_ids[:, :, self.hash_index]
         kv = self.wkv(self.embed(addresses).flatten(-2)).transpose(0, 1)
+        if self._cudnn_gate is not None:
+            return self._cudnn_gate(hidden_states, kv, self.q_weight, self.k_weight, token_mask)
         key, value = kv.split([self.n * self.hidden_size, self.hidden_size], dim=-1)
         key = key.float().unflatten(-1, (self.n, self.hidden_size))
         h = hidden_states.float().unflatten(-1, (self.n, self.hidden_size))
