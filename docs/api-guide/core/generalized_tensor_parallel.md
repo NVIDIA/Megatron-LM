@@ -75,10 +75,9 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
       - [Why pad this way](#why-pad-this-way)
       - [Trade-off](#trade-off)
     - [3.8 GTP\_remat + Context Parallelism (CP)](#38-gtp_remat--context-parallelism-cp)
-      - [The weight-sharding group absorbs CP](#the-weight-sharding-group-absorbs-cp)
-      - [Consequence 1: the DDP bucket must skip CP](#consequence-1-the-ddp-bucket-must-skip-cp)
-      - [Consequence 2: checkpoint writer election must exclude CP](#consequence-2-checkpoint-writer-election-must-exclude-cp)
-      - [What this does not change](#what-this-does-not-change)
+      - [How folding works](#how-folding-works)
+      - [What folding requires](#what-folding-requires)
+      - [Unchanged by folding](#unchanged-by-folding)
   - [4. Testing](#4-testing)
 
 ---

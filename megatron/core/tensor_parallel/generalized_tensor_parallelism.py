@@ -2901,11 +2901,17 @@ def gtp_replica_rank(param, explicit_group=None):
         return parallel_state.get_expert_data_parallel_rank(with_gtp_remat=False)
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 0  # single-process save: this rank is the only replica.
+    if is_expert:
+        needed_group = '`expt_dp`'
+    elif getattr(param, 'excludes_cp_from_bucket', False):
+        needed_group = '`dp` (this weight folds CP into its sharding group)'
+    else:
+        needed_group = '`dp_cp`'
     raise RuntimeError(
-        "GTP distributed checkpointing needs the gtp_remat-excluded DP x CP group to elect a "
+        "GTP distributed checkpointing needs the gtp_remat-excluded replica group to elect a "
         "shard writer, but parallel_state is not initialized and the param carries no "
-        "gtp_replica_group. Pass a pg_collection containing `dp` when building the model "
-        "(it is stamped onto GTP params at wrap time)."
+        f"gtp_replica_group. Pass a pg_collection containing {needed_group} when building the "
+        "model (it is stamped onto GTP params at wrap time)."
     )
 
 

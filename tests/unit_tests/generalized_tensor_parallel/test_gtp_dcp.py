@@ -1362,6 +1362,54 @@ def _worker_dp_reshardable_cp_gtp_roundtrip(
         GTPShardedParam._chain_state = {}
 
 
+def _worker_fully_reshardable_rejects_cp_folded_gtp(rank, world_size, port):
+    """fully_reshardable must reject CP-folded GTP buffers at save time with a clear error.
+    world=4 -> tp1*cp2*gtp2*dp1 (fully folded)."""
+    from functools import partial
+
+    from megatron.core.transformer.enums import AttnBackend
+    from tests.unit_tests.dist_checkpointing import setup_model_and_optimizer
+    from tests.unit_tests.dist_checkpointing.utils import initialize_moe_model
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        gtp_remat_size=2,
+        gtp_remat_fold_cp=True,
+    )
+    try:
+        moe_cfg = dict(
+            hidden_size=64,
+            num_attention_heads=8,
+            kv_channels=8,
+            ffn_hidden_size=128,
+            use_cpu_initialization=False,
+            attention_backend=AttnBackend.unfused,
+            gtp_remat_fold_cp=True,
+        )
+        meta = {'distrib_optim_sharding_type': 'fully_reshardable'}
+        model, optimizer = setup_model_and_optimizer(
+            seed=2,
+            tp=1,
+            pp=1,
+            cp=2,
+            bf16=True,
+            dist_opt=True,
+            use_param_layout=True,
+            initialize_fn=partial(initialize_moe_model, use_te=True, **moe_cfg),
+            optimizer='adam',
+        )
+        model_sd = model[0].sharded_state_dict()
+        with pytest.raises(AssertionError, match='does not support CP-folded GTP weights'):
+            optimizer.sharded_state_dict(model_sd, metadata=meta)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
 def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
     """GTP_remat+Muon ckpt fix: in_proj's gathered+split model entry does NOT id-match the
     per-shard optimizer param, so get_param_id_to_sharded_param_map misses it (the KeyError seen in
@@ -2333,6 +2381,10 @@ class TestGtpDcpHelper:
         _worker_dp_reshardable_cp_gtp_roundtrip(
             dist.get_rank(), 4, tmp_path_dist_ckpt, cp_size, gtp_remat_size, fold_cp
         )
+
+    def test_fully_reshardable_rejects_cp_folded_gtp(self):
+        _require_world_size(4)
+        _worker_fully_reshardable_rejects_cp_folded_gtp(dist.get_rank(), 4, None)
 
     def test_public_wrapper_delegates(self):
         _require_world_size(4)

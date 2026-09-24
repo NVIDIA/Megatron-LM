@@ -626,16 +626,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
-        # CP-FREE dense axis: the dedup filter's reduce group excludes CP.
-        self.gtp_remat_group = getattr(self.pg_collection, 'gtp_remat_no_cp', None)
-        self.expt_gtp_remat_group = getattr(self.pg_collection, 'expt_gtp_remat', None)
         for optimizer in optimizers:
             # Child optimizers perform duplicate filtering and gradient-stat reductions.
             optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
             optimizer.tp_group = self.tp_group
             optimizer.expert_tp_group = self.expert_tp_group
-            optimizer.gtp_remat_group = self.gtp_remat_group
-            optimizer.expt_gtp_remat_group = self.expt_gtp_remat_group
 
         super().__init__(optimizers)
 
@@ -985,8 +980,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=self.tp_group,
             expert_tp_group=self.expert_tp_group,
-            gtp_remat_group=self.gtp_remat_group,
-            expt_gtp_remat_group=self.expt_gtp_remat_group,
         )
 
     def start_param_sync_for_bucket_group_subset(self) -> None:

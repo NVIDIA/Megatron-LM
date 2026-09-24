@@ -1271,6 +1271,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state[gbuf_idx] = dtype_state
         return state
 
+    def _assert_no_cp_folded_gtp_for_dp_zero(self):
+        """dp_zero gathers over the global DP group keyed by gbuf_idx; CP-folded buffers have a
+        CP-free per-buffer DP group and hold **distinct** shards per CP rank under one gbuf_idx."""
+        assert not any(
+            getattr(p, 'excludes_cp_from_bucket', False) for b in self.buffers for p in b.params
+        ), (
+            "dp_zero_gather_scatter / fully_reshardable checkpoint format does not support "
+            "CP-folded GTP weights (--gtp-remat-fold-cp). Use the default dp_reshardable "
+            "format instead."
+        )
+
     def get_parameter_state_dp_zero(
         self,
         use_gloo_comm: bool = True,
@@ -1303,6 +1314,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dict or None: optimizer state dict on DP rank 0, or all ranks if return_on_all_ranks.
                 Returns None on non-zero DP ranks when return_on_all_ranks=False.
         """
+        self._assert_no_cp_folded_gtp_for_dp_zero()
         # Data parallelism variables.
         if use_gloo_comm:
             data_parallel_group = self.data_parallel_group_gloo
@@ -2193,7 +2205,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         method, along with `--ckpt-convert-format` and `--ckpt-convert-save` to
         update a legacy-format checkpoint to the modern format.
         """
-
+        self._assert_no_cp_folded_gtp_for_dp_zero()
         # Data parallelism variables.
         assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
@@ -2309,7 +2321,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # prior to Feb 13, 2024.
         if update_legacy_format:
             return self.load_parameter_state_from_dp_zero_legacy(state_dict)
-
+        self._assert_no_cp_folded_gtp_for_dp_zero()
         # Data parallelism variables.
         assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
