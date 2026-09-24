@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed.checkpoint
+import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -610,9 +611,13 @@ def test_save_checkpoint(
 
         assert os.path.exists(expected_ckpt_path)
         state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
+        # Legacy args remain unchanged; the run config records the effective policy.
+        assert state["args"].profile is False and state["args"].profile_ranks == [99]
+        assert state["args"].memory_snapshot_path == "stale.pickle"
+        with open(ckpt_dir / "run_config.yaml") as f:
+            saved_config = yaml.safe_load(f)
         for field in fields(profiling):
-            name = "profile" if field.name == "use_nsys_profiler" else field.name
-            assert getattr(state["args"], name) == getattr(profiling, field.name)
+            assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
         assert args.profile is False and args.profile_ranks == [99]
         assert args.memory_snapshot_path == "stale.pickle"
 
