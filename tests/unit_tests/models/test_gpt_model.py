@@ -78,6 +78,63 @@ class TestGPTModel:
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
 
+    def test_constructor_rejects_hash_routed_moe(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_num_hash_layers=1,
+            hash_moe_vocab_size=100,
+            use_cpu_initialization=True,
+        )
+
+        with pytest.raises(ValueError, match="supported only by HybridModel"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+    def test_hsm_requires_two_mtp_layers(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+        assert config.mtp_hsm is True
+
+    def test_rejects_hybrid_mtp_override(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_hybrid_override_pattern="*",
+        )
+        with pytest.raises(
+            ValueError, match="mtp_hybrid_override_pattern is not supported by GPTModel"
+        ):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
     @pytest.mark.internal
     def test_set_input_tensor(self):
         config: TransformerConfig = self.gpt_model.config
@@ -627,3 +684,38 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         assert (
             call_kwargs.get('use_te_activation_func') is True
         ), "use_te_activation_func must be forwarded from config"
+
+
+def test_gpt_builder_forwards_rope_scaling_factor():
+    """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
+    The --rope-scaling-factor flag was silently ignored because gpt_builder
+    passed rope_scaling but not rope_scaling_factor, so GPTModel always fell
+    back to its default factor of 8.0.
+    """
+    mock_config = MagicMock()
+
+    mock_args = MagicMock()
+    mock_args.spec = None
+    mock_args.transformer_impl = "transformer_engine"
+    mock_args.experimental_attention_variant = None
+    mock_args.num_experts = None
+    mock_args.heterogeneous_layers_config_path = None
+    mock_args.mtp_num_layers = None
+    mock_args.use_rope_scaling = True
+    mock_args.rope_scaling_factor = 32.0
+
+    with (
+        patch('gpt_builders.GPTModel') as mock_gpt_model,
+        patch('gpt_builders._get_transformer_layer_spec'),
+    ):
+        from gpt_builders import gpt_builder
+
+        gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
+
+        mock_gpt_model.assert_called_once()
+        _, call_kwargs = mock_gpt_model.call_args
+        assert (
+            call_kwargs.get('rope_scaling_factor') == 32.0
+        ), "rope_scaling_factor must be forwarded from args"

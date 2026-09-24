@@ -107,6 +107,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
     engine.context = context
+    engine.controller = SimpleNamespace(_async_sched_logits=Mock())
     engine.unified_memory_level = 0
     engine.requests = {}
     engine.waiting_request_ids = deque()
@@ -123,6 +124,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
 
     expected_order = ["deallocate", "cleared"] if expect_clear else ["deallocate"]
     assert order == expected_order
+    assert engine.controller._async_sched_logits.clear.call_count == int(expect_clear)
 
 
 def test_reset_metadata_can_preserve_prefix_allocator():
@@ -132,6 +134,7 @@ def test_reset_metadata_can_preserve_prefix_allocator():
     context.reset_mamba_state = Mock()
     context.kv_block_allocator = Mock()
     context.request_to_kv_block_ids = Mock()
+    context.mtp_metadata = Mock()
 
     context.reset_metadata(preserve_prefix_cache=True)
 
@@ -139,6 +142,10 @@ def test_reset_metadata_can_preserve_prefix_allocator():
     context.reset_mamba_state.assert_called_once_with()
     context.kv_block_allocator.reset.assert_not_called()
     context.request_to_kv_block_ids.fill_.assert_called_once_with(-1)
+    # The MTP draft-KV boundary carry is keyed to `chunked_prefill_request_id`, which this
+    # reset clears, so it must be retired here too -- otherwise a request that restarts at a
+    # new offset could still match a carry describing its pre-reset chunk.
+    context.mtp_metadata.invalidate_chunk_boundary.assert_called_once_with()
 
 
 def test_next_forward_can_discard_events_left_by_a_failed_forward():

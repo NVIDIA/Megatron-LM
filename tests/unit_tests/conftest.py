@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,16 @@ def pytest_addoption(parser):
         action='store_true',
         help="pass that argument to enable experimental flag during testing (DEFAULT: False)",
     )
+
+
+def pytest_runtest_logreport(report):
+    if report.failed:
+        rank = os.environ.get("RANK", "?")
+        print(
+            f"\n[rank {rank}] {report.nodeid} ({report.when})\n" f"{report.longreprtext}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 @pytest.fixture(autouse=True)

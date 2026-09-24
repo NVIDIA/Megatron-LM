@@ -77,7 +77,11 @@ class MockState:
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
-    """Dataloader checkpoints use the supplied module groups and canonical model-parallel path."""
+    """Dataloader checkpoints use the supplied module groups and canonical model-parallel path.
+
+    The data-parallel group here is the full data-distribution group (dp x gtp_remat), which is
+    the axis the dataloader shards on; the replicate group would give gtp_remat peers one name.
+    """
     groups = {
         "tp": SimpleNamespace(rank=0, size=2),
         "pp": SimpleNamespace(rank=0, size=2),
@@ -95,6 +99,9 @@ def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
         ),
         mock.patch(
             "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.mpu.get_context_parallel_group", return_value=None
         ),
         mock.patch(
             "megatron.training.checkpointing.torch.distributed.barrier",
@@ -121,6 +128,75 @@ def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
     )
 
 
+@pytest.mark.parametrize("dp_rank", [0, 3])
+@pytest.mark.parametrize("cp_rank", [None, 0, 1])
+def test_maybe_save_dataloader_state_rank_independent_writes_one_file(tmp_path, dp_rank, cp_rank):
+    """Rank-independent state is written only by data rank 0 on the first CP rank."""
+    groups = {
+        "tp": SimpleNamespace(rank=0, size=1),
+        "pp": SimpleNamespace(rank=0, size=1),
+        "dp": SimpleNamespace(rank=dp_rank, size=4),
+    }
+    barriers = []
+    saved = []
+    save_state_calls = []
+    cp_group = None if cp_rank is None else SimpleNamespace(rank=cp_rank, size=2)
+
+    def save_state():
+        save_state_calls.append(True)
+        return {"global_sequence_id": 16}
+
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=save_state, is_save_state_rank_independent=True)
+    )
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.mpu.get_context_parallel_group", return_value=None
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.distributed.barrier",
+            side_effect=lambda group: barriers.append(group),
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.save",
+            side_effect=lambda state, path: saved.append((state, path)),
+        ),
+    ):
+        maybe_save_dataloader_state(
+            iterator,
+            2,
+            tmp_path,
+            tp_group=groups["tp"],
+            pp_group=groups["pp"],
+            dp_group=groups["dp"],
+            cp_group=cp_group,
+        )
+
+    if cp_rank == 1:
+        assert barriers == []
+        assert saved == []
+        assert save_state_calls == []
+        return
+
+    # All DP ranks on the first CP rank join the barriers; only DP0 builds and writes state.
+    assert barriers == [groups["dp"], groups["dp"]]
+    if dp_rank == 0:
+        assert saved[0][1] == str(
+            tmp_path / "iter_0000002" / "mp_rank_00" / "train_dataloader_dprank000.pt"
+        )
+        assert save_state_calls == [True]
+    else:
+        assert saved == []
+        assert save_state_calls == []
+
+
 def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
     """Ranks without dataloader state participate in barriers but do not write a file."""
     group = SimpleNamespace(rank=0, size=1)
@@ -137,6 +213,9 @@ def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
             side_effect=lambda process_group: process_group.size,
         ),
         mock.patch(
+            "megatron.training.checkpointing.mpu.get_context_parallel_group", return_value=None
+        ),
+        mock.patch(
             "megatron.training.checkpointing.torch.distributed.barrier",
             side_effect=lambda group: barriers.append(group),
         ),
@@ -148,6 +227,96 @@ def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
 
     assert barriers == [group, group]
     save.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "cp_rank,global_cp_rank,should_save",
+    [
+        (None, None, True),
+        (None, 0, True),
+        (None, 1, False),
+        (0, None, True),
+        (1, None, False),
+        (0, 1, True),
+        (1, 0, False),
+    ],
+)
+def test_maybe_save_dataloader_state_context_parallel_groups(
+    tmp_path, cp_rank, global_cp_rank, should_save
+):
+    """Explicit CP groups take precedence; an absent global group must not assert."""
+    model_group = SimpleNamespace(rank=0, size=1)
+    dp_group = SimpleNamespace(rank=1, size=2)
+    cp_group = None if cp_rank is None else SimpleNamespace(rank=cp_rank, size=2)
+    global_cp_group = (
+        None if global_cp_rank is None else SimpleNamespace(rank=global_cp_rank, size=2)
+    )
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=mock.Mock(return_value={"position": 16}))
+    )
+
+    def get_context_parallel_group(check_initialized=True):
+        if check_initialized and global_cp_group is None:
+            raise AssertionError("context parallel group is not initialized")
+        return global_cp_group
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank",
+            side_effect=lambda process_group: process_group.rank,
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size",
+            side_effect=lambda process_group: process_group.size,
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.mpu.get_context_parallel_group",
+            side_effect=get_context_parallel_group,
+        ) as get_cp_group,
+        mock.patch(
+            "megatron.training.checkpointing.mpu.get_context_parallel_rank",
+            side_effect=AssertionError("Must not require the global CP rank"),
+        ),
+        mock.patch("megatron.training.checkpointing.torch.distributed.barrier") as barrier,
+        mock.patch("megatron.training.checkpointing.torch.save") as save,
+    ):
+        maybe_save_dataloader_state(
+            iterator,
+            2,
+            tmp_path,
+            tp_group=model_group,
+            pp_group=model_group,
+            dp_group=dp_group,
+            cp_group=cp_group,
+        )
+
+    if cp_group is None:
+        get_cp_group.assert_called_once_with(check_initialized=False)
+    else:
+        get_cp_group.assert_not_called()
+
+    if should_save:
+        iterator.iterable.save_state.assert_called_once_with()
+        assert barrier.call_args_list == [mock.call(group=dp_group), mock.call(group=dp_group)]
+        save.assert_called_once_with(
+            {"dataloader_state_dict": {"position": 16}},
+            str(tmp_path / "iter_0000002" / "mp_rank_00" / "train_dataloader_dprank001.pt"),
+        )
+    else:
+        iterator.iterable.save_state.assert_not_called()
+        barrier.assert_not_called()
+        save.assert_not_called()
+
+
+@pytest.mark.parametrize("save_path", [None, ""])
+def test_maybe_save_dataloader_state_disabled_without_global_groups(save_path):
+    """Text-only training without dataloader-state saving must not inspect CP groups."""
+    with mock.patch(
+        "megatron.training.checkpointing.mpu.get_context_parallel_group",
+        side_effect=AssertionError("Must not inspect CP when dataloader saving is disabled"),
+    ) as get_cp_group:
+        maybe_save_dataloader_state(iter([1]), 2, save_path)
+    get_cp_group.assert_not_called()
 
 
 class MockOptParamScheduler(MockState):
@@ -200,6 +369,37 @@ def test_load_args_restores_gdp_num_householder_from_checkpoint(
     assert restored_args.gdp_num_householder == expected_num_householder
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_args", "configured_scale", "expected_scale"),
+    [
+        (SimpleNamespace(activation_func_tanh_clamp_scale=16.0), None, 16.0),
+        (SimpleNamespace(activation_func_tanh_clamp_scale=16.0), 1.0, 16.0),
+        (SimpleNamespace(), 4.0, 4.0),
+    ],
+    ids=["restored", "overrides-command-line", "absent-keeps-command-line"],
+)
+def test_load_args_restores_activation_func_tanh_clamp_scale_from_checkpoint(
+    checkpoint_args, configured_scale, expected_scale
+):
+    """The checkpoint's clamp scale overrides the command line (force=True), like squared_relu."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        activation_func_tanh_clamp_scale=configured_scale,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.activation_func_tanh_clamp_scale == expected_scale
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
@@ -229,7 +429,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
-    args.async_strategy = "mcore"
+    args.async_strategy = "nvrx"
     args.data_parallel_random_init = False
     args.no_save_optim = False
     args.no_save_rng = False
@@ -281,6 +481,10 @@ def create_ckpt_load_args(create_args):
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
+    # Guard against leaked state: a prior test's teardown may have raised before
+    # reaching `unset_num_microbatches_calculator()`, leaving the calculator
+    # initialized for this test's setup.
+    unset_num_microbatches_calculator()
     init_num_microbatches_calculator(
         rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
     )
@@ -363,9 +567,21 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         args.save_tokenizer_assets = False
         set_args(args)
 
-        save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
-        )
+        # Text-only checkpoint saves still bypass dataloader state, while passing CP through.
+        cp_group = mock.sentinel.cp_group
+        with mock.patch(
+            "megatron.training.checkpointing.maybe_save_dataloader_state",
+            wraps=maybe_save_dataloader_state,
+        ) as save_dataloader_state:
+            save_checkpoint(
+                iteration,
+                [model],
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                cp_group=cp_group,
+            )
+        assert save_dataloader_state.call_args.kwargs["cp_group"] is cp_group
 
         with open(args.save / "latest_checkpointed_iteration.txt", "r") as f:
             assert iteration == int(f.read())

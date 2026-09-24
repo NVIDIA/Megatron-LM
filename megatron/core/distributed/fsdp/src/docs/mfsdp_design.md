@@ -124,7 +124,7 @@ axis.
 - `Shard(0)`. Torch's public dim-0 sharding placement. MFSDP specializes it to an
   internal per-unit DBuffer layout. Only dim-0 `Shard` placements are currently
   supported.
-  - `Flat`. The default row-atomic internal layout, good for elementwise optimizers.
+  - `RowAtomic`. The default row-atomic internal layout, good for elementwise optimizers.
   - `BlockAtomic(block_size)`. An internal `Shard` subclass that doesn’t cut a block of
     `block_size` rows. Simplifies blockwise quantization support. Currently, a 32x1
     mxfp8 block may be sharded across ranks. This introduces complex host-side logic and
@@ -316,9 +316,9 @@ one contiguous local buffer.
   local range.
 - `redistribute(new_placements)`, with `allgather`, `allreduce`, `reduce_scatter`, and
   `scatter` convenience operations. Redistributing between sharded placements preserves
-  the global layout; [the optimizer subdesign](optimizer.md) converts between `Flat` and
+  the global layout; [the optimizer subdesign](optimizer.md) converts between `RowAtomic` and
   `TensorAtomic` this way.
-- `get_local_tensor(index)`: the local view for one logical tensor.
+- `get_tensor_view(index)`: the local view for one logical tensor.
 - `get_dtensor(index)`: the corresponding DTensor, used by the optimizer and distributed
   checkpointing.
 
