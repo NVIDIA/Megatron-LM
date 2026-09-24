@@ -192,6 +192,24 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
+def _validate_cyclic_dataloader_resume(args, checkpoint_args, release):
+    """Reject sharded cyclic resumes whose sampler state cannot be remapped safely."""
+    if release or getattr(args, 'finetune', False):
+        return
+    if getattr(args, 'dataloader_type', None) != 'cyclic':
+        return
+    if not getattr(args, 'data_sharding', False):
+        return
+
+    checkpoint_dp = getattr(checkpoint_args, 'data_parallel_size', 0)
+    run_dp = getattr(args, 'data_parallel_size', 0)
+    if checkpoint_dp > 0 and run_dp > 0 and checkpoint_dp != run_dp:
+        raise RuntimeError(
+            'Cannot resume a sharded cyclic dataloader with a different '
+            f'data-parallel size ({checkpoint_dp} from the checkpoint vs. {run_dp} for this run).'
+        )
+
+
 def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
@@ -3009,6 +3027,7 @@ def load_checkpoint(
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
+        _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
         # A GPT block is split into separate attention and MLP positions in
         # HybridModel, so num_layers intentionally differs even for an
         # architecture-preserving load. Keep every other resume-time argument
