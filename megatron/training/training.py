@@ -1564,6 +1564,7 @@ def _freeze_non_dsa_indexer_parameters(model):
     frozen_param_count = 0
     indexer_element_count = 0
     frozen_element_count = 0
+    frozen_expert_bias_count = 0
 
     for model_module in model:
         for name, param in model_module.named_parameters():
@@ -1576,6 +1577,14 @@ def _freeze_non_dsa_indexer_parameters(model):
                 param.requires_grad_(False)
                 frozen_param_count += 1
                 frozen_element_count += param.nelement()
+        # The MoE router's expert_bias is a buffer, not a parameter: finalize_model_grads
+        # rewrites it every step from the observed token counts, for load balancing. Clearing
+        # requires_grad does not reach it, so the backbone's routing would keep drifting while
+        # only the indexer is meant to train.
+        for module in model_module.modules():
+            if hasattr(module, 'frozen_expert_bias'):
+                module.frozen_expert_bias = True
+                frozen_expert_bias_count += 1
 
     global_indexer_param_count = _global_dsa_indexer_reset_count(indexer_param_count)
     if global_indexer_param_count == 0:
@@ -1585,7 +1594,8 @@ def _freeze_non_dsa_indexer_parameters(model):
         )
 
     print_rank_0(
-        " > DSA train-indexer-only: trainable indexer params "
+        f" > DSA train-indexer-only: froze {frozen_expert_bias_count} MoE router expert biases; "
+        "trainable indexer params "
         f"{indexer_param_count} local tensors ({global_indexer_param_count} across ranks) / "
         f"{indexer_element_count} local elements; "
         f"frozen non-indexer params {frozen_param_count} tensors / {frozen_element_count} elements."
