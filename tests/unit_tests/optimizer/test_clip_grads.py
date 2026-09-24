@@ -90,3 +90,33 @@ def test_float64_device_norm_clips_like_the_python_float_path(max_norm):
 
         for got, want in zip(clip(device_norm), clip(python_norm)):
             assert torch.equal(got, want)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="device norms need a GPU")
+def test_chained_optimizer_combines_device_norms_in_float64():
+    """Optimizers with separate grad-stats groups (e.g. Muon + Adam): the combined norm is the
+    float64 root of the fp32 sum of squares, taken on the device (no host synchronization) with
+    exactly the value of the Python-float form ``math.sqrt(float(sum))``."""
+
+    class MockOptimizer:
+        def __init__(self, norm, group):
+            self.config = OptimizerConfig(clip_grad=1.0)
+            self.norm = torch.tensor([norm], device="cuda", dtype=torch.float32)
+            self.group = group
+            self.is_stub_optimizer = False
+            self.model_chunks = []
+
+        def get_grad_stats_parallel_group(self):
+            return self.group
+
+        def get_grad_norm(self):
+            return self.norm
+
+    chained = ChainedOptimizer([MockOptimizer(1.7, "dp"), MockOptimizer(0.3, "dp-ep")])
+    norm = chained.get_grad_norm()
+    assert isinstance(norm, torch.Tensor) and norm.dtype == torch.float64
+    squares = (
+        torch.tensor([1.7], dtype=torch.float32) ** 2
+        + torch.tensor([0.3], dtype=torch.float32) ** 2
+    )
+    assert norm.item() == math.sqrt(squares)

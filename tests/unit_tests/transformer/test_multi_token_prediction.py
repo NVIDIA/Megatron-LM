@@ -2619,3 +2619,61 @@ class TestMHCMTPIntegration:
             assert param.main_grad is not None, f"No gradient for {name}"
             if any(n in name for n in hc_param_names):
                 assert not torch.all(param.main_grad == 0), f"Zero gradient for {name}"
+
+
+class TestZigzagPackedRoll:
+    """The zigzag-CP packed roll against a roll of the full packed sequence."""
+
+    @staticmethod
+    def _zigzag_shard(full, cu, cp, rank):
+        """Rows CP rank ``rank`` owns in zigzag layout: per packed sequence, global chunk ``rank``
+        followed by global chunk ``2 * cp - 1 - rank``; empty slots contribute nothing."""
+        parts = []
+        for start, end in zip(cu[:-1], cu[1:]):
+            if end == start:
+                continue
+            chunks = full[..., start:end].chunk(2 * cp, dim=-1)
+            parts += [chunks[rank], chunks[2 * cp - 1 - rank]]
+        return torch.cat(parts, dim=-1)
+
+    @pytest.mark.parametrize("cp", [2, 4])
+    def test_matches_the_roll_of_the_full_packed_sequence(self, cp):
+        if Utils.world_size % cp != 0:
+            pytest.skip(f"world size {Utils.world_size} is not a multiple of cp={cp}")
+        from megatron.core.transformer.multi_token_prediction import (
+            _roll_tensor_packed_seq_zigzag_cp,
+        )
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        try:
+            cp_group = get_context_parallel_group()
+            rank = torch.distributed.get_rank(group=cp_group)
+            # Global packed lengths (multiples of 2 * cp); the empty slot mimics static packed
+            # metadata that repeats a boundary.
+            lengths = [8 * cp, 2 * cp, 0, 6 * cp]
+            cu = [0]
+            for length in lengths:
+                cu.append(cu[-1] + length)
+            total = cu[-1]
+            full = torch.arange(1, 2 * total + 1, device="cuda", dtype=torch.int64).view(2, total)
+            fill = -7
+            expected_full = full.clone()
+            for start, end in zip(cu[:-1], cu[1:]):
+                if end > start:
+                    expected_full[..., start : end - 1] = full[..., start + 1 : end]
+                    expected_full[..., end - 1] = fill
+            local = self._zigzag_shard(full, cu, cp, rank)
+            expected = self._zigzag_shard(expected_full, cu, cp, rank)
+            # Rows beyond the packed data (trailing padding) must come back untouched.
+            pad = torch.full((2, 3), 99, device="cuda", dtype=torch.int64)
+            local = torch.cat([local, pad], dim=-1)
+            expected = torch.cat([expected, pad], dim=-1)
+            cu_seqlens = torch.tensor(cu, device="cuda", dtype=torch.int32)
+
+            rolled = _roll_tensor_packed_seq_zigzag_cp(
+                local, -1, -1, cu_seqlens, cp_group, fill_value=fill
+            )
+
+            assert torch.equal(rolled, expected)
+        finally:
+            Utils.destroy_model_parallel()
