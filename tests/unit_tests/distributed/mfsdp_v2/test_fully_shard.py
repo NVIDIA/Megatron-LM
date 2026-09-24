@@ -918,6 +918,44 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(output, expected_output)
 
 
+def test_fully_shard_shares_class_stream(distributed_setup):
+    """Wrapping must not turn a lazy per-class stream into a per-instance stream."""
+
+    class LinearWithStream(nn.Linear):
+        _stream = None
+
+        @classmethod
+        def get_stream(cls) -> torch.cuda.Stream:
+            if cls._stream is None:
+                cls._stream = torch.cuda.Stream()
+            return cls._stream
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layers = [LinearWithStream(4, 4, device=device) for _ in range(2)]
+
+    with fully_shard_context(device=device):
+        for layer in layers:
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+
+    assert layers[0].get_stream() is layers[1].get_stream()
+
+
+def test_fully_shard_keeps_instance_state_separate(distributed_setup):
+    """Reusing the class must not reuse the FSDP context or parameter groups."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layers = [nn.Linear(4, 4, device=device) for _ in range(2)]
+    for layer in layers:
+        with fully_shard_context(device=device):
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+
+    assert type(layers[0]) is type(layers[1])
+    assert layers[0].context is not layers[1].context
+    assert layers[0].parameter_groups[0] is not layers[1].parameter_groups[0]
+    assert layers[0].weight is not layers[1].weight
+
+
 def test_fully_shard_preserves_parameter_attributes(distributed_setup):
     """Sharded parameters should retain the original model metadata."""
     device = distributed_setup.device
