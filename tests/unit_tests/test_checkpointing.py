@@ -107,6 +107,19 @@ def test_validate_cyclic_dataloader_resume(
         _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
 
 
+def test_validate_cyclic_dataloader_resume_uses_effective_dp_size():
+    args = SimpleNamespace(
+        dataloader_type='cyclic',
+        data_sharding=True,
+        data_parallel_size=8,
+        gtp_weight_remat_size=1,
+        finetune=False,
+    )
+    checkpoint_args = SimpleNamespace(data_parallel_size=4, gtp_weight_remat_size=2)
+
+    _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
+
+
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
     """Dataloader checkpoints use the supplied module groups and canonical model-parallel path.
 

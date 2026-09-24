@@ -201,8 +201,10 @@ def _validate_cyclic_dataloader_resume(args, checkpoint_args, release):
     if not getattr(args, 'data_sharding', False):
         return
 
-    checkpoint_dp = getattr(checkpoint_args, 'data_parallel_size', 0)
-    run_dp = getattr(args, 'data_parallel_size', 0)
+    checkpoint_dp = getattr(checkpoint_args, 'data_parallel_size', 0) * getattr(
+        checkpoint_args, 'gtp_weight_remat_size', 1
+    )
+    run_dp = getattr(args, 'data_parallel_size', 0) * getattr(args, 'gtp_weight_remat_size', 1)
     if checkpoint_dp > 0 and run_dp > 0 and checkpoint_dp != run_dp:
         raise RuntimeError(
             'Cannot resume a sharded cyclic dataloader with a different '
