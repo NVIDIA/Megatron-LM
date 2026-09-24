@@ -3752,6 +3752,7 @@ class CompressedSparseAttention(MegatronModule):
                 kv_reconstruction_parts=kv_reconstruction_parts,
                 out_rope=fused_out_rope,
                 hca_cp_rank=hca_cp_rank,
+                hca_cp_size=cp_size,
             )
         else:
             output = unfused_compressed_sparse_attn(

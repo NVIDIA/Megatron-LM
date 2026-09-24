@@ -30,20 +30,24 @@ def test_cli_default_and_opt_in():
     assert parser.parse_args(["--hca-aligned-backward"]).hca_aligned_backward is True
 
 
-def _metadata(cp_rank=0):
+def _metadata(cp_rank=0, sequence_length=65536, cp_size=16):
     """Make a padded single-sequence pack without allocating full attention inputs."""
-    q = torch.empty(1, device="cuda", dtype=torch.bfloat16).expand(4096, 128, 512)
-    kv = torch.empty(1, device="cuda", dtype=torch.bfloat16).expand(4752, 512)
-    cu = torch.tensor([0] + [65536] * 8, device="cuda", dtype=torch.int32)
+    local_tokens = sequence_length // cp_size
+    compressed_rows = sequence_length // 128 + cp_size
+    q = torch.empty(1, device="cuda", dtype=torch.bfloat16).expand(local_tokens, 128, 512)
+    kv = torch.empty(1, device="cuda", dtype=torch.bfloat16).expand(
+        local_tokens + 128 + compressed_rows, 512
+    )
+    cu = torch.tensor([0] + [sequence_length] * 8, device="cuda", dtype=torch.int32)
     params = PackedSeqParams(
         qkv_format="thd",
         cp_partition_mode="contiguous",
-        cu_seqlens_q=torch.tensor([0, 65533], device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, sequence_length - 3], device="cuda", dtype=torch.int32),
         cu_seqlens_q_padded=cu,
-        max_seqlen_q=65536,
+        max_seqlen_q=sequence_length,
     )
     group = Mock()
-    group.size.return_value = 16
+    group.size.return_value = cp_size
     group.rank.return_value = cp_rank
     return q, kv, params, group
 
@@ -61,7 +65,7 @@ def test_packing_changes_are_rechecked():
     q, kv, params, group = _metadata(cp_rank=15)
     with (
         patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
-        patch.object(hca, "_get_aligned_hca_backward"),
+        patch.object(hca, "_get_aligned_hca_backward", return_value=(Mock(), Mock())),
     ):
         assert _select(q, kv, params, group) == 15
         params.cu_seqlens_q_padded[1] = 32768
@@ -74,7 +78,7 @@ def test_packing_changes_are_rechecked():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "change", ["cp", "partition", "window", "ratio", "boundary", "q", "kv", "dtype", "device"]
+    "change", ["cp", "partition", "window", "ratio", "boundary", "q", "kv", "dtype"]
 )
 def test_unsupported_layout_falls_back(change):
     """Unsupported layouts never import the optional API."""
@@ -82,7 +86,7 @@ def test_unsupported_layout_falls_back(change):
     options = {}
     capability = (10, 3)
     if change == "cp":
-        group.size.return_value = 8
+        group.size.return_value = 2
     elif change == "partition":
         params.cp_partition_mode = "zigzag"
     elif change == "window":
@@ -97,8 +101,6 @@ def test_unsupported_layout_falls_back(change):
         kv = kv[:4740]
     elif change == "dtype":
         q = torch.empty(1, device="cuda", dtype=torch.float16).expand_as(q)
-    else:
-        capability = (10, 0)
     with (
         patch.object(torch.cuda, "get_device_capability", return_value=capability),
         patch.object(hca, "_get_aligned_hca_backward") as loader,
@@ -113,7 +115,7 @@ def test_capture_guards_current_boundaries():
     q, kv, params, group = _metadata()
     with (
         patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
-        patch.object(hca, "_get_aligned_hca_backward"),
+        patch.object(hca, "_get_aligned_hca_backward", return_value=(Mock(), Mock())),
         patch.object(torch, "_assert_async") as guard,
     ):
         assert _select(q, kv, params, group) == 0
@@ -129,48 +131,69 @@ def test_capture_guards_current_boundaries():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("cp_rank", [0, 1, 8, 15])
+@pytest.mark.parametrize(
+    "sequence_length,cp_size,cp_rank",
+    [
+        (65536, 16, 0),
+        (65536, 16, 1),
+        (65536, 16, 8),
+        (65536, 16, 15),
+        (8192, 4, 3),
+        (49152, 8, 7),
+        (10240, 16, 15),
+    ],
+)
 @pytest.mark.parametrize("reconstruct", [False, True])
-def test_stock_gradients_and_bit_exact_graph_replay(cp_rank, reconstruct):
+def test_stock_gradients_and_bit_exact_graph_replay(sequence_length, cp_size, cp_rank, reconstruct):
     """Exercise MCore-generated indices and its actual autograd backward dispatch."""
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("Aligned HCA requires GB300")
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Aligned HCA requires GB300 or Rubin")
     cudnn = pytest.importorskip("cudnn")
     if not hasattr(cudnn, "aligned_hca_backward_wrapper"):
         pytest.skip("cuDNN Frontend aligned HCA API is not installed")
     pytest.importorskip("flash_mla")
     torch.manual_seed(9100 + cp_rank)
-    _, _, params, group = _metadata(cp_rank)
+    local_tokens = sequence_length // cp_size
+    compressed_rows = sequence_length // 128 + cp_size
+    _, _, params, group = _metadata(cp_rank, sequence_length, cp_size)
     cu = params.cu_seqlens_q_padded
-    comp = layout.build_cp_compressor_layout(cu, cp_rank * 4096, 4096, 16, 128)
+    comp = layout.build_cp_compressor_layout(cu, cp_rank * local_tokens, local_tokens, cp_size, 128)
     indices, lengths, _, _ = layout.build_attention_indices(
         cu,
-        cp_rank * 4096,
-        4096,
+        cp_rank * local_tokens,
+        local_tokens,
         128,
         128,
         128,
-        512,
+        sequence_length // 128,
         cu_seqlens_compressed=comp.cu_seqlens_compressed,
         seq_to_rank_row=comp.seq_to_rank_row,
-        compressed_rows=528,
+        compressed_rows=compressed_rows,
         output_alignment=64,
     )
-    q = torch.randn(4096, 128, 512, device="cuda", dtype=torch.bfloat16).requires_grad_()
-    kv = torch.randn(4752, 512, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    q = torch.randn(local_tokens, 128, 512, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    kv = torch.randn(
+        local_tokens + 128 + compressed_rows, 512, device="cuda", dtype=torch.bfloat16
+    ).requires_grad_()
     sink = torch.randn(128, device="cuda", dtype=torch.float32).requires_grad_()
-    grad = torch.randn_like(q).reshape(4096, -1)
-    parts = tuple(part.detach() for part in kv.split((128, 4096, 528))) if reconstruct else None
+    grad = torch.randn_like(q).reshape(local_tokens, -1)
+    parts = (
+        tuple(part.detach() for part in kv.split((128, local_tokens, compressed_rows)))
+        if reconstruct
+        else None
+    )
     rope = None
     if reconstruct:
-        angles = torch.randn(65536, 32, device="cuda")
+        angles = torch.randn(sequence_length, 32, device="cuda")
         rope = sparse.OutputRopeParams(
-            cos=angles.cos().repeat(1, 2).to(torch.bfloat16).view(65536, 1, 1, 64),
-            sin=angles.sin().repeat(1, 2).to(torch.bfloat16).view(65536, 1, 1, 64),
+            cos=angles.cos().repeat(1, 2).to(torch.bfloat16).view(sequence_length, 1, 1, 64),
+            sin=angles.sin().repeat(1, 2).to(torch.bfloat16).view(sequence_length, 1, 1, 64),
             nope_dim=448,
             pos_dim=64,
             cu_seqlens_q=cu,
-            position_ids=torch.arange(cp_rank * 4096, (cp_rank + 1) * 4096, device="cuda"),
+            position_ids=torch.arange(
+                cp_rank * local_tokens, (cp_rank + 1) * local_tokens, device="cuda"
+            ),
         )
 
     def run(rank):
@@ -184,6 +207,7 @@ def test_stock_gradients_and_bit_exact_graph_replay(cp_rank, reconstruct):
             is_thd=True,
             kv_reconstruction_parts=parts,
             hca_cp_rank=rank,
+            hca_cp_size=cp_size,
             out_rope=rope,
         )
         return torch.autograd.grad(output, (q, kv, sink), grad.clone())
@@ -208,3 +232,18 @@ def test_stock_gradients_and_bit_exact_graph_replay(cp_rank, reconstruct):
             assert torch.equal(
                 got.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "sequence_length,cp_size", [(8192, 4), (49152, 8), (10240, 16), (131072, 4)]
+)
+def test_frontend_capability_controls_dispatch(sequence_length, cp_size):
+    q, kv, params, group = _metadata(cp_size - 1, sequence_length, cp_size)
+    api = Mock()
+    with patch.object(hca, "_get_aligned_hca_backward", return_value=(api, Mock())):
+        api.supports_configuration.return_value = True
+        assert _select(q, kv, params, group) == cp_size - 1
+        api.supports_configuration.assert_called_with(sequence_length // cp_size, cp_size, q.device)
+        api.supports_configuration.return_value = False
+        assert _select(q, kv, params, group) is None

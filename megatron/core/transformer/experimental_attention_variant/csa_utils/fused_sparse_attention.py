@@ -1510,6 +1510,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
         out_rope: Optional[OutputRopeParams] = None,
         hca_cp_rank: Optional[int] = None,
+        hca_cp_size: int = 16,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _csa_fwd_flash_mla(
@@ -1538,6 +1539,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         ctx.topk_length = topk_length
         ctx.out_rope = out_rope
         ctx.hca_cp_rank = hca_cp_rank
+        ctx.hca_cp_size = hca_cp_size
         return out, lse, lse_indexer
 
     @staticmethod
@@ -1564,6 +1566,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
                 lse,
                 attn_sink,
                 cp_rank=ctx.hca_cp_rank,
+                cp_size=ctx.hca_cp_size,
                 softmax_scale=ctx.softmax_scale,
             )
         else:
@@ -1579,7 +1582,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
                 topk_length=ctx.topk_length,
             )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -1594,6 +1597,7 @@ def csa_sparse_attn(
     kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
     out_rope: Optional[OutputRopeParams] = None,
     hca_cp_rank: Optional[int] = None,
+    hca_cp_size: int = 16,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -1672,6 +1676,7 @@ def csa_sparse_attn(
         kv_reconstruction_parts,
         out_rope,
         hca_cp_rank,
+        hca_cp_size,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
