@@ -15,14 +15,27 @@ from megatron.core.transformer.streamwise_residual_ops import (
 )
 
 
-def _reference_read(residual: torch.Tensor, factors: torch.Tensor) -> torch.Tensor:
-    """Apply the streamwise read equation without using the production helper."""
+def _reference_accumulation_dtype(*tensors: torch.Tensor) -> torch.dtype:
+    return (
+        torch.float64 if any(tensor.dtype == torch.float64 for tensor in tensors) else torch.float32
+    )
+
+
+def _reference_read(
+    residual: torch.Tensor, factors: torch.Tensor, *, output_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Apply the streamwise read equation with FP32 controller arithmetic."""
 
     num_streams = factors.numel()
     stream_width = residual.shape[-1] // num_streams
-    streams = residual.reshape(*residual.shape[:-1], num_streams, stream_width)
+    accumulation_dtype = _reference_accumulation_dtype(residual, factors)
+    streams = residual.reshape(*residual.shape[:-1], num_streams, stream_width).to(
+        accumulation_dtype
+    )
+    factors = factors.to(device=residual.device, dtype=accumulation_dtype)
     factor_shape = (1,) * (residual.ndim - 1) + (num_streams, 1)
-    return (streams * factors.reshape(factor_shape)).sum(dim=-2)
+    output = (streams * factors.reshape(factor_shape)).sum(dim=-2)
+    return output.to(residual.dtype if output_dtype is None else output_dtype)
 
 
 def _reference_writeback(
@@ -31,17 +44,27 @@ def _reference_writeback(
     write_factors: torch.Tensor,
     retention_factors: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Apply the streamwise retained write equation directly."""
+    """Apply the retained write equation with FP32 controller arithmetic."""
 
     num_streams = write_factors.numel()
     stream_width = residual.shape[-1] // num_streams
-    streams = residual.reshape(*residual.shape[:-1], num_streams, stream_width)
+    accumulation_inputs = [residual, update, write_factors]
+    if retention_factors is not None:
+        accumulation_inputs.append(retention_factors)
+    accumulation_dtype = _reference_accumulation_dtype(*accumulation_inputs)
+    streams = residual.reshape(*residual.shape[:-1], num_streams, stream_width).to(
+        accumulation_dtype
+    )
+    update = update.to(accumulation_dtype)
+    write_factors = write_factors.to(accumulation_dtype)
     factor_shape = (1,) * (residual.ndim - 1) + (num_streams, 1)
     output = (
-        streams if retention_factors is None else streams * retention_factors.reshape(factor_shape)
+        streams
+        if retention_factors is None
+        else streams * retention_factors.to(accumulation_dtype).reshape(factor_shape)
     )
     output = output + update.unsqueeze(-2) * write_factors.reshape(factor_shape)
-    return output.reshape_as(residual)
+    return output.to(residual.dtype).reshape_as(residual)
 
 
 @pytest.mark.parametrize("stream_width", [5, 10, 20])
@@ -64,6 +87,33 @@ def test_native_streamwise_forward_matches_equation(stream_width):
 
     assert torch.allclose(native_read, reference_read, atol=1.0e-12, rtol=1.0e-12)
     assert torch.allclose(native_write, reference_write, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_native_bf16_keeps_controller_arithmetic_in_fp32_until_output_store():
+    """BF16 activations must not force intermediate controller-factor rounding."""
+
+    torch.manual_seed(0)
+    residual = torch.randn(4, 3 * 8, dtype=torch.bfloat16)
+    update = torch.randn(4, 8, dtype=torch.bfloat16)
+    read_factors = torch.sigmoid(torch.randn(3, dtype=torch.float32))
+    write_factors = 2.0 * torch.sigmoid(torch.randn(3, dtype=torch.float32))
+    retention_factors = 1.0 - 0.2 * torch.sigmoid(-torch.randn(3, dtype=torch.float32))
+
+    read = streamwise_read(residual, read_factors)
+    write = streamwise_writeback(
+        residual, update, write_factors, retention_factors=retention_factors
+    )
+    reference_read = _reference_read(residual, read_factors)
+    reference_write = _reference_writeback(residual, update, write_factors, retention_factors)
+    rounded_read = _reference_read(residual, read_factors.to(torch.bfloat16))
+    rounded_write = _reference_writeback(
+        residual, update, write_factors.to(torch.bfloat16), retention_factors.to(torch.bfloat16)
+    )
+
+    assert torch.equal(read, reference_read)
+    assert torch.equal(write, reference_write)
+    assert not torch.equal(read, rounded_read)
+    assert not torch.equal(write, rounded_write)
 
 
 @pytest.mark.parametrize("stream_width", [4, 8])
@@ -131,7 +181,7 @@ def test_native_streamwise_rejects_incompatible_shapes():
     with pytest.raises(ValueError, match="same device"):
         streamwise_writeback(torch.randn(2, 12), torch.empty(2, 4, device="meta"), torch.randn(3))
 
-    with pytest.raises(ValueError, match="same dtype"):
+    with pytest.raises(ValueError, match="must either match"):
         streamwise_writeback(
             torch.randn(2, 12, dtype=torch.float32),
             torch.randn(2, 4, dtype=torch.float64),
@@ -198,8 +248,8 @@ def test_raw_logit_cpu_fallback_matches_factor_reference_and_padding_gradients()
         assert torch.count_nonzero(gradient[num_streams:]) == 0
 
 
-def test_raw_logit_cpu_fallback_read_output_dtype_matches_explicit_cast():
-    """The fallback preserves the same forward and backward cast composition as Triton."""
+def test_raw_logit_cpu_fallback_read_output_dtype_matches_fp32_reference():
+    """The fallback accumulates in FP32 before storing the requested output dtype."""
 
     torch.manual_seed(1357)
     num_streams = 3
@@ -212,8 +262,10 @@ def test_raw_logit_cpu_fallback_read_output_dtype_matches_explicit_cast():
     output = streamwise_sigmoid_read(
         residual, read_logits, num_streams, output_dtype=torch.bfloat16
     )
-    reference = streamwise_sigmoid_read(reference_residual, reference_logits, num_streams).to(
-        torch.bfloat16
+    reference = _reference_read(
+        reference_residual,
+        torch.sigmoid(reference_logits[:num_streams].float()),
+        output_dtype=torch.bfloat16,
     )
     gradients = torch.autograd.grad(output, (residual, read_logits), grad_output)
     reference_gradients = torch.autograd.grad(
@@ -222,13 +274,13 @@ def test_raw_logit_cpu_fallback_read_output_dtype_matches_explicit_cast():
 
     assert output.dtype == torch.bfloat16
     assert torch.equal(output, reference)
-    for gradient, reference_gradient in zip(gradients, reference_gradients):
-        assert gradient.dtype == reference_gradient.dtype
-        assert torch.equal(gradient, reference_gradient)
+    assert torch.equal(gradients[0], reference_gradients[0])
+    assert gradients[1].dtype == reference_gradients[1].dtype
+    assert _relative_l2(gradients[1], reference_gradients[1]) <= 1.0e-6
 
 
-def test_raw_logit_cpu_fallback_mixed_write_matches_explicit_cast():
-    """The fallback accepts the fused API but materializes the reference cast."""
+def test_raw_logit_cpu_fallback_mixed_write_matches_fp32_reference():
+    """The fallback promotes a lower-precision update only for FP32 arithmetic."""
 
     torch.manual_seed(2468)
     num_streams = 3
@@ -241,8 +293,11 @@ def test_raw_logit_cpu_fallback_mixed_write_matches_explicit_cast():
     grad_output = torch.randn_like(residual)
 
     output = streamwise_sigmoid_writeback(residual, update, write_logits, num_streams)
-    reference = streamwise_sigmoid_writeback(
-        reference_residual, reference_update.float(), reference_logits, num_streams
+    reference = _reference_writeback(
+        reference_residual,
+        reference_update,
+        2.0 * torch.sigmoid(reference_logits[:num_streams].float()),
+        None,
     )
     gradients = torch.autograd.grad(output, (residual, update, write_logits), grad_output)
     reference_gradients = torch.autograd.grad(
@@ -250,10 +305,12 @@ def test_raw_logit_cpu_fallback_mixed_write_matches_explicit_cast():
     )
 
     assert output.dtype == torch.float32
-    assert torch.equal(output, reference)
+    torch.testing.assert_close(output, reference, rtol=1.0e-6, atol=1.0e-6)
     for gradient, reference_gradient in zip(gradients, reference_gradients):
         assert gradient.dtype == reference_gradient.dtype
-        assert torch.equal(gradient, reference_gradient)
+    assert torch.equal(gradients[0], reference_gradients[0])
+    assert _relative_l2(gradients[1], reference_gradients[1]) <= 0.02
+    assert _relative_l2(gradients[2], reference_gradients[2]) <= 1.0e-6
 
 
 def test_raw_logit_api_validates_padded_controllers():
@@ -348,16 +405,12 @@ def _run_reference_cuda_case(
     grad_output: torch.Tensor,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     num_streams = 3
-    read_factors = torch.sigmoid(read_logits[:num_streams].float()).to(dtype=residual.dtype)
-    write_factors = (2.0 * torch.sigmoid(write_logits[:num_streams].float())).to(
-        dtype=residual.dtype
-    )
+    read_factors = torch.sigmoid(read_logits[:num_streams].float())
+    write_factors = 2.0 * torch.sigmoid(write_logits[:num_streams].float())
     retention_factors = (
         None
         if retention_logits is None
-        else (1.0 - 0.2 * torch.sigmoid(-retention_logits[:num_streams].float())).to(
-            dtype=residual.dtype
-        )
+        else 1.0 - 0.2 * torch.sigmoid(-retention_logits[:num_streams].float())
     )
     read = _reference_read(residual, read_factors)
     output = _reference_writeback(residual, update + 0.125 * read, write_factors, retention_factors)
@@ -436,8 +489,8 @@ def test_streamwise_triton_fp32_selector_respects_geometry_and_layout():
     ],
     ids=("fp32_to_bf16", "fp32_to_fp16", "bf16_to_fp32", "bf16_to_fp16", "fp16_to_bf16"),
 )
-def test_fused_cuda_read_output_dtype_matches_explicit_cast(input_dtype, output_dtype):
-    """Fusing the terminal read cast must preserve its forward and backward semantics."""
+def test_fused_cuda_read_output_dtype_matches_fp32_reference(input_dtype, output_dtype):
+    """The fused read accumulates in FP32 before its terminal output conversion."""
 
     torch.manual_seed(9753)
     num_streams = 3
@@ -451,9 +504,16 @@ def test_fused_cuda_read_output_dtype_matches_explicit_cast(input_dtype, output_
     grad_output = torch.randn(256, stream_width, device="cuda", dtype=output_dtype)
 
     output = streamwise_sigmoid_read(residual, read_logits, num_streams, output_dtype=output_dtype)
-    reference = streamwise_sigmoid_read(reference_residual, reference_logits, num_streams).to(
-        output_dtype
+    reference = _reference_read(
+        reference_residual,
+        torch.sigmoid(reference_logits[:num_streams].float()),
+        output_dtype=output_dtype,
     )
+    rounded_reference = _reference_read(
+        reference_residual.detach(),
+        torch.sigmoid(reference_logits[:num_streams].float()).to(input_dtype),
+        output_dtype=input_dtype,
+    ).to(output_dtype)
     gradients = torch.autograd.grad(output, (residual, read_logits), grad_output)
     reference_gradients = torch.autograd.grad(
         reference, (reference_residual, reference_logits), grad_output
@@ -461,12 +521,15 @@ def test_fused_cuda_read_output_dtype_matches_explicit_cast(input_dtype, output_
 
     assert output.dtype == output_dtype
     assert type(output.grad_fn).__name__ == "_StreamwiseSigmoidReadBackward"
-    assert torch.equal(output, reference)
-    assert torch.equal(gradients[0], reference_gradients[0])
-    assert gradients[1].dtype == reference_gradients[1].dtype
-    # The fused and explicit-cast graphs specialize the controller reduction on different
-    # grad-output pointer dtypes, so controller gradients are numerically rather than bitwise
-    # equivalent. Activation gradients remain bitwise equal.
+    torch.testing.assert_close(output, reference)
+    if input_dtype != torch.float32:
+        assert _relative_l2(output, reference) < _relative_l2(output, rounded_reference)
+    for gradient, reference_gradient in zip(gradients, reference_gradients):
+        assert gradient.dtype == reference_gradient.dtype
+    # Triton and PyTorch use different sigmoid implementations, and their controller-gradient
+    # reductions have different schedules, so both gradients are numerically rather than
+    # bitwise equivalent.
+    assert _relative_l2(gradients[0], reference_gradients[0]) <= 1.0e-6
     assert _relative_l2(gradients[1], reference_gradients[1]) <= 1.0e-6
     assert torch.count_nonzero(gradients[1][num_streams:]) == 0
 
@@ -477,8 +540,8 @@ def test_fused_cuda_read_output_dtype_matches_explicit_cast(input_dtype, output_
 )
 @pytest.mark.parametrize("update_dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
 @pytest.mark.parametrize("use_retention", [False, True], ids=("identity", "retention"))
-def test_fused_cuda_mixed_write_matches_explicit_cast(update_dtype, use_retention):
-    """The mixed write fuses only the update's terminal conversion to residual dtype."""
+def test_fused_cuda_mixed_write_matches_fp32_reference(update_dtype, use_retention):
+    """The mixed write promotes its update in registers for FP32 residual arithmetic."""
 
     torch.manual_seed(8642)
     num_streams = 3
@@ -503,13 +566,15 @@ def test_fused_cuda_mixed_write_matches_explicit_cast(update_dtype, use_retentio
         retention_logits=retention_logits if use_retention else None,
         retention_max_forget=0.2 if use_retention else 0.0,
     )
-    reference = streamwise_sigmoid_writeback(
+    reference = _reference_writeback(
         reference_residual,
-        reference_update.float(),
-        reference_write_logits,
-        num_streams,
-        retention_logits=reference_retention_logits if use_retention else None,
-        retention_max_forget=0.2 if use_retention else 0.0,
+        reference_update,
+        2.0 * torch.sigmoid(reference_write_logits[:num_streams].float()),
+        (
+            1.0 - 0.2 * torch.sigmoid(-reference_retention_logits[:num_streams].float())
+            if use_retention
+            else None
+        ),
     )
     inputs = (residual, update, write_logits)
     reference_inputs = (reference_residual, reference_update, reference_write_logits)
@@ -521,11 +586,13 @@ def test_fused_cuda_mixed_write_matches_explicit_cast(update_dtype, use_retentio
 
     assert output.dtype == torch.float32
     assert type(output.grad_fn).__name__ == "_StreamwiseSigmoidWritebackBackward"
-    torch.testing.assert_close(output, reference, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(output, reference, rtol=1.0e-6, atol=1.0e-6)
     for index, (gradient, reference_gradient) in enumerate(zip(gradients, reference_gradients)):
         assert gradient.dtype == reference_gradient.dtype
-        if index < 2:
+        if index == 0:
             torch.testing.assert_close(gradient, reference_gradient, rtol=0.0, atol=0.0)
+        elif index == 1:
+            assert _relative_l2(gradient, reference_gradient) <= 0.02
         else:
             assert _relative_l2(gradient, reference_gradient) <= 1.0e-6
     assert gradients[0].dtype == torch.float32
@@ -754,18 +821,16 @@ def test_fused_cuda_forward_only_context_matches_reference(
             retention_max_forget=max_forget if use_retention else 0.0,
         )
 
-        reference_read = _reference_read(
-            residual, torch.sigmoid(read_logits[:num_streams].float()).to(dtype=activation_dtype)
-        )
+        reference_read = _reference_read(residual, torch.sigmoid(read_logits[:num_streams].float()))
         retention_factors = None
         if use_retention:
-            retention_factors = (
-                1.0 - max_forget * torch.sigmoid(-retention_logits[:num_streams].float())
-            ).to(dtype=activation_dtype)
+            retention_factors = 1.0 - max_forget * torch.sigmoid(
+                -retention_logits[:num_streams].float()
+            )
         reference_output = _reference_writeback(
             residual,
             update + 0.125 * reference_read,
-            (2.0 * torch.sigmoid(write_logits[:num_streams].float())).to(dtype=activation_dtype),
+            2.0 * torch.sigmoid(write_logits[:num_streams].float()),
             retention_factors,
         )
         read_error = _relative_l2(read, reference_read)
@@ -918,15 +983,13 @@ def test_decode_sized_forward_only_fuses_and_matches_reference(context_factory, 
     assert event_names.isdisjoint(forbidden), sorted(event_names & forbidden)
 
     reference_read = _reference_read(
-        residual_source, torch.sigmoid(read_logits[:num_streams].float()).to(torch.bfloat16)
+        residual_source, torch.sigmoid(read_logits[:num_streams].float())
     )
     reference_output = _reference_writeback(
         residual_source,
         update_source + 0.125 * reference_read,
-        (2.0 * torch.sigmoid(write_logits[:num_streams].float())).to(torch.bfloat16),
-        (1.0 - max_forget * torch.sigmoid(-retention_logits[:num_streams].float())).to(
-            torch.bfloat16
-        ),
+        2.0 * torch.sigmoid(write_logits[:num_streams].float()),
+        1.0 - max_forget * torch.sigmoid(-retention_logits[:num_streams].float()),
     )
     assert _relative_l2(read_value, reference_read) <= 0.02
     assert _relative_l2(output_value, reference_output) <= 0.02
