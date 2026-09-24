@@ -23,6 +23,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _validate_cyclic_dataloader_resume,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -74,6 +75,34 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@pytest.mark.parametrize(
+    'dataloader_type,finetune,release,checkpoint_dp,run_dp,raises',
+    [
+        ('cyclic', False, False, 4, 8, True),
+        ('cyclic', False, False, 4, 4, False),
+        ('cyclic', False, False, 0, 8, False),
+        ('single', False, False, 4, 8, False),
+        ('cyclic', True, False, 4, 8, False),
+        ('cyclic', False, True, 4, 8, False),
+    ],
+)
+def test_validate_cyclic_dataloader_resume(
+    dataloader_type, finetune, release, checkpoint_dp, run_dp, raises
+):
+    args = SimpleNamespace(
+        dataloader_type=dataloader_type,
+        data_parallel_size=run_dp,
+        finetune=finetune,
+    )
+    checkpoint_args = SimpleNamespace(data_parallel_size=checkpoint_dp)
+
+    if raises:
+        with pytest.raises(RuntimeError, match='different data-parallel size'):
+            _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
+    else:
+        _validate_cyclic_dataloader_resume(args, checkpoint_args, release)
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
