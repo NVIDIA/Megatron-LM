@@ -728,6 +728,7 @@ def test_multi_axis_view_and_redistribute(distributed_setup, destination):
 @pytest.mark.parametrize(
     "old_placements,new_placements",
     [
+        ([RowAtomic(), RowAtomic()], [RowAtomic(), RowAtomic()]),
         ([Partial(), Partial()], [Replicate(), Replicate()]),
         ([Partial(), Partial()], [RowAtomic(), RowAtomic()]),
         ([Partial(), Partial()], [Replicate(), RowAtomic()]),
