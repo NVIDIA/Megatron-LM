@@ -391,11 +391,11 @@ class DBuffer:
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
     ) -> "DBuffer":
-        """Redistribute this buffer to ``new_placements``.
+        """Apply placement transitions one axis at a time.
 
-        Shard -> Replicate gathers and Replicate -> Shard views may change multiple
-        axes. Partial -> Replicate, Partial -> Shard, and Replicate -> Partial
-        transitions change one axis at a time. Other changes are unsupported.
+        Remove shards outer-to-inner and add shards inner-to-outer so sharded
+        axes remain a suffix throughout. Gather destinations share the final
+        output allocation; shrinking reductions may need intermediate buffers.
         """
         new_placements = tuple(new_placements)
         if len(new_placements) != self.mesh.ndim:
@@ -404,65 +404,60 @@ class DBuffer:
                 f"{len(new_placements)}."
             )
         _validate_placements(new_placements)
-
-        changed_axes = [
-            axis
-            for axis, (source, destination) in enumerate(zip(self.placements, new_placements))
-            if source != destination
-        ]
-        if not changed_axes:
-            if out is None:
-                return self
-            out = self._create_or_validate_out(out, placements=new_placements)
-            out.local_buffer.copy_(self.local_buffer)
-            return out
-
-        if all(
-            isinstance(self.placements[axis], Shard) and isinstance(new_placements[axis], Replicate)
-            for axis in changed_axes
+        # Fuse pure gather redistributions; other transitions use the per-axis dispatcher.
+        if self.placements != new_placements and all(
+            old == new or (isinstance(old, Shard) and isinstance(new, Replicate))
+            for old, new in zip(self.placements, new_placements)
         ):
-            return self.allgather(changed_axes, out=out)
-        if all(
-            isinstance(self.placements[axis], Replicate) and isinstance(new_placements[axis], Shard)
-            for axis in changed_axes
-        ):
-            view = self.view(new_placements)
-            if out is None:
-                return view
-            out = self._create_or_validate_out(out, placements=new_placements)
-            out.local_buffer.copy_(view.local_buffer)
-            return out
+            axes = [
+                axis
+                for axis, (old, new) in enumerate(zip(self.placements, new_placements))
+                if old != new
+            ]
+            return self.allgather(axes, out=out)
+        if out is not None:
+            self._create_or_validate_out(out, placements=new_placements)
 
-        if len(changed_axes) != 1:
-            raise NotImplementedError(
-                "Only Shard <-> Replicate redistribution supports multiple changed axes."
-            )
-        axis = changed_axes[0]
-        old_placement = self.placements[axis]
-        new_placement = new_placements[axis]
-        if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
-            return self.allreduce(axis, out=out)
-        if isinstance(old_placement, Partial) and isinstance(new_placement, Shard):
-            return self.reduce_scatter(axis, new_placement, out=out)
-        if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
-            # Replicate and Partial share the same local layout, so relabel the
-            # buffer without communication. Value-preserving for AVG only -- the
-            # mean of identical per-rank locals is that value; SUM would need a
-            # 1/axis_size rescale, which no caller needs.
-            if new_placement.reduce_op != "avg":
+        transitions = list(enumerate(zip(self.placements, new_placements)))
+        if any(
+            not isinstance(old, Shard) and isinstance(new, Shard) for _, (old, new) in transitions
+        ):
+            transitions.reverse()
+
+        result = self
+        for axis, (old, new) in transitions:
+            if old == new:
+                continue
+            placements = list(result.placements)
+            placements[axis] = new
+            step_out = out if tuple(placements) == new_placements else None
+            if isinstance(old, Shard) and isinstance(new, Replicate):
+                out = self._create_or_validate_out(out, placements=new_placements)
+                result = result.allgather(axis, out=out.view(placements))
+            elif isinstance(old, Partial) and isinstance(new, Replicate):
+                result = result.allreduce(axis, out=step_out)
+            elif isinstance(old, Partial) and isinstance(new, Shard):
+                result = result.reduce_scatter(axis, new, out=step_out)
+            elif isinstance(old, Replicate) and isinstance(new, Shard):
+                result = result.view(placements)
+            elif isinstance(old, Replicate) and isinstance(new, Partial):
+                # Relabeling replicas preserves AVG, but SUM would multiply the value.
+                if new.reduce_op != "avg":
+                    raise NotImplementedError(
+                        "Replicate -> Partial redistribute supports AVG only, got "
+                        f"{new.reduce_op!r}."
+                    )
+                result = DBuffer.from_local(result.local_buffer, self.mesh, placements, self.layout)
+            else:
                 raise NotImplementedError(
-                    "Replicate -> Partial redistribute supports AVG only, got "
-                    f"{new_placement.reduce_op!r}."
+                    f"Unsupported DBuffer placement transition on axis {axis}: {old!r} -> {new!r}."
                 )
-            if out is not None:
-                raise NotImplementedError(
-                    "Replicate -> Partial redistribute does not support an out buffer."
-                )
-            return DBuffer.from_local(self.local_buffer, self.mesh, new_placements, self.layout)
-        raise NotImplementedError(
-            "Unsupported DBuffer placement transition on axis "
-            f"{axis}: {old_placement!r} -> {new_placement!r}."
-        )
+
+        if out is None:
+            return result
+        if result is not out:
+            out.local_buffer.copy_(result.local_buffer)
+        return out
 
     def allgather(
         self, mesh_axis: int | Iterable[int], *, out: "DBuffer | None" = None

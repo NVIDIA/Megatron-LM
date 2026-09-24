@@ -760,6 +760,47 @@ def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes):
         torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
 
 
+@pytest.mark.parametrize("use_out", [False, True])
+@pytest.mark.parametrize(
+    "old_placements,new_placements",
+    [
+        ([Partial(), Partial()], [Replicate(), Replicate()]),
+        ([Partial(), Partial()], [RowAtomic(), RowAtomic()]),
+        ([Partial(), Partial()], [Replicate(), RowAtomic()]),
+        ([Replicate(), Partial()], [Partial("avg"), RowAtomic()]),
+        ([Partial(), RowAtomic()], [Replicate(), Replicate()]),
+    ],
+)
+def test_multi_axis_redistribute_reductions(
+    distributed_setup, old_placements, new_placements, use_out
+):
+    """Compose reductions, slices, gathers, and relabels in a valid axis order."""
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    local_scale = reduced_scale = 1
+    for axis, placement in enumerate(old_placements):
+        if isinstance(placement, Partial):
+            local_scale *= mesh.get_local_rank(axis) + 1
+            reduced_scale *= mesh.size(axis) * (mesh.size(axis) + 1) // 2
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source = DBuffer.distribute_tensors(
+        [tensor * local_scale for tensor in tensors], mesh, old_placements
+    )
+    expected = DBuffer.distribute_tensors(
+        [tensor * reduced_scale for tensor in tensors], mesh, new_placements
+    )
+    out = None
+    if use_out:
+        out = DBuffer(mesh, new_placements, source.layout, source.dtype, source.device)
+    result = source.redistribute(new_placements, out=out)
+    if out is not None:
+        assert result is out
+    assert result.placements == tuple(new_placements)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
+
+
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
