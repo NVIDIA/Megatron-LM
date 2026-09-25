@@ -41,6 +41,10 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     DynamicInferenceEvent,
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -89,6 +93,111 @@ from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
 # that start with ``_`` (see ``endpoints.common.validate_offload_params``), so
 # this namespace cannot be forged from a request body.
 _PROMPT_PREPARATION_ERROR_FIELD = "_request_prompt_preparation_error"
+
+_MULTIMODAL_STITCHING_FIELDS = {
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD: (
+        "a nonnegative integer counting the exact, already-expanded previous-turn tokens "
+        "at the start of the prompt"
+    ),
+    PREFIX_MEDIA_COUNT_FIELD: (
+        "a nonnegative integer counting logical image/video items in the previous prefix"
+    ),
+}
+
+
+def _take_expanded_prefix_stitching_metadata(offload_params):
+    """Remove and return engine-private expanded-prefix stitching metadata."""
+    if not isinstance(offload_params, dict):
+        return None, offload_params
+
+    required_fields = set(_MULTIMODAL_STITCHING_FIELDS)
+    if not required_fields.intersection(offload_params):
+        return None, offload_params
+
+    missing_fields = required_fields.difference(offload_params)
+    if missing_fields:
+        missing = "; ".join(
+            f"{field!r}: {_MULTIMODAL_STITCHING_FIELDS[field]}" for field in sorted(missing_fields)
+        )
+        raise ValueError(
+            "Incomplete multimodal expanded-prefix stitching metadata. "
+            f"Missing {missing}. A RequestPromptPreparer must be configured and return the "
+            "stitched prompt with its expanded prefix token count."
+        )
+
+    for field in required_fields:
+        value = offload_params[field]
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"Invalid multimodal stitching field {field!r}: "
+                f"expected {_MULTIMODAL_STITCHING_FIELDS[field]}."
+            )
+
+    metadata = {field: offload_params[field] for field in required_fields}
+    consumed_fields = required_fields | {PREFIX_TEMPLATE_TOKEN_IDS_FIELD, PREFIX_EOS_TOKEN_ID_FIELD}
+    remaining = {key: value for key, value in offload_params.items() if key not in consumed_fields}
+    return metadata, remaining or None
+
+
+def _prepend_expanded_multimodal_prefix(
+    prefix_tokens, suffix_tokens, suffix_mask, inference_wrapper, modality
+):
+    """Prepend exact prior model tokens to an expanded current-turn suffix."""
+    prefix_mask = inference_wrapper.build_preexpanded_media_token_mask(prefix_tokens, modality)
+
+    # Offset suffix mask positions so we inject the suffix embeddings correctly.
+    # For example: [ -1 0 1 2 -1 ] is the prefix mask, then the suffix mask
+    # needs to at least start at 3, or else the first prefix embedding will be
+    # used for the first suffix embedding.
+    prefix_embedding_count = int((prefix_mask >= 0).sum().item())
+    suffix_mask = suffix_mask.clone()
+    suffix_media_positions = suffix_mask >= 0
+    suffix_mask[suffix_media_positions] += prefix_embedding_count
+
+    return torch.cat((prefix_tokens, suffix_tokens)), torch.cat((prefix_mask, suffix_mask))
+
+
+def _slice_suffix_media_metadata(
+    prefix_media_count, *, num_tiles, imgs_sizes, num_frames, video_frame_indices, video_fps
+):
+    """Select metadata for media placeholders occurring in the compact suffix."""
+    if not isinstance(prefix_media_count, int) or prefix_media_count < 0:
+        raise ValueError("Expanded-prefix stitching requires a nonnegative prefix media count.")
+
+    # Retrieve the total media count and offset into the media data.
+    if num_frames is not None:
+        # Number of frame groups (such as videos or tubelets).
+        total_media_count = len(num_frames)
+        prefix_media_offset = int(num_frames[:prefix_media_count].sum().item())
+    elif imgs_sizes is not None:
+        # Number of frames.
+        total_media_count = len(imgs_sizes)
+        prefix_media_offset = prefix_media_count
+    elif num_tiles is not None:
+        # Number of tiles.
+        total_media_count = len(num_tiles)
+        prefix_media_offset = 0
+    else:
+        total_media_count = 0
+        prefix_media_offset = 0
+
+    if prefix_media_count > total_media_count:
+        raise ValueError(
+            "Expanded-prefix stitching prefix media count exceeds the request media count: "
+            f"prefix={prefix_media_count}, total={total_media_count}."
+        )
+
+    return {
+        "suffix_media_count": total_media_count - prefix_media_count,
+        "num_tiles": (num_tiles[prefix_media_count:] if num_tiles is not None else None),
+        "imgs_sizes": (imgs_sizes[prefix_media_offset:] if imgs_sizes is not None else None),
+        "num_frames": (num_frames[prefix_media_count:] if num_frames is not None else None),
+        "video_frame_indices": (
+            video_frame_indices[prefix_media_count:] if video_frame_indices is not None else None
+        ),
+        "video_fps": (video_fps[prefix_media_count:] if video_fps is not None else None),
+    }
+
 
 # Wire encoding of a None offload frame: msgpack nil is the single byte 0xc0,
 # i.e. ``msgpack.packb(None, use_bin_type=True)``. Spelled as a literal because
@@ -695,7 +804,6 @@ class DynamicInferenceEngine(AbstractEngine):
             request = entry.record[-1]
             if isinstance(request, DynamicVLMInferenceRequest):
                 request.image_embeddings = None
-                request.image_token_mask = None
 
     def _refresh_vlm_request_data(self, request: DynamicVLMInferenceRequest) -> None:
         """Rebuild missing media state for a known-multimodal request."""
@@ -723,42 +831,34 @@ class DynamicInferenceEngine(AbstractEngine):
         # for the inference wrapper decoder inputs.
         wrapper = self.controller.inference_wrapped_model
         modality = "video" if num_frames is not None else "image"
-        if request.media_tokens_preexpanded:
-            mask = wrapper.build_preexpanded_media_token_mask(request.prompt_tokens, modality)
-        else:
-            if request.compact_prompt_tokens is None:
-                raise RuntimeError(
-                    f"Cannot refresh vision state for request {request.request_id}: the compact "
-                    "multimodal prompt was not retained."
-                )
-            media_token_id = wrapper.resolve_media_token_id(self.controller.tokenizer, modality)
-            expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
-            if num_frames is not None:
-                expansion_kwargs["num_frames"] = num_frames
-                prompt_config = wrapper.multimodal_prompt_config
-                if (
-                    prompt_config is not None
-                    and prompt_config.video_spec.expansion_mode == "temporal_patch"
-                ):
-                    expansion_kwargs["tokenizer"] = self.controller.tokenizer
-                    expansion_kwargs["video_frame_indices"] = request.video_frame_indices
-                    expansion_kwargs["video_fps"] = request.video_fps
-            _, mask_list = wrapper.expand_image_tokens(
-                [request.compact_prompt_tokens.tolist()],
-                image_token_id=media_token_id,
-                **expansion_kwargs,
-            )
-            mask_values = [(-1 if value is None else int(value)) for value in mask_list[0]]
-            generated_suffix_length = len(request.prompt_tokens) - len(mask_values)
+        if request.image_token_mask is not None:
+            # If a request is checkpointed, retrieve the previous mask,
+            # which can be composed of multiple turns.
+            mask = request.image_token_mask.to(device=request.prompt_tokens.device)
+            generated_suffix_length = len(request.prompt_tokens) - len(mask)
             if generated_suffix_length < 0:
                 raise RuntimeError(
-                    f"Refreshed media mask for request {request.request_id} is longer than "
+                    f"Preserved media mask for request {request.request_id} is longer than "
                     "its checkpointed prompt."
                 )
-            mask = torch.tensor(
-                mask_values + ([-1] * generated_suffix_length),
-                dtype=torch.int64,
-                device=request.prompt_tokens.device,
+            if generated_suffix_length > 0:
+                # Mask out the previously generated tokens as invalid for media embeddings.
+                # This will extend our checkpointed mask for future turns as well.
+                mask = torch.cat(
+                    (
+                        mask,
+                        torch.full(
+                            (generated_suffix_length,), -1, dtype=mask.dtype, device=mask.device
+                        ),
+                    )
+                )
+        elif request.media_tokens_preexpanded:
+            # Non-checkpointed pre-expanded input prompt. Build a new mask.
+            mask = wrapper.build_preexpanded_media_token_mask(request.prompt_tokens, modality)
+        else:
+            raise RuntimeError(
+                f"Cannot refresh vision state for request {request.request_id}: the media "
+                "token mask was not retained."
             )
 
         encoder_kwargs = {"num_image_tiles": num_tiles, "imgs_sizes": imgs_sizes}
@@ -2063,6 +2163,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
         """
+        prefix_stitching_metadata, offload_params = _take_expanded_prefix_stitching_metadata(
+            offload_params
+        )
         cached_vision_entry = self._get_cached_vision_entry(media_cache_key)
         if cached_vision_entry is not None:
             modality = cached_vision_entry.modality
@@ -2156,11 +2259,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         mask_tensor: Optional[Tensor] = None
         image_embeddings: Optional[Tensor] = None
-        compact_prompt_tokens: Optional[Tensor] = None
         expected_embedding_count = 0
 
         if has_images:
             inference_wrapper = self.controller.inference_wrapped_model
+            suffix_media_metadata = None
+            if prefix_stitching_metadata is not None:
+                # Retrieve suffix multimodal data and metadata.
+                suffix_media_metadata = _slice_suffix_media_metadata(
+                    prefix_stitching_metadata[PREFIX_MEDIA_COUNT_FIELD],
+                    num_tiles=num_tiles,
+                    imgs_sizes=imgs_sizes,
+                    num_frames=num_frames,
+                    video_frame_indices=video_frame_indices,
+                    video_fps=video_fps,
+                )
 
             # Compute input mask that provides multimodal embedding injection
             # guidelines for the inference wrapper decoder inputs.
@@ -2171,35 +2284,83 @@ class DynamicInferenceEngine(AbstractEngine):
                 media_token_id = inference_wrapper.resolve_media_token_id(
                     self.controller.tokenizer, modality
                 )
-                compact_prompt_tokens = tokens.clone()
-                token_list: List[List[int]] = [tokens.tolist()]
-                expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
-                if num_frames is not None:
-                    expansion_kwargs["num_frames"] = num_frames
-                    prompt_config = inference_wrapper.multimodal_prompt_config
-                    if (
-                        prompt_config is not None
-                        and prompt_config.video_spec.expansion_mode == "temporal_patch"
-                    ):
-                        expansion_kwargs["tokenizer"] = self.controller.tokenizer
-                        expansion_kwargs["video_frame_indices"] = video_frame_indices
-                        expansion_kwargs["video_fps"] = video_fps
-                expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
-                    token_list, image_token_id=media_token_id, **expansion_kwargs
-                )
-                # expand_image_tokens pads the embedding slots with -1, but the mask
-                # below is what splices the embeddings in, so keep a real token id in
-                # prompt_tokens where the model has one: they are echoed to HTTP
-                # clients, detokenized for raw_text and hashed for prefix caching, and
-                # none of those accept a negative id.
-                expanded_tokens = [
-                    media_token_id if token < 0 else token for token in expanded_tokens_list[0]
-                ]
-                tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
-                mask_tensor = torch.tensor(
-                    [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
-                )
-                expected_embedding_count = sum(value is not None for value in mask_list[0])
+                prefix_tokens = None
+                if prefix_stitching_metadata is not None:
+                    # Split the exact, already-expanded prefix from the compact suffix.
+                    prefix_length = prefix_stitching_metadata[PREFIX_EXPANDED_TOKEN_COUNT_FIELD]
+                    if prefix_length > len(tokens):
+                        raise ValueError(
+                            f"Expanded prefix token count {prefix_length} exceeds the prompt "
+                            f"length {len(tokens)}."
+                        )
+                    prefix_tokens, tokens = tokens[:prefix_length], tokens[prefix_length:]
+                expansion_num_tiles = num_tiles
+                expansion_imgs_sizes = imgs_sizes
+                expansion_num_frames = num_frames
+                expansion_video_frame_indices = video_frame_indices
+                expansion_video_fps = video_fps
+                suffix_media_count = None
+                if suffix_media_metadata is not None:
+                    # Suffix / compact tokens require multi-modal expansion.
+                    expansion_num_tiles = suffix_media_metadata["num_tiles"]
+                    expansion_imgs_sizes = suffix_media_metadata["imgs_sizes"]
+                    expansion_num_frames = suffix_media_metadata["num_frames"]
+                    expansion_video_frame_indices = suffix_media_metadata["video_frame_indices"]
+                    expansion_video_fps = suffix_media_metadata["video_fps"]
+                    suffix_media_count = suffix_media_metadata["suffix_media_count"]
+
+                if prefix_tokens is not None:
+                    slice_placeholders = int((tokens == media_token_id).sum().item())
+                    if slice_placeholders != suffix_media_count:
+                        raise ValueError(
+                            f"Expected {suffix_media_count} compact media placeholder(s) after "
+                            f"the expanded prefix, found {slice_placeholders}."
+                        )
+
+                if suffix_media_count == 0:
+                    # No multimodal data.
+                    mask_tensor = torch.full_like(tokens, -1, dtype=torch.int64)
+                else:
+                    token_list: List[List[int]] = [tokens.tolist()]
+                    expansion_kwargs = {
+                        "num_tiles": expansion_num_tiles,
+                        "imgs_sizes": expansion_imgs_sizes,
+                    }
+                    if expansion_num_frames is not None:
+                        # Video and tubelet expansion kwargs.
+                        expansion_kwargs["num_frames"] = expansion_num_frames
+                        prompt_config = inference_wrapper.multimodal_prompt_config
+                        if (
+                            prompt_config is not None
+                            and prompt_config.video_spec.expansion_mode == "temporal_patch"
+                        ):
+                            expansion_kwargs["tokenizer"] = self.controller.tokenizer
+                            expansion_kwargs["video_frame_indices"] = expansion_video_frame_indices
+                            expansion_kwargs["video_fps"] = expansion_video_fps
+                    # Expand and prompt-format multimodal placeholder tokens.
+                    expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
+                        token_list, image_token_id=media_token_id, **expansion_kwargs
+                    )
+                    # Construct expanded token sequence with model-specific media tokens.
+                    expanded_tokens = [
+                        # Map -1 to <media>.
+                        media_token_id if token < 0 else token
+                        for token in expanded_tokens_list[0]
+                    ]
+                    tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
+                    # Multimodal mask: [ -1 = Text / 0, 1, 2, ... = Media Embed Indices ]
+                    mask_tensor = torch.tensor(
+                        [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
+                    )
+                    expected_embedding_count = sum(value is not None for value in mask_list[0])
+
+                if prefix_tokens is not None:
+                    # Multi-Modal Prefix Stitching
+                    tokens, mask_tensor = _prepend_expanded_multimodal_prefix(
+                        prefix_tokens, tokens, mask_tensor, inference_wrapper, modality
+                    )
+                    expected_embedding_count = int((mask_tensor >= 0).sum().item())
+                    media_tokens_preexpanded = True
 
             # Retrieve or compute the vision embedding.
             image_embeddings = self._get_cached_vision_embedding(media_cache_key)
@@ -2271,7 +2432,6 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
-            compact_prompt_tokens=compact_prompt_tokens,
             media_tensors=media_tensors,
             sampling_params=sampling_params,
             offload_params=offload_params,
@@ -4338,6 +4498,12 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id = data[1]
         prompt = msgpack.unpackb(message[1], raw=False)
         offload_params = msgpack.unpackb(message[3], raw=False)
+        if isinstance(offload_params, dict) and (
+            PREFIX_EXPANDED_TOKEN_COUNT_FIELD in offload_params
+        ):
+            # Multi-modal prefix and metadata for delayed
+            # post-expanded stitching. Skip prompt_preparer.
+            return message
 
         def _pack(prompt, offload_params):
             if isinstance(prompt, torch.Tensor):

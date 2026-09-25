@@ -774,7 +774,6 @@ class DynamicInferenceRequest(InferenceRequest):
     uid: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
-    compact_prompt_tokens: Optional[torch.Tensor] = None
     # Media tensors the vision encoder consumed; kept for the payload stager, never on the wire.
     media_tensors: Optional[Dict[str, torch.Tensor]] = None
     # Opaque JSON/msgpack-compatible metadata owned by an external payload stager.
@@ -945,7 +944,7 @@ class DynamicInferenceRequest(InferenceRequest):
         )
         dropped_fields = {}
         if should_drop_prompt_tokens:
-            for field_name in ("prompt_tokens", "compact_prompt_tokens", "remaining_prompt_tokens"):
+            for field_name in ("prompt_tokens", "remaining_prompt_tokens"):
                 if getattr(self, field_name) is not None:
                     dropped_fields[field_name] = getattr(self, field_name)
         if payload_offloaded:
@@ -1186,7 +1185,6 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             uid=old_request.uid,
             prompt_tokens=new_prompt_tokens,
-            compact_prompt_tokens=old_request.compact_prompt_tokens,
             media_tensors=old_request.media_tensors,
             sampling_params=old_request.sampling_params,
             offload_params=old_request.offload_params,
@@ -1209,6 +1207,8 @@ class DynamicInferenceRequestRecord:
                 num_tiles=old_request.num_tiles,
                 imgs_sizes=old_request.imgs_sizes,
                 num_frames=old_request.num_frames,
+                video_frame_indices=old_request.video_frame_indices,
+                video_fps=old_request.video_fps,
                 media_tokens_preexpanded=old_request.media_tokens_preexpanded,
                 media_cache_key=old_request.media_cache_key,
                 decoder_seq_length=old_request.decoder_seq_length,
@@ -1289,7 +1289,6 @@ class DynamicInferenceRequestRecord:
             uid=self.requests[0].uid,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
-            compact_prompt_tokens=first_request.compact_prompt_tokens,
             media_tensors=first_request.media_tensors,
             offload_params=first_request.offload_params,
             prompt_log_probs=self.requests[0].prompt_log_probs,
@@ -1357,10 +1356,7 @@ class OffloadedRequestPayload:
 
     ``prompt_token_ids`` is the prompt the model ran on. For a VLM request that is the
     *expanded* sequence (one media token per projected embedding), which is what a
-    trainer needs. ``compact_prompt_token_ids`` is the pre-expansion prompt the endpoint
-    tokenized (one media token per image/video), which is what a later turn must splice
-    against (see ``RequestPromptPreparer``); it is ``None`` for text-only requests and
-    for requests admitted with ``media_tokens_preexpanded``. ``media_tensors`` is
+    trainer needs. ``media_tensors`` is
     ``None`` for text-only requests; otherwise it holds host copies of what the vision
     encoder consumed (``imgs`` as packed patches ``[1, total_patches, C*P*P]`` on the
     HTTP path, ``imgs_sizes``, and ``num_frames`` / ``num_tiles`` when present), so a
@@ -1372,7 +1368,6 @@ class OffloadedRequestPayload:
     generated_log_probs: Optional[list[float]]
     prompt_log_probs: Optional[list[float]]
     routing_indices: Optional[np.ndarray]
-    compact_prompt_token_ids: Optional[list[int]] = None
     media_tensors: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
@@ -1400,7 +1395,6 @@ class OffloadedRequestPayload:
             generated_log_probs=to_plain_list(request.generated_log_probs),
             prompt_log_probs=to_plain_list(request.prompt_log_probs),
             routing_indices=request.routing_indices,
-            compact_prompt_token_ids=to_plain_list(request.compact_prompt_tokens),
             media_tensors=(
                 None
                 if request.media_tensors is None
@@ -1435,13 +1429,17 @@ class RequestPayloadStager(Protocol):
         ...
 
 
-# Request-metadata keys written by the chat endpoint when it defers the prompt
-# prefix replacement to a RequestPromptPreparer: the chat-template render of the
-# conversation through its last assistant message, and the EOS token id. The
-# consumer is out-of-tree (NeMo RL's ``TQMegatronPromptPreparer``), which passes
-# them straight to its ``replace_prefix_tokens``; the names mirror its arguments.
+# Request-metadata keys written by the chat endpoint when it defers prompt-prefix
+# replacement. A RequestPromptPreparer may consume them before admission; the
+# multimodal path also uses them to locate the splice after media expansion.
 PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
 PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
+
+# Reserved fields used to defer multimodal prefix stitching until after
+# media-token expansion. The HTTP endpoint validates client offload metadata
+# before adding these reserved keys, so clients cannot forge them.
+PREFIX_EXPANDED_TOKEN_COUNT_FIELD = "_prefix_expanded_token_count"
+PREFIX_MEDIA_COUNT_FIELD = "_prefix_media_count"
 
 
 @dataclass(frozen=True)
@@ -1462,8 +1460,11 @@ class RequestPromptPreparer(Protocol):
     returned prompt must stay in that space: ``_build_vlm_request`` expands every
     media token it finds, so a prefix spliced in already-expanded form would be
     expanded a second time and fail the placeholder-count check. Consumers that
-    store previous turns should splice with ``OffloadedRequestPayload.
-    compact_prompt_token_ids`` and verify against ``prompt_token_ids``.
+    store previous turns splice their exact tokens (``OffloadedRequestPayload.
+    prompt_token_ids`` plus ``generated_token_ids``) the same way for text and
+    multimodal requests. When ``PREFIX_MEDIA_COUNT_FIELD`` is present, they must also
+    return the length of that exact prefix as ``PREFIX_EXPANDED_TOKEN_COUNT_FIELD`` so
+    the engine expands only the tokens after it.
     """
 
     def prepare_prompt(
