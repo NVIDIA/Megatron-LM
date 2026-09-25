@@ -74,6 +74,8 @@ def test_parser_uses_mimo_prefixed_destinations():
         "mimo_llm_expt_tp": 10,
         "mimo_llm_only": True,
         "mimo_encoder_ddp_overlap": True,
+        "mimo_run_input_projections_on_llm_ranks": False,
+        "mimo_bridge_skip_shape_exchange": False,
     }
 
 
@@ -168,9 +170,30 @@ def test_parser_does_not_expose_unsupported_grid_knobs():
     assert not hasattr(args, "mimo_llm_expt_dp")
 
 
-def test_llm_cp_must_be_one():
-    args = _layout_8gpu_20l(mimo_llm_cp=2)
-    with pytest.raises(ValueError, match="CP=1 only"):
+def test_parser_exposes_llm_rank_input_projection_flag():
+    args = _parse(["--mimo-run-input-projections-on-llm-ranks"])
+    assert args.mimo_run_input_projections_on_llm_ranks
+
+
+def test_parser_exposes_bridge_shape_exchange_opt_in():
+    assert not _parse([]).mimo_bridge_skip_shape_exchange
+    assert _parse(["--mimo-bridge-skip-shape-exchange"]).mimo_bridge_skip_shape_exchange
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_language_cp_keeps_encoder_cp_one_and_data_parallel_size(cp_size):
+    args = _layout_8gpu_20l(mimo_llm_cp=cp_size)
+    encoder, language = build_module_grid_specs(args, 4 + 4 * cp_size, "radio_encoder")
+    assert encoder.cp == 1
+    assert encoder.dp == 2
+    assert language.cp == cp_size
+    assert language.dp == 2
+
+
+@pytest.mark.parametrize("cp_size", [0, -1])
+def test_language_cp_must_be_positive(cp_size):
+    args = _layout_8gpu_20l(mimo_llm_cp=cp_size)
+    with pytest.raises(ValueError, match="mimo-llm-cp must be positive"):
         validate_hetero_grid_args(args, WORLD_SIZE_8)
 
 
@@ -183,6 +206,17 @@ def test_encoder_overlap_requires_grad_reduce():
 def test_encoder_overlap_accepts_uniform_participation_opt_in():
     args = _layout_8gpu_20l(mimo_encoder_ddp_overlap=True, overlap_grad_reduce=True)
     assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+
+
+def test_language_rank_input_projection_accepts_llm_pp1():
+    args = _layout_8gpu_20l(mimo_run_input_projections_on_llm_ranks=True)
+    assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
+
+
+def test_language_rank_input_projection_rejects_llm_only():
+    args = _layout_8gpu_20l(mimo_run_input_projections_on_llm_ranks=True, mimo_llm_only=True)
+    with pytest.raises(ValueError, match="cannot be used with --mimo-llm-only"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
 
 
 def test_llm_only_requires_offset_zero():

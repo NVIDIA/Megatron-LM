@@ -16,8 +16,8 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer import TransformerConfig, WideResidualConfig
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -274,7 +274,57 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _mfsdp_v2_disables_pipeline_output_dealloc(args) -> bool:
+    """Whether the pipeline-output pseudo-free must stay disabled for ``args``.
+
+    Megatron-FSDP v2 registers a full-backward hook on every FSDP module, and
+    PyTorch delivers ``grad_output`` to that hook by wrapping the module output
+    in ``BackwardHookFunction``, whose forward returns its inputs. The pipeline
+    stage output therefore becomes an autograd view of the module's own output,
+    and ``deallocate_output_tensor()`` must not pseudo-free it: the base tensor
+    owns the storage and keeps it alive, so the swap would reclaim no memory.
+    Disable the optimization for this configuration instead of aborting on the
+    view guard.
+    """
+    return bool(
+        getattr(args, 'use_megatron_fsdp', False) and getattr(args, 'megatron_fsdp_version', 1) == 2
+    )
+
+
+def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | None:
+    """Build the optional nested wide-residual config from flat training arguments."""
+
+    num_streams = getattr(args, 'wide_residual_num_streams', None)
+    control_defaults = {
+        'wide_residual_streamwise_sigmoid_init_scale': 0.01,
+        'wide_residual_learned_retention': False,
+        'wide_residual_retention_init': 0.999,
+        'wide_residual_retention_max_forget': 0.10,
+    }
+    if num_streams is None:
+        nondefault_controls = [
+            name
+            for name, default in control_defaults.items()
+            if getattr(args, name, default) != default
+        ]
+        if nondefault_controls:
+            options = ', '.join('--' + name.replace('_', '-') for name in nondefault_controls)
+            raise ValueError(f'{options} require --wide-residual.')
+        return None
+
+    return WideResidualConfig(
+        num_streams=num_streams,
+        streamwise_sigmoid_init_scale=getattr(
+            args, 'wide_residual_streamwise_sigmoid_init_scale', 0.01
+        ),
+        learned_retention=getattr(args, 'wide_residual_learned_retention', False),
+        retention_init=getattr(args, 'wide_residual_retention_init', 0.999),
+        retention_max_forget=getattr(args, 'wide_residual_retention_max_forget', 0.10),
+    )
+
+
 def core_transformer_config_from_args(args, config_class=None):
+    """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
     from megatron.core.quantization.utils import (
@@ -302,10 +352,12 @@ def core_transformer_config_from_args(args, config_class=None):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
-    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    if kw_args.get('hash_moe_vocab_size') is None:
+        kw_args['hash_moe_vocab_size'] = args.vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
@@ -345,8 +397,25 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+
+        pattern = args.hybrid_layer_pattern
+        has_dsv4_attention = any(
+            symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
+        )
+        variant = getattr(args, 'experimental_attention_variant', None)
+        if has_dsv4_attention:
+            if variant not in (None, 'dsv4_hybrid'):
+                raise ValueError(
+                    "Hybrid C/H/W attention requires experimental_attention_variant='dsv4_hybrid', "
+                    f"got {variant!r} for pattern {pattern!r}."
+                )
+            kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+        elif variant is None and Symbols.DS_ATTENTION in pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
+
+        from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -361,6 +430,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
 
     kw_args['moe_latent_size'] = args.moe_latent_size
+
+    wide_residual = _wide_residual_config_from_args(args)
+    if wide_residual is not None or 'wide_residual' not in kw_args:
+        kw_args['wide_residual'] = wide_residual
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
@@ -430,14 +503,45 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
+def resolve_tokenizer_vocab_size(cfg: PretrainConfigContainer, padded_vocab_size: int | None) -> None:
+    """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+
+    Args:
+        cfg: Previously constructed training configuration. Explicit model
+            vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
+        padded_vocab_size: Final size resolved by tokenizer initialization,
+            including any CLI/checkpoint override. None is valid only when the
+            model does not require a tokenizer-derived size.
+
+    Raises:
+        ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
+    """
+    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
+        if padded_vocab_size is None:
+            raise ValueError('Model vocabulary must be resolved before model construction')
+        cfg.model.vocab_size = padded_vocab_size
+        cfg.model.should_pad_vocab = False
+
+
 def gpt_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = GPTModelConfig
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type = GPTModelConfig,
+    *,
+    vocab_size_from_tokenizer: bool = True,
 ) -> Any:
     """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
 
     `model_config_cls` lets callers reuse this same arg-derivation logic for
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptModelConfig`.
+
+    ``vocab_size_from_tokenizer`` uses the tokenizer-derived padded vocabulary
+    when padding is enabled. A size already resolved by CLI/checkpoint arguments
+    takes precedence. Otherwise the vocabulary is bound during runtime setup.
+    Set this to False to explicitly convert a raw ``args.vocab_size`` without
+    waiting for tokenizer initialization.
     """
     assert issubclass(model_config_cls, GPTModelConfig)
 
@@ -463,6 +567,7 @@ def gpt_config_from_args(
     kwargs["rotary_base"] = args.rotary_base
     kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
     kwargs["rope_scaling"] = args.use_rope_scaling
+    kwargs["rope_scaling_factor"] = args.rope_scaling_factor
 
     kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
     kwargs["seq_length"] = args.max_position_embeddings
@@ -471,25 +576,38 @@ def gpt_config_from_args(
     # GPTModelConfig supports either automatically padding vocab size or using exact provided
     # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
     # that is just mapped to settings in args appropriately.
-    if args.padded_vocab_size is not None:
-        kwargs["vocab_size"] = args.padded_vocab_size
+    padded_vocab_size = getattr(args, "padded_vocab_size", None)
+    if padded_vocab_size is not None:
+        kwargs["vocab_size"] = padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
-        kwargs["vocab_size"] = args.vocab_size
+        if not (vocab_size_from_tokenizer and args.pad_vocab_size):
+            assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        # With padding enabled, legacy tokenizer setup derives the model's
+        # vocabulary from the tokenizer, even if --vocab-size was supplied.
+        kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
     return model_config_cls(**kwargs)
 
 
 def hybrid_config_from_args(
-    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = HybridModelConfig
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type = HybridModelConfig,
+    *,
+    vocab_size_from_tokenizer: bool = True,
 ) -> Any:
     """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
 
     `model_config_cls` lets callers reuse this same arg-derivation logic for
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptHybridModelConfig`.
+
+    Vocabulary resolution follows ``gpt_config_from_args``: tokenizer-derived
+    vocabulary is the default when padding is enabled, and an already resolved
+    padded size takes precedence. Set ``vocab_size_from_tokenizer=False`` for
+    explicit raw-vocabulary conversion without tokenizer initialization.
     """
     assert issubclass(model_config_cls, HybridModelConfig)
 
@@ -505,7 +623,10 @@ def hybrid_config_from_args(
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
-        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+        hybrid_stack_spec = import_module(args.spec)
+        if not isinstance(hybrid_stack_spec, ModuleSpec):
+            raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
+        kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
@@ -522,12 +643,14 @@ def hybrid_config_from_args(
     # HybridModelConfig supports either automatically padding vocab size or using exact provided
     # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
     # that is just mapped to settings in args appropriately.
-    if args.padded_vocab_size is not None:
-        kwargs["vocab_size"] = args.padded_vocab_size
+    padded_vocab_size = getattr(args, "padded_vocab_size", None)
+    if padded_vocab_size is not None:
+        kwargs["vocab_size"] = padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
-        kwargs["vocab_size"] = args.vocab_size
+        if not (vocab_size_from_tokenizer and args.pad_vocab_size):
+            assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
     return model_config_cls(**kwargs)

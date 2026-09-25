@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import warnings
 from contextlib import ExitStack, contextmanager
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
+from megatron.core._rank_utils import warn_single_rank
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
@@ -18,9 +19,14 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import make_viewless_tensor, unwrap_model
+
+if TYPE_CHECKING:
+    from megatron.core.process_groups_config import ProcessGroupCollection
 
 logger = logging.getLogger(__name__)
+
+_LANGUAGE_INPUT_PROJECTIONS_ATTR = "mimo_input_projections"
 
 
 class MimoModel(MegatronModule):
@@ -54,11 +60,9 @@ class MimoModel(MegatronModule):
         # Initialize with language model's transformer config for MegatronModule compatibility
         super().__init__(mimo_config.language_model_spec.params['config'])
 
-        warnings.warn(
+        warn_single_rank(
             "MimoModel is experimental and still under active development. "
-            "The API may change without notice in future releases.",
-            category=UserWarning,
-            stacklevel=2,
+            "The API may change without notice in future releases."
         )
 
         self.mimo_config = mimo_config
@@ -97,8 +101,66 @@ class MimoModel(MegatronModule):
         # Initialize modality submodules from specifications
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
-        self._finish_init_quantization()
         self._initialize_language_model()
+        self._initialize_language_input_projections()
+        self._finish_init_quantization()
+
+    def refit_modules(self) -> list[tuple[str, torch.nn.Module, "ProcessGroupCollection"]]:
+        """Declare local LLaVA matching labels, modules, and their owning groups.
+
+        Native module registration and checkpoint names remain unchanged.
+        """
+        components = []
+        if self.language_model is not None:
+            language = unwrap_model(self.language_model)
+            components.append(
+                ("language_model", language, getattr(language, "pg_collection", None))
+            )
+        for modality, wrapped_tower in self.modality_submodules.items():
+            tower = unwrap_model(wrapped_tower)
+            if (
+                modality != "images"
+                or len(tower.encoders) != 1
+                or len(tower.input_projections) > 1
+                or tower.decoders
+                or tower.output_projections
+            ):
+                raise ValueError("Refit requires one image encoder and at most one input projector")
+            vision = unwrap_model(next(iter(tower.encoders.values())))
+            components.append(("vision_model", vision, getattr(vision, "pg_collection", None)))
+            for wrapped_projector in tower.input_projections:
+                projector = unwrap_model(wrapped_projector)
+                components.append(
+                    (
+                        "vision_projection",
+                        projector,
+                        getattr(projector, "pg_collection", None) or tower.pg_collection,
+                    )
+                )
+
+        for label, module, pg in components:
+            if pg is None or any(getattr(pg, axis, None) is None for axis in ("tp", "pp", "dp")):
+                raise ValueError(
+                    f"Refit component {label!r} requires explicit tp, pp and dp groups"
+                )
+            config = getattr(module, "config", None)
+            if (
+                getattr(config, "fp8", None)
+                or getattr(config, "fp4", None)
+                or getattr(config, "use_kitchen", False)
+                or getattr(config, "quant_recipe", None) is not None
+            ):
+                raise ValueError("Quantized component refit is not supported")
+            # Check legacy TP-only constructors (notably projectors); encoders
+            # such as CLIP pass their full collection directly to the decoder.
+            tp = getattr(module, "tp_group", None)
+            if tp is not None and torch.distributed.get_process_group_ranks(
+                tp
+            ) != torch.distributed.get_process_group_ranks(pg.tp):
+                raise ValueError(
+                    f"Refit component {label!r}: TP group disagrees with its declaration"
+                )
+        return components
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
@@ -138,9 +200,46 @@ class MimoModel(MegatronModule):
                 while isinstance(inner, (DistributedDataParallel, Float16Module)):
                     inner = inner.module
                     child_prefix += 'module.'
-                sharded_sd.update(
-                    sharded_state_dict_default(inner, child_prefix, sharded_offsets, mod_metadata)
+                module_sd = sharded_state_dict_default(
+                    inner, child_prefix, sharded_offsets, mod_metadata
                 )
+                if (
+                    name == 'language_model'
+                    and self.mimo_config.language_model_input_projections_spec
+                ):
+                    projection_specs = self.mimo_config.language_model_input_projections_spec
+                    runtime_root = f'{child_prefix}{_LANGUAGE_INPUT_PROJECTIONS_ATTR}.'
+                    input_projections = self.language_model_input_projections
+                    assert input_projections is not None
+                    for modality_name, projection in input_projections.items():
+                        module_sd.update(
+                            sharded_state_dict_default(
+                                projection,
+                                f'{runtime_root}{modality_name}.',
+                                sharded_offsets,
+                                mod_metadata,
+                            )
+                        )
+
+                    root_prefix, separator, wrapper_suffix = child_prefix.rpartition(
+                        'language_model.'
+                    )
+                    if not separator:
+                        raise ValueError(
+                            "language model prefix must contain 'language_model.', "
+                            f"got {child_prefix!r}"
+                        )
+                    apply_prefix_mapping(
+                        module_sd,
+                        {
+                            f'{runtime_root}{modality_name}.': (
+                                f'{root_prefix}modality_submodules.{modality_name}.'
+                                f'{wrapper_suffix}input_projections.0.'
+                            )
+                            for modality_name in projection_specs
+                        },
+                    )
+                sharded_sd.update(module_sd)
         return sharded_sd
 
     @staticmethod
@@ -233,6 +332,9 @@ class MimoModel(MegatronModule):
                 modality_embeddings, modality_token_indices, batch_size * seq_length
             )
             for modality_name, modality_emb in modality_embeddings.items():
+                # Bridges keep modality activations in parameter dtype; promote only when
+                # they join a higher-precision language-model residual stream.
+                modality_emb = modality_emb.to(dtype=dtype)
                 flat_combined_embeddings.index_copy_(
                     0, modality_token_indices[modality_name], modality_emb
                 )
@@ -257,6 +359,7 @@ class MimoModel(MegatronModule):
                     f"number of {modality_name} embeddings ({modality_emb.size(0)})"
                 )
 
+            modality_emb = modality_emb.to(dtype=dtype)
             expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)
             combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
 
@@ -291,11 +394,41 @@ class MimoModel(MegatronModule):
             self.modality_submodules[modality_name] = submodule
 
     def _finish_init_quantization(self) -> None:
-        """Apply per-module quantization recipes to initialized modality submodules."""
-        for name, module in self.modality_submodules.named_modules(prefix="modality_submodules"):
-            if hasattr(module, 'finish_init'):
-                quant_config = get_quant_config_or_none(name, module.config.quant_recipe)
-                module.finish_init(quant_config)
+        """Apply per-module quantization recipes to initialized projections and encoders."""
+        roots = [("modality_submodules", self.modality_submodules)]
+        input_projections = self.language_model_input_projections
+        if input_projections is not None:
+            roots.extend(
+                (f"modality_submodules.{name}.input_projections.0", projection)
+                for name, projection in input_projections.items()
+            )
+        for prefix, root in roots:
+            for name, module in root.named_modules(prefix=prefix):
+                if hasattr(module, 'finish_init'):
+                    quant_config = get_quant_config_or_none(name, module.config.quant_recipe)
+                    module.finish_init(quant_config)
+
+    def _initialize_language_input_projections(self) -> None:
+        """Install modality input projections on the first language stage."""
+        specs = self.mimo_config.language_model_input_projections_spec
+        if specs and self.role.mode is not ModuleLayout.NON_COLOCATED:
+            raise ValueError("Language-owned input projections require non-colocated MIMO modules")
+        if not self.role.has_language_module:
+            return
+
+        input_projections = torch.nn.ModuleDict()
+        if self.role.is_first_stage(MIMO_LANGUAGE_MODULE_KEY):
+            input_projections.update({name: build_module(spec) for name, spec in specs.items()})
+        setattr(
+            unwrap_model(self.language_model), _LANGUAGE_INPUT_PROJECTIONS_ATTR, input_projections
+        )
+
+    @property
+    def language_model_input_projections(self) -> Optional[torch.nn.ModuleDict]:
+        """Return the input projections installed on the language model."""
+        if self.language_model is None:
+            return None
+        return getattr(unwrap_model(self.language_model), _LANGUAGE_INPUT_PROJECTIONS_ATTR)
 
     def _initialize_language_model(self) -> None:
         """Initialize the language model.
@@ -604,6 +737,11 @@ class MimoModel(MegatronModule):
                 output = self._empty_encoder_output(encoder_name)
 
             if output is not None:
+                if encoder_name in self.mimo_config.language_model_input_projections_spec:
+                    # Pipeline schedules pseudo-deallocate sent outputs, which must be viewless.
+                    output = make_viewless_tensor(
+                        output, requires_grad=output.requires_grad, keep_graph=True
+                    )
                 self._attach_modality_split_sizes(output, input_ids, encoder_name)
                 outputs[encoder_name] = output
 
@@ -663,18 +801,15 @@ class MimoModel(MegatronModule):
     def _empty_encoder_output(self, encoder_name: str) -> torch.Tensor:
         """Return the bridge payload for text-only non-colocated batches."""
         language_config = self.mimo_config.language_model_spec.params['config']
-        hidden_size = getattr(language_config, 'hidden_size', None)
-        if hidden_size is None:
-            raise ValueError(
-                "Language model config must define hidden_size for empty modality output"
-            )
+        projection_spec = self.mimo_config.language_model_input_projections_spec.get(encoder_name)
+        hidden_size = (
+            projection_spec.params['input_size']
+            if projection_spec is not None
+            else language_config.hidden_size
+        )
 
-        output_dtype = getattr(language_config, 'params_dtype', None) or torch.float32
         return torch.empty(
-            (0, hidden_size),
-            device=torch.cuda.current_device(),
-            dtype=output_dtype,
-            requires_grad=True,
+            (0, hidden_size), device=torch.cuda.current_device(), dtype=language_config.params_dtype
         )
 
     def _build_packed_seq_params(self, packing_kwargs: Optional[dict]) -> Optional[PackedSeqParams]:
@@ -851,9 +986,18 @@ class MimoModel(MegatronModule):
             # First stage: receive encoder embeddings, combine with text, pass to LM
             # Build modality embeddings dict from encoder outputs
             modality_embeddings = {}
+            input_projections = self.language_model_input_projections
+            assert input_projections is not None
+            missing_inputs = set(input_projections) - (set(input_tensors or {}) - {lang_name})
+            if missing_inputs:
+                raise RuntimeError(
+                    f"Missing inputs for language input projections: {sorted(missing_inputs)}"
+                )
             if input_tensors:
                 for name, tensor in input_tensors.items():
                     if name != lang_name:
+                        if name in input_projections:
+                            tensor = input_projections[name](tensor)
                         modality_embeddings[name] = tensor
 
             # Get text embeddings

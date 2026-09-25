@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -12,8 +13,10 @@ from torch.optim import SGD, Adam
 # FP8 recipe will be used to test precision-aware-optimizer.
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import (
@@ -37,6 +40,7 @@ from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -79,6 +83,17 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+class WideResidualRetentionOptimizerNet(nn.Module):
+    """Small parameter set covering retention and ordinary weight-decay routing."""
+
+    def __init__(self):
+        super().__init__()
+        self.retention = nn.Parameter(torch.ones(128))
+        self.retention.is_wide_residual_retention_parameter = True
+        self.ordinary_vector = nn.Parameter(torch.ones(6))
+        self.ordinary_matrix = nn.Parameter(torch.ones(6, 6))
 
 
 def test_copy_optimizer_param_metadata_preserves_allreduce():
@@ -176,6 +191,45 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
     assert wd_mults == {1.0, 0.0}
+
+
+@pytest.mark.parametrize("apply_wd_to_qk_layernorm", [False, True])
+def test_standard_overrides_apply_weight_decay_to_wide_residual_retention(
+    monkeypatch, apply_wd_to_qk_layernorm
+):
+    """Retention logits inherit ordinary WD despite being represented as 1-D parameters."""
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(0, value),
+    )
+    net = WideResidualRetentionOptimizerNet()
+    config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        weight_decay=0.1,
+        apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm,
+    )
+    overrides = get_standard_config_overrides(config)
+    check_config_overrides_consistency(config, overrides)
+    param_groups = _get_param_groups([net], config, overrides)
+
+    def group_for(parameter):
+        matches = [
+            group for group in param_groups if any(param is parameter for param in group['params'])
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    retention_group = group_for(net.retention)
+    vector_group = group_for(net.ordinary_vector)
+    matrix_group = group_for(net.ordinary_matrix)
+    assert retention_group['wd_mult'] == 1.0
+    assert vector_group['wd_mult'] == 0.0
+    assert matrix_group['wd_mult'] == 1.0
+    assert config.weight_decay * retention_group['wd_mult'] == pytest.approx(0.1)
+    assert config.weight_decay * vector_group['wd_mult'] == 0.0
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
@@ -695,6 +749,7 @@ def test_mtp_grad_clipping_uses_separate_norms():
         get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
         has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
         _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
+        _uses_decoupled_grad = MegatronOptimizer._uses_decoupled_grad
         clip_grad_norm = MegatronOptimizer.clip_grad_norm
 
         def __init__(self, params):
@@ -1186,6 +1241,76 @@ def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_
         Utils.destroy_model_parallel()
 
 
+def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state_dict():
+    """Fused-LN MLA keeps the input LayerNorm params on linear_qkv_down_proj at runtime while the
+    checkpoint keeps them fused on linear_qkv_down_proj.layer_norm_*; reloading main
+    params through a DDP-wrapped model must still match every parameter."""
+    if not is_te_min_version("1.10.0"):
+        pytest.skip("Requires TE >= 1.10.0")
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        transformer_config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            mla_down_proj_fusion=True,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            multi_latent_attention=True, mla_down_proj_fusion=True
+        )
+        layer = build_module(layer_spec, config=transformer_config, layer_number=1)
+        if not layer.submodules_config.sharded_state_dict_keys_map:
+            pytest.skip("Backend does not fuse the input LayerNorm into the MLA down-projection")
+        runtime_names = [name for name, _ in layer.named_parameters()]
+        assert any("linear_qkv_down_proj.layer_norm_" in name for name in runtime_names)
+
+        model = nn.Module()
+        model.decoder = nn.Module()
+        model.decoder.layers = nn.ModuleList([layer])
+        model = model.bfloat16().cuda()
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+        model = DistributedDataParallel(transformer_config, ddp_config, model)
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', bf16=True, use_distributed_optimizer=True
+        )
+        optim = get_megatron_optimizer(optimizer_config, [model])
+
+        # Checkpoint-style state dict: canonical keys from sharded_state_dict, all values 3.
+        sharded_state_dict = layer.sharded_state_dict(prefix="decoder.layers.0.")
+        state_dict = {
+            key: torch.full_like(sh_ten.data, 3.0)
+            for key, sh_ten in sharded_state_dict.items()
+            if isinstance(sh_ten, ShardedTensor)
+        }
+        assert any(
+            key.startswith("decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_")
+            for key in state_dict
+        )
+
+        optim.reload_model_params(state_dict)
+
+        for group in optim.param_groups:
+            for main_param in group['params']:
+                assert main_param.dtype == torch.float32
+                torch.testing.assert_close(
+                    main_param, torch.full_like(main_param, 3.0), atol=0, rtol=0
+                )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(
     not is_torch_min_version("2.4.0"),
     reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
@@ -1408,3 +1533,63 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             use_gloo_process_groups=True,  # Should be False when using custom groups
             pg_collection=pg_collection_complete,
         )
+
+
+def _chain_member(param_groups):
+    """A MegatronOptimizer whose ``param_groups`` come from the given raw groups.
+
+    ``MegatronOptimizer.param_groups`` just forwards to ``self.optimizer.param_groups``,
+    so a namespace is enough and no real torch optimizer (or CUDA) is needed.
+    """
+    member = object.__new__(DistributedOptimizer)
+    member.is_stub_optimizer = False
+    member.optimizer = SimpleNamespace(param_groups=param_groups)
+    return member
+
+
+def _chain(*members):
+    chain = object.__new__(ChainedOptimizer)
+    chain.chained_optimizers = list(members)
+    return chain
+
+
+def test_synchronize_steps_with_nested_chained_optimizer():
+    """``_synchronize_steps`` must tolerate a member that is itself a ChainedOptimizer.
+
+    ``LayerWiseDistributedOptimizer`` subclasses ChainedOptimizer and holds more than one
+    inner optimizer whenever the model mixes optimizers, muon plus AdamW for instance, so
+    it presents to an outer chain as a nested ChainedOptimizer. Reaching through
+    ``.optimizer`` asserts on those; going through ``param_groups`` does not.
+    """
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 3}])
+    expert = _chain_member([{'params': [param], 'step': 3}])
+    # TE FusedAdam does not accumulate 'step' for empty param groups, which is the
+    # case _synchronize_steps exists to paper over; it must stay untouched.
+    empty = _chain_member([{'params': [], 'step': 99}])
+    nested = _chain(expert, empty)
+    outer = _chain(dense, nested)
+
+    # The bug this guards: the nested chain has >1 inner optimizer, so the
+    # ``.optimizer`` shortcut the old implementation used is not available.
+    with pytest.raises(AssertionError, match="more than one optimizer"):
+        nested.optimizer
+
+    step = outer._synchronize_steps()
+
+    assert step == 3
+    assert dense.param_groups[0]['step'] == 3
+    assert expert.param_groups[0]['step'] == 3
+    assert empty.param_groups[0]['step'] == 99
+
+
+def test_synchronize_steps_aligns_lagging_group():
+    """A group missing 'step' is left alone; populated groups converge on the one value."""
+    param = torch.nn.Parameter(torch.zeros(2))
+    dense = _chain_member([{'params': [param], 'step': 7}])
+    expert = _chain_member([{'params': [param]}])  # no 'step' yet
+    outer = _chain(dense, _chain(expert))
+
+    assert outer._synchronize_steps() == 7
+    assert dense.param_groups[0]['step'] == 7
+    assert 'step' not in expert.param_groups[0]
