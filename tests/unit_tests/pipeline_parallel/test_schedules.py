@@ -639,6 +639,7 @@ def test_schedule_enables_grad_sync_on_first_stage(
     monkeypatch, communicator_base, module_first_stage, pipeline_stages
 ):
     events = []
+    telemetry_events = []
 
     @contextmanager
     def no_sync():
@@ -678,23 +679,33 @@ def test_schedule_enables_grad_sync_on_first_stage(
             return module_first_stage
 
         @staticmethod
-        def recv_forward(*_args):
+        def recv_forward(*_args, **kwargs):
+            telemetry_events.append(("recv_forward", kwargs))
             return {"llm": None} if is_multimodule else None
 
         @staticmethod
-        def send_forward_recv_backward(*_args):
+        def send_forward_recv_backward(*_args, **kwargs):
+            telemetry_events.append(("send_forward_recv_backward", kwargs))
             return None
 
         @staticmethod
-        def send_forward(*_args):
+        def send_forward(*_args, **kwargs):
+            telemetry_events.append(("send_forward", kwargs))
             return None
 
         @staticmethod
-        def recv_backward(*_args):
+        def send_backward_recv_forward(*_args, **kwargs):
+            telemetry_events.append(("send_backward_recv_forward", kwargs))
+            return {"llm": None}
+
+        @staticmethod
+        def recv_backward(*_args, **kwargs):
+            telemetry_events.append(("recv_backward", kwargs))
             return None
 
         @staticmethod
-        def send_backward(*_args):
+        def send_backward(*_args, **kwargs):
+            telemetry_events.append(("send_backward", kwargs))
             return None
 
     monkeypatch.setattr(
@@ -736,14 +747,37 @@ def test_schedule_enables_grad_sync_on_first_stage(
         forward_step_func=None,
         data_iterator=None,
         model=model,
-        num_microbatches=1,
+        num_microbatches=3 if is_multimodule and pipeline_stages == 2 else 1,
         seq_length=1,
         micro_batch_size=1,
         p2p_communicator=FakeCommunicator(),
         pg_collection=pg_collection,
     )
 
-    assert events == ["enter_no_sync", "exit_no_sync", "backward"]
+    if is_multimodule and pipeline_stages == 2:
+        assert events == ["enter_no_sync", "backward", "backward", "exit_no_sync", "backward"]
+        assert telemetry_events == [
+            ("recv_forward", {"microbatch_id": 0}),
+            ("send_forward", {"microbatch_id": 0}),
+            ("recv_forward", {"microbatch_id": 1}),
+            (
+                "send_forward_recv_backward",
+                {"forward_microbatch_id": 1, "backward_microbatch_id": 0},
+            ),
+            (
+                "send_backward_recv_forward",
+                {"forward_microbatch_id": 2, "backward_microbatch_id": 0},
+            ),
+            (
+                "send_forward_recv_backward",
+                {"forward_microbatch_id": 2, "backward_microbatch_id": 1},
+            ),
+            ("send_backward", {"microbatch_id": 1}),
+            ("recv_backward", {"microbatch_id": 2}),
+            ("send_backward", {"microbatch_id": 2}),
+        ]
+    else:
+        assert events == ["enter_no_sync", "exit_no_sync", "backward"]
 
 
 def test_forward_backward_func_with_pipeline_parallel(mocker):

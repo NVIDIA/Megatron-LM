@@ -4,14 +4,74 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import wraps
 from typing import Deque, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+    from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
+except ImportError:
+    from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+    from megatron.core.telemetry.fallbacks import safe_set_span_attributes as _otel_safe_set_attrs
+
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
 logger = logging.getLogger()
+
+
+def _trace_bridge_operation(name, *, participants, requires_backward=False):
+    """Trace a substantive public bridge operation."""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapped(self, *args, **kwargs):
+            if (
+                not _otel_sg_enabled('communication')
+                or (requires_backward and not self.requires_backward)
+                or not self._participates_in_telemetry_scope(participants)
+            ):
+                return func(self, *args, **kwargs)
+
+            attributes = self._telemetry_attributes()
+            for argument, attribute in (
+                ('microbatch_id', 'megatron.mimo.microbatch.id'),
+                ('forward_microbatch_id', 'megatron.mimo.microbatch.forward_id'),
+                ('backward_microbatch_id', 'megatron.mimo.microbatch.backward_id'),
+            ):
+                value = kwargs.get(argument)
+                if value is not None:
+                    attributes[attribute] = value
+            if args and torch.is_tensor(args[0]):
+                tensor = args[0]
+                attributes.update(
+                    {
+                        'megatron.mimo.input.shape': list(tensor.shape),
+                        'megatron.mimo.input.dtype': str(tensor.dtype),
+                        'megatron.mimo.input.bytes': tensor.numel() * tensor.element_size(),
+                    }
+                )
+
+            with _otel_managed_span('communication', name, **attributes) as span:
+                output = func(self, *args, **kwargs)
+                if torch.is_tensor(output):
+                    _otel_safe_set_attrs(
+                        span,
+                        {
+                            'megatron.mimo.output.shape': list(output.shape),
+                            'megatron.mimo.output.dtype': str(output.dtype),
+                            'megatron.mimo.output.bytes': output.numel() * output.element_size(),
+                        },
+                    )
+                return output
+
+        return wrapped
+
+    return decorator
 
 
 class CommRole(Enum):
@@ -212,6 +272,63 @@ class BridgeCommunicator:
         self.build_comm_map(self.src_tp_leaders, self.dest_tp_leaders)
         dist.barrier()
 
+    def _participates_in_telemetry_scope(self, participants: str) -> bool:
+        """Return whether this rank performs work for a public bridge operation."""
+        rank_info = self.comm_map.get(self.current_rank)
+        if rank_info is None:
+            return False
+
+        if participants == 'sender':
+            return rank_info.role is CommRole.SENDER
+        if participants == 'source':
+            return rank_info.role is CommRole.SENDER or (
+                rank_info.role is CommRole.MEMBER
+                and self.current_rank in self.src_grid_broadcast_ranks
+            )
+        if participants == 'destination':
+            return rank_info.role is CommRole.RECEIVER or (
+                rank_info.role is CommRole.MEMBER
+                and self.current_rank in self.dest_grid_broadcast_ranks
+            )
+        if participants == 'receiver_or_dest_cp':
+            return rank_info.role is CommRole.RECEIVER or self.dest_cp_reduce_pg is not None
+        raise ValueError(f"unsupported bridge telemetry participant scope: {participants}")
+
+    def _telemetry_attributes(self) -> Dict[str, object]:
+        """Return static, rank-local metadata for bridge operation spans."""
+        rank_info = self.comm_map.get(self.current_rank)
+        role = 'unknown'
+        peer_count = 0
+        if rank_info is not None:
+            role = rank_info.role.value.lower()
+            peer_ranks = rank_info.send_to_ranks + rank_info.recv_from_ranks
+            peer_count = len(peer_ranks)
+        else:
+            peer_ranks = []
+
+        src_count = len(self.src_tp_leaders)
+        dest_count = len(self.dest_tp_leaders)
+        if src_count > dest_count:
+            direction = 'fan_in'
+        elif src_count < dest_count:
+            direction = 'fan_out'
+        else:
+            direction = 'equal'
+
+        attributes = {
+            'megatron.mimo.bridge.direction': direction,
+            'megatron.mimo.bridge.role': role,
+            'megatron.mimo.bridge.peer_count': peer_count,
+            'megatron.mimo.bridge.peer_ranks': peer_ranks,
+            'megatron.mimo.bridge.shape_exchange': not self.skip_shape_exchange,
+            'megatron.mimo.bridge.requires_backward': self.requires_backward,
+        }
+        if self.src_module_name is not None:
+            attributes['megatron.mimo.bridge.source_module'] = self.src_module_name
+        if self.dest_module_name is not None:
+            attributes['megatron.mimo.bridge.destination_module'] = self.dest_module_name
+        return attributes
+
     def _validate_send_dtype(self, tensor: torch.Tensor, operation: str) -> None:
         """Fail before entering NCCL when a sender disagrees with the receive dtype."""
         if self.comm_dtype is not None and tensor.dtype != self.comm_dtype:
@@ -396,12 +513,20 @@ class BridgeCommunicator:
                         role=CommRole.RECEIVER, recv_from_ranks=[src_rank]
                     )
 
-    def send_forward(self, tensor_to_send: torch.Tensor, expect_backward: bool = True):
+    @_trace_bridge_operation('megatron.mimo.bridge.send_forward', participants='sender')
+    def send_forward(
+        self,
+        tensor_to_send: torch.Tensor,
+        expect_backward: bool = True,
+        *,
+        microbatch_id: Optional[int] = None,
+    ):
         """Send forward activation tensor.
 
         Args:
             tensor_to_send: The tensor to send to the destination grid
             expect_backward: Whether to remember the sent shape for a later gradient receive.
+            microbatch_id: Optional telemetry ID for the forward microbatch.
         """
         if not self.is_current_rank_in_grid(self.src_grid):
             raise ValueError(
@@ -483,11 +608,15 @@ class BridgeCommunicator:
         dist.broadcast(tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg)
         return tensor
 
-    def recv_forward(self, recv_shape: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+    @_trace_bridge_operation('megatron.mimo.bridge.recv_forward', participants='destination')
+    def recv_forward(
+        self, recv_shape: Optional[Tuple[int, ...]] = None, *, microbatch_id: Optional[int] = None
+    ) -> torch.Tensor:
         """Receive forward activation tensor.
 
         Args:
             recv_shape: Expected tensor shape when shape exchange is skipped.
+            microbatch_id: Optional telemetry ID for the forward microbatch.
 
         Returns:
             torch.Tensor: The received activation tensor
@@ -588,13 +717,21 @@ class BridgeCommunicator:
         )
         return grad_tensor
 
-    def send_backward(self, grad_tensor: Optional[torch.Tensor]):
+    @_trace_bridge_operation(
+        'megatron.mimo.bridge.send_backward',
+        participants='receiver_or_dest_cp',
+        requires_backward=True,
+    )
+    def send_backward(
+        self, grad_tensor: Optional[torch.Tensor], *, microbatch_id: Optional[int] = None
+    ):
         """Send backward gradient tensor.
 
         Note: Gradient senders are activation 'RECEIVERS'
 
         Args:
             grad_tensor: The gradient tensor to send back, or None when backward is disabled.
+            microbatch_id: Optional telemetry ID for the backward microbatch.
         """
         if not self.is_current_rank_in_grid(self.dest_grid):
             raise ValueError(
@@ -633,13 +770,16 @@ class BridgeCommunicator:
                         )
                 self._run_batched_payload_p2p(tensor_splits, rank_info.recv_from_ranks, op="send")
 
-    def recv_backward(self) -> Optional[torch.Tensor]:
+    @_trace_bridge_operation(
+        'megatron.mimo.bridge.recv_backward', participants='source', requires_backward=True
+    )
+    def recv_backward(self, *, microbatch_id: Optional[int] = None) -> Optional[torch.Tensor]:
         """Receive backward gradient tensor.
 
         Note: Gradient receivers are activation 'SENDERS'
 
         Args:
-            tensor_shape: Expected gradient tensor shape
+            microbatch_id: Optional telemetry ID for the backward microbatch.
 
         Returns:
             The received gradient tensor, or None when backward is disabled.
@@ -746,14 +886,26 @@ class BridgeCommunicator:
             )
             return received_gradient
 
+    @_trace_bridge_operation(
+        'megatron.mimo.bridge.send_forward_recv_backward',
+        participants='source',
+        requires_backward=True,
+    )
     def send_forward_recv_backward(
-        self, input_tensor: torch.Tensor, grad_shape: Optional[Tuple[int, ...]] = None
+        self,
+        input_tensor: torch.Tensor,
+        grad_shape: Optional[Tuple[int, ...]] = None,
+        *,
+        forward_microbatch_id: Optional[int] = None,
+        backward_microbatch_id: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Combined operation: send forward activation and receive backward gradient.
 
         Args:
             input_tensor: The tensor to send forward
             grad_shape: Expected gradient tensor shape
+            forward_microbatch_id: Optional telemetry ID for the forward microbatch.
+            backward_microbatch_id: Optional telemetry ID for the backward microbatch.
 
         Returns:
             The received gradient tensor, or None when backward is disabled.
@@ -768,7 +920,9 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         if not self.requires_backward:
-            self.send_forward(input_tensor, expect_backward=False)
+            self.send_forward(
+                input_tensor, expect_backward=False, microbatch_id=forward_microbatch_id
+            )
             return None
         logger.debug(
             "[Bridge Communicator] [send_forward_recv_backward] Rank %s "
@@ -893,14 +1047,26 @@ class BridgeCommunicator:
             )
             return received_gradient
 
+    @_trace_bridge_operation(
+        'megatron.mimo.bridge.send_backward_recv_forward',
+        participants='destination',
+        requires_backward=True,
+    )
     def send_backward_recv_forward(
-        self, grad_tensor: Optional[torch.Tensor], forward_shape: Optional[Tuple[int, ...]] = None
+        self,
+        grad_tensor: Optional[torch.Tensor],
+        forward_shape: Optional[Tuple[int, ...]] = None,
+        *,
+        forward_microbatch_id: Optional[int] = None,
+        backward_microbatch_id: Optional[int] = None,
     ) -> torch.Tensor:
         """Combined operation: send backward gradient and receive forward activation.
 
         Args:
             grad_tensor: The gradient tensor to send backward, or None when backward is disabled.
             forward_shape: Expected forward tensor shape
+            forward_microbatch_id: Optional telemetry ID for the forward microbatch.
+            backward_microbatch_id: Optional telemetry ID for the backward microbatch.
 
         Returns:
             torch.Tensor: The received activation tensor
@@ -915,7 +1081,7 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         if not self.requires_backward:
-            return self.recv_forward(forward_shape)
+            return self.recv_forward(forward_shape, microbatch_id=forward_microbatch_id)
         assert grad_tensor is not None
         grad_tensor = self._reduce_dest_cp_gradient(grad_tensor)
 

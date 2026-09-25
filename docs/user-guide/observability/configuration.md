@@ -23,10 +23,15 @@ These flags are processed in `megatron/training/global_vars.py:_set_telemetry()`
 
 Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLensConfig` field](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.md) with `NEMO_LENS_*` as fallback — they are not independent settings. Setting `MEGATRON_OTEL_ENABLED=1` is equivalent to setting `NEMO_LENS_ENABLED=1`; they refer to the same underlying config. The prefix/fallback model lets Megatron scope its own env vars while still inheriting lens defaults from a shared environment.
 
+Most runs only need `MEGATRON_OTEL_ENABLED` and either an OTLP endpoint or the
+console exporter; the remaining variables have defaults. MIMO validation adds
+`MEGATRON_OTEL_EXPORT_STRATEGY` and `MEGATRON_OTEL_SPAN_GROUPS` when spans from
+all model regions are needed.
+
 | Variable | Default | Description |
 |---|---|---|
 | `MEGATRON_OTEL_ENABLED` | `0` | Master toggle; must be set to `1` to activate |
-| `MEGATRON_OTEL_RANK_STRATEGY` | `single_rank` | `single_rank`, `all_ranks`, `sampled`, `first_rank_per_node`, or any name registered via `register_rank_strategy()` |
+| `MEGATRON_OTEL_EXPORT_STRATEGY` | `single_rank` | `single_rank`, `all_ranks`, `sampled`, `first_rank_per_node`, or any name registered via `register_export_strategy()` |
 | `MEGATRON_OTEL_EXPORT_RANK` | `-1` | For `single_rank`: which rank exports. `-1` = last rank |
 | `MEGATRON_OTEL_EXPORT_SAMPLE_RATE` | `1.0` | For `sampled`: fraction in `[0.0, 1.0]` |
 | `MEGATRON_OTEL_SAMPLING_STRATEGY` | (empty) | `rank_aware` or any name registered via `register_sampling_strategy()`. Empty leaves the OTel SDK default sampler in place. |
@@ -41,9 +46,9 @@ Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLens
 For the full config model, field semantics, and validation rules, see
 [lens: configuration](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.md).
 
-## Rank strategy
+## Export strategy
 
-Controls which ranks actually send telemetry. Four strategies are available: `single_rank` (default), `all_ranks`, `sampled`, and `first_rank_per_node`, configured via `MEGATRON_OTEL_RANK_STRATEGY` above.
+Controls which ranks actually send telemetry. Four strategies are available: `single_rank` (default), `all_ranks`, `sampled`, and `first_rank_per_node`, configured via `MEGATRON_OTEL_EXPORT_STRATEGY` above.
 
 See [lens: sampling](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/sampling.md) for detailed semantics, when to use each, and how they compose with OTel SDK samplers.
 
@@ -140,3 +145,25 @@ export MEGATRON_OTEL_SPAN_GROUPS=per_step
 export OTEL_TRACES_SAMPLER=parentbased_traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.1    # keep 10% of traces
 ```
+
+### Heterogeneous MIMO training
+
+The MIMO entrypoint uses the shared training-loop telemetry. Because its encoder
+and language model can occupy disjoint ranks, use `all_ranks` when validating
+coverage for both regions. For example, the existing heterogeneous mock launcher
+can emit its shared spans to the console with:
+
+```bash
+export MEGATRON_OTEL_ENABLED=1
+export MEGATRON_OTEL_EXPORTER=console
+export MEGATRON_OTEL_EXPORT_STRATEGY=all_ranks
+export MEGATRON_OTEL_SPAN_GROUPS=per_step,microbatch
+
+TRAIN_ITERS=2 EVAL_ITERS=1 \
+  bash examples/mimo/scripts/run_hetero_nemotron_20l_mock_train.sh
+```
+
+`per_step` enables the shared step, forward/backward, optimizer, communication,
+checkpoint, and evaluation boundaries. Adding `microbatch` enables the shared
+pipeline-schedule forward and backward spans. These settings do not add
+MIMO-specific encoder, projection, or bridge spans.

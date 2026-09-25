@@ -44,6 +44,20 @@ Defined in `megatron/core/telemetry/span_groups.py`. Extends lens's base `SpanGr
 | `data_loading` | (reserved for future use) | every iteration |
 | `inference` | (reserved for the inference server) | every inference request |
 
+## MIMO spans
+
+MIMO training adds the following spans under existing groups:
+
+| Group | Spans emitted |
+|---|---|
+| `microbatch` | `megatron.mimo.encoder.forward`, `megatron.mimo.projection.forward`, `megatron.mimo.embedding.text`, `megatron.mimo.embedding.fuse`, `megatron.mimo.input.partition`, `megatron.mimo.language.forward`, `megatron.mimo.loss` |
+| `communication` | `megatron.mimo.bridge.{send,recv}_{forward,backward}`, `megatron.mimo.bridge.send_forward_recv_backward`, `megatron.mimo.bridge.send_backward_recv_forward` |
+
+Where available, these spans attach `megatron.mimo.*` module, placement, pipeline-stage,
+bridge, shape, and dtype metadata. Shape and dtype attributes come from tensor metadata and
+do not add device scalar reads or synchronization. Backward-dependent bridge spans are omitted
+when the bridge does not require backward communication.
+
 ## Examples
 
 ```bash
@@ -62,7 +76,7 @@ MEGATRON_OTEL_SPAN_GROUPS=all
 
 ## Span hierarchy
 
-The full tree of spans Megatron can emit, with the controlling span group shown per span:
+The shared training span hierarchy, with the controlling span group shown per span (see the MIMO table above for role-dependent MIMO spans):
 
 ```
 megatron.pretrain                                          # job
