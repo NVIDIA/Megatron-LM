@@ -255,11 +255,41 @@ class ShortcutMoEBlock(MegatronModule):
         assert self.route_ready_event is not None
         dispatch_stream = self._get_a2a_overlap_stream()
         dispatch_stream.wait_event(self.route_ready_event)
-        hidden_states.record_stream(dispatch_stream)
-        probs.record_stream(dispatch_stream)
 
         with torch.cuda.stream(dispatch_stream):
-            return self.moe_layer.mlp.dispatch(hidden_states, probs)
+            outputs = self.moe_layer.mlp.dispatch(hidden_states, probs)
+        self._wait_for_compute_in_backward(outputs, (hidden_states, probs))
+        return outputs
+
+    def _wait_for_compute_in_backward(self, outputs, inputs) -> None:
+        """Order side-stream buffer reuse after previously enqueued backward compute.
+
+        Expert/postprocess backward can release saved dispatch/combine outputs on
+        compute. Autograd's gradient-ready event may precede those other compute
+        uses, so wait for the current compute frontier before the next side-stream
+        backward operation allocates. The hook owns only streams, not activations.
+        """
+        compute_stream = torch.cuda.current_stream()
+        overlap_stream = self._get_a2a_overlap_stream()
+
+        def wait_for_compute(grad_outputs):
+            overlap_stream.wait_stream(compute_stream)
+
+        # A dispatcher can return a view or compose several autograd operations.
+        # Backward compute may run between them, so protect every side operation,
+        # stopping at the input nodes that were created before entering this stream.
+        visited = {value.grad_fn for value in inputs if value is not None}
+        visited.add(None)
+        pending = [value.grad_fn for value in outputs if value is not None]
+        while pending:
+            node = pending.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            if hasattr(node, "variable"):  # Leaf AccumulateGrad is not a side operation.
+                continue
+            node.register_prehook(wait_for_compute)
+            pending.extend(parent for parent, _ in node.next_functions)
 
     def _wait_dispatch(
         self, dispatched_input: torch.Tensor, dispatched_probs: torch.Tensor
@@ -268,8 +298,6 @@ class ShortcutMoEBlock(MegatronModule):
         assert self.overlap_mode
 
         torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
-        dispatched_input.record_stream(torch.cuda.current_stream())
-        dispatched_probs.record_stream(torch.cuda.current_stream())
         return dispatched_input, dispatched_probs
 
     def _launch_combine(self, output: torch.Tensor, async_op: bool = False) -> torch.Tensor:
@@ -279,14 +307,14 @@ class ShortcutMoEBlock(MegatronModule):
 
         combine_stream = self._get_a2a_overlap_stream()
         combine_stream.wait_stream(torch.cuda.current_stream())
-        output.record_stream(combine_stream)
         with torch.cuda.stream(combine_stream):
-            return self.moe_layer.mlp.combine(output)
+            combined_output = self.moe_layer.mlp.combine(output)
+        self._wait_for_compute_in_backward((combined_output,), (output,))
+        return combined_output
 
     def _wait_combine(self, combined_output: torch.Tensor) -> torch.Tensor:
         """Wait for the asynchronous combine and return its output on the main stream."""
         torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
-        combined_output.record_stream(torch.cuda.current_stream())
         return combined_output
 
     def forward(
@@ -393,4 +421,11 @@ class ShortcutMoEBlock(MegatronModule):
             )
         if cp_layout_state is not None:
             output = cp_layout_state.finalize_layer(self.moe_local_idx, output)
+        if self.overlap_mode:
+            # Locals keep route/expert inputs alive until their compute-stream
+            # joins above. Dispatch outputs are protected by _launch_combine's
+            # reverse wait; protect the last compute use of combine outputs too,
+            # before forward locals are released and the side stream can reuse
+            # their storage. Saved activations also need the backward pre-hooks.
+            self._get_a2a_overlap_stream().wait_stream(torch.cuda.current_stream())
         return output

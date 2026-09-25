@@ -1,11 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 import transformer_engine as te
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
@@ -412,6 +413,11 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
         if overlap:
             monkeypatch.setattr(
                 block,
+                "_get_a2a_overlap_stream",
+                lambda: SimpleNamespace(wait_stream=lambda stream: None),
+            )
+            monkeypatch.setattr(
+                block,
                 "_launch_dispatch",
                 lambda route_input, route_probs, async_op=False: block.moe_layer.mlp.dispatch(
                     route_input, route_probs
@@ -460,6 +466,252 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
     assert overlap_gradients.keys() == serial_gradients.keys()
     for name in overlap_gradients:
         torch.testing.assert_close(overlap_gradients[name], serial_gradients[name])
+
+
+class _CommunicationCopy(torch.autograd.Function):
+    """A linear transport operation that allocates on its execution stream."""
+
+    @staticmethod
+    def forward(ctx, value):
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient.clone()
+
+
+class _DelayedSin(torch.autograd.Function):
+    """Keep a saved activation in use on the GPU after Python releases it."""
+
+    delay_cycles = 1_000_000
+
+    @staticmethod
+    def forward(ctx, value):
+        ctx.save_for_backward(value)
+        return value.sin()
+
+    @staticmethod
+    def backward(ctx, gradient):
+        (value,) = ctx.saved_tensors
+        torch.cuda._sleep(_DelayedSin.delay_cycles)
+        return gradient * value.cos()
+
+
+def _cuda_shortcut_block(parallel):
+    config = TransformerConfig(num_layers=2, hidden_size=256, num_attention_heads=1)
+
+    class Compute(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = config
+            self.layer_number = 1
+
+        def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
+            return (hidden_states * 0.5,)
+
+        def forward_post_core_attn(self, value):
+            return value.cos()
+
+    class MLP(torch.nn.Module):
+        tp_group = None
+
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.full((256,), 0.5))
+
+        def dispatch(self, hidden_states, probs):
+            return _CommunicationCopy.apply(hidden_states), _CommunicationCopy.apply(probs)
+
+        def routed_experts_compute(self, hidden_states, probs):
+            return (
+                hidden_states * self.scale
+                + _DelayedSin.apply(hidden_states)
+                + _DelayedSin.apply(probs),
+                None,
+            )
+
+        def combine(self, value):
+            return _CommunicationCopy.apply(value)
+
+    moe = _FakeMoE(config)
+    moe.mlp = MLP()
+    block = ShortcutMoEBlock(Compute(), moe, overlap_a2a=parallel).cuda()
+    block._moe_router_preprocess = lambda shortcut_hidden, **kwargs: (
+        shortcut_hidden * 0.25,
+        shortcut_hidden * 0.125,
+    )
+    block._moe_shared_experts = lambda hidden_states, **kwargs: (
+        hidden_states.square(),
+        None,
+        hidden_states,
+        (),
+    )
+    block._postprocess = lambda residual, combined, shared, **kwargs: (
+        _DelayedSin.apply(combined) + shared + residual
+    )
+    return block
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "recompute", [None, False, True], ids=["no-recompute", "nonreentrant", "reentrant"]
+)
+def test_shortcut_cuda_stream_lifetimes(monkeypatch, capture, recompute):
+    """Exercise real stream handoffs, saved tensors, and repeated allocator reuse."""
+
+    def forbid_record_stream(*args, **kwargs):
+        raise AssertionError("ShortcutMoEBlock must use explicit stream synchronization")
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", forbid_record_stream)
+    values = torch.linspace(-0.75, 0.75, 1024 * 256, device="cuda").reshape(1024, 256)
+
+    def run(parallel):
+        blocks = [_cuda_shortcut_block(parallel) for _ in range(3)]
+        compute = torch.cuda.Stream()
+        compute.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(compute):
+            value = values.clone().requires_grad_()
+
+        def forward(value):
+            for block in blocks:
+                value = block(
+                    value, None, None, None, None, None, None, lambda *args: nullcontext()
+                )
+            return value
+
+        def step():
+            value.grad = None
+            for block in blocks:
+                block.zero_grad(set_to_none=True)
+            result = (
+                checkpoint(forward, value, use_reentrant=recompute)
+                if recompute is not None
+                else forward(value)
+            )
+            result.sum().backward()
+            return result, value.grad
+
+        with torch.cuda.stream(compute):
+            # Warm up the same streams, allocator bins, and autograd paths used in capture.
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(compute)
+        torch.cuda.synchronize()
+
+        if capture:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=compute):
+                result, gradient = step()
+            for _ in range(5):
+                graph.replay()
+        else:
+            with torch.cuda.stream(compute):
+                for _ in range(5):
+                    result, gradient = step()
+            torch.cuda.current_stream().wait_stream(compute)
+        torch.cuda.synchronize()
+        parameter_gradients = {
+            f"{index}.{name}": parameter.grad.detach().clone()
+            for index, block in enumerate(blocks)
+            for name, parameter in block.named_parameters()
+            if parameter.grad is not None
+        }
+        assert len(parameter_gradients) == len(blocks)
+        return result.detach().clone(), gradient.detach().clone(), parameter_gradients
+
+    serial = run(False)
+    overlapped = run(True)
+    for actual, expected in zip(overlapped, serial):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("output_view", [False, True])
+def test_shortcut_backward_reuses_freed_compute_activation(monkeypatch, output_view):
+    """A ready gradient event can be older than another use of freed side storage.
+
+    Run with CUDA_MODULE_LOADING=EAGER when checking the unsafe control: lazy
+    module loading can introduce driver synchronization that hides the race.
+    """
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    monkeypatch.setattr(_DelayedSin, "delay_cycles", 100_000_000)
+    block = _cuda_shortcut_block(True)
+    compute = torch.cuda.current_stream()
+    side = block._get_a2a_overlap_stream()
+    value = torch.full((1024, 256), 0.25, device="cuda", requires_grad=True)
+    # Lazy CUDA kernel loading can synchronize the device and hide the race.
+    with torch.no_grad():
+        (value.cos() * value).clone()
+        torch.ones((), device=value.device).expand_as(value).clone()
+    torch.cuda.synchronize()
+    side.wait_stream(compute)
+    backward_allocations = []
+
+    class Copy(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value, name):
+            ctx.name = name
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, gradient):
+            result = torch.empty_like(gradient).fill_(float("nan"))
+            result.copy_(gradient)
+            backward_allocations.append((ctx.name, result.data_ptr()))
+            return result, None
+
+    with torch.cuda.stream(side):
+        saved = Copy.apply(value, "saved")
+        independent = Copy.apply(value, "independent")
+        independent_copy = independent.grad_fn
+        if output_view:
+            independent = independent.view_as(independent)
+    compute.wait_stream(side)
+    block._wait_for_compute_in_backward((saved, independent), (value,))
+    saved_address = saved.data_ptr()
+    consumed = _DelayedSin.apply(saved)
+    first_sum = consumed.sum()
+    second_sum = independent.sum()
+    # Make both gradients ready before the delayed consumer runs. The independent
+    # side-stream backward then runs before the saved tensor's own producer.
+    second_sum.grad_fn._set_sequence_nr(100004)
+    first_sum.grad_fn._set_sequence_nr(100003)
+    consumed.grad_fn._set_sequence_nr(100002)
+    independent_copy._set_sequence_nr(100001)
+    if output_view:
+        independent.grad_fn._set_sequence_nr(100005)
+    saved.grad_fn._set_sequence_nr(100000)
+    del saved
+    (first_sum + second_sum).backward()
+    torch.cuda.synchronize()
+    assert [name for name, _ in backward_allocations] == ["independent", "saved"]
+    assert backward_allocations[0][1] == saved_address, "test must exercise storage reuse"
+    torch.testing.assert_close(value.grad, value.detach().cos() + 1, rtol=0, atol=0)
+
+
+def test_shortcut_forward_reuses_combine_storage():
+    """The next side allocation must wait for the final compute consumer."""
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    block = _cuda_shortcut_block(True)
+    value = torch.full((1024, 256), 0.25, device="cuda")
+    original_postprocess = block._postprocess
+
+    def delayed_postprocess(*args, **kwargs):
+        torch.cuda._sleep(10_000_000)
+        return original_postprocess(*args, **kwargs)
+
+    block._postprocess = delayed_postprocess
+    args = (value, None, None, None, None, None, None, lambda *args: nullcontext())
+    with torch.no_grad():
+        actual = block(*args)
+        # Overwrite all recently freed communication buffers while the CPU is
+        # ahead of compute. The release wait must precede these allocations.
+        with torch.cuda.stream(block._get_a2a_overlap_stream()):
+            reuse = [torch.empty_like(value).fill_(float("nan")) for _ in range(8)]
+        torch.cuda.synchronize()
+        expected = _cuda_shortcut_block(False)(*args)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_shortcut_norm_recompute_and_offload(monkeypatch):
