@@ -7,7 +7,64 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.tensor_parallel import gtp_api
+from megatron.core.tensor_parallel.gtp_utils import (
+    _fused_projection_optimizer_factory,
+    _gtp_gather_rows_for_save,
+    _gtp_slice_rows_on_load,
+)
 from megatron.core.transformer.utils import cat_with_oom_fallback
+
+
+def _split_in_proj_factory(
+    orig_sh_ten: ShardedTensor,
+    split_sections: list[int],
+    split_names: list[str],
+    *,
+    weight: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
+    sharded_offsets: tuple[tuple[int, int, int], ...] = (),
+) -> ShardedTensorFactory:
+    """Checkpoint an SSM input projection in its logical, TP-local section layout.
+
+    Mamba, GDN, and GDP concatenate different semantic sections along dimension 0.
+    GTP row-shard boundaries can cross those sections, so gather before splitting
+    and slice back to the physical shard after merging on load. The shared GTP
+    helpers handle alignment padding and elect one checkpoint writer per replica.
+
+    ``split_sections`` contains TP-local sizes; ``split_names`` preserves the
+    module's checkpoint keys (including GDP's individual householder copies).
+    ``orig_sh_ten.data`` is the checkpoint representation, already dequantized
+    for native-FP8 weights. ``weight`` supplies the live GTP group and shard shape.
+    Ordinary weights and replicated biases use the section factory directly.
+
+    All GTP ranks must call this together when constructing the checkpoint dict.
+    Model weights merge to physical GTP shards. A source-parameter companion
+    maps optimizer tensors and flat DP fragments to the same semantic keys
+    without additional collectives.
+    """
+    uses_gtp = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(weight)
+    if uses_gtp:
+        # Read the parameter's logical width independently of the requested
+        # sections, so the split factory still rejects wrong totals.
+        target_rows = weight._unsharded_shape[0]
+        orig_sh_ten = _gtp_gather_rows_for_save(
+            orig_sh_ten,
+            orig_sh_ten.key,
+            weight,
+            target_rows,
+            tp_group,
+            dp_cp_group,
+            sharded_offsets,
+        )
+
+    factory = _split_tensor_factory(orig_sh_ten, split_sections, split_names, split_dim=0)
+    if uses_gtp:
+        factory = _gtp_slice_rows_on_load(factory, weight)
+    else:
+        factory.optimizer_factory = _fused_projection_optimizer_factory(factory, weight)
+    return factory
 
 
 def _split_tensor_factory(

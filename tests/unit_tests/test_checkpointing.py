@@ -23,6 +23,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _load_gdn_bias_checkpoint_metadata,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -645,7 +646,64 @@ class TestBuildShardedStateDictMetadata:
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
+    def test_new_checkpoints_use_semantic_gdn_bias_sections(self):
+        metadata = _build_sharded_state_dict_metadata(
+            _make_metadata_args(), dp_cp_group=self.DUMMY_GROUP
+        )
+        assert metadata['gdn_in_proj_bias_split'] is True
+        assert 'gdn_legacy_in_proj_bias_tp_size' not in metadata
+
     def test_no_distributed_optimizer_no_sharding_type(self):
         args = _make_metadata_args()
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_args", "configured_num_householder", "expected_num_householder"),
+    [(SimpleNamespace(gdp_num_householder=5), 3, 5), (SimpleNamespace(), 5, 3)],
+)
+def test_load_args_restores_gdp_num_householder_from_checkpoint(
+    checkpoint_args, configured_num_householder, expected_num_householder
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        gdp_num_householder=configured_num_householder,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.gdp_num_householder == expected_num_householder
+
+
+@pytest.mark.parametrize('source_tp', [1, 2, None])
+def test_legacy_gdn_bias_metadata_preserves_source_tp(source_tp):
+    args = SimpleNamespace()
+    if source_tp is not None:
+        args.tensor_model_parallel_size = source_tp
+    # Older global and local checkpoints have no content metadata. Unknown TP
+    # stays unknown so GDN rejects loading the rank-ordered layout at a guessed TP.
+    state = {'args': args}
+    metadata = _load_gdn_bias_checkpoint_metadata(state)
+    assert metadata == {
+        'gdn_in_proj_bias_split': False,
+        'gdn_legacy_in_proj_bias_tp_size': source_tp,
+    }
+
+
+def test_gdn_bias_metadata_uses_saved_schema_and_explicit_legacy_tp():
+    state = {'content_metadata': {'gdn_legacy_in_proj_bias_tp_size': 2}}
+    assert _load_gdn_bias_checkpoint_metadata(state) == {
+        'gdn_in_proj_bias_split': False,
+        'gdn_legacy_in_proj_bias_tp_size': 2,
+    }
+    state['content_metadata']['gdn_in_proj_bias_split'] = True
+    assert _load_gdn_bias_checkpoint_metadata(state) == {'gdn_in_proj_bias_split': True}

@@ -33,23 +33,26 @@ class ModuleGridSpec:
     cp: int = 1
     pp: int = 1
     ep: int = 1
+    gtp_remat: int = 1
     rank_offset: int = 0
     # Experts default to TP=1 (set explicitly for MoE); intentionally not Megatron's etp=tp default.
     expt_tp: int = 1
+    expt_gtp_remat: int = 1
     dp: int = field(init=False)
     expt_dp: int = field(init=False)
 
     def __post_init__(self) -> None:
-        dense = self.tp * self.cp * self.pp
+        dense = self.tp * self.gtp_remat * self.cp * self.pp
         if self.num_ranks % dense != 0:
             raise ValueError(
-                f"num_ranks ({self.num_ranks}) must be divisible by tp*cp*pp ({dense})"
+                f"num_ranks ({self.num_ranks}) must be divisible by tp*gtp_remat*cp*pp ({dense})"
             )
         self.dp = self.num_ranks // dense
-        expert = self.expt_tp * self.ep * self.pp
+        expert = self.expt_tp * self.ep * self.expt_gtp_remat * self.pp
         if self.num_ranks % expert != 0:
             raise ValueError(
-                f"num_ranks ({self.num_ranks}) must be divisible by expt_tp*ep*pp ({expert})"
+                f"num_ranks ({self.num_ranks}) must be divisible by "
+                f"expt_tp*ep*expt_gtp_remat*pp ({expert})"
             )
         self.expt_dp = self.num_ranks // expert
 
@@ -118,27 +121,45 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
 def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
     """Create a dense grid plus its expert view and the process groups MIMO needs."""
     grid = HyperCommGrid(
-        shape=[spec.tp, spec.cp, spec.dp, spec.pp],
-        dim_names=["tp", "cp", "dp", "pp"],
+        shape=[spec.tp, spec.cp, spec.gtp_remat, spec.dp, spec.pp],
+        dim_names=["tp", "cp", "gtp_remat", "dp", "pp"],
         rank_offset=spec.rank_offset,
         backend="nccl",
     )
     # Expert factorization over the same rank span; pp is shared with the base view.
     grid.register_view(
         _EXPERT_VIEW,
-        shape=[spec.expt_tp, spec.ep, spec.expt_dp, spec.pp],
-        dim_names=["expt_tp", "ep", "expt_dp", "pp"],
+        shape=[spec.expt_tp, spec.ep, spec.expt_gtp_remat, spec.expt_dp, spec.pp],
+        dim_names=["expt_tp", "ep", "expt_gtp_remat", "expt_dp", "pp"],
         shared_dims=["pp"],
     )
 
     try:
         for dims in (
-            ["tp"], ["cp"], ["pp"], ["dp"],
-            ["dp", "cp"], ["tp", "cp"], ["tp", "pp"],
-            ["tp", "dp"], ["tp", "dp", "cp"], ["tp", "cp", "dp", "pp"],
+            ["tp"],
+            ["gtp_remat"],
+            ["cp"],
+            ["pp"],
+            ["dp"],
+            ["dp", "cp"],
+            ["cp", "gtp_remat", "dp"],
+            ["tp", "cp"],
+            ["tp", "gtp_remat", "pp"],
+            ["tp", "gtp_remat", "dp"],
+            ["tp", "cp", "gtp_remat", "dp"],
+            ["tp", "cp", "gtp_remat", "dp", "pp"],
         ):
             grid.create_pg(dims)
-        for dims in (["ep"], ["expt_tp"], ["expt_dp"], ["expt_tp", "ep"], ["expt_tp", "ep", "pp"]):
+        for dims in (
+            ["ep"],
+            ["expt_tp"],
+            ["expt_gtp_remat"],
+            ["expt_dp"],
+            ["expt_tp", "ep"],
+            ["expt_tp", "ep", "pp"],
+            ["expt_tp", "ep", "expt_gtp_remat", "pp"],
+            ["expt_gtp_remat", "expt_dp"],
+        ):
             grid.create_pg(dims, view=_EXPERT_VIEW)
     except Exception:
         grid.destroy()
@@ -193,18 +214,25 @@ def pg_collection_from_grid(
     pgc.pp = grid.get_pg("pp")
     pgc.dp = grid.get_pg("dp")
     pgc.dp_cp = grid.get_pg(["dp", "cp"])
+    pgc.dp_cp_gtp_remat = grid.get_pg(["cp", "gtp_remat", "dp"])
     pgc.intra_dp_cp = pgc.dp_cp
+    pgc.gtp_remat = grid.get_pg("gtp_remat")
     pgc.tp_cp = grid.get_pg(["tp", "cp"])
-    pgc.tp_dp = grid.get_pg(["tp", "dp"])
-    pgc.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
-    pgc.mp = grid.get_pg(["tp", "pp"])
-    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+    pgc.tp_dp = grid.get_pg(["tp", "gtp_remat", "dp"])
+    pgc.tp_dp_cp = grid.get_pg(["tp", "cp", "gtp_remat", "dp"])
+    pgc.mp = grid.get_pg(["tp", "gtp_remat", "pp"])
+    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "gtp_remat", "dp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
+    pgc.expt_gtp_remat = grid.get_pg("expt_gtp_remat", view=_EXPERT_VIEW)
     pgc.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
+    pgc.expt_dp_gtp_remat = grid.get_pg(["expt_gtp_remat", "expt_dp"], view=_EXPERT_VIEW)
     pgc.intra_expt_dp = pgc.expt_dp
     pgc.tp_ep = grid.get_pg(["expt_tp", "ep"], view=_EXPERT_VIEW)
     pgc.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
+    pgc.tp_ep_pp_with_egtp_remat = grid.get_pg(
+        ["expt_tp", "ep", "expt_gtp_remat", "pp"], view=_EXPERT_VIEW
+    )
     pgc.embd = None
     pgc.pos_embd = None
     if is_language:

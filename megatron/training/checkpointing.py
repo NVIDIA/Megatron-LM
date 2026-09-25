@@ -39,7 +39,13 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    grant_shape_mismatch_for_gtp_padding,
+    resolve_gtp_pad_for_alignment,
+    unwrap_model,
+)
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -164,6 +170,8 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    if hasattr(args, 'gdp_num_householder'):
+        _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
@@ -512,6 +520,7 @@ def _build_sharded_state_dict_metadata(
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
 
+    metadata['gdn_in_proj_bias_split'] = True
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
@@ -519,6 +528,22 @@ def _build_sharded_state_dict_metadata(
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     metadata['dp_cp_group'] = dp_cp_group
     return metadata
+
+
+def _load_gdn_bias_checkpoint_metadata(state_dict: dict) -> dict:
+    """Select the saved GDN bias layout for global and local checkpoint requests."""
+    saved_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict) or {}
+    if saved_metadata.get('gdn_in_proj_bias_split', False):
+        return {'gdn_in_proj_bias_split': True}
+    # Unknown source TP must not inherit the general loader's default of 1:
+    # the legacy bias layout depends on the actual save-time TP degree.
+    return {
+        'gdn_in_proj_bias_split': False,
+        'gdn_legacy_in_proj_bias_tp_size': saved_metadata.get(
+            'gdn_legacy_in_proj_bias_tp_size',
+            getattr(state_dict.get('args'), 'tensor_model_parallel_size', None),
+        ),
+    }
 
 
 def save_grads(save_dir, state_dict, iteration, grad_label):
@@ -960,6 +985,10 @@ def save_checkpoint(
                     and 'local_checkpoint_cache' in checkpointing_context
                 ):
                     cached_metadata = checkpointing_context['local_checkpoint_cache']
+                # Local checkpoints need the saved model layout when rebuilding load requests.
+                state_dict['content_metadata'] = _clean_metadata_for_serialization(
+                    sharded_sd_metadata
+                )
                 state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
                     state_dict,
                     algo=algo,
@@ -1028,6 +1057,8 @@ def save_checkpoint(
                 mpu.get_pipeline_model_parallel_rank,
                 mpu.get_pipeline_model_parallel_world_size,
             )
+            gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
+            gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
             def iter_finalize_fn():
                 prev_iteration = 0
@@ -1046,6 +1077,7 @@ def save_checkpoint(
                     f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
                     f"checkpoint from iteration {int(iteration):7d} to {args.save} "
                     f"[ t {tensor_mp_rank}/{tp_size_to_print}, "
+                    f"gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, "
                     f"p {pipeline_mp_rank}/{pp_size_to_print} ]"
                 )
                 if args.log_progress and args.async_save:
@@ -1593,6 +1625,15 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
+
+    # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
+    # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
+    gtp_pad_for_alignment = resolve_gtp_pad_for_alignment(
+        fp4=getattr(args, 'fp4', None) is not None,
+        fp8_recipe=getattr(args, 'fp8_recipe', None),
+        fp8=getattr(args, 'fp8', None) is not None,
+    )
+    grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_name, gtp_pad_for_alignment)
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
         checkpoint_name,
@@ -1972,6 +2013,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
+    # GDP checkpoints created before this argument existed always used three reflections.
+    if not hasattr(checkpoint_args, 'gdp_num_householder'):
+        setattr(checkpoint_args, 'gdp_num_householder', 3)
+    _set_arg('gdp_num_householder', force=True)
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
     _set_arg('hybrid_layer_pattern')
@@ -2187,7 +2232,8 @@ def load_checkpoint(
         # Ensure we have a dict before updating to avoid NoneType AttributeError.
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
-        sharded_sd_metadata["dp_cp_group"] = dp_cp_group
+        sharded_sd_metadata['dp_cp_group'] = dp_cp_group
+        sharded_sd_metadata.update(_load_gdn_bias_checkpoint_metadata(state_dict))
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
@@ -2344,12 +2390,26 @@ def load_checkpoint(
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
+        # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
+        # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if HAVE_GTP:
+            from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
+
+            load_ctx = lambda: gtp_native_fp8_load_context(module)
+        else:
+            from contextlib import nullcontext
+
+            load_ctx = nullcontext
         try:
-            module.load_state_dict(state_dict, strict=strict)
+            with load_ctx():
+                module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
-                load_return = module.load_state_dict(state_dict, strict=False)
+                with load_ctx():
+                    load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
 
     # Model.
@@ -2527,9 +2587,12 @@ def load_checkpoint(
         if pp_group is not None
         else mpu.get_pipeline_model_parallel_world_size()
     )
+    _gtp_remat_r = mpu.get_gtp_weight_remat_rank()
+    _gtp_remat_w = mpu.get_gtp_weight_remat_world_size()
     print_rank_0(
         f'  successfully loaded checkpoint from {load_dir} '
         f'[ t {_tp_r + 1}/{_tp_w}, '
+        f'gtp_remat {_gtp_remat_r + 1}/{_gtp_remat_w}, '
         f'p {_pp_r + 1}/{_pp_w} ] '
         f'at iteration {iteration}'
     )

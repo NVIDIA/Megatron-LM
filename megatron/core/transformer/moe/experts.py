@@ -23,7 +23,8 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -198,6 +199,10 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        # Replicate group for expert weights in sharded_state_dict. expt_dp EXCLUDES the
+        # egtp_remat axis (expt_dp_gtp_remat is the inclusive one), which is what writer
+        # election needs: EGTP peers are separated by replica_id[1], not by this rank.
+        self.expt_dp_group = pg_collection.expt_dp
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -1038,6 +1043,13 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
+        # Match construction's lazy import to avoid the TE/GTP import cycle.
+        from megatron.core.tensor_parallel import gtp_api
+        from megatron.core.tensor_parallel.gtp_utils import (
+            _gtp_gather_rows_for_save,
+            _gtp_slice_rows_on_load,
+        )
+
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
@@ -1059,10 +1071,39 @@ class TEGroupedMLP(MegatronModule):
                             (ep_axis, local_expert_indices_offset + i, num_global_experts),
                         )
                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
-                        if k in sub_sd:
-                            sub_sd[k] = apply_swiglu_sharded_factory(
-                                sub_sd[k], new_sharded_offsets, singleton_local_shards
+                        if k not in sub_sd:
+                            continue
+                        expert_w = getattr(module, f'weight{i}', None)
+                        is_gtp_weight = (
+                            k == f'{name}.weight{i}'
+                            and gtp_api.HAVE_GTP
+                            and gtp_api.is_gtp_param(expert_w)
+                            and getattr(expert_w, 'gtp_remat_size', 1) > 1
+                        )
+                        source = sub_sd[k]
+                        v = source
+                        if is_gtp_weight:
+                            # Experts share a key and carry an expert-axis offset.
+                            # Elect writers over expert DP, excluding EGTP peers.
+                            v = _gtp_gather_rows_for_save(
+                                source,
+                                source.key,
+                                expert_w,
+                                expert_w._unsharded_shape[0],
+                                self.tp_group,
+                                self.expt_dp_group,
+                                new_sharded_offsets,
                             )
+                        v = apply_swiglu_sharded_factory(
+                            v, new_sharded_offsets, singleton_local_shards
+                        )
+                        if is_gtp_weight:
+                            v = _gtp_slice_rows_on_load(v, expert_w)
+                            # Muon retains its unsplit physical schema and expert offsets.
+                            v.gtp_source_param = expert_w
+                            v.gtp_source_sharded_tensor = source
+                        sub_sd[k] = v
+
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
             else:
@@ -1169,6 +1210,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SQUARED_RELU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
+    # Later refits update these buffers, so create normal tensors without tracking gradients.
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
 
@@ -1185,6 +1229,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         intended for non-colocated inference.
         """
 
+        backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
@@ -1199,13 +1244,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
                         f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
                         f"got {type(w).__name__}. Was quantize_model_to_mxfp8 called?"
                     )
+                validate_mxfp8_tensor(
+                    mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
+                )
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
             stacked_data = torch.stack(q_list, dim=0).contiguous()
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
-            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
+            setattr(
+                self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend)
+            )
 
             # Redirect per-expert weight .data to views into the stacked buffer,
             # mirroring _build_concatenated_weights. This frees the original

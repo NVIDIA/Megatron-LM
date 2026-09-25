@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import math
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -46,7 +47,7 @@ from ..dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensorFactory,
 )
-from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
+from ..dist_checkpointing.optimizer import make_sharded_optimizer_fragment
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
     group_params_for_buffers,
@@ -60,6 +61,7 @@ from ..fp8_utils import (
     is_grouped_tensor_with_quantized_storage,
     quantize_param_shard,
 )
+from ..tensor_parallel import gtp_api
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -73,6 +75,69 @@ from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
 logger = getLogger(__name__)
+
+
+def _get_param_id_to_sharded_metadata(
+    model_sharded_state_dict: ShardedStateDict,
+) -> Dict[int, ShardedTensor | ShardedTensorFactory]:
+    """Index optimizer metadata once by exact parameter identity.
+
+    Prefer a factory's physical-parameter companion over its model representation.
+    Dequantized and padding-trimmed entries also resolve through their source identity.
+    Preserve the original keys, expert offsets and replica IDs in both cases.
+    """
+    from megatron.core.tensor_parallel.gtp_utils import gtp_entry_backlink
+
+    result, source_bound = {}, {}
+    for entry in nested_values(model_sharded_state_dict):
+        if isinstance(entry, ShardedTensorFactory):
+            entry = entry.for_optimizer()
+        elif not isinstance(entry, ShardedTensor):
+            continue
+        if entry.data is not None:
+            result[id(entry.data)] = entry
+            source = gtp_entry_backlink(entry)
+            if source is not None:
+                source_bound[id(source)] = entry
+    # Direct parameter bindings (including companions) take precedence over copies.
+    return {**source_bound, **result}
+
+
+def _validate_gtp_optimizer_padding(model_param: torch.Tensor, logical_numel: int) -> None:
+    """Validate a logical state size against this parameter's known GTP padding."""
+    expected_numel = model_param.numel()
+    pad_length = getattr(model_param, 'pad_length', 0)
+    gtp_size = getattr(model_param, 'gtp_remat_size', 1)
+    group = getattr(model_param, 'group', None)
+    if (
+        not gtp_api.HAVE_GTP
+        or not gtp_api.is_gtp_param(model_param)
+        or pad_length <= 0
+        or gtp_size <= 1
+        or group is None
+    ):
+        raise ValueError(
+            f"Optimizer state has {logical_numel} elements, expected {expected_numel}; "
+            "the parameter has no GTP alignment padding."
+        )
+    shard_rows = model_param.shape[0]
+    logical_rows = shard_rows * gtp_size - pad_length
+    keep_rows = max(0, min(shard_rows, logical_rows - group.rank() * shard_rows))
+    expected_logical_numel = keep_rows * math.prod(model_param.shape[1:])
+    if logical_numel != expected_logical_numel:
+        raise ValueError(
+            f"Optimizer state has {logical_numel} elements, expected {expected_logical_numel} "
+            f"logical elements or {expected_numel} padded elements."
+        )
+
+
+def _restore_gtp_optimizer_padding(state: torch.Tensor, model_param: torch.Tensor) -> torch.Tensor:
+    """Restore only the known alignment tail of a fully reshardable optimizer state."""
+    expected_numel = model_param.numel()
+    if state.numel() == expected_numel:
+        return state
+    _validate_gtp_optimizer_padding(model_param, state.numel())
+    return torch.cat((state, state.new_zeros(expected_numel - state.numel())))
 
 
 class Range:
@@ -210,6 +275,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
         data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
+
+        # The layout records how many shards it was built for. That count has to match the group
+        # the reduce-scatter and all-gather run over, which is the intra-instance group when
+        # there are several optimizer instances. If the layout was sized by a larger group, the
+        # trailing shards of every bucket belong to no rank: those params are never updated and
+        # drop out of grad-norm, num-zeros and params-norm, which sum over owned shards only.
+        num_optimizer_shards = param_and_grad_buffer.num_optimizer_shards
+        assert num_optimizer_shards is None or num_optimizer_shards == data_parallel_world_size, (
+            f"Parameter layout was built for {num_optimizer_shards} optimizer shards but the "
+            f"buffer's data-parallel group has {data_parallel_world_size} ranks. Size the layout "
+            f"by the group the optimizer shards over."
+        )
 
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
@@ -423,7 +500,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                         copy_optimizer_param_metadata(shard_model_param, model_param)
+                        shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                            model_param, param_range.start, param_range.end
+                        )
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -454,7 +535,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
                         copy_optimizer_param_metadata(shard_main_param, model_param)
+                        shard_main_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                            model_param, param_range.start, param_range.end
+                        )
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -476,7 +561,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
+                    tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                     copy_optimizer_param_metadata(shard_model_param, model_param)
+                    shard_model_param.gtp_pad_zeros = tensor_parallel.gtp_local_pad_zero_count(
+                        model_param, param_range.start, param_range.end
+                    )
 
                 else:
                     raise TypeError(
@@ -589,6 +678,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=data_parallel_world_size,
         )
 
     @staticmethod
@@ -1138,6 +1228,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     'Skipping loading grad scaler ...',
                 )
 
+        self._loaded_master_mismatch = torch.zeros(
+            (), dtype=torch.long, device=torch.cuda.current_device()
+        )
+
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
@@ -1157,6 +1251,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.load_parameter_state_from_fs_model_space(param_state)
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
+
+            self._warn_if_master_disagrees_with_model_weights()
+
+    def _warn_if_master_disagrees_with_model_weights(self):
+        """Warn when FP32 master restores overwrite different model-checkpoint values.
+
+        FP32 masters alias model parameters, and each rank restores only its owned
+        shard. If the two checkpoint copies disagree (e.g. BF16 saved, FP32 resumed),
+        the resulting model replicas can differ with the parallel layout.
+        """
+        counter = self._loaded_master_mismatch
+        self._loaded_master_mismatch = None
+        if counter is None:
+            return
+        # Other pipeline stages may not have this optimizer (e.g. expert parameters).
+        # Reduce and report within its DP group so they need not participate.
+        torch.distributed.all_reduce(counter, group=self.data_parallel_group)
+        num_params = int(counter.item())
+        if num_params == 0:
+            return
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'***WARNING*** {num_params} fp32 parameter shards were loaded from an optimizer '
+            f'master that disagrees with the model weights stored in the same checkpoint. '
+            f'Each rank only restores the shard it owns, so the weights this run starts from '
+            f'depend on the parallel layout and replicas may differ from one another. This '
+            f'usually means the checkpoint was saved with a different parameter precision '
+            f'than this run uses.',
+            rank=torch.distributed.get_global_rank(self.data_parallel_group, 0),
+        )
 
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
@@ -1290,15 +1415,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
-            # For fp32 model params, main_param is an autograd-tracked view of
-            # the model param (built without detach() in
-            # _build_model_and_main_param_groups), so the in-place copy must
-            # run under no_grad.
+            # FP32 main params are autograd-tracked model views; restore without autograd.
             with torch.no_grad():
                 for key in dst_tensors:
                     if not isinstance(tensors[key], torch.Tensor):
                         continue
-                    dst_tensors[key].copy_(tensors[key])
+                    dst = dst_tensors[key]
+                    src = tensors[key].to(device=dst.device, dtype=dst.dtype)
+                    if (
+                        key == "param"
+                        and model_param.dtype == torch.float32
+                        # Legacy parameter-only loads have no warning counter.
+                        and getattr(self, "_loaded_master_mismatch", None) is not None
+                    ):
+                        # Compare before overwriting the model shard; report once after load.
+                        self._loaded_master_mismatch += torch.ne(dst, src).any().long()
+                    dst.copy_(src)
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -1387,6 +1519,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                 # Create coalesced tensors for all state related to parameters in this buffer.
+                # These are sized to the compact (bucket-end padding stripped) layout, which is
+                # exactly what the loop below fills and what the load paths read back.
                 world_tensors = {}
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
@@ -1603,6 +1737,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Megatron-FSDP custom sharded state dict construction.
             state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
             return state_dict
+
+        if gtp_api.HAVE_GTP and sharding_type in ('fully_reshardable', 'fully_sharded_model_space'):
+            # Resolve physical optimizer views before reading state or exchanging buffers.
+            param_metadata = _get_param_id_to_sharded_metadata(model_sharded_state_dict)
+            for buffer in self.buffers:
+                for param in buffer.param_index_map:
+                    if gtp_api.is_gtp_param(param) and id(param) not in param_metadata:
+                        raise NotImplementedError(
+                            f"Distributed optimizer format '{sharding_type}' requires source-bound "
+                            "checkpoint metadata for GTP parameters. Gathered factories must "
+                            "provide an optimizer_factory companion; dequantized entries must "
+                            "retain their source parameter. Use 'dp_reshardable' otherwise."
+                        )
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
             log_single_rank(
@@ -1822,12 +1969,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return_on_all_ranks=return_on_all_ranks or is_loading,
         )
 
-        param_to_sharded_metadata = {}
-        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
-            model_sharded_state_dict
-        )
-        for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+        param_to_sharded_metadata = _get_param_id_to_sharded_metadata(model_sharded_state_dict)
 
         prefix = 'optimizer.state'
         model_space_state = {}
@@ -1845,24 +1987,43 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # Note: for NVFP4, param_index_map uses unpacked (full numel)
                 # offsets, which is correct here since optimizer states
                 # (fp32_param, exp_avg, exp_avg_sq) are in unpacked space.
+
+                # Compute cumulative bucket-end padding stripped before each bucket.
+                # world_tensors has bucket-end padding stripped, but param_index_map
+                # indices include bucket-end padding. We need to adjust indices.
+                cumulative_padding_stripped = [0]  # For bucket 0, no prior padding stripped
+                for bucket in buffer.buckets[:-1]:  # All but last bucket
+                    bucket_padding = bucket.grad_data.numel() - bucket.numel_unpadded
+                    cumulative_padding_stripped.append(
+                        cumulative_padding_stripped[-1] + bucket_padding
+                    )
+
                 for model_param, (
                     param_world_start,
                     param_world_end,
-                    _,
+                    bucket_id,
                 ) in buffer.param_index_map.items():
-                    try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
-                    except KeyError as e:
+                    sharded_metadata = param_to_sharded_metadata.get(id(model_param))
+                    if sharded_metadata is None:
+                        name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                         raise ValueError(
-                            f"Model param {model_param} not in model_sharded_state_dict."
+                            f"Model param {name} (shape={tuple(model_param.shape)})"
+                            f" has no source-bound metadata in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
-                        ) from e
+                        )
                     assert (
                         sharded_metadata.flattened_range is None
                     ), f"Flattened model tensor not supported ({sharded_metadata})"
 
                     # Note: replica_id is exactly the same as in the model param
                     replica_id = sharded_metadata.replica_id
+
+                    # Adjust indices to account for stripped bucket-end padding.
+                    # param_world_start/end are indices in the buffer (with padding),
+                    # but world_tensors has the bucket-end padding stripped.
+                    padding_adjustment = cumulative_padding_stripped[bucket_id]
+                    adjusted_start = param_world_start - padding_adjustment
+                    adjusted_end = param_world_end - padding_adjustment
 
                     tensors = {}
                     for state_key in world_tensor_keys:
@@ -1871,29 +2032,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # specifically and is read from param_groups.
                             # Numel unpadded is not needed.
                             continue
-                        state_ten = world_tensors[state_key][param_world_start:param_world_end]
-                        missing_elems_num = (param_world_end - param_world_start) - len(state_ten)
+                        assert adjusted_end <= world_tensors[state_key].numel(), (
+                            f"'{sharded_metadata.key}' range [{adjusted_start}, {adjusted_end})"
+                            f" runs past the coalesced buffer"
+                            f" ({world_tensors[state_key].numel()} elements);"
+                            f" bucket-padding adjustment is wrong."
+                        )
+                        state_ten = world_tensors[state_key][adjusted_start:adjusted_end]
 
-                        if missing_elems_num > 0:
-                            # `state_ten` is shorter than the slice which means the world_tensor
-                            # is shorter than `param_world_end` - this is a bug in the param ranges
-                            # logic. Here we can only pad this with zeros as a workaround.
-                            # TODO: this assert shouldn't hold and indicates a bug, see issue #504
-                            assert param_world_end > buffer.numel_unpadded
-
-                            logger.warning(
-                                f"'{sharded_metadata.key}' param range exceeds"
-                                f" unpadded buffer by {missing_elems_num} elements."
-                                f" It will be padded with zeros which can lead to"
-                                f" data corruption."
-                            )
-                            state_ten = torch.nn.functional.pad(state_ten, (0, missing_elems_num))
-
-                        assert len(state_ten) == param_world_end - param_world_start, (
+                        assert len(state_ten) == (param_world_end - param_world_start), (
                             len(state_ten),
                             param_world_end - param_world_start,
                         )
-                        state_ten = state_ten.reshape(sharded_metadata.data.shape)
+                        want_shape = tuple(sharded_metadata.data.shape)
+                        if getattr(sharded_metadata, 'gtp_pad_src', None) is not None:
+                            # The plain model entry excludes this physical shard's pad tail.
+                            # Fused companion factories retain physical data and trim at build.
+                            _validate_gtp_optimizer_padding(model_param, math.prod(want_shape))
+                            state_ten = state_ten[: math.prod(want_shape)]
+                        state_ten = state_ten.reshape(want_shape)
                         replace_kwargs = dict(
                             key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                             data=state_ten,
@@ -2072,12 +2229,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         This will allow changing TP and PP while using DistOpt (as with other optimizers).
         """
 
-        param_to_sharded_metadata = {}
-        model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
-            model_sharded_state_dict
-        )
-        for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+        param_to_sharded_metadata = _get_param_id_to_sharded_metadata(model_sharded_state_dict)
 
         prefix = 'optimizer.state'
         state = {}
@@ -2091,13 +2243,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
-            try:
-                sharded_metadata = param_to_sharded_metadata[model_param]
-            except KeyError as e:
+            sharded_metadata = param_to_sharded_metadata.get(id(model_param))
+            if sharded_metadata is None:
+                name = getattr(model_param, '_debug_name', None) or '<unnamed>'
                 raise ValueError(
-                    f"Model param {model_param} not in model_sharded_state_dict"
+                    f"Model param {name} (shape={tuple(model_param.shape)})"
+                    f" has no source-bound metadata in model_sharded_state_dict."
                     f" Hint: {KEEP_VARS_HINT}"
-                ) from e
+                )
 
             # Set DP corresponding replica_id coordinate to 0.
             assert (
@@ -2114,16 +2267,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     # The optimizer state of STEP is handled
                     # specifically and is read from param_groups.
                     continue
-                replace_kwargs = dict(
-                    key=f'{prefix}.{state_key}.{sharded_metadata.key}',
-                    data=state_ten,
-                    dtype=state_ten.dtype,
-                    flattened_range=item_slice,
-                    replica_id=replica_id,
-                )
                 if isinstance(sharded_metadata, ShardedTensorFactory):
-                    replace_kwargs.pop('dtype')
-                tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                    tensors[state_key] = replace(
+                        sharded_metadata,
+                        key=f'{prefix}.{state_key}.{sharded_metadata.key}',
+                        data=state_ten,
+                        flattened_range=item_slice,
+                        replica_id=replica_id,
+                    )
+                else:
+                    logical_numel = math.prod(sharded_metadata.local_shape)
+                    if logical_numel != model_param.numel():
+                        _validate_gtp_optimizer_padding(model_param, logical_numel)
+                    tensors[state_key] = make_sharded_optimizer_fragment(
+                        sharded_metadata,
+                        state_ten,
+                        f'{prefix}.{state_key}',
+                        item_slice,
+                        replica_id=replica_id,
+                        physical_numel=model_param.numel(),
+                    )
                 tensors[state_key].validate_metadata_integrity()
             return tensors
 
@@ -2474,7 +2637,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         if k == "step":
                             # Handle torch Adam "step" state separately.
                             continue
-                        v_flat = v.flatten()
+                        v_flat = _restore_gtp_optimizer_padding(v.flatten(), model_param)
                         v_flat = v_flat[
                             param_range_map["param"].start : param_range_map["param"].end
                         ]

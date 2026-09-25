@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -43,6 +43,7 @@ from megatron.core.transformer.experimental_attention_variant import dsa_logging
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
+    ensure_params_ready,
     get_attr_wrapped_model,
     get_torch_version,
     is_te_min_version,
@@ -69,6 +70,37 @@ except:
     HAVE_TE_GRAPHS = False
 
 try:
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+except ImportError:
+    # GTP requires TransformerEngine with the GTP hook registry; treat it as
+    # unavailable when that import path cannot be resolved.
+    HAVE_GTP = False
+
+if HAVE_GTP:
+    from megatron.core.tensor_parallel.gtp_api import (
+        GTP_CONFIG,
+        GTPChain,
+        get_rs_stream,
+        initialize_graph_wgrad_rings,
+        preserve_gtp_prefetch_state,
+        set_cuda_graph_mempool,
+        track_gtp_capture_comms,
+        wait_async_comms,
+    )
+else:
+    # Placeholders so static analysis does not flag these GTP-only symbols as
+    # possibly-used-before-assignment; every use site is guarded by HAVE_GTP /
+    # gtp_remat at runtime.
+    GTPChain = None
+    GTP_CONFIG = None
+    get_rs_stream = None
+    initialize_graph_wgrad_rings = None
+    preserve_gtp_prefetch_state = None
+    set_cuda_graph_mempool = None
+    track_gtp_capture_comms = None
+    wait_async_comms = None
+
+try:
     from tqdm import tqdm
 
     HAVE_TQDM = True
@@ -77,10 +109,113 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_CUDA_GRAPH_STREAM_POOL_SIZE = 3
+_CUDA_GRAPH_STREAM_POOLS = None
+_CUDA_GRAPH_STREAM_NEXT_SLOT = 0
 logger = logging.getLogger(__name__)
 
 _DSA_GRAPH_LAYOUT_BUFFER_KWARG = "dsa_cp_graph_layout_buffer"
 _DSA_GRAPH_ROUTE_BUFFER_KWARG = "dsa_cp_graph_route_buffer"
+
+
+def _get_cuda_graph_stream() -> torch.cuda.Stream:
+    """Assign local CUDA-graph runners across a bounded set of distinct streams.
+
+    PyTorch obtains streams from a bounded pool, so repeatedly constructing
+    ``torch.cuda.Stream`` objects can eventually return the same underlying CUDA stream.
+    Assigning capture and replay streams explicitly makes that sharing intentional.
+
+    ``CUDA_DEVICE_MAX_CONNECTIONS`` controls how CUDA maps logical streams to hardware work
+    queues. It does not make PyTorch stream handles unique and cannot prevent stream aliasing.
+    """
+    global _CUDA_GRAPH_STREAM_POOLS, _CUDA_GRAPH_STREAM_NEXT_SLOT
+
+    pool = _CUDA_GRAPH_STREAM_POOLS
+    if pool is None:
+        # CUDA recommends at least as many connections as independently active streams. GTP can
+        # concurrently use graph, GTP/EGTP AG and RS, EP, DDP, and activation-offload streams, so
+        # CUDA's default of eight connections can introduce false dependencies between them.
+        max_connections = os.getenv("CUDA_DEVICE_MAX_CONNECTIONS")
+        warning_reason = None
+        if max_connections is None:
+            warning_reason = "is unset (CUDA defaults to 8)"
+        else:
+            try:
+                max_connections_value = int(max_connections)
+            except ValueError:
+                warning_reason = f"must be an integer from 1 to 32, but is {max_connections!r}"
+            else:
+                if max_connections_value < 16:
+                    warning_reason = f"is {max_connections_value}"
+
+        if warning_reason is not None:
+            logger.warning(
+                "CUDA_DEVICE_MAX_CONNECTIONS %s. For GTP workloads, consider setting it to "
+                "16 or 32 before process startup to avoid implicit stream aliasing.",
+                warning_reason,
+            )
+
+        pool = tuple(torch.cuda.Stream() for _ in range(_CUDA_GRAPH_STREAM_POOL_SIZE))
+        if len({stream.cuda_stream for stream in pool}) != len(pool):
+            raise RuntimeError("CUDA graph stream pool contains aliased streams")
+        _CUDA_GRAPH_STREAM_POOLS = pool
+
+    slot = _CUDA_GRAPH_STREAM_NEXT_SLOT
+    _CUDA_GRAPH_STREAM_NEXT_SLOT = (slot + 1) % len(pool)
+    return pool[slot]
+
+
+def _get_tensor_alias_chain(tensor):
+    """Return a tensor followed by each underlying base tensor."""
+    aliases = []
+    while torch.is_tensor(tensor):
+        aliases.append(tensor)
+        base = getattr(tensor, "_base", None)
+        if base is None or base is tensor:
+            break
+        tensor = base
+    return aliases
+
+
+def _apply_cudagraph_buffer_metadata(tensor, *, is_output=False):
+    """Attach one shared CUDA graph metadata object to a tensor and its base chain."""
+    aliases = _get_tensor_alias_chain(tensor)
+    metadata = next(
+        (alias.cg_buffer_metadata for alias in aliases if hasattr(alias, "cg_buffer_metadata")),
+        None,
+    )
+    if is_output:
+        metadata = CudagraphBufferMetadata(
+            is_cudagraph_output=True,
+            is_saved_for_backward=bool(metadata and metadata.is_saved_for_backward),
+        )
+    elif metadata is None:
+        metadata = CudagraphBufferMetadata()
+    for alias in aliases:
+        alias.cg_buffer_metadata = metadata
+    return metadata
+
+
+def _tag_cudagraph_buffer_saved_for_backward(tensor):
+    """Tag a CUDA graph input or output observed in a Python 'save_for_backward' call."""
+    if not torch.is_tensor(tensor):
+        return
+
+    # Views of the same graph buffer share one metadata object. If this tensor has not reached a
+    # graph boundary yet, initialize its metadata now so record-time input/output classification
+    # can preserve the saved-for-backward lifetime.
+    metadata = _apply_cudagraph_buffer_metadata(tensor)
+    metadata.is_saved_for_backward = True
+
+
+_GTP_RUNNER_STREAMS: List[torch.cuda.Stream] = []
+
+
+def get_gtp_runner_streams() -> List[torch.cuda.Stream]:
+    """Replay streams of all GTP CG runners; finalize_model_grads waits on these
+    (tail = captured Phase 2 main_grad.add_) before reading main_grad.
+    """
+    return _GTP_RUNNER_STREAMS
 
 
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
@@ -354,6 +489,67 @@ fwd_buffer_reuse_ref_count = 0
 bwd_buffer_reuse_ref_count = 0
 
 
+def _backup_grads_before_capture(runner, parameters=None):
+    """Snapshot main_grad so CUDA-graph capture cannot corrupt finalized gradients."""
+    backup = {}
+    parameters = tuple(runner.base_module.parameters() if parameters is None else parameters)
+    for p in parameters:
+        mg = getattr(p, "main_grad", None)
+        if mg is not None:
+            backup[id(p)] = (p, mg.clone())
+
+    if runner.gtp_remat:
+        # GTP only: also protect the cross-graph next_w the cascade accumulates into.
+        for p in parameters:
+            nw = getattr(p, "next_w", None) if getattr(p, "is_gtp_weight_remat", False) else None
+            if nw is None:
+                continue
+            shards = nw.weight_list if getattr(nw, "is_routed_expert", False) else [nw]
+            for w in shards or []:
+                mg = getattr(w, "main_grad", None)
+                if mg is not None and id(w) not in backup:
+                    backup[id(w)] = (w, mg.clone())
+    return backup
+
+
+def _restore_grads_after_capture(backup):
+    """Restore the main_grad snapshots taken by ``_backup_grads_before_capture``."""
+    for p, saved in backup.values():
+        p.main_grad.copy_(saved)
+
+
+@contextmanager
+def _preserve_parameter_grads_during_backward_capture(runner):
+    """Give each backward runner fresh accumulation state without changing the training step."""
+
+    parameters = tuple(runner.params_to_backprop)
+    main_grad_backup = _backup_grads_before_capture(runner, parameters=parameters)
+    missing = object()
+    parameter_state = [
+        (param, param.grad, getattr(param, "grad_added_to_main_grad", missing))
+        for param in parameters
+    ]
+
+    # A module can back multiple runners, as with a repeated MTP layer. Each runner must capture
+    # its own contribution instead of inheriting another runner's accumulation flag or stale grad.
+    for param, _, _ in parameter_state:
+        param.grad = None
+        if hasattr(param, "grad_added_to_main_grad"):
+            param.grad_added_to_main_grad = False
+
+    try:
+        yield
+    finally:
+        _restore_grads_after_capture(main_grad_backup)
+        for param, grad, grad_added_to_main_grad in parameter_state:
+            param.grad = grad
+            if grad_added_to_main_grad is missing:
+                if hasattr(param, "grad_added_to_main_grad"):
+                    delattr(param, "grad_added_to_main_grad")
+            else:
+                param.grad_added_to_main_grad = grad_added_to_main_grad
+
+
 class _CudagraphGlobalRecord:
     """A global datastructure that records of the ordering of all _CudaGraphRunner's
     first fwd or bwd passes. 'create_cudagraphs' will use this to create
@@ -424,6 +620,12 @@ class _CudagraphGlobalRecord:
                     "is replayed. For more information see: "
                     "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
                 )
+
+        gtp_active = any(r[0].gtp_remat for r in cls.cudagraph_record)
+        if gtp_active:
+            # GTP buffer reuse during capture trips the param-state debug asserts; disable them.
+            GTP_CONFIG.check_param_states = False
+            initialize_graph_wgrad_rings()
 
         _set_capture_start()
         if has_te_modules:
@@ -536,11 +738,13 @@ def delete_cuda_graphs():
         runner.fwd_graph = None
         runner.bwd_graph = None
         runner.mempool = None
+        runner._gtp_fwd_params_to_ensure_ready = ()
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -637,7 +841,13 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        runner.fwd_graph.replay()
+        if runner.use_stream:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
+                runner.fwd_graph.replay()
+            torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
+        else:
+            runner.fwd_graph.replay()
 
         if runner.is_last_layer:
             outputs = tuple(torch.clone(t) for t in runner.fwd_graph_output_surface)
@@ -668,10 +878,25 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
-        runner.bwd_graph.replay()
+        if runner.use_stream:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            if runner.gtp_remat:
+                for slot in runner._gtp_wgrad_ring_slots:
+                    runner.stream.wait_event(slot.ready_event)
+            with torch.cuda.stream(runner.stream):
+                runner.bwd_graph.replay()
+                if runner.gtp_remat:
+                    for slot in runner._gtp_wgrad_ring_slots:
+                        slot.ready_event.record(runner.stream)
+            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+        else:
+            runner.bwd_graph.replay()
+
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
+            if hasattr(param, 'grad_added_to_main_grad'):
+                param.grad_added_to_main_grad = True
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
@@ -679,6 +904,18 @@ class _CudagraphReplayNode(torch.autograd.Function):
             FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling
         ):
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
+
+        # DDP grad-ready hook is silenced at capture/replay, so fire it here (on each param's
+        # rs_stream, after wait_stream(runner.stream) fences Phase 2) to let DDP RS overlap bwd.
+        if runner.gtp_remat:
+            for gtp_rs_stream, params in runner._gtp_finalize_hook_plan:
+                gtp_rs_stream.wait_stream(runner.stream)
+                with torch.cuda.stream(gtp_rs_stream):
+                    for param in params:
+                        param.grad = None
+                        hook = getattr(param, '_grad_accum_hook', None)
+                        if hook is not None:
+                            hook()
 
         return None, None, *runner.static_grad_inputs, *(None,) * len(runner.params_to_backprop)
 
@@ -727,6 +964,20 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fp4_runtime_enabled = None
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 0
+        self.needs_recompute_param_discovery = False
+        self.use_stream = False
+        self.gtp_remat = False
+        # Populated by create_bwd_graph: one entry per captured GTP wgrad-finalization occurrence.
+        # Repeated parameters intentionally appear more than once so replay matches eager DDP
+        # grad-ready accounting.
+        self.finalized_during_bwd_capture = []
+        # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
+        self._gtp_finalize_hook_plan = []
+        # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
+        # reader before launching the graph.
+        self._gtp_wgrad_ring_slots = []
+        # GTP weights read by this forward graph before their owning module pre-hooks execute.
+        self._gtp_fwd_params_to_ensure_ready = ()
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -745,10 +996,26 @@ class _CudaGraphRunner(torch.nn.Module):
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
+            self.needs_recompute_param_discovery = (
+                self.grad_enabled and self.base_module.config.recompute_granularity is not None
+            )
             self.fp8_enabled = self.base_module.config.fp8 is not None
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
+            self.gtp_remat = self.base_module.config.gtp_weight_remat_size > 1
+
+            if self.gtp_remat:
+                # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps
+                # for GTP: 1st builds chain + tickets, 2nd exercises prefetch path.
+                self.num_warmup_steps = max(self.num_warmup_steps, 2)
+
+                self.use_stream = True
+                self.stream = _get_cuda_graph_stream()
+                self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                # Registered for finalize_model_grads to wait on (Phase 2 fence).
+                _GTP_RUNNER_STREAMS.append(self.stream)
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -759,6 +1026,36 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 _set_skip_fp8_weight_update_tensor(False)
+
+    def _wait_side_streams(self, side_streams):
+        """Wait for side streams that carried work owned by one capture tracker.
+
+        Joining only streams discovered by ``track_gtp_capture_comms`` avoids waiting on an empty
+        captured stream.
+        """
+        for s in side_streams:
+            torch.cuda.current_stream().wait_stream(s)
+
+    def _set_gtp_finalize_hook_plan(self, finalized_params):
+        """Build the replay hook plan from captured GRAPHED finalization occurrences."""
+        self.finalized_during_bwd_capture = list(finalized_params) if self.gtp_remat else []
+        self._gtp_finalize_hook_plan = []
+        if not self.finalized_during_bwd_capture:
+            return
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat", "expt_gtp_remat"]
+        )
+        dense_group = pg_collection.gtp_remat
+        expert_group = pg_collection.expt_gtp_remat
+        params_by_group = defaultdict(list)
+        for param in self.finalized_during_bwd_capture:
+            is_expert = not getattr(param, 'allreduce', True)
+            params_by_group[expert_group if is_expert else dense_group].append(param)
+        self._gtp_finalize_hook_plan = [
+            (get_rs_stream(GTPChain.GRAPHED.value, group), params)
+            for group, params in params_by_group.items()
+        ]
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -825,9 +1122,7 @@ class _CudaGraphRunner(torch.nn.Module):
             for buf in self.base_module.buffers():
                 buffer_backup.append(buf.clone())
 
-            grad_backup = []
-            for param in self.base_module.parameters():
-                grad_backup.append(param.main_grad.clone() if hasattr(param, "main_grad") else None)
+            grad_backup = _backup_grads_before_capture(self)
 
             saved_fp8_tensors = None
             if self.fp8_enabled:
@@ -927,36 +1222,59 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fwd_graph_input_args, self.fwd_graph_input_kwargs
         )
 
-        ctx = torch.no_grad() if not self.grad_enabled else nullcontext()
-        with ctx:
-            # warmup again as case graph capture mode may execute a different codepath
+        grad_context = torch.no_grad() if not self.grad_enabled else nullcontext()
+        warmup_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext()
+        with grad_context, warmup_comm_context as warmup_comms:
+            # Warm up again because CUDA graph capture mode may execute a different codepath
             _set_warmup_start()
-            for _ in range(self.num_warmup_steps):
-                with self.get_quantization_context():
 
-                    def clone_ten(ten):
-                        if not torch.is_tensor(ten):
-                            return ten
-                        return torch.clone(ten).detach().requires_grad_(ten.requires_grad)
+            # Recompute parameter discovery needs one warmup output: graph warmup bypasses
+            # CheckpointWithoutOutput, making parameters hidden by its nested backward reachable
+            # from that output's autograd graph. Force this pass even when configured warmup is 0.
+            num_warmup_steps = max(self.num_warmup_steps, int(self.needs_recompute_param_discovery))
+            for _ in range(num_warmup_steps):
+                preserve_prefetch_context = (
+                    preserve_gtp_prefetch_state(self.base_module.parameters())
+                    if self.gtp_remat
+                    else nullcontext()
+                )
+                with preserve_prefetch_context:
+                    with self.get_quantization_context():
 
-                    warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
-                    warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
-                    warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
+                        def clone_ten(ten):
+                            if not torch.is_tensor(ten):
+                                return ten
+                            return torch.clone(ten).detach().requires_grad_(ten.requires_grad)
 
-                if self.grad_enabled:
-                    warmup_outputs = self.get_tensors(warmup_outputs)
-                    warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
-                    input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
-                    torch.autograd.grad(
-                        outputs=warmup_outputs,
-                        inputs=tuple(i for i in input_tensors if i.requires_grad),
-                        grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
-                        only_inputs=True,
-                        allow_unused=True,
-                    )
+                        warmup_args = tree_map(clone_ten, self.fwd_graph_input_args)
+                        warmup_kwargs = tree_map(clone_ten, self.fwd_graph_input_kwargs)
+                        warmup_outputs = self.func(*warmup_args, **warmup_kwargs)
 
+                    if self.grad_enabled:
+                        warmup_outputs = self.get_tensors(warmup_outputs)
+                        warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
+                        input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
+                        torch.autograd.grad(
+                            outputs=warmup_outputs,
+                            inputs=tuple(i for i in input_tensors if i.requires_grad),
+                            grad_outputs=tuple(torch.zeros_like(o) for o in warmup_outputs),
+                            only_inputs=True,
+                            allow_unused=True,
+                        )
+
+                    if self.gtp_remat:
+                        # Join only GRAPHED-chain communication issued by this runner. Selecting
+                        # by both capture ownership and chain keeps UNGRAPHED work on its eager
+                        # lifecycle instead of turning it into a cross-graph handoff.
+                        warmup_params, warmup_ag_streams, warmup_rs_streams = (
+                            warmup_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                        )
+                        wait_async_comms(GTPChain.GRAPHED.value, params=warmup_params)
+                        self._wait_side_streams(warmup_ag_streams)
+                        self._wait_side_streams(warmup_rs_streams)
             _set_warmup_end()
 
+        with grad_context:
             with self.get_quantization_context():
                 torch.cuda.synchronize()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
@@ -972,11 +1290,39 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
-                with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                capture_comm_context = (
+                    track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+                )
+                with (
+                    capture_comm_context as capture_comms,
+                    torch.cuda.graph(
+                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    ),
                 ):
+
                     fwd_graph_outputs = self.func(
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
+                    )
+
+                    if self.use_stream:
+                        # Release the caller before joining outgoing GTP prefetches. The next local
+                        # graph can launch while this graph's tail AG runs, then wait on that AG's
+                        # external event before reading the prefetched weight.
+                        self.fwd_completion_event.record()
+
+                    if self.gtp_remat:
+                        # Forward only issues AG prefetches. Drain the operations directly.
+                        captured_params, captured_ag_streams, _ = capture_comms.get_comms_for_chain(
+                            GTPChain.GRAPHED.value
+                        )
+                        wait_async_comms(
+                            GTPChain.GRAPHED.value, skip_rs=True, params=captured_params
+                        )
+                        self._wait_side_streams(captured_ag_streams)
+
+                if self.gtp_remat:
+                    self._gtp_fwd_params_to_ensure_ready = tuple(
+                        capture_comms.params_to_ensure_ready
                     )
 
                 # Unfreeze GC.
@@ -1030,16 +1376,17 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fwd_graph_outputs = tree_map(make_weakref, self.fwd_graph_outputs)
             self.fwd_graph_output_surface = tree_map(make_weakref, self.fwd_graph_output_surface)
 
-            self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
+            if self.needs_recompute_param_discovery:
+                self.params_to_backprop = self.get_connected_params(warmup_outputs)
+            else:
+                self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
             self.num_dgrads = len(self.fwd_graph_input_surface)
             self.fwd_graph_input_surface = self.fwd_graph_input_surface + self.params_to_backprop
 
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
             # restore cached grads
-            for main_grad_copy, param in zip(grad_backup, self.base_module.parameters()):
-                if main_grad_copy is not None:
-                    param.main_grad.copy_(main_grad_copy)
+            _restore_grads_after_capture(grad_backup)
 
             # restore cached buffers
             for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
@@ -1093,7 +1440,13 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.freeze()
 
-        with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+        capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+        with (
+            capture_comm_context as capture_comms,
+            _preserve_parameter_grads_during_backward_capture(self),
+            torch.cuda.graph(self.bwd_graph, pool=self.mempool),
+        ):
+
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1107,12 +1460,50 @@ class _CudaGraphRunner(torch.nn.Module):
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
             )
             for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
-                if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
+                grad_already_accumulated = getattr(param, 'grad_added_to_main_grad', False)
+                if wgrad is not None and not grad_already_accumulated:
                     param.main_grad.add_(wgrad)
+                if param.grad is not None and not grad_already_accumulated:
+                    # A nested backward can accumulate directly into param.grad instead of
+                    # returning that contribution through the outer autograd.grad call.
+                    param.main_grad.add_(param.grad)
+                param.grad_added_to_main_grad = True
+
+            # GTP cross-graph RS overlap, two phases:
+            #   Phase 1 — drain AG, fence runner_stream past ag_stream's tail,
+            #             then record bwd_completion_event so main_stream can
+            #             release the next runner while RS is still in flight.
+            #   Phase 2 — drain RS wait on rs_stream. For cross-graph chain
+            #             tails the wait is captured here, the add in the
+            #             consumer's cascade; for within-graph tails both
+            #             happen here (see wait_async_comms).
+            if self.gtp_remat:
+                captured_params, captured_ag_streams, captured_rs_streams = (
+                    capture_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                )
+                # Phase 1: drain AG
+                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=captured_params)
+                self._wait_side_streams(captured_ag_streams)
+
+                # Release the next runner after AG drain but before RS drain.
+                self.bwd_completion_event.record()
+
+                # Phase 2: in-graph RS drain + finalize.
+                wait_async_comms(
+                    GTPChain.GRAPHED.value, finalize_after_drain=True, params=captured_params
+                )
+                self._wait_side_streams(captured_rs_streams)
+
+            if self.use_stream and not self.gtp_remat:
+                # Non-GTP path: record after the side-stream join.
+                self.bwd_completion_event.record()
 
         # Unfreeze GC.
         if FREEZE_GC:
             gc.unfreeze()
+
+        self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
+        self._set_gtp_finalize_hook_plan(capture_comms.finalized_params if self.gtp_remat else ())
 
         for arg in args_to_clear_buffers:
             arg.cg_buffer_metadata.bwd_cudagraph_buffer = None
@@ -1239,6 +1630,9 @@ class _CudaGraphRunner(torch.nn.Module):
         if mismatch_errors:
             error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
             raise AssertionError(error_msg)
+
+        if self._gtp_fwd_params_to_ensure_ready:
+            ensure_params_ready(self._gtp_fwd_params_to_ensure_ready)
 
         inp_tensors = self.get_tensors(args, kwargs, check_types=False)
         if self.grad_enabled:
@@ -1444,6 +1838,10 @@ class CudaGraphManager(torch.nn.Module):
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
+            # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
+            # storage directly into it (created before the first graphed forward).
+            if HAVE_GTP:
+                set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
             # Cudagraph stream capture requires no operations on the default stream prior to the
             # capture, so change to a side stream.
             torch.cuda.set_stream(torch.cuda.Stream())
@@ -1630,7 +2028,7 @@ class CudaGraphManager(torch.nn.Module):
 
         self.is_first_microbatch = False
         # If forward only, next replay should be a forward pass as well
-        if is_inference_mode or not torch.is_grad_enabled():
+        if is_inference_mode or not torch.is_grad_enabled() or not runner.fwd_graph_recorded:
             runner.status = _GraphStatus.FWD_READY
         else:
             runner.status = _GraphStatus.BWD_READY
