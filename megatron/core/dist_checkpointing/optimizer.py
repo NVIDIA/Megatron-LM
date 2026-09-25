@@ -5,6 +5,7 @@ for model parameters.
 """
 
 import logging
+import math
 from copy import deepcopy
 from dataclasses import replace
 from typing import Dict, Iterable, Tuple, Union
@@ -18,6 +19,7 @@ from megatron.core.utils import log_single_rank, to_local_if_dtensor
 from .dict_utils import nested_values
 from .mapping import (
     LocalNonpersistentObject,
+    ReplicaId,
     ShardedStateDict,
     ShardedTensor,
     ShardedTensorFactory,
@@ -106,6 +108,161 @@ def make_sharded_optimizer_tensor(
     )
     sh_ten.validate_metadata_integrity()
     return sh_ten
+
+
+def make_sharded_optimizer_fragment(
+    model_param: ShardedTensor,
+    optim_param: torch.Tensor,
+    prefix: str,
+    flattened_range: slice,
+    *,
+    replica_id: ReplicaId | None = None,
+    physical_numel: int | None = None,
+) -> ShardedTensorFactory:
+    """Map a flat optimizer fragment into regular chunks of a model tensor.
+
+    A contiguous flat interval may cross several rows or higher-dimensional slabs.
+    Split its boundaries into rectangular shards while retaining the model's keys and
+    global coordinates. The emitted ShardedTensors never use ``flattened_range``.
+
+    Args:
+        model_param: Logical model checkpoint metadata, including any prepended axes.
+        optim_param: Optimizer tensor containing exactly ``flattened_range``.
+        prefix: Optimizer state prefix prepended to the model checkpoint key.
+        flattened_range: Explicit start and stop within the physical local parameter.
+        replica_id: Optimizer replica identifier; defaults to the model's identifier.
+        physical_numel: Physical parameter size when validated trailing padding extends
+            beyond the logical model tensor. Padding is omitted and restored as zeros.
+
+    Returns:
+        A factory whose merge restores the input optimizer fragment's shape and dtype.
+
+    Raises:
+        ValueError: The physical size cannot contain the logical model tensor.
+    """
+    logical_numel = math.prod(model_param.local_shape)
+    if physical_numel is None:
+        physical_numel = logical_numel
+    if physical_numel < logical_numel:
+        raise ValueError('Physical parameter size is smaller than its logical checkpoint tensor')
+    factory = _make_sharded_optimizer_factory(
+        [model_param],
+        optim_param,
+        model_param.key,
+        physical_numel=physical_numel,
+        replica_id=model_param.replica_id if replica_id is None else replica_id,
+        flattened_range=flattened_range,
+    )
+    return replace(factory, key=f'{prefix}.{model_param.key}')
+
+
+def _make_sharded_optimizer_factory(
+    model_parts: Iterable[ShardedTensor],
+    optim_param: torch.Tensor,
+    key: str,
+    *,
+    physical_numel: int,
+    replica_id: ReplicaId,
+    shard_offset: int = 0,
+    flattened_range: slice | None = None,
+) -> ShardedTensorFactory:
+    """Map physical fragments into ordered logical sections without gathering data.
+
+    ``model_parts`` describes consecutive sections of the logical tensor. Their keys
+    must share ``key`` as a prefix so outer optimizer key rewrites can be propagated.
+    ``shard_offset`` locates the physical parameter within that concatenation. Only
+    trailing alignment padding may extend beyond it; loading restores padding as zeros.
+    Ordinary parameters use one section; fused projections supply their semantic split.
+    """
+    templates = [part.without_data() for part in model_parts]
+    if any(not part.key.startswith(key) for part in templates):
+        raise ValueError('Optimizer section keys must share the model factory key prefix')
+    strides = [
+        tuple(math.prod(part.local_shape[axis + 1 :]) for axis in range(len(part.local_shape)))
+        for part in templates
+    ]
+    base_key = key
+
+    @torch.no_grad()
+    def build(key, data, replica_id, flattened_range):
+        if flattened_range is None:
+            start, stop = 0, physical_numel
+        else:
+            start, stop = flattened_range.start, flattened_range.stop
+            if (
+                flattened_range.step not in (None, 1)
+                or start is None
+                or stop is None
+                or not 0 <= start <= stop <= physical_numel
+            ):
+                raise ValueError(f'Invalid optimizer fragment: {flattened_range}')
+        if data.numel() != stop - start:
+            raise ValueError('Optimizer data size does not match its physical parameter slice')
+        flat = data.detach().reshape(-1)
+        logical_start, logical_stop = shard_offset + start, shard_offset + stop
+        section_start, saved_numel = 0, 0
+        chunks = []
+        for template, section_strides in zip(templates, strides):
+            shape = template.local_shape
+            section_numel = math.prod(shape)
+            cursor = max(logical_start, section_start)
+            end = min(logical_stop, section_start + section_numel)
+            while cursor < end:
+                coordinates = tuple(
+                    ((cursor - section_start) // stride) % size
+                    for stride, size in zip(section_strides, shape)
+                )
+                chunk_shape, count = (), 1
+                for axis, stride in enumerate(section_strides):
+                    if any(coordinates[axis + 1 :]):
+                        continue
+                    extent = min(shape[axis] - coordinates[axis], (end - cursor) // stride)
+                    if extent:
+                        chunk_shape = (1,) * axis + (extent,) + shape[axis + 1 :]
+                        count = extent * stride
+                        break
+                offset = list(template.global_offset)
+                for axis, coordinate in enumerate(coordinates, template.prepend_axis_num):
+                    offset[axis] += coordinate
+                # DCP's chunk extents and tensor view must expose the same dimensions.
+                chunk_shape = (1,) * template.prepend_axis_num + chunk_shape
+                chunk = flat[cursor - logical_start : cursor - logical_start + count].view(
+                    chunk_shape
+                )
+                chunks.append(
+                    replace(
+                        template,
+                        key=key + template.key[len(base_key) :],
+                        data=chunk,
+                        dtype=data.dtype,
+                        local_shape=chunk_shape,
+                        global_offset=tuple(offset),
+                        axis_fragmentations=None,
+                        prepend_axis_num=0,
+                        flattened_range=None,
+                        replica_id=replica_id,
+                    )
+                )
+                cursor += count
+                saved_numel += count
+            section_start += section_numel
+        return {
+            'chunks': chunks,
+            'layout': LocalNonpersistentObject(
+                (tuple(data.shape), data.numel() - saved_numel, data.new_empty(0))
+            ),
+        }
+
+    @torch.no_grad()
+    def merge(state):
+        output_shape, padding, prototype = state['layout']
+        chunks = state['chunks']
+        flat = torch.cat([chunk.reshape(-1) for chunk in chunks]) if chunks else prototype
+        if padding:
+            flat = torch.cat((flat, flat.new_zeros(padding)))
+        return flat.reshape(output_shape)
+
+    return ShardedTensorFactory(key, optim_param, build, merge, replica_id, flattened_range)
 
 
 def optim_state_to_sharding_state(
