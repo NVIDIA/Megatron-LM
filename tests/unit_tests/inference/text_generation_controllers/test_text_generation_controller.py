@@ -227,7 +227,10 @@ class TextGenerationControllerTestBase:
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
 
+        # Set before construction: __init__ reads `tokenizer.eod`, an int per the
+        # tokenizer interface, and a bare Mock yields a Mock.
         self.mock_tokenizer = mock.Mock()
+        self.mock_tokenizer.eod = self.vocab_size - 1
 
         self.text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
@@ -1872,6 +1875,65 @@ def test_async_generate_output_tokens_dynamic_batch_assertions(mode, expected_me
 
     with pytest.raises(AssertionError, match=expected_message):
         asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True))
+
+
+class _EosStubTokenizer:
+    """Minimal stand-in exposing only what `_build_extra_eos_token_id_set` reads."""
+
+    def __init__(self, eod=None, generation_config=None):
+        if eod is not None:
+            self.eod = eod
+        if generation_config is not None:
+            self.generation_config = generation_config
+
+
+def _make_eos_controller(eod=None, generation_config=None):
+    """A controller with only its EOS state built (no model, no GPU)."""
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller.extra_eos_token_id_set = controller._build_extra_eos_token_id_set(
+        _EosStubTokenizer(eod=eod, generation_config=generation_config)
+    )
+    return controller
+
+
+def test_terminating_token_ids_honors_multi_eos_generation_config():
+    # nanov3p5 declares [2, 11] = [</s>, <|im_end|>]; NeMo-RL sets termination_id to
+    # tokenizer.eod (2). vLLM stops on either, so all declared ids must terminate.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, 11]})
+    assert controller.extra_eos_token_id_set == frozenset({2, 11})
+    assert controller.terminating_token_ids(2) == frozenset({2, 11})
+    assert torch.equal(
+        controller.extra_eos_token_id_tensor, torch.tensor([2, 11], dtype=torch.long)
+    )
+
+
+def test_terminating_token_ids_leaves_single_eos_termination_id_sole_authority():
+    # One declared id means the model file adds nothing, so a client that deliberately
+    # narrowed termination_id is not silently widened back to tokenizer.eod.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": 2})
+    assert controller.extra_eos_token_id_set == frozenset()
+    assert controller.extra_eos_token_id_tensor is None
+    assert controller.terminating_token_ids(99) == frozenset({99})
+
+
+def test_terminating_token_ids_without_generation_config_is_unchanged_behavior():
+    controller = _make_eos_controller(eod=2)
+    assert controller.extra_eos_token_id_tensor is None
+    assert controller.terminating_token_ids(2) == frozenset({2})
+
+
+@pytest.mark.parametrize("termination_id", [-1, None])
+def test_terminating_token_ids_empty_when_ignore_eos(termination_id):
+    # termination_id of -1 is how `ignore_eos` is expressed. Multi-EOS must not
+    # resurrect termination for those requests.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, 11]})
+    assert controller.terminating_token_ids(termination_id) == frozenset()
+
+
+def test_build_extra_eos_token_id_set_rejects_booleans():
+    # bool is an int subclass, so {"eos_token_id": true} must not become id 1.
+    controller = _make_eos_controller(eod=2, generation_config={"eos_token_id": [2, True]})
+    assert controller.extra_eos_token_id_set == frozenset()
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):

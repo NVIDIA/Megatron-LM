@@ -252,7 +252,7 @@ class TestMTPCudaGraphInference:
         )
         wrapped = GPTInferenceWrapper(model, context)
         wrapped.model_is_pipeline_parallel = False
-        mock_tokenizer = mock.Mock()
+        mock_tokenizer = mock.Mock(eod=self.VOCAB_SIZE - 1)
         ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
         engine = DynamicInferenceEngine(ctrl, context)
         return engine
@@ -1393,7 +1393,7 @@ class TestMtpKvCacheIdleExpertParallelRank:
         wrapped.model_is_pipeline_parallel = False
         InferenceMode.set_active()
         controller = TextGenerationController(
-            inference_wrapped_model=wrapped, tokenizer=mock.Mock()
+            inference_wrapped_model=wrapped, tokenizer=mock.Mock(eod=self.VOCAB_SIZE - 1)
         )
         return controller, context
 
@@ -1634,7 +1634,7 @@ class TestMTPBlockScopeCudaGraph:
         )
         wrapped = GPTInferenceWrapper(model, context)
         wrapped.model_is_pipeline_parallel = False
-        mock_tokenizer = mock.Mock()
+        mock_tokenizer = mock.Mock(eod=self.VOCAB_SIZE - 1)
         ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
         engine = DynamicInferenceEngine(ctrl, context)
         return engine

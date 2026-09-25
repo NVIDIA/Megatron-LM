@@ -15,9 +15,12 @@ import os
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -25,11 +28,13 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     te_supports_batch_invariant_grouped_gemm,
 )
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
@@ -46,6 +51,7 @@ if HAVE_TE:
         TELayerNormColumnParallelLinear,
         TENorm,
         TERowParallelLinear,
+        te_cross_entropy,
     )
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
@@ -274,6 +280,26 @@ class TestTEWrappers:
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
         )
 
+    @pytest.mark.skipif(TEFusedMLP is None, reason="TE operation-based MLP is unavailable")
+    @pytest.mark.parametrize("hash_threshold", [None, 0])
+    def test_te_fused_mlp_builder_replays(self, hash_threshold):
+        seeded()
+        module = TEFusedMLP.as_mlp_submodule(
+            submodules=MLPSubmodules(
+                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            ),
+            config=_config(normalization="RMSNorm", gradient_accumulation_fusion=False),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+            is_mtp_layer=False,
+            hash_moe_layer_threshold=hash_threshold,
+        ).cuda()
+        x = torch.randn(
+            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what=f"TEFusedMLP[hash={hash_threshold}]"
+        )
+
     def test_te_grouped_linear_replays_on_uneven_splits(self):
         seeded()
         module = TEGroupedLinear(
@@ -412,6 +438,21 @@ class TestTEWrappers:
             assert module.weight0 is parameter
             assert torch.equal(module.weight0, expected)
 
+    def test_te_fused_cross_entropy_replays(self):
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(
+            tokens, 1, 32768, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        assert_replays_bit_exact(
+            lambda l, t: te_cross_entropy(l, t, tp_group),
+            (logits, target),
+            replays=4,
+            what="te_fused_cross_entropy",
+        )
+
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     @pytest.mark.parametrize("log_max_attention_logit", [False, True])
     def test_te_dot_product_attention_replays(self, backend, log_max_attention_logit, monkeypatch):
@@ -452,18 +493,46 @@ class TestTEWrappers:
         k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-        def fn(q, k, v):
-            if log_max_attention_logit:
-                module.current_max_attn_logits.fill_(float("-inf"))
-            output = module(q, k, v, None, AttnMaskType.causal)
-            if log_max_attention_logit:
-                return output, module.current_max_attn_logits.clone()
-            return output
+        cp_group = parallel_state.get_context_parallel_group()
+        assert cp_group.size() == 1
+        runtime_cp1 = PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, local_cp_size=1)
+        assert module.cp_group is None
+        reference = None
 
         try:
-            assert_replays_bit_exact(
-                fn, (q, k, v), replays=4, contention=True, what=f"TEDotProductAttention[{backend}]"
-            )
+            # Runtime CP1 retains its singleton metadata but must dispatch the same
+            # CP-off kernels as the legacy path, including after metadata is removed.
+            for packed_seq_params in (None, runtime_cp1, None):
+
+                def fn(q, k, v):
+                    if log_max_attention_logit:
+                        module.current_max_attn_logits.fill_(float("-inf"))
+                    output = module(
+                        q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params
+                    )
+                    assert module.cp_group is None
+                    if log_max_attention_logit:
+                        return output, module.current_max_attn_logits.clone()
+                    return output
+
+                result = assert_replays_bit_exact(
+                    fn,
+                    (q, k, v),
+                    replays=4,
+                    contention=True,
+                    what=f"TEDotProductAttention[{backend},runtime_cp1={packed_seq_params is not None}]",
+                )
+                assert len(result[1]) == 3  # Replay covers dQ, dK, and dV.
+                assert runtime_cp1.cp_group is cp_group
+                assert runtime_cp1.local_cp_size == 1
+                assert module.cp_group is None
+                if reference is None:
+                    reference = result
+                for expected, actual in zip(reference, result):
+                    assert actual.keys() == expected.keys()
+                    for name in expected:
+                        assert torch.isfinite(actual[name]).all()
+                        assert bytes_equal(expected[name], actual[name]), name
         except (RuntimeError, AssertionError) as error:
             if "backend" in str(error).lower() and "avail" in str(error).lower():
                 pytest.skip(f"TE has no {backend} attention backend here: {error}")

@@ -6,7 +6,11 @@ from packaging.version import Version as PkgVersion
 import sys
 import torch
 
-from utils import _ConverterFakeProcessGroup, chunk_bias, chunk_weight
+from utils import (
+    chunk_bias,
+    chunk_weight,
+    initialize_checkpoint_converter_fake_process_groups,
+)
 
 class MegatronCheckpointSaverBase:
     """Orchestrates saving a Megatron checkpoint using parameters received on a multiprocessing queue.
@@ -60,6 +64,8 @@ class MegatronCheckpointSaverBase:
             # These are arguments that we are either changing, or cause problems for validation if they are set
             # Note that some of these deal with T5 so will need to be changed if we support T5.
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
+                            'tensor_parallel_num_weight_shards', 'gtp_weight_remat_size',
+                            'expert_tensor_parallel_num_weight_shards', 'expert_gtp_weight_remat_size',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                             'sequence_parallel',
@@ -174,19 +180,12 @@ class MegatronCheckpointSaverBase:
         mpu.set_pipeline_model_parallel_rank(0)
         mpu.set_expert_model_parallel_rank(0)
         
-        # For backward compatibility during local parallel states refactoring
-        fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
-        fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
-        fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
-        fake_dp_group = _ConverterFakeProcessGroup(size=1)
-        fake_dp_ep_group = _ConverterFakeProcessGroup(size=1)
-        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-        mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
-        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
-        mpu._DATA_PARALLEL_GROUP = fake_dp_group
-        mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
-        mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
-        mpu._EXPERT_DATA_PARALLEL_GROUP = fake_dp_ep_group
+        initialize_checkpoint_converter_fake_process_groups(
+            mpu,
+            self.args.target_tensor_parallel_size,
+            self.args.target_pipeline_parallel_size,
+            self.args.target_expert_parallel_size,
+        )
         
         try:
             import torch_llm_debug_tools

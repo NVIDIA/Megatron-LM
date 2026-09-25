@@ -18,6 +18,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _has_previous_turn_tokens,
     _last_assistant_message,
     _replace_prefix_tokens_metadata,
+    _sanitize_messages_for_template,
     _tokenize_with_media_slots_sync,
 )
 
@@ -104,6 +105,61 @@ def test_media_slot_uses_tokenizer_id_when_model_id_is_unspecified():
     )
 
     assert tokens == [99]
+
+
+def test_temporal_video_slot_uses_the_configured_compact_wrapper():
+    class _Tokenizer:
+        unk_token_id = 0
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            return "__VIDEO__"
+
+        def convert_tokens_to_ids(self, token):
+            return 99 if token == "<image>" else self.unk_token_id
+
+        def __call__(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [7] if text else []
+
+    prompt_config = MultimodalPromptConfig(
+        video_spec=MediaPromptSpec(
+            model_token="<image>",
+            prefix="<img>",
+            suffix="</img>",
+            expansion_mode="temporal_patch",
+            include_frame_timestamps_for_nemotron_vl=True,
+        )
+    )
+
+    tokens = _tokenize_with_media_slots_sync(
+        _Tokenizer(),
+        messages=[],
+        media_slots=[("__VIDEO__", "video", 0)],
+        prompt_config=prompt_config,
+        tools=None,
+        chat_template_kwargs={},
+    )
+
+    assert tokens == [7, 99, 7]
+
+
+def test_media_content_uses_the_configured_part_separator():
+    prompt_config = MultimodalPromptConfig(video_spec=MediaPromptSpec(content_part_separator="\n"))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "question"},
+                {"type": "text", "text": "__VIDEO__"},
+            ],
+        }
+    ]
+
+    sanitized = _sanitize_messages_for_template(
+        messages, media_slots=[("__VIDEO__", "video", 0)], prompt_config=prompt_config
+    )
+
+    assert sanitized[0]["content"] == "question\n__VIDEO__"
 
 
 def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():

@@ -58,6 +58,7 @@ from megatron.inference.utils import (  # noqa: E402
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -104,20 +105,26 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--default-temperature",
         type=float,
-        default=1.0,
-        help="Default temperature sampling value when a request does not specify temperature.",
+        default=None,
+        help="Server-level temperature default when a request omits temperature. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     parser.add_argument(
         "--default-top-p",
         type=float,
-        default=1.0,
-        help="Default top-p sampling value when a request does not specify top_p.",
+        default=None,
+        help="Server-level top-p default when a request omits top_p. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
     )
     parser.add_argument(
         "--default-top-k",
         type=int,
-        default=0,
-        help="Default top-k sampling value when a request does not specify top_k.",
+        default=None,
+        help="Server-level top-k default when a request omits top_k. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 0 if neither is set.",
     )
     parser.add_argument(
         "--eval-mode",
@@ -159,7 +166,8 @@ def parse_args_and_detect_vlm(
         _defaults += ["--tokenizer-prompt-format", "mistral"]
     sys.argv[1:1] = _defaults
 
-    parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    initialize_runtime_services(args)
     initialize_megatron()
     args = get_args()
 
@@ -273,9 +281,9 @@ async def run_text_generation_server(
     server_port: int,
     hostname: str | None = None,
     chat_template: str | None = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: float | None = None,
+    default_top_p: float | None = None,
+    default_top_k: int | None = None,
     eval_mode: bool = False,
 ):
     """
@@ -288,9 +296,11 @@ async def run_text_generation_server(
         server_port (int): The network for port the frontend text generation server.
         hostname (str | None): Hostname or IP address for coordinator and HTTP traffic.
         chat_template (str | None): Inline chat template or contents loaded from a file.
-        default_temperature (float): Sampling default when a request omits `temperature`.
-        default_top_p (float): Sampling default when a request omits `top_p`.
-        default_top_k (int): Sampling default when a request omits `top_k`.
+        default_temperature (float | None): Sampling default when a request omits
+            `temperature`. None leaves it unset so the model's generation_config.json
+            can supply it; a value here takes precedence over that file.
+        default_top_p (float | None): Same, for `top_p`.
+        default_top_k (int | None): Same, for `top_k`.
         eval_mode (bool): Whether to use evaluation response defaults.
     """
 

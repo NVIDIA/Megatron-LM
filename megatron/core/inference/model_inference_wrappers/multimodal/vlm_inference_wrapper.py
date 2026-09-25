@@ -498,8 +498,8 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         Dispatches to one of three paths:
         1. Dynamic VLM path: 'image_token_mask' key is present.
         2. Static VLM path: 'images' key is present (LLaVA forward).
-        3. Pure text (GPT) path: neither key present — delegates to the base
-           GPTInferenceWrapper._forward so that text-only models work unmodified.
+        3. Pure-text/decode path: neither key present — embeds tokens directly
+           and calls LLaVAModel.forward_lm_only without media preprocessing.
 
         Args:
             inference_input(Dict[str, Any]): The input data.
@@ -507,34 +507,11 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         Returns:
             The model output logits.
         """
-        # Dynamic path: image_token_mask is present
-        if "image_token_mask" in inference_input:
+        # Dynamic prefill and media-free decode both use the LM-only path.
+        # Keep the legacy static path below only for callers that pass raw
+        # images for LLaVAModel.forward to encode.
+        if "image_token_mask" in inference_input or "images" not in inference_input:
             return self._forward_dynamic(inference_input)
-
-        # Pure text path: no VLM keys.
-        # Cannot delegate to super()._forward() because the abstract wrapper passes
-        # (tokens, position_ids, attention_mask) positionally, but LLaVAModel.forward
-        # expects (images, input_ids, position_ids, attention_mask).
-        if "images" not in inference_input:
-            tokens = inference_input["tokens"]
-            position_ids = inference_input["position_ids"]
-            attention_mask = inference_input["attention_mask"]
-            # Pass an empty images tensor (not None) to match what the training
-            # data pipeline provides for text-only samples.
-            empty_images = torch.tensor([], device=tokens.device).reshape(0, 0, 0)
-            output = self.model(
-                empty_images,
-                tokens,
-                position_ids,
-                attention_mask=attention_mask,
-                inference_context=self.inference_context,
-                runtime_gather_output=True,
-            )
-            if isinstance(output, tuple):
-                logits, _ = output
-            else:
-                logits = output
-            return logits
 
         # VLM path: standard LLaVA forward
         images = inference_input["images"]
