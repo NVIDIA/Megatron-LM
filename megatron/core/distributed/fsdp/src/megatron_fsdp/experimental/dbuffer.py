@@ -371,7 +371,7 @@ class DBuffer:
     ) -> "DBuffer":
         """Apply placement transitions one axis at a time.
 
-        Remove shards outer-to-inner, then add shards inner-to-outer so sharded
+        Add shards inner-to-outer; otherwise iterate outer-to-inner so sharded
         axes remain a suffix throughout. Collectives reuse a contained range of
         the final output or an intermediate buffer, preserving the input unless
         the caller supplies an output that aliases it.
@@ -387,14 +387,13 @@ class DBuffer:
         out = self._create_or_validate_out(out, placements=new_placements)
         preserve_input = not self.is_alias_of(out)
 
-        # Process non-sharded destinations first, then sharded destinations in
-        # reverse order. Both endpoints must satisfy the sharded-suffix invariant.
-        axes = [axis for axis, new in enumerate(new_placements) if not isinstance(new, Shard)]
-        axes += [
-            axis
-            for axis in reversed(range(self.mesh.ndim))
-            if isinstance(new_placements[axis], Shard)
-        ]
+        # Sharded axes form a suffix: valid transitions only add or only remove shards.
+        # Add from inner to outer; otherwise traverse from outer to inner.
+        old_shards = sum(p.is_shard() for p in self.placements)
+        new_shards = sum(p.is_shard() for p in new_placements)
+        axes = range(self.mesh.ndim)
+        if new_shards > old_shards:
+            axes = axes[::-1]
 
         result = self
         for axis in axes:
