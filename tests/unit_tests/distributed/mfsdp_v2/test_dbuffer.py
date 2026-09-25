@@ -857,6 +857,41 @@ def test_multi_axis_redistribute_reuses_storage(distributed_setup, monkeypatch, 
         torch.testing.assert_close(out.get_tensor_view(index), expected.get_tensor_view(index))
 
 
+def test_multi_axis_reduce_scatter_into_input_view(distributed_setup, monkeypatch):
+    """Two reduce-scatters can write successive shards into the original input."""
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source = DBuffer.distribute_tensors(
+        [tensor * (distributed_setup.rank + 1) for tensor in tensors], mesh, [Partial(), Partial()]
+    )
+    placements = [RowAtomic(), RowAtomic()]
+    out = source.view(placements)
+    reduced_scale = distributed_setup.world_size * (distributed_setup.world_size + 1) // 2
+    expected = DBuffer.distribute_tensors(
+        [tensor * reduced_scale for tensor in tensors], mesh, placements
+    )
+    calls = []
+    original_reduce_scatter = DBuffer.reduce_scatter
+
+    def record(buffer, axis, placement, *, out=None):
+        assert out is not None
+        assert out.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
+        assert buffer.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
+        assert out.local_buffer.storage_offset() - buffer.local_buffer.storage_offset() == (
+            mesh.get_local_rank(axis) * out.local_buffer.numel()
+        )
+        calls.append(axis)
+        return original_reduce_scatter(buffer, axis, placement, out=out)
+
+    monkeypatch.setattr(DBuffer, "reduce_scatter", record)
+    assert source.redistribute(placements, out=out) is out
+    assert calls == [1, 0]
+    for index in range(len(tensors)):
+        torch.testing.assert_close(out.get_tensor_view(index), expected.get_tensor_view(index))
+
+
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
