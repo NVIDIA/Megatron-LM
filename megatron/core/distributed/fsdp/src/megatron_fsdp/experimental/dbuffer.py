@@ -362,6 +362,10 @@ class DBuffer:
         destination.local_buffer.copy_(self.local_buffer)
         return destination
 
+    def is_alias_of(self, other: "DBuffer") -> bool:
+        """Return whether the local buffers share storage, regardless of their ranges."""
+        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
     ) -> "DBuffer":
@@ -381,8 +385,7 @@ class DBuffer:
             )
         _validate_placements(new_placements)
         out = self._create_or_validate_out(out, placements=new_placements)
-        input_storage = self.local_buffer.untyped_storage()
-        preserve_input = out.local_buffer.untyped_storage() is not input_storage
+        preserve_input = not self.is_alias_of(out)
 
         # Process non-sharded destinations first, then sharded destinations in
         # reverse order. Both endpoints must satisfy the sharded-suffix invariant.
@@ -406,7 +409,7 @@ class DBuffer:
             if local_numel <= out.local_buffer.numel():
                 step_out = out.view(placements)
             elif local_numel <= result.local_buffer.numel() and (
-                not preserve_input or result.local_buffer.untyped_storage() is not input_storage
+                not preserve_input or not result.is_alias_of(self)
             ):
                 step_out = result.view(placements)
             if isinstance(old, Shard) and isinstance(new, Replicate):
