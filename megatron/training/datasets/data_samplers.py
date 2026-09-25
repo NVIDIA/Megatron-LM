@@ -431,7 +431,7 @@ class MegatronPretrainingRandomSampler:
                 generator.manual_seed(epoch)
                 permutation = torch.randperm(epoch_size, generator=generator).tolist()
                 for index in permutation[offset:]:
-                    yield index
+                    yield epoch, index
                 position = (epoch + 1) * epoch_size
 
         sample_iterator = samples()
@@ -440,5 +440,14 @@ class MegatronPretrainingRandomSampler:
             for micro_batch_idx in range(num_micro_batches):
                 start = self.data_parallel_rank * self.micro_batch_size
                 start += micro_batch_idx * self.micro_batch_size * self.data_parallel_size
+                micro_batch = global_batch[start : start + self.micro_batch_size]
+                batch_epochs = {epoch for epoch, _ in micro_batch}
+                if isinstance(self.dataset, RandomSeedDataset):
+                    # A global batch can straddle an epoch boundary, but each
+                    # micro-batch remains within one epoch because epoch_size
+                    # is a multiple of micro_batch_size.
+                    assert len(batch_epochs) == 1
+                    self.epoch = batch_epochs.pop()
+                    self.dataset.set_epoch(self.epoch)
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
-                yield global_batch[start : start + self.micro_batch_size]
+                yield [index for _, index in micro_batch]

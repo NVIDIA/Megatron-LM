@@ -36,6 +36,14 @@ class _Dataset(torch.utils.data.Dataset):
         return torch.tensor([idx])
 
 
+class _RandomValueDataset(torch.utils.data.Dataset):
+    def __len__(self):
+        return 10
+
+    def __getitem__(self, idx):
+        return idx, torch.rand(1).item()
+
+
 class TestDataLoaderResume:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -121,3 +129,36 @@ def test_cyclic_sampler_no_sharding_preserves_samples_after_dp_change():
         reference = draws(dp_before, dp_before, 0)
         resumed = draws(dp_before, dp_after, resume_step)
         assert resumed == reference
+
+
+def test_cyclic_sampler_updates_random_seed_epoch_across_global_batch_boundary():
+    dataset = data_samplers.RandomSeedDataset(_RandomValueDataset(), seed=1234)
+    sampler = data_samplers.MegatronPretrainingRandomSampler(
+        dataset,
+        total_samples=len(dataset),
+        consumed_samples=0,
+        micro_batch_size=2,
+        data_parallel_rank=0,
+        data_parallel_size=1,
+        data_sharding=False,
+        global_batch_size=6,
+    )
+
+    observed = []
+    for batch in sampler:
+        observed.extend(dataset[index] for index in batch)
+
+    expected = []
+    for epoch, offset, count in ((0, 0, 10), (1, 0, 2)):
+        generator = torch.Generator().manual_seed(epoch)
+        permutation = torch.randperm(len(dataset), generator=generator).tolist()
+        for index in permutation[offset : offset + count]:
+            value_generator = torch.Generator().manual_seed(index + dataset.base_seed + epoch)
+            expected.append((index, torch.rand(1, generator=value_generator).item()))
+
+    assert [index for index, _ in observed] == [index for index, _ in expected]
+    torch.testing.assert_close(
+        torch.tensor([value for _, value in observed]),
+        torch.tensor([value for _, value in expected]),
+    )
+    assert dataset.curr_seed == dataset.base_seed + 1
