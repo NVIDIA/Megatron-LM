@@ -160,7 +160,7 @@ runs:
         [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
         sudo rm -rf -- assets_dir/testmon
         IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE") || IMAGE_ID=unknown
-        uv run --no-project --with pyyaml==6.0.3 python tests/unit_tests/testmon_cache.py identity \
+        uv run --locked --isolated --only-group testmon-cache python tests/unit_tests/testmon_cache.py identity \
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
           --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
 

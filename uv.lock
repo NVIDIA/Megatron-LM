@@ -2421,6 +2421,9 @@ test = [
 testmon = [
     { name = "pytest-testmon" },
 ]
+testmon-cache = [
+    { name = "pyyaml" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2530,6 +2533,7 @@ test = [
     { name = "wrapt" },
 ]
 testmon = [{ name = "pytest-testmon", specifier = "==2.2.0" }]
+testmon-cache = [{ name = "pyyaml", specifier = "==6.0.3" }]
 
 [[package]]
 name = "megatron-energon"

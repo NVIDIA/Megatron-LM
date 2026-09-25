@@ -44,6 +44,10 @@ def source_tree(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
     (root / cache.SOURCE_MAPPING_FILE).write_bytes((ROOT / cache.SOURCE_MAPPING_FILE).read_bytes())
+    for recipe in ROOT.glob("tests/test_utils/recipes/*/unit-tests.yaml"):
+        destination = root / recipe.relative_to(ROOT)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(recipe, destination)
     return root
 
 
@@ -104,13 +108,11 @@ def test_source_edits_preserve_identity(source_tree):
 def test_configured_source_mappings_target_existing_recipe_buckets():
     document = yaml.safe_load((ROOT / cache.SOURCE_MAPPING_FILE).read_text())
     recipe_buckets = {}
-    for platform in ("h100", "gb200"):
-        recipe = yaml.safe_load(
-            (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
-        )
-        recipe_buckets[f"dgx_{platform}"] = {
+    for recipe_path in ROOT.glob("tests/test_utils/recipes/*/unit-tests.yaml"):
+        recipe = yaml.safe_load(recipe_path.read_text())
+        recipe_buckets.setdefault(recipe["spec"]["platforms"], set()).update(
             bucket for product in recipe["products"] for bucket in product["test_case"]
-        }
+        )
     assert document["mappings"]
     for mapping in document["mappings"]:
         sources = mapping["source_dirs"]
@@ -120,6 +122,123 @@ def test_configured_source_mappings_target_existing_recipe_buckets():
         assert set(platforms) <= recipe_buckets.keys(), sources
         for platform, buckets in platforms.items():
             assert set(buckets) <= recipe_buckets[platform], (sources, platform)
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["unmapped", "mapped"])
+def test_new_platform_uses_recipe_spec_and_optional_source_mapping(
+    tmp_path, source_tree, mapped_source, configured
+):
+    platform = "future_accelerator"
+    recipe_path = source_tree / "tests/test_utils/recipes/different_directory/unit-tests.yaml"
+    recipe_path.parent.mkdir(parents=True)
+    recipe_path.write_text(yaml.safe_dump({"spec": {"platforms": platform}}))
+    if configured:
+        (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
+            yaml.safe_dump(_mapping_document({platform: [MAPPED_BUCKET]}))
+        )
+    producer = cache.cache_identity(source_tree, MAPPED_BUCKET, platform, IMAGE_ID)
+    assert producer["compatibility"]["platform"] == platform
+    assert producer["compatibility"]["inputs"][str(recipe_path.relative_to(source_tree))] == (
+        hashlib.sha256(recipe_path.read_bytes()).hexdigest()
+    )
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, "different_directory", IMAGE_ID)
+    directory = tmp_path / "assets_dir/testmon"
+    _create_generation(directory, producer)
+    (mapped_source / "module.py").write_text("def hook():\n    return False\n")
+    consumer = cache.cache_identity(source_tree, MAPPED_BUCKET, platform, IMAGE_ID)
+    if configured:
+        assert producer["compatibility"]["source_inputs"]
+        with pytest.raises(ValueError, match="mapped source"):
+            cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    else:
+        assert consumer == producer
+        assert consumer["compatibility"]["source_inputs"] == {}
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+
+
+@pytest.mark.parametrize("change", ["added", "edited", "removed"])
+def test_recipe_changes_invalidate_existing_platform_baseline(tmp_path, source_tree, change):
+    recipe_path = source_tree / "tests/test_utils/recipes/new_directory/unit-tests.yaml"
+    recipe_path.parent.mkdir(parents=True)
+    recipe = {"spec": {"platforms": "future_accelerator", "gpus": 8}}
+    if change != "added":
+        recipe_path.write_text(yaml.safe_dump(recipe))
+    producer = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    directory = tmp_path / "assets_dir/testmon"
+    _create_generation(directory, producer)
+    if change == "removed":
+        recipe_path.unlink()
+    else:
+        if change == "edited":
+            recipe["spec"]["gpus"] = 4
+        recipe_path.write_text(yaml.safe_dump(recipe))
+    consumer = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    assert consumer["cache_prefix"] == producer["cache_prefix"]
+    before = _snapshot(directory)
+    with pytest.raises(ValueError, match="compatibility"):
+        cache.validate_cache(directory, consumer, producer["cache_prefix"] + "123-1")
+    assert _snapshot(directory) == before
+
+
+@pytest.mark.parametrize("change", ["renamed", "removed"])
+def test_platform_removed_from_recipes_rejects_identity_and_stale_mapping(source_tree, change):
+    platform = "future_accelerator"
+    recipe_path = source_tree / "tests/test_utils/recipes/new_directory/unit-tests.yaml"
+    recipe_path.parent.mkdir(parents=True)
+    recipe_path.write_text(yaml.safe_dump({"spec": {"platforms": platform}}))
+    (source_tree / cache.SOURCE_MAPPING_FILE).write_text(
+        yaml.safe_dump(_mapping_document({platform: [MAPPED_BUCKET]}))
+    )
+    cache.cache_identity(source_tree, MAPPED_BUCKET, platform, IMAGE_ID)
+    if change == "removed":
+        recipe_path.unlink()
+    else:
+        recipe_path.write_text(yaml.safe_dump({"spec": {"platforms": "replacement_accelerator"}}))
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, MAPPED_BUCKET, platform, IMAGE_ID)
+    with pytest.raises(ValueError):
+        cache._source_mapping(source_tree)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        None,
+        [],
+        {},
+        {"spec": None},
+        {"spec": {}},
+        {"spec": {"platforms": None}},
+        {"spec": {"platforms": []}},
+        {"spec": {"platforms": 1}},
+        {"spec": {"platforms": ""}},
+        {"spec": {"platforms": "../invalid"}},
+        {"spec": {"platforms": "has space"}},
+        {"spec": {"platforms": "dgx_h100\n"}},
+    ],
+)
+def test_malformed_recipe_rejects_identity_even_for_other_platform(source_tree, document):
+    recipe_path = source_tree / "tests/test_utils/recipes/bad_recipe/unit-tests.yaml"
+    recipe_path.parent.mkdir(parents=True)
+    recipe_path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_invalid_recipe_yaml_rejects_identity(source_tree):
+    recipe_path = source_tree / "tests/test_utils/recipes/bad_recipe/unit-tests.yaml"
+    recipe_path.parent.mkdir(parents=True)
+    recipe_path.write_text("spec: [")
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+
+
+def test_missing_unit_recipes_rejects_identity(source_tree):
+    for recipe_path in source_tree.glob("tests/test_utils/recipes/*/unit-tests.yaml"):
+        recipe_path.unlink()
+    with pytest.raises(ValueError):
+        cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
 
 
 def test_unchanged_mapped_sources_accept_the_recorded_baseline(source_tree, mapped_generation):
@@ -692,9 +811,9 @@ def test_identity_without_image_diagnostics_preserves_usable_cache(
                 'sudo() { [[ "$*" == "rm -rf -- assets_dir/testmon" ]]; }',
                 'python() { [[ "$1" == "tests/unit_tests/testmon_cache.py" ]]; '
                 'shift; "$TEST_PYTHON" "$TESTMON_HELPER" "$@"; }',
-                'uv() { [[ "$1 $2 $3 $4 $5" == '
-                '"run --no-project --with pyyaml==6.0.3 python" ]] || return; '
-                'shift 5; python "$@"; }',
+                'uv() { [[ "$1 $2 $3 $4 $5 $6" == '
+                '"run --locked --isolated --only-group testmon-cache python" ]] || return; '
+                'shift 6; python "$@"; }',
                 script,
             )
         ),

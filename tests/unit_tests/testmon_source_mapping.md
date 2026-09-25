@@ -19,7 +19,7 @@ mappings:
 | `mappings` | List of rules. Add multiple entries for independent groups; use `[]` to configure no overrides. |
 | `source_dirs` | Nonempty list of repository-relative source directories to watch recursively, without wildcards or trailing slashes. |
 | `test_buckets` | Hardware platforms and their buckets to run fully when **any** listed source directory changes. Multiple platform keys are supported. |
-| `dgx_h100` / `dgx_gb200` | Optional platform keys; each value is a list of exact `test_case` bucket names from that platform's unit-test recipe. |
+| Platform keys, such as `dgx_h100` | Optional names from `spec.platforms` in `tests/test_utils/recipes/*/unit-tests.yaml`; each value is a list of exact `test_case` bucket names from that platform's unit-test recipe. |
 
 Every rule can list multiple source directories, multiple hardware platforms,
 and multiple buckets per platform. A change in **any** listed directory forces
@@ -27,6 +27,13 @@ and multiple buckets per platform. A change in **any** listed directory forces
 rules are additive: if a source appears in several rules, its targets are merged.
 Repeated source paths or bucket names do not create duplicate test executions.
 An empty list does not cancel a target added by another rule.
+
+Supported platform names are discovered from the unit-test recipe files. Adding
+a recipe with a new `spec.platforms` value makes it available to the mapping
+without editing Python. Recipe files are also included in cache compatibility
+checks, so additions, edits, and removals invalidate older baselines. Missing
+required platforms or malformed recipes reject identity calculation and take
+the full-test fallback.
 
 The example overrides only H100's MFSDP v2 bucket. GB200 is omitted, so its jobs
 keep their normal Testmon selection. Omitted platforms and empty bucket lists
@@ -67,10 +74,12 @@ base commit. This also covers changes already merged into `main` after that
 baseline was recorded. Unchanged mapped sources still allow Testmon selection.
 Mapping changes invalidate old baselines through the normal compatibility checks.
 
-Identity calculation uses PyYAML's safe loader. The CI action supplies the pinned
-parser with `uv run --no-project --with`, without synchronizing Megatron's project
-dependencies. Cache validation and publication do not need PyYAML. A parser setup
-failure takes the existing full-test fallback for selective runs.
+Identity calculation uses PyYAML's safe loader. The parser is declared in the
+`testmon-cache` dependency group in `pyproject.toml` and resolved by `uv.lock`.
+The CI action runs `uv run --locked --isolated --only-group testmon-cache` to
+install only that group in a separate environment. Cache validation and
+publication do not need PyYAML. A parser setup failure takes the existing
+full-test fallback for selective runs.
 
 Python bytecode (`.pyc` and `.pyo`) and generated `__pycache__`, `.pytest_cache`,
 `.mypy_cache`, and `.ruff_cache` directories are excluded. Invalid mappings,

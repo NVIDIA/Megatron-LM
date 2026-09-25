@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 SCHEMA = 1
 TESTMON_VERSION = "2.2.0"
 PHASES = ("prod", "experimental")
-RECIPE_PLATFORMS = frozenset({"dgx_h100", "dgx_gb200"})
+RECIPE_GLOB = "tests/test_utils/recipes/*/unit-tests.yaml"
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
@@ -42,10 +42,13 @@ COMPATIBILITY_FILES = (
     "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
     "tests/test_utils/python_scripts/recipe_parser.py",
     "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-    "tests/test_utils/recipes/h100/unit-tests.yaml",
-    "tests/test_utils/recipes/gb200/unit-tests.yaml",
 )
-COMPATIBILITY_GLOBS = ("docker/**/*", ".dockerignore", "tests/unit_tests/**/conftest.py")
+COMPATIBILITY_GLOBS = (
+    "docker/**/*",
+    ".dockerignore",
+    "tests/unit_tests/**/conftest.py",
+    RECIPE_GLOB,
+)
 DATABASE_TABLES = {
     "metadata",
     "environment",
@@ -116,21 +119,44 @@ def _validate_mapping_path(path: str) -> None:
         raise ValueError(f"invalid Testmon mapping path: {path!r}")
 
 
-def _source_mapping(root: Path) -> dict[str, dict[str, list[str]]]:
+def _read_yaml(path: Path) -> dict:
     # Only identity calculation needs YAML; restored-cache validation stays stdlib-only.
     try:
         import yaml
     except ImportError as error:
-        raise ValueError("PyYAML is required to read Testmon source mappings") from error
+        raise ValueError("PyYAML is required to read Testmon configuration") from error
     try:
-        document = yaml.safe_load((root / SOURCE_MAPPING_FILE).read_text())
+        document = yaml.safe_load(path.read_text())
     except yaml.YAMLError as error:
-        raise ValueError(f"invalid Testmon source mapping YAML: {error}") from error
-    if (
-        not isinstance(document, dict)
-        or set(document) != {"mappings"}
-        or not isinstance(document["mappings"], list)
-    ):
+        raise ValueError(f"invalid Testmon YAML in {path}: {error}") from error
+    if not isinstance(document, dict):
+        raise ValueError(f"expected a YAML mapping: {path}")
+    return document
+
+
+def _recipe_platforms(root: Path) -> set[str]:
+    platforms = set()
+    for path in sorted(root.glob(RECIPE_GLOB)):
+        recipe = _read_yaml(path)
+        spec = recipe.get("spec")
+        recipe_platform = spec.get("platforms") if isinstance(spec, dict) else None
+        if not isinstance(recipe_platform, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]+", recipe_platform
+        ):
+            raise ValueError(f"expected a platform name in recipe spec.platforms: {path}")
+        platforms.add(recipe_platform)
+    if not platforms:
+        raise ValueError("no unit-test recipe platforms found")
+    return platforms
+
+
+def _source_mapping(
+    root: Path, recipe_platforms: set[str] | None = None
+) -> dict[str, dict[str, list[str]]]:
+    if recipe_platforms is None:
+        recipe_platforms = _recipe_platforms(root)
+    document = _read_yaml(root / SOURCE_MAPPING_FILE)
+    if set(document) != {"mappings"} or not isinstance(document["mappings"], list):
         raise ValueError("expected a Testmon mapping document with a mappings list")
     mapping = {}
     for entry in document["mappings"]:
@@ -147,7 +173,7 @@ def _source_mapping(root: Path) -> dict[str, dict[str, list[str]]]:
         if not isinstance(platforms, dict) or not platforms:
             raise ValueError(f"expected recipe platforms for mapped sources: {sources!r}")
         for recipe_platform, buckets in platforms.items():
-            if recipe_platform not in RECIPE_PLATFORMS:
+            if recipe_platform not in recipe_platforms:
                 raise ValueError(f"unsupported mapped Testmon platform: {recipe_platform!r}")
             if not isinstance(buckets, list):
                 raise ValueError(f"expected unit-test buckets for mapped sources: {sources!r}")
@@ -171,10 +197,12 @@ def _raise_walk_error(error: OSError) -> None:
     raise error
 
 
-def _mapped_source_inputs(root: Path, bucket: str, recipe_platform: str) -> dict[str, str]:
+def _mapped_source_inputs(
+    root: Path, bucket: str, recipe_platform: str, recipe_platforms: set[str]
+) -> dict[str, str]:
     """Fingerprint mapped source trees independently of traced test dependencies."""
     inputs = {}
-    for source, platforms in _source_mapping(root).items():
+    for source, platforms in _source_mapping(root, recipe_platforms).items():
         if bucket not in platforms.get(recipe_platform, []):
             continue
         directory = root / source
@@ -211,7 +239,8 @@ def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
     """Separate cache lookup from compatibility checks and diagnostic image identity."""
-    if recipe_platform not in RECIPE_PLATFORMS:
+    recipe_platforms = _recipe_platforms(root)
+    if recipe_platform not in recipe_platforms:
         raise ValueError(f"unsupported Testmon platform: {recipe_platform}")
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
@@ -228,7 +257,7 @@ def cache_identity(
         "environment": "dev",
         "tag": "latest",
         "inputs": inputs,
-        "source_inputs": _mapped_source_inputs(root, bucket, recipe_platform),
+        "source_inputs": _mapped_source_inputs(root, bucket, recipe_platform, recipe_platforms),
     }
     bucket_hash = hashlib.sha256(bucket.encode()).hexdigest()[:16]
     return {

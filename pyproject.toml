@@ -163,6 +163,8 @@ test = [
 # GitHub CI installs Testmon at runtime for baseline and selective test modes.
 # Testmon remains inactive unless pytest receives a --testmon option.
 testmon = ["pytest-testmon==2.2.0"]
+# Lightweight host-side YAML parsing before the test environment is installed.
+testmon-cache = ["pyyaml==6.0.3"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
