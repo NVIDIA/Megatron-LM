@@ -695,9 +695,51 @@ def _forward_only_pipeline_schedule(
     ``tensor_shape``.
     """
     num_chunks = len(model_chunks)
-    total_stages = ps.pp_size * num_chunks
     outputs: list[dict] = []
 
+    if num_chunks == 1:
+        model = model_chunks[0]
+        for _ in range(num_microbatches):
+            batch = next(data_iter)
+            input_tensor = None
+            if not ps.pp_is_first:
+                input_tensor, _ = _send_recv_pipeline(
+                    None,
+                    None,
+                    True,
+                    False,
+                    ps,
+                    tensor_shape,
+                    batch_p2p=False,
+                    clone_recv=True,
+                    dynamic_shape=True,
+                )
+            out = _run_pipeline_chunk_forward(
+                forward_step_fn,
+                model,
+                batch,
+                input_tensor,
+                is_first_stage=ps.pp_is_first,
+                is_last_stage=ps.pp_is_last,
+                num_microbatches=num_microbatches,
+                pre_forward_hook=pre_forward_hook,
+                loss_fn=loss_fn,
+            )
+            if not ps.pp_is_last:
+                _send_recv_pipeline(
+                    out.get("hidden_states"),
+                    None,
+                    False,
+                    False,
+                    ps,
+                    tensor_shape,
+                    batch_p2p=False,
+                    dynamic_shape=True,
+                )
+            outputs.append(_compact_pipeline_output(out) if ps.pp_is_last else {})
+        return outputs
+
+    total_stages = ps.pp_size * num_chunks
     for _mb in range(num_microbatches):
         batch = next(data_iter)
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
