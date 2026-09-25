@@ -1,24 +1,33 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
+import sys
+import types
 from argparse import ArgumentError, ArgumentParser, Namespace
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Callable, Literal, Optional, Union
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
     _normalize_dsv4_hybrid_csa_compress_ratios,
+    core_transformer_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
+from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
 @dataclass
@@ -42,6 +51,200 @@ class DummyConfig:
 
     enum_setting: signal.Signals = signal.SIGTERM
     """Setting with enum type to test enum handling"""
+
+
+@dataclass(init=False)
+class CapturingTransformerConfig:
+    """Minimal config that records kwargs produced by core_transformer_config_from_args."""
+
+    moe_use_norm_before_up_proj: bool = False
+    hash_moe_vocab_size: int | None = None
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _minimal_training_args(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    return args
+
+
+def test_moe_norm_flag_reaches_transformer_config():
+    """The generated LatentMoE norm flag should populate the model config."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    default_args = parser.parse_args([])
+    assert default_args.moe_use_norm_before_up_proj is False
+
+    enabled_args = parser.parse_args(["--moe-use-norm-before-up-proj"])
+    # params_dtype has no CLI flag of its own; validate_args normally derives it.
+    enabled_args.params_dtype = torch.float32
+    config = core_transformer_config_from_args(
+        enabled_args, config_class=CapturingTransformerConfig
+    )
+
+    assert config.moe_use_norm_before_up_proj is True
+
+
+@pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
+def test_hash_moe_vocab_is_initialized_before_config_conversion(
+    monkeypatch, explicit_hash_vocab_size
+):
+    from megatron.training import global_vars
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.params_dtype = torch.float32
+    args.moe_num_hash_layers = 1
+    args.hash_moe_vocab_size = explicit_hash_vocab_size
+    args.vocab_size = 100000
+    args.padded_vocab_size = 100352
+    tokenizer = SimpleNamespace(vocab_size=100003)
+    monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
+    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
+
+    global_vars._build_tokenizer(args)
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    expected = 100003 if explicit_hash_vocab_size is None else explicit_hash_vocab_size
+    assert config.hash_moe_vocab_size == expected
+    assert args.hash_moe_vocab_size == expected
+    assert args.vocab_size == 100000
+    assert args.padded_vocab_size == 100352
+
+
+# ---------------------------------------------------------------------------
+# Tests for the Megatron-FSDP v2 pipeline-output dealloc opt-out
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fsdp_kwargs, expected",
+    [
+        ({}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 1}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
+    ],
+)
+def test_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+    """The Python-args path keeps the pseudo-free on except for Megatron-FSDP v2."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    # params_dtype has no CLI flag of its own; validate_args normally derives it.
+    args.params_dtype = torch.float32
+    for name, value in fsdp_kwargs.items():
+        setattr(args, name, value)
+
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    assert config.deallocate_pipeline_outputs is expected
+
+
+@pytest.mark.parametrize(
+    "fsdp_kwargs, expected",
+    [
+        ({}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 1}, True),
+        ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
+    ],
+)
+def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+    """The YAML path reads the FSDP flags from the outer namespace before rebinding."""
+    language_model = Namespace(
+        **vars(TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4))
+    )
+    language_model.params_dtype = torch.float32
+    language_model.activation_func = "gelu"
+    language_model.embedding_init_method = "xavier_uniform"
+
+    # ``core_transformer_config_from_yaml`` merges the ``language_model`` and
+    # ``model_parallel`` sections, and this fixture already carries every
+    # TransformerConfig field in ``language_model``; repeating one here raises
+    # ``TypeError: got multiple values for keyword argument``.
+    args = SimpleNamespace(
+        language_model=language_model, model_parallel=SimpleNamespace(), **fsdp_kwargs
+    )
+
+    config = core_transformer_config_from_yaml(args)
+
+    assert config.deallocate_pipeline_outputs is expected
+
+
+def test_moe_norm_flag_requires_latent_size(monkeypatch):
+    """validate_args should reject the LatentMoE norm flag without a latent size."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    # Let validate_args derive a global batch size that is valid for the
+    # active data-parallel size in distributed unit-test jobs.
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    args.moe_use_norm_before_up_proj = True
+    args.moe_latent_size = None
+
+    with pytest.raises(AssertionError, match="--moe-use-norm-before-up-proj requires"):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        (
+            {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
+            "cannot be combined with --freeze-all-layers",
+        )
+    ],
+)
+def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
+    args = _minimal_training_args(monkeypatch)
+    for name, value in overrides.items():
+        setattr(args, name, value)
+
+    with pytest.raises(AssertionError, match=error):
+        validate_args(args)
+
+
+@pytest.mark.parametrize("fsdp_flag", ["use_torch_fsdp2", "use_megatron_fsdp"])
+def test_shortcut_connection_rejects_fsdp(monkeypatch, fsdp_flag):
+    """validate_args should reject FSDP, whose per-layer param gather the block bypasses."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    args.moe_shortcut_connection = True
+    setattr(args, fsdp_flag, True)
+
+    with pytest.raises(AssertionError, match="FSDP is not supported"):
+        validate_args(args)
 
 
 @dataclass
@@ -84,6 +287,148 @@ class ConfigWithLiteral:
 
     precision: Literal[16, 32] = 32
     """Precision level"""
+
+
+class TestDsv4HybridCsaCompressRatioNormalization:
+    """Test the DSv4 HybridModel compression-ratio migration contract."""
+
+    @pytest.mark.parametrize(
+        ("provided", "expected_config_ratios"),
+        [
+            (None, [0, 0, 0, 4, 128, 0]),
+            ([0, 4, 128], [0, 0, 0, 4, 128, 0]),
+            ([0, 0, 0, 4, 128, 0], [0, 0, 0, 4, 128, 0]),
+        ],
+    )
+    def test_normalizes_default_compact_and_padded_ratios(self, provided, expected_config_ratios):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+        config_kwargs = {}
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, "-W|EC/H-")
+
+        assert args.csa_compress_ratios == expected_config_ratios
+        assert config_kwargs['csa_compress_ratios'] == expected_config_ratios
+
+    def test_normalizes_repeated_mtp_patterns(self):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=None)
+        config_kwargs = {}
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, "W|C/H-/H-")
+
+        assert args.csa_compress_ratios == [0, 4, 128, 0, 128, 0]
+        assert config_kwargs['csa_compress_ratios'] == [0, 4, 128, 0, 128, 0]
+
+    @pytest.mark.parametrize(
+        ("provided", "message"),
+        [
+            ([0, 8, 128], "ratio 8.*symbol 'C'.*expected 4"),
+            ([1, 0, 0, 4, 128, 0], "non-DSv4 hybrid symbol '-'.*non-zero ratio 1"),
+            ([0, 4], r"length \(2\).*W/C/H attention symbols \(3\)"),
+        ],
+    )
+    def test_rejects_invalid_ratios(self, provided, message):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+
+        with pytest.raises(AssertionError, match=message):
+            normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
+
+    def test_ordinary_d_does_not_consume_a_dsv4_ratio(self):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=[4])
+        config_kwargs = {}
+
+        normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, "D-C/D")
+
+        assert args.csa_compress_ratios == [0, 0, 4, 0]
+        assert config_kwargs['csa_compress_ratios'] == [0, 0, 4, 0]
+
+    @pytest.mark.parametrize(
+        ("provided", "expected_config_ratios"),
+        [
+            (None, [0, 0, 0, 4, 128, 0]),
+            ([0, 4, 128], [0, 0, 0, 4, 128, 0]),
+            ([0, 0, 0, 4, 128, 0], [0, 0, 0, 4, 128, 0]),
+        ],
+    )
+    def test_argument_utils_normalizer_keeps_compact_form_on_args(
+        self, provided, expected_config_ratios
+    ):
+        """argument_utils' normalizer leaves the compact CLI form on ``args``."""
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+        kw_args = {}
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, "-W|EC/H-")
+
+        assert args.csa_compress_ratios == [0, 4, 128]
+        assert kw_args['csa_compress_ratios'] == expected_config_ratios
+
+    @pytest.mark.parametrize(
+        ("provided", "message"),
+        [
+            ([0, 8, 128], "ratio 8.*symbol 'C'.*expected 4"),
+            ([1, 0, 0, 4, 128, 0], "non-attention hybrid symbol '-'.*non-zero ratio 1"),
+            ([0, 4], r"length \(2\).*W/C/H attention symbols \(3\)"),
+        ],
+    )
+    def test_argument_utils_normalizer_rejects_invalid_ratios(self, provided, message):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+
+        with pytest.raises(AssertionError, match=message):
+            _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
+
+
+class TestHybridConfigFromArgs:
+    """Test static and config-aware HybridStack spec resolution."""
+
+    @staticmethod
+    def _args():
+        return Namespace(
+            spec=["test_module", "test_spec"],
+            fp16_lm_cross_entropy=False,
+            hybrid_layer_pattern="M",
+            position_embedding_type="none",
+            rotary_percent=1.0,
+            rotary_base=10000,
+            make_vocab_size_divisible_by=128,
+            rotary_seq_len_interpolation_factor=None,
+            max_position_embeddings=1024,
+            untie_embeddings_and_output_weights=False,
+            padded_vocab_size=128,
+        )
+
+    @staticmethod
+    def _transformer_config():
+        return types.SimpleNamespace(
+            transformer_impl="transformer_engine", inference_fuse_tp_communication=False
+        )
+
+    @patch("megatron.training.argument_utils.import_module")
+    def test_preserves_static_module_spec(self, mock_import_module):
+        static_spec = ModuleSpec(module=object)
+        mock_import_module.return_value = static_spec
+
+        config = hybrid_config_from_args(self._args(), config=self._transformer_config())
+
+        assert config.hybrid_stack_spec is static_spec
+
+    @patch("megatron.training.argument_utils.import_module")
+    def test_resolves_config_aware_spec_factory(self, mock_import_module):
+        """A callable --spec is a stack-spec factory: call it with the transformer config."""
+        static_spec = ModuleSpec(module=object)
+        spec_factory = MagicMock(return_value=static_spec)
+        mock_import_module.return_value = spec_factory
+        transformer_config = self._transformer_config()
+
+        config = hybrid_config_from_args(self._args(), config=transformer_config)
+
+        spec_factory.assert_called_once_with(transformer_config)
+        assert config.hybrid_stack_spec is static_spec
+
+    @patch("megatron.training.argument_utils.import_module")
+    def test_rejects_spec_that_is_not_a_module_spec(self, mock_import_module):
+        mock_import_module.return_value = object()
+
+        with pytest.raises(TypeError, match="static ModuleSpec"):
+            hybrid_config_from_args(self._args(), config=self._transformer_config())
 
 
 class TestArgumentGroupFactoryBasic:
@@ -672,6 +1017,12 @@ class TestMegatronNetworkArgumentGeneration:
             not in TransformerConfig.__dataclass_fields__
         )
 
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_network_size_args
+
+        return _add_network_size_args(ArgumentParser(exit_on_error=False))
+
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""
         from megatron.training.arguments import _add_network_size_args
@@ -713,94 +1064,227 @@ class TestMegatronNetworkArgumentGeneration:
         ):
             assert symbol_and_name in action.help
 
+    def test_mhc_fused_backend_is_exposed_as_config_choice(self):
+        assert self._parser().parse_args([]).mhc_fused_backend == "auto"
 
-class TestDsv4HybridCsaCompressRatioNormalization:
-    """Test the shared DSv4 hybrid compression-ratio normalization contract."""
+        args = self._parser().parse_args(["--mhc-fused-backend", "native"])
 
-    @pytest.mark.parametrize(
-        ("provided", "expected_config_ratios"),
-        [
-            (None, [0, 0, 0, 4, 128, 0]),
-            ([0, 4, 128], [0, 0, 0, 4, 128, 0]),
-            ([0, 0, 0, 4, 128, 0], [0, 0, 0, 4, 128, 0]),
-        ],
+        assert args.mhc_fused_backend == "native"
+
+    def test_mhc_fused_backend_rejects_unknown_choice(self):
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            self._parser().parse_args(["--mhc-fused-backend", "cuda"])
+
+    def test_keep_mtp_in_bf16_flag(self):
+        assert self._parser().parse_args([]).keep_mtp_in_bf16 is False
+        assert self._parser().parse_args(["--keep-mtp-in-bf16"]).keep_mtp_in_bf16
+
+    def test_train_full_dataset_flag(self):
+        from megatron.training.arguments import _add_training_args
+        from megatron.training.config import TrainingConfig
+
+        # This remains a CLI option until dataset options get their own config.
+        assert "train_full_dataset" not in TrainingConfig.__dataclass_fields__
+        parser = _add_training_args(ArgumentParser(exit_on_error=False))
+        assert parser.parse_args([]).train_full_dataset is False
+        assert parser.parse_args(["--train-full-dataset"]).train_full_dataset is True
+
+
+def test_sft_loss_log_mode_argument():
+    from megatron.training.arguments import _add_sft_args
+
+    parser = _add_sft_args(ArgumentParser(exit_on_error=False))
+    assert parser.parse_args([]).sft_loss_log_mode == "token-weighted"
+    assert (
+        parser.parse_args(["--sft-loss-log-mode", "microbatch"]).sft_loss_log_mode == "microbatch"
     )
-    def test_normalizes_default_compact_and_padded_ratios(self, provided, expected_config_ratios):
-        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
-        kw_args = {}
-
-        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, "-W|EC/H-")
-
-        assert args.csa_compress_ratios == [0, 4, 128]
-        assert kw_args['csa_compress_ratios'] == expected_config_ratios
-
-    @pytest.mark.parametrize(
-        ("provided", "message"),
-        [
-            ([0, 8, 128], "ratio 8.*symbol 'C'.*expected 4"),
-            ([1, 0, 0, 4, 128, 0], "non-attention hybrid symbol '-'.*non-zero ratio 1"),
-            ([0, 4], r"length \(2\).*W/C/H attention symbols \(3\)"),
-        ],
-    )
-    def test_rejects_invalid_ratios(self, provided, message):
-        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
-
-        with pytest.raises(AssertionError, match=message):
-            _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
 
 
-class TestHybridConfigFromArgs:
-    """Test static and config-aware hybrid stack spec resolution."""
+class TestMegatronMLAArgumentGeneration:
+    """Test Megatron's manually registered MLA arguments."""
 
     @staticmethod
-    def _args():
-        return Namespace(
-            spec=["test_module", "test_spec"],
-            fp16_lm_cross_entropy=False,
-            hybrid_layer_pattern="M",
-            position_embedding_type="none",
-            rotary_percent=1.0,
-            rotary_base=10000,
-            make_vocab_size_divisible_by=128,
-            rotary_seq_len_interpolation_factor=None,
-            max_position_embeddings=1024,
-            untie_embeddings_and_output_weights=False,
-            padded_vocab_size=128,
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_mla_args
+
+        return _add_mla_args(ArgumentParser())
+
+    def test_original_max_position_embeddings_parser(self):
+        """The MLA YaRN context length has the expected default and accepts overrides."""
+        parser = self._parser()
+
+        assert parser.parse_args([]).original_max_position_embeddings == 4096
+        assert (
+            parser.parse_args(
+                ['--original-max-position-embeddings', '65536']
+            ).original_max_position_embeddings
+            == 65536
         )
 
+    def test_original_max_position_embeddings_reaches_mla_config(self):
+        """A validated non-default CLI value is propagated to MLATransformerConfig."""
+        argv = [
+            'test_argument_utils.py',
+            '--multi-latent-attention',
+            '--num-layers',
+            '2',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '65536',
+            '--original-max-position-embeddings',
+            '65536',
+        ]
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.original_max_position_embeddings == 65536
+
+    def test_d_symbol_defaults_to_dsa(self):
+        """The D symbol keeps its existing DSA default when no variant is specified."""
+        argv = [
+            'test_argument_utils.py',
+            '--hybrid-layer-pattern',
+            'D',
+            '--disable-bias-linear',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '32',
+        ]
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.experimental_attention_variant == 'dsa'
+
+    def test_dsv4_hybrid_arguments_reach_mla_config(self):
+        """The D symbol preserves DSv4 mode and propagates MLA-specific arguments."""
+        argv = [
+            'test_argument_utils.py',
+            '--hybrid-layer-pattern',
+            'D',
+            '--experimental-attention-variant',
+            'dsv4_hybrid',
+            '--attention-latent-norm-epsilon',
+            '1e-5',
+            '--csa-compress-ratios',
+            '[4]',
+            '--q-lora-rank',
+            '32',
+            '--output-projection-groups',
+            '4',
+            '--output-projection-lora-rank',
+            '64',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '32',
+        ]
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.experimental_attention_variant == 'dsv4_hybrid'
+        assert config.attention_latent_norm_epsilon == pytest.approx(1e-5)
+        assert config.output_projection_groups == 4
+        assert config.output_projection_lora_rank == 64
+
+    @pytest.mark.parametrize(
+        "variant,pattern,expected_ratios",
+        [
+            (None, "C", [4]),
+            ("dsv4_hybrid", "H", [128]),
+            (None, "W", [0]),
+            ("dsa", "W", None),
+            ("dsa", "M-/C-", None),
+        ],
+    )
+    def test_dsv4_symbols_validate_variant_and_ratios(self, variant, pattern, expected_ratios):
+        """C/H/W in either decoder or MTP require normalized DSv4 configuration."""
+        argv = [
+            'test_argument_utils.py',
+            '--hybrid-layer-pattern',
+            pattern,
+            '--disable-bias-linear',
+            '--position-embedding-type',
+            'rope',
+            '--q-lora-rank',
+            '32',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '32',
+        ]
+        if variant is not None:
+            argv.extend(['--experimental-attention-variant', variant])
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        if variant not in (None, 'dsv4_hybrid'):
+            with pytest.raises(ValueError, match="C/H/W attention requires.*dsv4_hybrid"):
+                core_transformer_config_from_args(args)
+            return
+
+        config = core_transformer_config_from_args(args)
+
+        assert args.multi_latent_attention is True
+        assert args.csa_compress_ratios == expected_ratios
+        assert config.experimental_attention_variant == 'dsv4_hybrid'
+        assert config.csa_compress_ratios == expected_ratios
+        assert config.qk_head_dim == config.v_head_dim - config.qk_pos_emb_head_dim
+        assert config.kv_lora_rank == config.qk_head_dim
+
+
+class TestMegatronMixedPrecisionArguments:
+    """Test language-model logit dtype CLI choices."""
+
     @staticmethod
-    def _transformer_config():
-        config = MagicMock()
-        config.transformer_impl = "transformer_engine"
-        config.inference_fuse_tp_communication = False
-        return config
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_mixed_precision_args
 
-    @patch(
-        "megatron.training.argument_utils.HybridModelConfig", side_effect=lambda **kwargs: kwargs
-    )
-    @patch("megatron.training.argument_utils.import_module")
-    def test_preserves_static_module_spec(self, mock_import_module, _mock_model_config):
-        static_spec = ModuleSpec(module=object)
-        mock_import_module.return_value = static_spec
+        return _add_mixed_precision_args(ArgumentParser(exit_on_error=False))
 
-        config = hybrid_config_from_args(self._args(), config=self._transformer_config())
+    def test_logit_dtype_defaults_to_input_dtype(self):
+        args = self._parser().parse_args([])
+        assert args.logit_dtype is None
 
-        assert config["hybrid_stack_spec"] is static_spec
+    @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+    def test_logit_dtype_accepts_supported_choices(self, dtype):
+        args = self._parser().parse_args(["--output-logit-dtype", dtype])
+        assert args.logit_dtype == dtype
 
-    @patch(
-        "megatron.training.argument_utils.HybridModelConfig", side_effect=lambda **kwargs: kwargs
-    )
-    @patch("megatron.training.argument_utils.import_module")
-    def test_resolves_config_aware_spec_factory(self, mock_import_module, _mock_model_config):
-        static_spec = ModuleSpec(module=object)
-        spec_factory = MagicMock(return_value=static_spec)
-        mock_import_module.return_value = spec_factory
-        transformer_config = self._transformer_config()
-
-        config = hybrid_config_from_args(self._args(), config=transformer_config)
-
-        spec_factory.assert_called_once_with(transformer_config)
-        assert config["hybrid_stack_spec"] is static_spec
+    def test_logit_dtype_rejects_fp16(self):
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            self._parser().parse_args(["--output-logit-dtype", "fp16"])
 
 
 # ---------------------------------------------------------------------------

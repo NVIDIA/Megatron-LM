@@ -1,9 +1,17 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
+    _wgrad_gemm,
+    copy_gtp_attributes,
+    gtp_local_pad_zero_count,
     linear_with_frozen_weight,
+    linear_with_grad_accumulation_and_async_allreduce,
     param_is_not_tensor_parallel_duplicate,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
@@ -36,6 +44,169 @@ def test_param_is_not_tensor_parallel_duplicate_uses_parameter_parallel_group(
     )
 
     assert actual is expected
+
+
+class _FakeGroup:
+    """Minimal mock for a dist process group — used in single-process unit tests."""
+
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
+class TestGtpLocalPadZeroCount:
+    """gtp_local_pad_zero_count: how many elements of a [range_start, range_end) fragment of a
+    GTP shard's flattened buffer are structural alignment padding (see
+    generalized_tensor_parallelism._gtp_slice_one_param). Padding is a contiguous suffix of the
+    *unsharded* padded buffer, sliced evenly across the GTP group -- usually it lands entirely on
+    the last rank, but when pad_length exceeds one shard's own row count (small dim0 relative to
+    pad_for_alignment * gtp_remat_size) it spills backward from the tail into lower-numbered
+    ranks' shards too."""
+
+    @staticmethod
+    def _shard(dim0, dim1, pad_length, group):
+        shard = torch.zeros(dim0, dim1)
+        shard.pad_length = pad_length
+        shard.group = group
+        return shard
+
+    @pytest.mark.parametrize(
+        "pad_length,rank",
+        [
+            (0, 3),  # no padding at all (tail rank)
+            # pad_length is stamped identically on every rank's shard object
+            # (_gtp_slice_one_param), but when padding is smaller than one shard, only the
+            # tail shard physically contains it -- rank 0 here has none.
+            (3, 0),
+        ],
+        ids=["no_padding", "non_tail_rank_padding_fits_in_tail_shard"],
+    )
+    def test_returns_zero_when_this_rank_has_no_local_padding(self, pad_length, rank):
+        shard = self._shard(8, 4, pad_length, group=_FakeGroup(size=4, rank=rank))
+        assert gtp_local_pad_zero_count(shard, 0, shard.numel()) == 0
+
+    def test_padding_spills_into_earlier_ranks_when_larger_than_one_shard(self):
+        # dim0=1, pad_for_alignment=16, gtp_remat_size=4 -> alignment=64, pad_length=63,
+        # shard_dim0=16: padding (63 rows) exceeds one shard's own row count (16), so every rank
+        # except rank 0 is entirely padding, and rank 0 is 1 real row + 15 padding rows.
+        dim0, pad_length, trailing = 16, 63, 8
+        group_size = 4
+        totals = []
+        for rank in range(group_size):
+            shard = self._shard(dim0, trailing, pad_length, group=_FakeGroup(group_size, rank))
+            totals.append(gtp_local_pad_zero_count(shard, 0, shard.numel()))
+        assert totals == [15 * trailing, 16 * trailing, 16 * trailing, 16 * trailing]
+        assert sum(totals) == pad_length * trailing
+
+    # dim0=8, dim1=4, pad_length=3 -> shard.numel()=32, pad_start=32-3*4=20. DP-optimizer bucket
+    # slicing can hand count_zeros_fp32 any [range_start, range_end) fragment of this shard.
+    @pytest.mark.parametrize(
+        "range_start,range_end,expected",
+        [
+            (0, 32, 12),  # whole range: all 12 pad elements
+            (0, 20, 0),  # fragment strictly before the pad region
+            (18, 32, 12),  # fragment straddling the boundary: only the pad portion counts
+            (21, 31, 10),  # fragment entirely inside padding: every element counts
+        ],
+        ids=["whole_range", "strictly_before_pad", "straddles_pad_boundary", "entirely_inside_pad"],
+    )
+    def test_tail_rank_fragment_ranges(self, range_start, range_end, expected):
+        shard = self._shard(8, 4, pad_length=3, group=_FakeGroup(size=4, rank=3))
+        assert gtp_local_pad_zero_count(shard, range_start, range_end) == expected
+
+    def test_no_gtp_group_returns_zero(self):
+        shard = torch.zeros(8, 4)
+        shard.pad_length = 3
+        assert gtp_local_pad_zero_count(shard, 0, shard.numel()) == 0
+
+
+class TestCopyGtpAttributes:
+    """copy_gtp_attributes(destination, source) must carry pad_length/group onto any param
+    view/copy (e.g. an optimizer's master param) -- regression coverage for a real bug where
+    a prior version dropped one of the two, which silently disabled GTP padding exclusion for
+    optimizers relying on this fallback (e.g. LayerWiseDistributedOptimizer/Muon)."""
+
+    def test_padding_exclusion_survives_the_copy(self):
+        """End-to-end: gtp_local_pad_zero_count on a copy must match the original -- this is
+        exactly the check that would have caught the pad_length/group-dropping bug directly."""
+        source = TestGtpLocalPadZeroCount._shard(
+            8, 4, pad_length=3, group=_FakeGroup(size=4, rank=3)
+        )
+
+        destination = torch.zeros(8, 4)
+        copy_gtp_attributes(destination, source)
+
+        expected = gtp_local_pad_zero_count(source, 0, source.numel())
+        assert expected > 0, "test setup must exercise real padding"
+        assert gtp_local_pad_zero_count(destination, 0, destination.numel()) == expected
+
+
+def _make_column_parallel_linear_for_weight_shape_check():
+    layer = ColumnParallelLinear.__new__(ColumnParallelLinear)
+    torch.nn.Module.__init__(layer)
+    layer.output_size_per_partition = 8
+    layer.input_size = 4
+    layer.bias = None
+    layer.skip_bias_add = False
+    layer.allreduce_dgrad = True
+    layer.sequence_parallel = False
+    layer.explicit_expert_comm = False
+    layer.disable_grad_reduce = False
+    layer.config = SimpleNamespace(
+        defer_embedding_wgrad_compute=False, _cpu_offloading_context=None
+    )
+    layer.gradient_accumulation_fusion = False
+    layer.grad_output_buffer = None
+    layer.tp_group = None
+    layer.gtp_remat_size = 2
+    layer.output_dtype = None
+    layer.gather_output = False
+    layer._forward_impl = lambda **kwargs: kwargs["input"]
+    return layer
+
+
+def test_column_parallel_linear_skips_shape_check_for_gtp_weight():
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    weight = torch.nn.Parameter(torch.zeros(4, 4))
+    weight.is_gtp_weight_remat = True
+    input_ = torch.zeros(2, 4)
+
+    output, output_bias = layer(input_, weight=weight)
+
+    assert output is input_
+    assert output_bias is None
+
+
+def test_column_parallel_linear_checks_shape_for_non_gtp_weight():
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    weight = torch.nn.Parameter(torch.zeros(4, 4))
+
+    with pytest.raises(RuntimeError, match="supplied weight's shape is"):
+        layer(torch.zeros(2, 4), weight=weight)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_linear_default_output_dtype_preserves_input_dtype(dtype):
+    Utils.initialize_model_parallel(1, 1)
+
+    try:
+        input_data = torch.randn(4, 3, 16, device="cuda", dtype=dtype)
+        weight = torch.randn(32, 16, device="cuda", dtype=dtype)
+        output = linear_with_grad_accumulation_and_async_allreduce(
+            input_data, weight, None, False, False, False, tp_group=None, output_dtype=None
+        )
+        reference = torch.nn.functional.linear(input_data, weight)
+
+        assert output.dtype == input_data.dtype
+        torch.testing.assert_close(output, reference)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("tensor_parallel,allreduce_dgrad", [(1, False), (8, True)])
@@ -101,3 +272,225 @@ def test_LinearWithFrozenWeight_3d_input_matches_torch_linear():
     assert torch.allclose(input_data.grad, expected_input.grad)
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
+    Utils.initialize_model_parallel(1, 1)
+
+    input_data = torch.randn(4, 3, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    reference_input = input_data.detach().clone().requires_grad_(True)
+    reference_weight = weight.detach().clone().requires_grad_(True)
+
+    output = linear_with_grad_accumulation_and_async_allreduce(
+        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
+    )
+    assert output._base is None
+    output.sum().backward()
+
+    reference_output = torch.nn.functional.linear(reference_input, reference_weight)
+    reference_output.sum().backward()
+    fp32_reference_output = torch.nn.functional.linear(
+        input_data.detach().float(), weight.detach().float()
+    )
+
+    assert output.dtype == torch.float32
+    assert input_data.grad.dtype == torch.bfloat16
+    assert weight.grad.dtype == torch.bfloat16
+    assert torch.allclose(output, fp32_reference_output, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(input_data.grad, reference_input.grad)
+    assert torch.allclose(weight.grad, reference_weight.grad)
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+@pytest.mark.parametrize("frozen_weight", [False, True])
+@pytest.mark.parametrize("cross_entropy_fusion", [False, True])
+def test_fp32_linear_output_is_an_inplace_safe_ce_workspace(frozen_weight, cross_entropy_fusion):
+    """FP32 output logits should be one owning allocation reusable by cross entropy."""
+    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core.parallel_state import get_tensor_model_parallel_group
+    from megatron.core.tensor_parallel.cross_entropy import (
+        VocabParallelCrossEntropy,
+        vocab_parallel_cross_entropy,
+    )
+
+    Utils.initialize_model_parallel(1, 1)
+
+    try:
+        input_data = torch.randn(4, 3, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(
+            32, 16, device="cuda", dtype=torch.bfloat16, requires_grad=not frozen_weight
+        )
+        if frozen_weight:
+            output = linear_with_frozen_weight(
+                input_data,
+                weight,
+                None,
+                False,
+                False,
+                False,
+                tp_group=None,
+                output_dtype=torch.float32,
+            )
+        else:
+            output = linear_with_grad_accumulation_and_async_allreduce(
+                input_data,
+                weight,
+                None,
+                False,
+                False,
+                False,
+                tp_group=None,
+                output_dtype=torch.float32,
+            )
+
+        output_data_ptr = output.data_ptr()
+        assert output.dtype is torch.float32
+        assert output._base is None
+        workspace, _ = VocabParallelCrossEntropy.calculate_logits_max(output)
+        assert workspace.data_ptr() == output_data_ptr
+
+        target = torch.randint(0, weight.size(0), input_data.shape[:-1], device="cuda")
+        if cross_entropy_fusion:
+            loss = fused_vocab_parallel_cross_entropy(
+                output, target, get_tensor_model_parallel_group()
+            )
+        else:
+            loss = vocab_parallel_cross_entropy(output, target)
+        loss.sum().backward()
+
+        assert output.data_ptr() == output_data_ptr
+        assert input_data.grad is not None
+        assert input_data.grad.dtype is torch.bfloat16
+        assert (weight.grad is None) is frozen_weight
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+def test_linear_fp32_output_is_bitwise_exact_for_integer_bf16_operands():
+    Utils.initialize_model_parallel(1, 1)
+
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    input_data = torch.randint(
+        -8, 9, (4, 3, 512), device="cuda", dtype=torch.int32, generator=generator
+    ).to(torch.bfloat16)
+    weight = torch.randint(
+        -8, 9, (128, 512), device="cuda", dtype=torch.int32, generator=generator
+    ).to(torch.bfloat16)
+
+    output = linear_with_grad_accumulation_and_async_allreduce(
+        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
+    )
+    reference = torch.nn.functional.linear(input_data.float(), weight.float())
+
+    # K * 8^2 = 32,768, so every possible integer product and partial sum is
+    # exactly representable in FP32. Compare raw words instead of using a tolerance.
+    assert output.dtype == torch.float32
+    assert torch.equal(output.contiguous().view(torch.int32), reference.view(torch.int32))
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+def test_linear_fp32_output_matches_plain_te_general_gemm():
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+
+    try:
+        from transformer_engine.pytorch.module.base import get_workspace
+    except ImportError:
+        get_workspace = None
+
+    Utils.initialize_model_parallel(1, 1)
+
+    input_data = torch.randn(4, 3, 64, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(96, 64, device="cuda", dtype=torch.bfloat16)
+    wrapped_output = linear_with_grad_accumulation_and_async_allreduce(
+        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
+    )
+
+    kwargs = {
+        "out_dtype": torch.float32,
+        "quantization_params": None,
+        "gelu": None,
+        "gelu_in": None,
+        "accumulate": False,
+        "layout": "TN",
+        "out": None,
+        "bias": None,
+        "use_split_accumulator": False,
+        "grad": False,
+        "ub": None,
+        "ub_type": None,
+        "extra_output": None,
+        "bulk_overlap": False,
+    }
+    if get_workspace is not None:
+        kwargs["workspace"] = get_workspace()
+    plain_te_output = general_gemm(weight, input_data.reshape(-1, 64), **kwargs)[0]
+    plain_te_output = plain_te_output.reshape_as(wrapped_output)
+
+    assert wrapped_output.dtype == torch.float32
+    assert torch.equal(
+        wrapped_output.contiguous().view(torch.int32),
+        plain_te_output.contiguous().view(torch.int32),
+    )
+
+    Utils.destroy_model_parallel()
+
+
+class TestWgradGemmAccumulate:
+    """``_wgrad_gemm(accumulate=True)`` adds into ``out`` instead of overwriting it.
+
+    This is what lets a weight consumed several times in one backward (MTP replays the block per
+    depth, and embedding/output_layer are shared across them) build its total wgrad in one buffer:
+    the first consume overwrites -- which doubles as the zero-fill -- and the rest accumulate.
+    Without it the caller needs a second full-size buffer, which at vocab scale is multiple GB.
+    """
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_overwrite_then_accumulate(self):
+        torch.manual_seed(1234)
+        tokens, out_features, in_features = 64, 32, 16
+        grad_output = torch.randn(tokens, out_features, dtype=torch.bfloat16, device="cuda")
+        total_input = torch.randn(tokens, in_features, dtype=torch.bfloat16, device="cuda")
+        # fp32 out from bf16 inputs is the real GTP case: main_grad is fp32 while the
+        # activations are bf16, which is why this path widens through the GEMM epilogue.
+        out = torch.full((out_features, in_features), 7.0, dtype=torch.float32, device="cuda")
+
+        # accumulate=False must overwrite, so the pre-existing 7.0 is gone.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=False)
+        first = out.clone()
+        assert not torch.allclose(first, torch.full_like(first, 7.0))
+
+        # accumulate=True over identical inputs must double it.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=True)
+        torch.testing.assert_close(out, first * 2, rtol=1e-5, atol=1e-5)
+
+        # A third accumulation keeps adding, so N consumes sum to N x.
+        _wgrad_gemm(out, grad_output, total_input, accumulate=True)
+        torch.testing.assert_close(out, first * 3, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_default_is_overwrite(self):
+        """Default must stay overwrite - every existing caller relies on it."""
+        torch.manual_seed(1234)
+        grad_output = torch.randn(32, 16, dtype=torch.bfloat16, device="cuda")
+        total_input = torch.randn(32, 8, dtype=torch.bfloat16, device="cuda")
+        out = torch.zeros(16, 8, dtype=torch.float32, device="cuda")
+
+        _wgrad_gemm(out, grad_output, total_input)
+        once = out.clone()
+        _wgrad_gemm(out, grad_output, total_input)
+        torch.testing.assert_close(out, once, rtol=0, atol=0)

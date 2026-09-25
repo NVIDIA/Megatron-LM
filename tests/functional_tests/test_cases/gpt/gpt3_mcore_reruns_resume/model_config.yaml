@@ -84,3 +84,4 @@ AFTER_SCRIPT: |
   check_log -F "WARNING:megatron.core.rerun_state_machine:Result validation enabled"
   EXIT_CODE=0
 TEST_TYPE: frozen-start
+LAUNCHER: ft_launcher

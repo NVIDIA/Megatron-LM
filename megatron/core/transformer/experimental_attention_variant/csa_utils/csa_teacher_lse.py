@@ -299,30 +299,52 @@ if _TRITON_AVAILABLE:
         )
 
 
+def csa_teacher_lse_unsupported_reason(
+    query: Tensor, full_kv: Tensor, compressed_kv: Tensor, attn_sink: Tensor, window_indices: Tensor
+) -> Optional[str]:
+    """Return why the Triton SBHD teacher-LSE kernels cannot run, or None if supported."""
+    tensors = (query, full_kv, compressed_kv, attn_sink, window_indices)
+    if not _TRITON_AVAILABLE:
+        return "Triton is not available"
+    if not all(tensor.is_cuda for tensor in tensors):
+        return "query, full_kv, compressed_kv, attn_sink, and window_indices must be CUDA tensors"
+    if any(tensor.device != query.device for tensor in tensors[1:]):
+        return "query, full_kv, compressed_kv, attn_sink, and window_indices must share a device"
+    if query.dtype not in (torch.bfloat16, torch.float16):
+        return f"query dtype must be bfloat16 or float16, got {query.dtype}"
+    if full_kv.dtype != query.dtype or compressed_kv.dtype != query.dtype:
+        return "query, full_kv, and compressed_kv must have the same dtype"
+    if query.ndim != 3 or full_kv.ndim != 2 or compressed_kv.ndim not in (2, 3):
+        return (
+            "expected flat query [total_q, heads, dim], flat full_kv [total_kv, dim], "
+            "and compressed_kv [batch, seqlen_k, dim] (SBHD) or [total_k, dim] (THD)"
+        )
+    if query.shape[-1] != full_kv.shape[-1] or query.shape[-1] != compressed_kv.shape[-1]:
+        return "query, full_kv, and compressed_kv head dimensions must match"
+    if query.shape[-1] < 16 or query.shape[-1] > 512:
+        return f"head dimension must be in [16, 512], got {query.shape[-1]}"
+    if query.stride(-1) != 1 or full_kv.stride(-1) != 1 or compressed_kv.stride(-1) != 1:
+        return "query, full_kv, and compressed_kv must be contiguous in the head dimension"
+    if attn_sink.ndim != 1 or attn_sink.numel() != query.shape[1]:
+        return f"attn_sink must have shape [{query.shape[1]}], got {tuple(attn_sink.shape)}"
+    if window_indices.ndim != 2 or window_indices.shape[0] != query.shape[0]:
+        return (
+            f"window_indices must have shape [{query.shape[0]}, window], "
+            f"got {tuple(window_indices.shape)}"
+        )
+    if window_indices.dtype not in (torch.int32, torch.int64):
+        return f"window_indices dtype must be int32 or int64, got {window_indices.dtype}"
+    return None
+
+
 def can_use_fused_csa_teacher_lse(
     query: Tensor, full_kv: Tensor, compressed_kv: Tensor, attn_sink: Tensor, window_indices: Tensor
 ) -> bool:
     """Return whether the Triton teacher-LSE kernels support these tensors."""
-    tensors = (query, full_kv, compressed_kv, attn_sink, window_indices)
-    if not _TRITON_AVAILABLE or not all(tensor.is_cuda for tensor in tensors):
-        return False
-    if query.dtype not in (torch.bfloat16, torch.float16):
-        return False
-    if full_kv.dtype != query.dtype or compressed_kv.dtype != query.dtype:
-        return False
-    if query.ndim != 3 or full_kv.ndim != 2 or compressed_kv.ndim not in (2, 3):
-        return False
-    if query.shape[-1] != full_kv.shape[-1] or query.shape[-1] != compressed_kv.shape[-1]:
-        return False
-    if query.shape[-1] < 16 or query.shape[-1] > 512:
-        return False
-    if query.stride(-1) != 1 or full_kv.stride(-1) != 1 or compressed_kv.stride(-1) != 1:
-        return False
-    if attn_sink.ndim != 1 or attn_sink.numel() != query.shape[1]:
-        return False
-    if window_indices.ndim != 2 or window_indices.shape[0] != query.shape[0]:
-        return False
-    return window_indices.dtype in (torch.int32, torch.int64)
+    return (
+        csa_teacher_lse_unsupported_reason(query, full_kv, compressed_kv, attn_sink, window_indices)
+        is None
+    )
 
 
 @torch.no_grad()
@@ -351,8 +373,11 @@ def fused_csa_teacher_lse(
     """
     if ratio <= 0:
         raise ValueError(f"ratio must be positive, got {ratio}")
-    if not can_use_fused_csa_teacher_lse(query, full_kv, compressed_kv, attn_sink, window_indices):
-        raise ValueError("unsupported tensor layout or dtype for fused CSA teacher LSE")
+    unsupported_reason = csa_teacher_lse_unsupported_reason(
+        query, full_kv, compressed_kv, attn_sink, window_indices
+    )
+    if unsupported_reason is not None:
+        raise ValueError(f"fused CSA teacher LSE is unavailable: {unsupported_reason}")
 
     total_q, num_heads, head_dim = query.shape
     block_d = max(16, triton.next_power_of_2(head_dim))
@@ -490,4 +515,8 @@ def fused_csa_teacher_lse(
         return output
 
 
-__all__ = ["can_use_fused_csa_teacher_lse", "fused_csa_teacher_lse"]
+__all__ = [
+    "can_use_fused_csa_teacher_lse",
+    "csa_teacher_lse_unsupported_reason",
+    "fused_csa_teacher_lse",
+]

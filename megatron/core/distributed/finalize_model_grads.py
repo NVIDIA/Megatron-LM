@@ -6,6 +6,10 @@ from typing import Callable, Dict, List, Optional, Union
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
+)
+
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
 
@@ -205,6 +209,35 @@ def _allreduce_word_embedding_grads(
     )
 
 
+def _full_embedding_grad(orig_grad):
+    """Expand an MFSDP v2 uneven (flat-buffer) sharded embedding grad to the full logical gradient.
+
+    MFSDP v2 shards the shared word embedding with uneven (flat-buffer) offsets, and different
+    PP stages can hold the same logical slice at different flat-buffer offsets with different local
+    shard shapes. ``uneven_dtensor_to_full_tensor`` gathers each rank's chunk metadata and local
+    buffer and reconstructs the full logical gradient in a canonical (uniform-row) layout so that
+    position ``i`` denotes the same logical element on every rank; only then can a cross-stage
+    all-reduce combine matching elements.
+    """
+    return uneven_dtensor_to_full_tensor(orig_grad) if orig_grad is not None else None
+
+
+def _copy_embedding_grad_back(orig_grad, full_grad):
+    """Copy this rank's logical slice from the full gradient back into its shard's local tensor.
+
+    After the all-reduce, ``full_grad`` holds the accumulated logical gradient in canonical layout.
+    Each rank owns a contiguous slice (the chunk ``orig_grad.__create_chunk_list__()[0]``) in its
+    own flattened shard, located by ``offsets``/``sizes``; copying that slice back into
+    ``orig_grad._local_tensor`` restores the stage's local shard without changing the (identical)
+    contents on other ranks.
+    """
+    chunk = orig_grad.__create_chunk_list__()[0]
+    local_slice = tuple(
+        slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
+    )
+    orig_grad._local_tensor.copy_(full_grad[local_slice])
+
+
 def _allreduce_embedding_grad(
     model: List[torch.nn.Module],
     embd_group: torch.distributed.ProcessGroup,
@@ -254,13 +287,19 @@ def _allreduce_embedding_grad(
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
-            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
-        grad = _unshard_if_dtensor(orig_grad)
+            # Expand the uneven (flat-buffer) sharded embedding grad to the full logical gradient
+            # so the cross-stage all-reduce below combines matching rows (see _full_embedding_grad).
+            grad = _full_embedding_grad(orig_grad)
+        else:
+            grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+        if ddp_config.use_megatron_fsdp:
+            _copy_embedding_grad_back(orig_grad, grad)
+        else:
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _allreduce_position_embedding_grads(
@@ -497,6 +536,72 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
+def _allreduce_replicated_grads_over_gtp_remat_group(
+    model: List[torch.nn.Module],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    egtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    calculate_per_token_loss: bool = False,
+):
+    """Complete the gtp_remat / egtp_remat axis reduction for replicated parameters.
+
+    Replicated (non-gtp-sharded) params have a grad per gtp_remat peer (each from distinct data);
+    the data-parallel collective only reduced the replicate axis, so the
+    gtp_remat axis is still missing. How to complete it depends on the loss normalization:
+
+    - ``calculate_per_token_loss=False`` (default): the DP collective produced the 1/replicate mean,
+      so a MEAN (AVG) over the gtp_remat axis yields the exact full (replicate x gtp) mean, keeping
+      gradient scaling decoupled from the DP degree. (gtp_remat-sharded params self-average via
+      their reduce-scatter mean and are skipped here.)
+    - ``calculate_per_token_loss=True``: DDP applies NO 1/dp scaling; finalize divides every grad by
+      1/total_global_tokens (which counts the gtp_remat peers' distinct tokens). The gtp_remat axis
+      must therefore be SUM-reduced (like the DP axis) — an AVG would shrink each grad by 1/gtp.
+
+    No-op when GTP_remat is inactive (group size <= 1).
+    """
+    dense_active = gtp_remat_group is not None and gtp_remat_group.size() > 1
+    expert_active = egtp_remat_group is not None and egtp_remat_group.size() > 1
+    if not dense_active and not expert_active:
+        return
+
+    dense_params, dense_grads = [], []
+    expert_params, expert_grads = [], []
+    for model_chunk in model:
+        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+            if not param.requires_grad or getattr(param, 'is_gtp_weight_remat', False):
+                continue  # GTP-sharded params: their gtp_remat axis is handled by the RS-mean.
+            grad_attr = _get_main_grad_attr(param)
+            grad = getattr(param, grad_attr, None)
+            if grad is None:
+                continue
+            grad = _unshard_if_dtensor(grad)
+            if getattr(param, 'allreduce', True):
+                dense_params.append(param)
+                dense_grads.append(grad.data)
+            else:
+                expert_params.append(param)
+                expert_grads.append(grad.data)
+
+    for params, grads, group in (
+        (dense_params, dense_grads, gtp_remat_group),
+        (expert_params, expert_grads, egtp_remat_group),
+    ):
+        if not grads or group is None or group.size() <= 1:
+            continue
+        coalesced = _flatten_dense_tensors(grads)
+        # SUM vs AVG per the loss-normalization regime documented above.
+        op = (
+            torch.distributed.ReduceOp.SUM
+            if calculate_per_token_loss
+            else torch.distributed.ReduceOp.AVG
+        )
+        torch.distributed.all_reduce(coalesced, op=op, group=group)
+        for param, buf, synced in zip(params, grads, _unflatten_dense_tensors(coalesced, grads)):
+            buf.copy_(synced)
+            grad_attr = _get_main_grad_attr(param)
+            orig_grad = getattr(param, grad_attr)
+            setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+
+
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
@@ -541,13 +646,40 @@ def finalize_model_grads(
         pp_group = pg_collection.pp
         embd_group = pg_collection.embd
         pos_emb_group = pg_collection.pos_embd
-        dp_cp_group = pg_collection.dp_cp
+        # Full DP x CP x gtp_remat group: num_tokens (the per-token-loss divisor below) counts the
+        # gtp_remat peers' distinct tokens. Falls back to replicate dp_cp when gtp is inactive.
+        dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
+        gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+        egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+        egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+
+    # A missing group would silently skip the gtp_remat-axis reduction below and train on
+    # wrong gradients, so fail loudly whenever the config says the axis is active.
+    for axis, group, axis_size in (
+        ('gtp_remat', gtp_remat_group, config.gtp_weight_remat_size),
+        ('expt_gtp_remat', egtp_remat_group, config.expert_gtp_weight_remat_size),
+    ):
+        if axis_size > 1:
+            found = 'None' if group is None else f'a size-{group.size()} group'
+            assert group is not None and group.size() == axis_size, (
+                f"{axis} is enabled (size={axis_size}) but pg_collection provides {found}. "
+                f"Pass a pg_collection carrying `{axis}` to finalize_model_grads."
+            )
+
+    # Fence the current stream against all GTP backward grad work before the DP gradient sync.
+    if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:
+        from megatron.core.tensor_parallel.gtp_api import (
+            wait_for_gtp_grad_reduction_on_current_stream,
+        )
+
+        wait_for_gtp_grad_reduction_on_current_stream()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
@@ -575,6 +707,12 @@ def finalize_model_grads(
             barrier=config.barrier_with_L1_time
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
+    _allreduce_replicated_grads_over_gtp_remat_group(
+        model,
+        gtp_remat_group,
+        egtp_remat_group,
+        calculate_per_token_loss=config.calculate_per_token_loss,
+    )
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
 

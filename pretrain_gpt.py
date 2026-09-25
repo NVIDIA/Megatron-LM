@@ -9,14 +9,12 @@ _PROGRAM_START_TIME = time.time()
 
 import json
 
-# Suppress warnings on all ranks but rank 0.
-import os
-import warnings
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
-rank = int(os.environ.get('RANK', 0))
-if rank != 0:
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
@@ -53,6 +51,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
@@ -64,6 +63,8 @@ from megatron.training.utils import (
     is_first_or_last_pipeline_stage,
     prepare_packed_seq_params,
 )
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.global_vars import initialize_runtime_services
 from model_provider import model_provider
 
 try:
@@ -510,6 +511,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     elif args.use_varlen_dataset:
         # Variable-length packed (THD) dataset, independent of --sft.
         # Reuses SFTDataset's THD/dynamic-cp packing internally but is gated
+        # Reuses SFTDataset's THD packing internally but is gated
         # by its own top-level flag.
         if args.mock_data:
             dataset_type = MockVarlenDataset
@@ -575,10 +577,14 @@ if __name__ == "__main__":
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = gpt_config_from_args(args, model_config_cls=ModelOptModelConfig)
+        model_cfg = gpt_config_from_args(
+            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
+        )
     else:
-        model_cfg = gpt_config_from_args(args)
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    initialize_runtime_services(args)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

@@ -48,6 +48,27 @@ def mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor
     return x * scale
 
 
+class _DisabledContextTracker:
+    """Track whether a projection runs inside the FP8-disabled context."""
+
+    def __init__(self):
+        self.depth = 0
+        self.entries = 0
+
+    def __call__(self, _config, is_init=False):
+        assert not is_init
+        return self
+
+    def __enter__(self):
+        self.depth += 1
+        self.entries += 1
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.depth -= 1
+        return False
+
+
 @pytest.fixture(autouse=True)
 def patch_hadamard_if_needed():
     """Automatically patch hadamard_transform in both dsa and csa modules if not installed."""
@@ -621,6 +642,45 @@ class TestCompressor:
             if param.requires_grad:
                 assert param.grad is not None, f"Parameter {name} has no gradient"
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_projection_disables_fp8(self, compress_ratio, monkeypatch):
+        compressor = Compressor(
+            config=self.config,
+            submodules=_make_compressor_submodules(),
+            compress_ratio=compress_ratio,
+            head_dim=self.config.v_head_dim,
+            rotate=False,
+            rotary_pos_emb=self.rotary_pos_emb,
+            pg_collection=self.pg_collection,
+        ).cuda()
+        tracker = _DisabledContextTracker()
+        calls = []
+
+        for name, projection in (
+            ('linear_wkv', compressor.linear_wkv),
+            ('linear_wgate', compressor.linear_wgate),
+        ):
+            original_forward = projection.forward
+
+            def checked_forward(*args, _name=name, _forward=original_forward, **kwargs):
+                assert tracker.depth > 0, f"{_name} ran outside the FP8-disabled context"
+                calls.append(_name)
+                return _forward(*args, **kwargs)
+
+            monkeypatch.setattr(projection, 'forward', checked_forward)
+
+        monkeypatch.setattr(
+            'megatron.core.transformer.experimental_attention_variant.csa.get_fp8_disabled_context',
+            tracker,
+        )
+        x = torch.randn(
+            compress_ratio * 2, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        compressor(x)
+
+        assert calls == ['linear_wkv', 'linear_wgate']
+        assert tracker.entries == 1
+
 
 # ===========================================================================
 # CSAIndexer tests
@@ -783,6 +843,21 @@ class TestCompressedSparseAttentionRatio1:
         """With ratio=1, compressor and indexer should not be built."""
         assert self.csa.compressor is None
         assert self.csa.indexer is None
+
+    def test_mtp_layer_number_is_offset(self):
+        """MTP attention layers are numbered after all decoder layers."""
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            compress_ratio=0,
+            is_mtp_layer=True,
+        )
+
+        assert csa.layer_number == self.config.num_layers + 1
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_ratio1_forward(self):

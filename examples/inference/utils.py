@@ -319,7 +319,7 @@ def build_dynamic_engine_setup_prefix(
     # Buffer limits config
     buffer_limits_str = (
         f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
-        f"{context.kv_block_allocator.active_count} chunks "
+        f"{context.kv_block_allocator.pool_size - 1} usable chunks "
         f"[r {context.max_requests}, t {context.max_tokens}]"
     )
 
@@ -349,7 +349,7 @@ def escape_str(s: str) -> str:
 def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -> None:
     """Print unique prompts and their outputs in gpt_dynamic_inference.py format.
 
-    Reads from the high-level API's ``DynamicInferenceRequest`` records returned
+    Reads from the high-level API's completed ``DynamicInferenceRequest`` objects returned
     by ``MegatronLLM.generate`` / ``MegatronAsyncLLM.generate``.
     """
     print("~~~~ Unique prompts + outputs. ~~~~")
@@ -359,7 +359,10 @@ def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -
         unique_prompt_map[req.prompt].append(idx)
 
     for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-        prompt_len = len(results[request_idxs[0]].prompt_tokens)
+        request = results[request_idxs[0]]
+        prompt_len = request.prompt_length
+        if prompt_len is None and request.prompt_tokens is not None:
+            prompt_len = len(request.prompt_tokens)
         print(
             f"\n{unique_idx+1}/{len(unique_prompt_map)}"
             f"[n {len(request_idxs)}, l {prompt_len}] {escape_str(prompt_text)}"
@@ -401,9 +404,9 @@ def dump_inference_results_to_json(
 ) -> None:
     """JSON dump of per-request results matching legacy gpt_dynamic_inference.py shape.
 
-    Reads from the high-level API's ``DynamicInferenceRequest`` records.
+    Reads from the high-level API's completed ``DynamicInferenceRequest`` objects.
     Note: ``latency`` is currently always ``None`` in direct mode because the
-    low-level engine doesn't populate it on ``DynamicInferenceRequest.merge()``;
+    low-level engine doesn't populate it when completing a request;
     will be populated once that field is wired up upstream.
 
     Args:

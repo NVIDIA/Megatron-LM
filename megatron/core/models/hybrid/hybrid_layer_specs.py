@@ -9,6 +9,7 @@ from megatron.core.extensions.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
@@ -17,9 +18,14 @@ from megatron.core.models.gpt.moe_module_specs import (
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import (
     GatedDeltaNet,
+    GatedDeltaNet2,
     GatedDeltaNetSubmodules,
     KimiDeltaAttention,
     KimiDeltaAttentionSubmodules,
+)
+from megatron.core.ssm.gated_delta_product import (
+    GatedDeltaProductMixer,
+    GatedDeltaProductMixerSubmodules,
 )
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
@@ -35,6 +41,18 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
+    CompressedSparseAttentionSubmodules,
+    Compressor,
+    CompressorSubmodules,
+    CSAIndexer,
+    CSAIndexerSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -44,6 +62,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
+    FusedMLASelfAttention,
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
@@ -70,6 +89,18 @@ moe = get_moe_module_spec(
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
 
+_csa_compressor = partial(
+    Compressor,
+    submodules=CompressorSubmodules(linear_wkv=TELinear, linear_wgate=TELinear, norm=TENorm),
+)
+_csa_indexer = partial(
+    CSAIndexer,
+    submodules=CSAIndexerSubmodules(
+        linear_wq_b=TELinear, linear_weights_proj=TELinear, compressor=_csa_compressor
+    ),
+)
+_csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+
 
 # MTP block spec - provides norms and projection only.
 # Inner layers are built by MultiTokenPredictionLayer using nested HybridStack
@@ -85,6 +116,8 @@ _hybrid_mtp_block_spec = ModuleSpec(
                     # Both projection forms are populated so the layer can switch on
                     # `config.enable_hyper_connections` at runtime: mHC=True uses
                     # `e_proj`+`h_proj` per-stream, mHC=False uses fused `eh_proj`.
+                    # Hybrid MTP selects the combined projection normally and
+                    # per-stream projections when mHC is enabled.
                     eh_proj=TEColumnParallelLinear,
                     e_proj=TEColumnParallelLinear,
                     h_proj=TEColumnParallelLinear,
@@ -95,6 +128,19 @@ _hybrid_mtp_block_spec = ModuleSpec(
         ]
     ),
 )
+
+
+def _get_gated_delta_product_mamba_layer_spec(in_proj, out_proj):
+    return ModuleSpec(
+        module=MambaLayer,
+        submodules=MambaLayerSubmodules(
+            mixer=ModuleSpec(
+                module=GatedDeltaProductMixer,
+                submodules=GatedDeltaProductMixerSubmodules(in_proj=in_proj, out_proj=out_proj),
+            ),
+            mamba_bda=get_bias_dropout_add,
+        ),
+    )
 
 
 hybrid_stack_spec = ModuleSpec(
@@ -135,6 +181,20 @@ hybrid_stack_spec = ModuleSpec(
                     submodules=KimiDeltaAttentionSubmodules(
                         in_proj=TEColumnParallelLinear,
                         beta_proj=TEColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=TERowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn2_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet2,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=TELayerNormColumnParallelLinear,
                         out_norm=TENorm,
                         out_proj=TERowParallelLinear,
                     ),
@@ -195,6 +255,58 @@ hybrid_stack_spec = ModuleSpec(
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
+        csa_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=DSv4HybridSelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=DSv4HybridSelfAttentionSubmodules(
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_proj=TEColumnParallelLinear,
+                        core_attention=partial(
+                            CompressedSparseAttention,
+                            submodules=CompressedSparseAttentionSubmodules(
+                                compressor=_csa_compressor, indexer=_csa_indexer
+                            ),
+                        ),
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                    metainfo={"fuse_input_layernorm": False},
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        csa_qk_layernorm_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=DSv4HybridSelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=DSv4HybridSelfAttentionSubmodules(
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_proj=TEColumnParallelLinear,
+                        core_attention=partial(
+                            CompressedSparseAttention,
+                            submodules=CompressedSparseAttentionSubmodules(
+                                compressor=_csa_compressor, indexer=_csa_indexer
+                            ),
+                        ),
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=_csa_qk_norm,
+                        kv_layernorm=_csa_qk_norm,
+                    ),
+                    metainfo={"fuse_input_layernorm": False},
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
         mla_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -216,6 +328,32 @@ hybrid_stack_spec = ModuleSpec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        mla_fused_down_proj_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=IdentityOp,
+                self_attention=ModuleSpec(
+                    module=FusedMLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=TEColumnParallelLinear,
+                        linear_qkv_down_proj=TELayerNormColumnParallelLinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_up_proj=TEColumnParallelLinear,
+                        core_attention=TEDotProductAttention,
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map={
+                    "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+                    "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+                    "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+                },
             ),
         ),
         # Started with spec from gpt_layer_specs.py
@@ -244,6 +382,23 @@ hybrid_stack_spec = ModuleSpec(
 )
 
 
+gated_delta_product_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
+        mamba_layer=_get_gated_delta_product_mamba_layer_spec(
+            TELayerNormColumnParallelLinear, TERowParallelLinear
+        ),
+        gdn_layer=hybrid_stack_spec.submodules.gdn_layer,
+        gdn2_layer=hybrid_stack_spec.submodules.gdn2_layer,
+        attention_layer=hybrid_stack_spec.submodules.attention_layer,
+        dsa_layer=hybrid_stack_spec.submodules.dsa_layer,
+        mlp_layer=hybrid_stack_spec.submodules.mlp_layer,
+        moe_layer=hybrid_stack_spec.submodules.moe_layer,
+        mtp_block_spec=hybrid_stack_spec.submodules.mtp_block_spec,
+    ),
+)
+
+
 hybrid_inference_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
@@ -258,6 +413,34 @@ hybrid_inference_stack_spec = ModuleSpec(
                     ),
                 ),
                 mamba_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn2_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=GatedDeltaNet2,
+                    submodules=GatedDeltaNetSubmodules(
+                        in_proj=InferenceLayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
             ),
         ),
         # Started with spec from gpt_layer_specs.py (with MLP removed)
@@ -335,6 +518,32 @@ hybrid_inference_stack_spec = ModuleSpec(
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
+        mla_fused_down_proj_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=IdentityOp,
+                self_attention=ModuleSpec(
+                    module=FusedMLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=TEColumnParallelLinear,
+                        linear_qkv_down_proj=TELayerNormColumnParallelLinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_up_proj=TEColumnParallelLinear,
+                        core_attention=TEDotProductAttention,
+                        linear_proj=InferenceRowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map={
+                    "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+                    "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+                    "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+                },
+            ),
+        ),
         # Started with spec from gpt_layer_specs.py
         # Using the TE spec because we had problems getting the non-TE spec
         # working
@@ -369,6 +578,7 @@ hybrid_inference_stack_spec = ModuleSpec(
                             hnorm=TENorm,
                             # Populate both projection forms so the layer can switch on
                             # `config.enable_hyper_connections` at runtime.
+                            # Keep both projection forms available for Hybrid MTP.
                             eh_proj=InferenceColumnParallelLinear,
                             e_proj=InferenceColumnParallelLinear,
                             h_proj=InferenceColumnParallelLinear,
@@ -383,59 +593,29 @@ hybrid_inference_stack_spec = ModuleSpec(
 )
 
 
+gated_delta_product_inference_stack_spec = ModuleSpec(
+    module=HybridStack,
+    submodules=HybridStackSubmodules(
+        mamba_layer=_get_gated_delta_product_mamba_layer_spec(
+            InferenceLayerNormColumnParallelLinear, InferenceRowParallelLinear
+        ),
+        gdn_layer=hybrid_inference_stack_spec.submodules.gdn_layer,
+        gdn2_layer=hybrid_inference_stack_spec.submodules.gdn2_layer,
+        attention_layer=hybrid_inference_stack_spec.submodules.attention_layer,
+        dsa_layer=hybrid_inference_stack_spec.submodules.dsa_layer,
+        mlp_layer=hybrid_inference_stack_spec.submodules.mlp_layer,
+        moe_layer=hybrid_inference_stack_spec.submodules.moe_layer,
+        mtp_block_spec=hybrid_inference_stack_spec.submodules.mtp_block_spec,
+    ),
+)
+
+
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
+gdp_stack_spec = gated_delta_product_stack_spec
+gdp_inference_stack_spec = gated_delta_product_inference_stack_spec
 
 
-def hybrid_dsv4_stack_spec(config):
-    """Config-aware hybrid stack spec whose ``D`` (DS_ATTENTION) layer runs the DSv4
-    ``CompressedSparseAttention`` (CSA/HCA + ``CSAIndexer``), identical to the GPT
-    ``dsv4_hybrid`` path, instead of the legacy ``DSAttention``.
-
-    The default ``hybrid_stack_spec`` wires the ``D`` layer to ``AbsorbedMLASelfAttention +
-    DSAttention`` (DS3.2-style sparse attention with no CSA/HCA compression). To run real
-    DSv4 on HybridModel — and to be numerically equivalent to a GPT ``dsv4_hybrid``
-    attention layer — we reuse GPT's own ``get_dsv4_hybrid_module_spec_for_backend``
-    (which is config-aware, e.g. picks the qk-layernorm form from ``config``) so the two
-    model paths build the *same* attention module. Selected via
-    ``--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_dsv4_stack_spec``;
-    ``hybrid_builder`` invokes this function with ``config`` when the spec is callable.
-    """
-    import dataclasses
-
-    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-        _get_backend_spec_provider,
-        get_dsv4_hybrid_module_spec_for_backend,
-    )
-
-    backend = _get_backend_spec_provider(config)
-    dsv4_attention = get_dsv4_hybrid_module_spec_for_backend(config, backend)
-
-    def _wrap_dsv4_layer(compress_ratio=None):
-        # Wrap the DSv4 attention in a hybrid TransformerLayer. When compress_ratio is given
-        # (the 'C'/'H'/'W' layer symbols), bake it into the attention params so the layer uses a
-        # fixed CSA(4)/HCA(128)/window-only(0) ratio regardless of csa_compress_ratios; otherwise
-        # the layer reads its ratio from config.csa_compress_ratios (array-driven 'D' / GPT-parity
-        # path). compress_ratio=0 builds neither the compressor nor the top-k indexer, so the
-        # 'W' layer reuses the entire CSA/HCA code path as pure sliding-window attention.
-        attn = dsv4_attention
-        if compress_ratio is not None:
-            attn = dataclasses.replace(
-                dsv4_attention, params={**dsv4_attention.params, "compress_ratio": compress_ratio}
-            )
-        return ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm, self_attention=attn, self_attn_bda=get_bias_dropout_add
-            ),
-        )
-
-    submodules = dataclasses.replace(
-        hybrid_stack_spec.submodules,
-        dsa_layer=_wrap_dsv4_layer(),  # 'D': array-driven (or window) DSv4 attention
-        csa_layer=_wrap_dsv4_layer(compress_ratio=4),  # 'C': CSA
-        hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
-        window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
-    )
-    return ModuleSpec(module=HybridStack, submodules=submodules)
+# Preserve the existing --spec import path; C/H/W use the standard static stack spec.
+hybrid_dsv4_stack_spec = hybrid_stack_spec

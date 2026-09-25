@@ -27,13 +27,14 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -85,7 +86,12 @@ class GatedDeltaNetSubmodules:
 
 
 class GatedDeltaRuleInterface(Protocol):
-    """Callable interface shared by GDN-family kernels."""
+    """
+    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
+
+    Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
+    variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
+    """
 
     def __call__(
         self,
@@ -93,7 +99,6 @@ class GatedDeltaRuleInterface(Protocol):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
-        beta: torch.Tensor,
         *,
         scale: float | None = None,
         initial_state: torch.Tensor | None = None,
@@ -104,7 +109,7 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
-class _GDNBase(MegatronModule):
+class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     """Shared implementation for the GDN-family layers.
 
     Provides the projection, Q/K/V causal convolution, gated delta-rule parameters,
@@ -115,6 +120,7 @@ class _GDNBase(MegatronModule):
 
     dt_bias_dim: int
     a_log_dim: int
+    in_proj_qkvg_dim: int
     in_proj_extra_dim: int
     in_proj_dim: int
 
@@ -162,8 +168,10 @@ class _GDNBase(MegatronModule):
             cp_comm_type (Optional[str]): Accepted for TransformerLayer compatibility and
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
-            pp_layer_offset (Optional[int]): Pipeline layer offset forwarded by
-                TransformerLayer. Stored for MTP/TransformerLayer API compatibility.
+            pp_layer_offset (Optional[int]): Offset of this pipeline stage's first global
+                layer, forwarded by TransformerLayer. Stored under both
+                ``pp_layer_offset`` (read by the SSM dynamic-inference mixin) and
+                ``_pp_layer_offset`` (the ``Attention`` spelling).
             is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
         """
         if not HAVE_FLA:
@@ -176,7 +184,11 @@ class _GDNBase(MegatronModule):
 
         # Attributes from arguments
         self.layer_number = layer_number
+        # Two live spellings: ``Attention`` and dev's GDN code read ``_pp_layer_offset``,
+        # while ``SSMDynamicInferenceMixin`` (and MambaMixer/GatedDeltaProduct) read
+        # ``pp_layer_offset``. Keep both so either consumer resolves.
         self._pp_layer_offset = pp_layer_offset
+        self.pp_layer_offset = 0 if pp_layer_offset is None else pp_layer_offset
         self.is_mtp_layer = is_mtp_layer
         self.bias = bias
         self.conv_bias = conv_bias
@@ -241,7 +253,8 @@ class _GDNBase(MegatronModule):
                 getattr(self, attr) is not None
             ), f"Attribute {attr} for the GDN-family variant is not set"
         # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -338,6 +351,23 @@ class _GDNBase(MegatronModule):
 
         self.reset_parameters()
 
+    def supports_two_stage_attention(self) -> bool:
+        """Output-norm recomputation requires the original atomic forward path."""
+        return not self.recompute_norm_out
+
+    def forward_post_core_attn(
+        self, norm_out: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply a GDN variant's output projection to its normalized recurrence output."""
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
+        return out, out_bias
+
     def _setup_variant_attrs(self):
         """Set variant projection sections, gate parameter sizes, and kernel callable.
 
@@ -388,9 +418,41 @@ class _GDNBase(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # pylint: disable=missing-function-docstring
-        raise NotImplementedError
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run a GDN variant's recurrence followed by its output projection."""
+        norm_out = self.forward_pre_attn_and_core_attn(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
+        return self.forward_post_core_attn(norm_out)
+
+    def _gated_norm_and_a2a(
+        self,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
+        thd_cp_a2a_inv: torch.Tensor | None,
+        batch: int,
+        seq_len: int,
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> torch.Tensor:
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
+
+        return a2a_hp_to_cp(
+            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
+        )
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -428,7 +490,12 @@ class _GDNBase(MegatronModule):
             ``k``, ``v``, ``g``, and ``beta``), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
-        cp_size = 1 if cp_size_headwise is None else cp_size_headwise
+        # Dev's GDN/KDA callers resolve the runtime head-parallel CP size and always pass it
+        # explicitly. Main's GDN2 caller splits its projection by the static ``self.cp_size``
+        # and passes nothing, so fall back to that (never to a hard-coded 1, which would
+        # disagree with ``GatedDeltaNet2.feat_dim_split``). ``getattr`` keeps the eager
+        # SimpleNamespace-based unit tests, which have no ``cp_size``, working.
+        cp_size = getattr(self, "cp_size", 1) if cp_size_headwise is None else cp_size_headwise
 
         # Split qkv into query_key and value
         query_key, value = torch.split(

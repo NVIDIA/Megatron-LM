@@ -234,6 +234,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool = True,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -249,6 +250,9 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
                 parameters for the layer-wise distributed optimizer.
+            use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+                controls whether to compute and supply a shard-aligned param layout to DDP.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,

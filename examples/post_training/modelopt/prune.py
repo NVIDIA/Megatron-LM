@@ -43,12 +43,12 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import initialize_runtime_services
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -165,7 +165,7 @@ def get_params(model):
 
 
 if __name__ == "__main__":
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_prune_args,
         args_defaults={
             "tokenizer_type": "HuggingFaceTokenizer",
@@ -173,6 +173,7 @@ if __name__ == "__main__":
             "no_load_optim": True,
         },
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()
@@ -191,7 +192,7 @@ if __name__ == "__main__":
     report_current_memory_info()
 
     if args.load is not None:
-        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     if args.pretrained_model_path is not None:

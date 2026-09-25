@@ -19,12 +19,14 @@ from tests.unit_tests.test_utilities import Utils
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        fused_apply_mla_rope_for_q,
         fused_mla_rope_concat,
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
     )
 except Exception:
+    fused_apply_mla_rope_for_q = None
     fused_mla_rope_concat = None
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
@@ -84,6 +86,109 @@ class FakeCPGroup:
 
     def rank(self):
         return self._rank
+
+
+class TestApplyRotaryPosEmbTHD:
+    @pytest.mark.parametrize(
+        ("unsupported_kwargs", "warning_text"),
+        [
+            ({"inverse": True}, "inverse RoPE is not supported"),
+            (
+                {"mla_rotary_interleaved": True, "mla_output_remove_interleaving": True},
+                "MLA-style interleaving",
+            ),
+            ({"mscale": 2.0}, "mscale=2.0 is not supported"),
+        ],
+    )
+    def test_unsupported_fusion_options_use_unfused(self, unsupported_kwargs, warning_text):
+        cp_group = FakeCPGroup()
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(2, 1, 1, 8)
+        cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+        config = TransformerConfig(
+            num_attention_heads=2, num_layers=1, apply_rope_fusion=True, rotary_interleaved=False
+        )
+        expected = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=2, **unsupported_kwargs
+        )
+
+        fused_mock = MagicMock(return_value=t.clone())
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb_thd", fused_mock),
+            pytest.warns(UserWarning, match=warning_text),
+        ):
+            output = apply_rotary_pos_emb(
+                t,
+                freqs,
+                config,
+                cu_seqlens=cu_seqlens,
+                cp_group=cp_group,
+                max_seqlen=2,
+                **unsupported_kwargs,
+            )
+
+        fused_mock.assert_not_called()
+        torch.testing.assert_close(output, expected)
+
+    def test_packed_freqs_returns_offset_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=0)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(8, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
+
+        expected_freqs = torch.cat([freqs[0:1], freqs[3:4], freqs[4:5], freqs[7:8]], dim=0)
+        expected = rope_utils_module._apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1), expected_freqs
+        ).squeeze(1)
+
+        torch.testing.assert_close(out, expected)
+
+    def test_max_seqlen_freqs_returns_sequence_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=1)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
+
+        expected_freqs = torch.cat([freqs[1:2], freqs[2:3]], dim=0)
+        expected_slices = []
+        for x in torch.split(t, [2, 2]):
+            expected_slices.append(
+                rope_utils_module._apply_rotary_pos_emb_bshd(
+                    x.unsqueeze(1), expected_freqs
+                ).squeeze(1)
+            )
+        expected = torch.cat(expected_slices, dim=0)
+
+        torch.testing.assert_close(out, expected)
+
+    def test_shared_max_seqlen_maps_asymmetric_query_sequences_from_zero(self):
+        cp_group = FakeCPGroup(size=1, rank=0)
+        cu_seqlens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
+        t = torch.randn(6, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+
+        max_seqlen_q = 3
+        max_seqlen_kv = freqs.size(0)
+        assert max_seqlen_q < max_seqlen_kv < t.size(0)
+        combined_max_seqlen = max(max_seqlen_q, max_seqlen_kv)
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens_q, freqs, cp_group=cp_group, max_seqlen=combined_max_seqlen
+        )
+
+        expected_freqs = freqs[torch.tensor([0, 1, 2, 0, 1, 2])]
+        expected = rope_utils_module._apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1), expected_freqs
+        ).squeeze(1)
+
+        torch.testing.assert_close(out, expected)
 
 
 class _SaveOutputForBackward(torch.autograd.Function):
@@ -523,11 +628,18 @@ def test_mla_rope_concat_matches_native(layout, num_heads, dtype):
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
-class TestFusedApplyMLARope:
+class TestFusedMLARope:
     @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize("rope_first", [False, True], ids=["nope-first", "rope-first"])
-    def test_forward_backward_for_q(self, input_format, rope_first):
-        _test_fused_mla_rope_inplace(input_format, rope_first=rope_first)
+    @pytest.mark.parametrize("inverse", [False, True])
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    def test_inplace_forward_backward(self, input_format, inverse, remove_interleaving, rope_first):
+        _test_fused_mla_rope_inplace(
+            input_format,
+            inverse=inverse,
+            remove_interleaving=remove_interleaving,
+            rope_first=rope_first,
+        )
 
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):
@@ -609,6 +721,47 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)
 
     inverse_output.backward(torch.randn_like(inverse_output).contiguous())
     torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+def test_legacy_query_api_remains_in_place(input_format):
+    """The legacy API keeps its original mutation behavior and allocation profile."""
+    assert fused_apply_mla_rope_for_q is not None
+    seqlen = 32
+    batch_size = 1
+    num_heads = 2
+    nope_dim = 16
+    emb_dim = 64
+    dtype = torch.bfloat16
+
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    freqs, mscale = yarn_rope(seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    if input_format == "sbhd":
+        shape = (seqlen, batch_size, num_heads, nope_dim + emb_dim)
+        cu_seqlens = None
+    else:
+        shape = (2 * seqlen, num_heads, nope_dim + emb_dim)
+        cu_seqlens = torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device="cuda")
+
+    query = torch.randn(shape, dtype=dtype, device="cuda")
+    reference = query.clone()
+    expected = fused_mla_rope_inplace(
+        reference.clone(), cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens
+    )
+    # Call positionally: the legacy name may resolve either to the explicit wrapper
+    # (``qk_head_dim=``) or to the ``fused_mla_rope_inplace`` alias (``nope_dim=``).
+    output = fused_apply_mla_rope_for_q(query, cos, sin, nope_dim, emb_dim, cu_seqlens)
+
+    assert output.data_ptr() == query.data_ptr()
+    assert not torch.equal(query, reference)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 class TestApplyRotaryPosEmbMlaFusionConflict:

@@ -12,11 +12,11 @@ import io
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import maybe_msc
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -29,7 +29,6 @@ from .mapping import (
     apply_factory_merges,
 )
 from .state_dict_utils import load_preprocess, save_preprocess
-from .strategies.async_utils import AsyncRequest
 from .strategies.common import COMMON_STATE_FNAME, load_common
 from .strategies.torch import (
     TorchDistLoadShardedStrategy,
@@ -47,11 +46,24 @@ from .validation import (
     verify_integrity_manifest,
 )
 
+if TYPE_CHECKING:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+else:
+    AsyncRequest = Any
+
+
 logger = logging.getLogger(__name__)
 
-# monkeypatch needed for ModelOpt
-# will be removed once MLM updated to newer ModelOpt
-get_default_load_sharded_strategy = TorchDistLoadShardedStrategy
+
+def get_default_load_sharded_strategy(checkpoint_dir: str | Path | None = None):
+    """Create the default torch distributed load strategy."""
+    return TorchDistLoadShardedStrategy(checkpoint_name=checkpoint_dir)
+
+
+def get_default_save_sharded_strategy(backend: str = "torch_dist"):
+    """Create the default torch distributed save strategy."""
+    return TorchDistSaveShardedStrategy(backend=backend)
+
 
 # flat state dict with sharded objects without any data
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
@@ -66,6 +78,7 @@ def load(
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -101,6 +114,8 @@ def load(
             and compares against the SHA-256 manifest. Raises `CheckpointingException` on any
             mismatch. Requires that the checkpoint was previously saved with
             `verify_integrity=True`.
+        process_group (ProcessGroup, optional): ranks that collectively describe
+            one complete sharded state dict. Defaults to the global process group.
 
     Returns:
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
@@ -128,8 +143,7 @@ def load(
         sharded_state_dict
     )
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
-    # torch_dist checkpoint (current format) or in a legacy common.pt. Loading it up front
-    # is also required to determine `async_strategy` for the sharded load below.
+    # torch_dist checkpoint (current format) or in a legacy common.pt.
     common_state_dict = load_common_state_dict(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
@@ -148,7 +162,9 @@ def load(
             k: v for k, v in ckpt_sharded_metadata.items() if v.key != 'common_state'
         }
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
-        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)
+        local_metadata, global_metadata = determine_global_metadata(
+            sharded_state_dict, process_group=process_group
+        )
 
     sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
         sharded_state_dict,
@@ -159,13 +175,7 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    ckpt_args = common_state_dict.get("args")
-    async_strategy = (
-        getattr(ckpt_args, "async_strategy", "mcore")
-        if getattr(ckpt_args, "async_save", False)
-        else "mcore"
-    )
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -180,10 +190,7 @@ def load(
 def _legacy_common_state_exists(checkpoint_dir: str) -> bool:
     """Check whether the checkpoint stores common data in a legacy common.pt file."""
     path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        return msc.Path(path).exists()
-    return os.path.exists(path)
+    return maybe_msc.Path(path).exists()
 
 
 def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
@@ -216,7 +223,7 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     loaded = pyt_state_dict[unique_key]
     if isinstance(loaded, io.BytesIO):
         loaded.seek(0)
-        loaded = torch.load(loaded, weights_only=False)
+        loaded = torch.load(loaded, weights_only=True)
     return loaded[0]
 
 
@@ -339,7 +346,6 @@ def save(
         Callable[[CommonStateDict], StateDict]
     ] = None,
     content_metadata: Optional[dict] = None,
-    async_strategy: Optional[str] = "nvrx",
     verify_integrity: bool = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
@@ -398,11 +404,7 @@ def save(
     from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 
     if torch.distributed.get_rank() == 0:
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            checkpoint_dir_path = msc.Path(str(checkpoint_dir))
-        else:
-            checkpoint_dir_path = Path(checkpoint_dir)
+        checkpoint_dir_path = maybe_msc.Path(str(checkpoint_dir))
 
         if next(checkpoint_dir_path.iterdir(), None) is not None:
             # Don't throw exception here since this could cause a cascade of failures
@@ -451,7 +453,7 @@ def save(
             integrity_finalize_fn()
         return None
 
-    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
+    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
     async_request.finalize_fns.append(metadata_finalize_fn)
     if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)

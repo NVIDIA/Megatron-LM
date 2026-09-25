@@ -42,7 +42,10 @@ import numpy
 import torch
 
 from megatron.core import config
-from megatron.core._rank_utils import log_single_rank
+from megatron.core._rank_utils import (  # pylint: disable=unused-import
+    log_single_rank,
+    set_default_log_ranks,
+)
 from megatron.core.package_info import __version__ as mcore_version
 
 try:
@@ -86,6 +89,7 @@ _fa_version = None
 _flashinfer_version = None
 _mamba_ssm_version = None
 _causal_conv1d_version = None
+_emerging_optimizers_version = None
 
 
 _Wrapped = TypeVar('_Wrapped', bound=Callable)
@@ -500,6 +504,39 @@ def is_flashinfer_min_version(version, check_equality=True):
     return flashinfer_version > PkgVersion(version)
 
 
+def get_emerging_optimizers_version():
+    """Get emerging_optimizers version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_emerging_optimizers_version_str():
+        import emerging_optimizers
+
+        if hasattr(emerging_optimizers, "__version__"):
+            return str(emerging_optimizers.__version__)
+        else:
+            # The distribution name is hyphenated even though the module is not.
+            return version("emerging-optimizers")
+
+    global _emerging_optimizers_version
+    if _emerging_optimizers_version is None:
+        _emerging_optimizers_version = PkgVersion(get_emerging_optimizers_version_str())
+    return _emerging_optimizers_version
+
+
+def is_emerging_optimizers_min_version(version, check_equality=True):
+    """Check if minimum version of `emerging_optimizers` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_emerging_optimizers_version() >= PkgVersion(version)
+    return get_emerging_optimizers_version() > PkgVersion(version)
+
+
 _VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
 
 
@@ -697,6 +734,25 @@ def get_pg_rank(group=None):
     if not torch.distributed.is_initialized() or group is None:
         return 0
     return group.rank()
+
+
+def cat_or_empty(parts: List[torch.Tensor], ref: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``parts`` into one flat tensor, or return an empty tensor matching
+    ``ref``'s dtype and device when there is nothing to concatenate.
+
+    Typical use: the send buffer of an all_to_all whose input splits are all zero on
+    this rank, where ``torch.cat`` of an empty list would raise.
+
+    Args:
+        parts: Tensors to concatenate along dim 0 (may be empty).
+        ref: Tensor whose dtype and device the empty result should match.
+
+    Returns:
+        torch.Tensor: The concatenation, or an empty 1-D tensor.
+    """
+    if parts:
+        return torch.cat(parts)
+    return torch.empty(0, dtype=ref.dtype, device=ref.device)
 
 
 def get_pg_src_rank(group=None):
@@ -942,6 +998,22 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
     tensor.data = new_data_tensor
 
 
+def copy_parameter_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy dynamically attached Megatron metadata between parameters.
+
+    Megatron records sharding and refit metadata as public Python attributes.
+    Tensor subclasses use private attributes for their storage and quantization
+    implementation details; those must not leak into a replacement tensor.
+
+    Args:
+        destination: Tensor receiving the metadata.
+        source: Tensor whose metadata should be copied.
+    """
+    for name, value in vars(source).items():
+        if not name.startswith("_"):
+            setattr(destination, name, value)
+
+
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
@@ -976,6 +1048,8 @@ def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0)
 
 def log_on_each_pipeline_stage(
     logger: logging.Logger,
+    level: int,
+    msg: object,
     *args: Any,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -986,23 +1060,32 @@ def log_on_each_pipeline_stage(
     Args:
         logger (logging.Logger): The logger to write the logs
 
-        args (Tuple[Any]): All logging.Logger.log positional arguments
+        level (int): Logging level for the message.
+
+        msg (object): Message format string.
+
+        args (Tuple[Any]): Message format arguments.
 
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
 
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if not logger.isEnabledFor(level):
+        return
+
     if tp_group is None and dp_cp_group is None:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    elif tp_group is not None and dp_cp_group is not None:
+    else:
+        assert tp_group is not None and dp_cp_group is not None
         tp_rank = tp_group.rank()
         dp_cp_rank = dp_cp_group.rank()
-    else:
-        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
 
     if tp_rank == 0 and dp_cp_rank == 0:
-        logger.log(*args, **kwargs)
+        logger.log(level, msg, *args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(
@@ -1051,7 +1134,10 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        ],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -1131,8 +1217,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # TP + FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = tensor._local_tensor
 
@@ -1145,10 +1234,57 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    gtp_pad_length = 0  # overwritten below for GTP params
+
+    # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
+    # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
+    # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
+    # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp_api import (
+            dequantize_gtp_native_fp8,
+            gtp_replica_rank,
+            is_gtp_param,
+        )
+
+        if is_gtp_param(tensor):
+            gtp_rank = get_pg_rank(tensor.group)
+            gtp_remat_size = get_pg_size(tensor.group)
+            if tp_axis == 0:
+                # same axis as TP → one composite axis-0 offset
+                new_offsets[0] = (
+                    prepend_axis_num,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    tp_size * gtp_remat_size,
+                )
+            else:
+                # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas): the
+            # group stamped on the param by the caller's pg_collection, else the MPU globals.
+            dp_replica_id = gtp_replica_rank(tensor)
+            gtp_pad_length = getattr(tensor, "pad_length", 0)
+            # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
+            # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
+            # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
+            # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
+            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
+            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            if is_float8tensor(tensor):
+                fp8_param = tensor
+                tensor = dequantize_gtp_native_fp8(tensor)
+                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
+                # to model entries by id(entry.data), which this dequantized copy would break
+                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                tensor._gtp_dequant_src = fp8_param
+
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1157,6 +1293,96 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    # Plain attribute (not a ShardedTensor field, so DCP never serializes it): global_shape minus
+    # this gives the true unpadded dim0. Read later by grant_shape_mismatch_for_gtp_padding.
+    sharded_tensor.gtp_pad_length = gtp_pad_length
+    return sharded_tensor
+
+
+def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
+    """Map a training recipe to the GTP dim-0 alignment tile size.
+
+    Zero-dependency by design (no TE/GTP imports) -- must stay safe to call from checkpoint
+    loading in a non-GTP run, unlike importing generalized_tensor_parallelism.py or gtp_api.py's
+    non-HAVE_GTP symbols.
+    """
+    if fp4:
+        return 16
+    if fp8_recipe == "mxfp8":
+        return 32
+    if fp8:
+        return 16
+    # No MXFP8/NVFP4 tile-size requirement in this recipe -- pad only to the minimum
+    # gtp_remat_size needed for even AG/RS sharding, not a fixed quantization tile size.
+    return 1
+
+
+def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad_for_alignment):
+    """Decide, per tensor, whether a checkpoint-vs-expected shape mismatch is GTP padding.
+
+    Reads the checkpoint's real on-disk shape and sets ``allow_shape_mismatch`` for every
+    tensor, GTP-tagged or plain -- narrowing GTP's blanket bypass to real padding, and letting a
+    non-GTP load recognize a GTP-padded checkpoint. A tensor that already has the flag set to
+    ``True`` is left untouched (granted for an unrelated reason, e.g. vocab padding).
+
+    The other 3 of these 4 (save, load) padding combinations can produce a shape difference
+    (an equal size always short-circuits below, regardless of cell)::
+
+        save \\ load     no pad              pads
+        no pad           declared==expected  declared(==dim0_unpadded) < expected
+        pads             declared > expected declared != expected (different pad amounts)
+
+    ``pad_for_alignment`` must come from the caller (the training recipe), not ``GTP_CONFIG`` --
+    that global is only set when GTP is active in *this* process.
+    """
+    from megatron.core.dist_checkpointing.dict_utils import nested_values
+
+    sharded_tensors = [v for v in nested_values(sharded_state_dict) if isinstance(v, ShardedTensor)]
+    if not sharded_tensors:
+        return
+
+    try:
+        from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
+
+        checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"grant_shape_mismatch_for_gtp_padding: could not read metadata, "
+            f"skipping GTP padding check: {e}"
+        )
+        return
+
+    for sh_ten in sharded_tensors:
+        if sh_ten.allow_shape_mismatch:
+            continue  # already granted for an unrelated reason (e.g., vocab padding)
+        if sh_ten.key not in checkpoint_metadata:
+            continue  # let the normal load path raise its own "key missing" error
+        ckpt_shape = checkpoint_metadata[sh_ten.key].global_shape
+        # The GTP-padded axis is dim0 of the WEIGHT, not necessarily index 0 of global_shape --
+        # e.g. a PP-layer axis prepended via prepend_offsets/sharded_offsets shifts it to
+        # prepend_axis_num. The checkpoint-side ShardedTensor is metadata-only (its own
+        # prepend_axis_num is meaningless, always 0), so index both shapes by the live tensor's.
+        axis0 = sh_ten.prepend_axis_num
+        if axis0 >= len(ckpt_shape):
+            continue  # axis layout mismatch -- not a shape this function understands
+        ckpt_dim0 = int(ckpt_shape[axis0])
+        required_dim0 = int(sh_ten.global_shape[axis0])
+        if ckpt_dim0 == required_dim0:
+            continue  # no difference -- nothing to fix
+        dim0_unpadded = required_dim0 - int(getattr(sh_ten, "gtp_pad_length", 0))
+        # Valid padding: either an unpadded save (ckpt_dim0 == dim0_unpadded exactly), or an
+        # alignment-padded one (ckpt_dim0 a multiple of pad_for_alignment). At
+        # pad_for_alignment == 1 (bf16) every integer is "a multiple", so that disjunct is gated
+        # off there -- otherwise any ckpt_dim0 >= required_dim0 would pass as "padding".
+        is_valid_padding = ckpt_dim0 == dim0_unpadded or (
+            pad_for_alignment > 1 and ckpt_dim0 % pad_for_alignment == 0
+        )
+        # Padding only ever adds rows, so also require ckpt_dim0 >= dim0_unpadded.
+        sh_ten.allow_shape_mismatch = ckpt_dim0 >= dim0_unpadded and is_valid_padding
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
@@ -1174,6 +1400,18 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
             - dp_cp_group: Data parallel + context parallel group
               (default: None, falls back to parallel_state)
     """
+    # Sanity guard.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+        assert not is_gtp_param(tensor), (
+            f"GTP weight-remat param '{key}' reached make_sharded_tensor_for_checkpoint (the "
+            "replicated path); route GTP-sharded weights through "
+            "make_tp_sharded_tensor_for_checkpoint or make_sharded_tensors_for_checkpoint instead."
+        )
+
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
@@ -1198,16 +1436,20 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     dp_size = get_pg_size(dp_cp_group)
     dp_replica_id = get_pg_rank(dp_cp_group)
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = get_full_tensor_if_necessary(tensor)
+        # Add FSDP sharding rank offsets.
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1216,10 +1458,19 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def get_full_tensor_if_necessary(tensor):
-    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    """
+    Captures an edge case where devices out-number elements in a DTensor,
+    for instance when generating a ShardedTensor. Replicate the DTensor
+    on all ranks to avoid empty DTensors on any rank.
+    """
     need_full_tensor = False
     for i in range(tensor.device_mesh.ndim):
         if (
@@ -2537,6 +2788,7 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
     METADATA_KEYS = (
         'cu_seqlens',
         'cu_seqlens_padded',
+        'dataset_id',
         'max_seqlen',
         'local_cp_size',
         'hybrid_cp_group',
@@ -2664,6 +2916,7 @@ def get_batch_on_this_cp_rank(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
+    use_contiguous_cp: bool = False,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2678,6 +2931,7 @@ def get_batch_on_this_cp_rank(
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
         and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
+      - **Contiguous CP**: Keeps the hybrid residual stream in causal rank order.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
@@ -2692,6 +2946,7 @@ def get_batch_on_this_cp_rank(
             even when ``cu_seqlens`` is present (e.g., for inter-document
             masking where document lengths are not divisible by
             ``2 * cp_size``).
+        use_contiguous_cp (bool): Use contiguous sequence shards for the linear CP layout.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
@@ -2704,7 +2959,11 @@ def get_batch_on_this_cp_rank(
         # internally): use the current context-parallel group.
         cp_group = parallel_state.get_context_parallel_group()
 
-    if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
+    if use_contiguous_cp:
+        from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
+
+        batch = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=cp_group)
+    elif use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
     elif is_hybrid_cp:
         assert (
@@ -2925,11 +3184,18 @@ def unwrap_model(model, module_instances=None):
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
         from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-            FullyShardedDataParallel as megatron_FSDP,
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
         )
         from megatron.core.transformer.module import Float16Module
 
-        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
+        module_instances = (
+            DDP,
+            torch_FSDP,
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
+            Float16Module,
+        )
 
     return_list = True
     if not isinstance(model, list):
@@ -3230,6 +3496,11 @@ def ensure_params_ready(params: Iterable[Any]) -> None:
     forward pre-hook normally makes ``param.data`` valid. Consumers that read a parameter without
     invoking its owning module call this first. Backends mark their parameters with
     :data:`PARAM_READY_CALLBACK_ATTR`; unmarked parameters are already readable.
+    A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
+    asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
+    consumer reading it earlier -- ahead of that module, or from another stream -- calls this
+    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    no-op, so neither side needs to know about the other.
 
     Callbacks are shared per communication bucket, so each fires once, not once per parameter.
     """

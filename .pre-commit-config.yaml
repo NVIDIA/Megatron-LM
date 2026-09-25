@@ -1,6 +1,8 @@
+default_install_hook_types: [pre-commit, commit-msg]
+
 repos:
 - repo: https://github.com/psf/black
-  rev: 'refs/tags/24.4.2:refs/tags/24.4.2'
+  rev: 'refs/tags/26.3.0:refs/tags/26.3.0'
   hooks:
   - id: black
     files: ^megatron/core/.*|^tests/unit_tests/.*
@@ -15,3 +17,12 @@ repos:
   hooks:
   - id: isort
     files: ^megatron/core/.*
+- repo: local
+  hooks:
+  - id: check-dco
+    name: Check Signed-off-by trailer
+    entry: bash -c 'if ! git interpret-trailers --parse "$1" | grep -Eiq "^Signed-off-by:[[:space:]]+.+[[:space:]]+<[^<>[:space:]]+@[^<>[:space:]]+>$"; then echo "❌ Commit message must be signed off. Use git commit -s to add it automatically."; exit 1; fi' --
+    language: system
+    always_run: true
+    stages: [commit-msg]
+    types: [text]

@@ -28,11 +28,19 @@ workflow:
   separate PR just to reduce reviewer groups.
 - If PR B depends on symbols renamed in PR A, call out the dependency and put
   backward-compatible aliases, re-exports, or shims in PR A when needed.
-- When creating dependent PRs, set the dependent PR's GitHub base/diffbase to
-  `pull-request/<base PR number>`, not the base PR author's branch.
-- Before merging a base PR, retarget each dependent PR back to `main` and
-  refresh it against `main`; otherwise GitHub may automatically close the
-  dependent PR, losing approvals and review discussion.
+- [GitHub's standard stacked-PR flow](https://docs.github.com/en/pull-requests/how-tos/create-pull-requests/creating-stacked-pull-requests)
+  — push each branch to the upstream repo and base each PR on the previous
+  branch — does not work here: contributors cannot push branches to
+  `NVIDIA/Megatron-LM`, and a PR's base must be an upstream branch. The only
+  upstream refs containing a fork PR's commits are the `pull-request/<N>`
+  mirrors that copy-pr-bot creates, so stacking goes through them.
+- Create every PR with base `main`; the `pull-request/<N>` mirror refs do not
+  exist until a vetter comments `/ok to test <head-sha>` (copy-pr-bot). Once
+  the mirror exists, stack a dependent PR with
+  `gh pr edit <child> --base pull-request/<base PR number>`.
+- Never merge a PR while its base is a `pull-request/*` ref: the squash lands
+  in the bot's scratch ref, not `main`, and the PR ends up MERGED and
+  unreopenable. Retarget to `main` first.
 - Wait for user approval before execution.
 - Execution creates draft PRs from the right base, applies file-scoped diffs
   with `git diff upstream/main..<source-branch> -- <paths> | git apply`, pushes
@@ -73,7 +81,7 @@ For each new PR:
 1. Create a new branch from the appropriate local base (`main`, or a dependency PR's branch).
 2. Extract the relevant changes: `git diff upstream/main..<source-branch> -- <file paths> | git apply`.
 3. Stage, commit with a clear message, and push to the user's fork.
-4. Create the PR as a **draft** (per repo contributing guidelines). For dependent PRs, set the GitHub base/diffbase to `pull-request/<base PR number>`.
+4. Create the PR as a **draft** with base `main` (per repo contributing guidelines). Retarget dependent PRs to `pull-request/<base PR number>` only after a vetter's `/ok to test` has created that mirror ref.
 5. If the original PR needs to be narrowed in scope, confirm with the user before force-pushing.
 6. Report all PR URLs when done.
 
@@ -81,7 +89,6 @@ For each new PR:
 
 - Always create PRs as **drafts** and push to the user's fork, never directly to upstream.
 - Backward-compatible changes (aliases, re-exports, deprecation shims) should go in the first PR so subsequent PRs can depend on them.
-- Dependent PRs should target `pull-request/<base PR number>` while stacked, then be retargeted and refreshed to `main` before the base PR is merged.
 - Test files should go with the production code they test, not in a separate PR.
 - Prefer a single clean commit per split PR over replaying the original commit history.
 - If a file is hard to categorize (e.g., it touches two groups), ask the user which PR it should go in.

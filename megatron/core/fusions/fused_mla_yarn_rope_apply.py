@@ -1470,8 +1470,60 @@ def fused_mla_rope_kv_split(
     )
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatible aliases (deprecated, prefer the new names above)
-# ---------------------------------------------------------------------------
-fused_apply_mla_rope_for_q = fused_mla_rope_inplace
-fused_apply_mla_rope_for_kv = fused_mla_rope_kv_split
+def fused_apply_mla_rope_for_q(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    qk_head_dim: int,
+    emb_dim: int,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+) -> torch.Tensor:
+    """Backward-compatible in-place MLA query RoPE API.
+
+    New callers should choose :func:`fused_mla_rope_inplace` or
+    :func:`fused_mla_rope_out_of_place` explicitly. This legacy name keeps
+    its original mutation behavior and does not add a clone to the hot path.
+    """
+    return fused_mla_rope_inplace(
+        t,
+        cos,
+        sin,
+        qk_head_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens_q,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+    )
+
+
+def fused_apply_mla_rope_for_kv(
+    kv: torch.Tensor,
+    k_pos_emb: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    emb_dim: int,
+    k_dim: int,
+    v_dim: int,
+    cu_seqlens_kv: Optional[torch.Tensor] = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward-compatible name for the MLA key/value split RoPE API."""
+    return fused_mla_rope_kv_split(
+        kv,
+        k_pos_emb,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        cu_seqlens_kv=cu_seqlens_kv,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        rotary_interleaved=rotary_interleaved,
+    )

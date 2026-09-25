@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import atexit
+import csv
 import math
 from collections import Counter
 from typing import Any, Dict, List, Optional, Union
@@ -62,6 +63,8 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        # Pre-calculate padding divisor to avoid redundant computation in get_item
+        self.padding_divisor = self._calculate_padding_divisor()
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -260,9 +263,21 @@ class MockSFTLowLevelDataset:
             )
 
         if mode == "file":
-            import pandas as pd
-
-            self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
+            # One sequence length per CSV line; non-numeric cells (e.g. a
+            # header row) are skipped. Stdlib csv keeps pandas out of the
+            # package's import-time dependencies.
+            lengths = []
+            with open(kwargs["path"], newline="") as f:
+                for row in csv.reader(f):
+                    for cell in row:
+                        cell = cell.strip()
+                        if not cell:
+                            continue
+                        try:
+                            lengths.append(int(float(cell)))
+                        except ValueError:
+                            continue
+            self.sequence_lengths = np.array(lengths)
             self.size = len(self.sequence_lengths)
         elif mode == "distribution":
             min_seq_len = kwargs["min_seq_len"]

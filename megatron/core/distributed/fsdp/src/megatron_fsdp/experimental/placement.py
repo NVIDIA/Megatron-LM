@@ -14,10 +14,9 @@
 
 """DBuffer placement definitions.
 
-These placement concepts are borrowed from PyTorch DTensor placements:
-``Replicate`` and ``Partial`` mirror DTensor's placements. ``Flat`` is the
-only sharded DBuffer placement implemented so far; it stores dim-0 shards in a
-flattened local buffer.
+DBuffer uses PyTorch DTensor's ``Placement``, ``Replicate``, and ``Partial``
+types directly. ``RowAtomic`` and ``BlockAtomic`` are DBuffer-specific dim-0
+``Shard`` placements whose local storage is part of one flattened buffer.
 
 =============  =============  ====================
 Source         Destination    DBuffer operation
@@ -25,38 +24,44 @@ Source         Destination    DBuffer operation
 sharded        ``Replicate``  ``allgather()``
 ``Partial``    sharded        ``reduce_scatter()``
 ``Partial``    ``Replicate``  ``allreduce()``
-``Replicate``  sharded        ``scatter()`` (local)
+``Replicate``  sharded        ``view()`` (local)
 =============  =============  ====================
 """
 
-import dataclasses
 from collections.abc import Iterable
 
-import torch.distributed as dist
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor.placement_types import Placement
+
+__all__ = ["BlockAtomic", "RowAtomic", "changed_mesh_axis"]
 
 
-class Placement:
-    """Base class for DBuffer placements."""
+class RowAtomic(Shard):
+    """DBuffer-specific dim-0 shard placement that keeps each row intact."""
+
+    def __init__(self) -> None:
+        super().__init__(0)
+
+    def __eq__(self, other: object) -> bool:
+        # PyTorch Shard.__eq__ compares only dim, so distinguish RowAtomic from BlockAtomic.
+        return isinstance(other, Shard) and other.dim == 0 and not isinstance(other, BlockAtomic)
 
 
-MeshAxis = int | str
+class BlockAtomic(Shard):
+    """Flattened dim-0 shard placement that keeps ``block_size`` rows together."""
 
+    def __init__(self, block_size: int) -> None:
+        if block_size <= 0:
+            raise ValueError(f"BlockAtomic block_size must be positive, got {block_size}.")
+        super().__init__(0)
+        self.block_size = block_size
 
-@dataclasses.dataclass(frozen=True)
-class Replicate(Placement):
-    """Replicated local buffer placement."""
+    def __eq__(self, other: object) -> bool:
+        # PyTorch Shard.__eq__ compares only dim, so preserve the block size as well.
+        return isinstance(other, BlockAtomic) and self.block_size == other.block_size
 
-
-@dataclasses.dataclass(frozen=True)
-class Partial(Placement):
-    """Unreduced replicated local buffer placement."""
-
-    reduce_op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM
-
-
-@dataclasses.dataclass(frozen=True)
-class Flat(Placement):
-    """Flat dim-0 sharded local buffer placement."""
+    def __repr__(self) -> str:
+        return f"BlockAtomic(block_size={self.block_size})"
 
 
 def changed_mesh_axis(
@@ -76,24 +81,3 @@ def changed_mesh_axis(
             )
         changed_axis = axis
     return changed_axis
-
-
-@dataclasses.dataclass(frozen=True)
-class Placements:
-    """Per-mesh-axis placements for parameter, gradient, and optimizer buffers."""
-
-    dp_axes: list[MeshAxis]
-    parameter: list[Placement]
-    gradient: list[Placement]
-    optimizer: list[Placement]
-
-    def __post_init__(self) -> None:
-        """Validate placement list lengths."""
-        axis_count = len(self.dp_axes)
-        for name, placements in (
-            ("parameter", self.parameter),
-            ("gradient", self.gradient),
-            ("optimizer", self.optimizer),
-        ):
-            if len(placements) != axis_count:
-                raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")

@@ -182,6 +182,8 @@ def get_mock_mla_config(
     apply_rope_fusion: bool = False,
     rope_type: str = "yarn",
     rotary_percent: float = 1.0,
+    # Main (#4452) added `qk_layernorm` as a required positional; dev already carried it as a
+    # keyword with a True default, so dev's list is a strict superset. Keep dev's.
     qk_layernorm: bool = True,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
@@ -327,6 +329,9 @@ def _run_functionality(
     model_parallel_cuda_manual_seed(123)
 
     # Create model
+    # Main (#4452) hoisted qk_layernorm into a local so the config and both submodule builders
+    # stay in sync; the (unconflicted) get_*_submodules calls below already read it.
+    qk_layernorm = True
     config = get_mock_mla_config(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
@@ -334,16 +339,17 @@ def _run_functionality(
         recompute_mla_up_proj=recompute_mla_up_proj,
         apply_rope_fusion=apply_rope_fusion,
         rope_type=rope_type,
+        qk_layernorm=qk_layernorm,
     )
     absorbed_submodules = get_absorbed_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
-        qk_layernorm=True,
+        qk_layernorm=qk_layernorm,
         rms_norm=True,
         combined_kv_up_projection=combined_kv_up_projection,
     )
     standard_submodules = get_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
-        qk_layernorm=True,
+        qk_layernorm=qk_layernorm,
         rms_norm=True,
     )
     absorbed_mla = AbsorbedMLASelfAttention(

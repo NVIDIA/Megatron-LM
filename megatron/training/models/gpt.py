@@ -55,7 +55,12 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
-    if transformer_cfg.transformer_impl == "inference_optimized":
+    if (
+        transformer_cfg.transformer_impl == "inference_optimized"
+        and transformer_cfg.num_moe_experts is None
+    ):
+        # MoE models fall through to the shared num_moe_experts branch below;
+        # get_gpt_decoder_block_spec already handles the inference_optimized impl.
         return get_gpt_layer_with_inference_spec(
             transformer_cfg.qk_layernorm,
             transformer_cfg.multi_latent_attention,
@@ -175,6 +180,7 @@ class GPTModelConfig(ModelConfig):
     ### GPT Model initialization ###
     seq_length: int = 1024
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     position_embedding_type: Literal["learned_absolute", "rope", "mrope", "yarn", "none"] = (
@@ -316,7 +322,12 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        mtp_spec = mtp_block_spec(self._model_config, transformer_layer_spec, vp_stage=vp_stage)
+        mtp_spec = mtp_block_spec(
+            self._model_config,
+            transformer_layer_spec,
+            vp_stage=vp_stage,
+            pp_rank=pg_collection.pp.rank(),
+        )
 
         # override spec with local backend if configured
         if self._model_config.attention_backend == AttnBackend.local:
@@ -343,6 +354,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             vocab_size=padded_vocab_size,
             max_sequence_length=self._model_config.seq_length,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,
@@ -374,6 +386,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool = True,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -390,6 +403,9 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
                 parameters for the layer-wise distributed optimizer.
+            use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+                controls whether to compute and supply a shard-aligned param layout to DDP.
 
         Returns:
             List of model stages.
@@ -410,6 +426,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
@@ -426,6 +443,7 @@ def mtp_block_spec(
     config: "GPTModelConfig",
     transformer_layer_spec: ModuleSpec | TransformerBlockSubmodules,
     vp_stage: int | None = None,
+    pp_rank: int | None = None,
 ) -> ModuleSpec | None:
     """Create MTP block spec if model has MTP layers.
 
@@ -433,6 +451,7 @@ def mtp_block_spec(
         config: Full model configuration.
         transformer_layer_spec: Resolved decoder layer or block specification.
         vp_stage: Optional virtual-pipeline stage.
+        pp_rank: Pipeline rank from the model process group.
 
     Returns:
         ModuleSpec: The MTP module specification
@@ -453,7 +472,11 @@ def mtp_block_spec(
             spec = transformer_layer_spec
 
         return get_gpt_mtp_block_spec(
-            transformer_cfg, spec, use_transformer_engine=use_te, vp_stage=vp_stage
+            transformer_cfg,
+            spec,
+            use_transformer_engine=use_te,
+            vp_stage=vp_stage,
+            pp_rank=pp_rank,
         )
     else:
         return None

@@ -13,11 +13,54 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import MHCCheckpointManager
+    from megatron.core.tensor_parallel.random import (
+        CheckpointWithoutOutputManager,
+        MHCCheckpointManager,
+    )
     from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
+
+
+def build_mhc_recompute_layer_plan(
+    num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
+) -> Tuple[list[Optional['CheckpointWithoutOutputManager']], list[bool]]:
+    """Build per-layer mHC recompute managers and recompute-block end markers."""
+    from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+
+    layer_managers: list[Optional['CheckpointWithoutOutputManager']] = [None] * num_layers
+    is_recompute_block_end = [False] * num_layers
+
+    if not use_mhc_recompute or num_layers == 0:
+        return layer_managers, is_recompute_block_end
+
+    mhc_manager = CheckpointWithoutOutputManager()
+    for layer_index in range(num_layers):
+        is_last_in_transformer_block = layer_index == num_layers - 1
+        is_last_in_recompute_block = is_last_in_transformer_block
+        if mhc_recompute_layer_num is not None:
+            is_last_in_recompute_block = is_last_in_transformer_block or (
+                (layer_index + 1) % mhc_recompute_layer_num == 0
+            )
+
+        layer_managers[layer_index] = mhc_manager
+        is_recompute_block_end[layer_index] = is_last_in_recompute_block
+
+        if is_last_in_recompute_block and not is_last_in_transformer_block:
+            mhc_manager = CheckpointWithoutOutputManager()
+
+    return layer_managers, is_recompute_block_end
+
+
+def finalize_mhc_recompute_layer(
+    mhc_manager: Optional['CheckpointWithoutOutputManager'],
+    hidden_states: Tensor,
+    is_last_in_recompute_block: bool,
+) -> None:
+    """Finalize mHC recompute state when the current recompute block ends."""
+    if mhc_manager is not None and is_last_in_recompute_block:
+        mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -305,7 +348,10 @@ class HyperConnectionModule(MegatronModule):
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
-        nn.init.xavier_uniform_(self.mapping_proj.weight)
+        # Honor the mcore convention: skip weight init when the caller will load a
+        # checkpoint over these parameters anyway (e.g. meta-device construction).
+        if self.config.perform_initialization:
+            nn.init.xavier_uniform_(self.mapping_proj.weight)
 
         # Set sequence_parallel attribute on parameters for gradient synchronization
         # across TP ranks when sequence_parallel is enabled.
@@ -553,7 +599,8 @@ class HyperConnectionModule(MegatronModule):
         hidden_states: Tensor,
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         output_slot: Optional['MHCRecomputeArenaSlot'] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        return_residual: bool = True,
+    ) -> Tuple[Tensor, ...]:
         """
         Full mHC forward pass.
 
@@ -569,11 +616,13 @@ class HyperConnectionModule(MegatronModule):
             output_slot: Optional arena slot used as the aggregate kernel's
                 caller-owned output for both forward and recompute. A differing
                 slot dtype is handled by casting the aggregate into the slot.
+            return_residual: Return the residual branch alongside the other three
+                outputs. Defaults to True because fused_h_res_h_post_bda consumes
+                the residual branch created by BroadcastTensorFused. Legacy
+                3-tuple callers pass False.
 
         Returns:
-            A 4-tuple. This is an intentional breaking change from the older
-            3-tuple API because fused_h_res_h_post_bda consumes the residual
-            branch created by BroadcastTensorFused.
+            A 4-tuple by default; the leading 3-tuple when return_residual=False.
             aggregated: [s, b, C] - aggregated input for layer computation
             h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
             h_post: [s, b, n] - expansion weights
@@ -581,13 +630,14 @@ class HyperConnectionModule(MegatronModule):
         """
 
         if mhc_recompute_manager is not None:
-            return self._forward_with_checkpoint(
+            result = self._forward_with_checkpoint(
                 hidden_states, mhc_recompute_manager, output_slot=output_slot
             )
         else:
             if output_slot is not None:
                 raise ValueError("fixed mHC outputs require an mHC recompute manager")
-            return self._forward_normal(hidden_states)
+            result = self._forward_normal(hidden_states)
+        return result if return_residual else result[:3]
 
     def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """

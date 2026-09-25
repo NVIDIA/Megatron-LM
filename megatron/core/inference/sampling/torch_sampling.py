@@ -7,10 +7,15 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.sampling.base import Sampling
+from megatron.core.inference.sampling_params import (
+    MIN_SAMPLING_TEMPERATURE,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 
 
 class TorchSampling(Sampling):
-    """Sampling via bucketed `torch.multinomial`.
+    """Sampling via a bucketed Gumbel-max (exponential-race) draw.
 
     Groups requests into unique buckets by `(temperature, top_k, top_p)` for separate launches.
     """
@@ -29,7 +34,7 @@ class TorchSampling(Sampling):
     def _modify_logits_for_top_p_filtering(logits: Tensor, top_p: float) -> None:
         """In-place: set logits outside the top-p (nucleus) set to -inf."""
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        cumulative_probs = sorted_logits.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
 
         filter_ = cumulative_probs > top_p
         # Clone needed: filter_[:, 1:] and filter_[:, :-1] are overlapping views;
@@ -54,18 +59,18 @@ class TorchSampling(Sampling):
         Returns a new tensor (input unmodified). Shared by `sample_from_logits` and
         `log_probs_kernel` so sampling and processed log-probs apply the same filter.
         """
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
-        assert top_p <= 1.0, "top-p should be in (0,1]"
+        top_p_active = not is_no_op_top_p(top_p)
+        assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
         # Clone needed: .div_() and the filters below modify in-place.
         last_token_logits = last_token_logits.clone()
         if temperature != 1.0:
-            last_token_logits.div_(temperature)
-        if top_k >= 1:
+            last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
+        if not is_no_op_top_k(top_k):
             assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
             if vocab_size:
                 assert top_k < vocab_size, "top-k is larger than vocab size."
             TorchSampling._modify_logits_for_top_k_filtering(last_token_logits, top_k)
-        elif top_p > 0.0:
+        elif top_p_active:
             TorchSampling._modify_logits_for_top_p_filtering(last_token_logits, top_p)
         return last_token_logits
 
@@ -87,7 +92,7 @@ class TorchSampling(Sampling):
             last_token_logits: Logits of shape `[batch_size, vocab_size]`.
             temperature: Temperature scaling factor.
             top_k: Top-k filtering value (0 = disabled).
-            top_p: Top-p (nucleus) filtering value (0.0 = disabled).
+            top_p: Top-p (nucleus) filtering value (0.0 or >= 1.0 = disabled).
             generator: RNG used by `torch.multinomial`.
             vocab_size: When provided, asserts `top_k < vocab_size` and clamps the
                 sampled ids to `[0, vocab_size - 1]`.
@@ -97,16 +102,27 @@ class TorchSampling(Sampling):
         """
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
-        assert top_p <= 1.0, "top-p should be in (0,1]"
+        assert not (
+            top_k > 0 and not is_no_op_top_p(top_p)
+        ), "Cannot have top-p and top-k both active"
         if top_k == 1:
             return torch.argmax(last_token_logits, dim=-1)
 
         filtered = TorchSampling.filter_logits(
             last_token_logits, temperature, top_k, top_p, vocab_size=vocab_size
         )
-        probabilities = filtered.softmax(dim=-1)
-        sampled = torch.multinomial(probabilities, num_samples=1, generator=generator).view(-1)
+        probabilities = filtered.softmax(dim=-1, dtype=torch.float32)
+        # Gumbel-max in exponential form: draw q ~ Exp(1) per vocabulary entry and
+        # take argmax(p / q). Distributionally identical to `torch.multinomial`,
+        # but it never forms a cumulative sum, so the low-probability tail is not
+        # eroded by the rounding an inverse-CDF walk accumulates across a 100k+
+        # vocabulary. Matches vLLM's sampler:
+        # https://github.com/vllm-project/vllm/blob/7702ee87dba0d8eed7f201e77a0a6613aac738a8/vllm/v1/sample/ops/topk_topp_sampler.py#L464
+        # which keeps the two engines' sampling paths aligned; vLLM also uses it to
+        # avoid the CPU-GPU sync that `torch.multinomial` incurs.
+        q = torch.empty_like(probabilities)
+        q.exponential_(generator=generator)
+        sampled = probabilities.div_(q).argmax(dim=-1).view(-1)
 
         if vocab_size:
             sampled = torch.clamp(sampled, min=0, max=(vocab_size - 1))
@@ -114,14 +130,34 @@ class TorchSampling(Sampling):
         return sampled
 
     def log_probs_kernel(
-        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
     ) -> Tensor:
         """Per-row log-probs of the temperature, top-k/top-p sampling distribution.
 
         Buckets rows by identical (temperature, top_k, top_p) and reuses `filter_logits`
-        (the same filter as `sample_from_logits`) so log-probs match how this backend
-        samples. `temperature`/`top_k`/`top_p` are per-row `[num_rows]` tensors.
+        (the same filter as `sample_from_logits`) so log-probs match how this backend samples.
+
+        Args:
+            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
+            context: Active dynamic inference context providing CPU sampling metadata.
+            token_to_request_index (Optional[Tensor]): Optional CPU mapping from
+                each logits row to its request index.
+
+        Returns:
+            Tensor: Per-row float32 log probabilities for the processed distribution.
         """
+        active_request_count = context.total_request_count - context.paused_request_count
+        metadata = context.active_request_metadata
+        if token_to_request_index is None:
+            temperature = metadata["temperature"][:active_request_count]
+            top_k = metadata["top_k"][:active_request_count]
+            top_p = metadata["top_p"][:active_request_count]
+        else:
+            assert not token_to_request_index.is_cuda
+            temperature = metadata["temperature"][:active_request_count][token_to_request_index]
+            top_k = metadata["top_k"][:active_request_count][token_to_request_index]
+            top_p = metadata["top_p"][:active_request_count][token_to_request_index]
+
         temps = temperature.tolist()
         top_ks = top_k.tolist()
         top_ps = top_p.tolist()
@@ -129,13 +165,17 @@ class TorchSampling(Sampling):
         for row, key in enumerate(zip(temps, top_ks, top_ps)):
             buckets[key].append(row)
 
-        log_probs = torch.empty_like(logits)
+        # fp32: `torch.log_softmax(..., dtype=torch.float32)` below is computed in
+        # fp32 precisely to avoid the tail erosion bf16/fp16 causes on wide vocabularies;
+        # allocating this buffer in `logits.dtype` would silently downcast the result
+        # back on assignment and defeat that precision fix.
+        log_probs = torch.empty_like(logits, dtype=torch.float32)
         for (t, k, p), rows in buckets.items():
             idx = torch.tensor(rows, device=logits.device, dtype=torch.long)
             filtered = TorchSampling.filter_logits(
                 logits[idx], float(t), int(k), float(p), vocab_size=self._vocab_size
             )
-            log_probs[idx] = torch.log_softmax(filtered, dim=-1)
+            log_probs[idx] = torch.log_softmax(filtered, dim=-1, dtype=torch.float32)
         return log_probs
 
     def sample_kernel(
@@ -144,28 +184,34 @@ class TorchSampling(Sampling):
         n: int,
         context,
         *,
+        no_top_k: bool,
+        no_top_p: bool,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
+        output: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
-        """Bucket active requests by `(temperature, top_k, top_p)` and sample each bucket.
+        """Bucket active requests by sampling parameters and sample each bucket.
 
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
+            no_top_k, no_top_p: Batch-level dispatch flags (part of the shared kernel
+                contract); ignored here since the exact per-bucket sort already handles
+                any top-k / top-p combination.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
+            output: Optional caller-owned destination tensor of shape `[n]`.
             eager: Accepted for API symmetry; ignored (TorchSampling has no graph wrapper).
             cache_key: Accepted for API symmetry; ignored.
 
         Returns:
-            Sampled token ids of shape `[n]`.
+            Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
-        # CudaGraphManager consumes these args, if it exists.
-        del eager, cache_key
+        del eager, cache_key, no_top_k, no_top_p
 
         # Group active requests into sampling buckets by (temperature, top_k, top_p).
         active_request_count = context.total_request_count - context.paused_request_count
@@ -187,7 +233,8 @@ class TorchSampling(Sampling):
         if gather_indices is not None:
             logits = logits[gather_indices[:n], :]
 
-        output = torch.empty(n, device=logits.device, dtype=torch.int64)
+        if output is None:
+            output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
         for idx_tensor, (_, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):

@@ -66,6 +66,14 @@ inputs:
     description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
     required: false
     default: ""
+  unit_testmon_mode:
+    description: "Unit-test mode: full, enforce (restore only), or baseline (main producer only)."
+    required: false
+    default: "full"
+  unit_testmon_target_branch:
+    description: "Baseline source branch. Selective unit tests currently support main only."
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -74,7 +82,7 @@ runs:
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
 
     - name: Checkout repository
-      uses: actions/checkout@v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       with:
         ref: ${{ inputs.sha }}
 
@@ -91,7 +99,7 @@ runs:
         sudo chown -R $(whoami) /home/runner/ 2>/dev/null || true
 
     - name: Setup python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
       with:
         python-version: '3.12'
 
@@ -112,6 +120,113 @@ runs:
           echo "uv install attempt $i failed, retrying..."
           sleep 10
         done
+
+    - name: Validate unit Testmon baseline producer
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'baseline'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        SOURCE_REPOSITORY: ${{ github.repository }}
+        SOURCE_REF: ${{ github.ref }}
+        SOURCE_EVENT: ${{ github.event_name }}
+        SOURCE_SHA: ${{ github.sha }}
+        REQUESTED_SHA: ${{ inputs.sha }}
+        TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
+        SUITE_TAG: ${{ inputs.tag }}
+      run: |
+        [[ "$SOURCE_REPOSITORY" == "NVIDIA/Megatron-LM" && "$SOURCE_REF" == "refs/heads/main" ]]
+        [[ "$SOURCE_EVENT" == "schedule" || "$SOURCE_EVENT" == "workflow_dispatch" || "$SOURCE_EVENT" == "push" ]]
+        [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
+        [[ "$REQUESTED_SHA" == "$SOURCE_SHA" && "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
+
+    - name: Pull container
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        echo "::group::Pull container"
+        docker pull ${{ inputs.container-image }}
+        echo "::endgroup::"
+
+    - name: Compute unit Testmon cache identity
+      id: unit-testmon-identity
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode != 'full'
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+        TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
+        SUITE_TAG: ${{ inputs.tag }}
+        CONTAINER_IMAGE: ${{ inputs.container-image }}
+      run: |
+        [[ "$TARGET_BRANCH" == "main" && "$SUITE_TAG" == "latest" ]]
+        sudo rm -rf -- assets_dir/testmon
+        IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE") || IMAGE_ID=unknown
+        python tests/unit_tests/testmon_cache.py identity \
+          --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" --image-id "$IMAGE_ID" \
+          --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
+
+    # Only main publishes this namespace. Synthetic PR pushes can read caches
+    # from the default branch; the sentinel primary key is never saved.
+    - name: Restore unit Testmon baseline
+      id: restore-unit-testmon
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      continue-on-error: true
+      with:
+        path: assets_dir/testmon
+        key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}
+
+    - name: Resolve unit Testmon mode
+      id: unit-testmon
+      if: inputs.is_unit_test == 'true'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
+        IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
+        RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
+        MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}
+      run: |
+        FALLBACK_REASON=""
+        case "$REQUESTED_MODE" in
+          full)
+            EFFECTIVE_MODE=full
+            ;;
+          baseline)
+            [[ "$IDENTITY_OUTCOME" == "success" ]]
+            EFFECTIVE_MODE=baseline
+            ;;
+          enforce)
+            if [[ "$IDENTITY_OUTCOME" == "success" && "$RESTORE_OUTCOME" == "success" && -n "$MATCHED_KEY" ]] \
+              && python tests/unit_tests/testmon_cache.py validate \
+                --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
+                --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"; then
+              EFFECTIVE_MODE=enforce
+            else
+              EFFECTIVE_MODE=full
+              FALLBACK_REASON="no valid compatible main baseline; running the full bucket without recording or saving"
+              echo "::notice::Testmon baseline unavailable or invalid; running the full unit-test bucket."
+            fi
+            ;;
+          *)
+            echo "Unsupported unit_testmon_mode: $REQUESTED_MODE" >&2
+            exit 2
+            ;;
+        esac
+        mkdir -p assets_dir/testmon
+        : > assets_dir/testmon/summary.md
+        echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
+        {
+          echo "### Unit Testmon"
+          echo
+          echo "- Requested mode: $REQUESTED_MODE"
+          echo "- Effective mode: $EFFECTIVE_MODE"
+          if [[ "$REQUESTED_MODE" == "enforce" ]]; then
+            echo "- Restored cache key: ${MATCHED_KEY:-none}"
+          fi
+          if [[ -n "$FALLBACK_REASON" ]]; then
+            echo "- Fallback: $FALLBACK_REASON"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
@@ -137,6 +252,7 @@ runs:
           --environment dev \
           --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \
+          --unit-testmon-mode "${{ steps.unit-testmon.outputs.mode }}" \
           --container-image ${{ inputs.container-image }} \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
@@ -195,13 +311,6 @@ runs:
       id: timeout_in_seconds
       run: echo "main=$(( ${{ inputs.timeout }} * 60 ))" | tee -a "$GITHUB_OUTPUT"
 
-    - name: Pull container
-      shell: bash -x -e -u -o pipefail {0}
-      run: |
-        echo "::group::Pull container"
-        docker pull ${{ inputs.container-image }}
-        echo "::endgroup::"
-
     - name: Run main script
       shell: bash -x -e -u -o pipefail {0}
       id: run-main-script
@@ -220,18 +329,77 @@ runs:
         echo "::endgroup::"
         exit $EXIT_CODE
 
+    - name: Prepare unit Testmon baseline cache
+      id: prepare-unit-testmon-cache
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.run-main-script.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        CACHE_DIR: assets_dir/testmon
+        SOURCE_SHA: ${{ github.sha }}
+        GENERATION: ${{ github.run_id }}-${{ github.run_attempt }}
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+        python tests/unit_tests/testmon_cache.py finalize \
+          --cache-dir "$CACHE_DIR" --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
+          --source-sha "$SOURCE_SHA" --generation "$GENERATION"
+
+    - name: Save unit Testmon baseline
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success' && github.repository == 'NVIDIA/Megatron-LM' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+      uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: assets_dir/testmon
+        key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+
+    # cache/save warns on upload failures, so verify publication explicitly.
+    - name: Verify unit Testmon cache publication
+      id: verify-unit-testmon-cache
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success'
+      uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: assets_dir/testmon
+        key: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+        lookup-only: true
+        fail-on-cache-miss: true
+
+    - name: Confirm unit Testmon cache generation
+      id: confirm-unit-testmon-cache
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'baseline' && steps.prepare-unit-testmon-cache.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        EXPECTED_KEY: ${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+        MATCHED_KEY: ${{ steps.verify-unit-testmon-cache.outputs.cache-matched-key }}
+        CACHE_HIT: ${{ steps.verify-unit-testmon-cache.outputs.cache-hit }}
+      run: |
+        [[ "$CACHE_HIT" == "true" && "$MATCHED_KEY" == "$EXPECTED_KEY" ]]
+        echo "- Published cache: $MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"
+        python tests/unit_tests/testmon_cache.py validate \
+          --cache-dir assets_dir/testmon --identity "$RUNNER_TEMP/unit-testmon-identity.json" \
+          --matched-key "$MATCHED_KEY" | tee -a "$GITHUB_STEP_SUMMARY"
+
+    - name: Publish unit Testmon summary
+      if: always() && inputs.is_unit_test == 'true'
+      shell: bash
+      env:
+        SUMMARY_FILE: assets_dir/testmon/summary.md
+      run: |
+        if [[ -f "$SUMMARY_FILE" ]]; then
+          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     - name: Check result
       id: check
       shell: bash -e -u -o pipefail {0}
       if: always()
       env:
         IS_UNIT_TEST: ${{ inputs.is_unit_test == 'true' }}
+        TESTMON_MODE: ${{ steps.unit-testmon.outputs.mode }}
+        CACHE_PUBLICATION: ${{ steps.confirm-unit-testmon-cache.outcome }}
         MAIN_CONCLUSION: ${{ steps.run-main-script.conclusion }}
         MAIN_EXIT_CODE: ${{ steps.run-main-script.outputs.exit_code }}
       run: |
         logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
-        if [[ "$IS_UNIT_TEST" == "true" ]]; then
+        if [[ "$IS_UNIT_TEST" == "true" && "$TESTMON_MODE" != "baseline" && -f .coverage ]]; then
           coverage_report=coverage-unit-test-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         else
           coverage_report=none
@@ -243,6 +411,10 @@ runs:
           IS_SUCCESS=true
         else
           IS_SUCCESS=false
+        fi
+        if [[ "$TESTMON_MODE" == "baseline" && "$CACHE_PUBLICATION" != "success" ]]; then
+          IS_SUCCESS=false
+          EXIT_CODE="Testmon cache publication failed"
         fi
 
         if [[ "$IS_SUCCESS" == "false" && "${{ inputs.is-optional }}" == "true" ]]; then
@@ -293,8 +465,10 @@ runs:
         fi
 
     - name: Upload coverage
-      uses: actions/upload-artifact@v6
+      id: upload-coverage
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: ${{ always() && steps.check.outputs.coverage_report != 'none' }}
+      continue-on-error: true
       with:
         name: ${{ steps.check.outputs.coverage_report }}
         path: |
@@ -302,9 +476,24 @@ runs:
           .coverage
         include-hidden-files: true
 
+    - name: Back off after coverage upload failure
+      if: ${{ always() && steps.upload-coverage.outcome == 'failure' }}
+      shell: bash
+      run: sleep 10
+
+    - name: Retry coverage upload
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      if: ${{ always() && steps.upload-coverage.outcome == 'failure' }}
+      with:
+        name: ${{ steps.check.outputs.coverage_report }}-retry
+        path: |
+          coverage.xml
+          .coverage
+        include-hidden-files: true
+
     - name: Upload logs
       id: upload-logs
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: always()
       continue-on-error: true
       with:
@@ -318,7 +507,7 @@ runs:
       run: sleep 10
 
     - name: Retry log upload
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
       if: ${{ always() && steps.upload-logs.outcome == 'failure' }}
       with:
         name: ${{ steps.check.outputs.logs_report }}-retry

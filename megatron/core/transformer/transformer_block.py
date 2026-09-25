@@ -22,6 +22,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
@@ -288,6 +289,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 
@@ -304,6 +306,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.name = name
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -337,6 +340,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config._cpu_offloading_context = None
 
         self.num_residual_streams = config.num_residual_streams
+        self.mhc_num_residual_streams = config.mhc_num_residual_streams
+        self.mhc_recompute_enabled = (
+            config.enable_mhc_connections
+            and config.recompute_granularity == 'selective'
+            and 'mhc' in config.recompute_modules
+        )
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -369,12 +378,34 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 quantization_context = nullcontext()
 
             with quantization_context:
+                # Pass names so per-module recipes choose storage before TE allocates
+                # parameters. GPTModel's later finish_init() sets quantization overrides
+                # but does not replace existing weights: under global MXFP8 storage,
+                # even BF16-selected modules would otherwise get MXFP8 parameters.
+                # Loading a BF16 checkpoint into those parameters would quantize its
+                # values; converting back to BF16 cannot recover the lost precision.
+                # HybridStack already passes names during construction. Keep unnamed
+                # custom layer specs unchanged by omitting the extra keyword argument.
+                layer_kwargs = (
+                    {"name": f"{self.name}.layers.{layer_number - 1}"}
+                    if self.name is not None
+                    else {}
+                )
                 module = build_module(
                     layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    **layer_kwargs,
+                )
+            if layer_config.enable_mhc_connections and not getattr(
+                module, "supports_mhc_connections", False
+            ):
+                raise ValueError(
+                    f"{type(module).__name__} does not implement mHC residual streams. Build "
+                    "TransformerBlock with HyperConnectionTransformerLayer when "
+                    "enable_mhc_connections=True."
                 )
             return module
 
@@ -924,6 +955,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config, self.vp_stage, get_pg_rank(pp_group)
         )
 
+        # Unwraps, makes viewless, and expands the mHC residual streams on the first PP stage.
         hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
         if self.config.sequence_parallel:
@@ -953,14 +985,20 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_inner_quantization_context = False
             outer_quantization_context = nullcontext()
 
-        # Determine if MHC recompute should be used
-        # Only enable when: training mode AND hyper connections AND 'mhc' in recompute_modules
-        use_mhc_recompute = (
-            self.training
-            and self.config.enable_hyper_connections
-            and self.config.recompute_granularity == 'selective'
-            and "mhc" in self.config.recompute_modules
-        )
+        # Determine if MHC recompute should be used.
+        # Managers retain per-forward checkpoint state, so allocate them for each training pass.
+        use_mhc_recompute = self.training and self.mhc_recompute_enabled
+        if use_mhc_recompute and len(extract_layer_indices) > 0:
+            # mHC recompute discards every checkpoint output in the block and restores them
+            # from a single hook on the block-end tensor. A loss taken on an extracted
+            # mid-block activation can reach those checkpoints before that hook fires and
+            # would read zero-sized storage.
+            raise NotImplementedError(
+                "'mhc' in recompute_modules is not supported together with "
+                "extract_layer_indices. The unified mHC recompute hook is registered on the "
+                "recompute-block boundary, so gradients entering from an extracted "
+                "intermediate layer can reach discarded activations before they are restored."
+            )
         mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
             use_mhc_recompute
         )
@@ -991,6 +1029,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states = checkpointed_result
             else:
                 for l_no, layer in enumerate(self.layers):
+                    residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -1012,6 +1051,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
+                    # Only thread mhc_recompute_manager when the layer is mHC and a
+                    # manager actually exists. Plain TransformerLayer (and its
+                    # MoETransformerLayer subclass) doesn't accept this kwarg, and
+                    # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
+                    extra_layer_kwargs = (
+                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
+                    )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -1029,7 +1075,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                             mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
+                            **extra_layer_kwargs,
                         )
+                    observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
@@ -1047,6 +1095,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
+        # Contracts the mHC residual streams on the stage owning the final layer norm, applies
+        # the final layer norm, and keeps a distinct output node for empty pipeline stages.
         hidden_states, mhc_multistream = self.postprocess_for_layer_schedule(
             hidden_states, extract_layer_indices=extract_layer_indices, return_mhc_multistream=True
         )

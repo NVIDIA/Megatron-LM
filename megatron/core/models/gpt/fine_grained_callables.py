@@ -13,7 +13,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -682,7 +682,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if checkpoint_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                        ckpt_manager=mhc_recompute_manager
+                        ckpt_manager=mhc_recompute_manager,
+                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual,
                     )
                     with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
@@ -697,13 +698,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
                 # the layernorm returns (normalized_output, residual). Unpack
                 # and use the fused residual for the downstream BDA connection.
-                if isinstance(pre_mlp_layernorm_output, tuple):
-                    if len(pre_mlp_layernorm_output) != 2:
-                        raise ValueError(
-                            f"When the output of pre_mlp_layernorm is a tuple, it is "
-                            f"expected to have 2 elements (output, residual), but "
-                            f"got {len(pre_mlp_layernorm_output)}"
-                        )
+                if layer._pre_mlp_layernorm_returns_residual:
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
                     if not is_mhc_layer:
                         residual = hidden_states
@@ -787,6 +782,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+
+        if enable_ncclep and layer.config.moe_ncclep_zero_copy:
+            # Insert an identity node as the sole consumer of the dispatch output, so the
+            # dispatch-backward gets the symm buffer instead of a non-symm AccumulateGrad clone.
+            # Must stay inside this node's graph segment (before the next node detaches it).
+            dispatched_tokens = StageDispatchBwdGrad.apply(dispatched_tokens, token_dispatcher)
 
         # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
         # passed to moe_forward within `layer_state` to avoid the free_input process

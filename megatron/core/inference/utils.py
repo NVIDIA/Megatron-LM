@@ -6,15 +6,44 @@ import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
 import torch
 
-from megatron.core.utils import get_model_config
+from megatron.core.utils import accepts_parameter, get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
+
+
+def detokenize_tokens(
+    tokenizer: Any, tokens: list[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+) -> str:
+    """Convert token IDs to text using the inference detokenization policy.
+
+    Args:
+        tokenizer: Tokenizer that supplies ``detokenize`` and optionally ``eod``.
+        tokens: Token IDs to detokenize.
+        remove_EOD: Remove trailing EOD tokens before detokenization.
+        skip_special_tokens: Pass special-token removal through when supported.
+
+    Returns:
+        The decoded text.
+    """
+    if not tokens:
+        return ""
+
+    if remove_EOD and getattr(tokenizer, "eod", None) is not None:
+        while tokens and tokens[-1] == tokenizer.eod:
+            tokens = tokens[:-1]
+    if not tokens:
+        return ""
+
+    if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
+        return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+    return tokenizer.detokenize(tokens)
 
 
 class InferenceMode:
@@ -26,6 +55,7 @@ class InferenceMode:
     """
 
     _is_active: bool = False
+    _use_bounded_mxfp8_rows: bool = False
 
     @classmethod
     def is_active(cls) -> bool:
@@ -34,13 +64,25 @@ class InferenceMode:
 
     @classmethod
     def set_active(cls) -> None:
-        """Mark the inference engine as active. Idempotent."""
+        """Mark the inference engine active and reset its phase to the safe default."""
         cls._is_active = True
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    def set_bounded_mxfp8_rows(cls, enabled: bool) -> None:
+        """Select bounded FlashInfer MXFP8 rows for the current inference step."""
+        cls._use_bounded_mxfp8_rows = enabled
+
+    @classmethod
+    def use_bounded_mxfp8_rows(cls) -> bool:
+        """Return whether the current step may use the configured bounded row prefix."""
+        return cls._use_bounded_mxfp8_rows
 
     @classmethod
     def unset_active(cls) -> None:
         """Mark the inference engine as inactive. Idempotent."""
         cls._is_active = False
+        cls._use_bounded_mxfp8_rows = False
 
     @classmethod
     @contextlib.contextmanager

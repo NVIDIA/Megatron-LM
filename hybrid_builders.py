@@ -72,6 +72,8 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         # wires the DSv4 CompressedSparseAttention into the 'D' layer per config).
         if not isinstance(hybrid_stack_spec, ModuleSpec) and callable(hybrid_stack_spec):
             hybrid_stack_spec = hybrid_stack_spec(config)
+        if not isinstance(hybrid_stack_spec, ModuleSpec):
+            raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 
@@ -84,6 +86,7 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        logit_dtype=getattr(args, 'logit_dtype', None),
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,

@@ -986,3 +986,40 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()
+
+
+# NOTE (nightly sync 24_09_2026): main-side counterpart of
+# test_dcp_dataloader_yields_microbatches_for_scheduler above, covering the
+# dp_balanced scheduler instead of default_dynamic_cp.
+def test_packing_scheduler_dataloader_yields_microbatches():
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs = 2
+        num_microbatches = 3
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        n = gbs * 2
+        cfg = _make_config(tok, seq_length=64, dp=dp, cp=1)
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        set_args(
+            _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
+        )
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # The packing scheduler calls next(data_iterator) num_microbatches times;
+        # each loader step must therefore be one local microbatch, not all
+        # local samples from the global batch.
+        assert isinstance(batch, list)
+        assert len(batch) == mbs
+        assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()

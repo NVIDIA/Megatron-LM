@@ -7,6 +7,7 @@ from collections.abc import Iterator
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,6 +39,9 @@ def distributed_setup() -> Iterator[DistributedSetup]:
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        # is_symm_mem_tensor() marks the current symmetric-memory backend as in use,
+        # even for ordinary tensors, so select NCCL before any DBuffer test calls it.
+        symm_mem.set_backend("NCCL")
     else:
         device = torch.device("cpu")
 

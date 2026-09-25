@@ -14,7 +14,7 @@ import torch
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
-from megatron.core._rank_utils import safe_get_world_size
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
@@ -258,6 +258,24 @@ def test_safely_set_viewless_tensor_data():
     new_data_tensor = torch.tensor(np.random.rand(3, 4))
     util.safely_set_viewless_tensor_data(tensor, new_data_tensor)
     assert torch.equal(tensor, new_data_tensor)
+
+
+def test_copy_parameter_metadata_copies_public_attributes_only():
+    source = torch.nn.Parameter(torch.ones(1))
+    destination = torch.nn.Parameter(torch.zeros(1))
+    process_group = object()
+
+    source.tensor_model_parallel = True
+    source.group = process_group
+    source.future_planner_metadata = "preserved without a name allowlist"
+    source._quantizer = "tensor-subclass implementation detail"
+
+    util.copy_parameter_metadata(destination, source)
+
+    assert destination.tensor_model_parallel is True
+    assert destination.group is process_group
+    assert destination.future_planner_metadata == "preserved without a name allowlist"
+    assert not hasattr(destination, "_quantizer")
 
 
 def test_assert_viewless_tensor():
@@ -671,6 +689,30 @@ class TestGetWorldSizeSafe:
 
         with pytest.raises(ValueError):
             safe_get_world_size()
+
+
+class TestGetRankSafe:
+    """Test safe_get_rank function."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"RANK": "9"})
+    def test_uninitialized_torch_distributed_with_rank_env_var(self, mock_is_initialized):
+        """Test safe_get_rank when torch.distributed is not initialized but RANK env var exists."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_rank()
+
+        assert result == 9
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"RANK": "invalid"})
+    def test_invalid_rank_env_var_should_raise_value_error(self, mock_is_initialized):
+        """Test safe_get_rank with invalid RANK environment variable."""
+        mock_is_initialized.return_value = False
+
+        with pytest.raises(ValueError):
+            safe_get_rank()
 
 
 class TestGetLocalRankPreinit:

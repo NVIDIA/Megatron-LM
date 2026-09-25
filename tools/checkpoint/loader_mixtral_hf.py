@@ -9,7 +9,7 @@ import torch
 import transformers
 from tqdm import tqdm
 
-from tools.checkpoint.utils import _ConverterFakeProcessGroup
+from tools.checkpoint.utils import initialize_checkpoint_converter_fake_process_groups
 
 
 def add_arguments(parser):
@@ -263,12 +263,13 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
-
-    # For backward compatibility during local parallel states refactoring
-    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
-    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
-    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+    
+    initialize_checkpoint_converter_fake_process_groups(
+        mpu,
+        margs.tensor_model_parallel_size,
+        margs.pipeline_model_parallel_size,
+        margs.expert_model_parallel_size,
+    )
 
     # Metadata.
     md = types.SimpleNamespace()
@@ -286,6 +287,7 @@ def _load_checkpoint(queue, args):
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
     md.norm_has_bias = False
+    md.qkv_bias = False
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size

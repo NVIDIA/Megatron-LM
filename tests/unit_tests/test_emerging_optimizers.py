@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import os
 
 import pytest
@@ -10,12 +11,16 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import emerging_optimizers as eo_mod
+from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
+    _PROFILES,
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
     _get_qkv_split_shapes,
+    _select_tp_mode,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
@@ -27,9 +32,12 @@ from tests.unit_tests.test_utilities import Utils
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
     from emerging_optimizers.soap import SOAP
+
+    from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
 else:
     SOAP = None
     Lion = None
+    LayerShardedMuon = None
 
 # Skip all tests in this file for LTS versions or when emerging_optimizers is missing
 pytestmark = [
@@ -66,6 +74,123 @@ class Net(nn.Module):
 # ===========================================================================
 
 
+def test_select_tp_mode_flops_only_fallback():
+    """Without a hardware profile, select by FLOPs or the cross-domain fallback."""
+    assert (
+        _select_tp_mode(
+            m=8192,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=None,
+        )
+        == "distributed"
+    )
+    assert (
+        _select_tp_mode(
+            m=8192,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=True,
+            profile=None,
+        )
+        == "duplicated"
+    )
+
+
+def test_select_tp_mode_with_profile():
+    """A hardware profile selects different modes for tall and wide matrices."""
+    profile = _PROFILES["GB200"]
+
+    assert (
+        _select_tp_mode(
+            m=8192,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=profile,
+        )
+        == "distributed"
+    )
+    assert (
+        _select_tp_mode(
+            m=1024,
+            n=8192,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=profile,
+        )
+        == "duplicated"
+    )
+
+
+def test_select_tp_mode_syrk_changes_selection():
+    """SYRK halves the Gram-op cost differently per mode -- can flip the selected mode."""
+    assert (
+        _select_tp_mode(
+            m=640,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=False,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=None,
+        )
+        == "duplicated"
+    )
+    assert (
+        _select_tp_mode(
+            m=640,
+            n=1024,
+            group_size=8,
+            steps=5,
+            use_syrk=True,
+            elem_size=2,
+            communication_crosses_domain=False,
+            profile=None,
+        )
+        == "distributed"
+    )
+
+
+def test_resolve_tp_mode_caches(monkeypatch):
+    """Repeated resolution of the same shape invokes the cost model only once."""
+    call_count = 0
+
+    def mock_select_tp_mode(*_args, **_kwargs):
+        nonlocal call_count
+        call_count += 1
+        return "distributed"
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers._select_tp_mode", mock_select_tp_mode
+    )
+
+    optimizer = TensorParallelMuon(
+        params=[torch.nn.Parameter(torch.zeros(1))], tp_mode="auto", pg_collection=None
+    )
+
+    first = optimizer._resolve_tp_mode(4096, 1024, 8)
+    second = optimizer._resolve_tp_mode(4096, 1024, 8)
+
+    assert first == second == "distributed"
+    assert call_count == 1
+    assert list(optimizer._tp_mode_cache) == [(4096, 1024, 8)]
+
+
 def test_muon_qkv_split_shapes():
     config = TransformerConfig(
         num_layers=1, hidden_size=1024, num_attention_heads=16, num_query_groups=8
@@ -80,6 +205,233 @@ def test_muon_qkv_split_shapes():
 
     assert _get_qkv_split_shapes(config) == [128, 64, 64]
     assert _get_qkv_split_shapes(gated_config) == [128, 128, 64, 64]
+
+
+@pytest.mark.parametrize("tp_mode", ["duplicated", "blockwise"])
+@pytest.mark.parametrize("gtp_rank", [0, 1])
+def test_muon_optimizer_gtp_remat_pad_length_scale_correction(monkeypatch, tp_mode, gtp_rank):
+    """scaled_orthogonalize_fn_with_gtp_remat strips GTP_remat's dim-0 padding before
+    calling scaled_orthogonalize_fn (unmodified, GTP-agnostic) and restores it after."""
+    from types import SimpleNamespace
+
+    gtp_group = object()
+    pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+
+    # 6 true rows, padded to 8 and sharded across 2 ranks: rank 1's shard holds the 2 pad rows.
+    full_grad = torch.tensor(
+        [[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [0.0], [0.0]], device='cuda'
+    )
+    pad_length = 2
+    local_grad = full_grad[gtp_rank * 4 : (gtp_rank + 1) * 4].clone()
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = pad_length
+
+    optimizer = TensorParallelMuon(
+        params=[param], num_ns_steps=1, pg_collection=pg_collection, tp_mode=tp_mode
+    )
+
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: gtp_rank
+    )
+
+    def fake_all_gather(shards, _local_grad, _group):
+        shards[0].copy_(full_grad[:4])
+        shards[1].copy_(full_grad[4:])
+
+    monkeypatch.setattr(torch.distributed, "all_gather", fake_all_gather)
+
+    calls = []
+
+    def fake_orthogonalize(grad, tp_group, partition_dim=None, tp_mode_this_group=None):
+        calls.append((grad.clone(), tp_group, partition_dim))
+        return grad + 100
+
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn", fake_orthogonalize)
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(param, local_grad, None, None)
+
+    assert len(calls) == 1
+    seen_grad, _, _ = calls[0]
+
+    if tp_mode == "duplicated":
+        # Gathered tensor is uniform on every rank: strip 2, restore after.
+        stripped_full = full_grad[:6]
+        torch.testing.assert_close(seen_grad, stripped_full)
+        restored = torch.nn.functional.pad(stripped_full + 100, (0, 0, 0, 2))
+        expected = restored[gtp_rank * 4 : (gtp_rank + 1) * 4]
+    else:
+        # blockwise: only rank 1's local block contains padding.
+        if gtp_rank == 1:
+            stripped_local = local_grad[:2]
+            torch.testing.assert_close(seen_grad, stripped_local)
+            expected = torch.nn.functional.pad(stripped_local + 100, (0, 0, 0, 2))
+        else:
+            torch.testing.assert_close(seen_grad, local_grad)
+            expected = local_grad + 100
+
+    torch.testing.assert_close(result, expected)
+
+
+@pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
+def test_muon_optimizer_gtp_distributed_padding_uses_logical_scale_shape(monkeypatch, scale_mode):
+    """Distributed NS keeps aligned rows, but Muon scaling uses the logical matrix shape."""
+    from types import SimpleNamespace
+
+    from emerging_optimizers.orthogonalized_optimizers import get_muon_scale_factor
+
+    gtp_group = object()
+    pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+
+    # GTP2: local [4, 7] reconstructs physical [8, 7], with 2 padded rows -> logical [6, 7].
+    # Padding crosses the square boundary so spectral and shape_scaling change too;
+    # logical shape_scaling is clamped to 1 while the padded value is sqrt(8 / 7).
+    local_grad = torch.ones((4, 7), dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = 2
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        num_ns_steps=1,
+        scale_mode=scale_mode,
+        pg_collection=pg_collection,
+        tp_mode="distributed",
+    )
+
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: 2)
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.newton_schulz_tp",
+        lambda grad, **_kwargs: torch.ones_like(grad),
+    )
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(param, local_grad, None, None)
+
+    expected_scale = get_muon_scale_factor(6, 7, mode=scale_mode)
+    padded_scale = get_muon_scale_factor(8, 7, mode=scale_mode)
+    assert expected_scale != padded_scale
+    torch.testing.assert_close(result, torch.full_like(local_grad, expected_scale))
+
+
+@pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
+@pytest.mark.parametrize(
+    "partition_dim,tp_size,gtp_size,local_shape,pad_length,logical_shape",
+    [
+        pytest.param(1, 2, 4, (4, 4), 3, (13, 8), id="row-parallel"),
+        pytest.param(0, 4, 2, (4, 8), 3, (20, 8), id="column-parallel"),
+    ],
+)
+def test_muon_optimizer_tp_gtp_distributed_padding_uses_logical_scale_shape(
+    monkeypatch,
+    scale_mode,
+    partition_dim,
+    tp_size,
+    gtp_size,
+    local_shape,
+    pad_length,
+    logical_shape,
+):
+    """TP x GTP scaling removes padding once from each TP-local dim-0 slice."""
+    from types import SimpleNamespace
+
+    from emerging_optimizers.orthogonalized_optimizers import get_muon_scale_factor
+
+    tp_group, gtp_group = object(), object()
+    group_sizes = {tp_group: tp_size, gtp_group: gtp_size}
+    pg_collection = SimpleNamespace(
+        tp=tp_group, expt_tp=tp_group, gtp_remat=gtp_group, expt_gtp_remat=gtp_group
+    )
+
+    local_grad = torch.ones(local_shape, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = pad_length
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        num_ns_steps=1,
+        scale_mode=scale_mode,
+        pg_collection=pg_collection,
+        tp_mode="distributed",
+    )
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: group_sizes[group]
+    )
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(
+        optimizer,
+        "_all_gather_tensor",
+        lambda tensor, group, dim: torch.cat([tensor] * group_sizes[group], dim=dim),
+    )
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.newton_schulz_tp",
+        lambda grad, **_kwargs: torch.ones_like(grad),
+    )
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(
+        param, local_grad, tp_group, partition_dim
+    )
+
+    expected_scale = get_muon_scale_factor(*logical_shape, mode=scale_mode)
+    torch.testing.assert_close(result, torch.full_like(local_grad, expected_scale))
+
+
+@pytest.mark.parametrize("gtp_rank,expected_local_pad_length", [(0, 0), (1, 1), (2, 2), (3, 2)])
+def test_muon_optimizer_gtp_remat_blockwise_pad_spans_multiple_ranks(
+    monkeypatch, gtp_rank, expected_local_pad_length
+):
+    """pad_length can span multiple ranks' shards, not just the last rank's. Each rank must
+    strip only its own overlap; a fully-padding rank (true dim0 == 0) must skip
+    scaled_orthogonalize_fn entirely and return exact zero."""
+    from types import SimpleNamespace
+
+    gtp_group = object()
+    pg_collection = SimpleNamespace(gtp_remat=gtp_group, expt_gtp_remat=gtp_group)
+
+    # 4 ranks, shard_size=2, pad_length=5: ranks 2 and 3 are fully padding, rank 1 half.
+    gtp_remat_size = 4
+    shard_size = 2
+    pad_length = 5
+    local_grad = torch.full((shard_size, 1), 3.0, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.is_gtp_weight_remat = True
+    param.pad_length = pad_length
+
+    optimizer = TensorParallelMuon(
+        params=[param], num_ns_steps=1, pg_collection=pg_collection, tp_mode="blockwise"
+    )
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_size", lambda group: gtp_remat_size
+    )
+    monkeypatch.setattr(
+        "megatron.core.optimizer.emerging_optimizers.get_pg_rank", lambda group: gtp_rank
+    )
+
+    calls = []
+
+    def fake_orthogonalize(grad, tp_group, partition_dim=None, tp_mode_this_group=None):
+        calls.append(grad.clone())
+        return grad  # identity: makes the strip/restore round-trip directly checkable
+
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn", fake_orthogonalize)
+
+    result = optimizer.scaled_orthogonalize_fn_with_gtp_remat(param, local_grad, None, None)
+
+    true_dim0 = shard_size - expected_local_pad_length
+    if true_dim0 <= 0:
+        assert calls == []
+        torch.testing.assert_close(result, torch.zeros_like(local_grad))
+    else:
+        assert len(calls) == 1
+        torch.testing.assert_close(calls[0], local_grad[:true_dim0])
+        expected = torch.nn.functional.pad(
+            local_grad[:true_dim0], (0, 0, 0, expected_local_pad_length)
+        )
+        torch.testing.assert_close(result, expected)
 
 
 def test_muon_optimizer_smoke():
@@ -141,6 +493,98 @@ def test_muon_optimizer_smoke():
 
     # Load state dict should not raise error
     optimizer.load_state_dict(state_dict)
+
+
+# ---------------------------------------------------------------------------
+# Registry dispatch for muon_tp_mode='layer_sharded' (LayerShardedMuon)
+# ---------------------------------------------------------------------------
+# Regression coverage for kwargs pollution across registry entries: the layer-sharding
+# branch must live ONLY on the ``muon`` entry's dispatcher (_muon_registry_config_to_kwargs),
+# never in the shared _muon_config_to_kwargs that adaptive_muon layers its own kwargs on.
+# When the branch leaked into the shared helper, ``--optimizer adaptive_muon --muon-tp-mode
+# layer_sharded`` crashed at construction: TensorParallelAdaptiveMuon received
+# LayerShardedMuon-only kwargs (gtp_remat_group, ns_batch_size, ...) and lost the ones it
+# needs (is_qkv_fn, qkv_split_shapes, pg_collection). These tests stay at the
+# signature/registry level (inspect, kwargs dicts) and never instantiate an optimizer, so
+# they run on any installed emerging-optimizers.
+
+
+class _DispatchModelCfg:
+    num_attention_heads = 8
+    num_query_groups = 2
+    kv_channels = 16
+
+
+class _DispatchChunk:
+    config = _DispatchModelCfg()
+
+
+def _dispatch_cfg(layer_sharded: bool) -> OptimizerConfig:
+    """A real OptimizerConfig, so the reflective ``_kwargs_from_config`` lookups
+    exercise the actual field surface instead of a stub that makes every
+    ``hasattr`` fail (which would shrink the test to the hardcoded keys only).
+    A valid muon config: ``__post_init__`` enforces the layer_sharded requirements."""
+    return OptimizerConfig(
+        optimizer='muon',
+        use_layer_wise_distributed_optimizer=True,
+        muon_split_qkv=False,
+        muon_tp_mode='layer_sharded' if layer_sharded else 'duplicated',
+    )
+
+
+def test_shared_muon_kwargs_ignore_layer_sharding_flag():
+    """The shared builder must stay pure even with the lsh flag set."""
+    kwargs = eo_mod._muon_config_to_kwargs(
+        _dispatch_cfg(True), [_DispatchChunk()], pg_collection=None
+    )
+    for lsh_only in ("gtp_remat_group", "tp_group", "ns_batch_size", "concurrent_groups"):
+        assert lsh_only not in kwargs, f"LayerShardedMuon-only kwarg leaked: {lsh_only}"
+    assert "is_qkv_fn" in kwargs
+    assert "qkv_split_shapes" in kwargs
+    assert "pg_collection" in kwargs
+
+
+@pytest.mark.parametrize("lsh_flag", [False, True])
+def test_adaptive_muon_kwargs_match_constructor_signature(lsh_flag):
+    """Every kwarg built for adaptive_muon must be accepted by its __init__.
+
+    This is the construction-crash regression: with the flag set, a polluted
+    shared helper produced gtp_remat_group/ns_batch_size and TensorParallelAdaptiveMuon
+    raised TypeError before training started.
+    """
+    kwargs = eo_mod._adaptive_muon_config_to_kwargs(
+        _dispatch_cfg(lsh_flag), [_DispatchChunk()], pg_collection=None
+    )
+    accepted = set(inspect.signature(eo_mod.TensorParallelAdaptiveMuon.__init__).parameters)
+    unexpected = set(kwargs) - accepted
+    assert not unexpected, f"kwargs TensorParallelAdaptiveMuon.__init__ rejects: {unexpected}"
+
+
+def test_muon_entry_dispatches_on_layer_sharding_flag():
+    """The muon entry's dispatcher pairs lsh kwargs with the lsh class."""
+    lsh_kwargs = eo_mod._muon_registry_config_to_kwargs(
+        _dispatch_cfg(True), [_DispatchChunk()], pg_collection=None
+    )
+    # 'layer_sharded' is the registry selector, not a TensorParallelMuon mode:
+    # the constructor must receive the bitwise reference mode instead.
+    assert lsh_kwargs["tp_mode"] == "duplicated"
+    assert "gtp_remat_group" in lsh_kwargs
+    assert eo_mod._muon_config_to_cls(_dispatch_cfg(True)) is LayerShardedMuon
+
+    plain_kwargs = eo_mod._muon_registry_config_to_kwargs(
+        _dispatch_cfg(False), [_DispatchChunk()], pg_collection=None
+    )
+    assert "gtp_remat_group" not in plain_kwargs
+    assert "is_qkv_fn" in plain_kwargs
+    assert eo_mod._muon_config_to_cls(_dispatch_cfg(False)) is eo_mod.TensorParallelMuon
+
+
+def test_muon_entry_registered_with_dispatcher():
+    """The registry wires the dispatcher to 'muon' and leaves adaptive_muon alone."""
+    muon_entry = eo_mod._EMERGING_OPTIMIZERS["muon"]
+    assert muon_entry.config_to_kwargs is eo_mod._muon_registry_config_to_kwargs
+    adaptive_entry = eo_mod._EMERGING_OPTIMIZERS["adaptive_muon"]
+    assert adaptive_entry.config_to_kwargs is eo_mod._adaptive_muon_config_to_kwargs
 
 
 @pytest.mark.skipif(
@@ -1710,3 +2154,41 @@ def test_lion_optimizer_multi_layer_net():
             params_updated += 1
 
     assert params_updated > 0, "At least some parameters should be updated after optimizer step"
+
+
+# ===========================================================================
+# use_syrk version gate
+# ===========================================================================
+
+
+@pytest.mark.parametrize("optimizer_cls", [TensorParallelMuon, TensorParallelAdaptiveMuon])
+def test_muon_use_syrk_rejected_on_old_emerging_optimizers(monkeypatch, optimizer_cls):
+    """use_syrk must raise on emerging_optimizers < 0.4.0 rather than silently falling back.
+
+    Covers TensorParallelAdaptiveMuon too, since it forwards use_syrk through
+    TensorParallelMuon.__init__ and that forwarding is what applies the gate to both.
+    """
+    import megatron.core.optimizer.emerging_optimizers as eo_module
+
+    monkeypatch.setattr(eo_module, "is_emerging_optimizers_min_version", lambda _version: False)
+    monkeypatch.setattr(eo_module, "get_emerging_optimizers_version", lambda: "0.2.0")
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    with pytest.raises(ValueError, match="use_syrk requires emerging_optimizers"):
+        optimizer_cls(
+            params=[model.weight], lr=0.01, pg_collection=None, tp_mode="duplicated", use_syrk=True
+        )
+
+
+@pytest.mark.parametrize("optimizer_cls", [TensorParallelMuon, TensorParallelAdaptiveMuon])
+def test_muon_use_syrk_default_off_ignores_version(monkeypatch, optimizer_cls):
+    """The gate only fires when use_syrk is requested; the default path stays version-agnostic."""
+    import megatron.core.optimizer.emerging_optimizers as eo_module
+
+    monkeypatch.setattr(eo_module, "is_emerging_optimizers_min_version", lambda _version: False)
+
+    model = torch.nn.Linear(60, 30, bias=False, dtype=torch.float32, device='cuda')
+    optimizer = optimizer_cls(
+        params=[model.weight], lr=0.01, pg_collection=None, tp_mode="duplicated"
+    )
+    assert optimizer is not None

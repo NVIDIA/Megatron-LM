@@ -3,9 +3,9 @@
 """OpenAI-compatible inference server using the Megatron high-level API.
 
 Mirrors tools/run_dynamic_text_generation_server.py but drives the
-``DynamicInferenceEngine`` through ``MegatronAsyncLLM.serve(...)`` instead
+`DynamicInferenceEngine` through `MegatronAsyncLLM.serve(...)` instead
 of building the coordinator/engine pipeline manually. Coordinator mode is
-required (HTTP serving uses the coordinator path); ``use_coordinator=True``
+required (HTTP serving uses the coordinator path); `use_coordinator=True`
 is hardcoded in the script.
 """
 
@@ -30,6 +30,7 @@ from megatron.inference.utils import (
 )
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services
 
 
 def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
@@ -49,6 +50,35 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
         default=4,
         help="Number of HTTP frontend processes spawned on the primary rank.",
     )
+    group.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Server-level temperature default when a request omits temperature. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
+    )
+    group.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Server-level top-p default when a request omits top_p. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
+    )
+    group.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Server-level top-k default when a request omits top_k. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 0 if neither is set.",
+    )
+    group.add_argument(
+        "--eval-mode",
+        action="store_true",
+        help="Avoid returning prompt token IDs by default for pure serving.",
+    )
     return parser
 
 
@@ -67,15 +97,20 @@ async def _serve(args, model, tokenizer, inference_config):
             parsers=args.parsers,
             verbose=args.verbose,
             frontend_replicas=args.frontend_replicas,
+            default_temperature=args.default_temperature,
+            default_top_p=args.default_top_p,
+            default_top_k=args.default_top_k,
+            eval_mode=args.eval_mode,
         )
         await llm.serve(serve_config, blocking=True)
 
 
 def main():
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_runtime_services(args)
     initialize_megatron()
 
     args = get_args()

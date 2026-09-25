@@ -18,7 +18,14 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.batch_invariant import (
+    build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
+)
+from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
 from megatron.core.transformer.moe.moe_logging import (
     get_moe_metrics_tracker,
     get_moe_overload_factor_tracker,
@@ -334,6 +341,7 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = 0,
+    return_batch_invariant_inverse_map: bool = False,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -366,6 +374,8 @@ def permute(
         tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
                                                     actual token counts per expert.
         align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
+        return_batch_invariant_inverse_map (bool, optional): Return a fixed-shape
+            batch-invariant inverse map in the `pad_offsets` slot for graph-safe unpermute.
 
     Returns:
         Tuple[
@@ -378,6 +388,10 @@ def permute(
             The permuted tokens, (optional) permuted probs, sorted indices,
             (optional) pad_offsets, (optional) padded_tokens_per_expert.
     """
+    if return_batch_invariant_inverse_map:
+        assert not fused, "batch-invariant MoE permute requires the unfused path"
+        assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
             raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
@@ -412,6 +426,7 @@ def permute(
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
     permuted_probs = None
+    batch_invariant_inverse_map = None
     if drop_and_pad and not (num_out_tokens is None):
         capacity = num_out_tokens // num_experts
         assert not routing_map.requires_grad
@@ -438,6 +453,7 @@ def permute(
         assert (
             num_out_tokens is not None
         ), "num_out_tokens is required for the argsort-based permute"
+        routing_map_for_inverse = routing_map
 
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
@@ -452,10 +468,21 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
+        if return_batch_invariant_inverse_map:
+            batch_invariant_inverse_map = build_batch_invariant_inverse_permutation_map(
+                routing_map_for_inverse, flat_sorted, sorted_indices, num_out_tokens
+            )
+
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
+    return (
+        permuted_input,
+        permuted_probs,
+        sorted_indices,
+        batch_invariant_inverse_map,
+        tokens_per_expert,
+    )
 
 
 def unpermute(
@@ -467,6 +494,7 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
+    batch_invariant_inverse_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -492,10 +520,18 @@ def unpermute(
             Tensor of per-expert cumulative padding offsets used to remove padding added
             during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
             and is required when unpermuting padded outputs. Defaults to None.
+        batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
+            `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
+            global expert id. Used by batch-invariant CUDA graph paths.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    batch_invariant_mode = is_batch_invariant_mode_enabled()
+    if batch_invariant_mode:
+        assert not fused, "batch-invariant MoE unpermute requires the unfused path"
+        assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"
+
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
@@ -508,6 +544,19 @@ def unpermute(
             merging_probs=probs,
             restore_shape=restore_shape,
             **extra_kwargs,
+        )
+
+    if batch_invariant_mode:
+        assert routing_map is not None, "batch-invariant MoE unpermute requires routing_map"
+        assert (
+            batch_invariant_inverse_map is not None
+        ), "batch-invariant MoE unpermute requires the AllToAll inverse map"
+        return batch_invariant_unpermute(
+            permuted_tokens,
+            restore_shape,
+            probs=probs,
+            num_experts=routing_map.size(1),
+            inverse_map=batch_invariant_inverse_map,
         )
 
     _, hidden = restore_shape
@@ -557,7 +606,14 @@ def unpermute(
         output_tokens.scatter_add_(
             0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
         )
-    return output_tokens.to(dtype=input_dtype)
+    out = output_tokens.to(dtype=input_dtype)
+    # Explicitly release intermediate tensor references to enable CUDA
+    # caching allocator to reclaim memory immediately during full
+    # recomputation. Without this, scatter_add_/index_add_ autograd
+    # references prevent GC until the next training iteration.
+    # See: https://github.com/NVIDIA/Megatron-LM/issues/3221
+    del output_tokens, permuted_tokens, sorted_indices
+    return out
 
 
 def sort_chunks_by_idxs(
@@ -679,8 +735,10 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     Returns:
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
     """
-    # Transpose to [num_experts, num_tokens] for easier row-wise operations
-    routing_map = routing_map.transpose(0, 1)  # [num_experts, num_tokens]
+    # Work on a copy because fused router autograd saves the returned routing
+    # map for backward. Padding a transposed view in place would increment the
+    # saved tensor's version counter and make backward fail.
+    routing_map = routing_map.clone().transpose(0, 1)  # [num_experts, num_tokens]
 
     # Calculate how many tokens need to be padded for each expert
     num_ones = routing_map.sum(dim=1)
@@ -853,7 +911,12 @@ def topk_routing_with_score_function(
             )
         else:
             # Sorting top-k turned off during inference
-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+            return torch.topk(
+                scores,
+                k=topk,
+                dim=1,
+                sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
+            )
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active
@@ -938,6 +1001,31 @@ def topk_routing_with_score_function(
     return routing_probs, routing_map
 
 
+def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
+    """Compute the normalized score distribution over all experts.
+
+    Args:
+        logits: Router logits with experts in the final dimension.
+        score_function: Score function to use. Must be `softmax`, `sigmoid`, or
+            `sqrtsoftplus`.
+
+    Returns:
+        Float32 normalized router scores with the same shape as `logits`.
+
+    Raises:
+        ValueError: If `score_function` is unsupported.
+    """
+    if score_function == "softmax":
+        return torch.softmax(logits, dim=-1, dtype=torch.float32)
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float())
+    elif score_function == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(logits.float()).sqrt()
+    else:
+        raise ValueError(f"Invalid score_function: {score_function}")
+    return scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+
+
 def compute_routing_scores_for_aux_loss(
     logits: torch.Tensor,
     topk: int,
@@ -974,16 +1062,7 @@ def compute_routing_scores_for_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
     else:
-        if score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float())
-            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-        elif score_function == "sqrtsoftplus":
-            scores = torch.nn.functional.softplus(logits.float()).sqrt()
-            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-        else:
-            raise ValueError(f"Invalid score_function: {score_function}")
+        scores = compute_normalized_router_scores(logits, score_function)
 
         _, top_indices = torch.topk(scores, k=topk, dim=1)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
@@ -1227,6 +1306,7 @@ def track_moe_metrics(
     force_initialize: bool = False,
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
+    num_moe_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -1244,6 +1324,7 @@ def track_moe_metrics(
         force_initialize=force_initialize,
         track_names=track_names,
         num_layers=num_layers,
+        num_moe_layers=num_moe_layers,
         moe_layer_freq=moe_layer_freq,
         mtp_num_layers=mtp_num_layers,
         pg_collection=pg_collection,
@@ -1278,9 +1359,15 @@ def get_updated_expert_bias(
 
         # All Reduce Across TPxCPxDP group
         torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
-        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
-        offset = average_tokens - tokens_per_expert
-        updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
+        num_experts = tokens_per_expert.shape[-1]
+        total_tokens = tokens_per_expert.sum(dim=-1, keepdim=True)
+        # Compare each tokens_per_expert value with the row average without converting the integer
+        # counts to floating point: tokens_per_expert < total / num_experts iff
+        # tokens_per_expert * num_experts < total.
+        update_direction = torch.sign(total_tokens - tokens_per_expert * num_experts)
+        updated_expert_bias = (
+            expert_bias + update_direction.to(dtype=expert_bias.dtype) * expert_bias_update_rate
+        )
         return updated_expert_bias
 
 
@@ -1617,7 +1704,10 @@ def get_default_pg_collection() -> ProcessGroupCollection:
     pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
     pg_collection.cp = parallel_state.get_context_parallel_group()
     pg_collection.expt_tp = parallel_state.get_expert_tensor_parallel_group()
-    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
+    pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group(with_gtp_remat=False)
+    pg_collection.expt_dp_gtp_remat = parallel_state.get_expert_data_parallel_group(
+        check_initialized=False
+    )
     pg_collection.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
     pg_collection.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
     pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(

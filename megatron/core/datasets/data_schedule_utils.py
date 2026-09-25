@@ -275,6 +275,141 @@ def broadcast_tensor(item, src_rank, group) -> None:
         torch.distributed.broadcast(item, src_rank, group=group)
 
 
+def broadcast_to_pp_group(
+    new_samples,
+    num_micro_batches,
+    seqlen_sum_this_global_batch,
+    seqlen_squared_sum_this_global_batch,
+    pp_group,
+    dev,
+):
+    """
+    Broadcast num_micro_batches, seqlen_sum_this_global_batch,
+    seqlen_squared_sum_this_global_batch and metadata to middle PP stages.
+    Before this broadcast, the new_samples on middle PP stages are None,
+    after this broadcast, the new_samples on middle PP stages contain the metadata but
+    without tokens, labels, loss_mask, position_ids.
+
+    Who needs what:
+
+      * **PP rank 0 and the last PP rank** both own a data iterator (only TP rank 0
+        on the first and last PP stage does), so both run the whole schedule ->
+        reroute -> pack pipeline on the same input samples and independently end up
+        with complete ``new_samples``: tokens, labels, loss_mask, position_ids *and*
+        the packing metadata. Neither takes anything from this broadcast; the last
+        stage in particular must keep its own labels / loss_mask.
+      * **Middle PP stages** have no data iterator, so ``new_samples`` is None on
+        entry. They only need the packing metadata (max_seqlen / cu_seqlens /
+        cu_seqlens_padded) to rebuild the packed-sequence params, never the token
+        tensors.
+
+    The last PP rank still takes part in the transfer because
+    ``torch.distributed.broadcast`` is a collective over ``pp_group``: every member
+    has to call it or the group deadlocks. It therefore receives the payload and
+    drops it, which is what the ``pp_group.rank() != pp_group.size() - 1`` guard
+    below implements. Filtering it out of the transfer itself would require a
+    separate "first + middle" process group, which is not worth an extra process
+    group for a payload of a few hundred bytes per global batch.
+    """
+
+    pp_src_rank = torch.distributed.get_process_group_ranks(pp_group)[0]
+
+    # size() > 2 asks "does a middle PP stage exist at all": with 1 or 2 PP ranks
+    # every rank is a first and/or last stage and already owns its packed samples,
+    # so there is nobody to broadcast to.
+    if pp_group.size() > 2:
+        if pp_group.rank() == 0:
+            cu_seqlens_lengths = torch.tensor(
+                [sample["cu_seqlens"].numel() for sample in new_samples],
+                dtype=torch.float32,
+                device=dev,
+            )
+            cu_seqlens_padded_lengths = torch.tensor(
+                [sample["cu_seqlens_padded"].numel() for sample in new_samples],
+                dtype=torch.float32,
+                device=dev,
+            )
+            tensor_list = [
+                torch.tensor(
+                    [
+                        num_micro_batches,
+                        seqlen_sum_this_global_batch,
+                        seqlen_squared_sum_this_global_batch,
+                    ],
+                    dtype=torch.float32,
+                    device=dev,
+                )
+            ]
+            for sample in new_samples:
+                tensor_list.append(sample["max_seqlen"].reshape(1))
+            tensor_list.append(cu_seqlens_lengths)
+            tensor_list.append(cu_seqlens_padded_lengths)
+            for sample in new_samples:
+                tensor_list.append(sample["cu_seqlens"])
+                tensor_list.append(sample["cu_seqlens_padded"])
+            info_to_broadcast = torch.cat(tensor_list, dim=0).to(device=dev, dtype=torch.float32)
+            info_length_tensor = torch.tensor(
+                info_to_broadcast.shape[0], dtype=torch.int32, device=dev
+            )
+            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
+            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
+        else:
+            # Every non-source rank has to take part in the collective, including
+            # the last PP stage.
+            info_length_tensor = torch.tensor(0, dtype=torch.int32, device=dev)
+            broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
+            info_to_broadcast = torch.empty(
+                info_length_tensor.item(), dtype=torch.float32, device=dev
+            )
+            broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
+            if pp_group.rank() != pp_group.size() - 1:
+                # Middle PP stages receive the broadcasted info and unpack it.
+                # Cu-seqlens lengths are encoded explicitly so zero values inside
+                # the payload cannot be mistaken for tensor boundaries.
+                # The last PP stage deliberately falls through: it built its own
+                # new_samples from its own data iterator (with the labels and
+                # loss_mask this payload does not carry), so it discards what it
+                # just received rather than overwriting them.
+                num_micro_batches = int(info_to_broadcast[0].item())
+                seqlen_sum_this_global_batch = info_to_broadcast[1].item()
+                seqlen_squared_sum_this_global_batch = info_to_broadcast[2].item()
+
+                cursor = 3
+                max_seqlens = info_to_broadcast[cursor : cursor + num_micro_batches]
+                cursor += num_micro_batches
+                cu_seqlens_lengths = info_to_broadcast[cursor : cursor + num_micro_batches].to(
+                    torch.int64
+                )
+                cursor += num_micro_batches
+                cu_seqlens_padded_lengths = info_to_broadcast[
+                    cursor : cursor + num_micro_batches
+                ].to(torch.int64)
+                cursor += num_micro_batches
+
+                new_samples = []
+                for i in range(num_micro_batches):
+                    cu_seqlens_len = int(cu_seqlens_lengths[i].item())
+                    cu_seqlens_padded_len = int(cu_seqlens_padded_lengths[i].item())
+                    new_sample = {}
+                    new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
+                    new_sample["cu_seqlens"] = info_to_broadcast[
+                        cursor : cursor + cu_seqlens_len
+                    ].to(torch.int32)
+                    cursor += cu_seqlens_len
+                    new_sample["cu_seqlens_padded"] = info_to_broadcast[
+                        cursor : cursor + cu_seqlens_padded_len
+                    ].to(torch.int32)
+                    cursor += cu_seqlens_padded_len
+                    new_samples.append(new_sample)
+
+    return (
+        new_samples,
+        num_micro_batches,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
+    )
+
+
 def broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
     """
     Broadcast scalar values from rank 0 to all ranks in the group.
@@ -550,9 +685,26 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
         dp_group: The data parallel group.
 
     Returns:
-        batch: The batch.
-        global_id_seqlens: The global sequence lengths.
-        global_ids_this_rank: The global IDs locally present on this rank.
+        batch (List[Dict[str, torch.Tensor]]): The sub-samples pulled from this rank's
+            ``data_iterator`` over ``num_microbatches`` steps, flattened and unpacked
+            (see :func:`_unpack_batch`). Every dict carries ``tokens`` / ``labels`` /
+            ``loss_mask`` / ``position_ids`` plus the ``original_seq_len`` and
+            ``padded_seq_len`` scalars used for scheduling.
+        global_id_seqlens (List[Tuple[int, int]]): ``(global_id, padded_seq_len)`` for
+            every sub-sample in the DP group, ordered by DP rank and then by local
+            index. Identical on all ranks; this is the scheduler's input.
+        global_ids_this_rank (torch.Tensor): int32 CUDA tensor holding the global IDs of
+            the sub-samples loaded by this rank, i.e. ``batch[i]`` has global ID
+            ``global_ids_this_rank[i]``.
+        offsets (torch.Tensor): int32 CPU tensor of shape ``[dp_size + 1]`` with the
+            exclusive prefix sum of the per-rank sub-sample counts, so DP rank ``r`` owns
+            global IDs ``offsets[r]:offsets[r + 1]``. Used by
+            :func:`reroute_samples_to_dcp_ranks` to map a global ID back to its source
+            rank.
+        seqlens_gathered (List[int]): Padded sequence length of every sub-sample in the
+            DP group, indexed by global ID (``seqlens_gathered[gid]`` equals
+            ``global_id_seqlens[gid][1]``). Handy for global-batch token counts such as
+            the FLOPs accounting.
     """
 
     batch_list = [next(data_iterator) for _ in range(num_microbatches)]

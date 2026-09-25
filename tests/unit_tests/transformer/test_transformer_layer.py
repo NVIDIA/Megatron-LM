@@ -2,35 +2,58 @@
 
 
 import gc
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     MHCCheckpointManager,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    create_cudagraphs,
+)
 from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
+    MoETransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def _make_mhc_layer_spec(**kwargs):
+    """Build a layer spec with HyperConnectionModule submodules.
+
+    This helper patches the mHC submodules directly so these layer tests do not
+    depend on GPT-spec wiring.
+    """
+    from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(**kwargs)
+    layer_spec.module = HyperConnectionTransformerLayer
+    layer_spec.submodules.self_attention_hyper_connection = HyperConnectionModule
+    layer_spec.submodules.mlp_hyper_connection = HyperConnectionModule
+    return layer_spec
 
 
 def _make_mhc_config(hidden_size=64, num_streams=4, **extra):
@@ -283,12 +306,68 @@ class TestParallelTransformerLayer:
         assert discarded_outputs[0] is attention_output[0]
         assert mlp_output[0].shape == hidden_states.shape
 
+    @pytest.mark.parametrize("threshold, is_hash_layer", [(None, False), (0, False), (2, True)])
+    def test_function_moe_builder_receives_hash_layer_threshold(self, threshold, is_hash_layer):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+            moe_num_hash_layers=1,
+            hash_moe_vocab_size=32,
+            use_cpu_initialization=True,
+        )
+        moe_builder = get_moe_module_spec(use_te=False, num_experts=2, moe_grouped_gemm=False)
+
+        def build_moe(**kwargs):
+            return moe_builder(**kwargs)
+
+        submodules = TransformerLayerSubmodules(mlp=build_moe)
+        layer = TransformerLayer(
+            config,
+            submodules,
+            layer_number=2,
+            add_layer_offset=False,
+            hash_moe_layer_threshold=threshold,
+        )
+
+        assert layer.mlp.router.hash_moe_layer_threshold == threshold
+        assert layer.mlp.router.is_hash_layer is is_hash_layer
+
+    def test_mtp_flag_is_forwarded_to_attention(self):
+        """All attention builders receive the MTP-layer flag."""
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        config.experimental_attention_variant = "gdn"
+        strict_attention_spec = object()
+        submodules = TransformerLayerSubmodules(self_attention=strict_attention_spec)
+        attention_kwargs = {}
+
+        def fake_build_module(spec, *args, **kwargs):
+            if spec is strict_attention_spec:
+                attention_kwargs.update(kwargs)
+            return torch.nn.Identity()
+
+        with patch(
+            "megatron.core.transformer.transformer_layer.build_module",
+            side_effect=fake_build_module,
+        ):
+            TransformerLayer(config, submodules, is_mtp_layer=True)
+
+        assert attention_kwargs["is_mtp_layer"] is True
+
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer
         config: TransformerConfig = parallel_transformer_layer.config
         sequence_length = 32
         micro_batch_size = 2
         parallel_transformer_layer.cuda()
+        parallel_transformer_layer.eval()
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
@@ -296,12 +375,14 @@ class TestParallelTransformerLayer:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states, context = parallel_transformer_layer(
+        output, context = parallel_transformer_layer(
             hidden_states=hidden_states, attention_mask=attention_mask
         )
-        assert hidden_states.shape[0] == sequence_length
-        assert hidden_states.shape[1] == micro_batch_size
-        assert hidden_states.shape[2] == config.hidden_size
+        assert not parallel_transformer_layer.supports_two_stage_attention()
+        assert context is None
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == config.hidden_size
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
     @pytest.mark.skipif(
@@ -833,6 +914,131 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert hidden_states.grad.shape == hidden_states.shape
         # Check that gradient is non-trivial (not all zeros)
         assert hidden_states.grad.abs().sum() > 0
+
+    def test_moe_layer_forward_backward_without_partial_cuda_graphs(self):
+        """mHC uses the ordinary MoE execution path when partial graphs are disabled."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+            add_bias_linear=False,
+        )
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+
+        assert layer.is_moe_layer
+        assert layer.supports_mhc_connections
+
+        state_dict = layer.state_dict()
+        assert any("self_attention_hyper_connection" in key for key in state_dict)
+        assert any("mlp_hyper_connection" in key for key in state_dict)
+
+        layer = layer.cuda()
+        hidden_states = torch.randn(8, 2, 128, device="cuda", requires_grad=True)
+        attention_mask = torch.zeros((1, 1, 8, 8), dtype=bool, device="cuda")
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        output.float().sum().backward()
+
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+        assert hidden_states.grad is not None
+
+    def test_moe_layer_skips_mlp_cuda_graph(self):
+        """A global MLP graph request must leave the mHC MoE layer eager."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+        )
+        config.cuda_graph_impl = "local"
+        config.cuda_graph_modules = [CudaGraphModule.mlp]
+
+        layer = HyperConnectionTransformerLayer(
+            config,
+            _make_mhc_layer_spec(
+                num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+            ).submodules,
+        )
+
+        assert layer.is_moe_layer
+        assert not hasattr(layer, "cudagraph_manager")
+        assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
+
+    @pytest.mark.parametrize(
+        "cuda_graph_module",
+        [CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+    )
+    def test_moe_layer_rejects_partial_cuda_graphs(self, cuda_graph_module):
+        """Partial MoE graphs must not drop the hyper-connection state."""
+        config = _make_mhc_config(
+            hidden_size=32,
+            num_streams=4,
+            num_layers=1,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_token_dispatcher_type="allgather",
+        )
+        config.cuda_graph_modules = [cuda_graph_module]
+
+        with pytest.raises(NotImplementedError, match="MoE CUDA graph"):
+            HyperConnectionTransformerLayer(
+                config,
+                _make_mhc_layer_spec(
+                    num_experts=4, moe_grouped_gemm=False, use_te_op_fuser=False
+                ).submodules,
+            )
+
+    @pytest.mark.parametrize("norm_attr", ["input_layernorm", "pre_mlp_layernorm"])
+    def test_residual_returning_layernorm_is_rejected(self, norm_attr):
+        """A norm returning (output, residual) must fail fast, not feed a tuple downstream.
+
+        Base TransformerLayer accepts that contract and uses the returned residual;
+        mHC cannot, because its residual is the n-stream tensor captured before
+        hyper-connection aggregation.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        layer, _ = self._create_layer_with_hyper_connection(hidden_size, num_streams)
+        layer.train()
+
+        class _ResidualReturningNorm(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, x):
+                return self.inner(x), x
+
+        setattr(layer, norm_attr, _ResidualReturningNorm(getattr(layer, norm_attr)).cuda())
+
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(seq_len, batch_size, n_channels, device='cuda')
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        with pytest.raises(ValueError, match=norm_attr):
+            layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
 
 class TestMHCRecomputeMemorySaving:
@@ -1711,6 +1917,52 @@ class TestMHCWithOffloading:
         )
 
 
+def _make_moe_transformer_layer(*, partial_cudagraph: bool):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        ffn_hidden_size=64,
+        moe_ffn_hidden_size=64,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_router_load_balancing_type="none",
+        moe_token_dispatcher_type="allgather",
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bias_dropout_fusion=False,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        cuda_graph_impl="local" if partial_cudagraph else "none",
+        cuda_graph_modules=[CudaGraphModule.moe_router] if partial_cudagraph else [],
+    )
+    submodules = TransformerLayerSubmodules(
+        mlp=get_moe_module_spec(use_te=False, num_experts=4, moe_grouped_gemm=False),
+        mlp_bda=get_bias_dropout_add,
+    )
+    return MoETransformerLayer(config, submodules)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_moe_router_synchronizes_host_outputs_and_reuses_event():
+    layer = object.__new__(MoETransformerLayer)
+    host_output = Mock()
+    host_output.device.type = "cpu"
+    cuda_output = torch.empty(1, device="cuda")
+    event = Mock()
+
+    with patch.object(torch.cuda, "Event", return_value=event) as event_factory:
+        layer._synchronize_router_host_outputs((host_output,))
+        layer._synchronize_router_host_outputs((cuda_output,))
+        assert event.record.call_count == 1
+        assert event.synchronize.call_count == 1
+        layer._synchronize_router_host_outputs((host_output,))
+
+    event_factory.assert_called_once_with()
+    assert event.record.call_count == 2
+    assert event.synchronize.call_count == 2
+
+
 @pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
     reason="CUDA graph tests require TransformerEngine >= 1.5",
@@ -1725,6 +1977,41 @@ class TestTransformerLayerCudaGraphManagers:
         Utils.destroy_model_parallel()
         _reset_cudagraph_state()
         gc.collect()
+
+    def test_moe_router_partial_cudagraph_forward_matches_eager(self):
+        eager_layer = _make_moe_transformer_layer(partial_cudagraph=False)
+        partial_cg_layer = _make_moe_transformer_layer(partial_cudagraph=True)
+        partial_cg_layer.load_state_dict(eager_layer.state_dict())
+        eager_layer.cuda()
+        partial_cg_layer.cuda()
+        for param in partial_cg_layer.parameters():
+            param.main_grad = torch.zeros_like(param)
+
+        hidden_states = torch.randn(8, 2, 32, device="cuda", requires_grad=True)
+        eager_output, _ = eager_layer(hidden_states.clone(), attention_mask=None)
+        eager_output = eager_output.detach().clone()
+
+        # The first forward/backward records the real router and postprocess graph boundaries.
+        recorded_output, _ = partial_cg_layer(hidden_states.clone(), attention_mask=None)
+        recorded_output.sum().backward()
+        create_cudagraphs()
+
+        assert _CudagraphGlobalRecord.cudagraph_created
+        assert partial_cg_layer.use_partial_cudagraphs
+        for manager in (
+            partial_cg_layer.cudagraph_manager_router,
+            partial_cg_layer.cudagraph_manager_postprocess,
+        ):
+            assert len(manager.cudagraph_runners) == 1
+            assert manager.cudagraph_runners[0].fwd_graph is not None
+
+        partial_cg_layer.zero_grad(set_to_none=True)
+        partial_cg_output, _ = partial_cg_layer(hidden_states.clone(), attention_mask=None)
+        partial_cg_output = partial_cg_output.detach().clone()
+
+        # All-gather routing metadata stays on CUDA, so replay must not create a host-wait event.
+        assert not hasattr(partial_cg_layer, '_router_dtoh_event')
+        torch.testing.assert_close(partial_cg_output, eager_output, rtol=0, atol=0)
 
     def test_empty_scope_transformer_layer_has_per_layer_manager(self):
         block = _make_cuda_graph_gpt_block(

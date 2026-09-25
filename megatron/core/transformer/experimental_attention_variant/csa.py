@@ -3,7 +3,7 @@
 import copy
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Tuple, Union
+from typing import Optional, Protocol, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -63,6 +63,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import not_none
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1013,38 @@ def _unfused_indexer_sparse_attn_from_topk(
 # ---------------------------------------------------------------------------
 
 
+class CompressorInterface(Protocol):
+    """Runtime interface exposed by a CSA compressor."""
+
+    def forward(
+        self, x: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> Union[Optional[torch.Tensor], Tuple[Optional[torch.Tensor], torch.Tensor]]:
+        """Compress an input sequence."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute deferred weight gradients."""
+        ...
+
+
+class CompressorBuilder(Protocol):
+    """Builder protocol for CSA compressors."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        compress_ratio: int,
+        head_dim: int,
+        rotate: bool = False,
+        rotary_pos_emb: nn.Module | None = None,
+        pg_collection: ProcessGroupCollection,
+        name: str | None = None,
+    ) -> CompressorInterface:
+        """Build a CSA compressor."""
+        ...
+
+
 @dataclass
 class CompressorSubmodules:
     """Submodule specs for CSA and HCA Compressor."""
@@ -1603,13 +1636,57 @@ class Compressor(MegatronModule):
 # ---------------------------------------------------------------------------
 
 
+class CSAIndexerInterface(Protocol):
+    """Runtime interface exposed by a CSA indexer."""
+
+    index_topk: int
+    softmax_scale: float
+    pg_collection: ProcessGroupCollection
+
+    def forward_before_topk(
+        self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute indexer projections before top-k selection."""
+        ...
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute index scores and selected indices."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute deferred weight gradients."""
+        ...
+
+
+class CSAIndexerBuilder(Protocol):
+    """Builder protocol for CSA indexers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        compress_ratio: int,
+        rotary_pos_emb: nn.Module | None = None,
+        pg_collection: ProcessGroupCollection,
+        name: str | None = None,
+    ) -> CSAIndexerInterface:
+        """Build a CSA indexer."""
+        ...
+
+
 @dataclass
 class CSAIndexerSubmodules:
     """Submodule specs for CSAIndexer."""
 
     linear_wq_b: Union[ModuleSpec, type] = None
     linear_weights_proj: Union[ModuleSpec, type] = None
-    compressor: Union[ModuleSpec, type] = None
+    compressor: Union[ModuleSpec, type, CompressorBuilder, None] = None
 
 
 class CSAIndexer(MegatronModule):
@@ -1687,8 +1764,7 @@ class CSAIndexer(MegatronModule):
             )
 
         # Own compressor (smaller head_dim, with Hadamard rotation)
-        self.compressor = build_module(
-            submodules.compressor,
+        self.compressor = not_none(submodules.compressor)(
             config=config,
             compress_ratio=compress_ratio,
             head_dim=self.index_head_dim,
@@ -2001,12 +2077,61 @@ class _OutputInverseRope:
         return torch.cat([content_part, rot_part], dim=-1)
 
 
+class CompressedSparseAttentionInterface(Protocol):
+    """Runtime interface exposed by compressed sparse attention."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        x: torch.Tensor | None = None,
+        qr: torch.Tensor | None = None,
+        attn_mask_type: AttnMaskType | None = None,
+        attention_bias: torch.Tensor | None = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        boundary_hidden: Optional[torch.Tensor] = None,
+        boundary_kv: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply compressed sparse attention."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute deferred weight gradients."""
+        ...
+
+
+class CompressedSparseAttentionBuilder(Protocol):
+    """Builder protocol for compressed sparse attention."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        softmax_scale: float | None,
+        k_channels: int | None,
+        v_channels: int | None,
+        cp_comm_type: str | None,
+        pg_collection: ProcessGroupCollection,
+        rotary_pos_emb: nn.Module | None,
+        compress_ratio: int,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ) -> CompressedSparseAttentionInterface:
+        """Build compressed sparse attention."""
+        ...
+
+
 @dataclass
 class CompressedSparseAttentionSubmodules:
     """Submodule specs for CompressedSparseAttention."""
 
-    compressor: Union[ModuleSpec, type] = None
-    indexer: Union[ModuleSpec, type] = None
+    compressor: Union[ModuleSpec, type, CompressorBuilder, None] = None
+    indexer: Union[ModuleSpec, type, CSAIndexerBuilder, None] = None
 
 
 class CompressedSparseAttention(MegatronModule):
@@ -2079,8 +2204,7 @@ class CompressedSparseAttention(MegatronModule):
 
         # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
         if self.compress_ratio > 1 and submodules.compressor is not None:
-            self.compressor = build_module(
-                submodules.compressor,
+            self.compressor = submodules.compressor(
                 config=config,
                 compress_ratio=self.compress_ratio,
                 head_dim=config.v_head_dim,
@@ -2098,8 +2222,7 @@ class CompressedSparseAttention(MegatronModule):
             and not config.csa_dense_mode
             and submodules.indexer is not None
         ):
-            self.indexer = build_module(
-                submodules.indexer,
+            self.indexer = submodules.indexer(
                 config=config,
                 compress_ratio=self.compress_ratio,
                 rotary_pos_emb=rotary_pos_emb,
@@ -3920,5 +4043,3 @@ class CompressedSparseAttention(MegatronModule):
 
         if indexer_loss is not None:
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
-
-        return output

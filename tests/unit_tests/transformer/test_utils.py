@@ -2,6 +2,8 @@
 
 import inspect
 import os
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -10,12 +12,106 @@ import megatron.core.transformer.utils as transformer_utils
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     is_layer_window_attention,
+    set_attention_backend,
+    set_model_config_attribute,
     set_model_to_sequence_parallel,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+
+_NVTE_BACKEND_ENV_VARS = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
+_NVTE_FLASH_VERSION_ENV_VARS = tuple(f'NVTE_FLASH_ATTN_V{version}' for version in (2, 3, 4))
+_BACKEND_ENV_VALUES = {
+    AttnBackend.local: ('0', '0', '0'),
+    AttnBackend.flash: ('1', '0', '0'),
+    AttnBackend.fused: ('0', '1', '0'),
+    AttnBackend.unfused: ('0', '0', '1'),
+    AttnBackend.auto: ('1', '1', '1'),
+}
+
+
+@pytest.fixture
+def isolated_nvte_attention_env():
+    """Restore process-wide NVTE attention settings after a test."""
+    with patch.dict(os.environ):
+        clear_nvte_env_vars()
+        yield
+
+
+def _attention_config(**overrides):
+    return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4, **overrides)
+
+
+@pytest.mark.parametrize("backend", [*AttnBackend, "unfused"])
+def test_set_attention_backend_accepts_all_enums_and_string(backend, isolated_nvte_attention_env):
+    set_attention_backend(_attention_config(attention_backend=backend))
+
+    expected_backend = AttnBackend[backend] if isinstance(backend, str) else backend
+    assert (
+        tuple(os.environ[name] for name in _NVTE_BACKEND_ENV_VARS)
+        == _BACKEND_ENV_VALUES[expected_backend]
+    )
+    assert all(name not in os.environ for name in _NVTE_FLASH_VERSION_ENV_VARS)
+
+
+def test_set_attention_backend_rejects_process_wide_conflicts(isolated_nvte_attention_env):
+    set_attention_backend(
+        _attention_config(attention_backend=AttnBackend.flash, flash_attention_version=3)
+    )
+    assert tuple(os.environ[name] for name in _NVTE_FLASH_VERSION_ENV_VARS) == ('0', '1', '0')
+
+    conflicts = (
+        _attention_config(attention_backend=AttnBackend.fused, flash_attention_version=3),
+        _attention_config(attention_backend=AttnBackend.flash, flash_attention_version=2),
+    )
+    for config in conflicts:
+        with pytest.raises(AssertionError, match="process-wide"):
+            set_attention_backend(config)
+
+
+class _TrackingConfig:
+    def __init__(self, value):
+        self._runtime_value = value
+        self.update_count = 0
+
+    @property
+    def runtime_value(self):
+        return self._runtime_value
+
+    @runtime_value.setter
+    def runtime_value(self, value):
+        self._runtime_value = value
+        self.update_count += 1
+
+
+class _ConfigModule(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+def test_set_model_config_attribute_updates_distinct_configs_once():
+    root_config = _TrackingConfig("original")
+    child_config = _TrackingConfig("original")
+    unsupported_config = SimpleNamespace()
+
+    module = _ConfigModule(root_config)
+    module.first_child = _ConfigModule(child_config)
+    module.second_child = _ConfigModule(child_config)
+    module.unsupported_child = _ConfigModule(unsupported_config)
+    model = SimpleNamespace(config=root_config, module=SimpleNamespace(module=module))
+    new_value = object()
+
+    set_model_config_attribute(model, "runtime_value", new_value)
+
+    assert root_config.runtime_value is new_value
+    assert child_config.runtime_value is new_value
+    assert root_config.update_count == 1
+    assert child_config.update_count == 1
+    assert not hasattr(unsupported_config, "runtime_value")
 
 
 class TestGPTModel:
