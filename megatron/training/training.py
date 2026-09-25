@@ -1938,15 +1938,19 @@ def _reload_dsa_indexer_optimizer_params(model, optimizer) -> int:
 def _should_reset_dsa_indexer_after_load(args) -> bool:
     """Whether a checkpoint load should run the one-time DSA indexer initialization.
 
-    The initialization derives the indexer from the loaded checkpoint, so it can only run
-    against the checkpoint the run starts from. ``args.iteration`` is zero exactly then:
-    ``load_checkpoint`` forces it to zero under ``--finetune`` and ``--pretrained-checkpoint``,
-    and reports the stored iteration on an ordinary resume. Re-running the initialization on
-    a resume would discard every indexer update the run has made.
+    The flag converts a checkpoint that has no indexer into a DSA run, so it should fire
+    exactly when the loaded checkpoint carries no indexer to preserve. ``load_checkpoint``
+    records that as ``args.checkpoint_has_dsa_indexer``.
+
+    Testing the checkpoint rather than ``args.iteration`` decouples this from ``--finetune``.
+    The iteration is zero under ``--finetune`` and ``--pretrained-checkpoint`` and non-zero on
+    an ordinary resume, so it forced ``--finetune`` on anyone converting a dense checkpoint,
+    and it did not stop ``--finetune`` from re-initialising a checkpoint whose indexer was
+    already trained.
     """
     if not getattr(args, "dsa_reset_indexer_on_load", False):
         return False
-    return getattr(args, "iteration", 0) == 0
+    return not getattr(args, "checkpoint_has_dsa_indexer", False)
 
 
 def _reset_dsa_indexer_after_load(model, optimizer, opt_param_scheduler, args):

@@ -2941,6 +2941,15 @@ def load_checkpoint(
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
+    # Record whether the checkpoint carries a DSA indexer, before the --finetune guard below
+    # skips reading its arguments. --dsa-reset-indexer-on-load uses this to tell a conversion
+    # from a resume: a dense checkpoint has no indexer to preserve, a DSA one does.
+    checkpoint_args_for_dsa = state_dict.get('args')
+    args.checkpoint_has_dsa_indexer = (
+        checkpoint_args_for_dsa is not None
+        and getattr(checkpoint_args_for_dsa, 'experimental_attention_variant', None) == 'dsa'
+    )
+
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
