@@ -1700,10 +1700,11 @@ def generate_state_dict(
     # Arguments, iteration, and model.
     state_dict = {}
     checkpoint_args = copy.copy(args)
-    checkpoint_args.dataloader_data_parallel_size = args.data_parallel_size * getattr(
-        args, 'gtp_weight_remat_size', 1
-    )
-    checkpoint_args.dataloader_data_sharding = getattr(args, 'data_sharding', False)
+    if hasattr(args, 'data_parallel_size'):
+        checkpoint_args.dataloader_data_parallel_size = args.data_parallel_size * getattr(
+            args, 'gtp_weight_remat_size', 1
+        )
+        checkpoint_args.dataloader_data_sharding = getattr(args, 'data_sharding', False)
     state_dict['args'] = checkpoint_args
     state_dict['checkpoint_version'] = 3.0
     if iteration is not None:
