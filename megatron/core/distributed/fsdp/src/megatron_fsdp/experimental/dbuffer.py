@@ -246,12 +246,11 @@ class DBuffer:
         return buffer
 
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
-        """Return a storage-sharing buffer with supported ``placements``.
+        """View a contained local range with the requested ``placements``.
 
-        Each axis may preserve its placement, relabel Partial to Replicate, or
-        slice Replicate/Partial to Shard. Multiple axes may change at once.
-        A view that changes a Partial placement is only a storage destination:
-        callers must populate it with a reduction before reading it.
+        This only slices and relabels storage; it performs no communication.
+        When changing Partial placements, callers must populate the view with
+        values appropriate to its new placements before reading it.
         """
         placements = tuple(placements)
         if len(placements) != self.mesh.ndim:
@@ -260,36 +259,12 @@ class DBuffer:
             )
 
         _validate_placements(placements)
-        for source, destination in zip(self.placements, placements):
-            if source == destination:
-                continue
-            if isinstance(source, (Replicate, Partial)) and isinstance(destination, Shard):
-                continue
-            if isinstance(source, Partial) and isinstance(destination, Replicate):
-                continue
-            raise ValueError(
-                "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
-                "or a Replicate/Partial-to-Shard slice on each axis, "
-                f"got {self.placements!r} -> {placements!r}."
-            )
-        view = self._view_storage(placements)
-        if view is None:
-            raise RuntimeError("DBuffer view is not contained in its source local buffer.")
-        return view
-
-    def _view_storage(self, placements: Iterable[Placement]) -> "DBuffer | None":
-        """View a contained storage range as a collective destination, or return None.
-
-        Unlike ``view``, this may relabel Replicate to Partial: the collective
-        populates the destination before its values are read.
-        """
-        placements = tuple(placements)
         if self.placements == placements:
             return self
         offset, local_numel = self.layout.get_local_range(self.mesh, placements)
         local_offset = offset - self.offset
         if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
-            return None
+            raise ValueError("DBuffer.view() requires a range contained in its local buffer.")
         return DBuffer.from_local(
             self.local_buffer.narrow(0, local_offset, local_numel),
             self.mesh,
@@ -447,12 +422,16 @@ class DBuffer:
                 continue
             placements = list(result.placements)
             placements[axis] = new
-            step_out = out._view_storage(placements)
-            if (
-                step_out is None
+            # Sharded-suffix layouts have nested local ranges, so size determines containment.
+            _, local_numel = self.layout.get_local_range(self.mesh, placements)
+            step_out = None
+            if local_numel <= out.local_buffer.numel():
+                step_out = out.view(placements)
+            elif (
+                local_numel <= result.local_buffer.numel()
                 and result.local_buffer.untyped_storage() is not self.local_buffer.untyped_storage()
             ):
-                step_out = result._view_storage(placements)
+                step_out = result.view(placements)
             if isinstance(old, Shard) and isinstance(new, Replicate):
                 result = result.allgather(axis, out=step_out)
             elif isinstance(old, Partial) and isinstance(new, Replicate):
@@ -468,7 +447,7 @@ class DBuffer:
                         "Replicate -> Partial redistribute supports AVG only, got "
                         f"{new.reduce_op!r}."
                     )
-                result = DBuffer.from_local(result.local_buffer, self.mesh, placements, self.layout)
+                result = result.view(placements)
             else:
                 raise NotImplementedError(
                     f"Unsupported DBuffer placement transition on axis {axis}: {old!r} -> {new!r}."
