@@ -203,7 +203,9 @@ def main(
 
         for test_idx, test_case in enumerate(list_of_test_cases):
             job_tags = list(tags)
-            job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
+            # Submit through the shared client; JET selects the SSH runner.
+            if cluster != "dgxgb300_oci-jhb":
+                job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
             script = [
                 "export PYTHONPATH=$(pwd); "
