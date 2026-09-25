@@ -58,7 +58,8 @@ from megatron.inference.utils import (  # noqa: E402
 from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -167,6 +168,9 @@ def parse_args_and_detect_vlm(
     sys.argv[1:1] = _defaults
 
     args = parse_and_validate_args(extra_args_provider=extra_args_provider, args_defaults=args_defaults)
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()
     args = get_args()
@@ -448,7 +452,10 @@ if __name__ == "__main__":
         # --profile and --nvtx-ranges are set). Otherwise the engine-side
         # nvtx_range_push labels (bookkeeping, Decode, _ep_establish_consensus,
         # etc.) are no-ops and the inter-step gap is unattributable in nsys.
-        if args.profile and args.nvtx_ranges:
+        # Temporary args/config duplication during the training-loop refactor:
+        # profiling is config-owned; unmigrated consumers still use legacy args.
+        cfg = get_run_config()
+        if cfg.profiling.use_nsys_profiler and cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(True)
 
         # Already requested via --return-log-probs default above; keep this

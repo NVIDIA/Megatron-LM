@@ -656,6 +656,18 @@ def hybrid_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
+    """Normalize legacy CLI/YAML profiling inputs at the configuration boundary."""
+    from copy import deepcopy
+
+    # Legacy args retain these fields temporarily during the training-loop refactor;
+    # ProfilingConfig is authoritative after construction.
+    kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    if hasattr(args, "profile"):
+        kwargs["use_nsys_profiler"] = args.profile
+    return ProfilingConfig(**deepcopy(kwargs))
+
+
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
@@ -675,9 +687,6 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
     ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
 
-    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
-    prof_kwargs["use_nsys_profiler"] = args.profile
-
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
@@ -695,7 +704,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         rng=_default_config_from_args(RNGConfig, args),
         logger=_default_config_from_args(LoggerConfig, args),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
-        profiling=ProfilingConfig(**prof_kwargs),
+        profiling=profiling_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
@@ -719,7 +728,7 @@ def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
 
 
 def inference_cfg_container_from_args(
-    args: Namespace, model_cfg=None
+    args: Namespace, model_cfg=None, *, build_model_config: bool = True
 ) -> InferenceConfigContainer:
     """Build an InferenceConfigContainer from the argparse arguments.
 
@@ -732,8 +741,10 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
+        build_model_config: If False, retain model_cfg (including None) for legacy callers
+            that still construct the model through a model provider.
     """
-    if model_cfg is None:
+    if model_cfg is None and build_model_config:
         if getattr(args, "hybrid_layer_pattern", None) is not None:
             model_cfg = hybrid_config_from_args(args)
         else:
@@ -747,9 +758,6 @@ def inference_cfg_container_from_args(
     ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
     ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
 
-    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
-    prof_kwargs["use_nsys_profiler"] = args.profile
-
     cfg = InferenceConfigContainer(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
@@ -758,7 +766,7 @@ def inference_cfg_container_from_args(
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
         logger=_default_config_from_args(LoggerConfig, args),
-        profiling=ProfilingConfig(**prof_kwargs),
+        profiling=profiling_config_from_args(args),
     )
 
     return cfg

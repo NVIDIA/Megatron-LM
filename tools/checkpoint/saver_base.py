@@ -143,12 +143,16 @@ class MegatronCheckpointSaverBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
-            from megatron.training.global_vars import set_global_variables, get_args
+            from megatron.training.global_vars import set_global_variables, get_args, set_run_config
+            from megatron.training.argument_utils import inference_cfg_container_from_args
             from megatron.core import mpu
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        # Temporary args/config duplication during the training-loop refactor:
+        # profiling is config-owned; unmigrated consumers still use legacy args.
+        set_run_config(inference_cfg_container_from_args(self.margs, build_model_config=False))
         set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')

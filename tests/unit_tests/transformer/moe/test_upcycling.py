@@ -25,13 +25,14 @@ from megatron.core.utils import (
     is_te_min_version,
     unwrap_model,
 )
-from megatron.training.argument_utils import gpt_config_from_args
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
     set_args,
     set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
@@ -134,6 +135,9 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
 
     validate_args(args)
     set_global_variables(args, False)
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
+    set_run_config(pretrain_cfg_container_from_args(args))
     return args
 
 

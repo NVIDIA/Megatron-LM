@@ -31,6 +31,8 @@ from tests.unit_tests.dist_checkpointing.models.common import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.usefixtures("run_config")
+
 
 def initialize_gpt_model(
     seed,

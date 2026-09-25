@@ -60,6 +60,32 @@ def experimental(request):
     config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
 
 
+@pytest.fixture
+def run_config(monkeypatch):
+    """Provide a config owner for isolated training-runtime consumers."""
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training import global_vars
+    from megatron.training.config import (
+        CheckpointConfig,
+        LoggerConfig,
+        PretrainConfigContainer,
+        SchedulerConfig,
+        TrainingConfig,
+    )
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    container = PretrainConfigContainer(
+        train=TrainingConfig(),
+        model=None,
+        optimizer=OptimizerConfig(),
+        scheduler=SchedulerConfig(),
+        logger=LoggerConfig(),
+        checkpoint=CheckpointConfig(),
+    )
+    global_vars.set_run_config(container)
+    return container
+
+
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0

@@ -66,6 +66,14 @@ class ProfilingConfig:
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""
 
+    def validate(self) -> None:
+        """Validate requirements when the selected profiler is about to start."""
+        # Match torch.profiler.schedule's active-window requirement. Inactive
+        # options and CUDA-profiler windows retain their existing CLI behavior.
+        if self.use_nsys_profiler and self.use_pytorch_profiler:
+            if self.profile_step_end <= self.profile_step_start:
+                raise ValueError("PyTorch profiling requires profile_step_end > profile_step_start")
+
 
 @dataclass(kw_only=True)
 class DistributedInitConfig:

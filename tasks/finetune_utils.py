@@ -7,6 +7,8 @@ import sys
 import torch
 
 from megatron.training import get_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import print_rank_0
 from megatron.training import get_timers
@@ -267,6 +269,9 @@ def finetune(train_valid_datasets_provider, model_provider,
 
     # Build model, optimizer and learning rate scheduler.
     timers('model and optimizer', log_level=0).start()
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
+    set_run_config(pretrain_cfg_container_from_args(args))
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_type, model_provider)
     timers('model and optimizer').stop()
 

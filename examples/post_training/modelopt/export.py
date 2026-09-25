@@ -19,7 +19,8 @@ from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.initialize import initialize_megatron
 from model_provider import model_provider
 
@@ -66,6 +67,9 @@ if __name__ == "__main__":
             'no_load_optim': True,
         },
     )
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_runtime_services(args)
     initialize_megatron()
 

@@ -9,6 +9,7 @@ import torch
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.training import get_args, print_rank_0
+from megatron.training.global_vars import get_run_config
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -33,8 +34,11 @@ def model_provider(
         Union[GPTModel, HybridModel]: The returned model
     """
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # profiling is config-owned; unmigrated consumers still use legacy args.
+    cfg = get_run_config()
 
-    if args.record_memory_history:
+    if cfg.profiling.record_memory_history:
         torch.cuda.memory._record_memory_history(
             True,
             # keep 100,000 alloc/free events from before the snapshot
@@ -47,7 +51,7 @@ def model_provider(
             # snapshot right after an OOM happened
             print('saving allocated state during OOM')
 
-            filename = f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}"
+            filename = f"oom_rank-{torch.distributed.get_rank()}_{cfg.profiling.memory_snapshot_path}"
             torch.cuda.memory._dump_snapshot(filename)
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)

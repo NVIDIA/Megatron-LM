@@ -20,6 +20,7 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -27,6 +28,7 @@ from megatron.training.global_vars import (
     get_args,
     set_args,
     set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import (
     force_param_sync,
@@ -181,6 +183,9 @@ class TestFP8Param:
 
         validate_args(args)
         set_global_variables(args, False)
+        # Temporary args/config duplication during the training-loop refactor:
+        # profiling is config-owned; unmigrated consumers still use legacy args.
+        set_run_config(pretrain_cfg_container_from_args(args))
         return args
 
     def get_batch(self, seq_length, micro_batch_size):

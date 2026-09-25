@@ -44,6 +44,8 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.usefixtures("run_config")
+
 
 def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
     if cu_seqlens is None:

@@ -23,10 +23,15 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.training import get_args, get_tokenizer
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
-from megatron.training.global_vars import set_global_variables, unset_global_variables
+from megatron.training.global_vars import (
+    set_global_variables,
+    set_run_config,
+    unset_global_variables,
+)
 from megatron.training.training import get_model
 from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
@@ -209,6 +214,9 @@ class Pipeline:
 
         # Set global args, build tokenizer.
         unset_global_variables()
+        # Temporary args/config duplication during the training-loop refactor:
+        # profiling is config-owned; unmigrated consumers still use legacy args.
+        set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
         set_global_variables(args)
 
         # Random seed.
@@ -813,6 +821,9 @@ class LLaVAPipeline(Pipeline):
 
         # Set global args, build tokenizer.
         unset_global_variables()
+        # Temporary args/config duplication during the training-loop refactor:
+        # profiling is config-owned; unmigrated consumers still use legacy args.
+        set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
         set_global_variables(args)
 
         # Random seed.
