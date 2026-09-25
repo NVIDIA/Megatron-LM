@@ -60,7 +60,8 @@ from megatron.core.utils import (
 )
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
-from megatron.training.global_vars import get_run_config, get_tokenizer
+from megatron.training.global_vars import get_run_config, get_tokenizer, get_train_state
+from megatron.training.utils.checkpoint_utils import get_checkpoint_train_state_filename
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -113,6 +114,7 @@ _LOADED_ITERATION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+_TRACKER_PREFIX = "latest"
 
 _WIDE_RESIDUAL_ARG_DEFAULTS = (
     ('wide_residual_num_streams', None),
@@ -1166,6 +1168,24 @@ def save_checkpoint(
                         run_config.to_yaml(run_config_filename)
 
                 # Save tokenizer files for torch_dist checkpoints (if enabled)
+                train_state = get_train_state()
+                train_state_dict = train_state.state_dict()
+                train_state_dict["floating_point_operations_so_far"] = torch.tensor(
+                    num_floating_point_operations_so_far, dtype=torch.float32
+                )
+
+                checkpoint_name = get_checkpoint_name(
+                    save_dir, iteration=iteration, release=release, return_base_dir=True
+                )
+                train_state_local_filename = get_checkpoint_train_state_filename(checkpoint_name)
+                train_state_global_filename = get_checkpoint_train_state_filename(save_dir, prefix=_TRACKER_PREFIX)
+
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    msc.torch.save(train_state_dict, train_state_local_filename)
+                else:
+                    torch.save(train_state_dict, train_state_local_filename)
+
                 if (
                     args.save_tokenizer_assets
                     and args.ckpt_format == 'torch_dist'
@@ -1177,6 +1197,12 @@ def save_checkpoint(
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
+
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    msc.torch.save(train_state_dict, train_state_global_filename)
+                else:
+                    shutil.copy(train_state_local_filename, train_state_global_filename)
 
                 with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write('release' if release else str(iteration))
