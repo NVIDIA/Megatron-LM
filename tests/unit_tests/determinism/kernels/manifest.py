@@ -251,7 +251,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="tensor_parallel_layers",
         sources=("megatron/core/tensor_parallel/layers.py",),
-        tests=(K + "test_tensor_parallel_kernels.py",),
+        tests=(
+            K + "test_tensor_parallel_kernels.py",
+            "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+        ),
         kind="torch-op",
         notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding) and local Column/RowParallelLinear "
         "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
@@ -468,7 +471,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/optimizer/optimizer.py",
             "megatron/training/utils/common_utils.py",
         ),
-        tests=(K + "test_optimizer_kernels.py",),
+        tests=(
+            K + "test_optimizer_kernels.py",
+            "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+        ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "

@@ -120,16 +120,26 @@ def copy_gtp_attributes(destination, source):
             setattr(destination, attr, getattr(source, attr))
 
 
-def param_is_not_gtp_duplicate(param):
+def param_is_not_gtp_duplicate(param, gtp_group=None, expert_gtp_group=None):
     """True if the param's grad is counted once across the GTP_remat/EGTP_remat axis.
 
     GTP_remat/EGTP_remat shards are unique per peer (kept); replicated params counted only on
     rank 0 of the gtp_remat/egtp_remat axis (else counted N times). When GTP_remat is off rank is 0,
     so every param is kept.
+
+    Pass the group that owns the param's GTP axis. The MPU fallback below is only correct for
+    callers whose axis is the global one: a module carrying its own grid (MIMO builds every
+    module's ``gtp_remat`` group in its HyperCommGrid and never initializes the MPU globals)
+    reads rank 0 on every rank there, which keeps every replicated param on every peer.
     """
     if getattr(param, "is_gtp_weight_remat", False):
         return True
     is_expert = not getattr(param, "allreduce", True)
+    group = expert_gtp_group if is_expert else gtp_group
+    # Prefer provided group when available (new explicit path).
+    if group is not None:
+        return group.rank() == 0
+    # Fallback to legacy global state (back-compat).
     if is_expert:
         return get_expert_gtp_weight_remat_rank() == 0
     return get_gtp_weight_remat_rank() == 0
