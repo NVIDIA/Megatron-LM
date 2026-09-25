@@ -7,7 +7,7 @@ import multiprocessing as mp
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 try:
     from hypercorn.asyncio import serve
@@ -182,9 +182,10 @@ def _server_process_worker(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    loop_factory: Optional[Callable[[], asyncio.AbstractEventLoop]] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
-    loop = asyncio.new_event_loop()
+    loop = (loop_factory or asyncio.new_event_loop)()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(
@@ -267,6 +268,7 @@ def start_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    loop_factory: Optional[Callable[[], asyncio.AbstractEventLoop]] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -290,6 +292,7 @@ def start_text_gen_server(
             shared with them.
         chat_template: Chat template to apply, as a file path or an inline
             template string. None falls back to the tokenizer's own template.
+        loop_factory: Builds each replica's event loop; None uses the process policy's default.
 
     Returns:
         The base URL this rank serves on, or None if the server was already
@@ -332,6 +335,7 @@ def start_text_gen_server(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                loop_factory,
             ),
             daemon=True,
         )
