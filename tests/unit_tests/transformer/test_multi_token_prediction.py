@@ -695,17 +695,19 @@ class TestMultiTokenPredictionLayer:
             assert len(mtp.layers) == config.mtp_num_layers
             assert all(_resolve_is_first_microbatch(m) is True for m in te_modules)
 
+    @pytest.mark.parametrize("tp", [1, 2])
     @pytest.mark.parametrize("cp", [1, 2])
     @pytest.mark.parametrize("layout", ["unpacked", "packed", "padded_packed"])
-    def test_get_embeddings_rolls_padding_mask(self, cp, layout):
+    def test_get_embeddings_rolls_padding_mask(self, tp, cp, layout):
         """Shifted sequence ends and existing padding stay excluded at every MTP depth."""
-        if Utils.world_size < cp:
-            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        if Utils.world_size < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
         torch.manual_seed(_SEED)
-        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=cp, use_te=cp > 1)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=tp, cp=cp, use_te=cp > 1)
         mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
         cp_group = get_context_parallel_group()
         cp_rank = torch.distributed.get_rank(group=cp_group)
+        tp_rank = torch.distributed.get_rank(group=get_tensor_model_parallel_group())
         capacities = [16] if layout == "unpacked" else [8, 12]
         lengths = [5, 9] if layout == "padded_packed" else capacities
         logical, physical, local_indices = [0], [0], []
@@ -737,12 +739,15 @@ class TestMultiTokenPredictionLayer:
             for row, length in enumerate(row_lengths):
                 full_mask[row, start : start + length] = False
         padding_mask = full_mask.index_select(-1, index)
+        # Match GPT preprocessing: IDs retain the CP-local layout, while the
+        # padding mask and hidden states are sharded along sequence over TP.
+        padding_mask = padding_mask.chunk(tp, dim=-1)[tp_rank].contiguous()
         input_ids = torch.arange(physical[-1], device="cuda").repeat(3, 1).index_select(-1, index)
         position_ids = input_ids.clone()
-        hidden_states = torch.randn(index.numel(), 3, config.hidden_size, device="cuda")
+        hidden_states = torch.randn(index.numel() // tp, 3, config.hidden_size, device="cuda")
 
         def fake_embedding(input_ids, position_ids):
-            return torch.zeros(input_ids.size(1), 3, config.hidden_size, device="cuda")
+            return torch.zeros(input_ids.size(1) // tp, 3, config.hidden_size, device="cuda")
 
         for depth in range(1, 4):
             original_mask = padding_mask.clone()
@@ -759,6 +764,7 @@ class TestMultiTokenPredictionLayer:
                 for row, length in enumerate(row_lengths):
                     expected[row, start : start + max(length - depth, 0)] = False
             expected = expected.index_select(-1, index)
+            expected = expected.chunk(tp, dim=-1)[tp_rank].contiguous()
             passed = torch.tensor(
                 [torch.equal(shifted_mask, expected), torch.equal(padding_mask, original_mask)],
                 dtype=torch.int32,

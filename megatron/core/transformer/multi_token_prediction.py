@@ -24,6 +24,7 @@ from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
+    gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
@@ -1573,6 +1574,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            padding_mask (torch.Tensor, optional): Padding flags of shape [b, s/tp] with
+                sequence parallelism, otherwise [b, s]. True marks padding.
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
@@ -1612,6 +1615,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             return_sum=False,
         )
         if padding_mask is not None:
+            # GPT has already SP-sharded this mask. Reconstruct the CP-local
+            # sequence before rolling so TP boundaries are not mistaken for ends
+            # and packed/CP metadata still describes the tensor being shifted.
+            if self.config.sequence_parallel:
+                padding_mask = gather_from_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(),
+                    tensor_parallel_output_grad=False,
+                    group=self.tp_group,
+                ).transpose(0, 1)
             # roll_tensor zero-fills sequence ends. Roll validity so these new
             # positions remain padding (True), including packed/CP boundaries.
             valid_mask, _ = roll_tensor(
@@ -1623,6 +1635,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 return_sum=False,
             )
             padding_mask = ~valid_mask
+            if self.config.sequence_parallel:
+                padding_mask = (
+                    scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
