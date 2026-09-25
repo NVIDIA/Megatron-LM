@@ -357,7 +357,7 @@ def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkey
 
 @pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])
 def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
-    calculate_per_token_loss, expected_scale
+    calculate_per_token_loss, expected_scale, mocker
 ):
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
@@ -377,6 +377,10 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
     def loss_func(output_tensor):
         return output_tensor.clone(), torch.tensor(4), {'loss_reduced': output_tensor.detach()}
 
+    cp_group = mocker.Mock()
+    mocker.patch.object(
+        torch.distributed, "all_reduce", side_effect=lambda tensor, group: tensor.mul_(4)
+    )
     DSAIndexerLossAutoScaler.main_loss_backward_scale = None
     schedule.forward_step_calc_loss(
         model=None,
@@ -388,6 +392,7 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
         num_microbatches=2,
         forward_data_store=forward_data_store,
         cp_group_size=4,
+        cp_group=cp_group,
         is_last_stage=True,
     )
 
