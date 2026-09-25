@@ -19,6 +19,7 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.optimizer import _make_sharded_optimizer_factory
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
@@ -42,11 +43,12 @@ def _gtp_gather_rows_for_save(
     including load-time target-dict construction, which is safe (all GTP peers build the
     dict together) but must stay out of per-iteration paths.
 
-    The gathered tensor is replicated across the GTP peers as well as DP/CP. The GTP rank
-    is folded into ``replica_id`` so DCP writer election stays correct even when
-    ``dp_cp_group`` excludes the GTP axis (explicit pg_collection grids pass
-    ``pg_collection.dp_cp``, where GTP peers share a rank).
+    Track gathered GTP copies separately from the parameter's true DP/CP replicas.
+    Caller metadata may include GTP; optimizer companions must inherit a DP coordinate
+    that excludes it, because their physical GTP shards are distinct.
     """
+    from megatron.core.tensor_parallel.gtp_api import gtp_replica_rank
+
     gtp_remat_group = weight.group
     gtp_rank = torch.distributed.get_rank(gtp_remat_group)
     local = sh_ten.data.contiguous()
@@ -63,7 +65,9 @@ def _gtp_gather_rows_for_save(
         gathered,
         key,
         tp_axis=0,
-        replica_id=(0, gtp_rank, torch.distributed.get_rank(dp_cp_group)),
+        # Normalize DP before for_optimizer() propagates this replica coordinate.
+        # Training metadata may include GTP peers, which own distinct physical shards.
+        replica_id=(0, gtp_rank, gtp_replica_rank(weight)),
         prepend_offsets=sharded_offsets,
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
@@ -90,8 +94,8 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         full = original_merge_fn(sub_state_dict)
         if full.dim() != 2:
             # Fail loudly instead of padding/slicing a flattened buffer: only the
-            # unflattened 2-D model-weight factory is supported. Optimizer checkpoint
-            # formats require their own mapping; this wrapper does not handle them.
+            # unflattened 2-D model-weight factory is supported. Optimizer state uses
+            # the physical-parameter companion rather than this model merge.
             raise NotImplementedError(
                 "GTP fused-projection merge expects the unflattened 2-D projection; got "
                 f"a {full.dim()}-D tensor (flattened factories are unsupported)"
@@ -102,4 +106,45 @@ def _gtp_slice_rows_on_load(factory: ShardedTensorFactory, weight) -> ShardedTen
         start = gtp_rank * gtp_local_size
         return full[start : start + gtp_local_size].contiguous()
 
-    return replace(factory, merge_fn=_gtp_slice_after_cat)
+    return replace(
+        factory,
+        merge_fn=_gtp_slice_after_cat,
+        # Physical optimizer shards cover distinct offsets, so only DP replicas
+        # remain; the model factory's middle coordinate elects gathered GTP copies.
+        optimizer_factory=_fused_projection_optimizer_factory(
+            factory,
+            weight,
+            shard_offset=gtp_rank * weight.numel(),
+            replica_id=(factory.replica_id[0], 0, factory.replica_id[2]),
+        ),
+    )
+
+
+def _fused_projection_optimizer_factory(
+    factory: ShardedTensorFactory, weight: torch.Tensor, *, shard_offset: int = 0, replica_id=None
+) -> ShardedTensorFactory:
+    """Map physical optimizer slices into a fused projection's semantic checkpoint keys.
+
+    Model checkpoint factories may hold a gathered/dequantized tensor instead of the
+    live parameter. Optimizers need the parameter identity and must transform their own
+    data, including arbitrary flat DP fragments, without requiring GTP collectives.
+    Capture only the logical section metadata; intersect each physical input slice with
+    those sections at build time. Padding is omitted on save and restored as zeros.
+
+    Flat fragments are represented as ordinary rectangular shards (partial boundary
+    rows and complete interior rows), since DCP no longer accepts flattened tensors.
+    This helper supports the 1-D biases and 2-D weights of row-split projections.
+    """
+    if weight.ndim not in (1, 2):
+        raise ValueError("Fused projection optimizer factory expects a 1-D or 2-D parameter")
+    parts = factory.build()
+    if any(len(part.local_shape) != weight.ndim for part in parts):
+        raise ValueError("Expected row-ordered fused projection section metadata")
+    return _make_sharded_optimizer_factory(
+        parts,
+        weight,
+        factory.key,
+        physical_numel=weight.numel(),
+        shard_offset=shard_offset,
+        replica_id=factory.replica_id if replica_id is None else replica_id,
+    )
