@@ -375,12 +375,16 @@ class DBuffer:
         destination.local_buffer.copy_(self.local_buffer)
         return destination
 
+    def is_alias_of(self, other: "DBuffer") -> bool:
+        """Return whether the local buffers share storage, regardless of their ranges."""
+        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
     ) -> "DBuffer":
         """Apply placement transitions one axis at a time.
 
-        Remove shards outer-to-inner, then add shards inner-to-outer so sharded
+        Add shards inner-to-outer; otherwise iterate outer-to-inner so sharded
         axes remain a suffix throughout. Collectives reuse a contained range of
         the final output or an intermediate buffer, preserving the input unless
         the caller supplies an output that aliases it.
@@ -399,23 +403,21 @@ class DBuffer:
             old == new or (isinstance(old, Shard) and isinstance(new, Replicate))
             for old, new in zip(self.placements, new_placements)
         ):
-            axes = [
+            gather_axes = [
                 axis
                 for axis, (old, new) in enumerate(zip(self.placements, new_placements))
                 if old != new
             ]
-            return self.allgather(axes, out=out)
-        input_storage = self.local_buffer.untyped_storage()
-        preserve_input = out.local_buffer.untyped_storage() is not input_storage
+            return self.allgather(gather_axes, out=out)
+        preserve_input = not self.is_alias_of(out)
 
-        # Process non-sharded destinations first, then sharded destinations in
-        # reverse order. Both endpoints must satisfy the sharded-suffix invariant.
-        axes = [axis for axis, new in enumerate(new_placements) if not isinstance(new, Shard)]
-        axes += [
-            axis
-            for axis in reversed(range(self.mesh.ndim))
-            if isinstance(new_placements[axis], Shard)
-        ]
+        # Sharded axes form a suffix: valid transitions only add or only remove shards.
+        # Add from inner to outer; otherwise traverse from outer to inner.
+        old_shards = sum(p.is_shard() for p in self.placements)
+        new_shards = sum(p.is_shard() for p in new_placements)
+        axes = range(self.mesh.ndim)
+        if new_shards > old_shards:
+            axes = axes[::-1]
 
         result = self
         for axis in axes:
@@ -430,7 +432,7 @@ class DBuffer:
             if local_numel <= out.local_buffer.numel():
                 step_out = out.view(placements)
             elif local_numel <= result.local_buffer.numel() and (
-                not preserve_input or result.local_buffer.untyped_storage() is not input_storage
+                not preserve_input or not result.is_alias_of(self)
             ):
                 step_out = result.view(placements)
             if isinstance(old, Shard) and isinstance(new, Replicate):
