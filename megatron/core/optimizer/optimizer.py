@@ -1877,11 +1877,14 @@ class ChainedOptimizer(MegatronOptimizer):
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
         else:
-            grad_norms = []
-            for optimizer in self.chained_optimizers:
-                _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+            grad_norms = [optimizer.get_grad_norm() for optimizer in self.chained_optimizers]
+            squared_norm = sum(norm**2 for norm in grad_norms)
+            if self.config.optimizer_cuda_graph:
+                assert isinstance(squared_norm, torch.Tensor), "CUDA graph norms must be tensors"
+                grad_norm = squared_norm.sqrt()
+            else:
+                # Preserve scalar clipping precision outside optimizer CUDA graphs.
+                grad_norm = math.sqrt(squared_norm)
         return grad_norm
 
     @torch.no_grad()
@@ -1947,8 +1950,13 @@ class ChainedOptimizer(MegatronOptimizer):
                     grouped_grads,
                     grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
                 )
-                group_norms.append(norm if norm else 0.0)
-            return math.sqrt(sum([x**2 for x in group_norms]))
+                group_norms.append(norm)
+            squared_norm = sum(norm**2 for norm in group_norms)
+            if self.config.optimizer_cuda_graph:
+                assert isinstance(squared_norm, torch.Tensor), "CUDA graph norms must be tensors"
+                return squared_norm.sqrt()
+            # Preserve scalar clipping precision outside optimizer CUDA graphs.
+            return math.sqrt(squared_norm)
 
     @torch.no_grad()
     def _compute_grad_norms_by_group(self) -> Dict[str, float]:
