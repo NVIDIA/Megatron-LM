@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def set_attention_backend(config: 'TransformerConfig') -> None:
-    """Configure Transformer Engine attention backends from a transformer config."""
+    """Configure TE attention backends, preserving environment selection for ``None``."""
     attention_backend = config.attention_backend
     if isinstance(attention_backend, str):
         try:
@@ -47,12 +47,12 @@ def set_attention_backend(config: 'TransformerConfig') -> None:
         assert_te_supports_batch_invariant_attention()
 
     def check_and_set_env_variable(
-        env_variable_name: str, expected_value: int, attn_type: AttnBackend
+        env_variable_name: str, expected_value: int, attn_type: Optional[AttnBackend]
     ) -> None:
         current_value = os.getenv(env_variable_name)
         assert current_value is None or current_value == str(expected_value), (
             f'{env_variable_name} is set to {current_value}, but attention_backend='
-            f'{attn_type.name!r} and flash_attention_version='
+            f'{attn_type.name if attn_type is not None else None!r} and flash_attention_version='
             f'{config.flash_attention_version!r} require {expected_value}. Transformer Engine '
             'attention backend and FlashAttention version controls are process-wide; all models '
             'constructed in one process must use compatible settings. Unset the NVTE attention '
@@ -67,10 +67,11 @@ def set_attention_backend(config: 'TransformerConfig') -> None:
         AttnBackend.unfused: (0, 0, 1),
         AttnBackend.auto: (1, 1, 1),
     }
-    flash, fused, unfused = backend_flags[attention_backend]
-    check_and_set_env_variable('NVTE_FLASH_ATTN', flash, attention_backend)
-    check_and_set_env_variable('NVTE_FUSED_ATTN', fused, attention_backend)
-    check_and_set_env_variable('NVTE_UNFUSED_ATTN', unfused, attention_backend)
+    if attention_backend is not None:
+        flash, fused, unfused = backend_flags[attention_backend]
+        check_and_set_env_variable('NVTE_FLASH_ATTN', flash, attention_backend)
+        check_and_set_env_variable('NVTE_FUSED_ATTN', fused, attention_backend)
+        check_and_set_env_variable('NVTE_UNFUSED_ATTN', unfused, attention_backend)
 
     if config.flash_attention_version is not None:
         for version in (2, 3, 4):
