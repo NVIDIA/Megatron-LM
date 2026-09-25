@@ -15,12 +15,16 @@ side effects at import time).
 
 import pytest
 import torch
+from torch import nn
 
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
 from tests.unit_tests.determinism.configs import GPT_CONFIGS, PARALLELISM_CONFIGS, gpt_base
+from tests.unit_tests.determinism.kernels.harness import bytes_equal
 
 SEQ_LEN = 32
 MICRO_BATCH = 4
@@ -91,3 +95,39 @@ class TestGPTModelDeterminism:
     @pytest.mark.parametrize("cfg_overrides", GPT_CONFIGS)
     def test_bit_exact_under_parallelism(self, cfg_overrides, parallelism):
         RUNNER.run(cfg_overrides, parallelism)
+
+    def test_custom_optimizer_group_grad_buffer_replays(self):
+        """A separately owned parameter buffer accumulates bit-exact gradients."""
+
+        class TwoPolicyModel(nn.Module):
+            def __init__(self, owner_group):
+                super().__init__()
+                self.table = nn.Parameter(torch.arange(256, device="cuda").reshape(32, 8).float())
+                self.table.optimizer_sharding_group = owner_group
+                self.dense = nn.Parameter(torch.linspace(0.0, 1.0, 8, device="cuda"))
+
+            def forward(self, indices):
+                return self.table[indices].sum() + self.dense.square().sum()
+
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        module = TwoPolicyModel(groups.tp_dp_cp)
+        ddp = DistributedDataParallel(
+            TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+            DistributedDataParallelConfig(
+                use_distributed_optimizer=True, overlap_grad_reduce=False
+            ),
+            module,
+        )
+        indices = (torch.arange(64, device="cuda") + torch.distributed.get_rank()) % 32
+        reference = None
+        for replay in range(3):
+            ddp.zero_grad_buffer()
+            ddp(indices).backward()
+            ddp.finish_grad_sync()
+            torch.cuda.synchronize()
+            current = (module.table.main_grad.clone(), module.dense.main_grad.clone())
+            if reference is None:
+                reference = current
+                continue
+            for name, expected, actual in zip(("table", "dense"), reference, current):
+                assert bytes_equal(expected, actual), f"{name} main_grad differs on replay {replay}"

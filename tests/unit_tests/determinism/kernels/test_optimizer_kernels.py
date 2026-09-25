@@ -12,6 +12,7 @@ import torch
 from megatron.core.optimizer import Adam
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
+from megatron.training.utils.common_utils import _get_param_data
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
@@ -139,3 +140,25 @@ def test_fused_adam_step_replays():
         assert len(got) == len(ref)
         for j, (a, b) in enumerate(zip(ref, got)):
             assert bytes_equal(a, b), f"Adam tensor {j} differs on replay {i}"
+
+
+def test_row_owned_main_param_selection_replays():
+    """Parameter norms consistently select the owner-local FP32 model shard."""
+    model_param = torch.nn.Parameter(torch.zeros(16, device="cuda", dtype=torch.bfloat16))
+    model_param.main_param = torch.full((16,), 7.0, device="cuda", dtype=torch.float32)
+    model_param.main_param_model_shard = torch.arange(16, device="cuda", dtype=torch.float32)
+    probe = torch.zeros(1, device="cuda")
+
+    def select_owner_shard(value):
+        selected, is_sharded = _get_param_data(model_param, force_create_fp32_copy=True, bf16=True)
+        assert is_sharded and selected is model_param.main_param_model_shard
+        return selected + value * 0
+
+    assert_replays_bit_exact(
+        select_owner_shard,
+        (probe,),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="row-owned optimizer model shard",
+    )

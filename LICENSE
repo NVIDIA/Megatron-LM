@@ -34,9 +34,17 @@ Albert Gu), and the Triton language and compiler project (Philippe Tillet and
 OpenAI). Files from these organizations have notices at the top of each file.
 Below are licenses used in those files, as indicated.
 
+The Engram tokenizer normalization, hashing, and fusion portions in
+`megatron/core/transformer/engram/{tokenizer,addressing,fusion}.py` are adapted from
+DeepSeek Engram (Copyright (c) 2023 DeepSeek), licensed under Apache-2.0:
+https://github.com/deepseek-ai/Engram/blob/fb7f84a21f91223715394a33a1dc24bbfb7f788e/engram_demo_v1.py
+https://github.com/deepseek-ai/Engram/blob/fb7f84a21f91223715394a33a1dc24bbfb7f788e/LICENSE
+These files identify the modifications and retain the Apache-2.0 notice; the
+complete Apache-2.0 terms are reproduced below.
+
 
 --------------------------------------------------------------------------------------
--- LICENSE FOR Facebook, huggingface, Google Research, LLaVA, Mamba, TinyZero and vLLM code  --
+-- LICENSE FOR Facebook, huggingface, Google Research, LLaVA, Mamba, TinyZero, vLLM and DeepSeek code --
 
 
                                  Apache License

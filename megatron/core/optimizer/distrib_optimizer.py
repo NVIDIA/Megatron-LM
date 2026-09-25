@@ -47,6 +47,7 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
+from ..distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
     group_params_for_buffers,
@@ -635,8 +636,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
             else:
                 dp_world_size = data_parallel_world_size
+            buffer_config = buffer_key.get_ddp_config(ddp_config)
+            if buffer_key.optimizer_sharding_group is not None:
+                dp_world_size = buffer_key.optimizer_sharding_group.size()
             layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                group_params, bucket_size, dp_world_size, ddp_config, param_indices
+                group_params,
+                None if buffer_key.optimizer_sharding_group is not None else bucket_size,
+                dp_world_size,
+                buffer_config,
+                param_indices,
             )
             layouts[buffer_key] = layout
         return FullParamLayout(layouts=layouts)
@@ -653,6 +661,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup],
         data_parallel_group_idx: int,
         distributed_optimizer_instance_id: int,
+        *,
+        ddp_config: DistributedDataParallelConfig | None = None,
+        checkpoint_sharding_type: Optional[str] = None,
+        checkpoint_step_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
@@ -684,6 +696,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 used by distributed checkpointing logic.
             distributed_optimizer_instance_id (int): Unique identifier for the
                 distributed optimizer instance.
+            checkpoint_sharding_type: Optional fixed checkpoint format for this instance.
+                Takes precedence over sharded_state_dict metadata and its legacy sharding_type
+                argument on save and load. None keeps the native per-call format selection.
+            checkpoint_step_group: Optional group over which serialized group steps are synchronized
+                during sharded_state_dict construction. All members must participate in that call.
+                The local state_dict method and runtime optimizer counters remain unchanged.
         """
 
         if has_config_logger_enabled(config):
@@ -691,9 +709,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
         self.model_chunks = model_chunks
-        self.ddp_config = self.model_chunks[0].ddp_config
-        for model_chunk in self.model_chunks:
-            assert self.ddp_config == model_chunk.ddp_config
+        self.checkpoint_sharding_type = checkpoint_sharding_type
+        self.checkpoint_step_group = checkpoint_step_group
+        self.ddp_config = self.model_chunks[0].ddp_config if ddp_config is None else ddp_config
+        if ddp_config is None:
+            for model_chunk in self.model_chunks:
+                assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
         assert (
@@ -1522,6 +1543,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             sharding_type = (metadata or {}).get(
                 'distrib_optim_sharding_type', 'fully_sharded_model_space'
             )
+        if self.checkpoint_sharding_type is not None:
+            sharding_type = self.checkpoint_sharding_type
+            # Sibling optimizers share the call metadata; keep their format selection intact.
+            metadata = {**(metadata or {}), 'distrib_optim_sharding_type': sharding_type}
 
         # Handle FSDP DistributedOptimizer States
         if self.ddp_config.use_megatron_fsdp and sharding_type != "fsdp_dtensor":
@@ -1543,6 +1568,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
 
         state_dict = self.state_dict()
+        if self.checkpoint_step_group is not None:
+            # A rank containing no optimizer shards cannot infer the shared Adam step.
+            # Synchronize checkpoint metadata only; ordinary state_dict stays noncollective.
+            param_groups = state_dict['optimizer']['param_groups']
+            step = max((int(group.get('step', 0) or 0) for group in param_groups), default=0)
+            device = (
+                'cuda'
+                if torch.distributed.get_backend(self.checkpoint_step_group) == 'nccl'
+                else 'cpu'
+            )
+            step_tensor = torch.tensor(step, dtype=torch.int64, device=device)
+            torch.distributed.all_reduce(
+                step_tensor, op=torch.distributed.ReduceOp.MAX, group=self.checkpoint_step_group
+            )
+            step = int(step_tensor.item())
+            for group in param_groups:
+                group['step'] = step
         if sharding_type not in self.checkpoint_fully_reshardable_formats:
             # State dict differs between different model parallel groups
             state_dict = {
@@ -3208,33 +3250,35 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
-    def start_param_sync_for_bucket_group_subset(self) -> None:
-        """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
+    def get_param_sync_bucket_groups(self) -> List[Tuple[MegatronModule, Any]]:
+        """Return DDP bucket groups owned by this optimizer's parameter buffers.
 
-        Walks each model chunk's DDP bucket groups and skips those tagged
-        ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
-        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
-        buckets). When no LayerWise tagging is present every bucket group is
-        included — matching the previous ``model_chunk.start_param_sync()``
-        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
-        so FP8 post-all-gather processing (and MXFP8 copy) still runs.
+        A model chunk can be shared by multiple distributed optimizers with different
+        replica groups. Buffer identity, rather than a broad parameter category, defines
+        which optimizer is allowed to dispatch each parameter gather.
         """
-        # Deferred import: layer_wise_optimizer's compute_full_param_layout
-        # lazily imports DistributedOptimizer, so importing the helper at
-        # module load here would create a cycle.
-        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
-
+        if self.is_stub_optimizer:
+            return []
+        owned_buckets = {id(bucket) for buffer in self.buffers for bucket in buffer.buckets}
+        result = []
+        seen = set()
         for model_chunk in self.model_chunks:
-            for bucket_group in (
-                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
-            ):
-                if not bucket_group.buckets:
+            groups = model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            for bucket_group in groups:
+                bucket_ids = {id(bucket) for bucket in bucket_group.buckets}
+                if not bucket_ids or not bucket_ids.intersection(owned_buckets):
                     continue
-                if _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0], default_for_untagged=False
-                ):
-                    continue
-                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+                if not bucket_ids.issubset(owned_buckets):
+                    raise ValueError("A parameter gather bucket group spans multiple optimizers")
+                if id(bucket_group) not in seen:
+                    seen.add(id(bucket_group))
+                    result.append((model_chunk, bucket_group))
+        return result
+
+    def start_param_sync_for_bucket_group_subset(self) -> None:
+        """Dispatch parameter gathers only for bucket groups owned by this optimizer."""
+        for model_chunk, bucket_group in self.get_param_sync_bucket_groups():
+            model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
