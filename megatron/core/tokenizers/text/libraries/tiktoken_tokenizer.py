@@ -157,7 +157,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
 
         self.shifted_id2token = {i: tok for i, tok in enumerate(self.special_tokens)}
         for key, value in self.id2token.items():
-            self.shifted_id2token[key + self.num_special_tokens] = value
+            self.shifted_id2token[key] = value
 
         special_tokens_dict = {t: i for i, t in enumerate(self.special_tokens)}
         self.tokenizer = tiktoken.Encoding(
@@ -184,7 +184,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         if token in self.special_tokens:
             return self.special_tokens.index(token)
         else:
-            return self.tokenizer.encode_single_token(token) + self.num_special_tokens
+            return self.tokenizer.encode_single_token(token)
 
     def tokens_to_ids(self, tokens: List[str]) -> List[int]:
         """Converts list of tokens to list of it's ids."""
