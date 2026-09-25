@@ -541,10 +541,9 @@ class CheckpointConfig:
     fully_parallel_load: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--ckpt-fully-parallel-load"], "dest": "ckpt_fully_parallel_load"}})
     """Apply full load parallelization across DP for distributed checkpoints."""
 
-    ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_rounds", "gather_object"] = "broadcast"
+    ckpt_fully_parallel_load_exchange_algo: Literal["broadcast", "gather_object"] = "broadcast"
     """Algorithm for fully parallel load of distributed checkpoints.
     "broadcast"(default): Broadcast the checkpoint from rank 0 to all other ranks.
-    "gather_rounds": Gather the checkpoint from all ranks in rounds.
     "gather_object": Gather the checkpoint from all ranks in a single operation.
     """
 
