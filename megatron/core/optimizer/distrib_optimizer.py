@@ -1103,6 +1103,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     'Skipping loading grad scaler ...',
                 )
 
+        self._loaded_master_mismatch = torch.zeros(
+            (), dtype=torch.long, device=torch.cuda.current_device()
+        )
+
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
@@ -1122,6 +1126,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.load_parameter_state_from_fs_model_space(param_state)
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
+
+            self._warn_if_master_disagrees_with_model_weights()
+
+    def _warn_if_master_disagrees_with_model_weights(self):
+        """Warn when FP32 master restores overwrite different model-checkpoint values.
+
+        FP32 masters alias model parameters, and each rank restores only its owned
+        shard. If the two checkpoint copies disagree (e.g. BF16 saved, FP32 resumed),
+        the resulting model replicas can differ with the parallel layout.
+        """
+        counter = self._loaded_master_mismatch
+        self._loaded_master_mismatch = None
+        if counter is None:
+            return
+        # Other pipeline stages may not have this optimizer (e.g. expert parameters).
+        # Reduce and report within its DP group so they need not participate.
+        torch.distributed.all_reduce(counter, group=self.data_parallel_group)
+        num_params = int(counter.item())
+        if num_params == 0:
+            return
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'***WARNING*** {num_params} fp32 parameter shards were loaded from an optimizer '
+            f'master that disagrees with the model weights stored in the same checkpoint. '
+            f'Each rank only restores the shard it owns, so the weights this run starts from '
+            f'depend on the parallel layout and replicas may differ from one another. This '
+            f'usually means the checkpoint was saved with a different parameter precision '
+            f'than this run uses.',
+            rank=torch.distributed.get_global_rank(self.data_parallel_group, 0),
+        )
 
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
@@ -1255,15 +1290,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
-            # For fp32 model params, main_param is an autograd-tracked view of
-            # the model param (built without detach() in
-            # _build_model_and_main_param_groups), so the in-place copy must
-            # run under no_grad.
+            # FP32 main params are autograd-tracked model views; restore without autograd.
             with torch.no_grad():
                 for key in dst_tensors:
                     if not isinstance(tensors[key], torch.Tensor):
                         continue
-                    dst_tensors[key].copy_(tensors[key])
+                    dst = dst_tensors[key]
+                    src = tensors[key].to(device=dst.device, dtype=dst.dtype)
+                    if (
+                        key == "param"
+                        and model_param.dtype == torch.float32
+                        # Legacy parameter-only loads have no warning counter.
+                        and getattr(self, "_loaded_master_mismatch", None) is not None
+                    ):
+                        # Compare before overwriting the model shard; report once after load.
+                        self._loaded_master_mismatch += torch.ne(dst, src).any().long()
+                    dst.copy_(src)
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
