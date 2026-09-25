@@ -21,6 +21,7 @@ Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
 - [ ] I have added relevant unit tests
 - [ ] I have added relevant functional tests
 - [ ] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))
+- [ ] For kernel cases with `author_tests`, I have linked independent-reference and comparator-sensitivity results for the changed revision and stated any pending GPU validation. I have also linked representative forward/backward timing evidence or explained why it is pending; accuracy and replay passes do not establish performance.
 - [ ] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)
 - [ ] I have added relevant documentation
 - [ ] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR

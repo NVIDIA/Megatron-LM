@@ -3,7 +3,7 @@
 """Model-level determinism check for GPTModel.
 
 Adding a new parallelism cell is a one-line append to
-``configs.PARALLELISM_CONFIGS`` — this file does not need to change.
+``configs.GPT_PARALLELISM_CONFIGS`` — this file does not need to change.
 
 The model factory + inputs + runner-builder live here (not in a separate
 helpers file) because ``test_fp8_determinism.py`` is the only other
@@ -16,11 +16,18 @@ side effects at import time).
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_batch_on_this_cp_rank
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
-from tests.unit_tests.determinism.configs import GPT_CONFIGS, PARALLELISM_CONFIGS, gpt_base
+from tests.unit_tests.determinism.configs import (
+    GPT_CONFIGS,
+    GPT_PARALLELISM_CONFIGS,
+    gb200_compatible_configs,
+    gpt_base,
+)
 
 SEQ_LEN = 32
 MICRO_BATCH = 4
@@ -46,17 +53,21 @@ def build_gpt(overrides, pre_process=True, post_process=True, vp_stage=None, **_
 
 def make_gpt_inputs():
     """Toy GPT inputs matching the runner's ``make_inputs`` contract."""
-    return {
+    batch = {
         "input_ids": torch.randint(
             0, VOCAB_SIZE, (MICRO_BATCH, SEQ_LEN), device="cuda", dtype=torch.long
         ),
         "position_ids": torch.arange(SEQ_LEN, device="cuda", dtype=torch.long)
         .unsqueeze(0)
         .repeat(MICRO_BATCH, 1),
-        "attention_mask": torch.ones(
-            MICRO_BATCH, 1, SEQ_LEN, SEQ_LEN, dtype=torch.bool, device="cuda"
+        "attention_mask": torch.triu(
+            torch.ones(MICRO_BATCH, 1, SEQ_LEN, SEQ_LEN, dtype=torch.bool, device="cuda"),
+            diagonal=1,
         ),
     }
+    return get_batch_on_this_cp_rank(
+        batch, is_hybrid_cp=False, cp_group=parallel_state.get_context_parallel_group()
+    )
 
 
 def make_gpt_runner(supports_pp: bool = True) -> BitExactRunner:
@@ -70,6 +81,7 @@ def make_gpt_runner(supports_pp: bool = True) -> BitExactRunner:
         make_inputs=make_gpt_inputs,
         base_config=gpt_base,
         supports_pp=supports_pp,
+        supports_cp=True,
         seq_len=SEQ_LEN,
         micro_batch=MICRO_BATCH,
     )
@@ -78,6 +90,7 @@ def make_gpt_runner(supports_pp: bool = True) -> BitExactRunner:
 RUNNER = make_gpt_runner(supports_pp=True)
 
 
+@pytest.mark.determinism_model(model_id="gpt")
 class TestGPTModelDeterminism:
 
     def setup_method(self, method):
@@ -87,7 +100,8 @@ class TestGPTModelDeterminism:
         RUNNER.teardown()
 
     @pytest.mark.internal
-    @pytest.mark.parametrize("parallelism", PARALLELISM_CONFIGS)
+    # launch_on_gb200 marks apply to four-GPU parameters only.
+    @pytest.mark.parametrize("parallelism", gb200_compatible_configs(GPT_PARALLELISM_CONFIGS))
     @pytest.mark.parametrize("cfg_overrides", GPT_CONFIGS)
     def test_bit_exact_under_parallelism(self, cfg_overrides, parallelism):
         RUNNER.run(cfg_overrides, parallelism)

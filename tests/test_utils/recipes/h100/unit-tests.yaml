@@ -58,6 +58,28 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
+    # Collect branch contexts and numerical evidence in the dedicated buckets.
+    if [[ "$TAG" == "latest" && ( "$BUCKET" == "tests/unit_tests/determinism/kernels/**/*.py" || "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ) ]]; then
+        # Match the timing runner's deterministic policy before importing Torch.
+        export CUDA_DEVICE_MAX_CONNECTIONS=1
+        export NCCL_ALGO=Ring CUBLAS_WORKSPACE_CONFIG=:4096:8
+        export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+        export MAMBA_DETERMINISTIC=1 CAUSAL_CONV1D_DETERMINISTIC=1
+        unset TRITON_CACHE_AUTOTUNING
+        mkdir -p "{assets_dir}/logs"
+        export DETERMINISM_EVIDENCE_DIR
+        DETERMINISM_EVIDENCE_DIR=$(mktemp -d "{assets_dir}/logs/determinism-shards.XXXXXX")
+        export DETERMINISM_EVIDENCE_RUN_ID="{environment}-{platforms}-{tag}-$(basename "$DETERMINISM_EVIDENCE_DIR")"
+        EVIDENCE_SCOPE=kernel
+        REQUIRED_VIEWS=(--require-author-checks)
+        if [[ "$BUCKET" == "tests/unit_tests/determinism/correctness/**/*.py" ]]; then
+            EVIDENCE_SCOPE=model
+            REQUIRED_VIEWS=(--require-parallelism)
+        fi
+        export PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:-}} -p tools.determinism.pytest_plugin --determinism-evidence-scope=$EVIDENCE_SCOPE --determinism-branch-coverage --determinism-evidence-dir=$DETERMINISM_EVIDENCE_DIR"
+        trap 'status=$?; cd "$TEST_PATH"; python -m tools.determinism.coverage "$DETERMINISM_EVIDENCE_DIR" --output "{assets_dir}/logs/determinism-coverage.json" --revision "$(git rev-parse HEAD)" --require-verified --forbid-nondeterministic --require-branches "${{REQUIRED_VIEWS[@]}}" || status=1; exit "$status"' EXIT
+    fi
+
     bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
       --tag $TAG \
       --environment $ENVIRONMENT \

@@ -178,6 +178,15 @@ run_test_cmd() {
 # Keep this path identical to exhaustive CI. The installed Testmon plugin is
 # inactive unless one of the selective paths below passes --testmon.
 run_full_tests() {
+    local selection="not experimental and ${MARKER_ARG}"
+    local evidence_args=""
+    if [[ -n "${DETERMINISM_EVIDENCE_DIR:-}" ]]; then
+        # One exhaustive pytest session supplies one shard per rank. Replays are
+        # performed by the tests; separate prod/experimental/repeat sessions must
+        # not append incompatible shards to the same evidence directory.
+        selection="${MARKER_ARG}"
+        evidence_args="--experimental"
+    fi
     for i in $(seq $UNIT_TEST_REPEAT); do
         echo "Running prod test suite."
         CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
@@ -186,9 +195,14 @@ run_full_tests() {
             --source=megatron/core \
             -m pytest \
             -vs \
+            $evidence_args \
             ${IGNORE_ARGS[@]} \
-            -m "'not experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
+            -m "'${selection}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
         run_test_cmd "$CMD"
+
+        if [[ -n "${DETERMINISM_EVIDENCE_DIR:-}" ]]; then
+            break
+        fi
 
         if [[ "$TAG" == "latest" ]]; then
             CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \

@@ -13,6 +13,8 @@ import random
 import numpy as np
 import torch
 
+from tests.unit_tests.determinism.comparison import assert_bit_exact as assert_bit_exact
+
 try:
     # Public-by-import helper used by PyTorch's own test_cuda.py to convert
     # milliseconds to device-cycle counts for torch.cuda._sleep.
@@ -58,47 +60,24 @@ def restore_rng_state(state: dict) -> None:
         get_cuda_rng_tracker().set_states(state["mpu_tracker"])
 
 
-def _strict_equal_with_nan(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Element-wise equality where NaN at the same position counts as equal.
-
-    Plain ``torch.equal`` returns False for any NaN-vs-NaN comparison, which
-    is the correct semantics for value equality but wrong for *determinism*
-    where we only care that two runs produced bit-identical outputs — same
-    NaN pattern included.
-    """
-    if a.shape != b.shape or a.dtype != b.dtype:
-        return False
-    eq = (a == b) | (a.isnan() & b.isnan())
-    return bool(eq.all().item())
-
-
-def assert_bit_exact(out_a, grads_a, out_b, grads_b) -> None:
-    """Assert two (output, grad-dict) pairs are bit-exact equal.
-
-    Uses explicit ``raise AssertionError`` rather than ``assert`` statements:
-    this helper lives outside ``test_*.py`` so pytest does NOT rewrite its
-    asserts, and bare ``assert`` would be stripped under ``python -O`` /
-    ``PYTHONOPTIMIZE=1`` — turning every determinism check into a silent
-    no-op.
-    """
-    if not _strict_equal_with_nan(out_a, out_b):
-        raise AssertionError("Outputs differ between deterministic runs")
-    if grads_a.keys() != grads_b.keys():
-        raise AssertionError("Grad keys differ between runs")
-    for name in grads_a:
-        if not _strict_equal_with_nan(grads_a[name], grads_b[name]):
-            raise AssertionError(f"Grad mismatch for {name}")
-
-
 def collect_grads(modules) -> dict:
     """Snapshot every parameter's gradient across one or more modules.
 
-    Handles BOTH eager autograd (``p.grad``) and Megatron-FSDP
-    (``p.main_grad`` — the adapter ``del``s ``p.grad`` post-backward, so
-    we have to fall through to ``main_grad`` when ``p.grad`` is None).
+    Megatron-FSDP must finish reduction and attach gradients before local
+    optimizer shards can be read. Eager/autograd callers retain the usual
+    ``main_grad``/``grad`` path. No DTensor gather is needed for local replay.
     """
     grads = {}
     for i, m in enumerate(modules):
+        buffer = getattr(m, "param_and_grad_buffer", None)
+        if buffer is not None:
+            m.finish_grad_sync()
+            for name, parameter in buffer.optimizer_named_parameters:
+                grad = parameter.grad
+                if grad is not None:
+                    local = grad.to_local() if hasattr(grad, "to_local") else grad
+                    grads[f"chunk{i}.{name}"] = local.detach().clone()
+            continue
         for name, p in m.named_parameters():
             g = getattr(p, "main_grad", None)
             if g is None:
@@ -305,8 +284,13 @@ def maybe_fsdp_wrap(model: torch.nn.Module, parallelism: dict) -> torch.nn.Modul
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=False,
-        overlap_grad_reduce=False,  # determinism — disable async overlap
-        overlap_param_gather=False,
+        use_megatron_fsdp=True,
+        megatron_fsdp_version=1,
+        data_parallel_sharding_strategy="optim_grads_params",
+        # Megatron-FSDP v1 requires overlap for full parameter/gradient sharding.
+        # collect_grads finishes both operations before snapshotting shards.
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
         use_distributed_optimizer=True,
         bucket_size=40_000_000,
     )

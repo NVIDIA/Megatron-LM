@@ -18,7 +18,10 @@ from tests.unit_tests.determinism.kernels.harness import (
     count_differing_replays,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+pytestmark = [
+    pytest.mark.launch_on_gb200,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
+]
 
 QUIET_NAN = 0x7FC00000
 NEGATIVE_QUIET_NAN = 0xFFC00000 - (1 << 32)  # same bits as an int32 literal

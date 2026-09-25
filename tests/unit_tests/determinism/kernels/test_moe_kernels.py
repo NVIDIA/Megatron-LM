@@ -253,6 +253,8 @@ def test_switch_load_balancing_loss_replays(fused):
 
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.launch_on_gb200
+@pytest.mark.determinism_case(op_id="moe_utils", implementation="test:router_gating_linear")
 def test_router_gating_linear_replays(router_dtype, with_bias):
     seeded()
     inp = torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -269,6 +271,7 @@ def test_router_gating_linear_replays(router_dtype, with_bias):
         replays=3,
         contention=True,
         what="router_gating_linear",
+        configuration={"router_dtype": str(router_dtype), "with_bias": with_bias},
     )
 
 

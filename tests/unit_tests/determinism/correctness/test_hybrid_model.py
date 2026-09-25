@@ -14,7 +14,11 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
-from tests.unit_tests.determinism.configs import HYBRID_CONFIGS, hybrid_base
+from tests.unit_tests.determinism.configs import (
+    HYBRID_CONFIGS,
+    gb200_compatible_configs,
+    hybrid_base,
+)
 
 # Hybrid covers the cheap-and-valuable composites that exercise Mamba +
 # parallelism interactions. The first cell pays a ~60s JIT tax (TE attention
@@ -27,13 +31,16 @@ from tests.unit_tests.determinism.configs import HYBRID_CONFIGS, hybrid_base
 #     hybrid kernels (~60s extra JIT). GPT-model EP cells already cover MoE
 #     + EP determinism; "MoE in the MLP slot of a hybrid pattern" is marginal
 #     (Mamba layers have no MoE).
-_HYBRID_PARALLELISM_CONFIGS = [
-    pytest.param({"PP": 2}, id="pp2"),
-    pytest.param({"PP": 4}, id="pp4"),
-    pytest.param({"TP": 2, "PP": 2}, id="tp2-pp2"),
-    pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
-    pytest.param({"FSDP": 8}, id="fsdp8"),
-]
+_HYBRID_PARALLELISM_CONFIGS = gb200_compatible_configs(
+    [
+        pytest.param({"PP": 2}, id="pp2"),
+        pytest.param({"PP": 4}, id="pp4"),
+        pytest.param({"TP": 2, "PP": 2}, id="tp2-pp2"),
+        pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
+        pytest.param({"FSDP": 4}, id="fsdp4"),
+        pytest.param({"FSDP": 8}, id="fsdp8"),
+    ]
+)  # launch_on_gb200 only for configurations that fit the four-GPU node.
 
 _SEQ_LEN = 32
 _MICRO_BATCH = 2
@@ -68,6 +75,7 @@ _LIFECYCLE = BitExactRunner(
 )
 
 
+@pytest.mark.determinism_model(model_id="hybrid")
 class TestHybridModelDeterminism:
 
     def setup_method(self, method):

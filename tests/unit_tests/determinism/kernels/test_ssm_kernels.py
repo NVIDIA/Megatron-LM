@@ -96,6 +96,10 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.determinism_case(
+    op_id="ssm_mamba2_varlen_kernels", implementation="test:selective_state_update"
+)
 def test_selective_state_update_replays():
     from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 
@@ -129,6 +133,10 @@ def test_selective_state_update_replays():
         replays=4,
         backward=False,
         what="selective_state_update",
+        configuration={
+            "ssm_deterministic_mode": ssm_determinism.use_deterministic_mode(),
+            "dt_softplus": True,
+        },
     )
 
 
