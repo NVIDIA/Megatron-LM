@@ -295,22 +295,32 @@ def test_simplified_main_q_reset_handles_optimizer_load_modes(
     assert len(clear_calls) == (0 if no_load_optim else 1)
 
 
-def test_dsa_reset_on_load_only_initializes_at_the_start_of_a_run():
+def test_dsa_reset_on_load_initializes_only_a_checkpoint_without_an_indexer():
+    """The flag converts a dense checkpoint, so it keys off what the checkpoint holds.
+
+    Keying off args.iteration instead coupled this to --finetune in both directions: it
+    refused to convert under a plain --load, and it happily re-initialised an already-trained
+    indexer when --finetune zeroed the iteration.
+    """
     import megatron.training.training as training
 
-    # The run that starts phase 1 loads with --finetune / --pretrained-checkpoint, which
-    # force iteration 0, so the one-time initialization runs.
-    start = SimpleNamespace(dsa_reset_indexer_on_load=True, iteration=0)
-    assert training._should_reset_dsa_indexer_after_load(start)
+    # A dense checkpoint has no indexer to preserve, so the conversion runs -- and now does
+    # so under a plain --load, without requiring --finetune.
+    dense = SimpleNamespace(dsa_reset_indexer_on_load=True, checkpoint_has_dsa_indexer=False)
+    assert training._should_reset_dsa_indexer_after_load(dense)
 
-    # A requeue resumes from the run's own checkpoint at a non-zero iteration. Re-running
-    # the initialization there would discard the indexer training done so far.
-    resume = SimpleNamespace(dsa_reset_indexer_on_load=True, iteration=250)
-    assert not training._should_reset_dsa_indexer_after_load(resume)
+    # A checkpoint that already carries an indexer is never re-initialised, whether this is a
+    # requeue or a --finetune run that left the flag set in its launch script.
+    trained = SimpleNamespace(dsa_reset_indexer_on_load=True, checkpoint_has_dsa_indexer=True)
+    assert not training._should_reset_dsa_indexer_after_load(trained)
 
-    # Without the flag the initialization never runs, at any iteration.
-    off = SimpleNamespace(dsa_reset_indexer_on_load=False, iteration=0)
+    # Without the flag the initialization never runs.
+    off = SimpleNamespace(dsa_reset_indexer_on_load=False, checkpoint_has_dsa_indexer=False)
     assert not training._should_reset_dsa_indexer_after_load(off)
+
+    # An absent attribute means no checkpoint args were recorded, which is the no-indexer case.
+    missing = SimpleNamespace(dsa_reset_indexer_on_load=True)
+    assert training._should_reset_dsa_indexer_after_load(missing)
 
 
 def test_dsa_reset_on_load_allows_pipeline_stage_without_local_indexer(monkeypatch):
