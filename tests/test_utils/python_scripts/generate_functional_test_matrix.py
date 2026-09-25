@@ -15,7 +15,7 @@ from tests.test_utils.python_scripts import recipe_parser
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 TEST_CASES = pathlib.PurePosixPath("tests/functional_tests/test_cases")
 RECIPES = pathlib.PurePosixPath("tests/test_utils/recipes")
-GITHUB_SCOPES = ("L0", "L1", "L2", "L3")
+GITHUB_SCOPES = ("L0", "L1")
 GPUS_PER_RUNNER = {"dgx_h100": 8, "dgx_gb200": 4}
 
 
@@ -101,7 +101,7 @@ def generate_matrix(
 ) -> list[dict[str, str]]:
     """Keep the current suite and append changed functional cases once each.
 
-    Changed cases bypass scope/cadence selection, but only active GitHub recipe
+    Changed cases bypass scope/cadence selection, but only active L0/L1 recipe
     rows on the requested platform are eligible. Existing selections win when
     a case belongs to multiple tiers, preserving their execution settings.
     Without a PR base reference, selection is unchanged.

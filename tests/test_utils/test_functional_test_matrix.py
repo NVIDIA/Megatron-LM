@@ -86,8 +86,8 @@ def test_pr_adds_changed_cases_across_all_commits_from_merge_base(repo: Path):
         _product("baseline", "L0"),
         _product("full", "L1"),
         _product("nightly", "L2", cadence=["nightly"]),
-        _product("untouched", "L3", cadence=["weekly"]),
-        _product("main_only", "L2", cadence=["nightly"]),
+        _product("untouched", "L1", cadence=["weekly"]),
+        _product("main_only", "L1", cadence=["nightly"]),
         _product("wrong_cadence", "L0", cadence=["nightly"]),
     ]
     for product in products:
@@ -113,10 +113,8 @@ def test_pr_adds_changed_cases_across_all_commits_from_merge_base(repo: Path):
 
     matrix = _matrix(repo, "main")
     assert sorted(matrix, key=lambda row: row["test_case"]) == [
-        _entry("added", "L3", ""),
         _entry("baseline"),
         _entry("full", "L1", ""),
-        _entry("nightly", "L2", ""),
     ]
     # The runtime must resolve each emitted row, including tests whose normal
     # cadence excludes PRs, to exactly one executable workload.
@@ -129,8 +127,9 @@ def test_pr_adds_changed_cases_across_all_commits_from_merge_base(repo: Path):
         assert workloads[0].spec["test_case"] == entry["test_case"]
 
 
-def test_product_edit_adds_only_affected_case(repo: Path):
-    products = [_product("edited", "L2"), _product("untouched", "L2")]
+@pytest.mark.parametrize("scope", ["L1", "L2", "L3"])
+def test_product_edit_adds_only_affected_case(repo: Path, scope):
+    products = [_product("edited", scope), _product("untouched", scope)]
     for name in ("edited", "untouched"):
         _case(repo, name)
     _recipe(repo, products)
@@ -140,7 +139,7 @@ def test_product_edit_adds_only_affected_case(repo: Path):
     _recipe(repo, products)
     _commit(repo)
 
-    assert _matrix(repo, base) == [_entry("edited", "L2", "")]
+    assert _matrix(repo, base) == ([_entry("edited", scope, "")] if scope == "L1" else [])
 
 
 @pytest.mark.parametrize("new_case", [True, False])
@@ -168,25 +167,24 @@ def test_changed_script_only_case_is_added_without_model_config(repo: Path, new_
 
 
 def test_shared_recipe_edit_adds_all_affected_cases(repo: Path):
-    products = [_product("nightly", "L2"), _product("weekly", "L3")]
+    products = [_product("nightly", "L1", cadence=["nightly"]), _product("weekly", "L3")]
     for name in ("nightly", "weekly", "other_recipe"):
         _case(repo, name)
     _recipe(repo, products)
-    _recipe(repo, [_product("other_recipe", "L2")], "recipes/h100/other.yaml")
+    _recipe(repo, [_product("other_recipe", "L1")], "recipes/h100/other.yaml")
     base = _commit(repo)
 
     _recipe(repo, products, script="bash updated_runner.sh")
     _commit(repo)
 
     assert sorted(_matrix(repo, base), key=lambda row: row["test_case"]) == [
-        _entry("nightly", "L2", ""),
-        _entry("weekly", "L3", ""),
+        _entry("nightly", "L1", "")
     ]
 
 
 def test_recipe_comment_does_not_add_unchanged_workloads(repo: Path):
     _case(repo, "nightly")
-    recipe = _recipe(repo, [_product("nightly", "L2")])
+    recipe = _recipe(repo, [_product("nightly", "L1")])
     base = _commit(repo)
     recipe.write_text("# Updated documentation\n" + recipe.read_text())
     _commit(repo)
@@ -196,7 +194,7 @@ def test_recipe_comment_does_not_add_unchanged_workloads(repo: Path):
 
 def test_deleted_cases_are_omitted_and_renamed_cases_use_current_names(repo: Path):
     names = ("deleted", "old_name", "surviving", "deleted_config")
-    products = [_product(name, "L2") for name in names]
+    products = [_product(name, "L1") for name in names]
     for name in names:
         directory = _case(repo, name)
         (directory / "golden_values_dev_dgx_h100.json").write_text("{}\n")
@@ -210,31 +208,31 @@ def test_deleted_cases_are_omitted_and_renamed_cases_use_current_names(repo: Pat
     (root / "deleted_config/model_config.yaml").unlink()
     _recipe(
         repo,
-        [_product(name, "L2") for name in ("deleted", "new_name", "surviving", "deleted_config")],
+        [_product(name, "L1") for name in ("deleted", "new_name", "surviving", "deleted_config")],
     )
     _commit(repo)
 
     assert sorted(_matrix(repo, base), key=lambda row: row["test_case"]) == [
-        _entry("deleted_config", "L2", ""),
-        _entry("new_name", "L2", ""),
-        _entry("surviving", "L2", ""),
+        _entry("deleted_config", "L1", ""),
+        _entry("new_name", "L1", ""),
+        _entry("surviving", "L1", ""),
     ]
 
 
 def test_changed_cases_keep_platform_environment_and_functional_scope_filters(repo: Path):
     products = [
-        _product("eligible", "L2"),
-        _product("broken", "L2-broken"),
+        _product("eligible", "L1"),
+        _product("broken", "L1-broken"),
         _product("gitlab", "mr"),
         _product("gitlab_slim", "mr-slim"),
         _product("smoke", "L0-smoke"),
         _product("unit_scope", "unit-tests"),
-        _product("lts", "L2", environment=["lts"]),
-        _product("gb200", "L2", platforms=["dgx_gb200"]),
+        _product("lts", "L1", environment=["lts"]),
+        _product("gb200", "L1", platforms=["dgx_gb200"]),
     ]
     _recipe(repo, products)
     _recipe(
-        repo, [_product("unit_bucket", "L2")], "recipes/h100/unit-tests.yaml", model="unit-tests"
+        repo, [_product("unit_bucket", "L1")], "recipes/h100/unit-tests.yaml", model="unit-tests"
     )
     for product in products:
         _case(repo, product["test_case"][0])
@@ -248,13 +246,13 @@ def test_changed_cases_keep_platform_environment_and_functional_scope_filters(re
     unit_file.write_text("def test_example(): assert True\n")
     _recipe(
         repo,
-        [_product("unit_bucket", "L2", nodes=[2])],
+        [_product("unit_bucket", "L1", nodes=[2])],
         "recipes/h100/unit-tests.yaml",
         model="unit-tests",
     )
     _commit(repo)
 
-    assert _matrix(repo, base) == [_entry("eligible", "L2", "")]
+    assert _matrix(repo, base) == [_entry("eligible", "L1", "")]
 
 
 @pytest.mark.parametrize(("platform", "gpu_capacity"), [("dgx_h100", 8), ("dgx_gb200", 4)])
@@ -264,9 +262,9 @@ def test_extra_cases_fit_runner_capacity_without_changing_baseline(
     products = [
         # Capacity checks apply only to additions; the existing suite is preserved.
         _product("baseline", "L0", nodes=[2], gpus=[gpu_capacity + 1]),
-        _product("eligible", "L2", nodes=[1], gpus=[gpu_capacity]),
-        _product("multi_node", "L2", nodes=[2], gpus=[gpu_capacity]),
-        _product("too_many_gpus", "L2", nodes=[1], gpus=[gpu_capacity + 1]),
+        _product("eligible", "L1", nodes=[1], gpus=[gpu_capacity]),
+        _product("multi_node", "L1", nodes=[2], gpus=[gpu_capacity]),
+        _product("too_many_gpus", "L1", nodes=[1], gpus=[gpu_capacity + 1]),
     ]
     for product in products:
         product["products"][0]["platforms"] = [platform]
@@ -281,7 +279,7 @@ def test_extra_cases_fit_runner_capacity_without_changing_baseline(
     matrix = generate_functional_test_matrix.generate_matrix(
         scope="L0", platform=platform, cadence="pr", base_ref=base, repo_root=repo
     )
-    assert matrix == [_entry("baseline"), _entry("eligible", "L2", "")]
+    assert matrix == [_entry("baseline"), _entry("eligible", "L1", "")]
 
 
 @pytest.mark.parametrize(
@@ -295,9 +293,12 @@ def test_changed_cases_support_legacy_scope_aliases(repo: Path, legacy_scope, re
     _case(repo, "changed", "MODEL_ARGS: {num_layers: 2}\n")
     _commit(repo)
 
-    assert _matrix(repo, base) == [
-        _entry("changed", resolved_scope, "pr" if resolved_scope == "L0" else "")
-    ]
+    expected = (
+        [_entry("changed", resolved_scope, "pr" if resolved_scope == "L0" else "")]
+        if resolved_scope in ("L0", "L1")
+        else []
+    )
+    assert _matrix(repo, base) == expected
 
 
 @pytest.mark.parametrize("cadence", ["pr", None])
@@ -313,7 +314,10 @@ def test_changed_baseline_case_runs_once_with_baseline_filters(repo: Path, caden
 
 @pytest.mark.parametrize(("scope", "cadence"), [("L0", "pr"), ("L1", None)])
 def test_changed_cases_are_added_with_or_without_full_suite_label(repo: Path, scope, cadence):
-    _recipe(repo, [_product("baseline", scope), _product("changed", "L2", cadence=["nightly"])])
+    changed_scope = "L1" if scope == "L0" else "L0"
+    _recipe(
+        repo, [_product("baseline", scope), _product("changed", changed_scope, cadence=["nightly"])]
+    )
     _case(repo, "baseline")
     _case(repo, "changed")
     base = _commit(repo)
@@ -322,7 +326,7 @@ def test_changed_cases_are_added_with_or_without_full_suite_label(repo: Path, sc
 
     assert _matrix(repo, base, scope=scope, cadence=cadence) == [
         _entry("baseline", scope, cadence or ""),
-        _entry("changed", "L2", ""),
+        _entry("changed", changed_scope, ""),
     ]
 
 
