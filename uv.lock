@@ -2532,7 +2532,7 @@ test = [
 ]
 testmon = [
     { name = "pytest-testmon", specifier = "==2.2.0" },
-    { name = "pyyaml", specifier = "==6.0.3" },
+    { name = "pyyaml" },
 ]
 
 [[package]]

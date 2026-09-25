@@ -164,7 +164,7 @@ test = [
 # Testmon remains inactive unless pytest receives a --testmon option.
 testmon = [
     "pytest-testmon==2.2.0",
-    "pyyaml==6.0.3",
+    "pyyaml",
 ]
 docs = [
     "sphinx",
