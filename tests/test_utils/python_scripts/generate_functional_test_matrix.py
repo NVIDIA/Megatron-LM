@@ -23,12 +23,26 @@ def _git(repo_root: pathlib.Path, *args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=repo_root, text=True)
 
 
+def _recipe_at_ref(repo_root: pathlib.Path, ref: str, path: str) -> list[recipe_parser.dotdict]:
+    manifest = recipe_parser.dotdict(yaml.safe_load(_git(repo_root, "show", f"{ref}:{path}")))
+    return recipe_parser.set_build_dependency(
+        recipe_parser.flatten_workload(recipe_parser.flatten_products(manifest))
+    )
+
+
+def _workload_key(workload: recipe_parser.dotdict) -> tuple:
+    return tuple(
+        workload.spec.get(field)
+        for field in ("model", "test_case", "scope", "environment", "platforms")
+    )
+
+
 def _changed_workloads(
-    repo_root: pathlib.Path, base_ref: str, platform: str
+    repo_root: pathlib.Path, base_ref: str, platform: str, head_ref: str
 ) -> list[recipe_parser.dotdict]:
-    # Compare the entire PR with its merge base, including on reruns and when
-    # the target branch has advanced since the tested merge commit was made.
-    base = _git(repo_root, "merge-base", base_ref, "HEAD").strip()
+    # Identify changes on the PR branch, excluding changes from the target
+    # branch that are only present in the merge commit being tested.
+    base = _git(repo_root, "merge-base", base_ref, head_ref).strip()
     changes = _git(
         repo_root,
         "diff",
@@ -36,7 +50,7 @@ def _changed_workloads(
         "--no-renames",
         "-z",
         base,
-        "HEAD",
+        head_ref,
         "--",
         str(TEST_CASES),
         str(RECIPES),
@@ -54,17 +68,18 @@ def _changed_workloads(
     for recipe_path in sorted((repo_root / RECIPES).glob("**/*.yaml")):
         workloads = recipe_parser.load_and_flatten(str(recipe_path))
         relative_path = recipe_path.relative_to(repo_root).as_posix()
-        previous = None
-        if relative_path in changed_files:
-            if changed_files[relative_path] == "A":
-                previous = []
-            else:
-                manifest = recipe_parser.dotdict(
-                    yaml.safe_load(_git(repo_root, "show", f"{base}:{relative_path}"))
-                )
-                previous = recipe_parser.set_build_dependency(
-                    recipe_parser.flatten_workload(recipe_parser.flatten_products(manifest))
-                )
+        changed_rows = set()
+        if changed_files.get(relative_path) not in (None, "D"):
+            previous = (
+                []
+                if changed_files[relative_path] == "A"
+                else _recipe_at_ref(repo_root, base, relative_path)
+            )
+            changed_rows = {
+                _workload_key(workload)
+                for workload in _recipe_at_ref(repo_root, head_ref, relative_path)
+                if workload not in previous
+            }
 
         for workload in workloads:
             spec = workload.spec
@@ -87,7 +102,7 @@ def _changed_workloads(
                 # Exclude deleted cases. Recipes can launch Python tests directly
                 # without using the model_config.yaml training harness.
                 continue
-            if case in changed_cases or (previous is not None and workload not in previous):
+            if case in changed_cases or _workload_key(workload) in changed_rows:
                 changed.append(workload)
     return changed
 
@@ -98,6 +113,7 @@ def generate_matrix(
     cadence: Optional[str] = None,
     base_ref: Optional[str] = None,
     repo_root: pathlib.Path = REPO_ROOT,
+    head_ref: str = "HEAD",
 ) -> list[dict[str, str]]:
     """Keep the current suite and append changed functional cases once each.
 
@@ -125,7 +141,7 @@ def generate_matrix(
             }
 
     if base_ref:
-        changed = _changed_workloads(repo_root, base_ref, platform)
+        changed = _changed_workloads(repo_root, base_ref, platform, head_ref)
         # Prefer the lowest active tier when the same changed test is
         # registered in multiple scopes. Normal-suite rows above always win.
         for workload in sorted(changed, key=lambda item: GITHUB_SCOPES.index(item.spec["scope"])):
@@ -152,11 +168,17 @@ def generate_matrix(
     help="Platform to select",
 )
 @click.option("--cadence", default=None, help="Existing cadence; empty disables the filter")
-@click.option("--base-ref", default=None, help="Pinned PR base SHA; omit outside PR pushes")
-def main(scope: str, platform: str, cadence: Optional[str], base_ref: Optional[str]) -> None:
+@click.option("--base-ref", default=None, help="Target commit used to find the PR's merge base")
+@click.option("--head-ref", default="HEAD", help="PR branch SHA used to identify its changes")
+def main(
+    scope: str, platform: str, cadence: Optional[str], base_ref: Optional[str], head_ref: str
+) -> None:
     """Print the functional-test matrix as compact GitHub Actions JSON."""
     click.echo(
-        json.dumps(generate_matrix(scope, platform, cadence, base_ref), separators=(",", ":"))
+        json.dumps(
+            generate_matrix(scope, platform, cadence, base_ref, head_ref=head_ref),
+            separators=(",", ":"),
+        )
     )
 
 

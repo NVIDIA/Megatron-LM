@@ -195,7 +195,7 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
-      functional_test_base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+      functional_test_head_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
     steps:
@@ -991,20 +991,20 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
-          fetch-depth: ${{ needs.configure.outputs.functional_test_base_sha != '' && '0' || '1' }}
+          fetch-depth: ${{ needs.configure.outputs.functional_test_head_sha != '' && '0' || '1' }}
 
       - name: Parse functional tests
         id: main
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
-          BASE_SHA: ${{ needs.configure.outputs.functional_test_base_sha }}
+          HEAD_SHA: ${{ needs.configure.outputs.functional_test_head_sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
           ARGS=(--scope "$SCOPE" --cadence "$CADENCE")
           # Full-suite labels select L1; keep their existing test matrix.
-          [ -n "$BASE_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref "$BASE_SHA")
+          [ -n "$HEAD_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref HEAD^1 --head-ref "$HEAD_SHA")
 
           python tests/test_utils/python_scripts/generate_functional_test_matrix.py \
             --platform dgx_h100 \
@@ -1073,20 +1073,20 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
-          fetch-depth: ${{ needs.configure.outputs.functional_test_base_sha != '' && '0' || '1' }}
+          fetch-depth: ${{ needs.configure.outputs.functional_test_head_sha != '' && '0' || '1' }}
 
       - name: Parse functional tests
         id: main
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
-          BASE_SHA: ${{ needs.configure.outputs.functional_test_base_sha }}
+          HEAD_SHA: ${{ needs.configure.outputs.functional_test_head_sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
           ARGS=(--scope "$SCOPE" --cadence "$CADENCE")
           # Full-suite labels select L1; keep their existing test matrix.
-          [ -n "$BASE_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref "$BASE_SHA")
+          [ -n "$HEAD_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref HEAD^1 --head-ref "$HEAD_SHA")
 
           python tests/test_utils/python_scripts/generate_functional_test_matrix.py \
             --platform dgx_gb200 \

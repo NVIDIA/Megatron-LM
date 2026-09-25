@@ -60,9 +60,14 @@ def _recipe(repo: Path, products: list, name: str = "recipes/h100/gpt.yaml", **s
     return path
 
 
-def _matrix(repo: Path, base_ref=None, scope="L0", cadence="pr") -> list:
+def _matrix(repo: Path, base_ref=None, scope="L0", cadence="pr", head_ref="HEAD") -> list:
     return generate_functional_test_matrix.generate_matrix(
-        scope=scope, platform="dgx_h100", cadence=cadence, base_ref=base_ref, repo_root=repo
+        scope=scope,
+        platform="dgx_h100",
+        cadence=cadence,
+        base_ref=base_ref,
+        repo_root=repo,
+        head_ref=head_ref,
     )
 
 
@@ -125,6 +130,38 @@ def test_pr_adds_changed_cases_across_all_commits_from_merge_base(repo: Path):
         workloads = [workload for workload in workloads if workload.type != "build"]
         assert len(workloads) == 1
         assert workloads[0].spec["test_case"] == entry["test_case"]
+
+
+def test_merge_checkout_adds_only_pr_case_and_recipe_changes(repo: Path):
+    names = ("pr_case", "pr_recipe", "main_case", "main_recipe")
+    products = [_product("baseline", "L0")]
+    products += [_product(name, "L1", time_limit=[1800]) for name in names]
+    for name in ("baseline", *names):
+        _case(repo, name)
+    _recipe(repo, products)
+    _commit(repo)
+    _git(repo, "checkout", "-b", "feature")
+
+    _case(repo, "pr_case", "MODEL_ARGS: {num_layers: 2}\n")
+    products[2]["products"][0]["time_limit"] = [3600]
+    _recipe(repo, products)
+    pr_head = _commit(repo)
+
+    _git(repo, "checkout", "main")
+    _case(repo, "main_case", "MODEL_ARGS: {num_layers: 4}\n")
+    products[2]["products"][0]["time_limit"] = [1800]
+    products[4]["products"][0]["time_limit"] = [7200]
+    _recipe(repo, products)
+    _commit(repo)
+    _git(repo, "-c", "commit.gpgsign=false", "merge", "--no-ff", "--no-edit", "feature")
+
+    # CI checks out this merge, but only the PR head determines additions.
+    # Both branches edited the same recipe; main's product must stay excluded.
+    assert _matrix(repo, "HEAD^1", head_ref=pr_head) == [
+        _entry("baseline"),
+        _entry("pr_case", "L1", ""),
+        _entry("pr_recipe", "L1", ""),
+    ]
 
 
 @pytest.mark.parametrize("scope", ["L1", "L2", "L3"])
