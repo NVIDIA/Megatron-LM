@@ -313,7 +313,7 @@ def test_changed_baseline_case_runs_once_with_baseline_filters(repo: Path, caden
 
 
 @pytest.mark.parametrize(("scope", "cadence"), [("L0", "pr"), ("L1", None)])
-def test_changed_cases_are_added_with_or_without_full_suite_label(repo: Path, scope, cadence):
+def test_changed_cases_are_added_only_without_full_suite_label(repo: Path, scope, cadence):
     changed_scope = "L1" if scope == "L0" else "L0"
     _recipe(
         repo, [_product("baseline", scope), _product("changed", changed_scope, cadence=["nightly"])]
@@ -324,10 +324,10 @@ def test_changed_cases_are_added_with_or_without_full_suite_label(repo: Path, sc
     _case(repo, "changed", "MODEL_ARGS: {num_layers: 2}\n")
     _commit(repo)
 
-    assert _matrix(repo, base, scope=scope, cadence=cadence) == [
-        _entry("baseline", scope, cadence or ""),
-        _entry("changed", changed_scope, ""),
-    ]
+    expected = [_entry("baseline", scope, cadence or "")]
+    if scope == "L0":
+        expected.append(_entry("changed", changed_scope, ""))
+    assert _matrix(repo, base if scope == "L0" else None, scope=scope, cadence=cadence) == expected
 
 
 @pytest.mark.parametrize(

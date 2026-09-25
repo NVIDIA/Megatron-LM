@@ -1003,7 +1003,8 @@ jobs:
           export PYTHONPATH=$(pwd)
 
           ARGS=(--scope "$SCOPE" --cadence "$CADENCE")
-          [ -n "$BASE_SHA" ] && ARGS+=(--base-ref "$BASE_SHA")
+          # Full-suite labels select L1; keep their existing test matrix.
+          [ -n "$BASE_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref "$BASE_SHA")
 
           python tests/test_utils/python_scripts/generate_functional_test_matrix.py \
             --platform dgx_h100 \
@@ -1084,7 +1085,8 @@ jobs:
           export PYTHONPATH=$(pwd)
 
           ARGS=(--scope "$SCOPE" --cadence "$CADENCE")
-          [ -n "$BASE_SHA" ] && ARGS+=(--base-ref "$BASE_SHA")
+          # Full-suite labels select L1; keep their existing test matrix.
+          [ -n "$BASE_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref "$BASE_SHA")
 
           python tests/test_utils/python_scripts/generate_functional_test_matrix.py \
             --platform dgx_gb200 \

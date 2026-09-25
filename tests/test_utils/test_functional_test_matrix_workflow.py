@@ -20,8 +20,9 @@ def jobs():
 @pytest.mark.parametrize("platform", ["h100", "gb200"])
 @pytest.mark.parametrize("base_sha", ["", "a" * 40])
 @pytest.mark.parametrize("cadence", ["", "pr"])
+@pytest.mark.parametrize("scope", ["L0", "L1"])
 def test_functional_parse_shell_passes_selection_and_publishes_matrix(
-    tmp_path, jobs, platform, base_sha, cadence
+    tmp_path, jobs, platform, base_sha, cadence, scope
 ):
     step = next(
         step
@@ -54,7 +55,7 @@ def test_functional_parse_shell_passes_selection_and_publishes_matrix(
         env={
             **os.environ,
             "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
-            "SCOPE": "L0",
+            "SCOPE": scope,
             "CADENCE": cadence,
             "BASE_SHA": base_sha,
             "GITHUB_OUTPUT": str(output),
@@ -62,10 +63,10 @@ def test_functional_parse_shell_passes_selection_and_publishes_matrix(
     )
     assert result.returncode == 0, result.stderr
     assert json.loads((tmp_path / "arguments.json").read_text()) == {
-        "scope": "L0",
+        "scope": scope,
         "platform": f"dgx_{platform}",
         "cadence": cadence,
-        "base_ref": base_sha or None,
+        "base_ref": (base_sha or None) if scope == "L0" else None,
     }
     name, value = output.read_text().strip().split("=", 1)
     assert name == f"integration-tests-{platform}"
