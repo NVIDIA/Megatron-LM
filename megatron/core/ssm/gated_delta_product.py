@@ -1048,7 +1048,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert self.cp is not None
             y = self.cp.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
-            z = rearrange(z, "b l d -> l b d").contiguous()
+            z = rearrange(z, "b l d -> l b d")
+            # With one batch item and CP1, the gated norm's flattening keeps this
+            # unit-column-stride view. Let its saved gate share the input-projection
+            # checkpoint's storage so that discarding/restoring z also covers the
+            # norm. A contiguous copy here would remain live through backward.
+            # Other layouts keep their existing materialization/CP behavior.
+            keep_gate_view = (
+                self.recompute_in_proj and self.pg_collection.cp.size() == 1 and z.shape[1] == 1
+            )
+            if not keep_gate_view:
+                z = z.contiguous()
             if not self.chunkwise_context_parallel:
                 z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
