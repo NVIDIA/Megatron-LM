@@ -300,6 +300,120 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
+      - name: Select native wheel cache
+        id: uv_cache
+        if: inputs.is-maintainer && !inputs.lts
+        shell: bash
+        env:
+          FROM_IMAGE_NAME: ${{ steps.base-image.outputs.version }}
+          REGISTRY: ${{ matrix.registry }}
+          CACHE_SCOPE: ${{ steps.cache_keys.outputs.key }}
+          BASELINE_SCOPE: ${{ steps.cache_keys.outputs.baseline }}
+          PR_NUMBER: ${{ steps.cache_keys.outputs.pr-number }}
+          PUBLISH_TARGET_CACHE: ${{ inputs.publish-target-cache }}
+        run: |
+          # Pin the base as well as fingerprinting it: mutable tags must not select
+          # one ABI for the key and a different ABI when the image is built.
+          BASE_DIGEST=$(docker buildx imagetools inspect "$FROM_IMAGE_NAME" --format '{{.Manifest.Digest}}')
+          [[ "$BASE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          BASE_IMAGE="${FROM_IMAGE_NAME%@*}@${BASE_DIGEST}"
+          # Fingerprint the locked build tools; uv keys individual native wheels
+          # by source/version, so unrelated runtime updates can reuse them.
+          BUILD_TOOLS=$(python - <<'PYTHON'
+          import json
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text())
+          packages = tomllib.loads(Path("uv.lock").read_text())["package"]
+          root = next(p for p in packages if p["name"] == project["project"]["name"])
+          pending = [d["name"] for d in root["dev-dependencies"]["build"]]
+          selected = set()
+          while pending:
+              name = pending.pop()
+              if name in selected or name in {"torch", "torchvision", "triton"}:
+                  continue
+              matches = [p for p in packages if p["name"] == name]
+              assert matches, f"Missing locked build dependency: {name}"
+              selected.add(name)
+              for package in matches:
+                  pending.extend(d["name"] for d in package.get("dependencies", []))
+                  for dependencies in package.get("optional-dependencies", {}).values():
+                      pending.extend(d["name"] for d in dependencies)
+          settings = dict(project["tool"]["uv"])
+          settings.pop("sources", None)
+          settings["dependency-metadata"] = [
+              m for m in settings.get("dependency-metadata", []) if m["name"] in selected
+          ]
+          print(json.dumps({"settings": settings,
+                            "build": project["dependency-groups"]["build"],
+                            "packages": [p for p in packages if p["name"] in selected]},
+                           sort_keys=True))
+          PYTHON
+          )
+          ABI=$({
+            printf '%s\n' "$BASE_IMAGE" "$(uname -m)" "$NVTE_CUDA_ARCHS" "$BUILD_TOOLS"
+            sha256sum docker/Dockerfile.ci.dev docker/common/install_nccl.sh \
+              .github/workflows/_build_ci_container.yml
+          } | sha256sum | cut -c1-32)
+          SCOPE_HASH=$(printf '%s' "$CACHE_SCOPE" | sha256sum | cut -c1-16)
+          BASELINE_HASH=$(printf '%s' "$BASELINE_SCOPE" | sha256sum | cut -c1-16)
+          CACHE_IMAGE="${REGISTRY}/megatron-lm:uvcache-v2-${SCOPE_HASH}-${ABI}"
+          BASELINE_IMAGE="${REGISTRY}/megatron-lm:uvcache-v2-${BASELINE_HASH}-${ABI}"
+          DONOR=""
+          for candidate in "$CACHE_IMAGE" "$BASELINE_IMAGE"; do
+            if digest=$(docker buildx imagetools inspect "$candidate" --format '{{.Manifest.Digest}}' 2>/dev/null); then
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+              DONOR="${candidate}@${digest}"
+              break
+            fi
+          done
+          # PRs publish only their own snapshots. Shared baseline publication is
+          # reserved for the existing target-branch cache-population workflow.
+          PUBLISH=false
+          if [ "$PR_NUMBER" != "0" ] || [ "$PUBLISH_TARGET_CACHE" = "true" ]; then
+            PUBLISH=true
+          fi
+          {
+            echo "base-image=$BASE_IMAGE"
+            echo "id=mcore-uv-$ABI"
+            echo "donor=$DONOR"
+            echo "image=$CACHE_IMAGE"
+            echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore native wheel cache
+        id: uv_cache_restore
+        if: steps.uv_cache.outputs.donor != ''
+        continue-on-error: true
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          file: ./docker/Dockerfile.ci.dev
+          context: .
+          target: uv-cache-restore
+          no-cache-filters: uv-cache-restore
+          build-args: |
+            FROM_IMAGE_NAME=${{ steps.uv_cache.outputs.base-image }}
+            UV_CACHE_IMAGE=${{ steps.uv_cache.outputs.donor }}
+            UV_CACHE_ID=${{ steps.uv_cache.outputs.id }}
+            NVTE_CUDA_ARCHS=${{ env.NVTE_CUDA_ARCHS }}
+
+      - name: Select native wheel cache mount
+        id: uv_cache_mount
+        if: steps.uv_cache.outputs.id != ''
+        shell: bash
+        env:
+          CACHE_ID: ${{ steps.uv_cache.outputs.id }}
+          RESTORE_OUTCOME: ${{ steps.uv_cache_restore.outcome }}
+        run: |
+          if [ "$RESTORE_OUTCOME" = "failure" ]; then
+            # A failed copy can leave partial files. Use fresh mounts rather than
+            # reading that partial cache during the normal source build.
+            CACHE_ID="${CACHE_ID}-cold-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "::warning::Wheel cache restore failed; compiling with an empty cache"
+          fi
+          echo "id=$CACHE_ID" >> "$GITHUB_OUTPUT"
+
       - name: Select cache donor
         id: cache_from
         shell: bash
@@ -335,15 +449,38 @@ jobs:
           context: .
           target: main
           build-args: |
-            FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
+            FROM_IMAGE_NAME=${{ steps.uv_cache.outputs.base-image || steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
             ${{ !inputs.lts && format('NVTE_CUDA_ARCHS={0}', env.NVTE_CUDA_ARCHS) || '' }}
+            ${{ steps.uv_cache_mount.outputs.id && format('UV_CACHE_ID={0}', steps.uv_cache_mount.outputs.id) || '' }}
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
           tags: |
             ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
             ${{ matrix.registry }}/megatron-lm:${{ inputs.source-sha }}-${{ matrix.cloud }}
+
+      - name: Publish native wheel cache
+        if: steps.uv_cache.outputs.publish == 'true'
+        # Cache export is an optimization; an empty mount after a layer hit or
+        # an unavailable registry must not fail an otherwise successful image.
+        continue-on-error: true
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          file: ./docker/Dockerfile.ci.dev
+          context: .
+          target: uv-cache
+          no-cache-filters: uv-cache-export
+          provenance: false
+          sbom: false
+          push: true
+          build-args: |
+            FROM_IMAGE_NAME=${{ steps.uv_cache.outputs.base-image }}
+            IMAGE_TYPE=dev
+            UV_CACHE_ID=${{ steps.uv_cache_mount.outputs.id }}
+            NVTE_CUDA_ARCHS=${{ env.NVTE_CUDA_ARCHS }}
+          tags: |
+            ${{ steps.uv_cache.outputs.image }}
 
       - name: Verify exported cache
         if: inputs.verify-cache
