@@ -17,6 +17,7 @@ import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
+    CoordinatorState,
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
@@ -166,6 +167,43 @@ def test_kv_handoff_rejects_legacy_single_frame_payload():
     legacy = [Headers.SUBMIT_REQUEST_WITH_KV.value, 1, [1, 2], {}, {}, []]
     HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV](coordinator, b"client-0", legacy, [])
     assert coordinator.sent == []
+
+
+@pytest.mark.skipif(not HAVE_ZMQ, reason="requires pyzmq")
+@pytest.mark.parametrize(
+    "initial_state, state_after_resume, resume_broadcast",
+    [
+        (CoordinatorState.RUNNING, CoordinatorState.RUNNING, False),
+        (CoordinatorState.SUSPENDED, CoordinatorState.PAUSED, True),
+    ],
+)
+def test_coordinator_initial_state_decides_whether_resume_is_honored(
+    initial_state, state_after_resume, resume_broadcast
+):
+    """Engines built suspended launch the coordinator SUSPENDED: from RUNNING the same
+    RESUME is dropped, which would leave every engine waiting forever."""
+    parent, child = multiprocessing.Pipe()
+    coordinator = DataParallelInferenceCoordinator(
+        child,
+        data_parallel_size=0,
+        tokenizer=DummyTokenizer(),
+        max_requests=1,
+        hostname="127.0.0.1",
+        initial_state=initial_state,
+    )
+    try:
+        assert parent.recv().startswith("tcp://")
+        assert coordinator.state is initial_state
+
+        coordinator.known_clients.add(b"client-0")
+        broadcasts = []
+        coordinator._broadcast_to_engines = broadcasts.append
+        HANDLERS[Headers.RESUME](coordinator, b"client-0", [Headers.RESUME.value], [])
+        assert coordinator.state is state_after_resume
+        assert broadcasts == ([[Headers.RESUME.value]] if resume_broadcast else [])
+    finally:
+        coordinator.stop()
+        parent.close()
 
 
 class DummyTokenizer:
