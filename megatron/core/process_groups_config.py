@@ -141,8 +141,14 @@ class ProcessGroupCollection:
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
-    # _GTP_WEIGHT_REMAT_GROUP
+    # _GTP_WEIGHT_REMAT_GROUP - the axis a dense GTP weight is sharded over (folds CP in under
+    # gtp_remat_fold_cp).
     gtp_remat: torch.distributed.ProcessGroup = field(init=False)
+
+    # _GTP_WEIGHT_REMAT_GROUP_NO_CP - CP-free gtp_remat axis, for non-GTP params whose CP
+    # contribution was already reduced by their dp_cp bucket (finalize_model_grads' replicated
+    # AVG). Identical to `gtp_remat` when CP is inactive.
+    gtp_remat_no_cp: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_GTP_WEIGHT_REMAT_GROUP
     expt_gtp_remat: torch.distributed.ProcessGroup = field(init=False)
@@ -317,6 +323,9 @@ class ProcessGroupCollection:
             ),
             'gtp_remat': partial(
                 parallel_state.get_gtp_weight_remat_group, check_initialized=False
+            ),
+            'gtp_remat_no_cp': partial(
+                parallel_state.get_gtp_weight_remat_group_no_cp, check_initialized=False
             ),
             'expt_gtp_remat': partial(
                 parallel_state.get_expert_gtp_weight_remat_group, check_initialized=False

@@ -22,12 +22,16 @@ from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_world_size,
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
-    get_gtp_weight_remat_rank,
-    get_gtp_weight_remat_world_size,
+    get_gtp_weight_remat_group,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.tensor_observation import suspend_tensor_observations
-from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    is_te_min_version,
+    safely_set_viewless_tensor_data,
+)
 
 # ---------------------------------------------------------------------------
 # C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
@@ -482,11 +486,14 @@ def model_parallel_cuda_manual_seed(
     if etp_rank is None:
         etp_rank = get_expert_tensor_parallel_rank()
     if gtp_remat_rank is None:
-        gtp_remat_rank = get_gtp_weight_remat_rank()
+        # FOLDED group (not get_gtp_weight_remat_rank, which is CP-free): CP peers hold
+        # different shards of the cp x gtp_remat-cut weight and must draw different seeds.
+        gtp_remat_rank = get_pg_rank(get_gtp_weight_remat_group(check_initialized=False))
     if egtp_remat_rank is None:
         egtp_remat_rank = get_expert_gtp_weight_remat_rank()
     if gtp_remat_world_size is None:
-        gtp_remat_world_size = get_gtp_weight_remat_world_size()
+        # Folded size: under gtp_remat_fold_cp at GTP 1 the CP-free size is 1, yet cp shards exist.
+        gtp_remat_world_size = get_pg_size(get_gtp_weight_remat_group(check_initialized=False))
     if egtp_remat_world_size is None:
         egtp_remat_world_size = get_expert_gtp_weight_remat_world_size()
     # 2718 is just for fun and any POSITIVE value will work.

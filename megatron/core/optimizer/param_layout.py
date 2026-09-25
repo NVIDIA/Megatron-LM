@@ -58,12 +58,39 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        excludes_cp_from_bucket: True for GTP-managed params whose own weight-materialization
+            group already spans CP (double-counts if the bucket collective also sums it) —
+            uses the plain replicate DP group instead of DP+CP.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    excludes_cp_from_bucket: bool = False
+
+
+def resolve_buffer_dp_world_size(
+    buffer_key: BufferKey,
+    params: List[torch.nn.Parameter],
+    data_parallel_world_size: int,
+    expert_data_parallel_world_size: Optional[int] = None,
+) -> int:
+    """Size of the data-parallel group a buffer's grads are sharded over; must agree with the
+    group DDP assigns to the same buffer. excludes_cp_from_bucket buffers drop the CP factor via
+    the params' own ``gtp_bucket_dp_divisor`` stamp."""
+    if buffer_key.is_expert_parallel:
+        if expert_data_parallel_world_size is not None:
+            return expert_data_parallel_world_size
+        return data_parallel_world_size
+    if buffer_key.excludes_cp_from_bucket:
+        # All folded params share one divisor (the CP size): folding is all-or-nothing.
+        divisor = params[0].gtp_bucket_dp_divisor
+        assert (
+            data_parallel_world_size % divisor == 0
+        ), f"DP world size {data_parallel_world_size} not divisible by CP divisor {divisor}."
+        return data_parallel_world_size // divisor
+    return data_parallel_world_size
 
 
 @dataclass

@@ -36,7 +36,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
       - [Per-microbatch schedule](#per-microbatch-schedule)
       - [Communication volume breakdown](#communication-volume-breakdown)
       - [GTP + NVFP4 (native NVFP4 param)](#gtp--nvfp4-native-nvfp4-param)
-    - [1.4 Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
+    - [1.4 Composability with TP / SP / CP / EP / DDP](#14-composability-with-tp--sp--cp--ep--ddp)
     - [1.5 Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
     - [1.6 Optimizer-agnostic (Adam + Muon)](#16-optimizer-agnostic-adam--muon)
     - [1.7 Scaling](#17-scaling)
@@ -74,6 +74,10 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
       - [Where padding lands](#where-padding-lands)
       - [Why pad this way](#why-pad-this-way)
       - [Trade-off](#trade-off)
+    - [3.8 GTP\_remat + Context Parallelism (CP)](#38-gtp_remat--context-parallelism-cp)
+      - [How folding works](#how-folding-works)
+      - [What folding requires](#what-folding-requires)
+      - [Unchanged by folding](#unchanged-by-folding)
   - [4. Testing](#4-testing)
 
 ---
@@ -160,7 +164,7 @@ NVFP4 GTP_remat keeps each shard as a native `NVFP4Tensor` and all-gathers it as
 - **`--fp4-param-gather` is mandatory.** Without it NVFP4 GTP falls back to a BF16 all-gather that trips TE's scaling-mode assert (`DELAYED` vs `NVFP4`); `validate_args` enforces it and raises early.
 - **Mixed-precision models (per-layer quant config).** A model may assign recipes per layer — e.g. NVFP4 default, MXFP8 for `mixer.out_proj`, BF16 for attention (`linear_qkv`/`linear_proj`) and latent MLPs. NVFP4 params gather natively as above. **MXFP8 params cannot be native-param-gathered** — the DDP param buffer has no MXFP8 storage remap (`replace_raw_data` is unimplemented for `MXFP8Tensor`, unlike NVFP4's packed-rowwise remap), so they are all-gathered in **BF16** and re-quantized with the layer's **own MXFP8 quantizer** inside the TE backward dgrad path (not the global delayed recipe). BF16-recipe layers gather BF16 unchanged.
 
-### 1.4 Composability with TP / SP / EP / DDP
+### 1.4 Composability with TP / SP / CP / EP / DDP
 
 - **TP** (intra-layer): orthogonal axis — GTP_remat shards `out_features` regardless of TP's parallel mode (column or row). 2D grid naturally formed via `tp_group × gtp_remat_group`.
 
@@ -173,6 +177,7 @@ NVFP4 GTP_remat keeps each shard as a native `NVFP4Tensor` and all-gathers it as
 > | **duplicated** (`fc1_latent_proj`, `fc2_latent_proj`) | none (weight replicated across TP) | `out_features` | GTP_remat only → `out_features/GTP_remat`; full output reconstructed via AG. Requires `--gtp-remat-opt-in-modules moe_latent_proj`. |
 
 - **SP** (sequence-parallel): transparent — GTP_remat operates at weight dim, SP at sequence dim.
+- **CP** (context-parallel): supported, but not transparent — a CP rank produces a partial wgrad for the whole weight. With `--gtp-remat-fold-cp`, GTP_remat **absorbs** the CP axis into its own weight-sharding group rather than running beside it. The DDP bucket and the DCP writer election then have to exclude CP to avoid double-counting it. See §3.8.
 - **EP** (MoE): `GroupedLinear` with GTP_remat → each routed expert sharded across `EXPERT_GTP_WEIGHT_REMAT_GROUP`, independent of EP. MoE AllToAll (HybridEP/NVLink) runs independently of GTP_remat AG/RS (NCCL/IB).
 - **DDP**: GTP_remat bypasses autograd's grad accumulator (async RS returns `None`; `_finalize_wgrad` accumulates directly into `main_grad`). DDP registers its grad-ready hook on GTP_remat params via `register_grad_accum_hook` (not autograd's `AccumulateGrad`); GTP_remat invokes it from `_finalize_wgrad` (eager path) and `_CudagraphReplayNode.backward` (captured path) **after** the wgrad lands in `main_grad`, so a bucket's DDP reduce-scatter runs strictly after every GTP_remat param's `{RS → main_grad add}` — never over a stale `main_grad` — and DDP↔GTP_remat NIC deadlock at IB scale is avoided. See §3.2.
 
@@ -228,7 +233,7 @@ See [§3.3 Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp) f
 
 ## 2. Usage
 
-GTP_remat is enabled through two CLI flags on Megatron's training launcher; everything else (process-group construction, parameter slicing, prefetch chain wiring, optimizer routing) is automatic once the flags are set.
+GTP_remat is enabled through two CLI flags on Megatron's training launcher (plus `--gtp-remat-fold-cp` to also shard dense weights over CP); everything else (process-group construction, parameter slicing, prefetch chain wiring, optimizer routing) is automatic once the flags are set.
 
 ### 2.1 Knob summary
 
@@ -238,6 +243,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 |---|---|---|---|---|
 | `--tensor-parallel-num-weight-shards` | **Required** | Always, to activate dense GTP | — | Total TP×GTP_remat shards per dense weight; GTP_remat degree = value ÷ TP. Must be ≥ TP and divisible by it. [§2.2](#22-required-flags) |
 | `--expert-tensor-parallel-num-weight-shards` | **Required** | MoE models (to shard routed-expert weights) | — | Total ETP×EGTP_remat shards per expert weight; EGTP_remat degree = value ÷ ETP. Independent of dense axis. [§2.2](#22-required-flags) |
+| `--gtp-remat-fold-cp` | **Optional** | CP > 1, to also shard dense weights over CP | off | Folds CP into the dense GTP_remat weight group (`cp × gtp_remat` shards per weight), at any GTP_remat size — at GTP_remat 1 it alone activates dense GTP, sharding over CP. Off: CP is reduced by the ordinary `dp_cp` bucket, giving a clean with/without-folding baseline. No effect when CP is 1; expert weights unaffected. [§3.8](#38-gtp_remat--context-parallelism-cp) |
 | `--gtp-remat-reduce-scatter-with-fp32-accumulation` | **Optional** | BF16 wgrads **and** GTP_remat axis ≥ 4 | off | Replaces the ring RS with an all-to-all + local FP32 sum to eliminate per-hop rounding error. Auto-bypassed at axis size ≤ 2. [§2.6](#26-fp32-accumulation-wgrad-reduce-scatter-optional) |
 | `--gtp-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the dense gtp_remat wgrad reduce-scatter path. Takes precedence over fp32-accum on its group; incompatible with `--disable-symmetric-registration`. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
 | `--gtp-expert-remat-nccl-ub` | **Optional** | For enabling symmetric-memory NCCL kernels on supported systems | off | Enables symmetric memory registration for the routed-expert egtp_remat wgrad reduce-scatter path. [§2.7](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional) |
@@ -874,6 +880,39 @@ Case A is what §1.3's "tail slice" framing describes for the reassembled tensor
 - **Negligible in the common case, severe in the small-`dim0` one.** That fraction is ~0 when `dim0 ≫ pad_for_alignment × gtp_remat_size`, but Case B's `dim0 = 1` weight pads to 64 rows — **98% (63/64) padding**, with 3 of its 4 per-rank shards pure padding and contributing nothing.
 - **No automatic mitigation.** Choosing `gtp_remat_size` to divide (or nearly divide) a weight's real `dim0` avoids this, but GTP does not warn when it doesn't — it's on the caller to notice.
 - **A bookkeeping tax on every raw-buffer consumer.** Checkpointing, `num_zeros`, and the wgrad ring all have to explicitly account for padding rather than assume a shard's buffer is fully real.
+
+### 3.8 GTP_remat + Context Parallelism (CP)
+
+A CP rank computes a **partial wgrad for the whole weight**, like a DP rank. **`--gtp-remat-fold-cp`** (default **off**) chooses where that partial wgrad is reduced, so the same config gives a clean with/without-folding comparison:
+
+| | **off** (default) | **on** |
+|---|---|---|
+| Dense weight group | `gtp_remat` | **`cp × gtp_remat`** (at GTP_remat 1: the CP group) |
+| CP's wgrad summed by | `dp_cp` DDP bucket | the weight group's reduce-scatter |
+| CP peers in a checkpoint | replicas of one shard | holders of **different** shards |
+
+No effect when CP = 1; **expert weights never fold** (the expert grid has no CP axis). With it on, dense GTP is active even at GTP_remat 1 — config-driven code checks `ModelParallelConfig.dense_gtp_remat_active`.
+
+#### How folding works
+
+- **One group, no new accessor.** The folded group *is* `get_gtp_weight_remat_group()` / `pg_collection.gtp_remat` (from `get_ranks('cp-gtp_remat')`, NCCL key still `gtp_remat`), so weight-sharding consumers stay CP-unaware. Rank order `tp-cp-gtp_remat-…` keeps it contiguous.
+- **CP-free values stay CP-free.** `gtp_weight_remat_size`, `get_gtp_weight_remat_world_size()` / `_rank()` and batch accounting exclude CP. `get_gtp_weight_remat_group_no_cp()` serves only the replicated-grad AVG in `finalize_model_grads`, which must not count CP twice.
+- **Per-param stamps.** `param.gtp_bucket_dp_divisor` (the folded CP degree; 1 for expert / explicit-grid groups) and `param.excludes_cp_from_bucket` drive everything below.
+
+#### What folding requires
+
+| Concern | Rule (and what breaks without it) | Where |
+|---|---|---|
+| **DDP bucket** | Folded params get their own buffer, reduced over CP-free `dp` with `1/dp` scaling — else CP is summed twice. | `BufferKey.excludes_cp_from_bucket`, `resolve_buffer_dp_world_size` |
+| **Checkpoint writer** | Elect over `dp` when folded, `dp_cp` when not — else shards lose their writer (folded) or get two (unfolded). | `gtp_replica_rank` |
+| **Optimizer ckpt keys** | `dp_reshardable` keys of folded buffers get **`.cp_rank_{i}`** (from group membership) — else CP ranks' FP32 masters / Adam moments alias. `fully_reshardable` is unaffected. | `sharded_param_state_dp_reshardable` |
+| **Init seeds** | Seed from the **folded** group rank — else CP peers draw identical shards (at GTP_remat 1, init crashes). | `model_parallel_cuda_manual_seed` |
+
+#### Unchanged by folding
+
+- Activation memory and the sequence split (plain CP).
+- `tensor_parallel_num_weight_shards` (still `tp × gtp_remat`), batch accounting, `args.data_parallel_size`.
+- **Gradients**: `test_fold_cp_grad_parity` matches both modes to an exact fp32 reference (CP4×GTP_remat1, CP2×GTP_remat2), up to bf16 rounding.
 
 ## 4. Testing
 

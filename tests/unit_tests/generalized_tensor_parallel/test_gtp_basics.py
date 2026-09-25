@@ -2115,3 +2115,135 @@ class TestWgradAccumBatchScheduleGate:
     )
     def test_gate(self, monkeypatch, schedule, enabled):
         assert self._tag_output_layer(monkeypatch, schedule) is enabled
+
+
+def _worker_gtp_cp_init_seeds_distinct(rank, world_size, port, cp_size, gtp_remat_size):
+    """Every shard of a CP-folded GTP weight must draw DIFFERENT init values.
+
+    A dense GTP weight is cut into cp * gtp_remat shards, and every other seed ingredient is
+    CP-invariant, so seeding off the CP-free gtp_remat rank hands two CP peers holding different
+    shards the same seed -- the logical weight comes out with cp-fold repeated blocks.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.random import (
+        get_cuda_rng_tracker,
+        get_gtp_remat_rng_tracker_name,
+        model_parallel_cuda_manual_seed,
+    )
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=cp_size,
+        gtp_remat_size=gtp_remat_size,
+        gtp_remat_fold_cp=True,
+    )
+    try:
+        model_parallel_cuda_manual_seed(1234)
+        merged = ps.get_gtp_weight_remat_group()
+        assert merged.size() == cp_size * gtp_remat_size
+
+        # Draw this rank's shard exactly the way the pre-sharded TE init does.
+        with get_cuda_rng_tracker().fork(get_gtp_remat_rng_tracker_name(is_expert=False)):
+            local = torch.randn(8, device="cuda")
+
+        gathered = [torch.empty_like(local) for _ in range(merged.size())]
+        dist.all_gather(gathered, local, group=merged)
+        for i in range(len(gathered)):
+            for j in range(i + 1, len(gathered)):
+                assert not torch.equal(gathered[i], gathered[j]), (
+                    f"shards {i} and {j} of the cp({cp_size}) x gtp_remat({gtp_remat_size}) "
+                    "group drew identical init values"
+                )
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
+class TestGTPCPInitSeeds:
+    """Weight init must key off the CP-expanded sharding group."""
+
+    # (4, 1): GTP 1 -- the CP-free size is 1 but the folded group has 4 shards.
+    @pytest.mark.parametrize("cp_size,gtp_remat_size", [(2, 2), (2, 4), (4, 2), (4, 1)])
+    def test_gtp_cp_init_seeds_distinct(self, cp_size, gtp_remat_size):
+        world_size = cp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_gtp_cp_init_seeds_distinct, world_size, cp_size, gtp_remat_size)
+
+
+def _worker_fold_cp_grad_parity(rank, world_size, port, cp_size, gtp_remat_size):
+    """gtp_remat_fold_cp must not change the math. Same weight, same per-rank inputs:
+    knob off reduces CP in the ordinary DDP bucket; knob on shards the weight over CP and
+    reduces via the GTP_remat reduce-scatter. Both must match the exact fp32 grad to within one
+    bf16 step (the folded path rounds a wider bf16 reduce-scatter, so compare each to the
+    reference rather than to each other); a scaling bug would be off by a whole factor."""
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    IN_F, OUT_F = 64, 128  # OUT_F divisible by pad_for_alignment * cp: no GTP padding.
+    inputs = []
+    for r in range(world_size):  # every rank's input, for the reference
+        torch.manual_seed(1000 + r)
+        inputs.append(torch.randn(16, IN_F, dtype=torch.bfloat16, device="cuda"))
+    # loss = sum(x W^T) -> dW = column sums of x, broadcast over rows; mean over all ranks.
+    ref = (sum(x.float().sum(0) for x in inputs) / world_size).expand(OUT_F, IN_F)
+    grads = {}
+    for fold in (False, True):
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel(
+            context_parallel_size=cp_size, gtp_remat_size=gtp_remat_size, gtp_remat_fold_cp=fold
+        )
+        try:
+            model_parallel_cuda_manual_seed(42)
+            torch.manual_seed(0)
+            full_w = torch.randn(OUT_F, IN_F, dtype=torch.bfloat16, device="cuda")
+            layer = te.Linear(IN_F, OUT_F, bias=False, params_dtype=torch.bfloat16, device="cuda")
+            with torch.no_grad():
+                layer.weight.copy_(full_w)
+            group = ps.get_gtp_weight_remat_group()
+            assert group.size() == (cp_size if fold else 1) * gtp_remat_size
+            if group.size() > 1:
+                layer.gtp_remat_size = group.size()
+                wrap_module_params_gtp(layer, layer.weight_names, group)
+            config = TransformerConfig(
+                num_attention_heads=1,
+                num_layers=1,
+                hidden_size=IN_F,
+                context_parallel_size=cp_size,
+                gtp_remat_fold_cp=fold,
+            )
+            ddp = DistributedDataParallel(
+                config,
+                DistributedDataParallelConfig(grad_reduce_in_fp32=True, overlap_grad_reduce=False),
+                torch.nn.Sequential(layer),
+            )
+            ddp.zero_grad_buffer()
+            ddp.module(inputs[rank]).float().sum().backward()
+            ddp.finish_grad_sync()
+            grad = layer.weight.main_grad.detach().float().clone()
+            if group.size() > 1:
+                shards = [torch.empty_like(grad) for _ in range(group.size())]
+                dist.all_gather(shards, grad, group=group)
+                grad = torch.cat(shards, dim=0)
+            grads[fold] = grad
+        finally:
+            ps.destroy_model_parallel()
+            ps.initialize_model_parallel()
+            GTPShardedParam._chain_state = {}
+
+    bf16_step = torch.finfo(torch.bfloat16).eps * ref.abs().max().item()
+    for fold, grad in grads.items():
+        torch.testing.assert_close(
+            grad, ref, rtol=0, atol=bf16_step, msg=lambda m: f"fold={fold}: {m}"
+        )
+
+
+class TestGTPFoldCPGradParity:
+    @pytest.mark.parametrize("cp_size,gtp_remat_size", [(4, 1), (2, 2)])
+    def test_fold_cp_grad_parity(self, cp_size, gtp_remat_size):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_fold_cp_grad_parity, 4, cp_size, gtp_remat_size)
