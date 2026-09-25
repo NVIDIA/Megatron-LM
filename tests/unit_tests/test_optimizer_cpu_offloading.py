@@ -131,6 +131,42 @@ def test_load_state_dict_with_native_fp32_param():
     restored_optimizer.step()
 
 
+@pytest.mark.parametrize('overlap_cpu_optimizer_d2h_h2d', [False, True])
+@pytest.mark.parametrize(
+    ('offload_fraction', 'param_update_in_fp32'), [(1.0, False), (1.0, True), (0.0, True)]
+)
+def test_hybrid_optimizer_skips_and_resumes_parameter_without_gradient(
+    overlap_cpu_optimizer_d2h_h2d, offload_fraction, param_update_in_fp32
+):
+    """A temporarily unused parameter must not be updated with a stale gradient."""
+    param = nn.Parameter(torch.ones(4, device='cuda', dtype=torch.bfloat16))
+    optimizer = HybridDeviceOptimizer(
+        [param],
+        offload_fraction=offload_fraction,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=param_update_in_fp32,
+        overlap_cpu_optimizer_d2h_h2d=overlap_cpu_optimizer_d2h_h2d,
+        lr=0.1,
+        weight_decay=0.0,
+    )
+
+    param.grad = torch.full_like(param, 0.5)
+    optimizer.step()
+    after_first_step = param.detach().clone()
+    assert not torch.equal(param, torch.ones_like(param))
+
+    param.grad = None
+    optimizer.step()
+    torch.cuda.synchronize()
+    assert torch.equal(param, after_first_step)
+
+    param.grad = torch.full_like(param, -0.25)
+    optimizer.step()
+    torch.cuda.synchronize()
+    assert not torch.equal(param, after_first_step)
+
+
 @pytest.mark.skipif(
     torch.__version__ < '2.3.0',
     reason=(
