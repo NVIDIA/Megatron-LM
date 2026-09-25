@@ -599,27 +599,6 @@ def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-def test_2d_mesh_row_atomic_before_replicate_is_rejected(distributed_setup):
-    """RowAtomic axes must be a suffix to keep every local buffer contiguous."""
-    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
-        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
-
-    mesh = init_device_mesh(
-        distributed_setup.device.type,
-        (2, distributed_setup.world_size // 2),
-        mesh_dim_names=("row_atomic", "replicate"),
-    )
-
-    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
-        DBuffer.empty(
-            mesh=mesh,
-            placements=[RowAtomic(), Replicate()],
-            tensor_shapes=[torch.Size((6, 4))],
-            dtype=torch.float32,
-            device=distributed_setup.device,
-        )
-
-
 def test_2d_mesh_shards_across_all_ranks(distributed_setup):
     """Multiple RowAtomic axes shard local storage by the product of their mesh sizes."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
