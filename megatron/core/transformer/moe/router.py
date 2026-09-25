@@ -14,6 +14,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -23,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_normalized_router_scores,
     compute_routing_scores_for_aux_loss,
+    fused_topk_with_score_function_supports_topk_indices,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
     router_gating_linear,
@@ -37,6 +39,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
+
+_HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
 
 class Router(ABC, MegatronModule):
@@ -65,6 +69,7 @@ class Router(ABC, MegatronModule):
         self.is_mtp_layer = is_mtp_layer
         self.hash_moe_layer_threshold = hash_moe_layer_threshold
         self.tp_group = pg_collection.tp
+        self.expt_tp_group = pg_collection.expt_tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
@@ -473,6 +478,32 @@ class TopKRouter(Router):
                 return True
         return False
 
+    def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
+        """Return the route-index dtype for Flex backends that consume dense top-k indices."""
+        if not self.config.moe_router_fusion:
+            return None
+        if self.config.moe_token_dispatcher_type != "flex":
+            return None
+        if self.config.moe_expert_capacity_factor is not None:
+            return None
+        if not fused_topk_with_score_function_supports_topk_indices:
+            return None
+
+        backend = self.config.moe_flex_dispatcher_backend
+        if backend in ("deepep", "ncclep"):
+            return torch.int64
+        if backend != "hybridep":
+            return None
+        if self.config.moe_hybridep_routing_map_mode != "indices":
+            return None
+        if not HAVE_HYBRIDEP_DENSE_ROUTING:
+            return None
+
+        num_experts = self.expt_tp_group.size() * self.config.num_moe_experts
+        if num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT:
+            return torch.int16
+        return None
+
     def _apply_aux_loss(
         self,
         probs: torch.Tensor,
@@ -811,13 +842,35 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
+                use_dense_indices = routing_map.dtype != torch.bool
                 if padding_mask is not None:
                     flat_mask = padding_mask.reshape(-1)
                     assert (
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
-                    routing_map = routing_map & (~flat_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                    if not use_dense_indices:
+                        routing_map = routing_map & (~flat_mask).unsqueeze(-1)
+                if use_dense_indices:
+                    # Fixed-shape counting: keep every [num_tokens, topk] slot and give padding
+                    # tokens and invalid (-1) routes a zero weight instead of filtering rows,
+                    # which would be a data-dependent shape (nonzero + host sync) inside this
+                    # compiled function and inside the moe_router CUDA graph scope.
+                    expert_indices = routing_map.reshape(-1).to(torch.long)
+                    token_counts = torch.ones_like(
+                        expert_indices, dtype=self.local_tokens_per_expert.dtype
+                    )
+                    if padding_mask is not None:
+                        valid = (~flat_mask).unsqueeze(-1).expand(-1, routing_map.shape[-1])
+                        token_counts = token_counts * valid.reshape(-1).to(token_counts.dtype)
+                    invalid_routes = expert_indices < 0
+                    expert_indices = expert_indices.masked_fill(invalid_routes, 0)
+                    token_counts = token_counts.masked_fill(invalid_routes, 0)
+                    if torch.are_deterministic_algorithms_enabled():
+                        self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
+                    else:
+                        self.local_tokens_per_expert.scatter_add_(0, expert_indices, token_counts)
+                else:
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(
         self, logits: torch.Tensor, input_ids: torch.Tensor, dense_output: bool = False
@@ -902,7 +955,8 @@ class TopKRouter(Router):
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
-                with shape [num_tokens, num_experts].
+                with shape [num_tokens, num_experts], or dense top-k indices with shape
+                [num_tokens, topk] for supported Flex backends.
         """
         seq_length, bsz = logits.shape[:2]
         observe_router_diagnostics = is_observing_tensor("router_diagnostics")
@@ -950,6 +1004,14 @@ class TopKRouter(Router):
             ), "Quantile balancing routing does not support padding masks yet."
             probs, routing_map = self.quantile_balancing(logits)
         else:
+            topk_indices_dtype = self._dense_route_indices_dtype()
+            topk_indices = (
+                torch.empty(
+                    (logits.shape[0], self.topk), dtype=topk_indices_dtype, device=logits.device
+                )
+                if topk_indices_dtype is not None
+                else None
+            )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -961,7 +1023,39 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                topk_indices=topk_indices,
             )
+            if (
+                self.config.moe_token_dispatcher_type == "flex"
+                and self.config.moe_flex_dispatcher_backend in ("deepep", "ncclep")
+                and self.config.moe_expert_capacity_factor is None
+            ):
+                # These backends dispatch (topk weights, topk indices). Select them here, in eager
+                # mode, so the token dispatcher's torch.compile'd dispatch_preprocess() has no
+                # differentiable compute left. This is to reduce CPU overhead incurred by extra
+                # torch.compiled functions
+                if topk_indices is not None:
+                    # Dense indices from TE's fused top-k; gather the weights at those indices.
+                    probs = probs.gather(1, routing_map.long())
+                else:
+                    # Bool routing map (no dense TE output): reconstruct indices with torch.topk.
+                    probs, routing_map = torch.topk(probs, self.topk, dim=-1)
+
+        # Dropless HybridEP consumes routing metadata directly, so exclude padding rows before
+        # dispatch. Other dispatchers retain their existing fixed-route assumptions.
+        use_dropless_hybridep = (
+            self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+            and self.config.moe_expert_capacity_factor is None
+            and self.config.moe_expert_rank_capacity_factor is None
+        )
+        if padding_mask is not None and use_dropless_hybridep:
+            valid_tokens = (~padding_mask).unsqueeze(-1)
+            probs = probs * valid_tokens
+            if routing_map.dtype == torch.bool:
+                routing_map = routing_map & valid_tokens
+            else:
+                routing_map = routing_map.masked_fill(padding_mask.unsqueeze(-1), -1)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -995,10 +1089,25 @@ class TopKRouter(Router):
                 selection_bias = (
                     -self.qb_beta if self.routing_type == "quantile_balancing" else self.expert_bias
                 )
+                actual_routing_map = routing_map
+                if actual_routing_map.dtype != torch.bool:
+                    # Dense top-k indices [num_tokens, topk] (flex dispatcher backends): the
+                    # diagnostics need the [num_tokens, num_experts] bool map. Invalid routes
+                    # (-1, padding rows) are dropped; scatter_add keeps duplicates deterministic.
+                    valid = actual_routing_map >= 0
+                    actual_routing_map = (
+                        torch.zeros_like(scores_for_aux_loss, dtype=torch.int32)
+                        .scatter_add_(
+                            1,
+                            actual_routing_map.long().masked_fill(~valid, 0),
+                            valid.to(torch.int32),
+                        )
+                        .bool()
+                    )
                 diagnostics = build_router_diagnostics(
                     scores_for_aux_loss,
                     routing_map_for_aux_loss,
-                    routing_map,
+                    actual_routing_map,
                     selection_bias,
                     seq_length,
                     bsz,

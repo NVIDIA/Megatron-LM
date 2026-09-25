@@ -564,3 +564,45 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
         Utils.destroy_model_parallel()
+
+
+# --- fused top-k router with dense indices ------------------------------------------------------
+
+
+@pytest.mark.parametrize("indices_dtype", [torch.int64, torch.int16], ids=["int64", "int16"])
+def test_te_fused_topk_dense_indices_replays(indices_dtype):
+    """The fused router wrapper can write dense [tokens, topk] expert ids into a caller-provided
+    tensor (flex deepep/ncclep: int64, HybridEP: int16) instead of the bool routing map."""
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
+    )
+
+    if fused_topk_with_score_function is None:
+        pytest.skip("TE fused router unavailable")
+    if not fused_topk_with_score_function_supports_topk_indices:
+        pytest.skip("TE fused router does not support topk_indices")
+    seeded()
+    num_tokens, num_experts, topk = 8192, 256, 8
+    logits = torch.randn(num_tokens, num_experts, device="cuda", requires_grad=True)
+    expert_bias = torch.randn(num_experts, device="cuda") * 0.01
+
+    def fn(logits):
+        topk_indices = torch.empty(num_tokens, topk, dtype=indices_dtype, device="cuda")
+        probs, routing_map = fused_topk_with_score_function(
+            logits=logits,
+            topk=topk,
+            use_pre_softmax=False,
+            num_groups=None,
+            group_topk=None,
+            scaling_factor=2.5,
+            score_function="sigmoid",
+            expert_bias=expert_bias,
+            topk_indices=topk_indices,
+        )
+        assert routing_map.dtype == indices_dtype and routing_map.shape == (num_tokens, topk)
+        return probs, routing_map
+
+    assert_replays_bit_exact(
+        fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
+    )

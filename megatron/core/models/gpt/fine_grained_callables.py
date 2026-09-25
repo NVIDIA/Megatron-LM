@@ -88,6 +88,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 rotary_pos_sin: Optional[Tensor] = None,
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
+                padding_mask: Optional[Tensor] = None,
             ):
                 hidden_states, _ = layer._forward_attention(
                     hidden_states=hidden_states,
@@ -123,7 +124,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                # Same routing inputs as the eager MoELayer.forward path: the padding mask is
+                # consumed by the router (dropless HybridEP excludes padded tokens).
+                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output, padding_mask)
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
@@ -137,6 +140,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             rotary_pos_sin=node.chunk_state.rotary_pos_sin,
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
+            padding_mask=getattr(node.chunk_state, "padding_mask", None),
         )
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
