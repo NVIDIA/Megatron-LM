@@ -1091,6 +1091,11 @@ def save_checkpoint(
         or torch.distributed.get_rank() == 0
     ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
+        config_container = (
+            checkpointing_context.get('config_container')
+            if checkpointing_context is not None
+            else None
+        )
 
         if ckpt_type == CheckpointType.LOCAL:
 
@@ -1153,17 +1158,19 @@ def save_checkpoint(
 
                     run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
-                    # NOTE(@maanug-nv): this try-except is a temporary safeguard for
-                    # unit tests that do not create a config container.
-                    # in the future, run_config.to_yaml() should always run.
-                    try:
-                        run_config = get_run_config()
-                    except AssertionError as e:
-                        if str(e) != 'run config is not initialized.':
-                            raise
-                        warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+                    if ckpt_type == CheckpointType.GLOBAL and config_container is not None:
+                        if getattr(config_container, 'model', None) is not None:
+                            config_container.to_yaml(run_config_filename)
                     else:
-                        run_config.to_yaml(run_config_filename)
+                        # Provider-based entrypoints use the initialized run config.
+                        try:
+                            run_config = get_run_config()
+                        except AssertionError as e:
+                            if str(e) != 'run config is not initialized.':
+                                raise
+                            warn_rank_0(f'WARNING: {e} Skipping save of run_config.yaml to checkpoint.')
+                        else:
+                            run_config.to_yaml(run_config_filename)
 
                 # Save tokenizer files for torch_dist checkpoints (if enabled)
                 if (
