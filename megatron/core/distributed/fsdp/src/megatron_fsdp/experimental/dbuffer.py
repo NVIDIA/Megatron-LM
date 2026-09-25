@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import changed_mesh_axis
+from .placement import PlacementReference, RowAtomic, TensorAtomic, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,6 +41,13 @@ def _validate_placements(placements: Iterable[Placement]) -> None:
     for placement in placements:
         if not isinstance(placement, (Replicate, Partial, Shard)):
             raise TypeError(f"Unsupported DBuffer placement: {placement!r}.")
+
+        if isinstance(placement, TensorAtomic) and len(placements) > 1:
+            raise NotImplementedError(
+                "Currently, DBuffer only supports only 1d device mesh, "
+                f"but got ndim={len(placements)}."
+            )
+
         if isinstance(placement, Shard):
             if placement.dim != 0:
                 raise NotImplementedError(
@@ -101,12 +108,10 @@ class DBuffer:
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
         _validate_placements(placements)
-
         self.mesh = mesh
         self.placements = placements
 
         self.layout = layout
-
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
 
@@ -119,13 +124,26 @@ class DBuffer:
         dtype: torch.dtype,
         device: torch.device | str,
         *,
-        block_size: int = 1,
+        reference: PlacementReference = RowAtomic(),
+        tensor_owners: tuple[int, ...] | None = None,
     ) -> "DBuffer":
-        """Build a layout from logical tensor shapes and allocate its local buffer."""
+        """Build a layout from logical tensor shapes and allocate its local buffer.
+
+        Args:
+            mesh: Device mesh whose dimensions correspond to ``placements``.
+            placements: Per-mesh-axis DBuffer placements.
+            tensor_shapes: Logical shapes that the DBuffer manages.
+            dtype: Dtype for the local buffer.
+            device: Device for the local buffer.
+            reference: Shard placement the global layout is planned against.
+            tensor_owners: Per-tensor owner ranks for a ``TensorAtomic`` reference; see
+                ``GlobalLayout.build``.
+        """
         layout = GlobalLayout.build(
             tuple(torch.Size(shape) for shape in tensor_shapes),
             dp_size=mesh.size(),
-            block_size=block_size,
+            reference=reference,
+            tensor_owners=tensor_owners,
         )
         return cls(mesh, placements, layout, dtype, device)
 
@@ -213,6 +231,7 @@ class DBuffer:
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
         _validate_placements(placements)
+
         if local_buffer.dim() != 1:
             raise ValueError("local_buffer must be a flat 1D tensor.")
         if not local_buffer.is_contiguous():
@@ -280,7 +299,8 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         *,
-        block_size: int = 1,
+        reference: PlacementReference = RowAtomic(),
+        tensor_owners: tuple[int, ...] | None = None,
     ) -> "DBuffer":
         """Distribute full local tensors into a DBuffer.
 
@@ -289,6 +309,9 @@ class DBuffer:
                 shape and dtype metadata but no values.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
+            reference: Shard placement the global layout is planned against.
+            tensor_owners: Per-tensor owner ranks for a ``TensorAtomic`` reference; see
+                ``GlobalLayout.build``.
 
         Returns:
             A DBuffer whose real local storage matches ``placements``. Ranges
@@ -310,7 +333,8 @@ class DBuffer:
             tensor_shapes=tensor_shapes,
             dtype=dtype,
             device=mesh.device_type,
-            block_size=block_size,
+            reference=reference,
+            tensor_owners=tensor_owners,
         )
         for index, tensor in enumerate(tensors):
             buffer.copy_from(index, tensor)
@@ -449,15 +473,23 @@ class DBuffer:
         placements[mesh_axis] = Replicate()
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
-        # Symmetric-memory registration is scoped to the collective's process
-        # group, so rendezvous the output on the same mesh axis as the all-gather.
-        if out.is_symmetric_memory:
-            out.rendezvous(mesh_axis)
-        dist.all_gather_into_tensor(
-            output_tensor=out.local_buffer,
-            input_tensor=self.local_buffer,
-            group=self.mesh.get_group(mesh_axis),
-        )
+        group = self.mesh.get_group(mesh_axis)
+        if self.layout.is_uniform:
+            # Symmetric-memory registration is scoped to the collective's process
+            # group, so rendezvous the output on the same mesh axis as the all-gather.
+            if out.is_symmetric_memory:
+                out.rendezvous(mesh_axis)
+            dist.all_gather_into_tensor(
+                output_tensor=out.local_buffer, input_tensor=self.local_buffer, group=group
+            )
+        else:
+            # Non-uniform segments: ``out`` spans the whole global buffer (without padding) and the
+            # layout's rank segments index it directly.
+            chunks = [
+                out.local_buffer.narrow(0, start, numel)
+                for start, numel in self.layout.rank_segments
+            ]
+            dist.all_gather(chunks, self.local_buffer, group=group)
         return out
 
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
@@ -492,21 +524,29 @@ class DBuffer:
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = _get_reduce_op(partial_placement)
-        # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
-        # reductions remain supported on older PyTorch versions that lack it.
-        if self.is_symmetric_memory:
-            self.rendezvous(axis)
-            # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
-            # for SUM. Preserve the placement's AVG semantics by scaling the
-            # SUM result after the collective.
-            if reduce_op == dist.ReduceOp.AVG:
-                reduce_op = dist.ReduceOp.SUM
-        dist.reduce_scatter_tensor(
-            output=out.local_buffer,
-            input=self.local_buffer,
-            op=reduce_op,
-            group=self.mesh.get_group(axis),
-        )
+        group = self.mesh.get_group(axis)
+        if self.layout.is_uniform:
+            # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
+            # reductions remain supported on older PyTorch versions that lack it.
+            if self.is_symmetric_memory:
+                self.rendezvous(axis)
+                # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
+                # for SUM. Preserve the placement's AVG semantics by scaling the
+                # SUM result after the collective.
+                if reduce_op == dist.ReduceOp.AVG:
+                    reduce_op = dist.ReduceOp.SUM
+            dist.reduce_scatter_tensor(
+                output=out.local_buffer, input=self.local_buffer, op=reduce_op, group=group
+            )
+        else:
+            # Non-uniform segments: the Partial input spans the whole global
+            # buffer (without padding), so the layout's rank segments index it directly.
+            chunks = [
+                self.local_buffer.narrow(0, start, numel)
+                for start, numel in self.layout.rank_segments
+            ]
+            dist.reduce_scatter(out.local_buffer, chunks, op=reduce_op, group=group)
+
         if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
             out.local_buffer.div_(self.mesh.size(axis))
         return out

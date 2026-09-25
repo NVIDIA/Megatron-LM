@@ -200,6 +200,7 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        param_to_owner: dict[nn.Parameter, int] | None = None,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -213,6 +214,9 @@ class FsdpModule:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
+            group_parameters, tensor_owners = _order_group_by_owner(
+                group_parameters, param_to_owner, mesh.size()
+            )
             first_parameter = next(iter(group_parameters.values()))
             group_dtype = effective_dtype(first_parameter)
             parameter_groups.append(
@@ -230,6 +234,7 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    tensor_owners=tensor_owners,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -623,6 +628,41 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         key = (effective_dtype(parameter), parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
+
+
+def _order_group_by_owner(
+    group: dict[str, nn.Parameter], param_to_owner: dict[nn.Parameter, int] | None, dp_size: int
+) -> tuple[dict[str, nn.Parameter], tuple[int, ...] | None]:
+    """Stable-sort one parameter group by owner rank and return per-unique-parameter owners.
+
+    Args:
+        group: FQN-to-parameter mapping for one dtype-homogeneous group.
+        param_to_owner: Owner rank of every parameter, or ``None`` to leave the group
+            untouched.
+        dp_size: Number of data-parallel ranks; owners must be in ``[0, dp_size)``.
+
+    Returns:
+        The reordered group and its owner tuple, or ``(group, None)`` when
+        ``param_to_owner`` is ``None``.
+    """
+    if param_to_owner is None:
+        return group, None
+    missing = [fqn for fqn, parameter in group.items() if parameter not in param_to_owner]
+    if missing:
+        raise ValueError(f"param_to_owner is missing entries for parameters {missing!r}.")
+    out_of_range = {
+        fqn: param_to_owner[parameter]
+        for fqn, parameter in group.items()
+        if not 0 <= param_to_owner[parameter] < dp_size
+    }
+    if out_of_range:
+        raise ValueError(f"Owner ranks must be in [0, {dp_size}), got {out_of_range!r}.")
+    # sorted() is stable: parameters sharing an owner keep their original FQN order.
+    ordered = dict(sorted(group.items(), key=lambda item: param_to_owner[item[1]]))
+    owners: dict[nn.Parameter, int] = {}
+    for parameter in ordered.values():
+        owners.setdefault(parameter, param_to_owner[parameter])
+    return ordered, tuple(owners.values())
 
 
 def _specialize_placements(

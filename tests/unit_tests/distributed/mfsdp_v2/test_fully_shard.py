@@ -21,7 +21,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpModule,
+    _order_group_by_owner,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import TensorAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
@@ -149,6 +156,26 @@ def _zero2_placements() -> Placements:
     return Placements(
         dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
     )
+
+
+def _tensor_atomic_zero1_placements() -> Placements:
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[TensorAtomic()]
+    )
+
+
+def _tensor_atomic_zero3_placements() -> Placements:
+    return Placements(
+        dp_axes=[0],
+        parameter=[TensorAtomic()],
+        gradient=[TensorAtomic()],
+        optimizer=[TensorAtomic()],
+    )
+
+
+def _tiny_model_param_to_owner(model: TinyModel) -> dict[nn.Parameter, int]:
+    """Uneven owner assignment for TinyModel: every group mixes ranks 0 and 1."""
+    return {model.fc1.weight: 1, model.fc1.bias: 0, model.fc2.weight: 0, model.fc2.bias: 1}
 
 
 def _hsdp_placements() -> Placements:
@@ -1022,3 +1049,156 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group.main_grad is not None
     assert group._unsharded_model_weight is not None
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
+
+
+def test_order_group_by_owner_sorts_stably_and_dedups_tied_parameters():
+    """Grouping reorders parameters by owner rank, keeps FQN order per owner, dedups ties."""
+    a = nn.Parameter(torch.zeros(2))
+    b = nn.Parameter(torch.zeros(3))
+    c = nn.Parameter(torch.zeros(4))
+    group = {"a": a, "b": b, "c": c, "tied_a": a}
+    param_to_owner = {a: 2, b: 0, c: 2}
+
+    ordered, owners = _order_group_by_owner(group, param_to_owner, dp_size=4)
+
+    assert list(ordered) == ["b", "a", "c", "tied_a"]
+    assert owners == (0, 2, 2)  # one entry per unique parameter, in ordered-group order
+
+    untouched, none_owners = _order_group_by_owner(group, None, dp_size=4)
+    assert untouched is group
+    assert none_owners is None
+
+
+def test_order_group_by_owner_rejects_missing_and_out_of_range_owners():
+    """Grouping validates the owner map before FsdpParameterGroup ever sees it."""
+    a = nn.Parameter(torch.zeros(2))
+    b = nn.Parameter(torch.zeros(3))
+    group = {"a": a, "b": b}
+
+    with pytest.raises(ValueError, match="missing entries.*'b'"):
+        _order_group_by_owner(group, {a: 0}, dp_size=2)
+    with pytest.raises(ValueError, match=r"Owner ranks must be in \[0, 2\)"):
+        _order_group_by_owner(group, {a: 0, b: 2}, dp_size=2)
+
+
+def test_parameter_group_validates_tensor_owners(distributed_setup):
+    """FsdpParameterGroup only accepts tensor_owners that match its placements and size."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    linear = nn.Linear(4, 4).to(device)
+    fqn_to_parameter = {"weight": linear.weight, "bias": linear.bias}
+
+    def build(placement, tensor_owners):
+        return FsdpParameterGroup(
+            owning_module=linear,
+            fqn_to_parameter=fqn_to_parameter,
+            mesh=mesh,
+            model_weight_placements=(placement,),
+            main_grad_placements=(placement,),
+            main_weight_placements=(placement,),
+            mixed_precision_policy=MixedPrecisionPolicy(),
+            tensor_owners=tensor_owners,
+        )
+
+    with pytest.raises(ValueError, match="one owner per unique parameter"):
+        build(TensorAtomic(), (0,))
+    with pytest.raises(ValueError, match="require tensor_owners"):
+        build(TensorAtomic(), None)
+    with pytest.raises(ValueError, match="only supported with TensorAtomic"):
+        build(Shard(0), (0, 1))
+
+    group = build(TensorAtomic(), (0, 1))
+    assert group.tensor_owners == (0, 1)
+    assert group.main_weight.layout.rank_segment_offsets[:3] == (0, 16, 20)
+
+
+def test_fully_shard_tensor_atomic_reorders_parameters_by_owner(distributed_setup):
+    """fully_shard consumes param_to_owner: groups are owner-ordered and layouts are uneven."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = TinyModel().to(device)
+    param_to_owner = _tiny_model_param_to_owner(model)
+    with fully_shard_context(device=device):
+        fully_shard(
+            model.fc1,
+            mesh=mesh,
+            placements=_tensor_atomic_zero3_placements(),
+            param_to_owner=param_to_owner,
+        )
+
+    (group,) = model.fc1.parameter_groups
+    # fc1.bias (owner 0) now precedes fc1.weight (owner 1) in tensor order.
+    assert [tuple(fsdp_parameter.fqns) for fsdp_parameter in group.fsdp_parameters] == [
+        ("bias",),
+        ("weight",),
+    ]
+    assert group.tensor_owners == (0, 1)
+    layout = group.main_weight.layout
+    assert not layout.is_uniform
+    assert layout.rank_segment_offsets[:3] == (0, 16, 16 + 16 * 8)
+    rank = mesh.get_local_rank(0)
+    for index, fsdp_parameter in enumerate(group.fsdp_parameters):
+        full_shape = layout.tensor_shapes[index]
+        expected_rows = full_shape[0] if group.tensor_owners[index] == rank else 0
+        assert group.main_weight.get_tensor_view(index).shape == (expected_rows, *full_shape[1:])
+
+
+@pytest.mark.parametrize(
+    "placements_factory",
+    [_tensor_atomic_zero1_placements, _tensor_atomic_zero3_placements],
+    ids=["tensor_atomic_zero1", "tensor_atomic_zero3"],
+)
+def test_fully_shard_tensor_atomic_losses_match_baseline(distributed_setup, placements_factory):
+    """TensorAtomic sharding driven through fully_shard should match single-rank SGD."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    placements = placements_factory()
+    torch.manual_seed(1234)
+    baseline = TinyModel().to(device)
+    model = TinyModel().to(device)
+    model.load_state_dict(baseline.state_dict())
+    param_to_owner = _tiny_model_param_to_owner(model)
+
+    with fully_shard_context(device=device) as context:
+        fully_shard(model.fc1, mesh=mesh, placements=placements, param_to_owner=param_to_owner)
+        fully_shard(model.fc2, mesh=mesh, placements=placements, param_to_owner=param_to_owner)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+
+    num_microbatches = 2
+    x = torch.randn(num_microbatches, 2, 8, device=device)
+    target = torch.randn(num_microbatches, 2, 4, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train(model, optimizer) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    losses.append(loss.detach())
+                    (loss / num_microbatches).backward()
+            optimizer.step()
+        return losses
+
+    baseline_losses = train(baseline, baseline_optimizer)
+    sharded_losses = train(model, optimizer)
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg="TensorAtomic sharded losses did not match baseline losses.",
+    )

@@ -39,6 +39,7 @@ def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
         tensor_shapes=tuple(torch.Size(s) for s in shapes),
         tensor_to_offset=tuple(offsets),
         size=size,
+        rank_segment_offsets=tuple(size // dp_size * rank for rank in range(dp_size + 1)),
     )
     params = tuple(nn.Parameter(torch.zeros(s)) for s in shapes)
     fsdp_parameters = tuple(SimpleNamespace(sharded=p) for p in params)

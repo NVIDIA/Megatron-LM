@@ -56,7 +56,10 @@ def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
             offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
         ),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        block_size=data_layout.block_size,
+        rank_segment_offsets=tuple(
+            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_segment_offsets
+        ),
+        reference=data_layout.reference,
     )
 
 
@@ -71,6 +74,9 @@ def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
             offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
         ),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
+        rank_segment_offsets=tuple(
+            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_segment_offsets
+        ),
     )
 
 
@@ -163,7 +169,7 @@ class QuantizedDBuffer:
     ) -> "QuantizedDBuffer":
         """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
         layout = GlobalLayout.build(
-            tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
+            tensor_shapes, dp_size=mesh.size(), reference=BlockAtomic(_MXFP8_BLOCK_SIZE)
         )
         return cls(mesh, placements, layout, device)
 
