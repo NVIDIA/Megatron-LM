@@ -381,6 +381,8 @@ class DBuffer:
             )
         _validate_placements(new_placements)
         out = self._create_or_validate_out(out, placements=new_placements)
+        input_storage = self.local_buffer.untyped_storage()
+        preserve_input = out.local_buffer.untyped_storage() is not input_storage
 
         # Process non-sharded destinations first, then sharded destinations in
         # reverse order. Both endpoints must satisfy the sharded-suffix invariant.
@@ -403,9 +405,8 @@ class DBuffer:
             step_out = None
             if local_numel <= out.local_buffer.numel():
                 step_out = out.view(placements)
-            elif (
-                local_numel <= result.local_buffer.numel()
-                and result.local_buffer.untyped_storage() is not self.local_buffer.untyped_storage()
+            elif local_numel <= result.local_buffer.numel() and (
+                not preserve_input or result.local_buffer.untyped_storage() is not input_storage
             ):
                 step_out = result.view(placements)
             if isinstance(old, Shard) and isinstance(new, Replicate):
