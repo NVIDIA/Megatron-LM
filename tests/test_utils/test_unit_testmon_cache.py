@@ -812,7 +812,7 @@ def test_identity_without_image_diagnostics_preserves_usable_cache(
                 'python() { [[ "$1" == "tests/unit_tests/testmon_cache.py" ]]; '
                 'shift; "$TEST_PYTHON" "$TESTMON_HELPER" "$@"; }',
                 'uv() { [[ "$1 $2 $3 $4 $5 $6" == '
-                '"run --locked --isolated --only-group testmon-cache python" ]] || return; '
+                '"run --locked --isolated --only-group testmon python" ]] || return; '
                 'shift 6; python "$@"; }',
                 script,
             )

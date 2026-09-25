@@ -75,8 +75,8 @@ baseline was recorded. Unchanged mapped sources still allow Testmon selection.
 Mapping changes invalidate old baselines through the normal compatibility checks.
 
 Identity calculation uses PyYAML's safe loader. The parser is declared in the
-`testmon-cache` dependency group in `pyproject.toml` and resolved by `uv.lock`.
-The CI action runs `uv run --locked --isolated --only-group testmon-cache` to
+`testmon` dependency group in `pyproject.toml` and resolved by `uv.lock`.
+The CI action runs `uv run --locked --isolated --only-group testmon` to
 install only that group in a separate environment. Cache validation and
 publication do not need PyYAML. A parser setup failure takes the existing
 full-test fallback for selective runs.
