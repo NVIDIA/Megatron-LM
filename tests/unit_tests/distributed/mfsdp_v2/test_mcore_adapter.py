@@ -501,8 +501,18 @@ class TestMcoreAdapterCudaGraph:
         StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
         _destroy_model_parallel()
 
-    def test_full_iteration_and_optimizer_cuda_graph_match_eager(self):
+    @pytest.mark.parametrize(
+        "instances,inner_strategy",
+        [(1, "optim_grads_params"), (2, "optim_grads")],
+        ids=["zero3", "hybrid_zero2"],
+    )
+    def test_full_iteration_and_optimizer_cuda_graph_match_eager(self, instances, inner_strategy):
         """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
+        if instances > 1:
+            _destroy_model_parallel()
+            Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=instances)
+            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
         eager_config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -524,7 +534,9 @@ class TestMcoreAdapterCudaGraph:
                     use_megatron_fsdp=True,
                     megatron_fsdp_version=2,
                     use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
+                    data_parallel_sharding_strategy=inner_strategy,
+                    num_distributed_optimizer_instances=instances,
+                    outer_dp_sharding_strategy="optim" if instances > 1 else "no_shard",
                     # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
                     # params. Capturable FusedAdam in the TE revision under test requires
                     # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).
@@ -567,12 +579,18 @@ class TestMcoreAdapterCudaGraph:
             assert seq_length is None
             assert not forward_only
             microbatch_losses = []
-            for _ in range(num_microbatches):
+            for index in range(num_microbatches):
                 batch = next(data_iterator[0])
                 # Pipeline schedules receive model chunks as a list, including with PP=1.
-                output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
-                loss = output.float().square().mean()
-                (loss / num_microbatches).backward()
+                sync_context = (
+                    contextlib.nullcontext()
+                    if index == num_microbatches - 1
+                    else model[0].no_sync()
+                )
+                with sync_context:
+                    output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
+                    loss = output.float().square().mean()
+                    (loss / num_microbatches).backward()
                 microbatch_losses.append({"loss": loss.detach()})
             return microbatch_losses
 
@@ -820,7 +838,14 @@ class TestMcoreAdapterHybrid:
         )
 
     @staticmethod
-    def _train(config, instances, outer_strategy, steps=3, microbatches=1):
+    def _train(
+        config,
+        instances,
+        outer_strategy,
+        steps=3,
+        microbatches=1,
+        inner_strategy="optim_grads_params",
+    ):
         """Train over the already-initialized DP topology and return per-step losses.
 
         With ``microbatches`` > 1 each step accumulates gradients, and every microbatch
@@ -838,7 +863,7 @@ class TestMcoreAdapterHybrid:
                 use_megatron_fsdp=True,
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
+                data_parallel_sharding_strategy=inner_strategy,
                 num_distributed_optimizer_instances=instances,
                 outer_dp_sharding_strategy=outer_strategy,
             ),
@@ -885,9 +910,26 @@ class TestMcoreAdapterHybrid:
             losses.append(torch.stack(step_losses).float().mean())
         return torch.stack(losses)
 
+    @pytest.mark.parametrize("inner_strategy", ["no_shard", "optim", "optim_grads"])
+    def test_inner_strategy_matches_zero3(self, inner_strategy):
+        """All supported inner strategies produce the same accumulated updates."""
+        config = self._config()
+        Utils.initialize_model_parallel(1, 1)
+        reference = self._train(config, instances=1, outer_strategy="no_shard", microbatches=2)
+        actual = self._train(
+            config,
+            instances=1,
+            outer_strategy="no_shard",
+            microbatches=2,
+            inner_strategy=inner_strategy,
+        )
+        assert torch.isfinite(reference).all()
+        torch.testing.assert_close(actual, reference, rtol=1e-2, atol=0)
+
+    @pytest.mark.parametrize("inner_strategy", ["optim_grads", "optim_grads_params"])
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
-    def test_hybrid_placements(self, outer_strategy):
-        """The outer axis takes its strategy's placement; the inner axis stays ZeRO-3."""
+    def test_hybrid_placements(self, outer_strategy, inner_strategy):
+        """Each axis controls model-weight and optimizer storage independently."""
         Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model_parallel_cuda_manual_seed(1234)
@@ -898,13 +940,28 @@ class TestMcoreAdapterHybrid:
                 use_megatron_fsdp=True,
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
+                data_parallel_sharding_strategy=inner_strategy,
                 num_distributed_optimizer_instances=2,
                 outer_dp_sharding_strategy=outer_strategy,
             ),
             module=_build_block(config),
             pg_collection=pg_collection,
         )
+        expected_inner = Shard(0) if inner_strategy == "optim_grads_params" else Replicate()
+        expected_outer = Shard(0) if outer_strategy == "optim" else Replicate()
+        groups = [
+            group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for group in module.parameter_groups
+        ]
+        assert groups
+        for group in groups:
+            assert group.model_weight.placements == (Replicate(), expected_inner)
+            assert group.main_weight.placements == (expected_outer, Shard(0))
+            assert group.post_optimizer_model_weight.local_buffer.untyped_storage().data_ptr() == (
+                group.model_weight.local_buffer.untyped_storage().data_ptr()
+            )
         output = model(
             hidden_states=torch.randn(
                 8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
@@ -920,8 +977,9 @@ class TestMcoreAdapterHybrid:
             assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
             assert parameter.grad.placements == (expected_outer, Shard(0))
 
+    @pytest.mark.parametrize("inner_strategy", ["optim_grads", "optim_grads_params"])
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
-    def test_hybrid_matches_single_instance_accumulating(self, outer_strategy):
+    def test_hybrid_matches_single_instance_accumulating(self, outer_strategy, inner_strategy):
         """Splitting the DP domain must not change the math under gradient accumulation.
 
         HSDP/HFSDP keep the DP-outer axis Partial between microbatches and reduce it on
@@ -936,7 +994,13 @@ class TestMcoreAdapterHybrid:
         _destroy_model_parallel()
 
         Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
-        hybrid = self._train(config, instances=2, outer_strategy=outer_strategy, microbatches=2)
+        hybrid = self._train(
+            config,
+            instances=2,
+            outer_strategy=outer_strategy,
+            microbatches=2,
+            inner_strategy=inner_strategy,
+        )
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
@@ -955,18 +1019,20 @@ class TestMcoreAdapterHybrid:
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    @pytest.mark.parametrize("dense_inner_strategy", ["optim_grads", "optim_grads_params"])
     @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
     @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
     def test_moe_with_independent_hybrid_placements(
-        self, dense_outer_strategy, expert_outer_strategy
+        self, dense_outer_strategy, expert_outer_strategy, dense_inner_strategy, ep_size
     ):
         """Dense and expert parameters use different placements on the same hybrid mesh."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if world_size < 4 or world_size % 4:
-            pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
+        if world_size % (2 * ep_size):
+            pytest.skip("MoE + hybrid needs a world size divisible by EP * instances.")
 
         Utils.initialize_model_parallel(
-            1, 1, expert_model_parallel_size=2, num_distributed_optimizer_instances=2
+            1, 1, expert_model_parallel_size=ep_size, num_distributed_optimizer_instances=2
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         torch.manual_seed(123)
@@ -976,7 +1042,7 @@ class TestMcoreAdapterHybrid:
             hidden_size=64,
             num_attention_heads=4,
             num_moe_experts=4,
-            expert_model_parallel_size=2,
+            expert_model_parallel_size=ep_size,
             moe_layer_freq=[0, 1],
             moe_token_dispatcher_type="alltoall",
             moe_router_topk=2,
@@ -996,7 +1062,8 @@ class TestMcoreAdapterHybrid:
                 use_megatron_fsdp=True,
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
+                data_parallel_sharding_strategy=dense_inner_strategy,
+                expert_data_parallel_sharding_strategy="optim_grads_params",
                 num_distributed_optimizer_instances=2,
                 outer_dp_sharding_strategy=dense_outer_strategy,
                 expert_outer_dp_sharding_strategy=expert_outer_strategy,
@@ -1022,13 +1089,34 @@ class TestMcoreAdapterHybrid:
             [model],
         )
 
-        optimizer.zero_grad(set_to_none=True)
-        input_ids = torch.randint(0, 128, (2, 8), device="cuda")
-        position_ids = torch.arange(8, device="cuda").repeat(2, 1)
-        output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
-        output.float().square().mean().backward()
-        success, _, _ = optimizer.step()
-        assert success
+        dense_groups = []
+        expert_groups = []
+        for name, submodule in model.named_modules():
+            if isinstance(submodule, FsdpModule):
+                groups = expert_groups if "experts" in name else dense_groups
+                groups.extend(submodule.parameter_groups)
+        assert dense_groups and expert_groups
+        dense_inner = Shard(0) if dense_inner_strategy == "optim_grads_params" else Replicate()
+        for group in dense_groups:
+            assert group.model_weight.placements == (Replicate(), dense_inner)
+        for group in expert_groups:
+            assert group.model_weight.placements == (Replicate(), Shard(0))
+
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            for index in range(2):
+                sync_context = contextlib.nullcontext() if index == 1 else model.no_sync()
+                with sync_context:
+                    input_ids = torch.randint(0, 128, (2, 8), device="cuda")
+                    position_ids = torch.arange(8, device="cuda").repeat(2, 1)
+                    output = model(
+                        input_ids=input_ids, position_ids=position_ids, attention_mask=None
+                    )
+                    loss = output.float().square().mean()
+                    assert torch.isfinite(loss)
+                    (loss / 2).backward()
+            success, _, _ = optimizer.step()
+            assert success
 
         mesh_dim_names = {
             parameter.grad.device_mesh.mesh_dim_names

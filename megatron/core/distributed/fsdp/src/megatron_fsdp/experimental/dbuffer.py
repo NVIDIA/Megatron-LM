@@ -16,6 +16,7 @@
 
 import dataclasses
 from collections.abc import Iterable
+from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
@@ -25,7 +26,6 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,6 +58,31 @@ def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
     """Convert a DTensor Partial reduction name to a torch.distributed op."""
     reduce_ops = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.AVG}
     return reduce_ops[partial_placement.reduce_op]
+
+
+_combined_groups: WeakValueDictionary[
+    tuple[tuple[int, ...], tuple[dist.ProcessGroup, ...]], dist.ProcessGroup
+] = WeakValueDictionary()
+
+
+def _get_combined_group(
+    ranks: tuple[int, ...], axis_groups: tuple[dist.ProcessGroup, ...]
+) -> dist.ProcessGroup:
+    """Reuse combined groups without retaining them after distributed teardown."""
+    # PyTorch owns registered groups and destroys them in destroy_process_group().
+    # Weak values let it release the groups and cache keys after that teardown.
+    # Constituent groups distinguish separate distributed initializations.
+    key = (ranks, axis_groups)
+    group = _combined_groups.get(key)
+    if group is None:
+        # Only members participate: other DP/EP domains may create different groups.
+        group = dist.new_group(
+            ranks=list(ranks),
+            backend=dist.get_backend(axis_groups[0]),
+            use_local_synchronization=True,
+        )
+        _combined_groups[key] = group
+    return group
 
 
 class DBuffer:
@@ -234,12 +259,11 @@ class DBuffer:
         return buffer
 
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
-        """Return a storage-sharing buffer with supported ``placements``.
+        """View a contained local range with the requested ``placements``.
 
-        Views preserve placements, relabel a full local buffer, or locally slice
-        one full local buffer to RowAtomic. A view that changes a Partial placement is
-        only a storage destination: callers must populate it with a reduction
-        before reading it.
+        This only slices and relabels storage; it performs no communication.
+        When changing Partial placements, callers must populate the view with
+        values appropriate to its new placements before reading it.
         """
         placements = tuple(placements)
         if len(placements) != self.mesh.ndim:
@@ -247,30 +271,18 @@ class DBuffer:
                 f"Expected {self.mesh.ndim} placements for device mesh, got {len(placements)}."
             )
 
-        changed_axis = changed_mesh_axis(self.placements, placements)
-        if changed_axis is None:
+        _validate_placements(placements)
+        if self.placements == placements:
             return self
-        source_placement = self.placements[changed_axis]
-        destination_placement = placements[changed_axis]
-        if isinstance(source_placement, (Replicate, Partial)) and isinstance(
-            destination_placement, Shard
-        ):
-            offset, local_numel = self.layout.get_local_range(self.mesh, placements)
-            local_offset = offset - self.offset
-            if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
-                raise RuntimeError("DBuffer view is not contained in its source local buffer.")
-            return DBuffer.from_local(
-                self.local_buffer.narrow(0, local_offset, local_numel),
-                self.mesh,
-                placements,
-                self.layout,
-            )
-        if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
-            return DBuffer.from_local(self.local_buffer, self.mesh, placements, self.layout)
-        raise ValueError(
-            "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
-            "or a Replicate/Partial-to-RowAtomic slice, "
-            f"got {self.placements!r} -> {placements!r}."
+        offset, local_numel = self.layout.get_local_range(self.mesh, placements)
+        local_offset = offset - self.offset
+        if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
+            raise ValueError("DBuffer.view() requires a range contained in its local buffer.")
+        return DBuffer.from_local(
+            self.local_buffer.narrow(0, local_offset, local_numel),
+            self.mesh,
+            placements,
+            self.layout,
         )
 
     @classmethod
@@ -376,15 +388,20 @@ class DBuffer:
         destination.local_buffer.copy_(self.local_buffer)
         return destination
 
+    def is_alias_of(self, other: "DBuffer") -> bool:
+        """Return whether the local buffers share storage, regardless of their ranges."""
+        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
     ) -> "DBuffer":
-        """Redistribute this buffer to ``new_placements``.
+        """Apply placement transitions one axis at a time.
 
-        This dispatcher supports the one-axis transitions:
-        RowAtomic -> Replicate, Partial -> Replicate, Partial -> RowAtomic,
-        Replicate -> RowAtomic, and Replicate -> Partial. Other placement changes are
-        intentionally unsupported.
+        Add shards inner-to-outer; otherwise iterate outer-to-inner so sharded
+        axes remain a suffix throughout. Collectives reuse a contained range of
+        the final output or an intermediate buffer, preserving the input unless
+        the caller supplies an output that aliases it.
+        Allocate the destination when ``out`` is omitted; use ``view`` to alias storage.
         """
         new_placements = tuple(new_placements)
         if len(new_placements) != self.mesh.ndim:
@@ -393,70 +410,125 @@ class DBuffer:
                 f"{len(new_placements)}."
             )
         _validate_placements(new_placements)
+        out = self._create_or_validate_out(out, placements=new_placements)
+        # Fuse pure gather redistributions; other transitions use the per-axis dispatcher.
+        if self.placements != new_placements and all(
+            old == new or (isinstance(old, Shard) and isinstance(new, Replicate))
+            for old, new in zip(self.placements, new_placements)
+        ):
+            gather_axes = [
+                axis
+                for axis, (old, new) in enumerate(zip(self.placements, new_placements))
+                if old != new
+            ]
+            return self.allgather(gather_axes, out=out)
+        preserve_input = not self.is_alias_of(out)
 
-        changed_axis = changed_mesh_axis(self.placements, new_placements)
-        if changed_axis is None:
-            if out is None:
-                return self
-            out = self._create_or_validate_out(out, placements=new_placements)
-            out.local_buffer.copy_(self.local_buffer)
-            return out
+        # Sharded axes form a suffix: valid transitions only add or only remove shards.
+        # Add from inner to outer; otherwise traverse from outer to inner.
+        old_shards = sum(p.is_shard() for p in self.placements)
+        new_shards = sum(p.is_shard() for p in new_placements)
+        axes = range(self.mesh.ndim)
+        if new_shards > old_shards:
+            axes = axes[::-1]
 
-        axis = changed_axis
-        old_placement = self.placements[axis]
-        new_placement = new_placements[axis]
-        if isinstance(old_placement, Shard) and isinstance(new_placement, Replicate):
-            return self.allgather(axis, out=out)
-        if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
-            return self.allreduce(axis, out=out)
-        if isinstance(old_placement, Partial) and isinstance(new_placement, Shard):
-            return self.reduce_scatter(axis, new_placement, out=out)
-        if isinstance(old_placement, Replicate) and isinstance(new_placement, Shard):
-            view = self.view(new_placements)
-            if out is None:
-                return view
-            out = self._create_or_validate_out(out, placements=new_placements)
-            out.local_buffer.copy_(view.local_buffer)
-            return out
-        if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
-            # Replicate and Partial share the same local layout, so relabel the
-            # buffer without communication. Value-preserving for AVG only -- the
-            # mean of identical per-rank locals is that value; SUM would need a
-            # 1/axis_size rescale, which no caller needs.
-            if new_placement.reduce_op != "avg":
+        result = self
+        for axis in axes:
+            old, new = self.placements[axis], new_placements[axis]
+            if old == new:
+                continue
+            placements = list(result.placements)
+            placements[axis] = new
+            # Sharded-suffix layouts have nested local ranges, so size determines containment.
+            _, local_numel = self.layout.get_local_range(self.mesh, placements)
+            step_out = None
+            if local_numel <= out.local_buffer.numel():
+                step_out = out.view(placements)
+            elif local_numel <= result.local_buffer.numel() and (
+                not preserve_input or not result.is_alias_of(self)
+            ):
+                step_out = result.view(placements)
+            if isinstance(old, Shard) and isinstance(new, Replicate):
+                result = result.allgather(axis, out=step_out)
+            elif isinstance(old, Partial) and isinstance(new, Replicate):
+                result = result.allreduce(axis, out=step_out)
+            elif isinstance(old, Partial) and isinstance(new, Shard):
+                result = result.reduce_scatter(axis, new, out=step_out)
+            elif isinstance(old, Replicate) and isinstance(new, Shard):
+                result = result.view(placements)
+            elif isinstance(old, Replicate) and isinstance(new, Partial):
+                # Relabeling replicas preserves AVG, but SUM would multiply the value.
+                if new.reduce_op != "avg":
+                    raise NotImplementedError(
+                        "Replicate -> Partial redistribute supports AVG only, got "
+                        f"{new.reduce_op!r}."
+                    )
+                result = result.view(placements)
+            else:
                 raise NotImplementedError(
-                    "Replicate -> Partial redistribute supports AVG only, got "
-                    f"{new_placement.reduce_op!r}."
+                    f"Unsupported DBuffer placement transition on axis {axis}: {old!r} -> {new!r}."
                 )
-            if out is not None:
-                raise NotImplementedError(
-                    "Replicate -> Partial redistribute does not support an out buffer."
-                )
-            return DBuffer.from_local(self.local_buffer, self.mesh, new_placements, self.layout)
-        raise NotImplementedError(
-            "Unsupported DBuffer placement transition on axis "
-            f"{axis}: {old_placement!r} -> {new_placement!r}."
-        )
 
-    def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
-        """All-gather a sharded axis into Replicate placement."""
-        if not isinstance(self.placements[mesh_axis], Shard):
-            raise ValueError(
-                f"allgather() currently requires a Shard placement on axis {mesh_axis!r}."
-            )
+        if result is not out:
+            out.local_buffer.copy_(result.local_buffer)
+        return out
 
+    def allgather(
+        self, mesh_axis: int | Iterable[int], *, out: "DBuffer | None" = None
+    ) -> "DBuffer":
+        """Gather one or more sharded axes into Replicate placements.
+
+        Multiple axes use one collective over their combined process group.
+        Output chunk views account for the difference between group rank order
+        and the inner-to-outer order of shards in the buffer.
+        """
+        axes = (mesh_axis,) if isinstance(mesh_axis, int) else tuple(mesh_axis)
+        axes = tuple(sorted(axis % self.mesh.ndim for axis in axes))
+        if len(set(axes)) != len(axes):
+            raise ValueError(f"All-gather axes must be distinct, got {axes}.")
         placements = list(self.placements)
-        placements[mesh_axis] = Replicate()
+        for axis in axes:
+            if not isinstance(placements[axis], Shard):
+                raise ValueError(f"allgather() requires a Shard placement on axis {axis}.")
+            placements[axis] = Replicate()
         _validate_placements(placements)
+        if not axes:
+            return self.redistribute(placements, out=out)
         out = self._create_or_validate_out(out, placements=placements)
-        # Symmetric-memory registration is scoped to the collective's process
-        # group, so rendezvous the output on the same mesh axis as the all-gather.
-        if out.is_symmetric_memory:
-            out.rendezvous(mesh_axis)
-        dist.all_gather_into_tensor(
-            output_tensor=out.local_buffer,
-            input_tensor=self.local_buffer,
-            group=self.mesh.get_group(mesh_axis),
+        # Singleton dimensions do not change the collective's rank domain.
+        active_axes = tuple(axis for axis in axes if self.mesh.size(axis) > 1)
+        if len(active_axes) <= 1:
+            axis = active_axes[0] if active_axes else axes[0]
+            if out.is_symmetric_memory:
+                out.rendezvous(axis)
+            dist.all_gather_into_tensor(
+                output_tensor=out.local_buffer,
+                input_tensor=self.local_buffer,
+                group=self.mesh.get_group(axis),
+            )
+            return out
+
+        coordinate = self.mesh.get_coordinate()
+        rank_grid = self.mesh.mesh[
+            tuple(
+                slice(None) if axis in active_axes else rank for axis, rank in enumerate(coordinate)
+            )
+        ]
+        # get_local_range() shards inner axes first, so outer axes vary fastest.
+        ranks_by_chunk = (
+            rank_grid.permute(tuple(reversed(range(len(active_axes))))).flatten().tolist()
+        )
+        group = _get_combined_group(
+            tuple(sorted(ranks_by_chunk)), tuple(self.mesh.get_group(axis) for axis in active_axes)
+        )
+        chunk_by_rank = {rank: chunk for chunk, rank in enumerate(ranks_by_chunk)}
+        # The list collective scatters rank-ordered results into these views.
+        # NCCL may use an internal staging allocation for this permutation.
+        chunks = out.local_buffer.chunk(group.size())
+        dist.all_gather(
+            [chunks[chunk_by_rank[rank]] for rank in dist.get_process_group_ranks(group)],
+            self.local_buffer,
+            group=group,
         )
         return out
 

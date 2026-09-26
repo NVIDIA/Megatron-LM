@@ -2,7 +2,10 @@
 
 """Unit tests for Megatron-FSDP DBuffer."""
 
+import gc
+import weakref
 from collections.abc import Iterable
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -11,7 +14,10 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import (
+    DBuffer,
+    _get_combined_group,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     RowAtomic,
@@ -599,27 +605,6 @@ def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-def test_2d_mesh_row_atomic_before_replicate_is_rejected(distributed_setup):
-    """RowAtomic axes must be a suffix to keep every local buffer contiguous."""
-    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
-        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
-
-    mesh = init_device_mesh(
-        distributed_setup.device.type,
-        (2, distributed_setup.world_size // 2),
-        mesh_dim_names=("row_atomic", "replicate"),
-    )
-
-    with pytest.raises(ValueError, match="Shard placements must be a suffix"):
-        DBuffer.empty(
-            mesh=mesh,
-            placements=[RowAtomic(), Replicate()],
-            tensor_shapes=[torch.Size((6, 4))],
-            dtype=torch.float32,
-            device=distributed_setup.device,
-        )
-
-
 def test_2d_mesh_shards_across_all_ranks(distributed_setup):
     """Multiple RowAtomic axes shard local storage by the product of their mesh sizes."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -691,6 +676,235 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(dist
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
+@pytest.mark.parametrize("destination", ["allocated", "separate", "aliased", "redistribute"])
+def test_multi_axis_view_and_allgather(distributed_setup, destination):
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    replicated = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+    sharded = replicated.view([RowAtomic(), RowAtomic()])
+    expected = DBuffer.distribute_tensors(tensors, mesh, [RowAtomic(), RowAtomic()])
+    for index in range(len(tensors)):
+        torch.testing.assert_close(sharded.get_tensor_view(index), expected.get_tensor_view(index))
+    assert sharded.local_buffer.untyped_storage().data_ptr() == (
+        replicated.local_buffer.untyped_storage().data_ptr()
+    )
+    # Invalidate everything except this rank's optimizer shard to catch missing gathers.
+    saved = sharded.local_buffer.clone()
+    replicated.local_buffer.fill_(-1)
+    sharded.local_buffer.copy_(saved)
+    with (
+        patch.object(dist, "all_gather", wraps=dist.all_gather) as gather,
+        patch.object(
+            dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor
+        ) as gather_into,
+    ):
+        if destination == "redistribute":
+            result = sharded.redistribute([Replicate(), Replicate()], out=replicated)
+        else:
+            out = None
+            if destination == "aliased":
+                out = replicated
+            elif destination == "separate":
+                out = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+                out.local_buffer.fill_(-1)
+            result = sharded.allgather((axis for axis in [1, 0]), out=out)
+            if out is not None:
+                assert result is out
+        assert gather.call_count + gather_into.call_count == 1
+    _assert_dbuffer_local_tensors_close(result, tensors)
+    sliced = result.redistribute([RowAtomic(), RowAtomic()])
+    for index in range(len(tensors)):
+        torch.testing.assert_close(sliced.get_tensor_view(index), expected.get_tensor_view(index))
+
+
+def test_multi_axis_allgather_group_lifetime(distributed_setup):
+    """Reuse active groups and release cached references after explicit teardown."""
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    local = torch.tensor([distributed_setup.rank], device=distributed_setup.device)
+    gathered = torch.empty(distributed_setup.world_size, dtype=local.dtype, device=local.device)
+
+    for _ in range(2):
+        # Each lifecycle starts with fresh constituent groups.
+        mesh = init_device_mesh(
+            distributed_setup.device.type, (2, distributed_setup.world_size // 2)
+        )
+        ranks = tuple(mesh.mesh.flatten().tolist())
+        axis_groups = tuple(mesh.get_group(axis) for axis in range(mesh.ndim))
+        group = _get_combined_group(ranks, axis_groups)
+        group_ref = weakref.ref(group)
+        try:
+            assert _get_combined_group(ranks, axis_groups) is group
+            dist.all_gather_into_tensor(gathered, local, group=group)
+            torch.testing.assert_close(
+                gathered, torch.arange(distributed_setup.world_size, device=local.device)
+            )
+        finally:
+            dist.destroy_process_group(group)
+        del group
+        gc.collect()
+        assert group_ref() is None
+
+
+@pytest.mark.parametrize("axes", [(0, 1), (1, 2), (0, 1, 2)])
+def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes):
+    if distributed_setup.world_size % 4:
+        pytest.skip("Requires a world size divisible by four.")
+    mesh = init_device_mesh(
+        distributed_setup.device.type, (2, 2, distributed_setup.world_size // 4)
+    )
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source_placements = [Replicate() if axis < min(axes) else RowAtomic() for axis in range(3)]
+    target_placements = [Replicate() if axis <= max(axes) else RowAtomic() for axis in range(3)]
+    source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
+    expected = DBuffer.distribute_tensors(tensors, mesh, target_placements)
+    with (
+        patch.object(dist, "all_gather", wraps=dist.all_gather) as gather,
+        patch.object(
+            dist, "all_gather_into_tensor", wraps=dist.all_gather_into_tensor
+        ) as gather_into,
+    ):
+        result = source.allgather(axes)
+        assert gather.call_count + gather_into.call_count == 1
+    assert result.placements == tuple(target_placements)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
+
+
+@pytest.mark.parametrize("use_out", [False, True])
+@pytest.mark.parametrize(
+    "old_placements,new_placements",
+    [
+        ([RowAtomic(), RowAtomic()], [RowAtomic(), RowAtomic()]),
+        ([Partial(), Partial()], [Replicate(), Replicate()]),
+        ([Partial(), Partial()], [RowAtomic(), RowAtomic()]),
+        ([Partial(), Partial()], [Replicate(), RowAtomic()]),
+        ([Replicate(), Partial()], [Partial("avg"), RowAtomic()]),
+        ([Partial(), RowAtomic()], [Replicate(), Replicate()]),
+    ],
+)
+def test_multi_axis_redistribute_reductions(
+    distributed_setup, old_placements, new_placements, use_out
+):
+    """Compose reductions, slices, gathers, and relabels in a valid axis order."""
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    local_scale = reduced_scale = 1
+    for axis, placement in enumerate(old_placements):
+        if isinstance(placement, Partial):
+            local_scale *= mesh.get_local_rank(axis) + 1
+            reduced_scale *= mesh.size(axis) * (mesh.size(axis) + 1) // 2
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source = DBuffer.distribute_tensors(
+        [tensor * local_scale for tensor in tensors], mesh, old_placements
+    )
+    expected = DBuffer.distribute_tensors(
+        [tensor * reduced_scale for tensor in tensors], mesh, new_placements
+    )
+    out = None
+    if use_out:
+        out = DBuffer(mesh, new_placements, source.layout, source.dtype, source.device)
+    result = source.redistribute(new_placements, out=out)
+    if out is not None:
+        assert result is out
+    assert result.placements == tuple(new_placements)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(result.get_tensor_view(index), expected.get_tensor_view(index))
+
+
+@pytest.mark.parametrize("collective", ["allgather", "allreduce", "reduce_scatter"])
+def test_multi_axis_redistribute_reuses_storage(distributed_setup, monkeypatch, collective):
+    """Reuse final/scratch storage across collectives without modifying the input."""
+    if distributed_setup.world_size % 4:
+        pytest.skip("Requires a world size divisible by four.")
+    mesh = init_device_mesh(
+        distributed_setup.device.type, (2, 2, distributed_setup.world_size // 4)
+    )
+    old_placements = [RowAtomic()] * 3 if collective == "allgather" else [Partial()] * 3
+    new_placements = [RowAtomic()] * 3 if collective == "reduce_scatter" else [Replicate()] * 3
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    local_scale = 1 if collective == "allgather" else distributed_setup.rank + 1
+    reduced_scale = (
+        1
+        if collective == "allgather"
+        else distributed_setup.world_size * (distributed_setup.world_size + 1) // 2
+    )
+    source = DBuffer.distribute_tensors(
+        [tensor * local_scale for tensor in tensors], mesh, old_placements
+    )
+    original = source.local_buffer.clone()
+    expected = DBuffer.distribute_tensors(
+        [tensor * reduced_scale for tensor in tensors], mesh, new_placements
+    )
+    out = DBuffer(mesh, new_placements, source.layout, source.dtype, source.device)
+    calls = []
+    original_collective = getattr(DBuffer, collective)
+
+    def record(buffer, axis, *args, out=None):
+        result = original_collective(buffer, axis, *args, out=out)
+        calls.append(
+            (
+                buffer.local_buffer.untyped_storage().data_ptr(),
+                result.local_buffer.untyped_storage().data_ptr(),
+                out is not None,
+            )
+        )
+        return result
+
+    monkeypatch.setattr(DBuffer, collective, record)
+    assert source.redistribute(new_placements, out=out) is out
+    assert len(calls) == (1 if collective == "allgather" else 3)
+    out_ptr = out.local_buffer.untyped_storage().data_ptr()
+    if collective == "reduce_scatter":
+        assert not calls[0][2]  # The first intermediate is larger than the final output.
+        assert calls[1][0] == calls[1][1] == calls[0][1]  # Reuse that scratch in place.
+        assert calls[1][2]
+        assert calls[2][1] == out_ptr
+    else:
+        assert all(output_ptr == out_ptr and supplied for _, output_ptr, supplied in calls)
+    torch.testing.assert_close(source.local_buffer, original, equal_nan=True)
+    for index in range(len(tensors)):
+        torch.testing.assert_close(out.get_tensor_view(index), expected.get_tensor_view(index))
+
+
+def test_multi_axis_reduce_scatter_into_input_view(distributed_setup, monkeypatch):
+    """Two reduce-scatters can write successive shards into the original input."""
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source = DBuffer.distribute_tensors(
+        [tensor * (distributed_setup.rank + 1) for tensor in tensors], mesh, [Partial(), Partial()]
+    )
+    placements = [RowAtomic(), RowAtomic()]
+    out = source.view(placements)
+    reduced_scale = distributed_setup.world_size * (distributed_setup.world_size + 1) // 2
+    expected = DBuffer.distribute_tensors(
+        [tensor * reduced_scale for tensor in tensors], mesh, placements
+    )
+    calls = []
+    original_reduce_scatter = DBuffer.reduce_scatter
+
+    def record(buffer, axis, placement, *, out=None):
+        assert out is not None
+        assert out.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
+        assert buffer.local_buffer.untyped_storage() is source.local_buffer.untyped_storage()
+        assert out.local_buffer.storage_offset() - buffer.local_buffer.storage_offset() == (
+            mesh.get_local_rank(axis) * out.local_buffer.numel()
+        )
+        calls.append(axis)
+        return original_reduce_scatter(buffer, axis, placement, out=out)
+
+    monkeypatch.setattr(DBuffer, "reduce_scatter", record)
+    assert source.redistribute(placements, out=out) is out
+    assert calls == [1, 0]
+    for index in range(len(tensors)):
+        torch.testing.assert_close(out.get_tensor_view(index), expected.get_tensor_view(index))
+
+
 def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_setup):
     """A Replicate+RowAtomic view chunks the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
@@ -722,3 +936,30 @@ def test_2d_mesh_replicate_row_atomic_view_to_row_atomic_row_atomic(distributed_
         == replicated_sharded_buffer.local_buffer.numel() // 2
     )
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
+
+
+@pytest.mark.parametrize("use_out", [False, True])
+def test_quantized_multi_axis_allgather(distributed_setup, use_out):
+    """Gather all four byte planes without requiring FP8 arithmetic."""
+    QuantizedDBuffer = pytest.importorskip(
+        "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer"
+    ).QuantizedDBuffer
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    mesh = init_device_mesh(distributed_setup.device.type, (2, distributed_setup.world_size // 2))
+    replicated = QuantizedDBuffer.empty(
+        mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    expected = []
+    for plane in replicated.planes:
+        values = torch.arange(plane.local_buffer.numel(), device=distributed_setup.device) % 251
+        plane.local_buffer.copy_(values)
+        expected.append(plane.local_buffer.clone())
+    sharded = replicated.view([BlockAtomic(32), BlockAtomic(32)])
+    for plane, shard in zip(replicated.planes, sharded.planes):
+        saved = shard.local_buffer.clone()
+        plane.local_buffer.zero_()
+        shard.local_buffer.copy_(saved)
+    result = sharded.allgather((axis for axis in [1, 0]), out=replicated if use_out else None)
+    for plane, values in zip(result.planes, expected):
+        torch.testing.assert_close(plane.local_buffer, values, rtol=0, atol=0)
