@@ -180,9 +180,26 @@ Forward pass (Layer N):                    Backward pass (Layer N):
 3. **`group_offload`**: Triggers asynchronous D2H copy on a dedicated CUDA stream (`d2h_stream`), optionally releases GPU storage of input tensors.
 4. **Backward**: Before the group's backward, tensors are reloaded from CPU to GPU on `h2d_stream`, and the compute stream waits for the transfer to complete.
 
+Every committed forward group occupies a slot in the backward reload queue, including groups
+kept on GPU by the offload policy. GPU-resident groups are consumed as no-op slots without
+recording a reload event. The group-start autograd marker retains the corresponding forward
+group so backward can consume its current no-op slot before preloading the next group. This
+preserves the reload cadence for partial offloading without reloading earlier groups too soon.
+
 ### Warmup and Adaptive Offloading
 
-The first training iteration serves as a **warmup phase** where the manager records tensor groups, their sizes, and the execution order. After warmup, a `post_warmup_callback` runs to:
+The first training iteration serves as a **warmup phase** where the manager records tensor groups,
+their candidate transfer sizes, and the execution order without requiring a CPU copy for every group.
+Because the final eligible group count is not yet known, each chunk uses an online quota:
+the kth group containing eligible tensors is offloaded only when `ceil(k * activation_offload_fraction)`
+increases. For example, fraction 0.5 offloads groups 0, 2, 4, ... during warmup. Empty groups and groups
+with no eligible tensors do not consume quota. Fraction 0 performs no activation offload copies;
+fraction 1 offloads every eligible warmup group. Rounding up favors GPU memory headroom.
+
+This temporary warmup selection does not change the groups' eligibility for later iterations. It
+also does not add explicit cache eviction. After warmup, `post_warmup_callback` computes the normal
+policy independently, preserving the preference for earlier forward groups:
+
 
 1. **Reserve margin**: The last N groups (by deduplication count) are kept on GPU to avoid reload blocking the compute stream.
 2. **Apply PP rank delta**: Higher PP ranks offload fewer bytes (controlled by `delta_offload_bytes_across_pp_ranks`).
