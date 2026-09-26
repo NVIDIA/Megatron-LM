@@ -252,6 +252,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/**/*.py]
     products:
       - environment: [lts, dev]

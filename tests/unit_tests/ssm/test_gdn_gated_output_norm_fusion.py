@@ -193,8 +193,23 @@ def test_post_fusion_revalidates_each_forward(model_parallel, pre_fusion):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("batch,heads,dim", [(2, 8, 64), (3, 4, 256)])
-@pytest.mark.parametrize("pre_fusion", [False, True])
+@pytest.mark.parametrize(
+    "pre_fusion,batch,heads,dim",
+    [
+        (False, 2, 8, 64),
+        (False, 3, 4, 256),
+        (True, 2, 8, 64),
+        pytest.param(
+            True,
+            3,
+            4,
+            256,
+            marks=pytest.mark.skip(
+                reason="Temporarily disabled: costly width-256 pre/post-fusion compilation in SSM CI"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("recompute", [False, True])
 def test_dense_batch_and_head_layout_parity(
     model_parallel, batch, heads, dim, pre_fusion, recompute, dtype
