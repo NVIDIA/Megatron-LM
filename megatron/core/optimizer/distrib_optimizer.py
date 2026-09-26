@@ -1051,7 +1051,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 assert len(steps) == 1, f"steps: {steps}"
                 step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
                 for v in self.optimizer.state.values():
-                    v["step"] = step.detach().clone()
+                    if "step" in v:
+                        v["step"] = step.detach().clone()
 
         # Optimizer.
         self.optimizer.load_state_dict(
@@ -1211,7 +1212,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             for k, v in tensors.items():
-                if not isinstance(v, torch.Tensor):
+                if k == "step" or not isinstance(v, torch.Tensor):
+                    # Scalar counters are restored separately from param_groups.
                     continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
@@ -1231,9 +1233,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
             for key in dst_tensors:
-                if not isinstance(tensors[key], torch.Tensor):
+                if key == "step":
+                    # Scalar counters are restored separately from param_groups.
                     continue
-                dst_tensors[key].copy_(tensors[key])
+                source_key = key
+                if (
+                    isinstance(self.optimizer, HybridDeviceOptimizer)
+                    and key == "master_param"
+                    and key not in tensors
+                ):
+                    # Fully reshardable checkpoints store the FP32 main weight
+                    # once, under "param", including the CPU-owned master copy.
+                    source_key = "param"
+                if not isinstance(tensors[source_key], torch.Tensor):
+                    continue
+                dst_tensors[key].copy_(tensors[source_key])
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -2113,6 +2127,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Main param & optimizer states.
                         self._set_main_param_and_optimizer_states(model_param, src_tensors)
 
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
+
     @torch.no_grad()
     def load_parameter_state_from_fs_model_space(self, state_dict):
         """Loads the parameter state from a "model space" representation.
@@ -2193,13 +2210,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                     assert sum(model_numels) == sum(checkpoint_numels)
                 for key in ("param",) + self.optimizer_state_keys:
-                    legacy_world_tensors = self._update_legacy_world_tensors(
-                        state_dict[gbuf_idx][torch.float32][key],
-                        [
-                            self.buffers[gbuf_idx].buckets[bi].numel_unpadded
-                            for bi in range(len(gbuf_range_map_for_all_buckets))
-                        ],
-                    )
+                    legacy_world_tensors = None
+                    if data_parallel_rank == 0:
+                        legacy_world_tensors = self._update_legacy_world_tensors(
+                            state_dict[gbuf_idx][torch.float32][key],
+                            [
+                                self.buffers[gbuf_idx].buckets[bi].numel_unpadded
+                                for bi in range(len(gbuf_range_map_for_all_buckets))
+                            ],
+                        )
                     offset_in_world_tensors = 0
                     for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                         # Compute local DP contiguous shard's size.
@@ -2271,6 +2290,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             tensor_to_copy_into.data.copy_(
                                 recv_tensor[gbuf_local_start:gbuf_local_end]
                             )
+                            if key == "param" and isinstance(self.optimizer, HybridDeviceOptimizer):
+                                # Legacy conversion also needs the FP32 owner copy;
+                                # the model/main parameter alone can be lower precision.
+                                master = self.optimizer.state[main_param].get("master_param")
+                                if master is not None:
+                                    master.copy_(recv_tensor[gbuf_local_start:gbuf_local_end])
+
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     def load_parameter_state_from_dp_zero(self, state_dict, *, update_legacy_format=False):
         """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank,
@@ -2375,6 +2403,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 for model_param, tensors in recv_tensors.items():
                     self._set_main_param_and_optimizer_states(model_param, tensors)
+
+        # ChainedOptimizer's legacy loader calls this method directly, bypassing
+        # load_state_dict. Refresh the child owners only after every shard is loaded.
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     @torch.no_grad()
     def load_parameter_state_from_fully_reshardable(self, state_dict: dict):
