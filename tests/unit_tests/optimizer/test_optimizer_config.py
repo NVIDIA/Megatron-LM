@@ -21,6 +21,26 @@ def test_layer_sharded_muon_tp_mode_requirements():
         OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True})
 
 
+def test_hybrid_muon_expert_tp_mode_requirements():
+    """muon_expert_tp_mode='layer_sharded' needs muon and the layer-wise path too; the
+    split-QKV restriction is keyed to the dense side, which alone owns QKV weights."""
+    ok = dict(optimizer='muon', use_layer_wise_distributed_optimizer=True)
+    hybrid = dict(muon_tp_mode='auto', muon_expert_tp_mode='layer_sharded')
+    # Dense auto + expert layer_sharded keeps dense split-QKV available.
+    OptimizerConfig(**hybrid, muon_split_qkv=True, **ok)
+    with pytest.raises(ValueError, match="muon_expert_tp_mode='layer_sharded' requires optimizer"):
+        OptimizerConfig(**hybrid, **{**ok, 'optimizer': 'adaptive_muon'})
+    with pytest.raises(ValueError, match="layer-wise"):
+        OptimizerConfig(**hybrid, **{**ok, 'use_layer_wise_distributed_optimizer': False})
+    # Reverse hybrid: the dense side is layer_sharded, so split-QKV must be off.
+    reverse = dict(muon_tp_mode='layer_sharded', muon_expert_tp_mode='duplicated')
+    OptimizerConfig(**reverse, muon_split_qkv=False, **ok)
+    with pytest.raises(ValueError, match="split-QKV"):
+        OptimizerConfig(**reverse, muon_split_qkv=True, **ok)
+    # An explicit expert mode equal to the dense one changes nothing.
+    OptimizerConfig(muon_tp_mode='duplicated', muon_expert_tp_mode='duplicated')
+
+
 def test_paramkey_matches():
     len_1_predicate = ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
     endswith_bias = ParamKey(name="*.bias")
