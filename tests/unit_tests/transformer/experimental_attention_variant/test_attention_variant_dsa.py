@@ -15,6 +15,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
@@ -197,6 +198,89 @@ class TestDSAIndexShareHelpers:
         assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
         assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
         assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+
+    @pytest.mark.parametrize("recompute_method", ["block", "uniform"])
+    def test_nonpacked_checkpointed_forwards_keep_index_share_holders_isolated(
+        self, monkeypatch, recompute_method
+    ):
+        config = SimpleNamespace(
+            dsa_indexer_topk=8,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=1,
+            kv_channels=16,
+        )
+        attention = DSAttention(
+            config=config,
+            submodules=DSAttentionSubmodules(indexer=object()),
+            layer_number=2,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            softmax_scale=1.0,
+            pg_collection=SimpleNamespace(),
+        )
+        recomputed_supports = []
+
+        class HolderLayer:
+            layer_number = 2
+
+            def __call__(self, hidden_states, attention_mask, packed_seq_params, **_kwargs):
+                topk_holder = attention._get_index_share_topk_holder(
+                    packed_seq_params, attention_mask
+                )
+                length_holder = attention._get_index_share_topk_length_holder(
+                    packed_seq_params, attention_mask
+                )
+                if torch.is_grad_enabled():
+                    recomputed_supports.append((topk_holder[1].clone(), length_holder[1].clone()))
+                else:
+                    topk_holder[1] = hidden_states.detach().to(torch.int64)
+                    length_holder[1] = hidden_states.detach().to(torch.int32)
+                return hidden_states
+
+        block = SimpleNamespace(
+            config=SimpleNamespace(
+                experimental_attention_variant="dsa",
+                dsa_indexer_topk_freq=4,
+                fp8=False,
+                fp4=False,
+                distribute_saved_activations=False,
+                recompute_method=recompute_method,
+                recompute_num_layers=1,
+            ),
+            layers=[HolderLayer()],
+            num_layers_per_pipeline_rank=1,
+            pg_collection=SimpleNamespace(tp=None),
+        )
+        checkpoint_calls = []
+
+        def fake_checkpoint(function, _distribute_saved_activations, *args):
+            checkpoint_calls.append((function, args))
+            with torch.no_grad():
+                return function(*args)
+
+        monkeypatch.setattr("megatron.core.recompute.tensor_parallel.checkpoint", fake_checkpoint)
+        shared_attention_mask = torch.empty(1)
+        for value in (1.0, 2.0):
+            checkpointed_forward(
+                block,
+                hidden_states=torch.tensor([value]),
+                attention_mask=shared_attention_mask,
+                context=None,
+                context_mask=None,
+                rotary_pos_emb=torch.empty(1),
+                attention_bias=None,
+                packed_seq_params=None,
+                use_inner_quantization_context=False,
+            )
+
+        for function, args in checkpoint_calls:
+            with torch.enable_grad():
+                function(*args)
+
+        assert [support.item() for support, _length in recomputed_supports] == [1, 2]
+        assert [length.item() for _support, length in recomputed_supports] == [1, 2]
+        assert not hasattr(shared_attention_mask, DSAttention._HOLDER_ATTR)
+        assert not hasattr(shared_attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
 
 
 def _build_packed_causal_mask_for_test(
