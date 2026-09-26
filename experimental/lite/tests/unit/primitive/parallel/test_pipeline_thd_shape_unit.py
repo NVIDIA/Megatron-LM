@@ -89,6 +89,8 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
         pl._1f1b_schedule(
             forward_step_fn, model, iter([(b, None) for b in batches]),
             num_mb, SimpleNamespace(num_microbatches=num_mb), ps, fwd_shapes[0])
+        if not ps.pp_is_first:
+            assert model._input_tensor is None
     finally:
         pl._send_recv_pipeline = orig_srp
     return recorded_fwd, recorded_bwd, fwd_shapes

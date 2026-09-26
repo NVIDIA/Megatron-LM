@@ -378,6 +378,10 @@ def _1f1b_schedule(
         if send_bwd is not None:
             _p2p(send_bwd=send_bwd)
 
+    if not ps.pp_is_first:
+        from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+
+        unwrap_model(model).set_input_tensor(None)
     return outputs
 
 
