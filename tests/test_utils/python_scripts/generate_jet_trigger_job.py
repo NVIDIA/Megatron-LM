@@ -196,7 +196,7 @@ def main(
     n_repeat: int,
     time_limit: int,
     test_cases: str,
-    platform: str,
+    platform: Optional[str],
     cluster: Optional[str],
     partition: Optional[str],
     output_path: str,
@@ -235,7 +235,7 @@ def main(
     ]
 
     changed_cases = {}
-    if base_ref:
+    if base_ref and platform:
         selected = {(case.spec["model"], case.spec["test_case"]) for case in list_of_test_cases}
         changed = _changed_workloads(BASE_PATH.parents[2], base_ref, platform, head_ref)
         for case in sorted(changed, key=lambda item: GITHUB_SCOPES.index(item.spec["scope"])):
@@ -254,6 +254,7 @@ def main(
         "team/megatron",
     ]
 
+    gitlab_pipeline: dict
     if not list_of_test_cases:
         gitlab_pipeline = {
             "stages": ["empty-pipeline-placeholder"],
@@ -360,7 +361,7 @@ def main(
                 test_script = build_test_script(test_script)
                 artifact_paths.extend([TRIAGE_LOG_PATH, TRIAGE_REPORT_PATH])
 
-            job = {
+            gitlab_pipeline[test_case['spec']['test_case']] = {
                 "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
@@ -383,11 +384,10 @@ def main(
             if key in changed_cases:
                 # GitHub reads these fields when converting the YAML to its matrix.
                 # Added cases keep their own tier and bypass the normal cadence.
-                job["variables"] = {
+                gitlab_pipeline[test_case['spec']['test_case']]["variables"] = {
                     "FUNCTIONAL_TEST_SCOPE": case_scope,
                     "FUNCTIONAL_TEST_CADENCE": "",
                 }
-            gitlab_pipeline[test_case.spec["test_case"]] = job
 
     with open(output_path, 'w') as outfile:
         yaml.dump(gitlab_pipeline, outfile, default_flow_style=False)
