@@ -5,12 +5,16 @@
 set -euxo pipefail
 
 NCCL_EXTENSIONS_VERSION="0.1.0"
+NVCC_THREADS=""
 PYTHON="${UV_PROJECT_ENVIRONMENT:-/opt/venv}/bin/python"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --NCCL_EXTENSIONS_VERSION=*)
             NCCL_EXTENSIONS_VERSION="${1#*=}"
+            ;;
+        --NVCC_THREADS=*)
+            NVCC_THREADS="${1#*=}"
             ;;
         --PYTHON=*)
             PYTHON="${1#*=}"
@@ -28,6 +32,11 @@ if [[ ! "${NCCL_EXTENSIONS_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 NCCL_EXTENSIONS_TAG="nccl-extensions-v${NCCL_EXTENSIONS_VERSION}"
+
+if [[ -n "${NVCC_THREADS}" && ! "${NVCC_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NVCC_THREADS must be a positive integer" >&2
+    exit 1
+fi
 
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 test -x "${CUDA_HOME}/bin/nvcc"
@@ -60,7 +69,13 @@ test -f "${NCCL_HOME}/include/nccl_device.h"
 test -d "${NCCL_HOME}/include/nccl_device"
 
 BUILD_DIR="${WORK_DIR}/build"
-NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100" \
+# Empty NVCC_THREADS keeps nvcc's default. nvcc applies the last --threads it sees, so the
+# appended value wins over any earlier one.
+M2N_BUILD_ENV=(NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100")
+if [[ -n "${NVCC_THREADS}" ]]; then
+    M2N_BUILD_ENV+=(NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:+${NVCC_APPEND_FLAGS} }--threads ${NVCC_THREADS}")
+fi
+env "${M2N_BUILD_ENV[@]}" \
     make -C "${NCCL_EXTENSIONS_DIR}/nccl_m2n" build \
         NCCL_HOME="${NCCL_HOME}" \
         CUDA_HOME="${CUDA_HOME}" \
