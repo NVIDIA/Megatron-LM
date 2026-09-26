@@ -151,9 +151,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             if IS_BETA_HEADWISE:
                 next_beta = tl.load(p_beta + HV, mask=has_next, other=0).to(tl.float32)
             else:
-                next_beta = tl.load(
-                    p_beta + HV * V, mask=mask_v & has_next, other=0
-                ).to(tl.float32)
+                next_beta = tl.load(p_beta + HV * V, mask=mask_v & has_next, other=0).to(tl.float32)
             if USE_G:
                 next_g = tl.load(p_g + HV, mask=has_next, other=0).to(tl.float32)
             if USE_QK_L2NORM_IN_KERNEL:
