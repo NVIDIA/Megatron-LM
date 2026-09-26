@@ -40,7 +40,7 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
-from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core import mpu, tensor_parallel
 
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
@@ -5557,8 +5557,7 @@ def train(
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
-                        nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+                    buf.deregister_nccl_mem_pools()
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )
