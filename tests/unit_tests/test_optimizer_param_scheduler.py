@@ -299,6 +299,51 @@ def test_load_state_dict(mock_optimizer):
     assert scheduler.wd_incr_style == 'cosine'
 
 
+def test_load_state_dict_applies_checkpoint_weight_decay(mock_optimizer):
+    """The param groups must follow the checkpoint weight decay schedule right after loading.
+
+    load_state_dict used to call step() before it restored the weight decay values, so the
+    weight_decay written into the param groups came from the constructor arguments while the
+    lr already came from the checkpoint. The first optimizer step after a resume then ran with
+    the wrong weight decay.
+    """
+    scheduler = OptimizerParamScheduler(
+        optimizer=mock_optimizer,
+        init_lr=0.01,
+        max_lr=0.1,
+        min_lr=0.001,
+        lr_warmup_steps=100,
+        lr_decay_steps=1000,
+        lr_decay_style='linear',
+        start_wd=0.0,
+        end_wd=0.1,
+        wd_incr_steps=1000,
+        wd_incr_style='linear',
+    )
+
+    state_dict = {
+        'max_lr': 0.2,
+        'min_lr': 0.0005,
+        'lr_warmup_steps': 200,
+        'lr_decay_steps': 2000,
+        'lr_decay_style': 'cosine',
+        'num_steps': 500,
+        'start_wd': 0.01,
+        'end_wd': 0.2,
+        'wd_incr_steps': 500,
+        'wd_incr_style': 'cosine',
+    }
+
+    scheduler.load_state_dict(state_dict)
+    param_group = mock_optimizer.param_groups[0]
+
+    # 500 steps into a 500 step ramp from 0.01 to 0.2 is exactly end_wd. The constructor
+    # schedule would give 0.05 at the same step, which is what the param group used to hold.
+    assert scheduler.get_wd() == pytest.approx(0.2)
+    assert param_group['weight_decay'] == pytest.approx(scheduler.get_wd())
+    assert param_group['lr'] == pytest.approx(scheduler.get_lr(param_group))
+
+
 # ── get_canonical_lr_for_logging tests ──────────────────────────────────────
 #
 # Returns the lr of the first default_config=True param group.  In practice
