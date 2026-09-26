@@ -197,6 +197,7 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
+      functional_test_head_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
     steps:
@@ -1013,6 +1014,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: ${{ needs.configure.outputs.functional_test_head_sha != '' && '0' || '1' }}
 
       - name: Parse functional tests
         id: main
@@ -1020,14 +1022,17 @@ jobs:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
+          HEAD_SHA: ${{ needs.configure.outputs.functional_test_head_sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope $SCOPE)
+          ARGS=(--scope "$SCOPE")
           [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
           # CADENCE is empty when label-based bypass is active; pass through
           # only when set so generate_jet_trigger_job sees None and skips the filter.
           [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
+          # Full-suite labels select L1; keep their existing test matrix.
+          [ -n "$HEAD_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref HEAD^1 --head-ref "$HEAD_SHA")
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -1042,11 +1047,11 @@ jobs:
             --environment dev \
             --platform dgx_h100 \
             --cluster ghci \
-            ${ARGS[@]} \
+            "${ARGS[@]}" \
             --output-path integration-tests-h100.yaml
 
           cat integration-tests-h100.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-h100.json
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key, "scope": (.value.variables.FUNCTIONAL_TEST_SCOPE // strenv(SCOPE)), "cadence": (.value.variables.FUNCTIONAL_TEST_CADENCE // strenv(CADENCE))}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-h100.json
 
           echo "integration-tests-h100=$(cat integration-tests-h100.json)" | tee -a "$GITHUB_OUTPUT"
 
@@ -1087,10 +1092,10 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
-          scope: ${{ needs.configure.outputs.scope }}
+          scope: ${{ matrix.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
-          cadence: ${{ needs.configure.outputs.cadence }}
+          cadence: ${{ matrix.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
   cicd-parse-integration-tests-gb200:
@@ -1111,6 +1116,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: ${{ needs.configure.outputs.functional_test_head_sha != '' && '0' || '1' }}
 
       - name: Parse functional tests
         id: main
@@ -1118,14 +1124,17 @@ jobs:
           SCOPE: ${{ needs.configure.outputs.scope }}
           LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
+          HEAD_SHA: ${{ needs.configure.outputs.functional_test_head_sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope $SCOPE)
+          ARGS=(--scope "$SCOPE")
           [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
           # CADENCE is empty when label-based bypass is active; pass through
           # only when set so generate_jet_trigger_job sees None and skips the filter.
           [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
+          # Full-suite labels select L1; keep their existing test matrix.
+          [ -n "$HEAD_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref HEAD^1 --head-ref "$HEAD_SHA")
 
           python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
             --n-repeat 5 \
@@ -1140,11 +1149,11 @@ jobs:
             --environment dev \
             --platform dgx_gb200 \
             --cluster dgxgb200_oci-hsg \
-            ${ARGS[@]} \
+            "${ARGS[@]}" \
             --output-path integration-tests-gb200.yaml
 
           cat integration-tests-gb200.yaml | \
-            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-gb200.json
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key, "scope": (.value.variables.FUNCTIONAL_TEST_SCOPE // strenv(SCOPE)), "cadence": (.value.variables.FUNCTIONAL_TEST_CADENCE // strenv(CADENCE))}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-gb200.json
 
           echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
 
@@ -1187,11 +1196,11 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
-          scope: ${{ needs.configure.outputs.scope }}
+          scope: ${{ matrix.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
           platform: dgx_gb200
-          cadence: ${{ needs.configure.outputs.cadence }}
+          cadence: ${{ matrix.cadence }}
           sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
