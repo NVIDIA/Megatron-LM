@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pathlib
+import subprocess
 from typing import Optional
 
 import click
@@ -11,6 +12,98 @@ from tests.test_utils.python_scripts import recipe_parser
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 TRIAGE_LOG_PATH = "jet_workload.log"
 TRIAGE_REPORT_PATH = "error_report.json"
+TEST_CASES = pathlib.PurePosixPath("tests/functional_tests/test_cases")
+RECIPES = pathlib.PurePosixPath("tests/test_utils/recipes")
+GITHUB_SCOPES = ("L0", "L1")
+GPUS_PER_RUNNER = {"dgx_h100": 8, "dgx_gb200": 4}
+
+
+def _git(repo_root: pathlib.Path, *args: str) -> str:
+    return subprocess.check_output(["git", *args], cwd=repo_root, text=True)
+
+
+def _recipe_at_ref(repo_root: pathlib.Path, ref: str, path: str) -> list[recipe_parser.dotdict]:
+    manifest = recipe_parser.dotdict(yaml.safe_load(_git(repo_root, "show", f"{ref}:{path}")))
+    return recipe_parser.set_build_dependency(
+        recipe_parser.flatten_workload(recipe_parser.flatten_products(manifest))
+    )
+
+
+def _workload_key(workload: recipe_parser.dotdict) -> tuple:
+    return tuple(
+        workload.spec.get(field)
+        for field in ("model", "test_case", "scope", "environment", "platforms")
+    )
+
+
+def _changed_workloads(
+    repo_root: pathlib.Path, base_ref: str, platform: str, head_ref: str
+) -> list[recipe_parser.dotdict]:
+    # Identify changes on the PR branch, excluding changes from the target
+    # branch that are only present in the merge commit being tested.
+    base = _git(repo_root, "merge-base", base_ref, head_ref).strip()
+    changes = _git(
+        repo_root,
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "-z",
+        base,
+        head_ref,
+        "--",
+        str(TEST_CASES),
+        str(RECIPES),
+    ).split("\0")
+    changed_files = dict(zip(changes[1::2], changes[0::2]))
+    changed_cases = set()
+    for filename in changed_files:
+        path = pathlib.PurePosixPath(filename)
+        if path.is_relative_to(TEST_CASES):
+            parts = path.relative_to(TEST_CASES).parts
+            if len(parts) >= 3:
+                changed_cases.add((parts[0], parts[1]))
+
+    changed = []
+    for recipe_path in sorted((repo_root / RECIPES).glob("**/*.yaml")):
+        workloads = recipe_parser.load_and_flatten(str(recipe_path))
+        relative_path = recipe_path.relative_to(repo_root).as_posix()
+        changed_rows = set()
+        if changed_files.get(relative_path) not in (None, "D"):
+            previous = (
+                []
+                if changed_files[relative_path] == "A"
+                else _recipe_at_ref(repo_root, base, relative_path)
+            )
+            changed_rows = {
+                _workload_key(workload)
+                for workload in _recipe_at_ref(repo_root, head_ref, relative_path)
+                if workload not in previous
+            }
+
+        for workload in workloads:
+            spec = workload.spec
+            # GitLab-only and disabled scopes must never become GitHub jobs.
+            # Keep the same environment/platform availability as the default matrix.
+            if (
+                workload.type == "build"
+                or spec.get("model") == "unit-tests"
+                or spec.get("scope") not in GITHUB_SCOPES
+                or spec.get("environment") != "dev"
+                or spec.get("platforms") != platform
+                # The GitHub launcher uses one DockerExecutor, unlike JET's
+                # multi-node launch path used by some nightly recipes.
+                or spec.get("nodes", 1) != 1
+                or spec.get("gpus", GPUS_PER_RUNNER[platform]) > GPUS_PER_RUNNER[platform]
+            ):
+                continue
+            case = (spec["model"], spec["test_case"])
+            if not (repo_root / TEST_CASES / case[0] / case[1]).is_dir():
+                # Exclude deleted cases. Recipes can launch Python tests directly
+                # without using the model_config.yaml training harness.
+                continue
+            if case in changed_cases or _workload_key(workload) in changed_rows:
+                changed.append(workload)
+    return changed
 
 
 def build_test_script(command: str) -> str:
@@ -95,13 +188,15 @@ def build_test_script(command: str) -> str:
     default=False,
     help="Extract a structured error report from GitLab child-job output.",
 )
+@click.option("--base-ref", default=None, help="Target commit used to find PR-only changes")
+@click.option("--head-ref", default="HEAD", help="PR branch SHA used to identify its changes")
 def main(
     scope: str,
     environment: str,
     n_repeat: int,
     time_limit: int,
     test_cases: str,
-    platform: Optional[str],
+    platform: str,
     cluster: Optional[str],
     partition: Optional[str],
     output_path: str,
@@ -117,6 +212,8 @@ def main(
     enable_warmup: Optional[bool] = None,
     cadence: Optional[str] = None,
     enable_error_extraction: bool = False,
+    base_ref: Optional[str] = None,
+    head_ref: str = "HEAD",
 ) -> None:
     # Treat empty string as "no cadence filter" so callers can wire shell
     # variables in directly without conditional flag emission.
@@ -136,6 +233,17 @@ def main(
         )
         if test_case.type != "build"
     ]
+
+    changed_cases = {}
+    if base_ref:
+        selected = {(case.spec["model"], case.spec["test_case"]) for case in list_of_test_cases}
+        changed = _changed_workloads(BASE_PATH.parents[2], base_ref, platform, head_ref)
+        for case in sorted(changed, key=lambda item: GITHUB_SCOPES.index(item.spec["scope"])):
+            key = (case.spec["model"], case.spec["test_case"])
+            if key not in selected:
+                selected.add(key)
+                changed_cases[key] = case.spec["scope"]
+                list_of_test_cases.append(case)
 
     tags = [
         "arch/amd64",
@@ -202,6 +310,8 @@ def main(
         warmup_job = ""
 
         for test_idx, test_case in enumerate(list_of_test_cases):
+            key = (test_case.spec["model"], test_case.spec["test_case"])
+            case_scope = changed_cases.get(key, scope)
             job_tags = list(tags)
             job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
@@ -212,7 +322,7 @@ def main(
                 f"--environment {test_case['spec']['environment']}",
                 f"--n-repeat {n_repeat}",
                 f"--time-limit {test_case['spec'].get('time_limit', time_limit)}",
-                f"--scope {scope}",
+                f"--scope {case_scope}",
                 f"--test-case '{test_case['spec']['test_case']}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
@@ -250,7 +360,7 @@ def main(
                 test_script = build_test_script(test_script)
                 artifact_paths.extend([TRIAGE_LOG_PATH, TRIAGE_REPORT_PATH])
 
-            gitlab_pipeline[test_case['spec']['test_case']] = {
+            job = {
                 "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
@@ -269,6 +379,15 @@ def main(
                     ],
                 },
             }
+
+            if key in changed_cases:
+                # GitHub reads these fields when converting the YAML to its matrix.
+                # Added cases keep their own tier and bypass the normal cadence.
+                job["variables"] = {
+                    "FUNCTIONAL_TEST_SCOPE": case_scope,
+                    "FUNCTIONAL_TEST_CADENCE": "",
+                }
+            gitlab_pipeline[test_case.spec["test_case"]] = job
 
     with open(output_path, 'w') as outfile:
         yaml.dump(gitlab_pipeline, outfile, default_flow_style=False)

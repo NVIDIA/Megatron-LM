@@ -997,18 +997,38 @@ jobs:
         id: main
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
+          LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
           HEAD_SHA: ${{ needs.configure.outputs.functional_test_head_sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope "$SCOPE" --cadence "$CADENCE")
+          ARGS=(--scope "$SCOPE")
+          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+          # CADENCE is empty when label-based bypass is active; pass through
+          # only when set so generate_jet_trigger_job sees None and skips the filter.
+          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
           # Full-suite labels select L1; keep their existing test matrix.
           [ -n "$HEAD_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref HEAD^1 --head-ref "$HEAD_SHA")
 
-          python tests/test_utils/python_scripts/generate_functional_test_matrix.py \
+          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+            --n-repeat 5 \
+            --time-limit 2700 \
+            --test-cases all \
+            --container-image mcore_ci_dev \
+            --container-tag latest \
+            --dependent-job functional:configure \
+            --record-checkpoints false \
+            --slurm-account gh \
+            --no-enable-warmup \
+            --environment dev \
             --platform dgx_h100 \
-            "${ARGS[@]}" > integration-tests-h100.json
+            --cluster ghci \
+            "${ARGS[@]}" \
+            --output-path integration-tests-h100.yaml
+
+          cat integration-tests-h100.yaml | \
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key, "scope": (.value.variables.FUNCTIONAL_TEST_SCOPE // strenv(SCOPE)), "cadence": (.value.variables.FUNCTIONAL_TEST_CADENCE // strenv(CADENCE))}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-h100.json
 
           echo "integration-tests-h100=$(cat integration-tests-h100.json)" | tee -a "$GITHUB_OUTPUT"
 
@@ -1079,18 +1099,38 @@ jobs:
         id: main
         env:
           SCOPE: ${{ needs.configure.outputs.scope }}
+          LIGHTWEIGHT: ${{ needs.configure.outputs.lightweight }}
           CADENCE: ${{ needs.configure.outputs.cadence }}
           HEAD_SHA: ${{ needs.configure.outputs.functional_test_head_sha }}
         run: |
           export PYTHONPATH=$(pwd)
 
-          ARGS=(--scope "$SCOPE" --cadence "$CADENCE")
+          ARGS=(--scope "$SCOPE")
+          [ "$LIGHTWEIGHT" == "true" ] && ARGS+=(--enable-lightweight-mode)
+          # CADENCE is empty when label-based bypass is active; pass through
+          # only when set so generate_jet_trigger_job sees None and skips the filter.
+          [ -n "$CADENCE" ] && ARGS+=(--cadence "$CADENCE")
           # Full-suite labels select L1; keep their existing test matrix.
           [ -n "$HEAD_SHA" ] && [ "$SCOPE" = "L0" ] && ARGS+=(--base-ref HEAD^1 --head-ref "$HEAD_SHA")
 
-          python tests/test_utils/python_scripts/generate_functional_test_matrix.py \
+          python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+            --n-repeat 5 \
+            --time-limit 2700 \
+            --test-cases all \
+            --container-image mcore_ci_dev \
+            --container-tag latest \
+            --dependent-job functional:configure \
+            --record-checkpoints false \
+            --slurm-account gh \
+            --no-enable-warmup \
+            --environment dev \
             --platform dgx_gb200 \
-            "${ARGS[@]}" > integration-tests-gb200.json
+            --cluster dgxgb200_oci-hsg \
+            "${ARGS[@]}" \
+            --output-path integration-tests-gb200.yaml
+
+          cat integration-tests-gb200.yaml | \
+            yq -o json 'del(.default, .stages, .workflow) | to_entries | map({"model": .value.stage, "test_case": .key, "scope": (.value.variables.FUNCTIONAL_TEST_SCOPE // strenv(SCOPE)), "cadence": (.value.variables.FUNCTIONAL_TEST_CADENCE // strenv(CADENCE))}) | sort_by(.model, .test_case)' | jq -c  > integration-tests-gb200.json
 
           echo "integration-tests-gb200=$(cat integration-tests-gb200.json)" | tee -a "$GITHUB_OUTPUT"
 
