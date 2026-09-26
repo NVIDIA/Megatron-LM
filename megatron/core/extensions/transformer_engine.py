@@ -3906,6 +3906,7 @@ try:
         Wrapper for TE's general_gemm function.
         It supports fp32, bf16, fp16, and fp8 GEMMs with TN, NN, and NT layouts.
         The output dtype can be specified by `out_dtype`.
+        When `accumulate` is True, the GEMM result is accumulated into `out`.
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
 
