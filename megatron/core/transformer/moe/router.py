@@ -282,7 +282,7 @@ class TopKRouter(Router):
 
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
-            self.router_replay = RouterReplay()
+            self.router_replay = RouterReplay(is_mtp_layer=self.is_mtp_layer)
 
     def set_layer_number(self, layer_number: int):
         """Set the layer number and initialize hash routing for eligible layers."""

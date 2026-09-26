@@ -216,7 +216,7 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
-        mock_controller._async_sched_logits = Mock()
+        mock_controller._async_sched_forward = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
@@ -272,7 +272,7 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
-        mock_controller._async_sched_logits = Mock()
+        mock_controller._async_sched_forward = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()

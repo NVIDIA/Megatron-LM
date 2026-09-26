@@ -2081,6 +2081,24 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
+    def test_store_routing_per_block_uses_explicit_forward_layout(self):
+        """A saved forward layout remains valid after context token rows change."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        block_ids = alloc.allocate_memory_blocks(2).tolist()
+        routing = np.arange(12, dtype=np.int16).reshape(3, 2, 2)
+        routing_block_ids = np.array([block_ids[1], block_ids[0], block_ids[1]])
+        routing_positions = np.array([2, 0, 1])
+
+        ctx.token_to_block_idx[:3] = -1
+        ctx.token_to_local_position_within_kv_block[:3] = -1
+        alloc.store_routing_per_block(routing, routing_block_ids, routing_positions)
+
+        assert np.array_equal(alloc.get_block_routing(block_ids[0])[0], routing[1])
+        assert np.array_equal(alloc.get_block_routing(block_ids[1])[1], routing[2])
+        assert np.array_equal(alloc.get_block_routing(block_ids[1])[2], routing[0])
+
+    @pytest.mark.internal
     def test_store_and_get_block_routing(self):
         """Verify store_block_routing / get_block_routing round-trip."""
         ctx = self._ctx()

@@ -641,42 +641,39 @@ class KVBlockAllocator:
     # Per-block routing storage methods (for MoE routing replay)
     # =========================================================================
 
-    def store_routing_per_block(self, flat_routing: Optional[np.ndarray]) -> None:
+    def store_routing_per_block(
+        self, flat_routing: np.ndarray, block_ids: np.ndarray, positions: np.ndarray
+    ) -> None:
         """Scatter flat routing indices into per-block storage.
 
-        Uses the context's token-to-block mapping to distribute each token's
-        routing data into the appropriate block. Matched (prefix-cached) blocks
-        already have routing from the original request and are not overwritten
-        here since their tokens are not in the active token layout.
+        Matched prefix-cache blocks already contain routing from the original
+        request and are absent from this forward's token layout.
 
         Args:
             flat_routing: ndarray of shape [active_token_count, num_layers, topk]
-                aligned with the context's active-token layout, or None.
+                aligned with the supplied token layout.
+            block_ids: KV-block ID for each routing row.
+            positions: Position within the KV block for each routing row.
         """
-        if flat_routing is None:
-            return
-
-        context = self.context
-        token_count = context.active_token_count
+        token_count = flat_routing.shape[0]
         if token_count == 0:
             return
 
-        assert (
-            flat_routing.shape[0] == token_count
-        ), f"Routing token count {flat_routing.shape[0]} != active token count {token_count}"
-
-        # Token-to-block mapping for all active tokens
-        block_ids_np = context.token_to_block_idx[:token_count].cpu().numpy()
-        positions_np = context.token_to_local_position_within_kv_block[:token_count].cpu().numpy()
+        assert block_ids.shape == (
+            token_count,
+        ), f"Routing block IDs shape {block_ids.shape} != ({token_count},)"
+        assert positions.shape == (
+            token_count,
+        ), f"Routing positions shape {positions.shape} != ({token_count},)"
 
         dummy = self.dummy_block_idx
 
         # Group tokens by block_id using sort for efficient scatter
         unique_blocks, inverse, counts = np.unique(
-            block_ids_np, return_inverse=True, return_counts=True
+            block_ids, return_inverse=True, return_counts=True
         )
         sorted_indices = np.argsort(inverse, kind='stable')
-        sorted_positions = positions_np[sorted_indices]
+        sorted_positions = positions[sorted_indices]
         sorted_routing = flat_routing[sorted_indices]
 
         offset = 0

@@ -709,6 +709,7 @@ class DynamicEngineTestConfig:
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
+    moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -1015,6 +1016,7 @@ class DynamicInferenceEngineTestBase:
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -1109,6 +1111,7 @@ class DynamicInferenceEngineTestBase:
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
                     if is_gdn or test_config.transformer_impl == "inference_optimized"
@@ -1463,7 +1466,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
     engine.unified_memory_level = 0
     engine.use_coordinator = False
@@ -1493,7 +1496,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
 
     assert engine.context.deallocate_inference_state_buffers.call_count == 1
     assert engine.context.reinitialize_inference_state_buffers.call_count == 1
-    engine.controller._async_sched_logits.clear.assert_called_once_with()
+    engine.controller._async_sched_forward.clear.assert_called_once_with()
     assert engine.state == EngineState.RUNNING
     replayed = [call.args[0].request_id for call in engine._add_request.call_args_list]
     assert replayed == [23, 24, 26, 25]
@@ -1553,7 +1556,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
     engine.num_speculative_tokens = 0
     engine.requests = {}
@@ -1596,7 +1599,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     assert not engine._vision_embedding_cache
     assert engine._vision_embedding_cache_bytes == 0
     engine.context.reset.assert_called_once_with()
-    engine.controller._async_sched_logits.clear.assert_called_once_with()
+    engine.controller._async_sched_forward.clear.assert_called_once_with()
 
 
 def test_drained_reset_rejects_suspended_state_before_context_mutation():
@@ -1606,14 +1609,14 @@ def test_drained_reset_rejects_suspended_state_before_context_mutation():
     engine.state = EngineState.SUSPENDED
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
     with pytest.raises(RuntimeError, match="only be reset while RUNNING or PAUSED"):
         engine.reset()
 
     engine.context.reset.assert_not_called()
-    engine.controller._async_sched_logits.clear.assert_not_called()
+    engine.controller._async_sched_forward.clear.assert_not_called()
 
 
 def test_drained_reset_rejects_outstanding_requests_before_mutation():
@@ -1625,7 +1628,7 @@ def test_drained_reset_rejects_outstanding_requests_before_mutation():
     engine.requests = requests
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
     with pytest.raises(RuntimeError, match="must drain all requests before reset"):
@@ -1633,7 +1636,7 @@ def test_drained_reset_rejects_outstanding_requests_before_mutation():
 
     assert engine.requests is requests
     engine.context.reset.assert_not_called()
-    engine.controller._async_sched_logits.clear.assert_not_called()
+    engine.controller._async_sched_forward.clear.assert_not_called()
 
 
 def _make_request_entry(loop, request_id: int, status: Status, resolve: bool = True):
