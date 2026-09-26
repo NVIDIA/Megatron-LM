@@ -1028,6 +1028,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
+    moe_return_chunk_size: int = 0
+    """Maximum return rows per peer and NCCL round; zero keeps the ordinary return path.
+
+    The opt-in path combines received chunks directly into tokens and bounds forward
+    and backward communication staging. It currently requires eager, dropless,
+    non-fused alltoall training with TP=ETP=CP=PP=1 and no shared experts.
+    """
+
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
@@ -3473,6 +3481,36 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
                     f"variable sequence length, please use alltoall dispatcher instead."
+                )
+
+        if self.moe_return_chunk_size < 0:
+            raise ValueError("moe_return_chunk_size must be nonnegative")
+        if self.moe_return_chunk_size:
+            if (
+                self.moe_token_dispatcher_type != "alltoall"
+                or self.tensor_model_parallel_size != 1
+                or self.expert_tensor_parallel_size != 1
+                or self.context_parallel_size != 1
+                or self.pipeline_model_parallel_size != 1
+                or self.moe_permute_fusion
+                or self.moe_expert_capacity_factor is not None
+                or self.moe_router_padding_for_quantization
+                or self.moe_shared_expert_intermediate_size is not None
+                or self.moe_latent_size is not None
+                or self.overlap_moe_expert_parallel_comm
+                or self.overlap_dispatch_backward_with_experts_wgrad
+                or self.recompute_granularity is not None
+                or self.cuda_graph_impl != "none"
+                or self.batch_invariant_mode
+                or self.deterministic_mode
+                or self.fp8
+                or self.fp4
+                or self.transformer_impl == "inference_optimized"
+            ):
+                raise ValueError(
+                    "moe_return_chunk_size requires eager dropless alltoall training, "
+                    "TP=ETP=CP=PP=1, native permutation, and no shared/latent experts, "
+                    "overlap, recomputation, quantization, or determinism mode"
                 )
 
         if self.moe_permute_fusion:
