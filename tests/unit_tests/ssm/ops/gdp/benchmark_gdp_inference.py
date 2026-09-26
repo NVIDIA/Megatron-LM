@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """CUDA-graph latency benchmark for the GDP decode kernels on GB200.
 
 Run inside a GPU allocation with the Megatron-LM CI container::
