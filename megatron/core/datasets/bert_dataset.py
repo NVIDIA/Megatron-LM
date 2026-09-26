@@ -10,6 +10,7 @@ from megatron.core.datasets.masked_dataset import (
     MaskedWordPieceDataset,
     MaskedWordPieceDatasetConfig,
 )
+from megatron.core.datasets.megatron_dataset import is_out_of_vocab_token_id
 from megatron.core.datasets.utils import Split
 
 
@@ -157,8 +158,10 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
         mask_loss[masked_positions] = 1
 
         # For padded sequences, ensure the embedding layer can map the token ID
-        tokens[tokens == self._pad_token_id] = 0
-        labels[labels == self._pad_token_id] = 0
+        vocab_size = getattr(self.config.tokenizer, "vocab_size", None)
+        if is_out_of_vocab_token_id(self._pad_token_id, vocab_size):
+            tokens[tokens == self._pad_token_id] = 0
+            labels[labels == self._pad_token_id] = 0
 
         return {
             "text": tokens,
