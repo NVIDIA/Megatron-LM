@@ -16,7 +16,7 @@
 
 import dataclasses
 from collections.abc import Iterable
-from functools import lru_cache
+from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
@@ -60,16 +60,29 @@ def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
     return reduce_ops[partial_placement.reduce_op]
 
 
-@lru_cache(maxsize=None)
+_combined_groups: WeakValueDictionary[
+    tuple[tuple[int, ...], tuple[dist.ProcessGroup, ...]], dist.ProcessGroup
+] = WeakValueDictionary()
+
+
 def _get_combined_group(
     ranks: tuple[int, ...], axis_groups: tuple[dist.ProcessGroup, ...]
 ) -> dist.ProcessGroup:
-    """Cache a combined group using its constituent process groups as identity."""
-    # Only members participate: other DP/EP domains may create different groups.
-    # Including the existing groups in the key prevents reuse after reinitialization.
-    return dist.new_group(
-        ranks=list(ranks), backend=dist.get_backend(axis_groups[0]), use_local_synchronization=True
-    )
+    """Reuse combined groups without retaining them after distributed teardown."""
+    # PyTorch owns registered groups and destroys them in destroy_process_group().
+    # Weak values let it release the groups and cache keys after that teardown.
+    # Constituent groups distinguish separate distributed initializations.
+    key = (ranks, axis_groups)
+    group = _combined_groups.get(key)
+    if group is None:
+        # Only members participate: other DP/EP domains may create different groups.
+        group = dist.new_group(
+            ranks=list(ranks),
+            backend=dist.get_backend(axis_groups[0]),
+            use_local_synchronization=True,
+        )
+        _combined_groups[key] = group
+    return group
 
 
 class DBuffer:

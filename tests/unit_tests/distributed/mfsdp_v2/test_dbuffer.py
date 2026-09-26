@@ -2,6 +2,8 @@
 
 """Unit tests for Megatron-FSDP DBuffer."""
 
+import gc
+import weakref
 from collections.abc import Iterable
 from unittest.mock import patch
 
@@ -12,7 +14,10 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import (
+    DBuffer,
+    _get_combined_group,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     RowAtomic,
@@ -712,6 +717,35 @@ def test_multi_axis_view_and_allgather(distributed_setup, destination):
     sliced = result.redistribute([RowAtomic(), RowAtomic()])
     for index in range(len(tensors)):
         torch.testing.assert_close(sliced.get_tensor_view(index), expected.get_tensor_view(index))
+
+
+def test_multi_axis_allgather_group_lifetime(distributed_setup):
+    """Reuse active groups and release cached references after explicit teardown."""
+    if distributed_setup.world_size % 2:
+        pytest.skip("Requires an even world size.")
+    local = torch.tensor([distributed_setup.rank], device=distributed_setup.device)
+    gathered = torch.empty(distributed_setup.world_size, dtype=local.dtype, device=local.device)
+
+    for _ in range(2):
+        # Each lifecycle starts with fresh constituent groups.
+        mesh = init_device_mesh(
+            distributed_setup.device.type, (2, distributed_setup.world_size // 2)
+        )
+        ranks = tuple(mesh.mesh.flatten().tolist())
+        axis_groups = tuple(mesh.get_group(axis) for axis in range(mesh.ndim))
+        group = _get_combined_group(ranks, axis_groups)
+        group_ref = weakref.ref(group)
+        try:
+            assert _get_combined_group(ranks, axis_groups) is group
+            dist.all_gather_into_tensor(gathered, local, group=group)
+            torch.testing.assert_close(
+                gathered, torch.arange(distributed_setup.world_size, device=local.device)
+            )
+        finally:
+            dist.destroy_process_group(group)
+        del group
+        gc.collect()
+        assert group_ref() is None
 
 
 @pytest.mark.parametrize("axes", [(0, 1), (1, 2), (0, 1, 2)])
