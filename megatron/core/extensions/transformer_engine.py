@@ -50,7 +50,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.module import is_first_microbatch_tracked
+from megatron.core.transformer.module import is_first_microbatch_tracked, mark_keep_in_fp32
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -2345,7 +2345,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
             # TE 2.9.0 introduces return_max_logit for qk-clip getting the max attention logits
             extra_kwargs["return_max_logit"] = True
-            self.current_max_attn_logits = None
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
@@ -2363,6 +2362,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             layer_number=layer_number,
             **extra_kwargs,
         )
+
+        if config.qk_clip or config.log_max_attention_logit:
+            self.register_buffer(
+                "current_max_attn_logits",
+                mark_keep_in_fp32(
+                    torch.full(
+                        (divide(config.num_attention_heads, self.tp_size),),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    )
+                ),
+                persistent=False,
+            )
 
     @contextmanager
     def _temporary_runtime_context_parallel_group(
@@ -2512,13 +2525,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 # log_max_attention_logit is set and clip_qk() never resets it).
                 batch_max_attention_logits = batch_max_attention_logits.detach()
 
-                # Update QK_Clip balancing eta
-                if self.current_max_attn_logits is None:
-                    self.current_max_attn_logits = batch_max_attention_logits
-                else:
-                    self.current_max_attn_logits = torch.max(
-                        self.current_max_attn_logits, batch_max_attention_logits
-                    )
+                torch.maximum(
+                    self.current_max_attn_logits,
+                    batch_max_attention_logits,
+                    out=self.current_max_attn_logits,
+                )
 
         else:
             _fa_kwargs = dict(**attention_bias_kwargs, **packed_seq_kwargs)

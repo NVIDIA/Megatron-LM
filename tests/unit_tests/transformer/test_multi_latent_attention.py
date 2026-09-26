@@ -1259,8 +1259,8 @@ class TestMLAClipQK:
             with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
                 attention.clip_qk()
 
-    def test_clip_qk_none_logits_raises_error(self):
-        """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
+    def test_clip_qk_uninitialized_logits_raises_error(self):
+        """Test that clip_qk requires accumulated attention logits."""
         if is_te_min_version("1.10.0"):
             attention = MLASelfAttention(
                 self.transformer_config,
@@ -1269,7 +1269,7 @@ class TestMLAClipQK:
                 attn_mask_type=AttnMaskType.causal,
             )
 
-            with pytest.raises(ValueError, match="current_max_attn_logits is None"):
+            with pytest.raises(ValueError, match="No attention logits have been accumulated"):
                 attention.clip_qk()
 
     def test_clip_qk_below_threshold_no_update(self):
@@ -1307,7 +1307,10 @@ class TestMLAClipQK:
             assert torch.equal(attention.linear_q_up_proj.weight.data, original_q_weight)
         assert torch.equal(attention.linear_kv_up_proj.weight.data, original_kv_weight)
         # current_max_attn_logits should be reset
-        assert attention.core_attention.current_max_attn_logits is None
+        torch.testing.assert_close(
+            attention.core_attention.current_max_attn_logits,
+            torch.full_like(attention.core_attention.current_max_attn_logits, float("-inf")),
+        )
 
     def test_clip_qk_above_threshold_updates_weights(self):
         """Test that weights are updated when max logits exceed threshold."""
@@ -1344,7 +1347,10 @@ class TestMLAClipQK:
             assert not torch.equal(attention.linear_q_up_proj.weight.data, original_q_weight)
         assert not torch.equal(attention.linear_kv_up_proj.weight.data, original_kv_weight)
         # current_max_attn_logits should be reset
-        assert attention.core_attention.current_max_attn_logits is None
+        torch.testing.assert_close(
+            attention.core_attention.current_max_attn_logits,
+            torch.full_like(attention.core_attention.current_max_attn_logits, float("-inf")),
+        )
 
     def test_clip_qk_mixed_logits(self):
         """Test clip_qk with mixed logits (some above, some below threshold)."""
@@ -1381,7 +1387,10 @@ class TestMLAClipQK:
             assert not torch.equal(attention.linear_q_up_proj.weight.data, original_q_weight)
         assert not torch.equal(attention.linear_kv_up_proj.weight.data, original_kv_weight)
         # current_max_attn_logits should be reset
-        assert attention.core_attention.current_max_attn_logits is None
+        torch.testing.assert_close(
+            attention.core_attention.current_max_attn_logits,
+            torch.full_like(attention.core_attention.current_max_attn_logits, float("-inf")),
+        )
 
     def test_clip_qk_with_absorption_raises_error(self):
         """Test that clip_qk raises ValueError when in absorption mode."""

@@ -2053,8 +2053,11 @@ class SelfAttention(Attention):
         if not self.config.qk_clip:
             raise ValueError("qk_clip option needs to be enabled")
 
-        if self.core_attention.current_max_attn_logits is None:
-            raise ValueError("current_max_attn_logits is None")
+        if (
+            self.core_attention.current_max_attn_logits is None
+            or torch.isneginf(self.core_attention.current_max_attn_logits).all()
+        ):
+            raise ValueError("No attention logits have been accumulated")
 
         assert self.core_attention.current_max_attn_logits.shape == (
             self.num_attention_heads_per_partition,
@@ -2091,8 +2094,7 @@ class SelfAttention(Attention):
 
             self.linear_qkv.weight.data.copy_(self._clip_linear_qkv(self.linear_qkv.weight.data))
 
-        # reset current_max_attn_logits
-        self.core_attention.current_max_attn_logits = None
+        self.core_attention.current_max_attn_logits.fill_(float("-inf"))
 
     def _clip_linear_qkv(self, weight):
         """Apply qkclip to linear_qkv layer"""
