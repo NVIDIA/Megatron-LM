@@ -687,7 +687,10 @@ class TestNativeProjRms:
 class TestFusedProjRmsComputeH:
     """Public fused proj_rms_compute_h dispatch/fallback plus numerical correctness."""
 
-    @pytest.mark.parametrize("M,n,K", [(256, 4, 4096), (64, 2, 512), (128, 4, 2048)])
+    # 112 and 21 tokens: M < 128 and not a power of two, the variable-length SFT micro-batch case
+    @pytest.mark.parametrize(
+        "M,n,K", [(256, 4, 4096), (64, 2, 512), (128, 4, 2048), (112, 4, 2048), (21, 2, 512)]
+    )
     def test_fwd_bwd_vs_reference(self, M, n, K):
         """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
         from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h

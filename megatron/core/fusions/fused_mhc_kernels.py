@@ -2505,7 +2505,11 @@ if _CUTILE_AVAILABLE:
             )
 
         # 2. Separate lightweight kernel for scalar gradients (grad_alpha, grad_bias)
-        tile_m_scalar = min(128, M)
+        # cuTile requires constant tile shapes to be powers of two. For M < 128 that is
+        # not a power of two (e.g. a 112-token SFT micro-batch) `min(128, M)` fails at
+        # compile time with "Dimension #0 of shape (M, TILE_N) is not a power of two".
+        # Round up instead; the loads use PAD_ZERO so the overhang adds nothing.
+        tile_m_scalar = min(128, _next_power_of_2(M))
         num_m_blocks = math.ceil(M / tile_m_scalar)
         grad_alpha_pre_partials = torch.empty(num_m_blocks, 1, dtype=torch.float32, device=dev)
         grad_alpha_post_partials = torch.empty(num_m_blocks, 1, dtype=torch.float32, device=dev)
