@@ -214,6 +214,14 @@ def test_batch_invariant_inference_activations_replay():
         backward=False,
         what="weighted_silu_mul_bounded",
     )
+    assert_replays_bit_exact(
+        lambda x: batch_invariant.weighted_silu_mul_bounded(x, probs, bound_elems, xblock=2048)[
+            :n_used
+        ],
+        (x2,),
+        backward=False,
+        what="weighted_silu_mul_bounded (larger block)",
+    )
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
