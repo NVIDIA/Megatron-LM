@@ -246,7 +246,8 @@ class SSMDynamicInferenceMixin:
                 intermediate_ssm_state=int_ssm_state,
             )
             # Flatten back to [N*S, 1, d] to match the merge logic.
-            y_decode = y_decode.view(decode_token_count, 1, -1)
+            # GDP can return a transposed, non-contiguous tensor when S > 1.
+            y_decode = y_decode.reshape(decode_token_count, 1, -1)
 
         # --- Prefill partition -------------------------------------------
         if prefill_req_count > 0:
