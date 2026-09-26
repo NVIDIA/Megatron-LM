@@ -1289,3 +1289,83 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
 
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload ordering.")
+def test_inline_reload_is_ordered_after_the_groups_offload():
+    """The inline ``tensor_pop`` reload must wait on its group's D2H and then hand the group back
+    from the reload LIFO, so the next prefetch advances to the group backward runs next.
+
+    Two forward-ordered groups are what make the second half visible. Backward reaches ``g2``
+    first and pops it inline; the next ``bulk_reload`` then has to target ``g1``. With a single
+    group nothing ever asks the prefetch to advance, so dropping the LIFO bookkeeping leaves the
+    values correct and the test green while warmup keeps re-targeting drained groups.
+    """
+    off_interface.reset_instance()
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        handler = ChunkOffloadHandler(
+            min_offloaded_tensor_size=0, cpu_tensor_pool=manager.cpu_tensor_pool
+        )
+        name = "core_attn"
+        numel = 4 * 1024 * 1024
+        tensors = [torch.randn(numel, device="cuda") for _ in range(2)]
+
+        # Warm the pinned pool before stalling. First-touch allocation of a staging buffer costs
+        # more wall time than the stall below, so leaving it inside the commit would let both
+        # D2H copies land before the pop and silently disarm the ordering check.
+        warmed = [
+            manager.cpu_tensor_pool.allocate(torch.Size([numel]), dtype=tensors[0].dtype)
+            for _ in range(2)
+        ]
+        for buffer in warmed:
+            manager.cpu_tensor_pool.free(buffer)
+
+        # Stall d2h_stream ahead of both commits, so neither group's D2H has provably run when
+        # the pop below fires.
+        with torch.cuda.stream(handler.d2h_stream):
+            torch.cuda._sleep(1_000_000_000)
+
+        tags = []
+        for tensor in tensors:
+            handler.on_group_start_forward(name)
+            tag = handler.tensor_push(tensor)
+            assert not isinstance(tag, torch.Tensor), "tensor was not managed by the handler"
+            handler.on_group_commit_forward(name, [])
+            tags.append(tag)
+
+        first_group, second_group = handler.offload_groups
+        first_tag, second_tag = tags
+        assert isinstance(first_group._tensors[first_tag], tuple), "group 1 was not offloaded"
+        assert isinstance(second_group._tensors[second_tag], tuple), "group 2 was not offloaded"
+        assert handler._groups_to_reload == [
+            first_group,
+            second_group,
+        ], "both groups should be queued for reload in forward order"
+        assert not second_group._offload_event.query(), "the d2h_stream stall did not take effect"
+
+        # Backward reaches the second group first and finds no prefetch: the inline path.
+        reloaded = handler.tensor_pop(second_tag)
+        torch.cuda.current_stream().synchronize()
+        assert second_group._offload_event.query(), (
+            "the inline reload finished before this group's D2H did: the H2D read the pinned "
+            "buffer before the D2H filled it"
+        )
+        assert torch.equal(reloaded, tensors[1]), "the inline reload returned the wrong values"
+
+        # The inline pop must also release the group, or every later prefetch re-targets a
+        # drained one and the groups still to be backwarded are never reloaded.
+        assert handler._groups_to_reload == [
+            first_group
+        ], "the inline-consumed group was left on the reload LIFO"
+        handler.bulk_reload()
+        assert not isinstance(
+            first_group._tensors[first_tag], tuple
+        ), "the next prefetch did not advance to the group backward runs next"
+        torch.cuda.synchronize()
+        assert torch.equal(
+            handler.tensor_pop(first_tag), tensors[0]
+        ), "the prefetched reload returned the wrong values"
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
