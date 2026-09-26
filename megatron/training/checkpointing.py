@@ -194,17 +194,22 @@ def get_loaded_iteration():
 
 
 def _validate_cyclic_dataloader_resume(args, checkpoint_args, release):
-    """Reject sharded cyclic resumes whose sampler state cannot be remapped safely."""
+    """Reject cyclic resumes whose sampler layout cannot be remapped safely."""
     if release or getattr(args, 'finetune', False):
         return
     if getattr(args, 'dataloader_type', None) != 'cyclic':
         return
-    if not getattr(args, 'data_sharding', False):
-        return
-
+    run_sharding = getattr(args, 'data_sharding', False)
     checkpoint_sharding = getattr(checkpoint_args, 'dataloader_data_sharding', None)
-    if checkpoint_sharding is not None and not checkpoint_sharding:
-        raise RuntimeError('Cannot resume a sharded cyclic dataloader from an unsharded checkpoint.')
+    if checkpoint_sharding is None:
+        checkpoint_sharding = getattr(checkpoint_args, 'data_sharding', None)
+    if checkpoint_sharding is not None and checkpoint_sharding != run_sharding:
+        raise RuntimeError(
+            'Cannot resume a cyclic dataloader when the data-sharding mode changes '
+            f'(checkpoint={checkpoint_sharding}, run={run_sharding}).'
+        )
+    if not run_sharding:
+        return
 
     checkpoint_dp = getattr(checkpoint_args, 'dataloader_data_parallel_size', None)
     if checkpoint_dp is None:

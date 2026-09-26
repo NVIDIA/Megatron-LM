@@ -123,20 +123,43 @@ def test_validate_cyclic_dataloader_resume_uses_effective_dp_size():
     _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
 
 
-def test_validate_cyclic_dataloader_resume_rejects_sharding_mode_change():
+@pytest.mark.parametrize('checkpoint_sharding,run_sharding', [(True, False), (False, True)])
+@pytest.mark.parametrize('metadata_source', ['explicit', 'legacy'])
+def test_validate_cyclic_dataloader_resume_rejects_sharding_mode_change(
+    checkpoint_sharding, run_sharding, metadata_source
+):
     args = SimpleNamespace(
         dataloader_type='cyclic',
-        data_sharding=True,
+        data_sharding=run_sharding,
         data_parallel_size=4,
         finetune=False,
     )
-    checkpoint_args = SimpleNamespace(
-        dataloader_data_parallel_size=4,
-        dataloader_data_sharding=False,
-    )
+    checkpoint_args = SimpleNamespace(data_parallel_size=4)
+    if metadata_source == 'explicit':
+        checkpoint_args.dataloader_data_parallel_size = 4
+        checkpoint_args.dataloader_data_sharding = checkpoint_sharding
+    else:
+        checkpoint_args.data_sharding = checkpoint_sharding
 
-    with pytest.raises(RuntimeError, match='unsharded checkpoint'):
+    with pytest.raises(RuntimeError, match='data-sharding mode changes'):
         _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
+
+
+@pytest.mark.parametrize('data_sharding', [True, False])
+@pytest.mark.parametrize('metadata_source', ['explicit', 'legacy'])
+def test_validate_cyclic_dataloader_resume_accepts_matching_sharding(
+    data_sharding, metadata_source
+):
+    args = SimpleNamespace(
+        dataloader_type='cyclic', data_sharding=data_sharding, data_parallel_size=4, finetune=False
+    )
+    checkpoint_args = SimpleNamespace(data_parallel_size=4, data_sharding=data_sharding)
+    if metadata_source == 'explicit':
+        checkpoint_args.dataloader_data_sharding = data_sharding
+        # Explicit dataloader metadata takes precedence over legacy arguments.
+        checkpoint_args.data_sharding = not data_sharding
+
+    _validate_cyclic_dataloader_resume(args, checkpoint_args, release=False)
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
