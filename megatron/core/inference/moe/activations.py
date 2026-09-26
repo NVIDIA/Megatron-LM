@@ -404,3 +404,120 @@ def squared_relu_and_quantize_mxfp8(
     return MXFP8Tensor(
         data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), dtype=x.dtype, backend="triton"
     )
+
+
+@triton.jit
+def _swiglu_quantize_kernel(
+    input_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    src_idx_ptr,
+    n_used_ptr,
+    K,
+    n_col_blocks,
+    max_rows,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """Fused SwiGLU + MXFP8 quantize + swizzle in one kernel."""
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+    two_K = 2 * K
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(src_idx_ptr + row) >= 0:
+                offs = tl.arange(0, BLOCK_K)
+                mask = offs < K
+
+                gate = tl.load(
+                    input_ptr + row.to(tl.int64) * two_K + offs, mask=mask, other=0.0
+                ).to(tl.float32)
+                up = tl.load(
+                    input_ptr + row.to(tl.int64) * two_K + K + offs, mask=mask, other=0.0
+                ).to(tl.float32)
+                # Match the unfused inference route: materialize the SwiGLU result in
+                # BF16 before MXFP8 quantization, since that rounding selects the bins.
+                activated = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
+
+                x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])
+                max_vals = tl.max(tl.abs(x_grouped), axis=1)
+
+                dequant_scale = max_vals / 448.0
+                dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+                dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+                quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+
+                quantized = x_grouped * quant_scale[:, None]
+                quantized_flat = tl.reshape(quantized, [BLOCK_K])
+                out_fp8 = quantized_flat.to(tl.float8e4nv)
+                tl.store(out_fp8_ptr + row.to(tl.int64) * K + offs, out_fp8, mask=mask)
+
+                scale_exp = (dequant_exp >> 23).to(tl.uint8)
+                col_offs = tl.arange(0, BLOCK_GROUPS)
+                col_mask = col_offs < REAL_GROUPS
+
+                macro_row_block = row.to(tl.int64) // 128
+                macro_col_block = col_offs // 4
+                local_row = row % 128
+                local_col = col_offs % 4
+                group = local_row // 32
+                sub_row = local_row % 32
+                tile_idx = macro_row_block * n_col_blocks + macro_col_block
+                swizzled_offs = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
+
+                tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+
+
+def swiglu_and_quantize_mxfp8(x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor):
+    """Fused SwiGLU + MXFP8 quantize + scale swizzle.
+
+    Args:
+        x: [output_size, 2 * K] BF16 FC1 output, laid out as gate | up.
+        permutation_map: [output_size] int32, original token index or -1 for padding.
+        n_used: scalar int32 CUDA tensor with the number of used rows. Rows beyond
+            this and alignment-padding rows are skipped.
+
+    Returns:
+        MXFP8Tensor with .data [output_size, K] float8_e4m3fn and .scale (swizzled e8m0).
+    """
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    M, two_K = x.shape
+    assert two_K % 2 == 0, f"SwiGLU FC1 output width must be even, got {two_K}"
+    K = two_K // 2
+    assert K % MXFP8_BLOCK_SIZE == 0
+
+    scale_cols = K // MXFP8_BLOCK_SIZE
+    n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
+    n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
+
+    out_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
+
+    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
+    NUM_BLOCKS = min(M, 512)
+
+    _swiglu_quantize_kernel[(NUM_BLOCKS,)](
+        x,
+        out_fp8,
+        out_scale,
+        permutation_map,
+        n_used,
+        K,
+        n_col_blocks,
+        M,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=BLOCK_K,
+        BLOCK_GROUPS=BLOCK_GROUPS,
+        NUM_BLOCKS=NUM_BLOCKS,
+    )
+
+    return MXFP8Tensor(
+        data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), dtype=x.dtype, backend="triton"
+    )
