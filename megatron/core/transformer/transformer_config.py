@@ -392,7 +392,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     dsa_indexer_kpool: int = 1
-    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection."""
+    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection.
+    When greater than one, ``dsa_indexer_topk`` must be divisible by this value.
+    """
 
     dsa_indexer_kpool_use_quantization: bool = False
     """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
@@ -1770,6 +1772,20 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            if self.dsa_indexer_kpool < 1:
+                raise ValueError(
+                    f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
+                )
+            if (
+                self.dsa_indexer_kpool > 1
+                and self.dsa_indexer_topk is not None
+                and self.dsa_indexer_topk % self.dsa_indexer_kpool != 0
+            ):
+                raise ValueError(
+                    "dsa_indexer_topk must be divisible by dsa_indexer_kpool when KPool is "
+                    f"enabled, got topk={self.dsa_indexer_topk}, "
+                    f"kpool={self.dsa_indexer_kpool}."
                 )
             if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
                 raise ValueError(
