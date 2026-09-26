@@ -106,7 +106,6 @@ user-guide/observability/extending
 
 developer/contribute
 developer/submit
-developer/functional-test-selection
 developer/oncall
 developer/generate_docs
 ```
