@@ -17,7 +17,7 @@ import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -33,7 +33,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, reset_megatron_test_state
 
 logger = logging.getLogger(__name__)
 
@@ -54,16 +54,44 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
 
 
 def _destroy_model_parallel():
-    """Utils.destroy_model_parallel, plus the groups it leaves behind.
+    """Reset Megatron state, then release c10d groups retained by MFSDP v2.
 
-    It clears Megatron's references but frees only a few of the groups; c10d holds its own
-    reference to the rest, so their NCCL communicators -- and, with NVLS enabled, their
-    multicast reservations -- would outlive the test. See #6897.
+    c10d holds its own references to MFSDP v2 groups; without explicit release,
+    their NCCL communicators and NVLS multicast reservations outlive the test.
+    See #6897.
     """
-    Utils.destroy_model_parallel()
-    for group in list(_world.pg_map):
-        if group is not torch.distributed.group.WORLD:
-            torch.distributed.destroy_process_group(group)
+    try:
+        reset_megatron_test_state()
+    finally:
+        for group in list(_world.pg_map):
+            if group is not torch.distributed.group.WORLD:
+                torch.distributed.destroy_process_group(group)
+
+
+def test_destroy_model_parallel_releases_retained_groups_after_reset_error(monkeypatch):
+    """MFSDP-specific groups are released even when shared reset fails."""
+    retained_group = object()
+    destroyed_groups = []
+    destroy_process_group = torch.distributed.destroy_process_group
+
+    def fail_reset():
+        raise RuntimeError("shared reset failed")
+
+    def record_and_destroy(group):
+        destroyed_groups.append(group)
+        if group is not retained_group:
+            destroy_process_group(group)
+
+    monkeypatch.setitem(globals(), "reset_megatron_test_state", fail_reset)
+    monkeypatch.setitem(_world.pg_map, torch.distributed.group.WORLD, object())
+    monkeypatch.setitem(_world.pg_map, retained_group, object())
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", record_and_destroy)
+
+    with pytest.raises(RuntimeError, match="shared reset failed"):
+        _destroy_model_parallel()
+
+    assert retained_group in destroyed_groups
+    assert torch.distributed.group.WORLD not in destroyed_groups
 
 
 class TestMcoreAdapterDense:
@@ -490,15 +518,6 @@ class TestMcoreAdapterCudaGraph:
         model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
 
     def teardown_method(self):
-        # The wrappers store capture state globally. Reset it so the next test captures its
-        # own work instead of replaying this test's graph.
-        OptimizerCudaGraphWrapper.curr_iteration = 0
-        OptimizerCudaGraphWrapper.cuda_graph = None
-        OptimizerCudaGraphWrapper.result = None
-        FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-        FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
-        FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
         _destroy_model_parallel()
 
     def test_full_iteration_and_optimizer_cuda_graph_match_eager(self):
