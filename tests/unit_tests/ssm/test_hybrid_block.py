@@ -78,8 +78,13 @@ def test_wide_residual_spec_preserves_unmodified_stack_submodules():
     ("layer_pattern", "expected_spec_names"),
     [
         (
-            Symbols.MAMBA + Symbols.GDN + Symbols.ATTENTION + Symbols.MLP + Symbols.MOE,
-            ["mamba_layer", "gdn_layer", "attention_layer", "mlp_layer", "moe_layer"],
+            Symbols.MAMBA
+            + Symbols.GDN
+            + Symbols.KDA
+            + Symbols.ATTENTION
+            + Symbols.MLP
+            + Symbols.MOE,
+            ["mamba_layer", "gdn_layer", "kda_layer", "attention_layer", "mlp_layer", "moe_layer"],
         ),
         (Symbols.DS_ATTENTION + Symbols.MLA, ["dsa_layer", "mla_layer"]),
     ],
@@ -158,13 +163,13 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     )
 
     config = MLATransformerConfig(
-        num_layers=7,
+        num_layers=8,
         hidden_size=64,
         num_attention_heads=4,
         linear_cp_layout="contiguous",
         attention_cp_layout="zigzag",
     )
-    layer_config_list = validate_segment_layers("MG*-E", config) + validate_segment_layers(
+    layer_config_list = validate_segment_layers("MGK*-E", config) + validate_segment_layers(
         "D+", config
     )
 
@@ -181,6 +186,7 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     )
 
     assert layout_manager_kwargs["layer_layouts"] == (
+        "contiguous",
         "contiguous",
         "contiguous",
         "zigzag",

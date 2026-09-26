@@ -437,6 +437,14 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
     layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
 
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment.
+    This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
+    the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
+
     ####################
     # initialization
     ####################
@@ -617,7 +625,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shared_experts", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
@@ -627,6 +635,7 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "gdn": recompute the full GDN-family layer, including gated norm.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
     preprocessing.
@@ -638,7 +647,7 @@ class TransformerConfig(ModelParallelConfig):
             Requires moe_shortcut_connection=True and selective recomputation.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
     "mhc" and "shortcut_pre_mlp_layernorm" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
     ####################
@@ -2339,6 +2348,11 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
+            from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+            is_kda_variant = isinstance(self, KDALayerConfig) or (
+                self.experimental_attention_variant == "kda"
+            )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -2348,6 +2362,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",
@@ -2371,12 +2386,32 @@ class TransformerConfig(ModelParallelConfig):
                     "multi_latent_attention."
                 )
 
-            if "gdn_norm_out" in self.recompute_modules and (
-                not is_gated_delta_net_variant(self.experimental_attention_variant)
+            if (
+                "gdn_norm_out" in self.recompute_modules
+                and not self.is_hybrid_model
+                and not is_kda_variant
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
-                    "experimental_attention_variant='gdn' or 'gdn2'."
+                    f"GDN-family layers, but got {self.experimental_attention_variant=}."
+                )
+
+            if (
+                "gdn" in self.recompute_modules
+                and not self.is_hybrid_model
+                and not is_kda_variant
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
+            ):
+                raise ValueError(
+                    "gdn in recompute_modules is only supported with GDN-family layers, but got "
+                    f"{self.experimental_attention_variant=} and {self.is_hybrid_model=}."
+                )
+
+            if "gdn" in self.recompute_modules and "gdn_norm_out" in self.recompute_modules:
+                raise ValueError(
+                    "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
+                    "'gdn' recomputes the full GDN-family layer, including gated norm."
                 )
 
             if "core_attn" in self.recompute_modules:
