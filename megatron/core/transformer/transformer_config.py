@@ -1572,7 +1572,11 @@ class TransformerConfig(ModelParallelConfig):
         """Validate context-parallel layout settings."""
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
-        if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
+        if (
+            self.context_parallel_size > 1
+            and self.attention_cp_layout == "contiguous"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
@@ -1818,9 +1822,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
-            assert (
-                self.context_parallel_size == 1
-            ), "DSv4 Hybrid Attention does not support context parallelism yet."
+            if self.context_parallel_size > 1 and self.attention_cp_layout != "contiguous":
+                raise ValueError(
+                    "DSv4 context parallelism requires attention_cp_layout='contiguous'."
+                )
+            if self.hybrid_context_parallel:
+                raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(

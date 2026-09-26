@@ -265,7 +265,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="tensor_parallel_mappings",
         sources=("megatron/core/tensor_parallel/mappings.py",),
-        tests=(C + "test_transformer_layer.py", C + "test_gpt_model.py"),
+        tests=(
+            C + "test_transformer_layer.py",
+            C + "test_gpt_model.py",
+            K + "test_csa_packed_kernels.py",
+        ),
         kind="external-lib",
         notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
     ),
@@ -738,6 +742,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_triton_kernels.py",),
         kind="triton",
         notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
+    ),
+    KernelEntry(
+        name="csa_packed_layout_and_loss",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_indexer_loss_kernels.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
+        ),
+        tests=(K + "test_csa_packed_kernels.py",),
+        kind="triton",
+        notes="Tensor-based packed layout, index sanitation and compiled KL. "
+        "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
+        "numerical CP parity is covered by test_dsv4_packed_cp.py.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
