@@ -2141,6 +2141,10 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
+        # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
+        # fallback below can skip when there was nothing left to train this invocation
+        # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
+        has_iterations_remaining = args.iteration < (args.train_iters or 0)
         if args.do_train and (args.train_iters or 0) > 0:
             try:
                 iteration, num_floating_point_operations_so_far = train(
@@ -2173,7 +2177,13 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
+        if (
+            not cfg_container.validation.skip_train
+            and cfg_container.checkpoint.save
+            and iteration != 0
+            and has_iterations_remaining
+            and iteration % cfg_container.checkpoint.save_interval != 0
+        ):
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -5480,6 +5490,16 @@ def train(
             num_floating_point_operations_since_last_log_event,
             nsys_nvtx_context,
         )
+
+        # Detect a dead/broken cached-logits-saver async worker promptly: its
+        # completion queue only ever reports "done", never "failed", so an
+        # uncaught exception there would otherwise stall silently (both future
+        # logits and regular checkpoint saves for that rank) rather than
+        # surfacing until a much later blocking checkpoint finalize hangs.
+        if args.logits_save_dir is not None:
+            from megatron.training.distillation import check_logits_saver_failure
+
+            check_logits_saver_failure()
 
         # Checkpoint and decide whether to exit.
         should_exit = checkpoint_and_decide_exit(
