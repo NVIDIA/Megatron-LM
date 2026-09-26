@@ -60,6 +60,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     scale,
     T,
     STEPS_PER_TOKEN: tl.constexpr,
+    PREFETCH_NEXT: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -126,53 +127,123 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_h0 = h0 + state_offset + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for i_t in tl.range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
+    # The longer folded sequence has draft tokens to overlap with the
+    # current recurrence. Keep the original loop for a single decode token.
+    if PREFETCH_NEXT:
+        b_q = tl.load(p_q, mask=mask_k & (T > 0), other=0).to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k & (T > 0), other=0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v & (T > 0), other=0).to(tl.float32)
         if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta).to(tl.float32)
+            b_beta = tl.load(p_beta, mask=T > 0, other=0).to(tl.float32)
         else:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-
+            b_beta = tl.load(p_beta, mask=mask_v & (T > 0), other=0).to(tl.float32)
         if USE_G:
-            b_g = tl.load(p_g).to(tl.float32)
-            b_h *= exp(b_g)
+            b_g = tl.load(p_g, mask=T > 0, other=0).to(tl.float32)
 
-        b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-        b_h += b_k[:, None] * b_v
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        # Each padding program writes zeros at its own output address. Keep the
-        # recurrence and store order for valid cache slots unchanged.
-        tl.store(p_o, tl.where(i_s >= 0, b_o, 0).to(p_o.dtype.element_ty), mask=mask_v)
+        for i_t in tl.range(0, T):
+            # Fetch the next step before this step's reductions. The math below and
+            # its operation order remain unchanged; the last iteration uses masked
+            # loads so it does not read past the input sequence.
+            has_next = i_t + 1 < T
+            next_q = tl.load(p_q + H * K, mask=mask_k & has_next, other=0).to(tl.float32)
+            next_k = tl.load(p_k + H * K, mask=mask_k & has_next, other=0).to(tl.float32)
+            next_v = tl.load(p_v + HV * V, mask=mask_v & has_next, other=0).to(tl.float32)
+            if IS_BETA_HEADWISE:
+                next_beta = tl.load(p_beta + HV, mask=has_next, other=0).to(tl.float32)
+            else:
+                next_beta = tl.load(
+                    p_beta + HV * V, mask=mask_v & has_next, other=0
+                ).to(tl.float32)
+            if USE_G:
+                next_g = tl.load(p_g + HV, mask=has_next, other=0).to(tl.float32)
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q * scale
+            if USE_G:
+                b_h *= exp(b_g)
 
-        # Snapshot the state once per draft token, on the step that closes that
-        # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
-        # snapshot is the state a rollback to "this token accepted" must restore.
-        # Padding requests (`i_s < 0`) write nothing, exactly as they leave the
-        # state cache untouched below.
-        if STORE_INTERMEDIATE and i_s >= 0:
-            if (i_t + 1) % STEPS_PER_TOKEN == 0:
-                p_int = (
-                    intermediate_states
-                    + int_offset
-                    + (i_t // STEPS_PER_TOKEN) * int_token_stride
-                    + o_k[:, None] * V
-                    + o_v[None, :]
-                )
-                tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+            b_h += b_k[:, None] * b_v
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+            # Each padding program writes zeros at its own output address. Keep the
+            # recurrence and store order for valid cache slots unchanged.
+            tl.store(p_o, tl.where(i_s >= 0, b_o, 0).to(p_o.dtype.element_ty), mask=mask_v)
 
-        p_q += H * K
-        p_k += H * K
-        p_v += HV * V
-        if USE_G:
-            p_g += HV
-        p_beta += HV * (1 if IS_BETA_HEADWISE else V)
-        p_o += HV * V
+            # Snapshot the state once per draft token, on the step that closes that
+            # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
+            # snapshot is the state a rollback to "this token accepted" must restore.
+            # Padding requests (`i_s < 0`) write nothing, exactly as they leave the
+            # state cache untouched below.
+            if STORE_INTERMEDIATE and i_s >= 0:
+                if (i_t + 1) % STEPS_PER_TOKEN == 0:
+                    p_int = (
+                        intermediate_states
+                        + int_offset
+                        + (i_t // STEPS_PER_TOKEN) * int_token_stride
+                        + o_k[:, None] * V
+                        + o_v[None, :]
+                    )
+                    tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+
+            p_q += H * K
+            p_k += H * K
+            p_v += HV * V
+            if USE_G:
+                p_g += HV
+            p_beta += HV * (1 if IS_BETA_HEADWISE else V)
+            p_o += HV * V
+            b_q, b_k, b_v, b_beta = next_q, next_k, next_v, next_beta
+            if USE_G:
+                b_g = next_g
+    else:
+        for i_t in tl.range(0, T):
+            b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+            b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+            b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+            if USE_QK_L2NORM_IN_KERNEL:
+                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q * scale
+            if IS_BETA_HEADWISE:
+                b_beta = tl.load(p_beta).to(tl.float32)
+            else:
+                b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+
+            if USE_G:
+                b_g = tl.load(p_g).to(tl.float32)
+                b_h *= exp(b_g)
+
+            b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+            b_h += b_k[:, None] * b_v
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+            # Each padding program writes zeros at its own output address. Keep the
+            # recurrence and store order for valid cache slots unchanged.
+            tl.store(p_o, tl.where(i_s >= 0, b_o, 0).to(p_o.dtype.element_ty), mask=mask_v)
+
+            # Snapshot the state once per draft token, on the step that closes that
+            # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
+            # snapshot is the state a rollback to "this token accepted" must restore.
+            # Padding requests (`i_s < 0`) write nothing, exactly as they leave the
+            # state cache untouched below.
+            if STORE_INTERMEDIATE and i_s >= 0:
+                if (i_t + 1) % STEPS_PER_TOKEN == 0:
+                    p_int = (
+                        intermediate_states
+                        + int_offset
+                        + (i_t // STEPS_PER_TOKEN) * int_token_stride
+                        + o_k[:, None] * V
+                        + o_v[None, :]
+                    )
+                    tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+
+            p_q += H * K
+            p_k += H * K
+            p_v += HV * V
+            if USE_G:
+                p_g += HV
+            p_beta += HV * (1 if IS_BETA_HEADWISE else V)
+            p_o += HV * V
 
     if STORE_FINAL_STATE and i_s >= 0:
         p_ht = ht + state_offset + o_k[:, None] * V + o_v[None, :]
@@ -310,6 +381,7 @@ def fused_recurrent_gated_delta_rule_update(
         scale=scale,
         T=T,
         STEPS_PER_TOKEN=steps_per_token,
+        PREFETCH_NEXT=T > steps_per_token,
         H=H,
         HV=HV,
         K=K,
