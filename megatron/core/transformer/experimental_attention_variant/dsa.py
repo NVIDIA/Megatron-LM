@@ -851,29 +851,98 @@ def _kpool_compress_keys_per_seg(
 
     Return pooled keys and their global starting token indices. Segment boundaries
     need not be multiples of pool_size; a pool must never span two documents.
+    The output uses a fixed upper bound of ``floor(total_tokens / pool_size)``;
+    unused rows have a ``-1`` base so packed metadata stays device-side.
     """
     cu = cu_seqlens_kv.to(device=k.device, dtype=torch.int64)
-    n_seg = int(cu.numel()) - 1
-    pooled_parts = []
-    base_parts = []
-    for i in range(n_seg):
-        s = int(cu[i])
-        e = int(cu[i + 1])
-        seg_len = e - s
-        if seg_len <= 0:
-            continue
-        k_seg = k[s:e]
-        gate_seg = gate_score[s:e] if gate_score is not None else None
-        k_pooled_seg = _kpool_compress_keys(k_seg, gate_seg, ape, pool_size)
-        # [num_pools_seg, b, d]
-        n_pools_seg = k_pooled_seg.size(0)
-        pooled_parts.append(k_pooled_seg)
-        # pool j (local) of this segment starts at global token s + j*pool_size.
-        seg_bases = torch.arange(n_pools_seg, device=k.device, dtype=torch.int64) * pool_size + s
-        base_parts.append(seg_bases)
-    k_pooled_global = torch.cat(pooled_parts, dim=0)
-    pool_token_base = torch.cat(base_parts, dim=0)
-    return k_pooled_global, pool_token_base
+    sk, bsz, head_dim = k.shape
+    segment_lengths = cu[1:] - cu[:-1]
+    pools_per_segment = torch.div(segment_lengths, pool_size, rounding_mode="floor")
+    pool_offsets = torch.cat(
+        (torch.zeros(1, device=k.device, dtype=torch.int64), pools_per_segment.cumsum(0))
+    )
+    max_pools = sk // pool_size
+    if max_pools == 0:
+        return (
+            k.new_empty((0, bsz, head_dim), dtype=torch.bfloat16),
+            torch.empty(0, device=k.device, dtype=torch.int64),
+        )
+
+    token_positions = torch.arange(sk, device=k.device, dtype=torch.int64)
+    segment_ids = torch.searchsorted(cu[1:], token_positions, right=True)
+    local_positions = token_positions - cu[segment_ids]
+    complete = local_positions < pools_per_segment[segment_ids] * pool_size
+    token_positions = token_positions[complete]
+    segment_ids = segment_ids[complete]
+    local_positions = local_positions[complete]
+    pool_ids = pool_offsets[segment_ids] + torch.div(
+        local_positions, pool_size, rounding_mode="floor"
+    )
+    slots = local_positions.remainder(pool_size)
+
+    if not token_positions.numel():
+        return (
+            k.new_empty((max_pools, bsz, head_dim), dtype=torch.bfloat16),
+            torch.full((max_pools,), -1, device=k.device, dtype=torch.int64),
+        )
+
+    k_selected = k[token_positions].float()
+    if gate_score is None:
+        score = torch.zeros_like(k_selected)
+    else:
+        score = gate_score[token_positions].float()
+    score = score + ape.to(device=k.device, dtype=torch.float32)[slots].unsqueeze(1)
+
+    pool_index = pool_ids.view(-1, 1, 1).expand(-1, bsz, head_dim)
+    pool_max = torch.full(
+        (max_pools, bsz, head_dim), float("-inf"), device=k.device, dtype=torch.float32
+    )
+    pool_max.scatter_reduce_(0, pool_index, score, reduce="amax", include_self=True)
+    probability = torch.exp(score - pool_max[pool_ids])
+
+    denominator = torch.zeros_like(pool_max)
+    numerator = torch.zeros_like(pool_max)
+    denominator.index_add_(0, pool_ids, probability)
+    numerator.index_add_(0, pool_ids, probability * k_selected)
+    k_pooled = (numerator / denominator.clamp_min(1e-12)).to(torch.bfloat16)
+
+    pool_token_base = torch.full((max_pools,), -1, device=k.device, dtype=torch.int64)
+    first_token = slots == 0
+    pool_token_base.scatter_(0, pool_ids[first_token], token_positions[first_token])
+    return k_pooled, pool_token_base
+
+
+def _pool_validity_from_token_mask(
+    mask: torch.Tensor, pool_token_base: torch.Tensor, pool_size: int, sk: int
+) -> torch.Tensor:
+    """Map token validity to complete-pool validity for KPool scoring."""
+    if mask.ndim not in (2, 3) or mask.shape[-1] != sk:
+        raise ValueError(
+            "KPool attention mask must have shape [sq, sk] or [batch, sq, sk], "
+            f"got {tuple(mask.shape)} for sk={sk}"
+        )
+    token_positions = pool_token_base.clamp_min(0).unsqueeze(-1) + torch.arange(
+        pool_size, device=mask.device
+    )
+    token_positions = token_positions.clamp_max(sk - 1)
+    token_valid = torch.isfinite(mask)[..., token_positions]
+    pool_valid = token_valid.all(dim=-1)
+    pool_valid = pool_valid & (pool_token_base >= 0)
+    return pool_valid
+
+
+def _mask_topk_tokens_with_token_mask(
+    topk_indices: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    """Remove expanded KPool tokens that are invalid in an explicit token mask."""
+    token_valid = torch.isfinite(mask)
+    if token_valid.ndim == 2:
+        token_valid = token_valid.unsqueeze(0)
+    if token_valid.size(0) == 1 and topk_indices.size(0) != 1:
+        token_valid = token_valid.expand(topk_indices.size(0), -1, -1)
+    token_ids = topk_indices.clamp_min(0).to(torch.long)
+    selected_valid = torch.gather(token_valid, -1, token_ids)
+    return topk_indices.masked_fill((topk_indices < 0) | ~selected_valid, -1)
 
 
 def fused_qk_topk_kpool(
@@ -892,6 +961,7 @@ def fused_qk_topk_kpool(
     use_relu: bool = True,
     always_select_tail: bool = True,
     fp8_indexer: bool = False,
+    rotate_activation_enabled: bool = False,
 ):
     """Select complete causal pools and append each query's incomplete tail.
 
@@ -916,10 +986,14 @@ def fused_qk_topk_kpool(
 
     if fp8_indexer:
         q, k_pooled = _kpool_fp8_input(q), _kpool_fp8_input(k_pooled)
+    elif rotate_activation_enabled:
+        q, k_pooled = rotate_activation(q), rotate_activation(k_pooled)
     index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
 
     # A pool is causal only when its final token is within the query's bounds.
-    pool_positions = pool_token_base + (pool_size - 1)
+    pool_exists = pool_token_base >= 0
+    safe_pool_token_base = pool_token_base.clamp_min(0)
+    pool_positions = safe_pool_token_base + (pool_size - 1)
     eff_key_positions = (
         key_positions[pool_positions] if key_positions is not None else pool_positions
     )
@@ -937,9 +1011,20 @@ def fused_qk_topk_kpool(
         )
     elif mask is not None:
         assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
-        index_scores = index_scores + mask
+        pool_exists = pool_exists & _pool_validity_from_token_mask(
+            mask, pool_token_base, pool_size, sk
+        )
+    if pool_exists.ndim == 1:
+        index_scores = index_scores.masked_fill(~pool_exists.view(1, 1, -1), float("-inf"))
+    else:
+        index_scores = index_scores.masked_fill(~pool_exists, float("-inf"))
 
     # Keep the selection width fixed, including when fewer causal pools exist.
+    if index_topk % pool_size != 0:
+        raise ValueError(
+            f"index_topk ({index_topk}) must be divisible by pool_size ({pool_size}) "
+            "for KPool selection."
+        )
     budget = index_topk // pool_size
     select_k = min(budget, num_pools)
     if select_k > 0:
@@ -994,6 +1079,9 @@ def fused_qk_topk_kpool(
             pool_size,
             tail_start_override=tail_starts.expand(batch, -1).reshape(-1),
         ).reshape(batch, sq, -1)
+
+    if mask is not None:
+        token_topk = _mask_topk_tokens_with_token_mask(token_topk, mask)
 
     return index_scores, token_topk
 
@@ -1754,9 +1842,7 @@ class DSAIndexer(MegatronModule):
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
         q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q)
-        if self.config.dsa_indexer_rotate_activation and not (
-            self.index_kpool > 1 and self.index_kpool_use_quantization
-        ):
+        if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
             q = rotate_activation(q)
 
         # =========================================
@@ -1777,8 +1863,8 @@ class DSAIndexer(MegatronModule):
             k = k.reshape(seqlen, bsz, self.index_head_dim)
 
             # =========================================
-            # Rotate activation for the per-token path.
-            # Pooled keys are rotated after compression by _kpool_fp8_input.
+            # Rotate activation for the per-token path. KPool rotates both q and
+            # compressed keys together after compression in fused_qk_topk_kpool.
             # =========================================
             if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
                 k = rotate_activation(k)
@@ -2707,6 +2793,7 @@ class DSAttention(MegatronModule):
                         use_relu=self.config.dsa_indexer_scoring_relu,
                         always_select_tail=self.indexer.index_kpool_always_select_tail,
                         fp8_indexer=self.indexer.index_kpool_use_quantization,
+                        rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
                     )
                     del _index_scores
             elif fused_bounds is not None:
