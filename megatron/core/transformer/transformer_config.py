@@ -108,6 +108,17 @@ class TransformerConfig(ModelParallelConfig):
     since a single depth has nothing to mix. Model constructors validate this
     against the resolved architecture."""
 
+    mtp_loss_early_backward: bool = False
+    """Run each MTP head's vocabulary projection, cross-entropy and their backward back-to-back
+    during the forward pass instead of deferring the backward to the main backward pass.
+    By default autograd keeps the [seq, batch, vocab] fp32 softmax of every MTP head alive from
+    the forward until the main backward reaches it, on top of the main head's, so peak memory
+    grows by one full logits tensor per MTP depth. With this option the loop is
+    fwd(head_k) -> bwd(head_k) for every head: the head's logits/softmax are freed before the
+    next head starts, the output-layer weight gradient is accumulated immediately, and only the
+    [seq, batch, hidden] gradient of the head input is kept and injected into the main backward.
+    No recomputation is involved; total FLOPs are unchanged."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -1498,6 +1509,12 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
+        "fused_group_mlp" and "expert_fc1" + "moe_act" are two spellings of the same request
+        for the two GroupedMLP paths (fused TE op-fuser vs. unfused), and are mutually
+        exclusive in the config. Each GroupedMLP instance maps whichever is given onto its own
+        path: a fused instance offloads the block input, an unfused instance offloads the fc1
+        and activation inputs. So either spelling covers a model that mixes fused (quantized)
+        and unfused (e.g. bf16 MTP) experts.
     "gdp_qkv": offload the input of the causal conv and QKV preparation in the
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
@@ -2597,11 +2614,14 @@ class TransformerConfig(ModelParallelConfig):
             if "fused_group_mlp" in self.offload_modules:
                 if not self.use_transformer_engine_op_fuser:
                     raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
+                # "fused_group_mlp" and "expert_fc1" + "moe_act" are equivalent spellings that
+                # each GroupedMLP maps onto its own path; listing both is redundant.
                 moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
                 if moe_partial_offload:
                     raise ValueError(
-                        "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
-                        f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
+                        "fused_group_mlp is equivalent to expert_fc1 + moe_act (each GroupedMLP "
+                        "maps either onto its own fused/unfused path), so it cannot be combined "
+                        f"with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
                     )
 
         if self.gdp_cutedsl_kernel:

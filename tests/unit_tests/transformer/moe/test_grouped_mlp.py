@@ -797,6 +797,24 @@ def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
     assert module._is_fused_impl_supported() is True
 
 
+def test_is_fused_impl_supported_ignores_offload_knobs(monkeypatch):
+    """expert_fc1/moe_act offload must not push a fusable GroupedMLP onto the unfused path;
+    the knobs are reconciled per instance in __init__ instead."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
+    )
+    module.offload_expert_fc1 = True
+    module.offload_moe_act = True
+
+    assert module._is_fused_impl_supported() is True
+
+
 @pytest.mark.parametrize("activation_func_clamp_value", [None, 10.0], ids=("unclamped", "clamped"))
 def test_is_fused_impl_supported_requires_cutedsl_for_swiglu(
     monkeypatch, activation_func_clamp_value
@@ -1402,6 +1420,102 @@ class TestTEGroupedMLP:
             assert experts._with_fused_impl
         else:
             assert not experts._with_fused_impl
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "offload_modules",
+        (["expert_fc1", "moe_act"], ["fused_group_mlp"], ["moe_act"]),
+        ids=("unfused_knobs", "fused_knob", "partial_unfused_knob"),
+    )
+    @pytest.mark.parametrize("override_pattern", (None, "*experts*"), ids=("fused", "unfused"))
+    def test_gpu_offload_knobs_follow_the_experts_path(self, override_pattern, offload_modules):
+        """'fused_group_mlp' and 'expert_fc1' + 'moe_act' are equivalent spellings; each
+        GroupedMLP maps whichever is given onto its own path. A fused instance offloads the
+        block input (a partial 'expert_fc1'/'moe_act' selection is widened to that, with a
+        warning), an unfused instance offloads the fc1 and activation inputs. Listing the
+        unfused knobs must not force fusable experts onto the unfused path.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        quant_recipe = None
+        if override_pattern is not None:
+            quant_recipe = RecipeConfig.from_config_dict(
+                {
+                    "configs": {
+                        "high_precision": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {},
+                        }
+                    },
+                    "matchers": {
+                        "experts_high_precision": {
+                            "type": "glob",
+                            "enabled": True,
+                            "pattern": override_pattern,
+                            "config": "high_precision",
+                        }
+                    },
+                }
+            )
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=quant_recipe,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        fused_instance = override_pattern is None
+        partial = offload_modules == ["moe_act"]
+        if fused_instance and partial:
+            with pytest.warns(UserWarning, match=r"partial 'expert_fc1' or 'moe_act' selection"):
+                layer = MoELayer(tf_config, submodules, name="mlp")
+        else:
+            import warnings as _warnings
+
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("error", UserWarning)
+                layer = MoELayer(tf_config, submodules, name="mlp")
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+
+        if fused_instance:
+            assert experts._with_fused_impl
+            assert experts._is_fused_impl_supported()
+            assert experts.offload_fused_group_mlp
+            assert not experts.offload_expert_fc1
+            assert not experts.offload_moe_act
+        else:
+            assert not experts._with_fused_impl
+            assert not experts.offload_fused_group_mlp
+            assert experts.offload_expert_fc1 == (not partial)
+            assert experts.offload_moe_act
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
