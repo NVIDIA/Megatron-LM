@@ -66,6 +66,12 @@ from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
+from .glu_checkpointing import (
+    prepare_glu_checkpoint_for_load,
+    prepare_glu_checkpoint_for_save,
+    validate_glu_checkpoint_backend,
+    validate_glu_optimizer_layout,
+)
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
@@ -861,6 +867,8 @@ def save_checkpoint(
                 rerun_state=rerun_state,
             )
 
+        validate_glu_checkpoint_backend(state_dict, args, ckpt_format=ckpt_format)
+        state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -2709,6 +2717,27 @@ def load_checkpoint(
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release
 
+    def validate_glu_layout(checkpoint_state, is_release):
+        validate_glu_checkpoint_backend(
+            checkpoint_state,
+            args,
+            ckpt_format=ckpt_format,
+            skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+        )
+        loading_optimizer = (
+            optimizer is not None
+            and not getattr(optimizer, 'is_stub_optimizer', False)
+            and not is_release
+            and (not args.finetune or gpt_compat_load_optim)
+            and not args.no_load_optim
+            and not getattr(checkpoint_state.get('args'), 'no_save_optim', False)
+        )
+        validate_glu_optimizer_layout(checkpoint_state, args, loading_optimizer=loading_optimizer)
+
+    if state_dict is not None:
+        # Check common metadata before DCP can write into model/optimizer storage.
+        validate_glu_layout(state_dict, release)
+
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
             print_rank_0('WARNING: TP size not found in checkpoint args, using 1 as default.')
@@ -3005,6 +3034,11 @@ def load_checkpoint(
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    # Legacy checkpoints are first read here. Convert the state dict itself so
+    # --load-main-params-from-ckpt observes the same rows as model.load_state_dict.
+    validate_glu_layout(state_dict, release)
+    state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
