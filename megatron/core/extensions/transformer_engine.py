@@ -2364,6 +2364,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        # TE creates a head-sharded learnable softmax_offset but does not mark it TP.
+        # Mark it when missing so clip-norm includes every rank's sink grads.
+        if (
+            getattr(self, "softmax_offset", None) is not None
+            and not hasattr(self.softmax_offset, "tensor_model_parallel")
+        ):
+            set_tensor_model_parallel_attributes(self.softmax_offset, True, 0, 1)
+
     @contextmanager
     def _temporary_runtime_context_parallel_group(
         self, packed_seq_params: Optional[PackedSeqParams]
