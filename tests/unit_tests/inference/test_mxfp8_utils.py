@@ -679,6 +679,88 @@ class TestSquaredReluAndQuantizeMxfp8:
         )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# swiglu_and_quantize_mxfp8 vs PyTorch reference
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _ref_swiglu(x):
+    gate, up = x.float().chunk(2, dim=-1)
+    return (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+
+
+class TestSwigluAndQuantizeMxfp8:
+    """Compare fused SwiGLU + MXFP8 quantize with the materialized BF16 route."""
+
+    @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 128), (128, 2688), (256, 1856)])
+    def test_data_matches_pytorch_ref(self, M, K):
+        from megatron.core.inference.moe.activations import swiglu_and_quantize_mxfp8
+
+        torch.manual_seed(42)
+        x = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
+        perm_map = _make_permutation_map(M)
+
+        _, ref_data = ref_to_mxfp(_ref_swiglu(x))
+        fused_result = swiglu_and_quantize_mxfp8(x, perm_map, _vt(M))
+
+        torch.testing.assert_close(
+            fused_result.data.view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0
+        )
+
+    @pytest.mark.parametrize("M,K", [(1, 32), (16, 128), (128, 128), (128, 2688)])
+    def test_scales_match_pytorch_ref(self, M, K):
+        from megatron.core.inference.moe.activations import swiglu_and_quantize_mxfp8
+
+        torch.manual_seed(42)
+        x = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
+        perm_map = _make_permutation_map(M)
+
+        ref_scales_2d, _ = ref_to_mxfp(_ref_swiglu(x))
+        ref_swizzled = ref_swizzle(ref_scales_2d)
+        fused_result = swiglu_and_quantize_mxfp8(x, perm_map, _vt(M))
+
+        torch.testing.assert_close(
+            fused_result.scale.view(torch.uint8), ref_swizzled.view(torch.uint8), atol=0, rtol=0
+        )
+
+    @pytest.mark.parametrize("M,K,num_padding", [(32, 128, 8), (128, 2688, 64), (256, 1856, 128)])
+    def test_real_rows_match_pytorch_ref_with_padding(self, M, K, num_padding):
+        from megatron.core.inference.moe.activations import swiglu_and_quantize_mxfp8
+
+        torch.manual_seed(42)
+        x = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
+        perm_map = _make_permutation_map(M, num_padding=num_padding)
+
+        real_rows = M - num_padding
+        _, ref_data = ref_to_mxfp(_ref_swiglu(x[:real_rows]))
+        fused_result = swiglu_and_quantize_mxfp8(x, perm_map, _vt(M))
+
+        torch.testing.assert_close(
+            fused_result.data[:real_rows].view(torch.uint8),
+            ref_data.view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+
+    def test_matches_unfused_activation_then_quantize(self):
+        from megatron.core.inference.moe.activations import padded_swiglu, swiglu_and_quantize_mxfp8
+
+        M, K = 128, 256
+        torch.manual_seed(42)
+        x = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
+        perm_map = _make_permutation_map(M)
+
+        fused = swiglu_and_quantize_mxfp8(x, perm_map, _vt(M))
+        unfused = MXFP8Tensor.from_bf16(padded_swiglu(x, perm_map, _vt(M)), backend="triton")
+
+        torch.testing.assert_close(
+            fused.data.view(torch.uint8), unfused.data.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            fused.scale.view(torch.uint8), unfused.scale.view(torch.uint8), atol=0, rtol=0
+        )
+
+
 CLAMP_SCALE = 16.0
 
 
