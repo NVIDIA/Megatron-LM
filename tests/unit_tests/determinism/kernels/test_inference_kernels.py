@@ -351,6 +351,64 @@ def test_inference_permute_row_order_is_a_permutation_per_expert():
         assert torch.equal(perm_h[live], hidden_states[perm_map[live].long()])
 
 
+def test_batch_invariant_mxfp8_permute_replays():
+    """Replay logical token/expert rows, independent of atomic physical row order."""
+    from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+    seeded()
+    num_tokens, hidden, topk, num_local = 4096, 1024, 4, 16
+    hidden_states = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(num_tokens, topk, device="cuda")
+    tokens = torch.arange(num_tokens, device="cuda", dtype=torch.int32)[:, None]
+    routes = torch.arange(topk, device="cuda", dtype=torch.int32)[None, :]
+    routing_map = (tokens + routes) % num_local
+    valid = _dev_scalar(num_tokens - 37)
+
+    def scale_bytes(tensor, rows):
+        scale_cols = tensor.data.shape[1] // 32
+        n_col_blocks = (scale_cols + 3) // 4
+        rows = rows[:, None]
+        cols = torch.arange(scale_cols, device="cuda")[None, :]
+        offsets = (
+            (rows // 128 * n_col_blocks + cols // 4) * 512
+            + rows % 32 * 16
+            + (rows % 128) // 32 * 4
+            + cols % 4
+        )
+        return tensor.scale.view(torch.uint8)[offsets]
+
+    def logical_rows(hidden_states, probs):
+        quantized, permuted_probs, permutation_map, offs, inverse_map = permute_and_quantize_mxfp8(
+            hidden_states,
+            probs,
+            routing_map,
+            0,
+            num_local,
+            valid,
+            alignment=128,
+            zero_padding=True,
+            return_batch_invariant_inverse_map=True,
+        )
+        live_rows = inverse_map[inverse_map >= 0].long()
+        n_used = int(offs[-1].item())
+        padding = permutation_map[:n_used] < 0
+        return (
+            quantized.data[live_rows].view(torch.uint8),
+            scale_bytes(quantized, live_rows),
+            permuted_probs[live_rows],
+            quantized.data[:n_used][padding].view(torch.uint8),
+            scale_bytes(quantized, padding.nonzero().flatten()),
+        )
+
+    assert_replays_bit_exact(
+        logical_rows,
+        (hidden_states, probs),
+        replays=4,
+        backward=False,
+        what="batch_invariant permute_and_quantize_mxfp8",
+    )
+
+
 def _unpermute_case():
     from megatron.core.inference.moe import permute
 
