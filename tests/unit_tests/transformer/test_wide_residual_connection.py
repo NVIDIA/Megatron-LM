@@ -169,6 +169,18 @@ def test_transformer_config_rejects_unsupported_wide_residual_modes(override, ex
         _wide_config(**override)
 
 
+def test_transformer_config_accepts_fp32_wide_residual_stream():
+    config = _wide_config(
+        bf16=True,
+        fp32_residual_connection=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+    )
+
+    assert config.fp32_residual_connection
+    assert config.pipeline_dtype == torch.float32
+
+
 class TestStreamwiseSigmoidWideResidualConnection:
     def test_maps_materialize_expected_initial_factors(self):
         config = _wide_config(num_streams=3, init_scale=0.2)
@@ -217,6 +229,161 @@ class TestStreamwiseSigmoidWideResidualConnection:
             StreamwiseSigmoidResidualReadout(config)(torch.randn(2, 8))
         with pytest.raises(ValueError, match="greater than one"):
             expand_wide_residual_stream(torch.randn(2, 8), 1)
+
+    def test_fp32_state_promotion_aliases_an_already_fp32_stream(self):
+        """The defensive FP32 promotion must not allocate for normal FP32 model ingress."""
+
+        config = _wide_config(fp32_residual_connection=True)
+        connection = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        )
+        residual_stream = torch.randn(
+            2, connection.residual_stream_hidden_size, dtype=torch.float32
+        )
+
+        _, state = connection(residual_stream, operation="read", fp32_residual_connection=True)
+
+        assert connection.residual_stream(state).dtype == torch.float32
+        assert connection.residual_stream(state) is residual_stream
+        assert connection.residual_stream(state).data_ptr() == residual_stream.data_ptr()
+
+    def test_read_output_dtype_does_not_change_fp32_connection_state(self):
+        config = _wide_config(fp32_residual_connection=True)
+        connection = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        )
+        residual_stream = torch.randn(
+            2, connection.residual_stream_hidden_size, dtype=torch.float32
+        )
+
+        branch_input, state = connection(
+            residual_stream,
+            operation="read",
+            fp32_residual_connection=True,
+            branch_input_dtype=torch.bfloat16,
+        )
+
+        assert branch_input.dtype == torch.bfloat16
+        assert connection.residual_stream(state) is residual_stream
+
+    @pytest.mark.parametrize(
+        ("has_bias", "dropout_probability", "training", "expected_update_dtype"),
+        [
+            (False, 0.0, True, torch.bfloat16),
+            (False, 0.1, False, torch.bfloat16),
+            (True, 0.0, True, torch.float32),
+            (False, 0.1, True, torch.float32),
+            (True, 0.1, True, torch.float32),
+        ],
+        ids=(
+            "no_bias_no_dropout",
+            "eval_dropout",
+            "bias",
+            "active_dropout",
+            "bias_and_active_dropout",
+        ),
+    )
+    def test_write_defers_update_cast_only_when_bias_and_dropout_are_inactive(
+        self, monkeypatch, has_bias, dropout_probability, training, expected_update_dtype
+    ):
+        config = _wide_config(fp32_residual_connection=True)
+        connection = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        )
+        residual_stream = torch.randn(
+            2, connection.residual_stream_hidden_size, dtype=torch.float32
+        )
+        branch_update = torch.randn(2, connection.branch_hidden_size, dtype=torch.bfloat16)
+        bias = (
+            torch.randn(connection.branch_hidden_size, dtype=torch.bfloat16) if has_bias else None
+        )
+        observed = {}
+
+        def record_writeback(residual, update, *args, **kwargs):
+            del args, kwargs
+            observed["update_dtype"] = update.dtype
+            observed["update"] = update
+            return residual
+
+        def preserve_dropout_input(update, *args, **kwargs):
+            del args, kwargs
+            observed["dropout_input"] = update.detach().clone()
+            return update
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.wide_residual_layer.streamwise_sigmoid_writeback",
+            record_writeback,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.wide_residual_layer.F.dropout", preserve_dropout_input
+        )
+        connection(
+            (branch_update, bias),
+            operation="write",
+            state=(residual_stream,),
+            dropout_probability=dropout_probability,
+            training=training,
+        )
+
+        assert observed["update_dtype"] == expected_update_dtype
+        if expected_update_dtype == torch.bfloat16:
+            assert observed["update"] is branch_update
+            assert observed["update"].data_ptr() == branch_update.data_ptr()
+        else:
+            expected_dropout_input = branch_update.float()
+            if bias is not None:
+                expected_dropout_input = expected_dropout_input + bias.float()
+            assert torch.equal(observed["dropout_input"], expected_dropout_input)
+
+    def test_bias_and_dropout_keep_explicit_fp32_preprocessing_semantics(self):
+        """The guarded path retains the original FP32 bias/dropout graph and gradients."""
+
+        torch.manual_seed(8765)
+        config = _wide_config(fp32_residual_connection=True, init_scale=0.01)
+        connection = StreamwiseSigmoidWideResidualConnection(
+            config=config, layer_number=1, branch_name="test", pg_collection=_process_groups()
+        )
+        residual = torch.randn(
+            4, connection.residual_stream_hidden_size, dtype=torch.float32, requires_grad=True
+        )
+        update = torch.randn(
+            4, connection.branch_hidden_size, dtype=torch.bfloat16, requires_grad=True
+        )
+        bias = torch.randn(connection.branch_hidden_size, dtype=torch.bfloat16, requires_grad=True)
+        reference_residual = residual.detach().clone().requires_grad_()
+        reference_update = update.detach().clone().requires_grad_()
+        reference_bias = bias.detach().clone().requires_grad_()
+        reference_logits = connection.write_map.logit.detach().clone().requires_grad_()
+        grad_output = torch.randn_like(residual)
+
+        torch.manual_seed(4321)
+        output = connection(
+            (update, bias),
+            operation="write",
+            state=(residual,),
+            dropout_probability=0.25,
+            training=True,
+        )
+        torch.manual_seed(4321)
+        reference_preprocessed = torch.nn.functional.dropout(
+            reference_update.float() + reference_bias.float(), p=0.25, training=True
+        )
+        reference = streamwise_sigmoid_writeback(
+            reference_residual, reference_preprocessed, reference_logits, connection.num_streams
+        )
+        gradients = torch.autograd.grad(
+            output, (residual, update, bias, connection.write_map.logit), grad_output
+        )
+        reference_gradients = torch.autograd.grad(
+            reference,
+            (reference_residual, reference_update, reference_bias, reference_logits),
+            grad_output,
+        )
+
+        assert torch.equal(output, reference)
+        for gradient, reference_gradient in zip(gradients, reference_gradients):
+            assert gradient.dtype == reference_gradient.dtype
+            assert torch.equal(gradient, reference_gradient)
 
     def test_initial_read_write_and_readout_preserve_base_stream(self):
         config = _wide_config(init_scale=0.0)
