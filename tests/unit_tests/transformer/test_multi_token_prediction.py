@@ -238,6 +238,81 @@ class TestMultiTokenPredictionLayer:
 
         assert captured["avg_group"] is metric_avg_group
 
+    def test_process_mtp_loss_acceptance_survives_destructive_ce(self, monkeypatch):
+        """Acceptance must be counted before CE backends that overwrite logits in place.
+
+        Transformer Engine fused CE (and FP32 native/unfused CE) may reuse the logits
+        buffer for softmax-onehot scratch. If acceptance ran after CE, argmax would
+        miss the label and report zero acceptance while the loss stayed correct.
+        """
+        captured = {}
+
+        def capture_metrics(loss, correct, total, *args, **kwargs):
+            captured["correct"] = correct.detach().clone()
+            captured["total"] = total.detach().clone()
+
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        batch_size = 1
+        vocab_size = 8
+        # Labels roll left once before acceptance/CE, with the vacated tail zeroed.
+        # Pre-roll [1, 2, 3, 4] -> post-roll [2, 3, 4, 0]; loss_mask becomes [1, 1, 1, 0].
+        labels = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        loss_mask = torch.ones(batch_size, seq_len)
+        hidden_states = torch.zeros(2 * seq_len, batch_size, 1)
+
+        # Logits whose argmax matches the post-roll labels (100% acceptance on valid tokens).
+        post_roll_labels = torch.tensor([2, 3, 4, 0], dtype=torch.long)
+        mtp_logits = torch.full((seq_len, batch_size, vocab_size), -10.0)
+        for seq_idx, label in enumerate(post_roll_labels.tolist()):
+            mtp_logits[seq_idx, 0, label] = 10.0
+
+        def output_layer(hidden, **kwargs):
+            return mtp_logits, None
+
+        def destructive_te_like_ce(ce_labels, logits):
+            # Mimic TE fused CE overwrite_input: replace logits with nonnegative scratch
+            # except a negative target entry, so a later argmax cannot select the label.
+            with torch.no_grad():
+                logits.fill_(1.0)
+                labels_sb = ce_labels.transpose(0, 1).contiguous()
+                for seq_idx in range(labels_sb.size(0)):
+                    for batch_idx in range(labels_sb.size(1)):
+                        target = int(labels_sb[seq_idx, batch_idx].item())
+                        if 0 <= target < logits.size(-1):
+                            logits[seq_idx, batch_idx, target] = -1.0
+            return torch.ones_like(ce_labels, dtype=logits.dtype)
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=True,
+            is_training=True,
+            compute_language_model_loss=destructive_te_like_ce,
+            config=config,
+            metric_avg_group=object(),
+        )
+
+        assert "correct" in captured and "total" in captured
+        # Three valid tokens after the roll; all must still count as accepted.
+        assert captured["total"].item() == 3.0
+        assert captured["correct"].item() == 3.0
+        # Post-CE logits are destroyed: argmax no longer matches rolled labels.
+        destroyed_preds = torch.argmax(mtp_logits, dim=-1).view(-1)
+        assert not torch.equal(destroyed_preds[:3], post_roll_labels[:3])
+
     def test_hsm_mix_preserves_dtype_and_gradients(self, monkeypatch):
         """HSM selects per-element history entries without changing dtype or gradients."""
         first = torch.full((2, 1, 3), 1.0, dtype=torch.bfloat16, requires_grad=True)

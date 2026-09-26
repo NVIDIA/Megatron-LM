@@ -1243,14 +1243,10 @@ def process_mtp_loss(
             # no-mask fast path for all non-multimodal MTP callers.
             num_tokens = rolled_num_tokens
 
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-
-        mtp_loss = layer_loss_mask * mtp_loss
-
+        # Acceptance must run before CE: TE fused CE (and FP32 native/unfused CE) may
+        # overwrite the logits buffer in place with softmax-onehot scratch, which would
+        # make a later argmax report zero acceptance while the loss remains correct.
         if is_training:
-            mtp_loss_for_log = (
-                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
-            ) / num_tokens.clamp(min=1)
             correct, total = _compute_mtp_acceptance_counts(
                 mtp_logits,
                 mtp_labels,
@@ -1259,6 +1255,15 @@ def process_mtp_loss(
                 runtime_gather_output,
                 tp_group,
             )
+
+        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+
+        mtp_loss = layer_loss_mask * mtp_loss
+
+        if is_training:
+            mtp_loss_for_log = (
+                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+            ) / num_tokens.clamp(min=1)
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
