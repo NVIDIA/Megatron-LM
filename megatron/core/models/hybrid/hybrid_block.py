@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -769,6 +769,12 @@ class HybridStack(MegatronModule):
         hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        if not self.pre_process and not self.post_process and len(self.layers) == 0:
+            # The schedule may pseudo-deallocate our output after sending it. An
+            # empty stage must not return the input object itself: its shape and
+            # storage are still needed to receive and propagate the gradient.
+            hidden_states = hidden_states.clone()
 
         if mhc_multistream is not None:
             return hidden_states, mhc_multistream

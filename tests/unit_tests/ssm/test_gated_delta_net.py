@@ -165,7 +165,13 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
             msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
         )
 
-    def test_deterministic_mode(self):
+    def test_deterministic_mode(self, monkeypatch):
+        from megatron.core.ssm.gated_delta_net import common
+
+        def reject_autotuned_l2norm(*args, **kwargs):
+            raise AssertionError("Deterministic GDN must not dispatch FLA's autotuned L2 norm")
+
+        monkeypatch.setattr(common, "l2norm", reject_autotuned_l2norm)
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)

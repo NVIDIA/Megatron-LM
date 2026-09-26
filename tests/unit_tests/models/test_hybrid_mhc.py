@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
@@ -8,6 +8,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.pipeline_parallel.schedules import custom_backward, deallocate_output_tensor
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -146,6 +147,34 @@ class TestHybridStackMHC:
         state = stack.sharded_state_dict(prefix="decoder.", metadata={})
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             assert f"decoder.{name}" in state
+
+    def test_empty_pipeline_stage_preserves_input_after_output_deallocation(self):
+        config = _get_config(num_layers=2, deallocate_pipeline_outputs=True)
+        stack = _get_stack(config, num_local_layers=0, pre_process=False, post_process=False).cuda()
+        hidden_states = torch.randn(8, 2, 64, device="cuda", requires_grad=True)
+        stack.set_input_tensor(hidden_states)
+
+        output = stack(hidden_states=None, attention_mask=None)
+        assert output is not hidden_states
+        assert output.data_ptr() != hidden_states.data_ptr()
+        torch.testing.assert_close(output, hidden_states)
+        deallocate_output_tensor(output, deallocate_pipeline_outputs=True)
+        assert output.numel() == 1
+        assert hidden_states.shape == (8, 2, 64)
+        custom_backward(output, torch.ones_like(hidden_states))
+        torch.testing.assert_close(hidden_states.grad, torch.ones_like(hidden_states))
+
+    def test_mhc_mtp_requires_post_process_chunk(self):
+        config = _get_config(num_layers=1, mtp_num_layers=1)
+        with pytest.raises(ValueError, match="final post_process pipeline chunk"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=64,
+                max_sequence_length=8,
+                hybrid_layer_pattern="-/-",
+                post_process=False,
+            )
 
     def test_fused_backend_policy_is_bound_per_wrapper(self):
         config = _get_config(num_layers=1, use_fused_mhc=True, mhc_fused_backend="native")
