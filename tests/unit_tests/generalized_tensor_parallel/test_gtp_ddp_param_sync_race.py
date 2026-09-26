@@ -187,7 +187,8 @@ def _gtp_env():
         yield
     finally:
         gtp_module.GTP_CONFIG.pad_for_alignment = orig_pad
-        # Finish asynchronous CUDA work on every rank before destroying its groups.
+        # The grouped-expert test can leave a prefetch running on a separate CUDA stream.
+        # The world barrier does not drain that stream; finish it before clearing groups/cache.
         torch.cuda.synchronize()
         torch.distributed.barrier()
         ps.destroy_model_parallel()
