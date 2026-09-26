@@ -14,19 +14,17 @@
 
 """PyTorch Distributed Checkpoint (DCP) save/load for the experimental Megatron-FSDP path.
 
-After :func:`fully_shard`, a module's parameters rest as ``DTensor`` views over the optimizer
-(``main_weight``) buffers, and the optimizer's ``exp_avg``/``exp_avg_sq`` states are ``DTensor`` s
-on the same device mesh. The standard DCP state-dict helpers
-(:func:`torch.distributed.checkpoint.state_dict.get_model_state_dict` /
-:func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`) expose those as FQN-keyed
-DTensors and initialize the (empty) optimizer state on load, so we do not reimplement that here.
+These helpers wrap local parameters and optimizer state only for DCP and unwrap
+loaded state before reinstalling it. Bare model/optimizer state_dict()
+calls return local shards and must not be used as distributed checkpoints.
 
-The one Megatron-FSDP-specific step is :func:`attach_uneven_dtensor_metadata`, which describes each
+:func:`attach_uneven_dtensor_metadata` describes each
 parameter's true position inside its packed parameter-group buffer. Without it the default planner
 assumes canonical ``Shard(0)`` offsets and silently corrupts the checkpoint.
 """
 
 import os
+from typing import Any
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -36,11 +34,81 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
+from torch.distributed.tensor import DTensor, Shard
 
+from .module import FsdpModule
 from .parameter_group import sync_model_weights_from_main_weights
 from .uneven_dtensor import attach_uneven_dtensor_metadata
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
+
+
+class _CheckpointState:
+    """Translate between local runtime state and DCP state without replacing live tensors.
+
+    Each state_dict() call creates new dictionaries and DTensor views sharing the local
+    tensor storage. Only this adapter tracks which entries need unwrapping after a load.
+    """
+
+    def __init__(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> None:
+        self.model = model
+        self.optimizer = optimizer
+        self._local_fqns: set[str] = set()
+
+    def state_dict(self) -> dict[str, Any]:
+        """Build checkpoint dictionaries with global shapes and uneven-shard metadata."""
+        model_state_dict = get_model_state_dict(self.model)
+        optimizer_state_dict = get_optimizer_state_dict(self.model, self.optimizer)
+        # Optimizer.state_dict() can share these nested dictionaries with live state.
+        optimizer_state_dict["state"] = {
+            fqn: dict(state) for fqn, state in optimizer_state_dict.get("state", {}).items()
+        }
+        layouts = {}
+        for module in self.model.modules():
+            if isinstance(module, FsdpModule):
+                for group in module.parameter_groups:
+                    for index, parameter in enumerate(group.fsdp_parameters):
+                        layouts[parameter.sharded] = (group.main_weight, index)
+        self._local_fqns = set()
+        for fqn, parameter in self.model.named_parameters(remove_duplicate=False):
+            if parameter not in layouts:
+                continue
+            buffer, index = layouts[parameter]
+            self._local_fqns.add(fqn)
+            model_state_dict[fqn] = buffer.get_dtensor(index)
+            for key, value in optimizer_state_dict.get("state", {}).get(fqn, {}).items():
+                if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                    continue
+                if value.shape != parameter.shape:
+                    raise NotImplementedError(
+                        "Local-tensor checkpoints require parameter-shaped optimizer state."
+                    )
+                shape = buffer.layout.tensor_shapes[index]
+                optimizer_state_dict["state"][fqn][key] = DTensor.from_local(
+                    value,
+                    buffer.mesh,
+                    tuple(Shard(p.dim) if isinstance(p, Shard) else p for p in buffer.placements),
+                    run_check=False,
+                    shape=shape,
+                    stride=torch.empty(shape, device="meta").stride(),
+                )
+        attach_uneven_dtensor_metadata(self.model, model_state_dict, optimizer_state_dict)
+        return {"model": model_state_dict, "optimizer": optimizer_state_dict}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Install loaded local tensors, keeping checkpoint wrappers out of live state."""
+        model_state_dict = dict(state_dict["model"])
+        optimizer_state_dict = dict(state_dict["optimizer"])
+        optimizer_state_dict["state"] = {
+            fqn: dict(state) for fqn, state in optimizer_state_dict.get("state", {}).items()
+        }
+        for fqn in self._local_fqns:
+            model_state_dict[fqn] = model_state_dict[fqn].to_local()
+            for key, value in optimizer_state_dict["state"].get(fqn, {}).items():
+                if isinstance(value, DTensor):
+                    optimizer_state_dict["state"][fqn][key] = value.to_local()
+        set_model_state_dict(self.model, model_state_dict)
+        set_optimizer_state_dict(self.model, self.optimizer, optimizer_state_dict)
 
 
 def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
@@ -78,12 +146,8 @@ def save_checkpoint(
         optimizer: Optimizer stepping the sharded parameters.
         checkpoint_dir: Destination directory for the DCP checkpoint.
     """
-    model_state_dict = get_model_state_dict(model)
-    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
-    attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
-    dcp.save(
-        {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
-    )
+    checkpoint = _CheckpointState(model, optimizer)
+    dcp.save(checkpoint.state_dict(), checkpoint_id=checkpoint_dir)
 
 
 def load_checkpoint(
@@ -97,9 +161,8 @@ def load_checkpoint(
 
     The model and optimizer must already be sharded with the same layout used at save time (the same
     module structure and mesh); DCP reshards the on-disk data to this rank's shards.
-    :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes the
-    (empty) optimizer state so DCP has DTensors to load into in place, and the ``set_*`` helpers
-    reinstall the loaded state.
+    Empty optimizer state is initialized before wrapping local tensors for DCP.
+    After loading, the ``set_*`` helpers reinstall unwrapped local state.
 
     Args:
         model: A module tree sharded with :func:`fully_shard`, whose weights receive the load.
@@ -108,13 +171,9 @@ def load_checkpoint(
         sync_model_weights: Refresh compute weights from the loaded main weights afterwards.
     """
     _init_optimizer_state(optimizer)
-    model_state_dict = get_model_state_dict(model)
-    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
-    attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
-    dcp.load(
-        {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
-    )
-    set_model_state_dict(model, model_state_dict)
-    set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
+    checkpoint = _CheckpointState(model, optimizer)
+    state_dict = checkpoint.state_dict()
+    dcp.load(state_dict, checkpoint_id=checkpoint_dir)
+    checkpoint.load_state_dict(state_dict)
     if sync_model_weights:
         sync_model_weights_from_main_weights(model.parameters())

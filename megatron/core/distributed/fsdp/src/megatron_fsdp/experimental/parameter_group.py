@@ -330,7 +330,7 @@ class FsdpParameterGroup:
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
-                self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
+                self.main_weight.get_local_tensor(index), requires_grad=parameter.requires_grad
             )
             copy_parameter_attributes(parameter, sharded_parameter)
             if main_grad_dtype:
@@ -415,7 +415,7 @@ class FsdpParameterGroup:
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
-        """Install sharded DTensor parameters on the owning modules."""
+        """Install optimizer-facing sharded parameters on the owning modules."""
         self._switch_to_sharded_parameters()
 
     def release_unsharded_storage(self) -> None:
@@ -514,7 +514,7 @@ class FsdpParameterGroup:
 
         def install_sharded_grads(main_grad: DBuffer) -> None:
             for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-                fsdp_parameter.sharded.grad = main_grad.get_dtensor(index)
+                fsdp_parameter.sharded.grad = main_grad.get_local_tensor(index)
 
         if is_last_microbatch and self.pre_optimizer_main_grad is not self.main_grad:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
@@ -524,9 +524,8 @@ class FsdpParameterGroup:
                 self.main_weight.placements, out=self.pre_optimizer_main_grad
             )
             self._main_grad_is_stale = True
-            install_sharded_grads(self.pre_optimizer_main_grad)
-        else:
-            # We could install pre_optimizer_main_grad unconditionally because
-            # sharded.grad is only read by the optimizer. However, for consistency and
-            # debugging, keep sharded.grad valid even between microbatches.
-            install_sharded_grads(self.main_grad)
+
+        # A local Parameter cannot accept a larger, pre-reduction gradient.
+        # Keep its optimizer-sized view bound between microbatches; accumulation
+        # still uses main_grad, and the final reduction fills this view before step.
+        install_sharded_grads(self.pre_optimizer_main_grad)
