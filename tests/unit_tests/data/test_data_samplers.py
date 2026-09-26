@@ -162,3 +162,45 @@ def test_cyclic_sampler_updates_random_seed_epoch_across_global_batch_boundary()
         torch.tensor([value for _, value in expected]),
     )
     assert dataset.curr_seed == dataset.base_seed + 1
+
+
+def test_cyclic_sampler_uses_running_global_batch_size(monkeypatch):
+    from megatron.core.num_microbatches_calculator import (
+        init_num_microbatches_calculator,
+        unset_num_microbatches_calculator,
+    )
+
+    requested_global_batch_size = 18
+    running_global_batch_size = 16
+    monkeypatch.setattr(
+        data_samplers,
+        'get_args',
+        lambda: SimpleNamespace(
+            dataloader_type='cyclic',
+            micro_batch_size=2,
+            global_batch_size=requested_global_batch_size,
+            data_sharding=False,
+            full_validation=False,
+            num_workers=0,
+            hybrid_context_parallel=False,
+            sequence_packing_scheduler=None,
+            use_varlen_dataset=False,
+            varlen_sbhd_validation=False,
+        ),
+    )
+    monkeypatch.setattr(data_samplers.mpu, 'get_data_parallel_rank', lambda: 0)
+    monkeypatch.setattr(data_samplers.mpu, 'get_data_parallel_world_size', lambda: 4)
+
+    init_num_microbatches_calculator(
+        rank=0,
+        global_batch_size=requested_global_batch_size,
+        micro_batch_size=2,
+        data_parallel_size=4,
+        decrease_batch_size_if_needed=True,
+    )
+    try:
+        loader = data_samplers.build_pretraining_data_loader(torch.arange(250), consumed_samples=0)
+    finally:
+        unset_num_microbatches_calculator()
+
+    assert loader.batch_sampler.global_batch_size == running_global_batch_size

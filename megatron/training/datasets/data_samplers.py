@@ -45,6 +45,9 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     is_eval = split in (Split.valid, Split.test)
     micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
     global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
+    if args.dataloader_type == 'cyclic' and not is_eval and not args.data_sharding:
+        from megatron.core.num_microbatches_calculator import get_current_running_global_batch_size
+        global_batch_size = get_current_running_global_batch_size()
 
     if split == Split.valid and args.full_validation:
         batch_sampler = MegatronFullValidationSampler(
