@@ -637,6 +637,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
+        name="dsa_indexer_weights_projection",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
+        tests=(K + "test_te_wrappers.py",),
+        kind="dispatch",
+        notes="Dispatches the non-quantized FP32 indexer projection to TE general_gemm when "
+        "supported or FP32 torch.mm otherwise; the replay covers both forward routes and the "
+        "custom-autograd dgrad and wgrad GEMMs.",
+    ),
+    KernelEntry(
         name="fp8_fp4_master_weight_casts",
         sources=(
             "megatron/core/fp8_utils.py",
