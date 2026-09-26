@@ -55,3 +55,38 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
 
     else:
         yield tmp_dir
+# Appended to tests/unit_tests/transformer/moe/conftest.py
+
+import os as _os
+
+import pytest as _pytest
+import torch as _torch
+import torch.distributed as _dist
+
+
+@_pytest.fixture(scope="session")
+def nccl_session():
+    """A session-scoped real NCCL process group for the A3 regression tests.
+
+    Skipped when torchrun did not provide RANK/WORLD_SIZE. Lifecycle is deliberately NOT torn
+    down here: the session-scoped ``cleanup`` fixture above is the single owner of
+    ``destroy_process_group``.
+
+    Why this exists: both A3 test modules need a real distributed group. Giving each module its
+    own init/destroy pair breaks when they run in one torchrun session, because a module-scoped
+    destroy races the next module's init and the session dies with
+    ``ncclRemoteError: ... remote process exited prematurely`` while rank 0 is SIGTERM'd --
+    which looks like a code failure but is a test-harness lifecycle bug.
+    """
+    if not _torch.cuda.is_available():
+        _pytest.skip("CUDA not available")
+    if "RANK" not in _os.environ or "WORLD_SIZE" not in _os.environ:
+        _pytest.skip("requires torchrun with RANK/WORLD_SIZE")
+
+    world = int(_os.environ["WORLD_SIZE"])
+    _torch.cuda.set_device(int(_os.environ.get("LOCAL_RANK", 0)))
+    if not _dist.is_initialized():
+        _dist.init_process_group(
+            "nccl", device_id=_torch.device("cuda", _torch.cuda.current_device())
+        )
+    return world
