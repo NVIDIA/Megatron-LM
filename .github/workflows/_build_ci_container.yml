@@ -114,6 +114,10 @@ jobs:
       # nvcc --threads 1. CI-Events' megatron-lm build profiles pass the same value to keep hitting
       # this cache.
       NVTE_BUILD_THREADS_PER_JOB: "4"
+      # Opt-in nvcc threads for the DeepEP extensions (3 = their GPU targets) and the single nvcc
+      # call that builds nccl_m2n; the Dockerfile defaults keep nvcc's own. CI-Events passes the same.
+      DEEPEP_NVCC_THREADS: "3"
+      NCCL_M2N_NVCC_THREADS: "8"
     permissions:
       contents: read
       id-token: write
@@ -276,7 +280,9 @@ jobs:
               if [ "$CACHE_VARIANT" != "lts" ]; then
                 printf '%s\n' \
                   "build-arg:NVTE_CUDA_ARCHS=$NVTE_CUDA_ARCHS" \
-                  "build-arg:NVTE_BUILD_THREADS_PER_JOB=$NVTE_BUILD_THREADS_PER_JOB"
+                  "build-arg:NVTE_BUILD_THREADS_PER_JOB=$NVTE_BUILD_THREADS_PER_JOB" \
+                  "build-arg:DEEPEP_NVCC_THREADS=$DEEPEP_NVCC_THREADS" \
+                  "build-arg:NCCL_M2N_NVCC_THREADS=$NCCL_M2N_NVCC_THREADS"
               fi
               sha256sum "${BUILD_INPUTS[@]}"
             } | sha256sum | cut -c1-32
@@ -345,6 +351,8 @@ jobs:
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
             ${{ !inputs.lts && format('NVTE_CUDA_ARCHS={0}', env.NVTE_CUDA_ARCHS) || '' }}
             ${{ !inputs.lts && format('NVTE_BUILD_THREADS_PER_JOB={0}', env.NVTE_BUILD_THREADS_PER_JOB) || '' }}
+            ${{ !inputs.lts && format('DEEPEP_NVCC_THREADS={0}', env.DEEPEP_NVCC_THREADS) || '' }}
+            ${{ !inputs.lts && format('NCCL_M2N_NVCC_THREADS={0}', env.NCCL_M2N_NVCC_THREADS) || '' }}
           cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.build_cache.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
