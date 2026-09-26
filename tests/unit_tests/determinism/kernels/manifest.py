@@ -323,9 +323,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(K + "test_moe_kernels.py", K + "test_cudnn_bf16_experts.py"),
         kind="te-wrapper",
         notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+    ),
+    KernelEntry(
+        name="cudnn_bf16_experts",
+        sources=("megatron/core/fusions/cudnn_bf16_experts.py",),
+        tests=(K + "test_cudnn_bf16_experts.py",),
+        kind="external-lib",
+        notes="Triton padding/gather/scatter and compiled activation replay bit-exactly. "
+        "External cuDNN Frontend wgrad uses FP32 atomics; deterministic mode is rejected.",
     ),
     KernelEntry(
         name="moe_fused_a2a",

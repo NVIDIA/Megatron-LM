@@ -10,10 +10,13 @@ from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
 from math import ceil
-from typing import Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from megatron.core.fusions.cudnn_bf16_experts import CudnnBf16Experts
 
 from megatron.core import tensor_parallel
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
@@ -349,10 +352,14 @@ class TEGroupedMLP(MegatronModule):
             and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
         )
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+        self._cudnn_bf16_ops: Optional[Tuple["CudnnBf16Experts"]] = None
+        if config.moe_bf16_expert_backend == "cudnn" and self.tp_group.size() != 1:
+            raise ValueError("cuDNN BF16 experts require expert tensor parallel size 1")
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
             and not self._with_fused_impl
+            and self.config.moe_bf16_expert_backend != "cudnn"
         ):
             logger.warning(
                 "`moe_mlp_glu_interleave_size=%s` is enabled, but fused MoE MLP implementation "
@@ -955,6 +962,39 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
 
+        if self.config.moe_bf16_expert_backend == "cudnn":
+            if output_buffer is not None or grad_input_buffer is not None:
+                raise ValueError("cuDNN BF16 experts do not support NCCL-EP zero-copy buffers")
+            if self._cudnn_bf16_ops is None:
+                from megatron.core.fusions.cudnn_bf16_experts import CudnnBf16Experts
+
+                ops = CudnnBf16Experts(
+                    self.num_local_experts,
+                    self.config.hidden_size,
+                    self.config.moe_ffn_hidden_size,
+                    self.config.activation_func_clamp_value,
+                )
+                ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())
+                self._cudnn_bf16_ops = (ops,)
+            weights = tuple(
+                torch.nn.Module.get_parameter(linear, f"weight{expert}")
+                for linear in (self.linear_fc1, self.linear_fc2)
+                for expert in range(self.num_local_experts)
+            )
+            # Dynamic HybridEP dispatch returns synchronized pinned host counts.
+            # Stage only this small metadata tensor on the expert execution stream;
+            # cuDNN's device-side offsets and validation keep their CUDA contract.
+            if tokens_per_expert.device.type == "cpu":
+                tokens_per_expert = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device, non_blocking=True
+                )
+            return (
+                self._cudnn_bf16_ops[0](
+                    permuted_local_hidden_states, tokens_per_expert, permuted_probs, *weights
+                ),
+                None,
+            )
+
         # Call fused impl if enabled
         if self._with_fused_impl:
             output = self._fused_forward(
@@ -1192,6 +1232,11 @@ class TEGroupedMLP(MegatronModule):
                                 singleton_local_shards,
                                 tp_group=self.tp_group,
                                 dp_group=metadata['dp_cp_group'],
+                                glu_interleave_size=(
+                                    self.config.moe_mlp_glu_interleave_size
+                                    if self.config.moe_bf16_expert_backend == "cudnn"
+                                    else None
+                                ),
                             )
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')

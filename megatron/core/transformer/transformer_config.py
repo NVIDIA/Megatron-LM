@@ -937,6 +937,14 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
 
+    moe_bf16_expert_backend: Literal["transformer_engine", "cudnn"] = "transformer_engine"
+    """Local BF16 expert implementation. ``cudnn`` opts into cuDNN Frontend on SM100.
+
+    Requires discrete interleave32 clamped SwiGLU parameters, eager execution,
+    expert TP1 and FP32 main-gradient accumulation. Quantized training, FSDP,
+    deterministic mode and delayed/overlapped expert wgrad are unsupported.
+    """
+
     moe_grouped_gemm: bool = False
     """Use grouped GEMM to execute multiple local MoE experts together.
 
@@ -1682,6 +1690,63 @@ class TransformerConfig(ModelParallelConfig):
             self.dsa_kernel_backend = (
                 "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
             )
+
+        if self.moe_bf16_expert_backend not in ("transformer_engine", "cudnn"):
+            raise ValueError("moe_bf16_expert_backend must be 'transformer_engine' or 'cudnn'.")
+        if self.moe_bf16_expert_backend == "cudnn":
+            if not (self.moe_grouped_gemm and self.bf16 and self.params_dtype == torch.bfloat16):
+                raise ValueError("cuDNN BF16 experts require grouped GEMM and BF16 parameters.")
+            if self.fp8 or self.fp4 or self.quant_recipe is not None:
+                raise ValueError("cuDNN BF16 experts do not support quantization.")
+            if self.use_transformer_engine_op_fuser or self.moe_use_grouped_tensor:
+                raise ValueError("cuDNN BF16 experts require the discrete parameter module path.")
+            if self.moe_single_grouped_weight or self.add_bias_linear or self.moe_latent_size:
+                raise ValueError(
+                    "cuDNN BF16 experts require discrete weights without bias or latent projection."
+                )
+            if not (
+                self.gated_linear_unit
+                and self.activation_func == F.silu
+                and self.moe_mlp_glu_interleave_size == 32
+                and self.activation_func_clamp_value is not None
+                and math.isfinite(self.activation_func_clamp_value)
+                and self.activation_func_clamp_value > 0
+                and self.activation_func_tanh_clamp_scale is None
+                and self.activation_func_tanh_clamp_scale_linear is None
+                and self.glu_linear_offset == 0
+                and not self.use_te_activation_func
+            ):
+                raise ValueError(
+                    "cuDNN BF16 experts require interleave32 clamped SwiGLU "
+                    "with zero linear offset."
+                )
+            if not self.gradient_accumulation_fusion or self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "cuDNN BF16 experts require eager FP32 main-gradient accumulation."
+                )
+            if (
+                self.delay_wgrad_compute
+                or self.overlap_dispatch_backward_with_experts_wgrad
+                or self.overlap_moe_expert_parallel_comm
+                or self.moe_apply_probs_on_input
+                or self.moe_paged_stash
+                or (
+                    self.fine_grained_activation_offloading
+                    and {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    & set(self.offload_modules or ())
+                )
+                or self.moe_ncclep_zero_copy
+                or self.deterministic_mode
+            ):
+                raise ValueError(
+                    "cuDNN BF16 experts do not yet support delayed/overlapped wgrad "
+                    "or expert activation offload."
+                )
+
+            if self.expert_tensor_parallel_size not in (None, 1):
+                raise ValueError("cuDNN BF16 experts require expert tensor parallel size 1.")
+            if self.recompute_granularity != "selective" or "moe_act" not in self.recompute_modules:
+                raise ValueError("cuDNN BF16 experts require selective moe_act recomputation.")
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
             self.moe_use_grouped_tensor = True
