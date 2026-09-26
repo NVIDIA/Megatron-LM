@@ -233,6 +233,10 @@ class TestGDPDecodeIntermediateStates:
         seq_len, num_householder, batch, num_slots = 3, 2, 4, 5
         q, k, v, g, beta = _make_inputs(batch, seq_len, num_householder)
         state_indices = torch.tensor([2, -1, 0, -1], dtype=torch.int32, device="cuda")
+        # Captured padding buffers can retain non-finite values from earlier
+        # replays. Their outputs must still be zero after this decode step.
+        for tensor in (q, k, v, g, beta):
+            tensor[[1, 3]] = float("nan")
 
         initial_state = torch.randn(num_slots, _HV, _K, _V, device="cuda", dtype=torch.float32)
         state = initial_state.clone()

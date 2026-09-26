@@ -9,8 +9,9 @@ call. The 32-request case matches the GDP 800M inference recipe's kernel shape.
 """
 
 import argparse
+import hashlib
 import json
-import subprocess
+from pathlib import Path
 
 import torch
 
@@ -88,7 +89,15 @@ def main():
     parser.add_argument("--samples", type=int, default=30)
     args = parser.parse_args()
     assert torch.cuda.is_available(), "run on a GPU compute node"
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    root = Path(__file__).resolve().parents[5]
+    source_sha256 = {
+        name: hashlib.sha256((root / path).read_bytes()).hexdigest()
+        for name, path in (
+            ("fused_recurrent", "megatron/core/ssm/ops/gdp/fused_recurrent.py"),
+            ("decode_prepare", "megatron/core/ssm/ops/gdp/decode_prepare.py"),
+            ("ssm_inference", "megatron/core/ssm/ssm_inference.py"),
+        )
+    }
     cases = (
         [(args.batch, args.tokens, False)]
         if args.batch is not None and args.tokens is not None
@@ -107,7 +116,7 @@ def main():
             print(
                 json.dumps(
                     {
-                        "revision": revision,
+                        "source_sha256": source_sha256,
                         "gpu": torch.cuda.get_device_name(),
                         "kernel": name,
                         "batch": batch,
