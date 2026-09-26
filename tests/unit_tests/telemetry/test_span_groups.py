@@ -146,6 +146,18 @@ class TestResolve:
         assert MegatronSpanGroup.resolve("default") == MegatronSpanGroup._PRESETS["default"]
         assert MegatronSpanGroup.resolve("all") == MegatronSpanGroup.ALL_GROUPS
 
+    @pytest.mark.skipif(not HAVE_NEMO_LENS, reason="requires nemo-lens")
+    def test_megatron_export_strategy_uses_nemo_lens_field_name(self, monkeypatch):
+        from nemo.lens import NemoLensConfig
+
+        monkeypatch.setenv("MEGATRON_OTEL_EXPORT_STRATEGY", "all_ranks")
+
+        config = NemoLensConfig.from_env(
+            prefix="MEGATRON_OTEL", fallback_prefix="NEMO_LENS", span_group_cls=MegatronSpanGroup
+        )
+
+        assert config.export_strategy == "all_ranks"
+
 
 @pytest.mark.skipif(HAVE_NEMO_LENS, reason="stub SpanGroup is only used without nemo-lens")
 class TestStubFallback:
