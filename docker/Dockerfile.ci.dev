@@ -74,9 +74,10 @@ ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 # Preserve Ampere support unless a caller selects narrower TE build targets.
 ARG NVTE_CUDA_ARCHS="80;90;100"
 # TE compiles each source's GPU targets one after another by default (nvcc --threads 1), so
-# the few largest kernels leave a long near-serial tail. Compile up to this many targets of one
-# source concurrently; the uv sync below caps concurrent sources to keep the compiler budget.
-ARG NVTE_BUILD_THREADS_PER_JOB=4
+# the few largest kernels leave a long near-serial tail. Unset keeps TE's defaults. CI passes
+# --build-arg NVTE_BUILD_THREADS_PER_JOB=<n> to compile up to n targets of one source
+# concurrently; the uv sync below then caps concurrent sources to keep the compiler budget.
+ARG NVTE_BUILD_THREADS_PER_JOB
 # Keep compiled wheels separate when the CPU or TE GPU targets change.
 RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cache/uv \
     bash -ex <<"EOF"
@@ -98,7 +99,9 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
         export MAX_JOBS=8
     fi
     # Split the same compiler budget across TE sources and their per-source target threads.
-    export NVTE_BUILD_MAX_JOBS="${NVTE_BUILD_MAX_JOBS:-$(( (${MAX_JOBS:-$(nproc)} + NVTE_BUILD_THREADS_PER_JOB - 1) / NVTE_BUILD_THREADS_PER_JOB ))}"
+    if [ -n "${NVTE_BUILD_THREADS_PER_JOB:-}" ]; then
+        export NVTE_BUILD_MAX_JOBS="${NVTE_BUILD_MAX_JOBS:-$(( (${MAX_JOBS:-$(nproc)} + NVTE_BUILD_THREADS_PER_JOB - 1) / NVTE_BUILD_THREADS_PER_JOB ))}"
+    fi
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
     UV_CONCURRENT_INSTALLS=1 uv sync -v \
         --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
