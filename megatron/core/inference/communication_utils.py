@@ -142,70 +142,131 @@ def send_to_next_pipeline_rank(
     torch.cuda.synchronize()
 
 
-def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):
+def _resolve_broadcast_group_and_src_rank(
+    group: ProcessGroup | None, rank: int, data_parallel: bool
+) -> tuple[ProcessGroup | None, int]:
+    """Resolve the process group and source rank for a broadcast.
+
+    Args:
+        group: Explicit process group, or None to use the default / MPU fallback.
+        rank: Caller-specified global source rank.
+        data_parallel: If True, broadcast within one data-parallel replica
+            (the model-parallel group) and use that group's first rank as src.
+
+    Returns:
+        Tuple of (process group, global source rank).
+    """
+    if group is not None:
+        # Lists of ProcessGroups are used for multimodal inference but not supported here
+        assert isinstance(
+            group, ProcessGroup
+        ), "group must be a single ProcessGroup, not a list of ProcessGroups"
+        if data_parallel:
+            rank = torch.distributed.get_process_group_ranks(group)[0]
+        return group, rank
+    if data_parallel:
+        # Migration fallback: read MPU globals when the caller did not pass a group.
+        return (
+            parallel_state.get_model_parallel_group(),
+            parallel_state.get_model_parallel_src_rank(),
+        )
+    return None, rank
+
+
+def broadcast_tensor(
+    size, dtype, tensor=None, rank=0, data_parallel=False, group: ProcessGroup | None = None
+):
     """Given size and type of a tensor on all ranks and the tensor value
     only on a specific rank, broadcast from that rank to all other ranks.
 
     Args:
+        size: Expected tensor size.
+        dtype: Expected tensor dtype.
+        tensor: Tensor to broadcast (only on the source rank).
+        rank: Global rank to broadcast from when ``data_parallel`` is False
+            and ``group`` is None.
         data_parallel (bool): Broadcast across a single data parallel model replica.
+        group: Explicit process group to broadcast over. When ``data_parallel``
+            is True and ``group`` is None, falls back to the MPU model-parallel
+            group.
     """
-    if data_parallel:
-        rank = parallel_state.get_model_parallel_src_rank()
+    group, rank = _resolve_broadcast_group_and_src_rank(group, rank, data_parallel)
 
     if torch.distributed.get_rank() == rank:
         _is_cuda_contiguous(tensor)
     else:
         tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
 
-    group = None
-    if data_parallel:
-        group = parallel_state.get_model_parallel_group()
-
     torch.distributed.broadcast(tensor, rank, group=group)
 
     return tensor
 
 
-def broadcast_list(size, dtype, list_values=None, rank=0, data_parallel=False):
+def broadcast_list(
+    size, dtype, list_values=None, rank=0, data_parallel=False, group: ProcessGroup | None = None
+):
     """Broadcast a list of values with a given type.
 
     Args:
+        size: Number of elements in the list.
+        dtype: Tensor dtype used for the broadcast.
+        list_values: Values to broadcast (only on the source rank).
+        rank: Global rank to broadcast from when ``data_parallel`` is False
+            and ``group`` is None.
         data_parallel (bool): Broadcast across a single data parallel model replica.
+        group: Explicit process group to broadcast over. When ``data_parallel``
+            is True and ``group`` is None, falls back to the MPU model-parallel
+            group.
     """
+    group, rank = _resolve_broadcast_group_and_src_rank(group, rank, data_parallel)
 
     tensor = None
+    if torch.distributed.get_rank() == rank:
+        tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
 
-    if data_parallel:
-        if parallel_state.get_model_parallel_src_rank() == torch.distributed.get_rank():
-            tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
-
-        rank = parallel_state.get_model_parallel_src_rank()
-    else:
-        if torch.distributed.get_rank() == rank:
-            tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
-
-    return broadcast_tensor(size, dtype, tensor=tensor, rank=rank, data_parallel=data_parallel)
-
-
-def broadcast_int_list(size, int_list=None, rank=0, data_parallel=False):
-    """Broadcast a list of integer values.
-
-    Args:
-        data_parallel (bool): Broadcast across a single data parallel model replica.
-    """
-
-    return broadcast_list(
-        size, torch.int64, list_values=int_list, rank=rank, data_parallel=data_parallel
+    return broadcast_tensor(
+        size, dtype, tensor=tensor, rank=rank, data_parallel=data_parallel, group=group
     )
 
 
-def broadcast_float_list(size, float_list=None, rank=0, data_parallel=False):
-    """Broadcast a list of float values.
+def broadcast_int_list(
+    size, int_list=None, rank=0, data_parallel=False, group: ProcessGroup | None = None
+):
+    """Broadcast a list of integer values.
 
     Args:
+        size: Number of elements in the list.
+        int_list: Integer values to broadcast (only on the source rank).
+        rank: Global rank to broadcast from when ``data_parallel`` is False
+            and ``group`` is None.
         data_parallel (bool): Broadcast across a single data parallel model replica.
+        group: Explicit process group to broadcast over.
     """
 
     return broadcast_list(
-        size, torch.float32, list_values=float_list, rank=rank, data_parallel=data_parallel
+        size, torch.int64, list_values=int_list, rank=rank, data_parallel=data_parallel, group=group
+    )
+
+
+def broadcast_float_list(
+    size, float_list=None, rank=0, data_parallel=False, group: ProcessGroup | None = None
+):
+    """Broadcast a list of float values.
+
+    Args:
+        size: Number of elements in the list.
+        float_list: Float values to broadcast (only on the source rank).
+        rank: Global rank to broadcast from when ``data_parallel`` is False
+            and ``group`` is None.
+        data_parallel (bool): Broadcast across a single data parallel model replica.
+        group: Explicit process group to broadcast over.
+    """
+
+    return broadcast_list(
+        size,
+        torch.float32,
+        list_values=float_list,
+        rank=rank,
+        data_parallel=data_parallel,
+        group=group,
     )
