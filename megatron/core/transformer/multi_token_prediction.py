@@ -220,10 +220,14 @@ def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
     """Exchange both roll boundaries with the adjacent context-parallel ranks."""
     first_boundary = first_boundary.contiguous()
     second_boundary = second_boundary.contiguous()
-    first_received = torch.empty_like(first_boundary)
-    second_received = torch.empty_like(second_boundary)
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
     local_rank = torch.distributed.get_rank(group=cp_group)
+    first_received = (
+        torch.empty_like(first_boundary) if local_rank != len(global_ranks) - 1 else second_boundary
+    )
+    second_received = (
+        torch.empty_like(second_boundary) if local_rank != 0 else torch.zeros_like(second_boundary)
+    )
 
     # Keep boundary exchanges on the CP communicator so independent DP lanes
     # can issue different packed P2P sequences without coupling through WORLD.
@@ -240,8 +244,6 @@ def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
                 torch.distributed.irecv, second_received, previous_rank, group=cp_group
             )
         )
-    else:
-        second_received.zero_()
     if local_rank != len(global_ranks) - 1:
         next_rank = global_ranks[local_rank + 1]
         ops.append(
@@ -254,8 +256,6 @@ def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
                 torch.distributed.isend, second_boundary, next_rank, group=cp_group
             )
         )
-    else:
-        first_received.copy_(second_boundary)
     for request in torch.distributed.batch_isend_irecv(ops):
         request.wait()
     return first_received, second_received
@@ -370,55 +370,56 @@ def _roll_tensor_packed_seq(
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
-    cu_seqlens = cu_seqlens.to(device=tensor.device)
     physical_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
     if physical_cu_seqlens is None:
         physical_cu_seqlens = cu_seqlens
-    else:
-        physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
 
     cp_size = cp_group.size() if cp_group is not None else 1
+    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+    if tensor.size(sequence_dim) > 0:
+        rolled_tensor.select(dims, shifts).zero_()
     if cp_size == 1:
+        original_cu_seqlens = cu_seqlens
+        cu_seqlens = cu_seqlens.to(device=tensor.device)
+        physical_cu_seqlens = (
+            cu_seqlens
+            if physical_cu_seqlens is original_cu_seqlens
+            else physical_cu_seqlens.to(device=tensor.device)
+        )
         if cu_seqlens.numel() == 1:
-            rolled_tensor = tensor.clone()
             return rolled_tensor, rolled_tensor.sum() if return_sum else None
-        # A single roll supplies every interior token. Mask each document's last
-        # valid position and its physical padding in one operation instead of
-        # launching GPU work separately for every packed document.
+        # Mask each document's last valid position and physical padding; slots
+        # after the final document roll as a separate trailing segment.
         positions = torch.arange(
             tensor.size(sequence_dim), device=tensor.device, dtype=physical_cu_seqlens.dtype
         )
         document_ids = torch.searchsorted(physical_cu_seqlens[1:], positions, right=True)
-        # A packed tensor may have trailing slots after its final document.
-        # Clamp the lookup, then keep those slots unchanged as the loop did.
+        # Clamp the lookup for positions beyond the final document.
         trailing = positions >= physical_cu_seqlens[-1]
         document_ids.clamp_max_(len(cu_seqlens) - 2)
         valid_ends = physical_cu_seqlens[:-1] + torch.diff(cu_seqlens)
         invalid = (positions >= valid_ends.index_select(0, document_ids) - 1) & ~trailing
-        source_positions = torch.where(
-            trailing, positions, (positions + 1).clamp_max(tensor.size(sequence_dim) - 1)
-        )
-        rolled_tensor = tensor.index_select(sequence_dim, source_positions.long())
         rolled_tensor.masked_fill_(invalid.view(mask_shape), 0)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
-    # Divide the global boundaries as the old per-document path did, then match
-    # torch.chunk(2): the first local chunk is one token longer when odd.
+    physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
+    # CP attention requires two equal chunks per rank for every physical document.
+    torch._assert_async(
+        (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all(),
+        "Packed document lengths must be divisible by twice the CP size",
+    )
     local_boundaries = torch.div(physical_cu_seqlens, cp_size, rounding_mode='floor').long()
     local_lengths = torch.diff(local_boundaries)
     # Exchange one boundary vector per neighbour for all nonempty documents.
     # RL packing may repeat the final boundary in fixed-size metadata.
     nonempty = torch.nonzero(local_lengths > 0).flatten()
     if nonempty.numel() == 0:
-        rolled_tensor = tensor.clone()
         return rolled_tensor, rolled_tensor.sum() if return_sum else None
     local_starts = local_boundaries[:-1].index_select(0, nonempty)
     local_ends = local_boundaries[1:].index_select(0, nonempty)
-    first_chunk_lengths = torch.div(
-        local_lengths.index_select(0, nonempty) + 1, 2, rounding_mode='floor'
-    )
-    second_starts = local_starts + first_chunk_lengths
+    chunk_lengths = local_lengths.index_select(0, nonempty) // 2
+    second_starts = local_starts + chunk_lengths
     first_ends = second_starts - 1
     second_ends = local_ends - 1
     first_boundary = tensor.index_select(sequence_dim, local_starts)
@@ -427,12 +428,6 @@ def _roll_tensor_packed_seq(
         first_boundary, second_boundary, cp_group
     )
 
-    positions = torch.arange(tensor.size(sequence_dim), device=tensor.device)
-    trailing = positions >= local_boundaries[-1]
-    source_positions = torch.where(
-        trailing, positions, (positions + 1).clamp_max(tensor.size(sequence_dim) - 1)
-    )
-    rolled_tensor = tensor.index_select(sequence_dim, source_positions)
     rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
     rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
     rolled_sum = rolled_tensor.sum() if return_sum else None
@@ -529,7 +524,7 @@ def _packed_seq_params_for_local_hsm_roll(
                 ),
                 dim=1,
             ).flatten()
-        cp_local = torch.cat((padded.new_zeros(1), boundaries)).unique_consecutive()
+        cp_local = torch.cat((padded.new_zeros(1), boundaries))
         add_zigzag_midpoints = False
     else:
         cp_size = get_pg_size(cp_group)
@@ -542,7 +537,7 @@ def _packed_seq_params_for_local_hsm_roll(
     # A document's local slots are its two zigzag chunks, which are adjacent locally but
     # usually far apart globally, so the midpoint between them is a boundary too: the
     # token after the front chunk's last one lives on another rank, not in the next local
-    # slot. Splitting there is what roll_tensor's CP branch used chunk(2) for.
+    # slot. The local roll must stop at that seam.
     #
     # The exception is the last CP rank. The zigzag hands rank r chunks r and
     # 2 * cp_size - 1 - r, which for r == cp_size - 1 are chunks cp_size - 1 and cp_size:

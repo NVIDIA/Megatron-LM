@@ -2040,7 +2040,7 @@ class TestMTPHiddenStateRollUnderParallelism:
             (1, 0): [0, 6, 8, 8, 8],
             (1, 1): [0, 0, 0, 6, 8],
         }[(get_pg_rank(cp_group), get_pg_rank(tp_group))]
-        assert really_padded.cu_seqlens_q.tolist() == expected_padded
+        assert really_padded.cu_seqlens_q.unique_consecutive().tolist() == expected_padded
         assert really_padded.cu_seqlens_q_padded is None
 
         Utils.destroy_model_parallel()
@@ -3386,25 +3386,6 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
-    def test_roll_tensor_with_uneven_unpadded_cp_chunks(self):
-        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-            pytest.skip("CP=2 requires at least 2 ranks")
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
-        cp_group = get_context_parallel_group()
-        cp_rank = get_pg_rank(cp_group)
-        local_tensors = ([1, 2, 6, 11, 12, 16], [3, 4, 5, 13, 14, 15])
-        expected_tensors = ([2, 3, 0, 12, 13, 0], [4, 5, 6, 14, 15, 16])
-        tensor = torch.tensor(local_tensors[cp_rank], device="cuda")
-        boundaries = torch.tensor([0, 6, 12], dtype=torch.int32, device="cuda")
-        packed = PackedSeqParams(
-            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
-        )
-
-        rolled, _ = roll_tensor(tensor, cp_group=cp_group, packed_seq_params=packed)
-
-        torch.testing.assert_close(rolled, torch.tensor(expected_tensors[cp_rank], device="cuda"))
-        Utils.destroy_model_parallel()
-
     def test_roll_tensor_with_attention_padded_packed_sequences_without_cp(self):
         tensor = torch.arange(1, 25)
         expected = torch.zeros_like(tensor)
@@ -3425,7 +3406,7 @@ class TestMultiTokenPrediction:
 
         torch.testing.assert_close(rolled, expected)
 
-    def test_roll_tensor_preserves_trailing_slots_after_final_packed_sequence(self):
+    def test_roll_tensor_rolls_trailing_slots_after_final_packed_sequence(self):
         tensor = torch.arange(10)
         logical = torch.tensor([0, 3], dtype=torch.int32)
         physical = torch.tensor([0, 8], dtype=torch.int32)
@@ -3441,7 +3422,7 @@ class TestMultiTokenPrediction:
 
         rolled, _ = roll_tensor(tensor, packed_seq_params=packed_seq_params)
 
-        torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 8, 9]))
+        torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0]))
 
     def test_roll_tensor_local_packed_gradients_with_trailing_slots(self):
         tensor = torch.arange(20, dtype=torch.float32).reshape(2, 10).requires_grad_()
@@ -3463,10 +3444,10 @@ class TestMultiTokenPrediction:
         expected_grad = torch.zeros_like(tensor)
         expected_grad[:, 1] = weights[:, 0]
         expected_grad[:, 2] = weights[:, 1]
-        expected_grad[:, 8:] = weights[:, 8:]
+        expected_grad[:, 9] = weights[:, 8]
         torch.testing.assert_close(tensor.grad, expected_grad)
 
-    def test_roll_tensor_with_no_packed_documents_keeps_trailing_slots(self):
+    def test_roll_tensor_with_no_packed_documents_rolls_trailing_slots(self):
         tensor = torch.arange(4)
         boundaries = torch.tensor([0], dtype=torch.int32)
         packed = PackedSeqParams(
@@ -3479,8 +3460,8 @@ class TestMultiTokenPrediction:
 
         rolled, rolled_sum = roll_tensor(tensor, packed_seq_params=packed)
 
-        torch.testing.assert_close(rolled, tensor)
-        torch.testing.assert_close(rolled_sum, tensor.sum())
+        torch.testing.assert_close(rolled, torch.tensor([1, 2, 3, 0]))
+        torch.testing.assert_close(rolled_sum, rolled.sum())
 
     def test_roll_tensor_accepts_cpu_boundaries_with_cuda_tokens(self):
         if not torch.cuda.is_available():
@@ -3499,8 +3480,55 @@ class TestMultiTokenPrediction:
         rolled, _ = roll_tensor(tensor, packed_seq_params=packed)
 
         torch.testing.assert_close(
-            rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 8, 9], device="cuda")
+            rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0], device="cuda")
         )
+
+    def test_roll_tensor_rejects_misaligned_cp_document(self):
+        class CPGroup:
+            def size(self):
+                return 2
+
+        tensor = torch.tensor([7])
+        boundaries = torch.tensor([0, 2], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
+        )
+
+        with pytest.raises(RuntimeError, match="divisible by twice the CP size"):
+            roll_tensor(tensor, cp_group=CPGroup(), packed_seq_params=packed)
+
+    def test_roll_tensor_packed_cp_gradients(self):
+        cp = 4
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+        tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda", requires_grad=True)
+        weights = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda")
+        boundaries = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
+        )
+
+        rolled, rolled_sum = roll_tensor(
+            tensor, cp_group=cp_group, packed_seq_params=packed, return_sum=False
+        )
+        assert rolled_sum is None
+        expected = torch.tensor(
+            [2.0, 3.0 if cp_rank == cp - 1 else 1.0, 4.0, 0.0 if cp_rank == 0 else 3.0],
+            device="cuda",
+        )
+        torch.testing.assert_close(rolled, expected)
+        unpacked_rolled, _ = roll_tensor(tensor.detach(), cp_group=cp_group, return_sum=False)
+        torch.testing.assert_close(unpacked_rolled, expected)
+        (rolled * weights).sum().backward()
+
+        expected_grad = torch.tensor(
+            [0.0, 1.0, 2.0 if cp_rank == cp - 1 else 0.0, 3.0], device="cuda"
+        )
+        torch.testing.assert_close(tensor.grad, expected_grad)
+        Utils.destroy_model_parallel()
 
     def test_roll_tensor_with_attention_padded_packed_sequences(self):
         cp = 4
@@ -3555,8 +3583,14 @@ class TestMultiTokenPrediction:
         )
         torch.testing.assert_close(rolled_physical_only, expected)
 
+        unpadded = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded, cu_seqlens_kv=cu_seqlens_padded, qkv_format="thd"
+        )
+        rolled_unpadded, _ = roll_tensor(tensor, cp_group=cp_group, packed_seq_params=unpadded)
+        torch.testing.assert_close(rolled_unpadded, expected)
+
         # Fixed-size RL metadata may contain empty documents anywhere, while
-        # trailing local slots beyond the final boundary must stay unchanged.
+        # trailing local slots beyond the final boundary form another segment.
         tensor_with_tail = torch.cat((tensor, torch.tensor([99, 100], device="cuda")))
         physical_with_empty = torch.tensor([0, 0, 8, 8, 24, 24], dtype=torch.int32, device="cuda")
         logical_with_empty = torch.tensor([0, 0, 3, 3, 13, 13], dtype=torch.int32, device="cuda")
@@ -3572,7 +3606,16 @@ class TestMultiTokenPrediction:
         rolled_with_tail, _ = roll_tensor(
             tensor_with_tail, cp_group=cp_group, packed_seq_params=packed_with_empty
         )
-        torch.testing.assert_close(rolled_with_tail, torch.cat((expected, tensor_with_tail[-2:])))
+        expected_with_tail = torch.cat((expected, torch.tensor([100, 0], device="cuda")))
+        torch.testing.assert_close(rolled_with_tail, expected_with_tail)
+
+        unpadded_with_tail = PackedSeqParams(
+            cu_seqlens_q=physical_with_empty, cu_seqlens_kv=physical_with_empty, qkv_format="thd"
+        )
+        rolled_unpadded_with_tail, _ = roll_tensor(
+            tensor_with_tail, cp_group=cp_group, packed_seq_params=unpadded_with_tail
+        )
+        torch.testing.assert_close(rolled_unpadded_with_tail, expected_with_tail)
         Utils.destroy_model_parallel()
 
 
