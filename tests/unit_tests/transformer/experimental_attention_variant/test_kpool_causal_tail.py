@@ -6,6 +6,7 @@ import torch
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
     _kpool_compress_keys,
+    _kpool_compress_keys_per_seg,
     _kpool_fp8_input,
     rotate_activation,
     fused_qk_topk_kpool,
@@ -67,64 +68,97 @@ def test_kpool_fp8_input_matches_hadamard_matrix_reference(input_scale):
     torch.testing.assert_close(_kpool_fp8_input(x), expected, rtol=0, atol=0)
 
 
-def test_kpool_rotate_activation_rotates_q_and_compressed_k_together():
-    torch.manual_seed(789)
-    q = torch.randn(4, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(6, 1, 8, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(4, 1, 2, device="cuda", dtype=torch.bfloat16)
+def test_kpool_packed_compression_keeps_fixed_shape_and_matches_reference():
+    torch.manual_seed(457)
+    lengths = [7, 5, 9]
+    total = sum(lengths)
+    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda")
+    k = torch.randn(total, 1, 8, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(k)
-    ape = torch.randn(2, 8, device="cuda", dtype=torch.float32)
+    ape = torch.randn(4, 8, device="cuda", dtype=torch.float32)
 
-    scores, indices = fused_qk_topk_kpool(
-        q,
-        k,
-        weights,
-        index_topk=4,
-        pool_size=2,
-        gate_score=gate,
-        ape=ape,
-        use_relu=False,
-        always_select_tail=False,
-        rotate_activation_enabled=True,
+    pooled, bases = _kpool_compress_keys_per_seg(k, gate, ape, 4, cu)
+    expected = torch.cat(
+        [_kpool_compress_keys(k[s:e], gate[s:e], ape, 4) for s, e in zip(cu[:-1], cu[1:]) if e > s],
+        dim=0,
     )
-    pooled_k = _kpool_compress_keys(k, gate, ape, pool_size=2)
-    expected_scores = _compute_index_scores(
-        rotate_activation(q), weights, rotate_activation(pooled_k), use_relu=False
-    )
-    torch.testing.assert_close(scores, expected_scores, rtol=0, atol=0)
-    expected_pool_ids = expected_scores.topk(2, dim=-1).indices
-    expected_indices = (
-        expected_pool_ids.unsqueeze(-1) * 2 + torch.arange(2, device="cuda")
-    ).reshape(1, 4, 4)
-    torch.testing.assert_close(indices, expected_indices.to(indices.dtype))
+    torch.testing.assert_close(pooled[: expected.size(0)], expected, rtol=0, atol=0)
+    assert pooled.shape[0] == total // 4
+    assert bases.tolist() == [0, 7, 12, 16, -1]
 
 
-@pytest.mark.parametrize("batched_mask", [False, True])
-def test_kpool_explicit_token_mask_filters_pool_and_tail_tokens(batched_mask):
-    torch.manual_seed(790)
-    q = torch.randn(3, 2, 1, 8, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(6, 2, 8, device="cuda", dtype=torch.bfloat16)
-    weights = torch.ones(3, 2, 1, device="cuda", dtype=torch.bfloat16)
-    mask = torch.triu(
-        torch.full((3, 6), float("-inf"), device="cuda", dtype=torch.float32), diagonal=1
-    )
-    mask[:, 1] = float("-inf")
-    if batched_mask:
-        mask = mask.unsqueeze(0).expand(2, -1, -1).contiguous()
+def test_kpool_explicit_mask_tail_uses_global_query_positions():
+    torch.manual_seed(458)
+    query_positions = [0, 1, 6, 7]
+    q = torch.randn(len(query_positions), 1, 1, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(8, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.ones(len(query_positions), 1, 1, device="cuda", dtype=torch.bfloat16)
+    mask = torch.full((len(query_positions), 8), float("-inf"), device="cuda")
+    for row, position in enumerate(query_positions):
+        mask[row, : position + 1] = 0
 
     _, indices = fused_qk_topk_kpool(
         q,
         k,
         weights,
         index_topk=4,
-        pool_size=2,
+        pool_size=4,
         gate_score=torch.zeros_like(k),
-        ape=torch.zeros(2, 8, device="cuda"),
+        ape=torch.zeros(4, 8, device="cuda"),
         mask=mask,
-        use_relu=False,
         always_select_tail=True,
     )
-    assert not torch.any(indices == 1)
-    assert not torch.any(indices == 3)
-    assert not torch.any(indices == 4)
-    assert not torch.any(indices == 5)
+    assert indices.shape == (1, len(query_positions), 7)
+    torch.testing.assert_close(
+        indices[0, 2], torch.arange(7, device="cuda", dtype=indices.dtype), rtol=0, atol=0
+    )
+    assert not torch.any(indices == 7)
+
+
+def test_kpool_explicit_batched_mask_filters_invalid_tokens():
+    q = torch.randn(4, 2, 1, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(8, 2, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.ones(4, 2, 1, device="cuda", dtype=torch.bfloat16)
+    mask = torch.full((2, 4, 8), float("-inf"), device="cuda")
+    mask[:, :, :4] = 0
+    mask[0, 2, 4:7] = 0
+    mask[1, 3, 4:8] = 0
+
+    _, indices = fused_qk_topk_kpool(
+        q,
+        k,
+        weights,
+        index_topk=4,
+        pool_size=4,
+        gate_score=torch.zeros_like(k),
+        ape=torch.zeros(4, 8, device="cuda"),
+        mask=mask,
+    )
+    selected_valid = torch.gather(torch.isfinite(mask), -1, indices.clamp_min(0).to(torch.long))
+    assert torch.all((indices < 0) | selected_valid)
+
+
+def test_kpool_rotation_applies_to_query_and_pooled_key():
+    torch.manual_seed(459)
+    q = torch.randn(4, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(8, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(4, 1, 2, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(4, 8, device="cuda", dtype=torch.float32)
+    scores, _ = fused_qk_topk_kpool(
+        q,
+        k,
+        weights,
+        index_topk=4,
+        pool_size=4,
+        gate_score=gate,
+        ape=ape,
+        use_relu=False,
+        always_select_tail=False,
+        rotate_activation_enabled=True,
+    )
+    pooled = _kpool_compress_keys(k, gate, ape, 4)
+    expected = _compute_index_scores(
+        rotate_activation(q), weights, rotate_activation(pooled), use_relu=False
+    )
+    torch.testing.assert_close(scores, expected, rtol=0, atol=0)
