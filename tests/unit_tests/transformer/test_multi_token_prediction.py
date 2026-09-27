@@ -3424,6 +3424,26 @@ class TestMultiTokenPrediction:
 
         torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 8, 9]))
 
+    def test_roll_tensor_accepts_cpu_boundaries_with_cuda_tokens(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+        tensor = torch.arange(10, device="cuda")
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+        )
+
+        rolled, _ = roll_tensor(tensor, packed_seq_params=packed)
+
+        torch.testing.assert_close(
+            rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 8, 9], device="cuda")
+        )
+
     def test_roll_tensor_with_attention_padded_packed_sequences(self):
         cp = 4
         if int(os.environ.get("WORLD_SIZE", "1")) < cp:

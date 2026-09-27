@@ -377,9 +377,12 @@ def _roll_tensor_packed_seq(
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
+    cu_seqlens = cu_seqlens.to(device=tensor.device)
     physical_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
     if physical_cu_seqlens is None:
         physical_cu_seqlens = cu_seqlens
+    else:
+        physical_cu_seqlens = physical_cu_seqlens.to(device=tensor.device)
 
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
