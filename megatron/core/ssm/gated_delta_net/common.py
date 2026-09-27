@@ -16,6 +16,7 @@ from typing import Optional, Protocol, Union
 import torch
 import torch.nn as nn
 
+from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -43,7 +44,6 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
@@ -51,9 +51,13 @@ except ImportError:
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
-    build_cp_context = None
 
     HAVE_FLA = False
+
+try:
+    from fla.ops.cp import build_cp_context
+except ImportError:
+    build_cp_context = None
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +226,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8:
+        if self.config.fp8 and not getattr(self.config, "kda_disable_fp8", False):
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN layer "
@@ -390,6 +394,22 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a GDN variant's recurrence followed by its output projection."""
+        if self.recompute_gdn and self.training:
+
+            def _checkpointed_forward(hidden_states):
+                norm_out = self.forward_pre_attn_and_core_attn(
+                    hidden_states,
+                    attention_mask,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    inference_params=inference_params,
+                    **kwargs,
+                )
+                return self.forward_post_core_attn(norm_out)
+
+            return tensor_parallel.checkpoint(_checkpointed_forward, False, hidden_states)
+
         norm_out = self.forward_pre_attn_and_core_attn(
             hidden_states,
             attention_mask,
