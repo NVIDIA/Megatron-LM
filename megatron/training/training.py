@@ -837,6 +837,30 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _logit_flops_per_token(hidden_size, vocab_size, mtp_num_layers=0, mtp_detach_heads=False):
+    """Return training FLOPs per token for the final and MTP logit projections.
+
+    The final language-model head always participates in forward, dgrad, and
+    wgrad. MTP draft heads do the same by default, but ``mtp_detach_heads``
+    detaches their shared output weight and therefore removes only wgrad; the
+    draft hidden states still require dgrad for the MTP layer parameters.
+    """
+    fma_expansion_factor = 2
+    forward_backward_expansion_factor = 3
+    mtp_forward_backward_expansion_factor = (
+        2 if mtp_detach_heads else forward_backward_expansion_factor
+    )
+    return (
+        fma_expansion_factor
+        * hidden_size
+        * vocab_size
+        * (
+            forward_backward_expansion_factor
+            + mtp_num_layers * mtp_forward_backward_expansion_factor
+        )
+    )
+
+
 def num_floating_point_operations(
     args,
     batch_size,
@@ -1020,7 +1044,7 @@ def num_floating_point_operations(
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
-                     vocab_size=256000, mtp_num_layers=0):
+                     vocab_size=256000, mtp_num_layers=0, mtp_detach_heads=False):
         """Calculate total FLOPs for the hybrid model."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
@@ -1045,10 +1069,15 @@ def num_floating_point_operations(
                 num_gdn_layers * gdn_layer_flops(total_tokens, hidden_size,
                                                   gdn_qk_head_dim, gdn_v_head_dim,
                                                   gdn_num_qk_heads, gdn_num_v_heads,
-                                                  gdn_conv_kernel_dim, gdn_use_gdn2) +
-                (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
+                                                  gdn_conv_kernel_dim, gdn_use_gdn2)
         )
-        return flops_fwd * 3
+        logit_flops = total_tokens * _logit_flops_per_token(
+            hidden_size,
+            vocab_size,
+            mtp_num_layers=mtp_num_layers,
+            mtp_detach_heads=mtp_detach_heads,
+        )
+        return flops_fwd * 3 + logit_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1340,11 +1369,12 @@ def num_floating_point_operations(
                     + 2 * args.hidden_size * args.hidden_size
                 )
                 # Logit.
-                + forward_backward_expansion_factor
-                * fma_expansion_factor
-                * args.hidden_size
-                * args.padded_vocab_size
-                * (mtp_num_layers + 1)  # MTP + final logit
+                + _logit_flops_per_token(
+                    args.hidden_size,
+                    args.padded_vocab_size,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_detach_heads=getattr(args, "mtp_detach_heads", False),
+                )
             )
             # Self Attention (core L^2 part). For BSHD the default
             # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
@@ -1426,6 +1456,7 @@ def num_floating_point_operations(
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            mtp_detach_heads=getattr(args, "mtp_detach_heads", False),
         ))
     else:
         # Compute standard Transformer model FLOPs.
