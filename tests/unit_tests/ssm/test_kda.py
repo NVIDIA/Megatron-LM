@@ -100,6 +100,29 @@ def test_kda_rejects_invalid_packed_boundaries():
         KimiDeltaAttention._validate_packed_cu_seqlens(empty, empty.clone())
 
 
+@pytest.mark.parametrize("field", ["linear_key_head_dim", "linear_value_head_dim"])
+def test_kda_config_rejects_missing_dimensions(field):
+    with pytest.raises(ValueError, match=f"{field} must be positive"):
+        _make_config(**{field: None})
+
+
+def test_kda_config_rejects_headwise_cp_misalignment():
+    with pytest.raises(ValueError, match=r"divisible by TP\*CP"):
+        _make_config(cp_size=2, linear_num_key_heads=3, linear_num_value_heads=3)
+
+
+@pytest.mark.parametrize("alignment", [0, -4])
+def test_kda_config_rejects_nonpositive_conv_padding_alignment(alignment):
+    with pytest.raises(ValueError, match="gdn_conv_pad_alignment must be positive"):
+        _make_config(gdn_conv_pad_alignment=alignment)
+
+
+@pytest.mark.parametrize("lower_bound", [None, 0.0, -6.0])
+def test_kda_config_rejects_invalid_safe_gate_lower_bound(lower_bound):
+    with pytest.raises(ValueError, match="kda_lower_bound"):
+        _make_config(kda_safe_gate=True, kda_lower_bound=lower_bound)
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 @pytest.mark.parametrize("two_stage_gates", [False, True])
