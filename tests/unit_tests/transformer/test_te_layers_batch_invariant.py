@@ -19,6 +19,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     HAVE_DEEPGEMM_BF16,
     assert_te_supports_batch_invariant_attention,
+    matmul_persistent,
     set_batch_invariant_mode,
     te_supports_batch_invariant_attention,
 )
@@ -824,6 +825,26 @@ def test_bik_te_general_gemm_numerical_parity(dtype):
         C_bik = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
 
     torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))
+
+
+@pytest.mark.parametrize("rows", [1, 4, 8, 32, 64, 96, 127, 128, 129, 160, 192, 224, 255, 256, 257])
+def test_bik_te_general_gemm_triton_strided_weight_is_bit_exact(rows):
+    """A partial M tile and strided weight preserve bits across batch sizes."""
+    torch.manual_seed(193)
+    weight = torch.randn(256, 128, **_device(torch.bfloat16))
+    full_inputs = torch.randn(384, 128, **_device(torch.bfloat16))
+    inputs = full_inputs[:rows].contiguous()
+    pointer = weight.untyped_storage().data_ptr()
+    with set_batch_invariant_mode(True, backend="triton"):
+        expected = matmul_persistent(inputs, weight.transpose(0, 1).contiguous())
+        actual = _te_general_gemm(weight, inputs, out_dtype=torch.bfloat16, layout="TN")[0]
+        full_actual = _te_general_gemm(weight, full_inputs, out_dtype=torch.bfloat16, layout="TN")[
+            0
+        ]
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, full_actual[:rows])
+    assert weight.untyped_storage().data_ptr() == pointer
+    assert weight.stride(1) == 1
 
 
 @pytest.mark.skipif(not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable")
