@@ -1767,6 +1767,35 @@ def test_indexer_teacher_valid_zero_mass_has_zero_manual_gradient():
     torch.testing.assert_close(grad_k, torch.zeros_like(grad_k))
 
 
+def test_indexer_loss_empty_query_returns_zero_key_gradient():
+    """An empty query batch must not return an empty-shaped key gradient."""
+    q = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    weights = torch.empty((0, 1, 1), dtype=torch.float32)
+    k = torch.ones((3, 1, 2), dtype=torch.float32)
+    query = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    key = torch.ones((3, 1, 1, 2), dtype=torch.float32)
+
+    grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        q=q,
+        weights=weights,
+        k=k,
+        query=query,
+        key=key,
+        topk_indices=torch.empty((1, 0, 1), dtype=torch.long),
+        softmax_scale=1.0,
+        loss_coeff=1.0,
+        sparse_loss=False,
+        mask=torch.empty((0, 3), dtype=torch.float32),
+        grad_loss=torch.tensor(1.0),
+        pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 1)),
+    )
+
+    assert grad_q.shape == q.shape
+    assert grad_weights.shape == weights.shape
+    assert grad_k.shape == k.shape
+    torch.testing.assert_close(grad_k, torch.zeros_like(k))
+
+
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])
 class TestComputeDSAIndexerLoss:
     """Test compute_dsa_indexer_loss function."""

@@ -1840,16 +1840,22 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
                 )
-            if (
-                self.dsa_indexer_kpool > 1
-                and self.dsa_indexer_topk is not None
-                and self.dsa_indexer_topk % self.dsa_indexer_kpool != 0
-            ):
-                raise ValueError(
-                    "dsa_indexer_topk must be divisible by dsa_indexer_kpool when KPool is "
-                    f"enabled, got topk={self.dsa_indexer_topk}, "
-                    f"kpool={self.dsa_indexer_kpool}."
-                )
+            if self.dsa_indexer_kpool > 1:
+                if self.dsa_indexer_topk is None:
+                    raise ValueError(
+                        "dsa_indexer_topk must be set when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk < 1:
+                    raise ValueError(
+                        "dsa_indexer_topk must be positive"
+                        " when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk % self.dsa_indexer_kpool != 0:
+                    raise ValueError(
+                        "dsa_indexer_topk must be divisible"
+                        " by dsa_indexer_kpool for pool selection; "
+                        f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
+                    )
             if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
                 raise ValueError(
                     "DSA indexer loss is not supported with kpool selection; set "

@@ -781,6 +781,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_tilelang_kernels",
         sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa.py",
             "megatron/core/transformer/experimental_attention_variant/ops/indexer.py",
             "megatron/core/transformer/experimental_attention_variant/ops/sparse_mla.py",
             "megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",

@@ -375,20 +375,22 @@ class AbsorbedMLASelfAttention(Attention):
                 **kv_down_proj_kwargs,
             )
 
-        self.linear_kv_up_proj = build_module(
-            layer_classes["linear_kv_up_proj"],
-            self.config.kv_lora_rank,
-            self.config.num_attention_heads * (self.config.qk_head_dim + self.config.v_head_dim),
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=False,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name='kv_up_proj',
-            tp_group=pg_collection.tp,
-            name=(name + ".linear_kv_up_proj") if name is not None else None,
-        )
+        with self._mla_projection_context(is_init=True):
+            self.linear_kv_up_proj = build_module(
+                layer_classes["linear_kv_up_proj"],
+                self.config.kv_lora_rank,
+                self.config.num_attention_heads
+                * (self.config.qk_head_dim + self.config.v_head_dim),
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='kv_up_proj',
+                tp_group=pg_collection.tp,
+                name=(name + ".linear_kv_up_proj") if name is not None else None,
+            )
 
         if self.config.q_lora_rank is not None:
             self.q_layernorm = build_module(
