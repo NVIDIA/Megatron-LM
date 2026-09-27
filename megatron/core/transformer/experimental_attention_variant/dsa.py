@@ -29,7 +29,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import ensure_params_ready, get_pg_size
@@ -863,16 +863,10 @@ def _kpool_compress_keys_per_seg(
 
     Return pooled keys and their global starting token indices. Segment boundaries
     need not be multiples of pool_size; a pool must never span two documents.
-    The output uses a fixed upper bound of ``floor(total_tokens / pool_size)``;
-    unused rows have a ``-1`` base so packed metadata stays device-side.
     """
     cu = cu_seqlens_kv.to(device=k.device, dtype=torch.int64)
     sk, bsz, head_dim = k.shape
-    segment_lengths = cu[1:] - cu[:-1]
-    pools_per_segment = torch.div(segment_lengths, pool_size, rounding_mode="floor")
-    pool_offsets = torch.cat(
-        (torch.zeros(1, device=k.device, dtype=torch.int64), pools_per_segment.cumsum(0))
-    )
+    n_seg = cu.numel() - 1
     max_pools = sk // pool_size
     if max_pools == 0:
         return (
@@ -880,47 +874,21 @@ def _kpool_compress_keys_per_seg(
             torch.empty(0, device=k.device, dtype=torch.int64),
         )
 
-    token_positions = torch.arange(sk, device=k.device, dtype=torch.int64)
-    segment_ids = torch.searchsorted(cu[1:], token_positions, right=True)
-    local_positions = token_positions - cu[segment_ids]
-    complete = local_positions < pools_per_segment[segment_ids] * pool_size
-    token_positions = token_positions[complete]
-    segment_ids = segment_ids[complete]
-    local_positions = local_positions[complete]
-    pool_ids = pool_offsets[segment_ids] + torch.div(
-        local_positions, pool_size, rounding_mode="floor"
+    # Enumerate a fixed upper bound of complete pools and map each pool to its
+    # segment. Invalid slots stay allocated and are excluded from top-k below.
+    pools_per_segment = torch.div(cu[1:] - cu[:-1], pool_size, rounding_mode="floor")
+    pool_offsets = torch.cat(
+        (torch.zeros(1, device=k.device, dtype=torch.int64), pools_per_segment.cumsum(0))
     )
-    slots = local_positions.remainder(pool_size)
-
-    if not token_positions.numel():
-        return (
-            k.new_empty((max_pools, bsz, head_dim), dtype=torch.bfloat16),
-            torch.full((max_pools,), -1, device=k.device, dtype=torch.int64),
-        )
-
-    k_selected = k[token_positions].float()
-    if gate_score is None:
-        score = torch.zeros_like(k_selected)
-    else:
-        score = gate_score[token_positions].float()
-    score = score + ape.to(device=k.device, dtype=torch.float32)[slots].unsqueeze(1)
-
-    pool_index = pool_ids.view(-1, 1, 1).expand(-1, bsz, head_dim)
-    pool_max = torch.full(
-        (max_pools, bsz, head_dim), float("-inf"), device=k.device, dtype=torch.float32
-    )
-    pool_max.scatter_reduce_(0, pool_index, score, reduce="amax", include_self=True)
-    probability = torch.exp(score - pool_max[pool_ids])
-
-    denominator = torch.zeros_like(pool_max)
-    numerator = torch.zeros_like(pool_max)
-    denominator.index_add_(0, pool_ids, probability)
-    numerator.index_add_(0, pool_ids, probability * k_selected)
-    k_pooled = (numerator / denominator.clamp_min(1e-12)).to(torch.bfloat16)
-
-    pool_token_base = torch.full((max_pools,), -1, device=k.device, dtype=torch.int64)
-    first_token = slots == 0
-    pool_token_base.scatter_(0, pool_ids[first_token], token_positions[first_token])
+    pool_ids = torch.arange(max_pools, device=k.device, dtype=torch.int64)
+    segment_ids = torch.searchsorted(pool_offsets[1:], pool_ids, right=True).clamp_max(n_seg - 1)
+    pool_token_base = cu[segment_ids] + (pool_ids - pool_offsets[segment_ids]) * pool_size
+    pool_valid = pool_ids < pool_offsets[-1]
+    token_positions = pool_token_base.unsqueeze(-1) + torch.arange(pool_size, device=k.device)
+    token_positions = token_positions.clamp(0, sk - 1).reshape(-1)
+    pooled_gate = gate_score[token_positions] if gate_score is not None else None
+    k_pooled = _kpool_compress_keys(k[token_positions], pooled_gate, ape, pool_size)
+    pool_token_base = pool_token_base.masked_fill(~pool_valid, -1)
     return k_pooled, pool_token_base
 
 
@@ -937,10 +905,33 @@ def _pool_validity_from_token_mask(
         pool_size, device=mask.device
     )
     token_positions = token_positions.clamp_max(sk - 1)
-    token_valid = torch.isfinite(mask)[..., token_positions]
+    if mask.ndim == 2:
+        token_valid = torch.gather(
+            torch.isfinite(mask).unsqueeze(1).expand(-1, pool_token_base.numel(), -1),
+            -1,
+            token_positions.unsqueeze(0).expand(mask.size(0), -1, -1),
+        )
+    else:
+        token_valid = torch.gather(
+            torch.isfinite(mask).unsqueeze(-2).expand(-1, -1, pool_token_base.numel(), -1),
+            -1,
+            token_positions.view(1, 1, -1, pool_size).expand(mask.size(0), mask.size(1), -1, -1),
+        )
     pool_valid = token_valid.all(dim=-1)
-    pool_valid = pool_valid & (pool_token_base >= 0)
-    return pool_valid
+    return pool_valid & (pool_token_base >= 0)
+
+
+def _query_bounds_from_token_mask(mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return global valid key bounds for each query row of an explicit mask."""
+    valid = torch.isfinite(mask)
+    sk = mask.size(-1)
+    key_positions = torch.arange(sk, device=mask.device, dtype=torch.int64)
+    starts = key_positions.masked_fill(~valid, sk).amin(dim=-1)
+    ends = key_positions.masked_fill(~valid, -1).amax(dim=-1) + 1
+    has_valid = valid.any(dim=-1)
+    starts = starts.masked_fill(~has_valid, 0)
+    ends = ends.masked_fill(~has_valid, 0)
+    return starts, ends
 
 
 def _mask_topk_tokens_with_token_mask(
@@ -1004,8 +995,7 @@ def fused_qk_topk_kpool(
 
     # A pool is causal only when its final token is within the query's bounds.
     pool_exists = pool_token_base >= 0
-    safe_pool_token_base = pool_token_base.clamp_min(0)
-    pool_positions = safe_pool_token_base + (pool_size - 1)
+    pool_positions = pool_token_base.clamp_min(0) + (pool_size - 1)
     eff_key_positions = (
         key_positions[pool_positions] if key_positions is not None else pool_positions
     )
@@ -1026,17 +1016,9 @@ def fused_qk_topk_kpool(
         pool_exists = pool_exists & _pool_validity_from_token_mask(
             mask, pool_token_base, pool_size, sk
         )
-    if pool_exists.ndim == 1:
-        index_scores = index_scores.masked_fill(~pool_exists.view(1, 1, -1), float("-inf"))
-    else:
-        index_scores = index_scores.masked_fill(~pool_exists, float("-inf"))
+    index_scores = index_scores.masked_fill(~pool_exists, float("-inf"))
 
     # Keep the selection width fixed, including when fewer causal pools exist.
-    if index_topk % pool_size != 0:
-        raise ValueError(
-            f"index_topk ({index_topk}) must be divisible by pool_size ({pool_size}) "
-            "for KPool selection."
-        )
     budget = index_topk // pool_size
     select_k = min(budget, num_pools)
     if select_k > 0:
@@ -1075,9 +1057,16 @@ def fused_qk_topk_kpool(
     if always_select_tail:
         # Pool phase is query-local, never the final length of the packed sample.
         sq, batch = q.shape[:2]
-        ends = v_ends if v_ends is not None else torch.arange(1, sq + 1, device=q.device)
+        if v_ends is not None:
+            ends = v_ends
+        elif mask is not None:
+            mask_starts, ends = _query_bounds_from_token_mask(mask)
+        else:
+            ends = torch.arange(1, sq + 1, device=q.device)
         if v_starts is not None:
             starts = v_starts
+        elif mask is not None:
+            starts = mask_starts
         elif cu_seqlens_kv is not None:
             cu = cu_seqlens_kv.to(device=q.device, dtype=torch.int64)
             starts = cu[torch.searchsorted(cu[1:], ends - 1, right=True)]
@@ -1913,9 +1902,11 @@ class DSAIndexer(MegatronModule):
         if self.index_kpool > 1:
             # KPool currently supports selection only, not an auxiliary indexer loss.
             # fp32 [kpool, index_head_dim] additive positional bias per pool slot.
-            self.index_kpool_compress_ape = torch.nn.Parameter(
-                torch.zeros(self.index_kpool, self.index_head_dim, dtype=torch.float32),
-                requires_grad=False,
+            self.index_kpool_compress_ape = mark_keep_in_fp32(
+                torch.nn.Parameter(
+                    torch.zeros(self.index_kpool, self.index_head_dim, dtype=torch.float32),
+                    requires_grad=False,
+                )
             )
             # bf16 [index_head_dim, hidden_size]; gate_score = F.linear(x, gate) = x @ gate^T
             # -> [seqlen, index_head_dim]. Matches vLLM's checkpoint name (no .weight suffix).
@@ -2063,8 +2054,7 @@ class DSAIndexer(MegatronModule):
             k = k.reshape(seqlen, bsz, self.index_head_dim)
 
             # =========================================
-            # Rotate activation for the per-token path. KPool rotates both q and
-            # compressed keys together after compression in fused_qk_topk_kpool.
+            # KPool rotates q and compressed keys together after pooling.
             # =========================================
             if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
                 k = rotate_activation(k)
@@ -2133,6 +2123,7 @@ class DSAIndexer(MegatronModule):
                 use_relu=self.config.dsa_indexer_scoring_relu,
                 always_select_tail=self.index_kpool_always_select_tail,
                 fp8_indexer=self.index_kpool_use_quantization,
+                rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
             )
         else:
             # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
