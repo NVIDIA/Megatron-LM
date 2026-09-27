@@ -238,6 +238,3 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
         "Expected all zero-CTA reduce-scatter events to be ncclSymk kernels. "
         f"Observed reduce-scatter events: {reduce_scatter_groups[:20]}"
     )
-
-    # Release the dedicated communicator (leaks only on a test failure above, which is fine).
-    dist.destroy_process_group(dp_group)
