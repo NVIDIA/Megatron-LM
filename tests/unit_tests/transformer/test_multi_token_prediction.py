@@ -3386,6 +3386,25 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
+    def test_roll_tensor_with_uneven_unpadded_cp_chunks(self):
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("CP=2 requires at least 2 ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+        local_tensors = ([1, 2, 6, 11, 12, 16], [3, 4, 5, 13, 14, 15])
+        expected_tensors = ([2, 3, 0, 12, 13, 0], [4, 5, 6, 14, 15, 16])
+        tensor = torch.tensor(local_tensors[cp_rank], device="cuda")
+        boundaries = torch.tensor([0, 6, 12], dtype=torch.int32, device="cuda")
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
+        )
+
+        rolled, _ = roll_tensor(tensor, cp_group=cp_group, packed_seq_params=packed)
+
+        torch.testing.assert_close(rolled, torch.tensor(expected_tensors[cp_rank], device="cuda"))
+        Utils.destroy_model_parallel()
+
     def test_roll_tensor_with_attention_padded_packed_sequences_without_cp(self):
         tensor = torch.arange(1, 25)
         expected = torch.zeros_like(tensor)
@@ -3423,6 +3442,29 @@ class TestMultiTokenPrediction:
         rolled, _ = roll_tensor(tensor, packed_seq_params=packed_seq_params)
 
         torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 8, 9]))
+
+    def test_roll_tensor_local_packed_gradients_with_trailing_slots(self):
+        tensor = torch.arange(20, dtype=torch.float32).reshape(2, 10).requires_grad_()
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+        )
+        weights = torch.arange(1, 21, dtype=torch.float32).reshape_as(tensor)
+
+        rolled, rolled_sum = roll_tensor(tensor, packed_seq_params=packed, return_sum=False)
+        assert rolled_sum is None
+        (rolled * weights).sum().backward()
+
+        expected_grad = torch.zeros_like(tensor)
+        expected_grad[:, 1] = weights[:, 0]
+        expected_grad[:, 2] = weights[:, 1]
+        expected_grad[:, 8:] = weights[:, 8:]
+        torch.testing.assert_close(tensor.grad, expected_grad)
 
     def test_roll_tensor_with_no_packed_documents_keeps_trailing_slots(self):
         tensor = torch.arange(4)
@@ -3516,9 +3558,7 @@ class TestMultiTokenPrediction:
         # Fixed-size RL metadata may contain empty documents anywhere, while
         # trailing local slots beyond the final boundary must stay unchanged.
         tensor_with_tail = torch.cat((tensor, torch.tensor([99, 100], device="cuda")))
-        physical_with_empty = torch.tensor(
-            [0, 0, 8, 8, 24, 24], dtype=torch.int32, device="cuda"
-        )
+        physical_with_empty = torch.tensor([0, 0, 8, 8, 24, 24], dtype=torch.int32, device="cuda")
         logical_with_empty = torch.tensor([0, 0, 3, 3, 13, 13], dtype=torch.int32, device="cuda")
         packed_with_empty = PackedSeqParams(
             cu_seqlens_q=logical_with_empty,
@@ -3532,9 +3572,7 @@ class TestMultiTokenPrediction:
         rolled_with_tail, _ = roll_tensor(
             tensor_with_tail, cp_group=cp_group, packed_seq_params=packed_with_empty
         )
-        torch.testing.assert_close(
-            rolled_with_tail, torch.cat((expected, tensor_with_tail[-2:]))
-        )
+        torch.testing.assert_close(rolled_with_tail, torch.cat((expected, tensor_with_tail[-2:])))
         Utils.destroy_model_parallel()
 
 

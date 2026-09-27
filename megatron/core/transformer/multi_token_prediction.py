@@ -216,6 +216,51 @@ def tie_output_layer_state_dict(
     )
 
 
+def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
+    """Exchange both roll boundaries with the adjacent context-parallel ranks."""
+    first_boundary = first_boundary.contiguous()
+    second_boundary = second_boundary.contiguous()
+    first_received = torch.empty_like(first_boundary)
+    second_received = torch.empty_like(second_boundary)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = torch.distributed.get_rank(group=cp_group)
+
+    # Keep boundary exchanges on the CP communicator so independent DP lanes
+    # can issue different packed P2P sequences without coupling through WORLD.
+    ops = []
+    if local_rank != 0:
+        previous_rank = global_ranks[local_rank - 1]
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, first_boundary, previous_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, second_received, previous_rank, group=cp_group
+            )
+        )
+    else:
+        second_received.zero_()
+    if local_rank != len(global_ranks) - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, first_received, next_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, second_boundary, next_rank, group=cp_group
+            )
+        )
+    else:
+        first_received.copy_(second_boundary)
+    for request in torch.distributed.batch_isend_irecv(ops):
+        request.wait()
+    return first_received, second_received
+
+
 def roll_tensor(
     tensor,
     shifts=-1,
@@ -289,68 +334,16 @@ def roll_tensor(
     for i in range(len(tensor_list)):
         rolled_tensor_list.append(torch.roll(tensor_list[i], shifts=shifts, dims=dims))
 
-    # Prepare tensors for communication between CP ranks
-    # Each CP rank needs to send boundary elements to adjacent ranks
-    tensor_send_list = []
-    tensor_recv_list = []
-    for i in range(len(rolled_tensor_list)):
-        tensor_send_list.append(rolled_tensor_list[i].select(dims, shifts).contiguous())
-        empty_tensor = torch.empty(
-            tensor_send_list[i].shape,
-            dtype=tensor_send_list[i].dtype,
-            device=torch.cuda.current_device(),
-        )
-        tensor_recv_list.append(empty_tensor)
-
-    # Get the global rank of next and prev process in the cp group
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
-    prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
-
-    # Keep each boundary exchange on its CP communicator. Using the default WORLD
-    # communicator couples otherwise independent DP lanes and can deadlock when
-    # packed batches issue different P2P sequences.
-    ops = []
-    if local_rank != 0:
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
-            )
-        )
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
-            )
-        )
-    else:
-        # Inserted elements are set to be 0.0.
-        tensor_recv_list[1] = 0
-    if local_rank != len(global_ranks) - 1:
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
-            )
-        )
-        ops.append(
-            torch.distributed.P2POp(
-                torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
-            )
-        )
-    else:
-        # For the last CP rank, the removed elements of second part go into the first part
-        tensor_recv_list[0] = tensor_send_list[1]
-
-    # Wait for all communication operations to complete
-    for request in torch.distributed.batch_isend_irecv(ops):
-        request.wait()
+    first_received, second_received = _exchange_cp_roll_boundaries(
+        rolled_tensor_list[0].select(dims, shifts),
+        rolled_tensor_list[1].select(dims, shifts),
+        cp_group,
+    )
 
     # Splicing: Replace boundary elements with received elements from adjacent ranks
     # This ensures proper sequence continuity across CP boundaries
-    index = [slice(None)] * rolled_tensor_list[0].dim()
-    index[dims] = shifts
-    for i in range(len(rolled_tensor_list)):
-        rolled_tensor_list[i][tuple(index)] = tensor_recv_list[i]
+    rolled_tensor_list[0].select(dims, shifts).copy_(first_received)
+    rolled_tensor_list[1].select(dims, shifts).copy_(second_received)
 
     # Concatenate the processed chunks back into a single tensor
     rolled_tensor = torch.cat(rolled_tensor_list, dim=dims)
@@ -401,183 +394,47 @@ def _roll_tensor_packed_seq(
         trailing = positions >= physical_cu_seqlens[-1]
         document_ids.clamp_max_(len(cu_seqlens) - 2)
         valid_ends = physical_cu_seqlens[:-1] + torch.diff(cu_seqlens)
-        invalid = positions >= valid_ends.index_select(0, document_ids) - 1
-        rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
+        invalid = (positions >= valid_ends.index_select(0, document_ids) - 1) & ~trailing
+        source_positions = torch.where(
+            trailing, positions, (positions + 1).clamp_max(tensor.size(sequence_dim) - 1)
+        )
+        rolled_tensor = tensor.index_select(sequence_dim, source_positions.long())
         rolled_tensor.masked_fill_(invalid.view(mask_shape), 0)
-        rolled_tensor = torch.where(trailing.view(mask_shape), tensor, rolled_tensor)
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
-    if packed_seq_params.cu_seqlens_q_padded is not None:
-        # Exchange one boundary vector per neighbour for all nonempty documents.
-        chunk_lengths = torch.div(
-            torch.diff(physical_cu_seqlens), 2 * cp_size, rounding_mode='floor'
-        ).long()
-        # RL packing keeps fixed-size cu_seqlens by repeating the final boundary.
-        # Empty entries cannot be gathered or patched, particularly at the end.
-        nonempty = torch.nonzero(chunk_lengths > 0).flatten()
-        if nonempty.numel() == 0:
-            rolled_tensor = tensor.clone()
-            return rolled_tensor, rolled_tensor.sum() if return_sum else None
-        local_starts = torch.div(
-            physical_cu_seqlens[:-1], cp_size, rounding_mode='floor'
-        ).long()
-        local_starts = local_starts.index_select(0, nonempty)
-        chunk_lengths = chunk_lengths.index_select(0, nonempty)
-        second_starts = local_starts + chunk_lengths
-        first_ends = second_starts - 1
-        second_ends = second_starts + chunk_lengths - 1
-        first_boundary = tensor.index_select(sequence_dim, local_starts)
-        second_boundary = tensor.index_select(sequence_dim, second_starts)
-        first_received = torch.empty_like(first_boundary)
-        second_received = torch.empty_like(second_boundary)
+    # Divide the global boundaries as the old per-document path did, then match
+    # torch.chunk(2): the first local chunk is one token longer when odd.
+    local_boundaries = torch.div(physical_cu_seqlens, cp_size, rounding_mode='floor').long()
+    local_lengths = torch.diff(local_boundaries)
+    # Exchange one boundary vector per neighbour for all nonempty documents.
+    # RL packing may repeat the final boundary in fixed-size metadata.
+    nonempty = torch.nonzero(local_lengths > 0).flatten()
+    if nonempty.numel() == 0:
+        rolled_tensor = tensor.clone()
+        return rolled_tensor, rolled_tensor.sum() if return_sum else None
+    local_starts = local_boundaries[:-1].index_select(0, nonempty)
+    local_ends = local_boundaries[1:].index_select(0, nonempty)
+    first_chunk_lengths = torch.div(
+        local_lengths.index_select(0, nonempty) + 1, 2, rounding_mode='floor'
+    )
+    second_starts = local_starts + first_chunk_lengths
+    first_ends = second_starts - 1
+    second_ends = local_ends - 1
+    first_boundary = tensor.index_select(sequence_dim, local_starts)
+    second_boundary = tensor.index_select(sequence_dim, second_starts)
+    first_received, second_received = _exchange_cp_roll_boundaries(
+        first_boundary, second_boundary, cp_group
+    )
 
-        local_rank = torch.distributed.get_rank(group=cp_group)
-        global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-        ops = []
-        if local_rank != 0:
-            previous_rank = global_ranks[local_rank - 1]
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, first_boundary, previous_rank, group=cp_group
-                )
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, second_received, previous_rank, group=cp_group
-                )
-            )
-        else:
-            second_received.zero_()
-        if local_rank != cp_size - 1:
-            next_rank = global_ranks[local_rank + 1]
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, first_received, next_rank, group=cp_group
-                )
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, second_boundary, next_rank, group=cp_group
-                )
-            )
-        else:
-            first_received.copy_(second_boundary)
-        for request in torch.distributed.batch_isend_irecv(ops):
-            request.wait()
-
-        rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
-        rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
-        positions = torch.arange(tensor.size(sequence_dim), device=tensor.device)
-        trailing = positions >= physical_cu_seqlens[-1] // cp_size
-        rolled_tensor = torch.where(trailing.view(mask_shape), tensor, rolled_tensor)
-        rolled_sum = rolled_tensor.sum() if return_sum else None
-        return rolled_tensor, rolled_sum
-
-    def slice_sequence(tensor, start, end):
-        index = [slice(None)] * tensor.dim()
-        index[sequence_dim] = slice(start, end)
-        return tensor[tuple(index)]
-
-    def assign_sequence(tensor, start, end, value):
-        index = [slice(None)] * tensor.dim()
-        index[sequence_dim] = slice(start, end)
-        tensor[tuple(index)] = value
-
-    # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
-    rolled_tensor = tensor.clone()
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    next_rank = global_ranks[(local_rank + 1) % cp_size]
-    prev_rank = global_ranks[(local_rank - 1) % cp_size]
-
-    # Iterate over each sequence individually
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = physical_cu_seqlens[i]
-        end_idx = physical_cu_seqlens[i + 1]
-
-        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
-        local_start_idx = start_idx // cp_size
-        local_end_idx = end_idx // cp_size
-
-        # Skip empty sequences - this can happen when a sequence is very short and
-        # after dividing by cp_size, the local slice has zero length
-        local_seq_len = local_end_idx - local_start_idx
-        if local_seq_len == 0:
-            continue
-
-        tensor_slice = slice_sequence(rolled_tensor, local_start_idx, local_end_idx).clone()
-
-        # The following code is very similar as the code in roll_tensor function
-        local_chunks = tensor_slice.chunk(2, dim=sequence_dim)
-        rolled_chunks = [
-            torch.roll(chunk, shifts=shifts, dims=sequence_dim) for chunk in local_chunks
-        ]
-
-        tensor_send_list = []
-        tensor_recv_list = []
-        for chunk in rolled_chunks:
-            # Skip empty chunks that can occur when the sequence slice is very small
-            if chunk.size(sequence_dim) == 0:
-                boundary_shape = list(chunk.shape)
-                del boundary_shape[sequence_dim]
-                tensor_send_list.append(
-                    torch.empty(boundary_shape, dtype=chunk.dtype, device=chunk.device)
-                )
-                tensor_recv_list.append(
-                    torch.empty(boundary_shape, dtype=chunk.dtype, device=chunk.device)
-                )
-                continue
-            boundary = chunk.select(sequence_dim, shifts).contiguous().clone()
-            tensor_send_list.append(boundary)
-            tensor_recv_list.append(torch.empty_like(boundary))
-
-        ops = []
-        if local_rank != 0:
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, tensor_send_list[0], prev_rank, group=cp_group
-                )
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, tensor_recv_list[1], prev_rank, group=cp_group
-                )
-            )
-        else:
-            tensor_recv_list[1].zero_()
-
-        if local_rank != cp_size - 1:
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, tensor_recv_list[0], next_rank, group=cp_group
-                )
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, tensor_send_list[1], next_rank, group=cp_group
-                )
-            )
-        else:
-            tensor_recv_list[0].copy_(tensor_send_list[1])
-
-        for request in torch.distributed.batch_isend_irecv(ops):
-            request.wait()
-
-        index = [slice(None)] * rolled_chunks[0].dim()
-        index[sequence_dim] = shifts
-        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
-            # Skip empty chunks
-            if chunk.size(sequence_dim) == 0:
-                continue
-            chunk[tuple(index)] = recv
-
-        seq_result = torch.cat(rolled_chunks, dim=sequence_dim)
-
-        # update the rolled tensor
-        assign_sequence(rolled_tensor, local_start_idx, local_end_idx, seq_result)
-
+    positions = torch.arange(tensor.size(sequence_dim), device=tensor.device)
+    trailing = positions >= local_boundaries[-1]
+    source_positions = torch.where(
+        trailing, positions, (positions + 1).clamp_max(tensor.size(sequence_dim) - 1)
+    )
+    rolled_tensor = tensor.index_select(sequence_dim, source_positions)
+    rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
+    rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
     rolled_sum = rolled_tensor.sum() if return_sum else None
     return rolled_tensor, rolled_sum
 
