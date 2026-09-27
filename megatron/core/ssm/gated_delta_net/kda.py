@@ -357,9 +357,16 @@ class KimiDeltaAttention(_GDNBase):
             cu_seqlens_q = None
 
         if cp_size_chunkwise > 1:
+            if build_cp_context is None:
+                raise ImportError("KDA chunkwise CP requires FLA's fla.ops.cp.build_cp_context.")
             if cu_seqlens_q is None:
+                # A runtime CP group can change between microbatches.  Its context embeds the
+                # communicator, so never reuse a cached SBHD context for dynamic CP metadata.
+                use_cached_context = packed_seq_params is None or packed_seq_params.cp_group is None
                 cache_key = (seq_len_global, batch)
-                cached = self._chunkwise_cp_context_cache.get(cache_key)
+                cached = (
+                    self._chunkwise_cp_context_cache.get(cache_key) if use_cached_context else None
+                )
                 if cached is None:
                     cached_cu_seqlens = (
                         torch.arange(
@@ -373,7 +380,8 @@ class KimiDeltaAttention(_GDNBase):
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
                     cached = (cached_cu_seqlens, cached_ctx)
-                    self._chunkwise_cp_context_cache[cache_key] = cached
+                    if use_cached_context:
+                        self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
             else:
                 chunkwise_cp_context = build_cp_context(
