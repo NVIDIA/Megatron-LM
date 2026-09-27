@@ -307,6 +307,38 @@ def test_media_content_uses_the_configured_part_separator():
     assert sanitized[0]["content"] == "question\n__VIDEO__"
 
 
+def test_media_first_content_order_matches_structured_hf_rendering():
+    prompt_config = MultimodalPromptConfig(
+        image_spec=MediaPromptSpec(content_part_separator="\n"),
+        content_part_order="media_first",
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "question"},
+                {"type": "text", "text": "__IMAGE_0__"},
+                {"type": "text", "text": "Image 1:"},
+                {"type": "text", "text": "__IMAGE_1__"},
+                {"type": "text", "text": "Image 2:"},
+            ],
+        }
+    ]
+
+    sanitized = _sanitize_messages_for_template(
+        messages,
+        media_slots=[
+            ("__IMAGE_0__", "image", 0),
+            ("__IMAGE_1__", "image", 0),
+        ],
+        prompt_config=prompt_config,
+    )
+
+    assert sanitized[0]["content"] == (
+        "__IMAGE_0__\n__IMAGE_1__\nquestion\nImage 1:\nImage 2:"
+    )
+
+
 def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
     """Lowering media slots must not be a coroutine.
 

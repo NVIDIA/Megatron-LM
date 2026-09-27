@@ -355,6 +355,14 @@ class MultimodalPromptConfig:
 
     image_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
     video_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+    content_part_order: Literal["preserve", "media_first"] = "preserve"
+
+    def __post_init__(self):
+        if self.content_part_order not in ("preserve", "media_first"):
+            raise ValueError(
+                "MultimodalPromptConfig.content_part_order must be 'preserve' or "
+                f"'media_first', got {self.content_part_order!r}."
+            )
 
     def get_spec(self, modality: str) -> MediaPromptSpec:
         """Return the prompt specification for ``image`` or ``video``."""
@@ -373,6 +381,9 @@ class MultimodalPromptConfig:
         return cls(
             image_spec=replace(defaults.image_spec, **dict(value.get("image_spec", {}))),
             video_spec=replace(defaults.video_spec, **dict(value.get("video_spec", {}))),
+            content_part_order=value.get(
+                "content_part_order", defaults.content_part_order
+            ),
         )
 
 
