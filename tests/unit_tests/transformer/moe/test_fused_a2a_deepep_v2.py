@@ -20,6 +20,7 @@ import importlib
 import sys
 
 import pytest
+import torch
 
 
 def _reimport(name):
@@ -65,6 +66,8 @@ def test_v2_absent_falls_back_to_v1(monkeypatch):
     monkeypatch.setitem(sys.modules, "deep_ep.utils", fake_utils)
     # Provide a dummy Buffer so HAVE_DEEP_EP is True when reimported.
     class _DummyBuffer:
+        _num_sms = None
+
         @staticmethod
         def get_dispatch_config(n):
             raise NotImplementedError
@@ -75,7 +78,7 @@ def test_v2_absent_falls_back_to_v1(monkeypatch):
 
         @staticmethod
         def set_num_sms(n):
-            pass
+            _DummyBuffer._num_sms = n
 
     fake.Buffer = _DummyBuffer
 
@@ -86,6 +89,9 @@ def test_v2_absent_falls_back_to_v1(monkeypatch):
     assert mod.HAVE_DEEP_EP is True, "Legacy Buffer is present"
     assert mod.fused_dispatch is not None
     assert mod.fused_combine is not None
+
+    mod.set_deepep_num_sms(7)
+    assert _DummyBuffer._num_sms == 7, "V1 must still route to Buffer.set_num_sms"
 
 
 def test_v2_present_sets_have_v2_true(monkeypatch):
@@ -145,6 +151,82 @@ def test_v2_present_sets_have_v2_true(monkeypatch):
     assert _DummyElastic._num_sms == 7, (
         "set_deepep_num_sms must dispatch to ElasticBuffer.set_num_sms when V2 is active"
     )
+
+
+def test_v2_without_set_num_sms_records_and_threads_num_sms(monkeypatch):
+    """deep_ep 2.1.0 `ElasticBuffer` has no `set_num_sms` (the SM count is a
+    per-call `num_sms` argument of `dispatch` / `combine`), so
+    `set_deepep_num_sms` must record the value in `_V2_NUM_SMS` and every
+    V2 call site must pass it -- forward dispatch, its backward combine,
+    forward combine and its backward dispatch."""
+    import types
+
+    fake = types.ModuleType("deep_ep")
+
+    class _DummyElastic:
+        # Mirrors deep_ep 2.1.0: `get_theoretical_num_sms` only, no setter.
+        @staticmethod
+        def get_buffer_size_hint(**kwargs):
+            return 1024 * 1024
+
+    class _DummyBuffer:
+        @staticmethod
+        def set_num_sms(n):
+            raise AssertionError("V1 set_num_sms must not be called when V2 is present")
+
+    fake.Buffer = _DummyBuffer
+    fake.ElasticBuffer = _DummyElastic
+
+    fake_utils = types.ModuleType("deep_ep.utils")
+
+    class _DummyEventHandle:
+        pass
+
+    class _DummyEventOverlap:
+        def __init__(self, *a, **k):
+            pass
+
+    fake_utils.EventHandle = _DummyEventHandle
+    fake_utils.EventOverlap = _DummyEventOverlap
+
+    monkeypatch.setitem(sys.modules, "deep_ep", fake)
+    monkeypatch.setitem(sys.modules, "deep_ep.utils", fake_utils)
+
+    mod = _reimport("megatron.core.transformer.moe.fused_a2a")
+    assert mod.HAVE_DEEP_EP_V2 is True
+
+    # `_DeepepManager.__init__` calls this; it raised AttributeError before the fix.
+    mod.set_deepep_num_sms(7)
+    assert mod._V2_NUM_SMS == 7
+
+    seen = []
+    handle = types.SimpleNamespace(num_experts=8, num_recv_tokens_per_expert_list=[1, 2])
+
+    class _RecordingBuffer:
+        def dispatch(self, x, **kwargs):
+            seen.append(("dispatch", kwargs["num_sms"]))
+            return x, None, None, handle, None
+
+        def combine(self, x, *args, **kwargs):
+            seen.append(("combine", kwargs["num_sms"]))
+            return x, None, None
+
+    monkeypatch.setattr(mod, "get_buffer", lambda group, hidden_bytes: _RecordingBuffer())
+
+    x = torch.zeros(4, 8)
+    token_indices = torch.zeros(4, 2, dtype=torch.int64)
+    token_probs = torch.zeros(4, 2)
+    ctx = types.SimpleNamespace()
+    mod.FusedDispatch.forward(ctx, x, token_indices, token_probs, 8, None)
+    mod.FusedDispatch.backward(ctx, x, None, token_probs, None, None)
+    mod.FusedCombine.forward(ctx, x, None, handle)
+    mod.FusedCombine.backward(ctx, x)
+    assert seen == [
+        ("dispatch", 7),
+        ("combine", 7),
+        ("combine", 7),
+        ("dispatch", 7),
+    ], "every V2 dispatch/combine call must pass the recorded num_sms"
 
 
 def test_neither_v1_nor_v2_sets_callables_to_none(monkeypatch):

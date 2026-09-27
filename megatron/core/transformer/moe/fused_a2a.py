@@ -71,6 +71,14 @@ _V2_NUM_MAX_TOKENS_PER_RANK = int(
 )
 _V2_HIDDEN = int(os.environ.get("MCORE_DEEPEP_V2_HIDDEN", "7168"))
 _V2_NUM_TOPK = int(os.environ.get("MCORE_DEEPEP_V2_NUM_TOPK", "8"))
+# SM budget for the V2 `dispatch` / `combine` calls below. `ElasticBuffer`
+# (deep_ep 2.1.0) has no class-level `set_num_sms`; `num_sms` is a per-call
+# argument where 0 means `get_theoretical_num_sms(num_experts, num_topk)` on
+# dispatch (elastic.py:967) and "reuse `handle.num_sms`" on combine
+# (elastic.py:1129). `set_deepep_num_sms` records the framework's value here
+# and every V2 call site passes it, so the forward dispatch handle and its
+# paired combine / backward dispatch always agree on the SM count.
+_V2_NUM_SMS = 0
 
 
 def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
@@ -205,7 +213,7 @@ class FusedDispatch(torch.autograd.Function):
                     topk_weights=token_probs,
                     num_experts=num_experts,
                     num_max_tokens_per_rank=_V2_NUM_MAX_TOKENS_PER_RANK,
-                    num_sms=0,
+                    num_sms=_V2_NUM_SMS,
                     num_qps=0,
                     previous_event=_prev_evt,
                     async_with_compute_stream=async_finish,
@@ -304,9 +312,10 @@ class FusedDispatch(torch.autograd.Function):
 
         if HAVE_DEEP_EP_V2:
             # V2 combine returns `(grad_x, grad_topk_weights, event)`.
-            # `num_sms=0` tells V2 to reuse `handle.num_sms` from the
-            # forward dispatch — a mismatch triggers CUDA 719 at
-            # csrc/jit/handle.hpp:86.
+            # `num_sms` must match `handle.num_sms` from the forward
+            # dispatch (a mismatch triggers CUDA 719 at
+            # csrc/jit/handle.hpp:86), so pass the same `_V2_NUM_SMS`
+            # the forward used; 0 makes V2 reuse `handle.num_sms`.
             _prev_evt = None
             _alloc_on_comm = ctx.allocate_on_comm_stream
             if ctx.async_finish:
@@ -319,7 +328,7 @@ class FusedDispatch(torch.autograd.Function):
                 grad_output.contiguous(),
                 handle,
                 topk_weights=grad_token_probs.float(),
-                num_sms=0,
+                num_sms=_V2_NUM_SMS,
                 num_qps=0,
                 previous_event=_prev_evt,
                 async_with_compute_stream=ctx.async_finish,
@@ -366,7 +375,7 @@ class FusedCombine(torch.autograd.Function):
             combined_x, _, after_event = buffer.combine(
                 x,
                 handle=handle,
-                num_sms=0,
+                num_sms=_V2_NUM_SMS,
                 num_qps=0,
                 previous_event=_prev_evt,
                 async_with_compute_stream=async_finish,
@@ -412,7 +421,7 @@ class FusedCombine(torch.autograd.Function):
             # V2 `ElasticBuffer.dispatch` at elastic.py:768 calls
             # `get_theoretical_num_sms(num_experts, num_topk)` before
             # resolving `num_experts` from the handle, so we must pass
-            # it explicitly when `num_sms=0`.
+            # it explicitly when `_V2_NUM_SMS` is 0.
             _prev_evt = None
             _alloc_on_comm = ctx.allocate_on_comm_stream
             if ctx.async_finish:
@@ -426,7 +435,7 @@ class FusedCombine(torch.autograd.Function):
                 grad_output.contiguous(),
                 handle=ctx.handle,
                 num_experts=_handle_num_experts,
-                num_sms=0,
+                num_sms=_V2_NUM_SMS,
                 num_qps=0,
                 previous_event=_prev_evt,
                 async_with_compute_stream=ctx.async_finish,
@@ -504,12 +513,18 @@ if HAVE_DEEP_EP or HAVE_DEEP_EP_V2:
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP.
 
-        Routes to `ElasticBuffer.set_num_sms` when DeepEP V2 is
-        available (the V2 `Buffer` symbol may not exist), otherwise to
-        legacy `Buffer.set_num_sms`.
+        Legacy V1 routes to `Buffer.set_num_sms`. DeepEP V2 (deep_ep
+        2.1.0) has no `ElasticBuffer.set_num_sms` -- the SM count is a
+        per-call `num_sms` argument of `dispatch` / `combine` -- so the
+        value is recorded in `_V2_NUM_SMS`, which every V2 call site
+        above passes explicitly. A V2 build that does expose
+        `ElasticBuffer.set_num_sms` gets it called as well.
         """
+        global _V2_NUM_SMS
         if HAVE_DEEP_EP_V2:
-            ElasticBuffer.set_num_sms(num_sms)
+            _V2_NUM_SMS = int(num_sms)
+            if hasattr(ElasticBuffer, "set_num_sms"):
+                ElasticBuffer.set_num_sms(num_sms)
         else:
             Buffer.set_num_sms(num_sms)
 
