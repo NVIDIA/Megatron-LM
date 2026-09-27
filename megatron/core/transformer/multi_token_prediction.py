@@ -386,6 +386,9 @@ def _roll_tensor_packed_seq(
 
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
+        if cu_seqlens.numel() == 1:
+            rolled_tensor = tensor.clone()
+            return rolled_tensor, rolled_tensor.sum() if return_sum else None
         # A single roll supplies every interior token. Mask each document's last
         # valid position and its physical padding in one operation instead of
         # launching GPU work separately for every packed document.

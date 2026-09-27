@@ -3424,6 +3424,22 @@ class TestMultiTokenPrediction:
 
         torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 8, 9]))
 
+    def test_roll_tensor_with_no_packed_documents_keeps_trailing_slots(self):
+        tensor = torch.arange(4)
+        boundaries = torch.tensor([0], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries,
+            cu_seqlens_kv=boundaries,
+            cu_seqlens_q_padded=boundaries,
+            cu_seqlens_kv_padded=boundaries,
+            qkv_format="thd",
+        )
+
+        rolled, rolled_sum = roll_tensor(tensor, packed_seq_params=packed)
+
+        torch.testing.assert_close(rolled, tensor)
+        torch.testing.assert_close(rolled_sum, tensor.sum())
+
     def test_roll_tensor_accepts_cpu_boundaries_with_cuda_tokens(self):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required")
